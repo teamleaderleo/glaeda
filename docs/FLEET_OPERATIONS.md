@@ -163,6 +163,71 @@ state. A seed is useful when it reduces measured admission work for the same
 toolchain and source lineage. Its presence alone is not evidence that it should
 be retained.
 
+## Linux VM base on a mini
+
+`glaeda-linux-arm64` jobs run in one fresh Lima clone each (cmuxterm-hq#13261). Step one on a
+std mini is the stopped clone source:
+
+```bash
+python3 scripts/glaeda-linux-vm-base            # plan, no side effects
+python3 scripts/glaeda-linux-vm-base --apply    # idempotent; second run says unchanged
+python3 scripts/glaeda-linux-vm-base --apply --clone-smoke   # one 4 vCPU / 8 GiB clone, verified, deleted
+```
+
+It installs the pinned Lima 2.2.0 release (size and SHA-256 checked) under
+`~/.glaeda/linux-vm/lima-2.2.0`, uses `~/.glaeda/linux-vm/lima-home` as `LIMA_HOME`, and
+creates `glaeda-linux-arm64-base` from the exact bytes of
+`examples/lima/glaeda-prepared-template.yaml`. Readiness checks the guest's architecture, host
+mounts, root-owned marker, runner integrity, non-sudo workload account and masked apt timers, and
+the base is left stopped. An instance without the installer's `base.json` receipt, built from
+another template, or broken is reported (exit 2), never replaced. A clone is
+`limactl --tty=false clone glaeda-linux-arm64-base NAME --cpus 4 --memory 8 --mount-none --start`
+with that `LIMA_HOME`; 3 to 4 fit on a 48 GB mini.
+
+Step two is the installed disposable-worker service that clones that base per job
+(`docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md`), staged by `scripts/glaeda-linux-vm-serve`:
+
+```bash
+python3 scripts/glaeda-linux-vm-serve --apply      # operator: pinned Go 1.26.3, Rust 1.97.1, build + stage
+fleet-sudo HOST "$PWD/scripts/glaeda-linux-vm-serve" install-root --from ~/.glaeda/linux-vm \
+  --glaeda-sha256 X --bridge-sha256 Y --apply      # root: exact staged digests to /opt/smolrunner/bin, 0555
+# once ~/.config/glaeda/scaleset-token.json is pushed:
+~/.glaeda/linux-vm/serve/stage/scaleset-enroll --token-file ~/.config/glaeda/scaleset-token.json \
+  --workflow ORG/REPO/.github/workflows/F.yml@refs/heads/main --apply > ~/.glaeda/linux-vm/serve/scaleset-enroll.json
+python3 scripts/glaeda-linux-vm-serve finish --scale-set ~/.glaeda/linux-vm/serve/scaleset-enroll.json   # prints plan_identity
+python3 scripts/glaeda-linux-vm-serve finish --scale-set ... --apply --approve-plan sha256:...
+```
+
+The operator run prints the exact `install-root` line with both digests. `finish` writes the
+canonical schema-2 enrollment (`installation_token_file` credential, base VM as the clone source,
+4 vCPU / 8 GiB / 20 GiB) to `~/.glaeda/linux-vm/serve/enrollment.json` at mode 0600, re-plans,
+runs `service apply` only for the approved identity, and requires `service status` to read
+`loaded_exact`. Paths under `/opt/smolrunner` and the `io.smolrunner.disposable-worker` label are
+the code's existing contracts. A file it did not install is reported, never replaced.
+
+## Linux VM rollout on every mini
+
+`glaeda-linux-vm-rollout` brings a mini's whole tier up in one order: base, stage
+(`glaeda-linux-vm-serve`), install-root, token, enroll, finish. Run it on the mini as the
+operator, from the glaeda checkout to install; it plans by default and stops at the first step with
+work left, printing `stopped_at` and the exact `next` commands:
+
+```bash
+W=manaflow-ai/cmux/.github/workflows/FILE.yml@refs/heads/main   # the runner group's list, repeated exactly
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W"            # plan
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply    # stops at install_root
+fleet-sudo HOST .../glaeda-linux-vm-serve install-root ... --apply              # printed; the controller runs it
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply    # enrolls, stops at approve
+python3 scripts/glaeda-linux-vm-rollout --host HOST --workflow "$W" --apply --approve-plan ID   # serving
+```
+
+Each mini enrolls its own scale set, `glaeda-linux-arm64-HOST`, in the shared runner group, all
+carrying the one job label `glaeda-linux-arm64`. A scale set's message session belongs to one
+listener, and every listener sizes itself from the whole scale set's assigned-job count, so minis
+cannot share one. The token step waits for the org-runners token push to reach the host. Each mini
+advertises a maximum capacity of one clone today: the bridge target refuses any other value, and
+the fleet host lock does not count VM clones yet, so a higher cap waits for that accounting.
+
 ## Runbook map
 
 - [`FLEET_STATUS.md`](FLEET_STATUS.md) defines the typed status document and finding schema.

@@ -36,11 +36,13 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
   being merged), 2 on timeout (`--timeout S`, default 3600), 3 when the daemon is down, 4 when the
-  PR conflicts with its base, 6 when no CI ever reported on the head, 64 on bad arguments.
+  PR conflicts with its base, 6 when no CI ever reported on the head, 7 (inconclusive) when `--until done`
+  is left with only checks queued with no runner past 30 min or the deadline passes on a partial read,
+  64 on bad arguments. Done and green never exit 0 while any check is queued, running or pending.
 - Every non-zero exit of `status` and `wait pr|run` ends with a line saying what is wrong and a last line
   `next: <command>` (or `next: none (why)`), and with `--json` its one object carries `ok`, `code`, `reason`
   and `next` (codes: `not-found`, `timeout`, `checks-failed`, `run-failed`, `pr-closed`, `conflict`,
-  `nothing-reported`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
+  `nothing-reported`, `inconclusive`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
   `not-found` (exit 1) on the daemon's first read of it, not a wait to the timeout. `status` exits 3 when
   the daemon has not read a target yet. Deadlines are UTC with a Z (`17:55:00Z`).
 - While it blocks, a `wait pr|run` prints `glaeda-gh: still waiting on KEY: 240s of 1800s, deadline
@@ -96,6 +98,7 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 ```bash
 glaeda-gh wait file PATH --timeout 600           # exists and not empty ([ -s PATH ]); PATH may be a glob
 glaeda-gh wait file PATH --exists | --gone | --contains 'REGEX'
+glaeda-gh wait until quota --timeout 4000       # until this host's GitHub quota reset; or 14:40Z, an ISO time, 45m
 glaeda-gh wait pid 12345                         # until the process exits
 ```
 
@@ -238,7 +241,14 @@ glaeda-gh land cancel OWNER/REPO#N
   merges nothing. The calls carry `CMUX_AGENT_SESSION=glaeda-land` and `MAY_MERGE_PATH=glaeda-land`.
 - It stops and tells the requester (`acpmux send --no-wait`, default this host/`$ACPMUX_SESSION_NAME`)
   only on a real stop: a BLOCK, a hold, a conflict, a step only a person can take, the PR or an
-  `--after` PR closed, or 3 identical refusals in a row. On a stop, do the named step, then `land` again.
+  `--after` PR closed, or 3 identical refusals in a row. A refusal naming an update-branch or a wait
+  never counts toward that: the daemon sends the update pinned, once per head, and a wait waits to its
+  bound (checks: 4 h with none moving, `checks_stuck`; a review, an unreadable retry or a cancelled
+  job's rerun: 2 h, `<kind>_deadline`). On a stop, do the named step, then `land` again. A land
+  `--after` a stopped PR keeps waiting for it (24 h): landing or merging that PR resumes it.
+- A PR that reads MERGED ends its entry merged; CLOSED ends it "closed unmerged", naming no step. A
+  step GitHub refused because the PR is closed, or a base change on a lane VM's stale copy, reads the
+  PR's state first; an unreadable state waits, never counting toward a stop.
 - Landing again updates `--after` and `--notify`; landing a stopped or cancelled PR starts it over.
 
 ## When the daemon is down or hung
@@ -305,7 +315,11 @@ never a raw API loop:
 ## Fine to do directly
 
 - Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `glaeda-gh post`.
-- Logs: `gh run view RUN_ID --log-failed` once a run has failed.
+- Logs: ask a question instead of reading a whole log. `glaeda-gh log errors OWNER/REPO JOB_ID` prints one
+  job's error-level lines by step. `glaeda-gh log search OWNER/REPO 'PATTERN' --since 24h` names the recent
+  jobs that printed it. `glaeda-gh log flaky OWNER/REPO [TEST]` lists failing tests by name and marks the ones
+  whose job passed on re-run. Both scans read the build controller's job history and kept logs, never REST.
+  `glaeda-gh log job` prints the whole log when you need it.
 - One-off reads across many PRs: a single batched GraphQL query with aliases
   (`p0: repository(owner:, name:) { pullRequest(number:) { ... } } p1: ...`) through `gh api graphql`.
   GraphQL has its own 5000-point quota, and one aliased query costs about 1 point.

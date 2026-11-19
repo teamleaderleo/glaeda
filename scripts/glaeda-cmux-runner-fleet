@@ -89,7 +89,8 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
           "glaeda-promotion-admit", "glaeda-capture-admit", "glaeda-nightly-only-admit",
-          "glaeda-job-needs.json")  # the hook's measured job needs (CAPACITY_ARITHMETIC in glaeda-cmux-runner-hook)
+          "glaeda-job-needs.json",  # the hook's measured job needs (CAPACITY_ARITHMETIC in glaeda-cmux-runner-hook)
+          "glaeda-runner-job-disk.json")  # one runner job's measured disk (RUNNER_JOBS_DISK in the hook)
 # HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh: every stage installs the staged copy
 # there (a temp file renamed into place, so a running request never reads a half-written file)
 PROMOTION_ADMIT = "glaeda-promotion-admit"
@@ -114,6 +115,7 @@ def load_labels() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -125,6 +127,7 @@ def load_runner() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_for_fleet", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_cmux_runner_for_fleet", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -209,8 +212,13 @@ def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
 
 def trimmed(manifest: dict[str, Any], member: str) -> dict[str, Any]:
     defaults = manifest.get("defaults") if isinstance(manifest.get("defaults"), dict) else {}
-    return {"defaults": {k: defaults[k] for k in TRIMMED_DEFAULTS if k in defaults},
-            "hosts": {member: manifest["hosts"][member]}}
+    out = {"defaults": {k: defaults[k] for k in TRIMMED_DEFAULTS if k in defaults},
+           "hosts": {member: manifest["hosts"][member]}}
+    if isinstance(manifest.get("ssh_user"), str):
+        # DEDICATED_USER: the member's own user, so glaeda-cmux-runner on the mini refuses a user entry run as anyone
+        # else and an entry without a user run by another account
+        out["ssh_user"] = manifest["ssh_user"]
+    return out
 
 
 def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
@@ -552,11 +560,23 @@ def refusal_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     return [head, *(f"  {r['text']}" for r in guard["refusals"])]
 
 
+def ssh_argv(member: str, user: str | None = None) -> list[str]:
+    """ssh to the member, as its own user (the operator's ssh config) or, for a runner.dedicated entry with a user
+    (DEDICATED_USER), as that macOS account: -l USER, the same options."""
+    return ["ssh", *SSH_OPTIONS, *(["-l", user] if user else []), member]
+
+
+def scp_target(member: str, path: str, user: str | None = None) -> str:
+    return f"{user}@{member}:{path}" if user else f"{member}:{path}"
+
+
 def stage(member: str, manifest: dict[str, Any], scratch: Path,
-          override: dict[str, Any] | None = None, head: str | None = None) -> str | None:
+          override: dict[str, Any] | None = None, head: str | None = None, user: str | None = None) -> str | None:
     """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None.
     override: the --allow-downgrade reason and the refusals it overrode, recorded in the stamp. head: the commit
-    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us)."""
+    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us). user: a
+    runner.dedicated entry's macOS account (DEDICATED_USER): the copy goes to that account's home, over ssh as it, and
+    HQ's promotion-admit (the member user's) is not installed there."""
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
     files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
@@ -567,26 +587,29 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
         (scratch / member).mkdir(exist_ok=True)
         (scratch / member / SOURCE_STAMP).write_text(json.dumps(stamp, sort_keys=True) + "\n")
         files.append(os.fspath(scratch / member / SOURCE_STAMP))
-    code, _, err = run(["ssh", *SSH_OPTIONS, member, f"mkdir -p ~/{REMOTE_DIR}/scripts"], 60)
+    code, _, err = run([*ssh_argv(member, user), f"mkdir -p ~/{REMOTE_DIR}/scripts"], 60)
     if code != 0:
         return f"ssh: {err.strip()[-200:]}"
     if stamp is None:  # an old stamp would vouch for these new files
-        run(["ssh", *SSH_OPTIONS, member, f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
-    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, f"{member}:{REMOTE_DIR}/scripts/"], 300)
+        run([*ssh_argv(member, user), f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
+    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, scp_target(member, f"{REMOTE_DIR}/scripts/", user)], 300)
     if code == 0:
         # scp normally preserves executable bits, but an SSH implementation or a mounted
         # home can discard them. The runner copy is ours, so repair the modes explicitly.
-        code, _, err = run(["ssh", *SSH_OPTIONS, member,
-                            f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
-                            f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
-                            f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
-                            f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py "
-                            f"~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT} && mkdir -p ~/.local/bin && "
-                            f"cp ~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT} ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
-                            f"chmod 755 ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
-                            f"mv -f ~/.local/bin/.{PROMOTION_ADMIT}.tmp ~/.local/bin/{PROMOTION_ADMIT}"], 60)
+        modes = (f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
+                 f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
+                 f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
+                 f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py "
+                 f"~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT}")
+        if not user:
+            modes += (f" && mkdir -p ~/.local/bin && "
+                      f"cp ~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT} ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
+                      f"chmod 755 ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
+                      f"mv -f ~/.local/bin/.{PROMOTION_ADMIT}.tmp ~/.local/bin/{PROMOTION_ADMIT}")
+        code, _, err = run([*ssh_argv(member, user), modes], 60)
     if code == 0:
-        code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
+        code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local),
+                            scp_target(member, f"{REMOTE_DIR}/mini-fleet.json", user)], 60)
     return None if code == 0 else f"scp: {err.strip()[-200:]}"
 
 
@@ -878,7 +901,9 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
 
 def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dict[str, Any]:
     """Apply one runner.dedicated runner (glaeda-cmux-runner --dedicated): a token for its own scope, piped over SSH.
-    A dedicated runner with a job is never stopped: its plan blocks a relabel and its agent step waits for idle."""
+    A dedicated runner with a job is never stopped: its plan blocks a relabel and its agent step waits for idle. An entry
+    with a user (DEDICATED_USER) runs over ssh as that macOS account, so it installs under that account's home and loads
+    into its own gui/<uid> session; stage it there first (user_stage)."""
     token = mint(scope_api(entry["repo"], entry["org"]))
     if token is None:
         return {"dedicated": entry["name"], "exit": None,
@@ -893,7 +918,11 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
               + " ".join(_quote(a) for a in extra if a != "--headless"))
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+    if entry.get("user"):
+        # PROTECTED_TOOLCHAIN (glaeda-cmux-runner): the installer runs on Apple's python3 against the root-owned Command
+        # Line Tools with only the system PATH, never a Homebrew python the member user can replace
+        remote = f"PATH={USER_PATH} DEVELOPER_DIR={USER_DEVELOPER_DIR} {USER_PYTHON} {remote}"
+    code, out, err = run([*ssh_argv(member, entry.get("user")), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
         acts = {a["kind"]: a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and "kind" in a}
@@ -903,7 +932,31 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
         state, name = f"no receipt: {(err or out).strip()[-200:]}", None
     if code != 0:
         state = f"{state} ({_failed_note(out, err, code)})"
-    return {"dedicated": entry["name"], "exit": code, "state": state, "name": name}
+    return {"dedicated": entry["name"], "exit": code, "state": state, "name": name,
+            **({"user": entry["user"]} if entry.get("user") else {})}
+
+
+# DEDICATED_USER: what an entry with a user needs on the member before its apply, outside glaeda (a root step per
+# host): that account reachable over ssh with the operator's key. Typed, so the operator sees the missing step.
+USER_SSH_MISSING = "user-ssh"
+USER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"  # glaeda-cmux-runner PROTECTED_PATH
+USER_PYTHON = "/usr/bin/python3"  # PROTECTED_PYTHON
+USER_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"  # PROTECTED_DEVELOPER_DIR
+
+
+def user_stage(member: str, entry: dict[str, Any], manifest: dict[str, Any], scratch: Path,
+               override: dict[str, Any] | None, head: str | None) -> dict[str, Any] | None:
+    """Stage the scripts in the entry's user's home (DEDICATED_USER), or the failed result row for that entry alone."""
+    user = entry["user"]
+    failed = stage(member, manifest, scratch, override, head, user=user)
+    if not failed:
+        return None
+    if failed.startswith("ssh:"):
+        return {"dedicated": entry["name"], "exit": None, "user": user, "missing": USER_SSH_MISSING,
+                "state": (f"cannot ssh as {user} ({failed.removeprefix('ssh:').strip()[-160:] or 'no output'}): "
+                          f"{user} needs the operator's key in its ~/.ssh/authorized_keys and Remote Login access "
+                          "(com.apple.access_ssh), a root step on the host outside glaeda; nothing changed")}
+    return {"dedicated": entry["name"], "exit": None, "user": user, "state": f"stage as {user} failed: {failed}"}
 
 
 def member_scope(args: argparse.Namespace, manifest: dict[str, Any], member: str) -> tuple[str | None, str | None,
@@ -935,6 +988,8 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
     dedicated, bad = load_labels().dedicated_runners(manifest, member)
     row["dedicated"] = [d["name"] for d in dedicated]
+    # DEDICATED_USER: the entries that run as their own macOS account, shown by the plan and applied as that user
+    row["dedicatedUsers"] = {d["name"]: d["user"] for d in dedicated if d.get("user")}
     if bad:
         row["eligible"], row["action"] = False, f"bad runner.dedicated: {bad}"
         return row
@@ -1023,8 +1078,12 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         # claim the dedicated runners never join, so no dedicated runner is (re)applied until every one is retired
         results.append({"dedicated": "*", "exit": None, "state": held})
     else:
-        # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
-        results += [apply_dedicated(member, entry, extra) for entry in dedicated]
+        # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels; one with a user
+        # is staged and applied over ssh as that user (DEDICATED_USER), and a failure there fails that entry alone
+        for entry in dedicated:
+            failed_stage = user_stage(member, entry, manifest, scratch, override, args.guard.get("head")) \
+                if entry.get("user") else None
+            results.append(failed_stage or apply_dedicated(member, entry, extra))
     row["instances"] = results
     row["action"] = "applied" if all(r["exit"] == 0 or r.get("deferred") for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)
@@ -1052,9 +1111,13 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
         if row.get("dedicated") and not row.get("instances"):
-            lines.append(f"      dedicated: {', '.join(row['dedicated'])}")
+            users = row.get("dedicatedUsers") or {}
+            lines.append("      dedicated: " + ", ".join(f"{n} (as {users[n]})" if n in users else n
+                                                         for n in row["dedicated"]))
         for inst in row.get("instances", []):
-            lines.append(f"      {inst.get('instance', inst.get('dedicated'))}: exit={inst['exit']} {inst['state']}  {inst.get('name') or ''}")
+            who = f" (as {inst['user']})" if inst.get("user") else ""
+            lines.append(f"      {inst.get('instance', inst.get('dedicated'))}{who}: exit={inst['exit']} {inst['state']}  "
+                         f"{inst.get('name') or ''}")
     for member, why in sorted(skipped.items()):
         lines.append(f"  {member:<22} not a runner member: {why}")
     total = sum(r["runners"] for r in rows if r.get("eligible"))

@@ -1030,6 +1030,19 @@ class IosSimulatorTests(unittest.TestCase):
         fixes = [i["fix"] for i in mf.check(self.manifest, obs, ["build-mini-1"]) if i["area"] == "ios"]
         self.assertEqual(fixes, ["xcrun simctl runtime delete 24A5390f"])
 
+    def test_an_allowed_runtime_beside_an_exclusive_pin_is_no_drift(self) -> None:
+        # The opt-in iOS 27 runtime beside the 26.5 pin (2026-11-17): carried, never required, never deleted.
+        self.manifest["defaults"]["ios_simulator"]["allowed"] = ["24A5390f"]
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\n"
+                "ios_runtime\t27.0|27.0|24A5390f|com.apple.CoreSimulator.SimRuntime.iOS-27-0\n")
+        self.assertEqual(self.ios(text), [])
+        pin_only = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                    "ios_device\t26.5|iPhone 17 Pro Max\n")
+        self.assertEqual(self.ios(pin_only), [])
+        other = text + "ios_runtime\t26.3|26.3.1|23D8133|com.apple.CoreSimulator.SimRuntime.iOS-26-3\n"
+        self.assertEqual(self.ios(other), ["extra iOS simulator runtime 26.3.1 (23D8133)"])
+
     def test_unavailable_and_malformed_runtimes(self) -> None:
         text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5|unavailable\n"
                 "ios_device\t26.5|iPhone 17 Pro Max\n"
@@ -1044,7 +1057,8 @@ class IosSimulatorTests(unittest.TestCase):
     def test_declaration_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             for bad in ({"runtimes": ["26.5"]}, {"runtimes": ["23F77"], "devices": ["iPhone|x"]},
-                        {"exclusive": True}, {"runtimes": ["23F77"], "extra": 1}):
+                        {"exclusive": True}, {"runtimes": ["23F77"], "extra": 1},
+                        {"runtimes": ["23F77"], "allowed": ["27.0"]}, {"runtimes": ["23F77"], "allowed": "24A5390f"}):
                 data = json.loads(EXAMPLE.read_text())
                 data["defaults"]["ios_simulator"] = bad
                 with self.assertRaises(mf.Failure, msg=bad):

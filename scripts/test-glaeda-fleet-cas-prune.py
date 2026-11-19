@@ -132,6 +132,76 @@ class PruneTest(unittest.TestCase):
         self.assertFalse((self.root / "cas").exists())
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".cas")], [])
 
+    def crash_report(self, name: str, when: float, in_plugin: bool = True) -> Path:
+        reports = Path(self.tmp.name) / "DiagnosticReports"
+        reports.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S.00 %z", time.localtime(when))
+        images = [{"name": "libsystem_platform.dylib"}, {"name": fp.CAS_PLUGIN if in_plugin else "libswift.dylib"}]
+        body = {"faultingThread": 1, "usedImages": images,
+                "threads": [{"frames": [{"imageIndex": 0}]}, {"frames": [{"imageIndex": 0}, {"imageIndex": 1}]}]}
+        path = reports / name
+        path.write_text(json.dumps({"app_name": name.split("-")[0], "timestamp": stamp}) + "\n" + json.dumps(body))
+        return reports
+
+    def corrupt_cas(self) -> None:
+        """A small, just-used local CAS, with a build running since before it was last touched: under budget and
+        not idle, so before this change it was kept, and every build crashed on it (cmux7s, 2026-11-10 to 11-17)."""
+        self.env()
+        (self.root / "cas/plugin/v1.1").mkdir(parents=True)
+        (self.root / "cas/plugin/lock").write_text("")
+        (self.root / "cas/plugin/v1.1/v8.index").write_bytes(b"\0" * 8192)
+        fp.running_commands = lambda: ["/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2"]
+        fp.build_starts = lambda: [time.time() - 3 * 3600]
+
+    def test_corrupt_local_cas_goes_under_budget_while_builds_run(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-2026-11-17-010834.ips", time.time() + 5)
+        with mock.patch.object(fp, "CRASH_REPORTS", reports):
+            rec = self.run_main("--apply")
+        self.assertTrue(rec["local_cas"].startswith("removed (corrupt: SWBBuildService-2026-11-17"), rec)
+        self.assertEqual(rec["result"], "ok")
+        self.assertFalse((self.root / "cas").exists())
+
+    def test_corrupt_local_cas_waits_for_its_lock(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-2026-11-17-010834.ips", time.time() + 5)
+        fd = os.open(self.root / "cas/plugin/lock", os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            with mock.patch.object(fp, "CRASH_REPORTS", reports):
+                rec = self.run_main("--apply")
+        finally:
+            os.close(fd)
+        self.assertIn("holds the CAS lock", rec["result"])
+        self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
+
+    def test_crash_before_the_cas_or_outside_the_plugin_keeps_it(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-old.ips", time.time() - 3600)
+        self.crash_report("swift-frontend-new.ips", time.time() + 5, in_plugin=False)
+        self.crash_report("bsdtar-new.ips", time.time() + 5)  # not a CAS client
+        with mock.patch.object(fp, "CRASH_REPORTS", reports):
+            rec = self.run_main("--apply")
+        self.assertEqual(rec["local_cas"], "within budget")
+        self.assertTrue((self.root / "cas/plugin/v1.1/v8.index").exists())
+
+    def test_malformed_crash_report_is_unreadable_not_fatal(self) -> None:
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-good.ips", time.time() - 3600)  # before the CAS: not counted
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S.00 %z", time.localtime(time.time() + 5))
+        (reports / "SWBBuildService-partial.ips").write_text(
+            json.dumps({"timestamp": stamp}) + "\n" + json.dumps({"threads": ["x"], "usedImages": ["y"]}))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports), "")
+
+    def test_lookback_reads_the_report_time_not_its_mtime(self) -> None:
+        """macOS rewrites old reports when it submits them, so a fresh mtime says nothing about when Xcode crashed."""
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-resubmitted.ips", time.time() + 5)
+        later = time.time() + 30 * 86400
+        os.utime(reports / "SWBBuildService-resubmitted.ips", (later, later))
+        self.assertEqual(fp.corrupt_local_cas(self.root / "cas", reports, now=later), "")
+        self.assertTrue(fp.corrupt_local_cas(self.root / "cas", reports).startswith("corrupt: "))
+
     def test_leftover_renamed_cas_is_swept(self) -> None:
         self.env()
         left = self.root / ".cas.pruning-4242/v1"
@@ -468,6 +538,40 @@ class PruneTest(unittest.TestCase):
         self.assertFalse(any(p.exists() for p in paths if "/cas/" in str(p)))
         rec = self.run_main("--apply", "--node-gib", "0")
         self.assertTrue(rec["result"].startswith("deferred: ps failed"), rec)
+
+    def test_cap_only_caps_both_stores_with_no_sweep_or_gc(self) -> None:
+        self.env()
+        paths = self.node(6)
+        blob = self.local_cas()
+        left = self.root / ".cas.pruning-4242/v1"
+        left.mkdir(parents=True)
+        rec = self.run_main("--apply", "--cap-only", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertEqual((rec["result"], rec["local_cas"]), ("ok", "removed"), rec)
+        self.assertEqual(rec["local_cas_bytes"], 8192)
+        self.assertEqual(rec["node_store_freed_bytes"], rec["node_store_bytes"])
+        self.assertFalse(any(p.exists() for p in paths) or blob.exists())
+        self.assertTrue(left.exists(), "no sweep")
+        self.assertNotIn("gc", rec)
+        self.assertNotIn("swept_bytes", rec)
+
+    def test_cap_only_still_caps_the_node_store_when_ps_fails_and_keeps_the_local_cas(self) -> None:
+        self.env()
+        paths = self.node(6)
+        blob = self.local_cas()
+        fp.running_commands = lambda: None
+        rec = self.run_main("--apply", "--cap-only", "--node-gib", "0", "--local-cas-gib", "0")
+        self.assertIn("removed", rec["node_store"], rec)
+        self.assertFalse(any(p.exists() for p in paths))
+        self.assertTrue(rec["local_cas"].startswith("deferred: ps failed"), rec)
+        self.assertEqual(rec["result"], rec["local_cas"])
+        self.assertTrue(blob.exists())
+
+    def test_node_only_reports_the_local_cas_size_without_judging_it(self) -> None:
+        self.env()
+        blob = self.local_cas()
+        rec = self.run_main("--apply", "--node-only", "--local-cas-gib", "0")
+        self.assertEqual((rec["local_cas"], rec["local_cas_bytes"]), ("not judged (--node-only)", 8192))
+        self.assertTrue(blob.exists())
 
 
     def test_a_reserved_host_above_its_floor_is_left_alone(self) -> None:

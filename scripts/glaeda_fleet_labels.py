@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any, Callable, NamedTuple
 
 MINI_LABEL = "glaeda-mini"
@@ -86,12 +87,11 @@ SIM_PREFIX = "sim"
 # one heavy job's 20 GiB (SMALL_ONLY). On 2026-11-16 that 20 GiB held 12 of cmux18's 14 runners at 17.2 GiB free.
 MAX_SMALL_RUNNERS = 2
 SMALL_PREFIX = "small"
-# simSlots (1 to MAX_SIM_SLOTS, default 1) is how many copies of the simulator token a simulator mini's hook hands
-# out (glaeda-cmux-runner-hook SIM_SLOTS, --sim-slots): that many simulator jobs may run at once, each told its copy
-# (GLAEDA_SIM_SLOT) to boot its own devices, and every copy past the first only with headroom for it (load, memory
-# pressure, the class's measured RAM). Leo, 2026-11-17: "aziz also wanted to look into packing more ios simulators
-# at once and right-sizing them in ci". A member without the simulator role keeps 1.
-MAX_SIM_SLOTS = 4  # the hook's MAX_SIM_SLOTS (a test keeps them equal)
+# simSlots is ignored (logged once per class, SIM_SLOTS_IGNORED): no simulator count is set by hand (Leo,
+# 2026-11-17: "hm why 3 tho shouldn't this be more dynamic? i think it's finally time to start getting these things
+# done"). A simulator mini's hook hands out simulator token copies by measured headroom up to a ceiling it computes
+# from the host's RAM and one simulator's measured RSS (glaeda-cmux-runner-hook SIM_DYNAMIC), each job told its copy
+# (GLAEDA_SIM_SLOT) to boot its own devices.
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -353,8 +353,8 @@ def listener_count(cpus: int, memory_gib: int | None, reserve_cores: int = 0, di
     with a disk shape, also at most disk_listeners(disk)."""
     by_cores = max(1, (cpus - reserve_cores) // LISTENER_MIN_JOB_CORES)
     if memory_gib:
-        floor = max(4, memory_gib // 8)  # the hook's mem_floor_mib, in GiB
-        by_cores = min(by_cores, max(1, (memory_gib - floor) // LISTENER_MIN_JOB_GIB))
+        floor = max(1.0, memory_gib / 10)  # the hook's mem_floor_mib, in GiB (a tenth of the RAM: admit to 90%)
+        by_cores = min(by_cores, max(1, int((memory_gib - floor) // LISTENER_MIN_JOB_GIB)))
     if disk is not None:
         by_cores = min(by_cores, disk_listeners(disk))
     return min(MAX_RUNNERS, by_cores)
@@ -402,14 +402,10 @@ def small_label(version: str) -> str:
     return f"glaeda-{SMALL_PREFIX}-xcode-{version}"
 
 
-SIM_SLOTS_LABEL_PREFIX = "glaeda-sim-slots-"
-
-
-def sim_slots_label(slots: int) -> str:
-    """glaeda-sim-slots-<N>: a simulator mini's slot count (simSlots above 1), on its glaeda-ios-sim runners and its
-    sim-first runner. cmux's picker (scripts/ci/ios_runner_pool.py, cmux#44908) reads it to learn how many simulator
-    jobs the mini runs at once, and routes test-ios to the sim-first runner only where it is. None at 1."""
-    return f"{SIM_SLOTS_LABEL_PREFIX}{slots}"
+# No simulator count label: a simulator mini carries IOS_SIM_LABEL alone (cmuxterm-hq lane/sim-dynamic-admission's
+# contract), and its hook admits simulator jobs by measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC); its
+# sim-first runner listens exactly while one more is admissible. glaeda-sim-slots-<N> is no longer written.
+SIM_SLOTS_IGNORED: set[str] = set()  # the classes whose simSlots was logged as ignored, once each
 
 
 def _role_label(pool: str, role: str) -> str:
@@ -576,11 +572,13 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         gateway = declared.get("gatewayRunners", 0)
         sim = declared.get("simRunners", 0)
         small = declared.get("smallRunners", 0)
-        sim_slots = declared.get("simSlots", 1)
+        if "simSlots" in declared and klass not in SIM_SLOTS_IGNORED:
+            SIM_SLOTS_IGNORED.add(klass)
+            print(f"glaeda_fleet_labels: runner.classes.{klass}.simSlots is ignored: simulator copies follow "
+                  "measured headroom (glaeda-cmux-runner-hook SIM_DYNAMIC)", file=sys.stderr)
         reserve = declared.get("reserveCores", 0)
     else:
         compile_slots, roots, gui, fast, gateway, sim, small, reserve = 1, 1, 0, 0, 0, 0, 0, 0
-        sim_slots = 1
     if dedicated_only:
         gateway = sim = small = 0  # DEDICATED_ONLY: no pool instance, so no gateway, sim-first or small runner either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
@@ -614,11 +612,6 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
     sim = sim if ios_sim else 0
-    if not (isinstance(sim_slots, int) and not isinstance(sim_slots, bool) and 1 <= sim_slots <= MAX_SIM_SLOTS):
-        return None, f"runner.classes.{klass}.simSlots must be 1 to {MAX_SIM_SLOTS}"
-    sim_slots = sim_slots if ios_sim else 1  # a class default, read the same way as simRunners
-    if sim_slots > 1:  # cmux#44908: the picker learns the slot count from this label
-        labels.append(sim_slots_label(sim_slots))
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
@@ -663,7 +656,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "gatewayRunners": gateway,
             "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
             else [],
-            "simRunners": sim, "simSlots": sim_slots,
+            "simRunners": sim,
             "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else [],
             "smallRunners": small,
             "smallPools": list(dict.fromkeys(small_label(v) for v in (versions if pools else []))) if small else [],
@@ -703,6 +696,15 @@ DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
 # A dedicated command's first word may be this: the runner's own hook interpreter (glaeda-cmux-runner hook_python), so
 # a command that loads the hook runs on the Python the hook runs on, never a pinned path.
 PYTHON_WORD = "{python}"
+# DEDICATED_USER: a trusted runner.dedicated entry's "user" is the macOS account its runner runs as, instead of the
+# member's one user (its ssh_user, which every pool and PR runner runs as). glaeda-cmux-runner-fleet applies it over
+# ssh as that user, so the runner, its _work and its LaunchAgent live in that account's home and its own gui/<uid>
+# session, and a PR job on the Mac never shares a macOS user with it (cmuxterm-hq#13863: probes that hold a production
+# test account's session and a token). Only on a trusted entry (trustedRef: no PR code ever runs in that account), never
+# with lanRelay (the relay is the member user's) or yieldToExclusive (it reads the member user's capacity ledger, which a
+# user entry keeps out of: its hook keeps its own under that account's home). A lowercase short name, never root and
+# never the member's own ssh_user.
+DEDICATED_USER_RE = r"[a-z_][a-z0-9_-]{0,31}"
 
 
 # Where a member's pool instances register (glaeda-cmux-runner-fleet, when no --org/--repo is passed): the manifest's
@@ -742,10 +744,12 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay}], None), or ([], why the
-    member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
-    floor, or None for the member's disk.min_free_gib. lanRelay is the one private LAN IPv4:port the entry's relay
-    agent forwards to (LAN_RELAY), or None."""
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib, lanRelay, user}], None), or ([], why
+    the member's list is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk
+    floor, or None for the member's disk.min_free_gib. lanRelay is the private LAN "IPv4:port" the entry's relay
+    agent forwards to (LAN_RELAY), the list of one host's adapter addresses on one port it tries in order
+    (LAN_RELAY_ADAPTERS), or None. user is the macOS account the runner runs as (DEDICATED_USER), or None for the
+    member's own user."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
     if not isinstance(host, dict):
@@ -768,7 +772,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
                                        "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive",
-                                       "lanRelay"})
+                                       "lanRelay", "user"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -848,11 +852,24 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                                runner.get("dedicatedOnly") is True)
         if why:
             return [], why
+        user = entry.get("user")
+        if user is not None:
+            owner = host.get("ssh_user") or manifest.get("ssh_user")
+            if not (isinstance(user, str) and re.fullmatch(DEDICATED_USER_RE, user)) or user == "root":
+                return [], f"{where}.user must be a macOS short name ({DEDICATED_USER_RE}), never root"
+            if user == owner:
+                return [], f"{where}.user {user} is the member's own ssh_user: leave user out for a runner of that user"
+            if trusted_ref is None:
+                return [], (f"{where}.user needs trustedRef and trustedRepo: a runner in its own macOS account takes "
+                            "only merged code of its repository, never PR code")
+            if relay is not None or yields:
+                return [], (f"{where}.user goes without lanRelay and yieldToExclusive: both are the member user's "
+                            "(its relay socket, its capacity ledger)")
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
                     "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields,
-                    "lanRelay": relay})
+                    "lanRelay": relay, "user": user})
     # LAN_RELAY: every runner of a member runs as the one macOS user, so any of them could open a relay's socket. A
     # relay is allowed only when every dedicated entry beside it is trusted too (dedicatedOnly leaves no pool instance).
     relays, untrusted = [d["name"] for d in out if d["lanRelay"]], [d["name"] for d in out if d["trustedRef"] is None]
@@ -868,13 +885,17 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
 # open, and starts Apple's /usr/bin/nc to that one address and port per connection. Nothing in a job can choose another
 # destination. It is allowed only where a job's code is the trusted branch's (trustedRef) and no other runner shares the
 # Mac (runner.dedicatedOnly), and only to a private (RFC 1918) address.
+# LAN_RELAY_ADAPTERS: one host with several wired adapters (one per Studio Display, its address set by which display
+# it is plugged into) has one LAN address per adapter, so lanRelay may instead list them,
+# ["A.B.C.D:PORT", ...]: at most LAN_RELAY_MAX, distinct, every one RFC 1918, all on one port. The relay tries them in
+# order per connection and forwards to the first that connects. The trust stays "these declared addresses of one host,
+# one port", and no name is ever resolved.
 LAN_RELAY_RE = r"((?:[0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})"
+LAN_RELAY_MAX = 4
 
 
-def lan_relay(value: Any, where: str, trusted: bool, dedicated_only: bool) -> tuple[str | None, str | None]:
-    """(the normalised "A.B.C.D:PORT", None), (None, None) when the entry has none, or (None, why it is refused)."""
-    if value is None:
-        return None, None
+def lan_relay_address(value: Any, where: str) -> tuple[str | None, str | None]:
+    """(the normalised "A.B.C.D:PORT", None) for one private IPv4:PORT, or (None, why it is refused)."""
     match = re.fullmatch(LAN_RELAY_RE, value) if isinstance(value, str) else None
     octets = [int(x) for x in match.group(1).split(".")] if match else []
     port = int(match.group(2)) if match else 0
@@ -883,16 +904,55 @@ def lan_relay(value: Any, where: str, trusted: bool, dedicated_only: bool) -> tu
     first, second = octets[0], octets[1]
     if not (first == 10 or (first == 172 and 16 <= second <= 31) or (first == 192 and second == 168)):
         return None, f"{where}.lanRelay must be a private (RFC 1918) LAN address"
-    if not trusted or not dedicated_only:  # dedicated_only: runner.dedicatedOnly is exactly true
-        return None, (f"{where}.lanRelay needs trustedRef on an entry of a runner.dedicatedOnly member: the relay "
-                      "crosses Local Network privacy only where no other runner shares the Mac")
     return ".".join(str(x) for x in octets) + f":{port}", None
 
 
+def lan_relay(value: Any, where: str, trusted: bool,
+              dedicated_only: bool) -> tuple[str | list[str] | None, str | None]:
+    """(the normalised "A.B.C.D:PORT", None); (["A.B.C.D:PORT", ...], None) for two or more of one host's adapter
+    addresses on one port (LAN_RELAY_ADAPTERS; a list of one is that one string); (None, None) when the entry has
+    none; or (None, why it is refused)."""
+    if value is None:
+        return None, None
+    relay: str | list[str] | None
+    if isinstance(value, list):
+        if not 0 < len(value) <= LAN_RELAY_MAX:
+            return None, (f"{where}.lanRelay lists 1 to {LAN_RELAY_MAX} addresses of one host (its adapters), "
+                          f"not {len(value)}")
+        addresses = []
+        for item in value:
+            address, why = lan_relay_address(item, where)
+            if why:
+                return None, why
+            addresses.append(address)
+        if len(set(addresses)) != len(addresses):
+            return None, f"{where}.lanRelay lists an address twice"
+        if len({a.rsplit(":", 1)[1] for a in addresses}) != 1:
+            return None, f"{where}.lanRelay lists one host's adapter addresses on one port, not several ports"
+        relay = addresses[0] if len(addresses) == 1 else addresses
+    else:
+        relay, why = lan_relay_address(value, where)
+        if why:
+            return None, why
+    if not trusted or not dedicated_only:  # dedicated_only: runner.dedicatedOnly is exactly true
+        return None, (f"{where}.lanRelay needs trustedRef on an entry of a runner.dedicatedOnly member: the relay "
+                      "crosses Local Network privacy only where no other runner shares the Mac")
+    return relay, None
+
+
+# A trusted pool label as pool_label() makes it, in the default namespace or a member's runner.poolPrefix one:
+# glaeda-trusted-std-xcode-26.6, glaeda-promote-trusted-light-xcode-26.6 (cmux's vars.CI_FFI_RELEASE_POOL), and
+# glaeda-signing-trusted-std-xcode-26.6.
+TRUSTED_POOL_LABEL_RE = (rf"glaeda-(?:{POOL_PREFIX_RE})?trusted-(?:{'|'.join(RUNNER_CLASSES)})-xcode-{VERSION_RE}")
+
+
 def trusted_pool_matches(manifest: Any, label: str, trusted_ref: str, trusted_repo: str) -> bool:
-    """Whether `label` is a trusted pool label (glaeda-trusted-...) and every member that declares it is trusted-only
-    on exactly trusted_ref of trusted_repo: only then may a trusted runner.dedicated entry carry it."""
-    if not label.lower().startswith("glaeda-trusted-"):
+    """Whether `label` is a trusted pool label (TRUSTED_POOL_LABEL_RE: glaeda-trusted-... or a namespaced
+    glaeda-<prefix>trusted-...) and every member that declares it is trusted-only on exactly trusted_ref of
+    trusted_repo: only then may a trusted runner.dedicated entry carry it. A namespaced one counts too: on 2026-11-18
+    cmux19 alone served glaeda-promote-trusted-light-xcode-26.6 (cmux's FFI release build) and went offline, and no
+    second host could carry the label without converting its whole PR pool into a promote pool."""
+    if not re.fullmatch(TRUSTED_POOL_LABEL_RE, label.lower()):
         return False
     members = declared_pools(manifest).get(label) or declared_pools(manifest).get(label.lower()) or []
     if not members:

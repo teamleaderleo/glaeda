@@ -176,6 +176,54 @@ class LoadDiskModuleTest(unittest.TestCase):
                          "importlib.util.module_from_spec(spec_from_loader(name, loader)) and loader.exec_module:\n"
                          + hits)
 
+    def test_it_loads_a_script_whose_dataclasses_look_up_their_module(self) -> None:
+        # 11-17: glaeda-disk grew a @dataclass(frozen=True) under `from __future__ import annotations`; dataclasses
+        # reads sys.modules[cls.__module__] while it makes the class, so the unregistered module failed every minute
+        # with "'NoneType' object has no attribute '__dict__'".
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = Path(tmp) / "glaeda-disk"
+            disk.write_text("from __future__ import annotations\nfrom dataclasses import dataclass\n"
+                            "from typing import ClassVar\n\n\n@dataclass(frozen=True)\nclass Probe:\n"
+                            "    kind: ClassVar[str] = 'x'\n    busy: str = ''\n\n\n"
+                            "def host_busy():\n    return Probe().busy\n")
+            with mock.patch.dict("os.environ", {"GLAEDA_DISK": str(disk)}):
+                module = idle.load_disk_module()
+        self.assertEqual(module.host_busy(), "")
+
+    def test_it_loads_the_real_glaeda_disk(self) -> None:
+        with mock.patch.dict("os.environ", {"GLAEDA_DISK": str(ROOT / "scripts/glaeda-disk")}):
+            module = idle.load_disk_module()
+        self.assertTrue(callable(module.host_busy))
+
+    def test_every_script_registers_the_module_it_executes(self) -> None:
+        # The detector for the class: a script that runs loader.exec_module(m) puts m in sys.modules first, or the
+        # first dataclass in the module it loads breaks it. Tests are exempt: their own run shows a miss.
+        import re
+        import subprocess
+        files = subprocess.run(["git", "-C", str(ROOT), "grep", "-l", "-F", ".exec_module(", "--", "scripts", "glaeda"],
+                               capture_output=True, text=True).stdout.split()
+        missing = []
+        for name in files:
+            if Path(name).name.startswith("test-"):
+                continue
+            lines = (ROOT / name).read_text().splitlines()
+            for i, line in enumerate(lines):
+                if re.match(r"\s*[\w.]+\.exec_module\(\w+\)", line) and \
+                        not any("sys.modules[" in prior for prior in lines[max(0, i - 3):i]):
+                    missing.append(f"{name}:{i + 1}: {line.strip()}")
+            # The registration names sys, so the script imports it (a bare `sys.modules[...]` raises NameError
+            # at load, which compiling never shows: cmux_fleet_operator_summary.py, #2129).
+            # An import counts at the top level, or earlier at no deeper indent (a function's own import).
+            imports = [(i, len(line) - len(line.lstrip())) for i, line in enumerate(lines)
+                       if re.match(r"\s*import\s+(?:[\w.]+\s*,\s*)*sys\b", line)]
+            for i, line in enumerate(lines):
+                if "sys.modules[" in line and not line.lstrip().startswith("#"):
+                    indent = len(line) - len(line.lstrip())
+                    if not any(depth == 0 or (at < i and depth <= indent) for at, depth in imports):
+                        missing.append(f"{name}:{i + 1}: sets sys.modules[...] with no `import sys` in scope")
+        self.assertEqual(missing, [], "set sys.modules[loader.name] = module before loader.exec_module(module):\n"
+                         + "\n".join(missing))
+
 
 if __name__ == "__main__":
     unittest.main()

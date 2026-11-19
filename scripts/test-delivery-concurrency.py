@@ -25,7 +25,7 @@ ALLOWED_SHARED: dict[tuple[str, str], str] = {
     ("release.yml", "canary"): (
         "canary.json's one writer: each run moves canary to the newest release on main that descends from "
         "it, read when it starts, so the run that replaced a waiting one covers its release"),
-    ("promote.yml", ""): (
+    ("promote.yml", "promote"): (
         "stable.json's one writer (a release asset upload has no compare-and-swap): each run decides from the "
         "releases and statuses it reads when it starts"),
     ("mirror.yml", ""): (

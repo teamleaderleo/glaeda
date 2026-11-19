@@ -860,6 +860,22 @@ class DiskAndLeaks(Base):
                                                                        {"unmeasured": None}]}
         self.assertEqual(self.run_once()["findings"], [])
 
+    def test_gate_restarts_of_a_stuck_listener_are_healed_for_a_day(self) -> None:
+        # glaeda-cmux-runner-hook stuck_acquire writes one line per restart; ci-dash shows them under healed
+        self.mini.home = self.dir
+        path = self.dir / ".local/state/glaeda/cmux-runner" / health.GATE_RESTARTS
+        path.parent.mkdir(parents=True)
+        line = {"cause": "listener_acquire_stuck", "runner": "actions-runner-glaeda-12", "request": "f233fe94",
+                "acknowledged": "2026-11-17 08:02:33Z", "held_s": 901, "bound_s": 900.0}
+        path.write_text(json.dumps({**line, "t": NOW - 2 * health.HEALED_KEEP_S}) + "\nnot json\n" +
+                        json.dumps({**line, "t": NOW - 60, "at": "then"}) + "\n")
+        healed = self.run_once()["healed"]
+        self.assertEqual([(h["id"], h["code"], h["auto_fix"]) for h in healed],
+                         [("listener_acquire_stuck:actions-runner-glaeda-12:f233fe94", "listener_acquire_stuck",
+                           "done")])
+        self.assertIn("started no Worker in 901 s", healed[0]["evidence"])
+        self.assertEqual(health.gate_restarts_healed(Path("/nonexistent"), NOW), [])
+
     def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
         self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
         report = self.run_once()
@@ -2681,6 +2697,20 @@ class DaemonHeal(Base):
         f = self.run_once()["findings"]
         self.assertEqual([(x["id"], x["severity"]) for x in f], [("disk_root_copy_stale:all", "error")])
 
+    def test_an_unenrolled_ci_minis_root_census_is_reported_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        for state, severity, fix in (("stale", "warn", "pending"), ("error", "error", "impossible")):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": {
+                "state": state, "why": "root census plist missing", "action": "reinstall"}}}))
+            f = [x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"]
+            self.assertEqual([(x["severity"], x["auto_fix"]) for x in f], [(severity, fix)])
+            self.assertIn("root census plist missing", f[0]["evidence"])
+        for census in ({"state": "current"}, {"state": "skipped", "why": "not a CI mini"}):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": census}}))
+            self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"], [])
+
 
 class DaemonHealLiveness(Base):
     """An installed copy that is unloaded, or whose passes stopped, is no healthy healer."""
@@ -3569,6 +3599,27 @@ class UnmanagedServiceTest(unittest.TestCase):
                 out = health.run(mini, True, now=NOW, state_path=state, report_path=report, runner=runner)
                 self.assertIn("unmanaged_service:ai.manaflow.x-worker", [f["id"] for f in out["findings"]], runner)
                 self.assertEqual(out["heals"], [])
+
+
+class PressureBlocked(unittest.TestCase):
+    """disk_pressure_blocked: under pressure with almost nothing reclaimable while tens of GiB are blocked."""
+
+    G = 1024**3
+
+    def summary(self, reclaimable: float, blocked: float, under: bool = True) -> dict:
+        return {"schema": "glaeda-disk/v1", "reclaimable": reclaimable * self.G, "blocked": blocked * self.G,
+                "filesystems": [{"mount": "/", "free": 27 * self.G, "total": 460 * self.G, "under": under}]}
+
+    def test_the_panel_that_read_reclaimable_zero_warns(self) -> None:
+        out = health.pressure_blocked_findings(self.summary(0.0, 153.5))
+        self.assertEqual([f["id"] for f in out], ["disk_pressure_blocked"])
+        self.assertIn("blocked 153.5 GiB", out[0]["evidence"])
+
+    def test_no_pressure_enough_reclaimable_or_little_blocked_is_quiet(self) -> None:
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 153.5, under=False)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(20.0, 153.5)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 10.0)), [])
+        self.assertEqual(health.pressure_blocked_findings({"schema": "glaeda-disk/v1"}), [])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ home="${HOME:?HOME is required}"
 python="${GLAEDA_PYTHON:-/opt/homebrew/bin/python3}"
 disk="${GLAEDA_DISK:-$home/.local/bin/glaeda-disk}"
 export GLAEDA_DISK_CALLER="${GLAEDA_DISK_CALLER:-disk-pressure LaunchAgent}"
+# Each pass ends before the next one starts (the agent runs every 15 minutes): glaeda-disk stops starting walks and
+# deletes 60 s before HYGIENE_RUN_DEADLINE and the next pass goes on, so no pass waits behind a long one.
+export HYGIENE_RUN_DEADLINE="${HYGIENE_RUN_DEADLINE:-$(( $(date +%s) + ${GLAEDA_DISK_PASS_S:-840} ))}"
 # GLAEDA_DISK_PRESSURE_ONLY=1 (setup's --gh-only profile): only below the floor, no idle sweep.
 idle=(--idle)
 [[ "${GLAEDA_DISK_PRESSURE_ONLY:-}" == 1 ]] && idle=()
