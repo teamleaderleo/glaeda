@@ -6365,6 +6365,52 @@ time.sleep(60)
             for runner in ("h0", "n0", "n1", "n2", "n3", "n4"):
                 self.finish(runner)
 
+    def fleet_holder(self, fleet: Path, seconds: float) -> subprocess.Popen:
+        """A fleet build holding host.lock exclusively for `seconds`, then letting go."""
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import fcntl,os,time\n"
+                                   f"fd=os.open({os.fspath(fleet / 'host.lock')!r},os.O_RDWR)\n"
+                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\n"
+                                   f"time.sleep({seconds!r})\n"],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_capacity_guest_waits_out_a_fleet_build_holding_the_host(self) -> None:
+        """GUEST_HOST_WAIT: a guest job GitHub already handed this runner is not refused after --guest-wait for a fleet
+        build holding host.lock; GitHub never moves a handed job, so the refusal only failed it red (cmuxterm-hq's
+        scheduled next-dogfood, run 44505512009, 2026-11-19: refused on cmux19 after 600 s). It waits for the build to
+        end, up to --guest-host-wait, and is admitted; time behind the build does not count against --guest-wait."""
+        fleet = self.fleet()
+        env = {"GITHUB_REPOSITORY": "manaflow-ai/cmuxterm-hq"}
+        self.fleet_holder(fleet, 6)
+        try:
+            waited = time.monotonic()
+            result = self.job("dogfood", "g0", 20, None, "--allowed-repo", "manaflow-ai/cmuxterm-hq",
+                              "--guest-wait", "2", env=env)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertGreaterEqual(time.monotonic() - waited, 4, "admitted only once the build let go")
+            self.assertIn("waiting", result.stdout)
+            self.assertNotIn("refused", result.stdout)
+        finally:
+            self.finish("g0")
+
+    def test_capacity_guest_host_wait_is_bounded(self) -> None:
+        """A host lock that stays held past --guest-host-wait still refuses the guest, so a stranded lock never holds
+        its runner for the job's whole timeout."""
+        fleet = self.fleet()
+        env = {"GITHUB_REPOSITORY": "manaflow-ai/cmuxterm-hq"}
+        self.fleet_holder(fleet, 60)
+        waited = time.monotonic()
+        result = self.job("dogfood", "g0", 20, None, "--allowed-repo", "manaflow-ai/cmuxterm-hq",
+                          "--guest-wait", "1", "--guest-host-wait", "3", env=env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("refused: capacity: a fleet build holds the host lock", result.stdout)
+        self.assertGreaterEqual(time.monotonic() - waited, 3, "it waited --guest-host-wait, not --guest-wait")
+
     # ------------------------------------------------------------ ci-step admission (cmuxterm-hq#794)
 
     def ci_step(self, phase: str, *extra: str, units: int = 7, env: dict | None = None) -> tuple[int, dict]:
