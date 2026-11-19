@@ -11153,6 +11153,31 @@ class GateTest(unittest.TestCase):
                                   "build-nightly-app")
         self.assertIsNone(hook.nightly_capacity_wait(untrusted, "push", ref, "build-nightly-app", "nightly.yml", "1"))
 
+    def test_the_fast_tier_waits_a_bounded_time_for_capacity(self) -> None:
+        """FAST_TIER_WAIT: cmux-next.yml's fast tier has a 20-minute timeout that counts its wait in "Set up runner",
+        and its run after admission takes 866 s p50 (856 owned fast tiers, 11-16 14Z to 11-19 01Z). Of the 191 that
+        waited 60 s or more for units, 3 passed; 141 of the 348 that ran out the 20 minutes had waited 60 s or more,
+        68202 s in all (run 44290763187 on ultra2: admitted at 1203 s, cancelled before its first step). So it is
+        refused after FAST_TIER_CAPACITY_WAIT_S, and cmux's owned-pool rescue re-runs it (hook_refused() reads the
+        step), instead of a timeout nobody re-runs. Any runner, the fast runner too; other jobs and repos unchanged."""
+        bound = hook.FAST_TIER_CAPACITY_WAIT_S
+        self.assertEqual(bound, 60.0)
+        self.assertLess(bound + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S + 866, 20 * 60,
+                        "a median run admitted at the bound still fits the 20-minute cap")
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        self.assertEqual(hook.fast_tier_capacity_wait("Manaflow-AI/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        for repo, workflow, job in (("someone/else", "cmux-next.yml", "fast-tier"),
+                                    (None, "cmux-next.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "cmux-next.yml", "swift-test"),
+                                    ("manaflow-ai/cmux", "ci.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "", "fast-tier")):
+            with self.subTest(repo=repo, workflow=workflow, job=job):
+                self.assertIsNone(hook.fast_tier_capacity_wait(repo, home, workflow, job))
+        # composes like the other bounds: a shorter explicit wait is kept
+        self.assertEqual(hook.bounded_wait(None, bound), bound)
+        self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
+
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
