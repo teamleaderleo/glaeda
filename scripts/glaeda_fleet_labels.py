@@ -940,10 +940,19 @@ def lan_relay(value: Any, where: str, trusted: bool,
     return relay, None
 
 
+# A trusted pool label as pool_label() makes it, in the default namespace or a member's runner.poolPrefix one:
+# glaeda-trusted-std-xcode-26.6, glaeda-promote-trusted-light-xcode-26.6 (cmux's vars.CI_FFI_RELEASE_POOL), and
+# glaeda-signing-trusted-std-xcode-26.6.
+TRUSTED_POOL_LABEL_RE = (rf"glaeda-(?:{POOL_PREFIX_RE})?trusted-(?:{'|'.join(RUNNER_CLASSES)})-xcode-{VERSION_RE}")
+
+
 def trusted_pool_matches(manifest: Any, label: str, trusted_ref: str, trusted_repo: str) -> bool:
-    """Whether `label` is a trusted pool label (glaeda-trusted-...) and every member that declares it is trusted-only
-    on exactly trusted_ref of trusted_repo: only then may a trusted runner.dedicated entry carry it."""
-    if not label.lower().startswith("glaeda-trusted-"):
+    """Whether `label` is a trusted pool label (TRUSTED_POOL_LABEL_RE: glaeda-trusted-... or a namespaced
+    glaeda-<prefix>trusted-...) and every member that declares it is trusted-only on exactly trusted_ref of
+    trusted_repo: only then may a trusted runner.dedicated entry carry it. A namespaced one counts too: on 2026-11-18
+    cmux19 alone served glaeda-promote-trusted-light-xcode-26.6 (cmux's FFI release build) and went offline, and no
+    second host could carry the label without converting its whole PR pool into a promote pool."""
+    if not re.fullmatch(TRUSTED_POOL_LABEL_RE, label.lower()):
         return False
     members = declared_pools(manifest).get(label) or declared_pools(manifest).get(label.lower()) or []
     if not members:

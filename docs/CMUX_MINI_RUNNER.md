@@ -1487,7 +1487,8 @@ A runner.dedicated entry may declare `trustedRef` and `trustedRepo` (together; `
 `repo`, never an org). glaeda-cmux-runner then gives the job-started hook `--trusted-ref`/`--trusted-repo` for that
 runner even on a member that is not trusted-only, so the hook takes only that repository's push and schedule jobs on
 that branch, never PR code. Such an entry, and only such an entry, may carry a trusted pool label
-(`glaeda-trusted-...`) when every member that declares that pool is trusted-only on the same ref and repository; any
+(`glaeda-trusted-...`, or a `runner.poolPrefix` namespace's `glaeda-<prefix>trusted-...` such as
+`glaeda-promote-trusted-light-xcode-26.6`) when every member that declares that pool is trusted-only on the same ref and repository; any
 other pool label stays refused. Its admit runs `glaeda-nightly-only-admit --trusted-ref REF --trusted-repo REPO`,
 which admits what the hook's `trusted_refusal` admits, and of that only nightly.yml and the trusted seed
 (seed-derived-data.yml), so a host dedicated to the nightly runs no other main push or schedule job there; it still

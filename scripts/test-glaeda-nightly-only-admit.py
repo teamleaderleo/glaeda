@@ -13,6 +13,7 @@ import io
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -598,6 +599,32 @@ class TrustedDedicatedTest(unittest.TestCase):
                                          "hardware": "m4pro-48"}
                 _, why = labels.dedicated_runners(doc, "m")
                 self.assertIn("pool labels", why or "")
+
+    def test_a_namespaced_trusted_pool_label_of_the_same_trust(self):
+        # cmux19 alone served glaeda-promote-trusted-light-xcode-26.6 (poolPrefix promote-, feat-cmux-next) on
+        # 2026-11-18; a second host carries it as a trusted dedicated entry of the same trust, never another trust
+        promote = "glaeda-promote-trusted-light-xcode-26.6"
+        ref = "refs/heads/feat-cmux-next"
+        entry = dict(TRUSTED, name="promote-ffi", trustedRef=ref, labels=[promote, "glaeda-runner-m-promote-ffi"])
+
+        def doc_with(pool_ref, pool_repo=REPO):
+            doc = two_hosts(entry, ref)
+            doc["hosts"]["p"] = {"class": "light", "availability": "dedicated", "roles": ["ci-runner"],
+                                 "hardware": "m6-16", "overrides": {"runner": {
+                                     "poolPrefix": "promote-", "trustedRef": pool_ref, "trustedRepo": pool_repo}}}
+            return doc
+        self.assertIn(promote, labels.declared_pools(doc_with(ref)))
+        entries, why = labels.dedicated_runners(doc_with(ref), "m")
+        self.assertIsNone(why)
+        self.assertEqual(next(e for e in entries if e["name"] == "promote-ffi")["labels"][0], promote)
+        for pool_ref, pool_repo in (("refs/heads/main", REPO), (ref, "other/repo")):
+            with self.subTest(pool_ref=pool_ref, pool_repo=pool_repo):
+                _, why = labels.dedicated_runners(doc_with(pool_ref, pool_repo), "m")
+                self.assertIn("pool labels", why or "")
+        for label in ("glaeda-promote-side-trusted-light-xcode-26.6", "glaeda-promote-light-xcode-26.6",
+                      "glaeda-trusted-next-nightly"):
+            with self.subTest(label=label):
+                self.assertIsNone(re.fullmatch(labels.TRUSTED_POOL_LABEL_RE, label))
 
     def test_trust_needs_both_fields_and_a_repo_scope(self):
         for bad in ({k: v for k, v in TRUSTED.items() if k != "trustedRepo"},
