@@ -5283,6 +5283,44 @@ class Daemon:
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
 
+    def outbox_actor(self, item: dict) -> dict | None:
+        """Pick the installed writer on the same host as the login. No token goes in the outbox."""
+        op = {"pr": "create", "comment": "comment"}.get(item.get("kind"))
+        if (not op or self.upstream() is not None or item.get("status") or item.get("delivered") or item.get("reviewers") or
+                os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+            return None
+        if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
+                re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
+            return None
+        role = "lander" if op == "create" else "review"
+        saved = item.get("appWriter")
+        if saved is None and (item.get("uncertain") or item.get("attempts")):
+            return None  # the first send was already attempted by the login
+        if saved not in (None, role):
+            return None
+        state = latch_state_dir()
+        def held(identity):
+            doc = read_json(state / ("rest-exhausted" + identity + ".json")) or {}
+            until = doc.get("until") if isinstance(doc, dict) else None
+            return doc if isinstance(until, (int, float)) and until > self.clock() and not doc.get("share") and \
+                doc.get("counter") in (None, "core") else {}
+        if not saved and held("").get("source") not in ("x-ratelimit-reset", "said"):
+            return None
+        if held("@app-" + role):
+            return None
+        tool = app_pool_tool()
+        if not tool:
+            return None
+        try:
+            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
+            actor = json.loads(result.stdout) if not result.returncode else None
+            if isinstance(actor, dict) and actor.get("role") == role and isinstance(actor.get("note"), str) and \
+                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(actor.get("token", ""))):
+                return actor
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        return None
+
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Oldest first; a write waiting out its own retry is skipped."""
@@ -5302,14 +5340,17 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
-            if self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
-                continue  # REST's hour is spent (rest_out): it waits for the reset; a comment behind it goes over GraphQL
             if self.now < self.content_pause_until() or self.content_pause_unknown():
-                return  # the login's create pause (or no word of it): every write waits, in order, none dropped
+                return  # shared content/secondary cooldown also holds an App-authored write
+            actor = self.outbox_actor(item)
+            if item.get("appWriter") and not actor and not item.get("delivered"):
+                continue  # never replay an App-authored POST with the login
+            if not actor and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
+                continue
             self.writing = True
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
-                    self.post_one(path, item)
+                    self.post_one(path, item, actor)
             except OutOfTime:
                 pass
             except Exception as error:  # noqa: BLE001  a malformed entry (a key missing, an unknown kind) fails alone
@@ -5521,7 +5562,7 @@ class Daemon:
             # the secondary limit, not the hourly one: the pause is the login's, so report it where every writer reads
             self.report_content_pause(self.post_hold, str(item.get("kind") or "write"))
 
-    def post_one(self, path: Path, item: dict) -> None:
+    def post_one(self, path: Path, item: dict, actor: dict | None = None) -> None:
         if item.get("delivered"):
             self.post_delivered(path, item)
             return
@@ -5538,17 +5579,33 @@ class Daemon:
                 return
         # a look that answered "not there": nothing landed, so a join may still be undone; it is resent over REST
         resend = bool(item.pop("uncertain", False))
-        if item["kind"] == "comment" and not item.get("group"):
+        if not actor and item["kind"] == "comment" and not item.get("group"):
             self.post_join(path, item)
         elif item.get("group") and not item.get("delivered") \
                 and self.thread_watched(str(item["repo"]), item["number"]):
             self.post_unjoin(path, item)  # a wait began watching the thread since the join: each goes out alone
-        if item["kind"] == "comment" and not resend and self.post_over_graphql(item):
+        if not actor and item["kind"] == "comment" and not resend and self.post_over_graphql(item):
             return self.post_comment_graphql(path, item)
         method, api, body = post_request(item)
+        if actor:
+            item["appWriter"] = actor["role"]  # persist the author before the POST; never its credential
+            if item["kind"] == "pr":
+                body["body"] = actor["note"] + "\n\n" + body["body"]
         write_json(path, {**item, "uncertain": True})  # a daemon that dies mid-request looks it up first
         try:
-            status, h, doc = self.request(method, api, body, content=True)
+            if actor:
+                if time.monotonic() >= self.tick_deadline or not self.secondary_admit("rest", 1):
+                    raise OutOfTime
+                headers = {"Authorization": "Bearer " + actor["token"], "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json", "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+                status, h, raw = self.transport(method, API + api, headers, json.dumps(body).encode())
+                self.sent.append((self.now, "app"))
+                try:
+                    doc = json.loads(raw) if raw else None
+                except ValueError:
+                    raise WatchError("App write returned an unreadable response") from None
+            else:
+                status, h, doc = self.request(method, api, body, content=True)
         except WatchError as error:
             self.post_at = self.now
             self.post_retry(path, item, describe(error), uncertain=True)
@@ -5566,7 +5623,11 @@ class Daemon:
             if item["kind"] == "comment":
                 self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
-        elif self.rest_out(status, h, text):
+        elif actor and status in (403, 429) and h.get("x-ratelimit-remaining") == "0" and not h.get("retry-after") and not THROTTLED.search(text):
+            reset = str(h.get("x-ratelimit-reset", ""))
+            item["notBefore"] = max(self.now + POST_SPACING, min(self.now + PACE_HOLD_MAX, int(reset)) if reset.isdigit() else 0)
+            write_json(path, item)  # only the App is out; other outbox items keep their turn
+        elif not actor and self.rest_out(status, h, text):
             write_json(path, item)  # nothing was written: GraphQL posts it if it can, else it waits for REST's reset
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):

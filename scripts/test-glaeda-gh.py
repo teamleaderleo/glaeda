@@ -12785,6 +12785,35 @@ class PostTest(unittest.TestCase):
         self.assertNotIn("body", state)
         self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
 
+    def test_latched_outbox_uses_installed_writer_and_keeps_login_budget(self):
+        item = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/proof", "--base", "main",
+                          "--title", "test", "--body", "original footer")
+        d, transport = self.daemon((201, {}, {"number": 7, "html_url": "https://github.com/teamleaderleo/glaeda/pull/7"}))
+        d.backoff["rest"] = NOW + 3600
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        token = "ghs_" + "x" * 40
+        def send(method, url, headers, body):
+            self.assertEqual(headers["Authorization"], "Bearer " + token)
+            self.assertEqual(gg.read_json(path)["appWriter"], "lander")
+            self.assertNotIn(token, path.read_text())
+            return transport(method, url, headers, body)
+        d.transport = send
+        with mock.patch.object(d, "outbox_actor", return_value={"role":"lander", "token": token, "note":"Authorship: lander App"}):
+            self.step(d, NOW)
+        self.assertEqual(transport.calls[0][2]["body"], "Authorship: lander App\n\noriginal footer")
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(d.rest_spent(), 0)
+
+    def test_unavailable_saved_comment_actor_keeps_queue_without_login_replay(self):
+        item = self.queue("comment", "teamleaderleo/glaeda#42", "--body", "progress")
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        gg.write_json(path, {**item, "appWriter":"review", "uncertain": True})
+        d, t = self.daemon()
+        with mock.patch.object(d, "outbox_actor", return_value=None):
+            self.step(d, NOW)
+        self.assertEqual(t.calls, [])
+        self.assertTrue(gg.read_json(path)["uncertain"])
+
     def test_the_outbox_is_not_held_or_counted_at_the_rest_share(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "landed")
         d, t = self.daemon((201, {}, {"html_url": "u"}))
