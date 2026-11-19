@@ -46,6 +46,8 @@ MAX_CPUS = 8
 MAX_MEMORY_GIB = 16
 DISK_GIB = 100
 MIN_FREE_GIB = 30
+CREATE_TIMEOUT = 300
+GUEST_TRIES = 36
 REPO = pathlib.Path(__file__).resolve().parents[1]
 TEMPLATE_YAML = REPO / "examples" / "lima" / "glaeda-personal.yaml"
 
@@ -76,6 +78,7 @@ class Personal(base.Installer):
         self.plist_path = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         self.wrapper_path = self.home / ".local" / "bin" / "glaeda-linux"
         self.uid = os.getuid() if uid is None else uid
+        self.start_timeout: float = base.CREATE_TIMEOUT
         self.launchctl = launchctl or (lambda argv: self.run(["/bin/launchctl", *argv], 30))
 
     def personal_template(self) -> dict[str, Any]:
@@ -151,8 +154,8 @@ class Personal(base.Installer):
         if not template["path"].exists():
             plan.append("materialize_template")
         if item is None:
-            plan.append("create_start")
-        elif item.get("status") == "Stopped":
+            plan.append("create")
+        if (item or {}).get("status") != "Running":
             plan.append("start")
         if not self.plist_path.exists() or self.plist_path.read_bytes() != self.plist_bytes():
             plan.append("login_item")
@@ -176,35 +179,45 @@ class Personal(base.Installer):
         self.lima_home.mkdir(mode=0o700, exist_ok=True)
         self.materialize_template(template)
         if item is None:
+            # `limactl create` only writes the instance; the image download and first boot happen in `start`, which
+            # launchd runs below, so a dropped SSH or relay session (which kills its process group) cannot cut it off.
             self.write_receipt({"created_by": SCHEMA, "instance": INSTANCE, "state": "create_started",
                                 "template_digest": template["digest"], "sizing": size, "created_at": now()})
-            started = time.monotonic()
-            result = self.lima("start", "--name", INSTANCE, f"--cpus={size['cpus']}",
-                               f"--memory={size['memory_gib']}", f"--disk={size['disk_gib']}",
-                               f"--timeout={base.CREATE_TIMEOUT // 60}m", str(template["path"]),
-                               timeout=base.CREATE_TIMEOUT + 120)
-            out["create_s"] = round(time.monotonic() - started, 1)
+            result = self.lima("create", "--name", INSTANCE, f"--cpus={size['cpus']}", f"--memory={size['memory_gib']}",
+                               f"--disk={size['disk_gib']}", str(template["path"]), timeout=CREATE_TIMEOUT)
             if result.returncode != 0:
-                raise Failed(f"limactl start --name {INSTANCE} failed: {tail(result.stderr)}")
-            self.actions.append({"action": "create_start", "instance": INSTANCE})
+                raise Failed(f"limactl create --name {INSTANCE} failed: {tail(result.stderr)}")
+            self.actions.append({"action": "create", "instance": INSTANCE})
             self.write_receipt({"created_by": SCHEMA, "instance": INSTANCE, "state": "created",
                                 "template_digest": template["digest"], "sizing": size,
                                 "created_at": base.receipt_created(self.receipt())})
-        elif "start" in plan:
-            self.start_existing(INSTANCE)
+        target = f"gui/{self.uid}"
         if self.write_if_changed(self.plist_path, self.plist_bytes(), 0o644, "login_item"):
-            target = f"gui/{self.uid}"
             self.launchctl(["bootout", f"{target}/{LABEL}"])  # absent the first time; its failure is expected
             result = self.launchctl(["bootstrap", target, str(self.plist_path)])
             if result.returncode != 0:
                 raise Failed(f"launchctl bootstrap {target} {self.plist_path} failed: {tail(result.stderr)}")
         self.write_if_changed(self.wrapper_path, self.wrapper_bytes(), 0o755, "wrapper")
+        if "start" in plan:
+            started = time.monotonic()
+            result = self.launchctl(["kickstart", f"{target}/{LABEL}"])  # a no-op when RunAtLoad already started it
+            if result.returncode != 0:
+                raise Failed(f"launchctl kickstart {target}/{LABEL} failed: {tail(result.stderr)}")
+            self.actions.append({"action": "start", "instance": INSTANCE, "by": "launchd"})
+            try:
+                self.wait_status(INSTANCE, "Running", self.start_timeout)
+            except Failed as error:
+                log = self.root / "personal-start.log"
+                raise Failed(f"{error}; launchd's limactl start log: {tail(log.read_text(errors='replace')) if log.exists() else 'none'}") from None
+            out["start_s"] = round(time.monotonic() - started, 1)
 
-        final = self.instances().get(INSTANCE, {})
-        out["status"] = final.get("status")
-        if out["status"] != "Running":
-            raise Failed(f"{INSTANCE} ended {out['status']!r}, want 'Running'")
+        out["status"] = self.instances().get(INSTANCE, {}).get("status")
         probe = self.guest(INSTANCE, "/usr/bin/uname", "-m")
+        for _ in range(GUEST_TRIES - 1):  # Lima lists Running before the guest's sshd answers
+            if probe.returncode == 0:
+                break
+            self.sleep(5)
+            probe = self.guest(INSTANCE, "/usr/bin/uname", "-m")
         out["guest_arch"] = probe.stdout.strip()
         if probe.returncode != 0 or out["guest_arch"] != "aarch64":
             raise Failed(f"{INSTANCE} does not answer a shell: {tail(probe.stderr or probe.stdout)}")

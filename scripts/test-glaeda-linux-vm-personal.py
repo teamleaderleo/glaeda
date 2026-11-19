@@ -29,6 +29,21 @@ personal = load("glaeda_linux_vm_personal", ROOT / "scripts" / "glaeda-linux-vm-
 base = personal.base
 
 
+class FakeLima(fixtures.FakeLima):
+    """The base fake plus `limactl create`, which writes the instance and leaves it Stopped like the real one."""
+
+    def __call__(self, argv, *, env, timeout):
+        if argv[1:3] == ["--tty=false", "create"]:
+            self.calls.append(list(argv))
+            self.envs.append(dict(env))
+            name, home = argv[4], pathlib.Path(env["LIMA_HOME"])
+            (home / name).mkdir(parents=True)
+            (home / name / "lima.yaml").write_bytes(pathlib.Path(argv[-1]).read_bytes())
+            self.status[name] = "Stopped"
+            return fixtures.ok()
+        return super().__call__(argv, env=env, timeout=timeout)
+
+
 class PersonalTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -36,7 +51,8 @@ class PersonalTests(unittest.TestCase):
         self.root, self.home = tmp / "linux-vm", tmp / "home"
         self.archive = fixtures.lima_archive()
         self.downloads = 0
-        self.fake = fixtures.FakeLima(self.root)
+        self.fake = FakeLima(self.root)
+        self.boots = True
         self.launchctl_calls: list[list[str]] = []
         self._pin = (base.LIMA_BYTES, base.LIMA_SHA256)
         base.LIMA_BYTES, base.LIMA_SHA256 = len(self.archive), hashlib.sha256(self.archive).hexdigest()
@@ -50,16 +66,21 @@ class PersonalTests(unittest.TestCase):
         dest.write_bytes(self.archive)
 
     def launchctl(self, argv):
+        """launchd: loading the RunAtLoad job or kickstarting it runs `limactl start linux` outside any session."""
         self.launchctl_calls.append(argv)
-        return fixtures.ok("", 0 if argv[0] == "bootstrap" else 3)
+        if argv[0] in ("bootstrap", "kickstart") and "linux" in self.fake.status and self.boots:
+            self.fake.status["linux"] = "Running"
+        return fixtures.ok("", 3 if argv[0] == "bootout" else 0)
 
     def make(self, host=None):
-        return personal.Personal(root=self.root, home=self.home, uid=501, launchctl=self.launchctl, runner=self.fake,
+        made = personal.Personal(root=self.root, home=self.home, uid=501, launchctl=self.launchctl, runner=self.fake,
                                  download=self.download, host=host or fixtures.HOST, sleep=lambda s: None)
+        made.start_timeout = 0
+        return made
 
     def test_plan_has_no_side_effects(self):
         out = self.make().execute(apply=False)
-        self.assertEqual(out["plan"], ["install_lima", "materialize_template", "create_start", "login_item", "wrapper"])
+        self.assertEqual(out["plan"], ["install_lima", "materialize_template", "create", "start", "login_item", "wrapper"])
         self.assertEqual(out["sizing"], {"cpus": 7, "memory_gib": 12, "disk_gib": 100})
         self.assertFalse(self.root.exists())
         self.assertFalse(self.home.exists())
@@ -74,9 +95,12 @@ class PersonalTests(unittest.TestCase):
         self.assertEqual(out["disposition"], "changed")
         self.assertEqual(out["status"], "Running")
         self.assertEqual(out["guest_arch"], "aarch64")
-        create = [c for c in self.fake.calls if c[2:4] == ["start", "--name"]]
+        create = [c for c in self.fake.calls if c[2:3] == ["create"]]
         self.assertEqual(len(create), 1)
         self.assertEqual(create[0][3:8], ["--name", "linux", "--cpus=7", "--memory=12", "--disk=100"])
+        # The VM is booted by launchd, never by a `limactl start` in this process.
+        self.assertFalse([c for c in self.fake.calls if c[2:3] == ["start"]])
+        self.assertEqual(self.launchctl_calls[-1], ["kickstart", "gui/501/com.glaeda.linux-vm"])
         self.assertEqual(pathlib.Path(create[0][-1]).read_bytes(), personal.TEMPLATE_YAML.read_bytes())
         self.assertTrue(all(env["LIMA_HOME"] == str(self.root / "personal-home") for env in self.fake.envs))
         plist = plistlib.loads((self.home / "Library/LaunchAgents/com.glaeda.linux-vm.plist").read_bytes())
@@ -84,7 +108,7 @@ class PersonalTests(unittest.TestCase):
         self.assertEqual(plist["EnvironmentVariables"]["LIMA_HOME"], str(self.root / "personal-home"))
         self.assertTrue(plist["RunAtLoad"])
         self.assertNotIn("KeepAlive", plist)
-        self.assertEqual(self.launchctl_calls[-1], ["bootstrap", "gui/501", str(self.home / "Library/LaunchAgents/com.glaeda.linux-vm.plist")])
+        self.assertIn(["bootstrap", "gui/501", str(self.home / "Library/LaunchAgents/com.glaeda.linux-vm.plist")], self.launchctl_calls)
         wrapper = self.home / ".local/bin/glaeda-linux"
         self.assertEqual(wrapper.stat().st_mode & 0o777, 0o755)
         self.assertIn(f"LIMA_HOME='{self.root / 'personal-home'}'", wrapper.read_text())
@@ -104,6 +128,25 @@ class PersonalTests(unittest.TestCase):
         out = self.make().execute(apply=True)
         self.assertEqual(out["plan"], ["start"])
         self.assertEqual(out["status"], "Running")
+        self.assertEqual(self.launchctl_calls[-1], ["kickstart", "gui/501/com.glaeda.linux-vm"])
+
+    def test_create_cut_off_before_boot_is_finished_by_a_rerun(self):
+        self.boots = False  # the first run's session died: the instance exists, never booted
+        with self.assertRaises(base.Failed):
+            self.make().execute(apply=True)
+        self.assertEqual(self.fake.status["linux"], "Stopped")
+        self.boots = True
+        out = self.make().execute(apply=True)
+        self.assertEqual(out["plan"], ["start"])
+        self.assertEqual(out["status"], "Running")
+        self.assertEqual(len([c for c in self.fake.calls if c[2:3] == ["create"]]), 1)
+
+    def test_guest_shell_is_retried_while_sshd_comes_up(self):
+        answers = iter([fixtures.ok("", 255, "connection refused")] * 3)
+        guest = self.fake.guest
+        self.fake.guest = lambda argv: next(answers, None) or guest(argv)
+        out = self.make().execute(apply=True)
+        self.assertEqual(out["guest_arch"], "aarch64")
 
     def test_foreign_instance_is_left_alone(self):
         self.make().execute(apply=True)
