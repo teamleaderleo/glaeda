@@ -224,7 +224,7 @@ let the gate hold the line.
 | `personal_worker_tick` | `all` | binary | 6 |
 | `personal_worker_verification_plan` | `target_os="linux"` | none | 0 |
 | `plan` | `all` | binary | 1 |
-| `process` | `all` | binary | 75 |
+| `process` | `all` | binary | 77 |
 | `production_recovery_adapter` | `all` | none | 0 |
 | `project_catalog` | `all` | binary | 35 |
 | `project_checkout_observation` | `unix` | binary | 14 |

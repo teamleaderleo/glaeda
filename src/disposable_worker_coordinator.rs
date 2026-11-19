@@ -23,6 +23,7 @@ use crate::disposable_clone_runtime::{
     DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, admission_seal,
 };
 use crate::disposable_host_storage::{DisposableHostStorageSource, HOST_STORAGE_UNAVAILABLE_CODE};
+use crate::disposable_host_yield::{DisposableHostYieldSource, HostYieldReason, NoHostYield};
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
@@ -90,6 +91,8 @@ impl DisposableWorkerServiceBridge for ScaleSetBridgeClient {
 pub(crate) enum DisposableWorkerCoordinatorDisposition {
     Idle,
     HostStorageUnavailable,
+    /// The Mac's own work holds new workers off; zero capacity was advertised.
+    HostYielding(HostYieldReason),
     TemplateAdvanced(DisposableTemplateRuntimeDisposition),
     DeliverySettled {
         acquired: usize,
@@ -134,6 +137,7 @@ pub(crate) struct DisposableWorkerCoordinator {
     state_root: PathBuf,
     policy: ScaleSetDeliveryConsumerPolicy,
     host_storage: Box<dyn DisposableHostStorageSource>,
+    host_yield: Box<dyn DisposableHostYieldSource>,
 }
 
 impl DisposableWorkerCoordinator {
@@ -146,7 +150,18 @@ impl DisposableWorkerCoordinator {
             state_root: state_root.into(),
             policy,
             host_storage,
+            host_yield: Box::new(NoHostYield),
         }
+    }
+
+    /// Advertise zero capacity while the host's own work holds new workers off. A worker that
+    /// already has its job keeps it.
+    pub(crate) fn with_host_yield(
+        mut self,
+        host_yield: Box<dyn DisposableHostYieldSource>,
+    ) -> Self {
+        self.host_yield = host_yield;
+        self
     }
 
     #[cfg(test)]
@@ -256,16 +271,21 @@ impl DisposableWorkerCoordinator {
                 )
             });
         if !operation_owns_live_poll {
-            // The host-yield veto (#2203) plugs in here as the fourth term of new capacity:
-            // `self.host_yield.host_yield().is_some()`, asked while a slot is free
-            // (`catalog.active().len() < max_workers`), which on a one-worker host is exactly
-            // while no attempt is active. Until it lands, no host yields.
-            let host_yields = false;
+            // The host is asked only while a slot is free: on a one-worker host that is exactly
+            // while no attempt is active. While it yields, no new worker is admitted; attempts
+            // that already hold a job keep it.
+            let has_free_slot =
+                catalog.active().len() < usize::from(self.policy.host_budget().max_workers());
+            let host_yield = if has_free_slot {
+                self.host_yield.host_yield()
+            } else {
+                None
+            };
             let available_capacity = advertised_capacity(
                 &catalog,
                 &self.policy,
                 self.host_storage.as_ref(),
-                host_yields,
+                host_yield.is_some(),
             );
             let observed_at = clock
                 .epoch_millis()
@@ -300,6 +320,11 @@ impl DisposableWorkerCoordinator {
                 ScaleSetDeliveryControllerDisposition::Idle => {}
             }
 
+            if let Some(reason) = host_yield
+                && catalog.active().is_empty()
+            {
+                return Ok(DisposableWorkerCoordinatorDisposition::HostYielding(reason));
+            }
             if catalog.active().is_empty() && available_capacity == 0 {
                 return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
             }

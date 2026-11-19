@@ -2752,6 +2752,79 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_advertises_zero_capacity_while_the_host_yields() {
+        struct FixedHostYield(Option<crate::disposable_host_yield::HostYieldReason>);
+
+        impl crate::disposable_host_yield::DisposableHostYieldSource for FixedHostYield {
+            fn host_yield(&self) -> Option<crate::disposable_host_yield::HostYieldReason> {
+                self.0
+            }
+        }
+
+        let root = TempRoot::new("coordinator-host-yield");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-coordinator-host-yield",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let runner_runtime = runner_runtime(&host);
+        let executor = executor(&host, false);
+        install_ready_generation(&root, &host, &clone_runtime);
+        let prepared = current_disposable_prepared_template().unwrap();
+        let policy = ScaleSetDeliveryConsumerPolicy::new(
+            7,
+            "repo",
+            "owner",
+            &["self-hosted".to_owned()],
+            DisposableWorkerResources::new(4_000, 8 * GIB, TARGET_DISK).unwrap(),
+            &prepared,
+        )
+        .unwrap();
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        DisposableAttemptCatalog::new(store).initialize().unwrap();
+        let mut bridge = FakeCoordinatorBridge {
+            runner: None,
+            capacities: Vec::new(),
+            polls: std::collections::VecDeque::new(),
+            acknowledged: Vec::new(),
+        };
+
+        let nightly = crate::disposable_host_yield::HostYieldReason::NightlyJobRunning { jobs: 1 };
+        let yielding = DisposableWorkerCoordinator::new_for_test(root.path(), policy.clone())
+            .with_host_yield(Box::new(FixedHostYield(Some(nightly))));
+        assert_eq!(
+            yielding
+                .supervise_with_bridge(
+                    &mut bridge,
+                    &clone_runtime,
+                    &runner_runtime,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableWorkerCoordinatorDisposition::HostYielding(nightly)
+        );
+        assert_eq!(bridge.capacities, [0]);
+
+        let free = DisposableWorkerCoordinator::new_for_test(root.path(), policy)
+            .with_host_yield(Box::new(FixedHostYield(None)));
+        assert_eq!(
+            free.supervise_with_bridge(
+                &mut bridge,
+                &clone_runtime,
+                &runner_runtime,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap(),
+            DisposableWorkerCoordinatorDisposition::Idle
+        );
+        assert_eq!(bridge.capacities, [0, 1]);
+    }
+
+    #[test]
     fn runner_transaction_checkpoints_jit_registration_and_start_before_one_command() {
         let root = TempRoot::new("runner-transaction");
         let host = LimaHostIdentityFixture::new_with_disk_bytes(

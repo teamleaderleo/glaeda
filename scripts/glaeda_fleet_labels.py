@@ -353,8 +353,8 @@ def listener_count(cpus: int, memory_gib: int | None, reserve_cores: int = 0, di
     with a disk shape, also at most disk_listeners(disk)."""
     by_cores = max(1, (cpus - reserve_cores) // LISTENER_MIN_JOB_CORES)
     if memory_gib:
-        floor = max(4, memory_gib // 8)  # the hook's mem_floor_mib, in GiB
-        by_cores = min(by_cores, max(1, (memory_gib - floor) // LISTENER_MIN_JOB_GIB))
+        floor = max(1.0, memory_gib / 10)  # the hook's mem_floor_mib, in GiB (a tenth of the RAM: admit to 90%)
+        by_cores = min(by_cores, max(1, int((memory_gib - floor) // LISTENER_MIN_JOB_GIB)))
     if disk is not None:
         by_cores = min(by_cores, disk_listeners(disk))
     return min(MAX_RUNNERS, by_cores)
