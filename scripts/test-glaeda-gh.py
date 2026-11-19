@@ -5051,7 +5051,7 @@ class ClientTest(Base):
     def test_until_done_waits_for_checks_still_running_past_the_first_100(self) -> None:
         """manaflow-ai/cmux#43515 at f35486bc, 2026-11-15: 247 contexts; an excused "cmux-next CI guard group" red at
         position 95 made GitHub's rollup FAILURE, and every web / react-apps-check shard (positions 168-179) was still
-        running past the first page. `wait pr --until done` read "0 pending" and exited 1 in 23 s, while merge_hold
+        running past the first page. `wait pr --until done` read "0 pending" and exited 1 in 23 s, while land_judge
         refused [webview] on exactly those shards and printed that wait as its next step. The rollup's counts over
         every page say they still run: --until done waits for them."""
         shown = [check_run(f"c{i}") for i in range(99)] + [check_run("cmux-next CI guard group", conclusion="FAILURE")]
@@ -15410,15 +15410,15 @@ class ReaderTest(Base):
         self.assertEqual(self.reader_in({**session, "CMUX_AGENT_NAME": "lane-3"}), "session:claude-sr2-coord:agent:lane-3")
         self.assertEqual(self.reader_in({**sub, "GLAEDA_GH_AGENT": "a b"}, "/x"), "session:claude-sr2-coord:agent:helper")
         self.assertEqual(self.reader_in({"CLAUDE_CODE_SESSION_ID": "fbe26a19"}), "session:fbe26a19")
-        self.assertEqual(self.reader_in({**session, "GLAEDA_GH_READER": "tool:merge_hold.py"}), "tool:merge_hold.py")
+        self.assertEqual(self.reader_in({**session, "GLAEDA_GH_READER": "tool:land-judge"}), "tool:land-judge")
 
     def test_register_and_a_cached_read_add_their_reader_once(self) -> None:
         gg._reader = "session:a"
         gg.register("pr:o/r#1")
         self.assertEqual(list(self.readers("pr:o/r#1")), ["session:a"])
-        gg._reader = "tool:merge_hold.py"
+        gg._reader = "tool:land-judge"
         gg.touch_interest("pr:o/r#1")
-        self.assertEqual(sorted(self.readers("pr:o/r#1")), ["session:a", "tool:merge_hold.py"])
+        self.assertEqual(sorted(self.readers("pr:o/r#1")), ["session:a", "tool:land-judge"])
         path = gg.watch_dir() / gg.file_name("pr:o/r#1")
         before = path.read_text()
         gg.touch_interest("pr:o/r#1")  # the latest reader, named within READER_REFRESH: the file is not rewritten
@@ -17483,7 +17483,7 @@ class ScarceWaitedFirstTest(Base):
 class LandSnapshotTest(Base):
     """glaeda-gh land reads check state from the daemon's PR read, not a read per queued PR (cosmic-gray, 2026-11-17:
     session glaeda-land was the shared login's top caller, 606 REST in an hour, mostly `commits/SHA/check-runs` reads
-    merge_hold explain made for each queued PR at each judgment). For each PR the land queue holds, a full read keeps
+    land_judge explain made for each queued PR at each judgment). For each PR the land queue holds, a full read keeps
     the head's raw rollup (ROLLUP_DIR); a probe that confirms it keeps it; only a new head or fingerprint reads again."""
 
     N = 10
@@ -17539,7 +17539,7 @@ class LandSnapshotTest(Base):
             snap, cache = gg.read_rollup(key), gg.read_cache(key)
             self.assertEqual((snap["head"], snap["fp"], snap["complete"]), ("a" * 40, cache["fp"], True))
             check, status_node = snap["rollup"]["nodes"]
-            # the fields merge_hold's HEAD_REDS_QUERY reads, as GitHub gave them
+            # the fields land_judge's HEAD_REDS_QUERY reads, as GitHub gave them
             self.assertEqual((check["databaseId"], check["checkSuite"]["databaseId"],
                               check["checkSuite"]["workflowRun"]["event"]), (10 * n, n, "pull_request"))
             self.assertEqual(status_node["description"], "queued")
@@ -17586,7 +17586,7 @@ class LandSnapshotTest(Base):
     def test_a_pr_whose_judgment_waits_for_its_snapshot_is_read_ahead_of_the_deferred_backlog(self) -> None:
         # huge-blue, 2026-11-17: 245 land PRs and 434 watches on a lean daemon, PR data 20 to 77 min old; 1159 of the
         # day's judgments waited the 120 s for a snapshot that the nudge never brought ahead of the backlog, then ran
-        # merge_hold live (land counts: snapshot 17, live 512)
+        # land_judge live (land counts: snapshot 17, live 512)
         self.cycle(0)
         self.gh.prs[("o", "r", 10)]["headRefOid"] = "b" * 40  # a new head: its snapshot is stale, the read is a full one
         keys = [f"pr:o/r#{n}" for n in range(1, self.N)]
@@ -19383,7 +19383,7 @@ class LogScanTest(Base):
         self.assertEqual(self.rest_calls, 1)  # the finished log was kept
 
 
-# ---------------------------------------------------------------- land: the queue that takes merge_hold's next steps
+# ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
 
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
@@ -19397,7 +19397,7 @@ def land_pr(head: str, state: str = "OPEN", checks: list | None = None) -> dict:
 
 
 def refusal(code: str, head: str, action: dict | None, nxt: str = "", reason: str = "") -> tuple[int, dict]:
-    doc = {"ok": False, "code": code, "reason": reason or f"merge-hold: refused: {code}", "next": nxt, "head": head,
+    doc = {"ok": False, "code": code, "reason": reason or f"land-judge: refused: {code}", "next": nxt, "head": head,
            "repo": "o/r", "number": "1"}
     if action is not None:
         doc["action"] = {"v": 1, "repo": "o/r", "number": 1, "head": head, **action}
@@ -19413,7 +19413,7 @@ def ok_answer(head: str, action: bool = True) -> tuple[int, dict]:
 
 
 class LandWorld:
-    """The fakes a LandQueue runs against: the daemon's cache, merge_hold explain, the gh shim, acpmux."""
+    """The fakes a LandQueue runs against: the daemon's cache, land_judge explain, the gh shim, acpmux."""
 
     def __init__(self, tmp: str) -> None:
         self.cache: dict[str, dict] = {}
@@ -19435,11 +19435,11 @@ class LandWorld:
         self.gh.parent.mkdir(parents=True, exist_ok=True)
         self.gh.write_text("#!/bin/sh\nexit 99\n")
         self.gh.chmod(0o755)
-        # merge_hold.py must exist to be run (a missing one stops the land): a real file, never executed.
-        self.mh = os.fspath(Path(tmp) / "tools" / "merge_hold.py")
+        # land-judge must exist to be run (a missing one stops the land): a real file, never executed.
+        self.mh = os.fspath(Path(tmp) / "tools" / "land-judge")
         Path(self.mh).parent.mkdir(parents=True, exist_ok=True)
         Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
-        self.config = {"gh": os.fspath(self.gh), "mergeHold": self.mh, "acpmux": "/fake/acpmux",
+        self.config = {"gh": os.fspath(self.gh), "landJudge": self.mh, "acpmux": "/fake/acpmux",
                        "python": "/fake/python3", "routerReview": "/fake/router-review", "git": "/fake/git",
                        "laneGh": "/fake/lane-gh"}
         # A fetch step's mirror: a real (empty) directory, its origin what the fake git config answers.
@@ -19518,7 +19518,7 @@ class LandCrash(BaseException):
 
 
 class LandTest(Base):
-    """glaeda-gh land: a lane says it once, the daemon takes every machine step merge_hold names (Leo, 2026-11-16:
+    """glaeda-gh land: a lane says it once, the daemon takes every machine step land_judge names (Leo, 2026-11-16:
     "glaeda clearly needs improvement given the amount of manual work we've had to do these past days")."""
 
     KEY = "pr:o/r#1"
@@ -19527,13 +19527,13 @@ class LandTest(Base):
         super().setUp()
         self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
-        # The CLI (`glaeda-gh land`) resolves merge_hold.py from the host's land.json and defaults: pin the defaults to
+        # The CLI (`glaeda-gh land`) resolves land-judge from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
-        paths = mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),))
+        paths = mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),))
         paths.start()
         self.addCleanup(paths.stop)
-        # No ws-sync release unless a test makes one: the host's own never decides which merge_hold.py runs.
-        release = mock.patch.object(gg, "LAND_MERGE_HOLD", Path(self.tmp.name) / "no-ws-sync" / "merge_hold.py")
+        # No ws-sync release unless a test makes one: the host's own never decides which land-judge runs.
+        release = mock.patch.object(gg, "LAND_JUDGE", Path(self.tmp.name) / "no-ws-sync" / "land-judge")
         release.start()
         self.addCleanup(release.stop)
         # Not a lane VM unless a test says so: the host's own lane-gh wrapper never decides the update-branch form.
@@ -19671,7 +19671,7 @@ class LandTest(Base):
     def tip_merge(self, head: str = LA) -> tuple[int, dict]:
         return refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head},
                        nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={head}",
-                       reason="merge_hold: refused: base commit e2c89417ace1 changed goals/x.md, which this PR changes")
+                       reason="land_judge: refused: base commit e2c89417ace1 changed goals/x.md, which this PR changes")
 
     def lane_vm(self) -> None:
         self.broker = self.upstream = True
@@ -19679,7 +19679,7 @@ class LandTest(Base):
         self.q = self.queue()
 
     def test_a_merged_pr_whose_update_branch_is_refused_closed_ends_merged(self):
-        # manaflow-ai/cmuxterm-hq#13226 (2026-11-18): merged while the lane VM's copy stayed OPEN; merge_hold judged
+        # manaflow-ai/cmuxterm-hq#13226 (2026-11-18): merged while the lane VM's copy stayed OPEN; land_judge judged
         # tip_merge against its own squash merge, update-branch was refused "PR 13226 is closed" 12 times, and the
         # entry stopped on "3 identical refusals in a row" telling the requester to update a merged PR.
         self.lane_vm()
@@ -19810,10 +19810,10 @@ class LandTest(Base):
         self.assertEqual(doc["dataAt"], self.w.cache[self.KEY]["dataAt"])
         self.assert_merged_at(LA)
         merge_env = [env for argv, env in zip(self.w.calls, self.w.envs) if argv[1:3] == ["pr", "merge"]][0]
-        self.assertNotIn(gg.LAND_SNAPSHOT_ENV, merge_env)  # the shim's merge_hold reads the merge's evidence live
+        self.assertNotIn(gg.LAND_SNAPSHOT_ENV, merge_env)  # the shim's land_judge reads the merge's evidence live
         self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["snapshot"], 1)
 
-    def test_a_head_the_snapshot_lacks_waits_for_the_daemons_read_never_merge_holds(self):
+    def test_a_head_the_snapshot_lacks_waits_for_the_daemons_read_never_land_judges(self):
         self.snap_pr(LB, snap_head=LA)  # the daemon's snapshot is of the old head
         self.land()
         for _ in range(3):
@@ -20107,12 +20107,12 @@ class LandTest(Base):
         self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
         self.tick(30)
         self.assertEqual(len(self.w.explains()), 1)
-        # merge_hold's timed step: its timeout judges again, the verdict's age notwithstanding.
+        # land_judge's timed step: its timeout judges again, the verdict's age notwithstanding.
         self.w.answers.append(refusal("ws_check_missing", LA, {**wait, "timeout_s": 1800}))
         self.tick(100)
         self.assertEqual(len(self.w.explains()), 2)
 
-    def test_stale_green_from_an_old_merge_hold_uses_the_fallback_table(self):
+    def test_stale_green_from_an_old_land_judge_uses_the_fallback_table(self):
         self.pr(LA)
         self.land()
         self.w.answers.append(refusal("stale_green", LA, None, nxt="gh pr update-branch 1 --needs-newer-base"))
@@ -20243,7 +20243,7 @@ class LandTest(Base):
 
     def test_a_refusal_naming_the_broker_update_branch_takes_it(self):
         self.assertTrue(gg.LAND_STEP_NEXT_UPDATE.search(
-            f"merge-hold: refused [tip_merge]; next: gh pr update-branch 1 -R o/r --match-head-commit {LA} "
+            f"land-judge: refused [tip_merge]; next: gh pr update-branch 1 -R o/r --match-head-commit {LA} "
             "--needs-newer-base ws-check"))
 
     def test_head_moved_during_review_repins_and_merges_at_the_new_head(self):
@@ -20269,7 +20269,7 @@ class LandTest(Base):
         self.assert_merged_at(LB)
 
     def test_a_repin_to_the_head_the_cache_holds_judges_it_again_pinned(self):
-        # merge_hold's fallback for a refusal with no step of its own is judge_again(): a repin to the head it judged.
+        # land_judge's fallback for a refusal with no step of its own is judge_again(): a repin to the head it judged.
         # Taken as a stale cache, it waited LAND_HEAD_TIMEOUT for a head that never came (nudging reads all along),
         # then judged unpinned: a live read with no snapshot, the same answer, round again.
         self.snap_pr(LA, snap_head=LA)
@@ -20292,7 +20292,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.answers.append(refusal("other_code", LA, {"kind": "repin", "sha": LA}))
-        self.w.cache[self.KEY]["data"]["headRefOid"] = LB  # the cache moved on while merge_hold judged LA
+        self.w.cache[self.KEY]["data"]["headRefOid"] = LB  # the cache moved on while land_judge judged LA
         e = self.tick()
         self.assertEqual((e["wait"]["kind"], e["wait"]["before"]), ("head_change", LA))
 
@@ -20330,7 +20330,7 @@ class LandTest(Base):
     # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
     # job failed a test on a local port; a hand rerun was the step.
     RUN = 44118660533
-    OWN_RED = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: 'Native/OptChat/optchat-chief': "
+    OWN_RED = ("land_judge: refused: base_red_excuse.py exit 1 at {head}: not excused: 'Native/OptChat/optchat-chief': "
                "its log names failed test streamable_http_server_with_get_stream_events, which passed on base")
 
     def unrelated_world(self, files: list[str], red: bool = True) -> None:
@@ -20346,7 +20346,7 @@ class LandTest(Base):
                    "conclusion": state[1], "runId": self.RUN, "completedAt": at},
                   {"name": "rust workspaces", "workflow": "rust workspaces", "status": state[0],
                    "conclusion": state[1], "runId": self.RUN, "completedAt": at},
-                  # a base red merge_hold excused: another workflow, never rerun for this
+                  # a base red land_judge excused: another workflow, never rerun for this
                   {"name": "cmux-next CI guard group", "workflow": "cmux-next guards", "status": other,
                    "conclusion": "FAILURE" if other == "COMPLETED" else None, "runId": 44118660549}]
         self.w.set_pr(self.KEY, {**land_pr(LA), "checks": checks}, self.t)
@@ -20594,7 +20594,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["next"]), ("stopped", "ask Aziz"))
 
     def test_a_command_naming_a_run_wait_is_waited_then_judged_again(self):
-        """cmux#45404, 2026-11-17: merge_hold's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
+        """cmux#45404, 2026-11-17: land_judge's checks_running step was {"kind": "command", "text": "glaeda-gh wait run
         manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it (and every land queued after it). It is a
         step: land waits on that run and judges again, and a wait never counts toward the identical-refusal stop."""
         self.pr(LA)
@@ -20652,7 +20652,7 @@ class LandTest(Base):
         self.land()
         queued = refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 600},
                          nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 600",
-                         reason="merge-hold: refused: checks still running at the head: react-apps-base-check: queued")
+                         reason="land-judge: refused: checks still running at the head: react-apps-base-check: queued")
         for _ in range(5):
             self.w.answers.append(queued)
         e = self.tick()
@@ -20668,7 +20668,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         running = refusal("review_running", LA, {"kind": "wait_comment", "match": "SHIP|BLOCK", "timeout_s": 1800},
-                          reason="merge-hold: refused: a review is running at the head")
+                          reason="land-judge: refused: a review is running at the head")
         for _ in range(6):
             self.w.answers.append(running)
         e = self.tick()
@@ -20681,13 +20681,13 @@ class LandTest(Base):
         self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
 
     def test_a_cancelled_shard_rerun_never_strikes(self):
-        # cmux#46183, #46220: a cancelled shard, rerun; merge_hold then answers cancelled_rerun (a wait on the rerun)
+        # cmux#46183, #46220: a cancelled shard, rerun; land_judge then answers cancelled_rerun (a wait on the rerun)
         # until it runs, and cancelled again once more; it lands once the rerun is green.
         self.pr(LA)
         self.land()
         cancelled = refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [77]})
         rerun = refusal("cancelled_rerun", LA, {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900},
-                        reason="merge-hold: refused: a cancelled shard's rerun is waiting: test (shard 3/4)")
+                        reason="land-judge: refused: a cancelled shard's rerun is waiting: test (shard 3/4)")
         self.w.answers += [cancelled, rerun, rerun, cancelled, rerun, rerun]
         e = self.tick()
         self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "77", "--failed", "-R", "o/r"]])
@@ -20829,7 +20829,7 @@ class LandTest(Base):
 
         def train(holder: str) -> tuple[int, dict]:
             return refusal("train_wait", LA, {"kind": "retry", "after_s": 1800}, reason=(
-                "merge_hold: refused: a merge-train PR's rerun holds the base for a file this PR changes: o/r#13113 "
+                "land_judge: refused: a merge-train PR's rerun holds the base for a file this PR changes: o/r#13113 "
                 f"(label merge-train, head {holder}) lost the checked tree twice"))
 
         self.w.answers += [train("5395c374953b")] * 4 + [train("f88b029f4655")] * 5
@@ -20851,7 +20851,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("streak")), ("waiting", None))  # 4 judgments, 5403 s: no strike
         e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertIn("for a judgment merge_hold could not make, still regen_retry", e["stop"]["reason"])
+        self.assertIn("for a judgment land_judge could not make, still regen_retry", e["stop"]["reason"])
 
     def test_a_read_that_could_not_complete_never_stops_a_land_inside_its_long_bound(self):
         # 2026-11-19: cmux#46508 at 0ca8cdb6 and #46516 at fa982deb stopped retry_deadline after 3 judgments over
@@ -20861,7 +20861,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60}, reason=(
-            "merge_hold: refused: its webview verdict is not published for 0ca8cdb60000 yet, and the live read took "
+            "land_judge: refused: its webview verdict is not published for 0ca8cdb60000 yet, and the live read took "
             "over 40 s (stopped); retry in a minute; its checks could not be read: RuntimeError: timed out"))] * 16
         e = self.tick()
         waited = 0.0
@@ -20872,7 +20872,7 @@ class LandTest(Base):
         self.assertGreater(waited, 14356)  # past each stopped land's wait
         e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # the bound holds
-        self.assertIn("for a judgment merge_hold could not make, still unreadable", e["stop"]["reason"])
+        self.assertIn("for a judgment land_judge could not make, still unreadable", e["stop"]["reason"])
 
     def test_time_due_and_not_judged_never_counts_toward_a_wait_deadline(self):
         # 2026-11-19: a PR stopped retry_deadline "waited 8273 s (deadline 7200 s, 3 judgments) ... still unreadable"
@@ -21006,7 +21006,7 @@ class LandTest(Base):
         self.assert_merged_at(LA)
 
     def test_a_retry_deadline_stop_is_rearmed_once_the_checkout_turns_current(self):
-        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.stale_why = "land-judge's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
         self.stop_retry_deadline()
         self.stale_why = None
         self.w.answers.append(ok_answer(LA))
@@ -21181,7 +21181,7 @@ class LandTest(Base):
     def queued_wait(self, head: str = LA, timeout: int = 1800) -> tuple[int, dict]:
         nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
-                       nxt=nxt, reason=f"merge-hold: refused: checks still running at {head[:8]}")
+                       nxt=nxt, reason=f"land-judge: refused: checks still running at {head[:8]}")
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
@@ -21229,7 +21229,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
-        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+        self.w.gh_err["merge"] = ("land-judge: refused [checks_running]: checks still running; next: glaeda-gh wait "
                                   f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
         e = self.run_hour(lambda: ok_answer(LA), seconds=3 * gg.LAND_WAIT_DEFAULT, step=60.0)
         self.assertGreater(len(self.w.gh_calls("pr", "merge")), gg.LAND_STEP_STOP)
@@ -21288,7 +21288,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "block"))
 
     def run_hour(self, answer, seconds: float = 3600.0, step: float = 10.0) -> dict:
-        """Tick for SECONDS, every merge_hold explain answered by ANSWER(): what the loop did."""
+        """Tick for SECONDS, every land_judge explain answered by ANSWER(): what the loop did."""
         end = self.t + seconds
         e: dict = {}
         while self.t < end:
@@ -21304,7 +21304,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
-        self.w.gh_err["merge"] = "merge-hold (warn): ... it lands anyway\nGraphQL: Pull request is not mergeable"
+        self.w.gh_err["merge"] = "land-judge (warn): ... it lands anyway\nGraphQL: Pull request is not mergeable"
         e = self.run_hour(lambda: ok_answer(LA))
         merges = len(self.w.gh_calls("pr", "merge"))
         self.assertEqual((e["state"], e["stop"]["code"], merges, len(self.w.explains())),
@@ -21331,7 +21331,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
-        self.w.gh_err["merge"] = ("merge-hold: refused [tip_merge]: the base's checks have not run on this PR merged "
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: the base's checks have not run on this PR merged "
                                   f"with the tip; next: gh api -X PUT repos/o/r/pulls/1/update-branch -f "
                                   f"expected_head_sha={LA} (why: guard-why)")
         self.w.answers.append(ok_answer(LA))
@@ -21344,7 +21344,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
-        self.w.gh_err["merge"] = ("merge-hold: refused [checks_running]: checks still running; next: glaeda-gh wait "
+        self.w.gh_err["merge"] = ("land-judge: refused [checks_running]: checks still running; next: glaeda-gh wait "
                                   f"pr o/r#1 --until done --sha {LA} --timeout 900 (why: guard-why)")
         self.w.answers.append(ok_answer(LA))
         e = self.tick()
@@ -21371,7 +21371,7 @@ class LandTest(Base):
         steps = [h["at"] for h in e["history"] if h["event"] == "step"]
         self.assertEqual([round(b - a) for a, b in zip(steps, steps[1:])], [60, 120, 240, 480, 960])
 
-    UPDATE_CODES = {  # every merge_hold code whose step is the pinned update-branch (merge_hold _step), and its args
+    UPDATE_CODES = {  # every land_judge code whose step is the pinned update-branch (land_judge _step), and its args
         "tip_merge": {}, "stale_green": {}, "ws_check_stale_base": {"needs_newer_base": ["ws-check"]},
         "startup_failure": {"needs_newer_base": ["ci"]}, "red_not_excused": {"needs_newer_base": ["build"]},
     }
@@ -21801,7 +21801,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.gh_rc["merge"] = 1
-        self.w.gh_err["merge"] = "merge_hold: HOLD: a HOLD line in the PR body"
+        self.w.gh_err["merge"] = "land_judge: HOLD: a HOLD line in the PR body"
         self.w.answers.append(ok_answer(LA))
         e = self.tick()
         self.assertEqual((e["state"], self.handoffs()), ("waiting", []))
@@ -21832,7 +21832,7 @@ class LandTest(Base):
         self.assertIn("unknown tool", e["stop"]["reason"])
 
     def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
-        # On the broker host the hand-off is a plain queued land: merge_hold's teammate rule stops it there, nothing
+        # On the broker host the hand-off is a plain queued land: land_judge's teammate rule stops it there, nothing
         # is merged, and the requester the lane named is told.
         rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "after": [], "requester": "lanevm/lane",
                                       "requesterFrom": "lane-gh land_handoff", "queuedBy": "broker:lanevm",
@@ -21923,7 +21923,7 @@ class LandTest(Base):
         for env in self.w.envs:
             self.assertEqual((env["CMUX_AGENT_SESSION"], env["MAY_MERGE_PATH"], env["GLAEDA_GH_AGENT"]),
                              ("glaeda-land", "glaeda-land", "glaeda-land"))
-            self.assertEqual(env["GH_QUOTA_LANDING_READ"], "merge-hold")
+            self.assertEqual(env["GH_QUOTA_LANDING_READ"], "land-judge")
             for k in ("ACPMUX_SESSION_NAME", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "ACPMUX_SESSION_ID"):
                 self.assertNotIn(k, env)
 
@@ -22003,7 +22003,7 @@ class LandTest(Base):
         e = self.tick(gg.LAND_WAIT_DEFAULT + 1)
         self.assertEqual((len(self.w.explains()), e["state"]), (1, "stopped"))
 
-    def test_merge_hold_head_ahead_of_a_stale_cache_does_not_rejudge_every_tick(self):
+    def test_land_judge_head_ahead_of_a_stale_cache_does_not_rejudge_every_tick(self):
         self.pr(LA)
         self.land()
         self.w.answers.append(refusal("quota", LB, {"kind": "retry", "after_s": 120}))
@@ -22025,7 +22025,7 @@ class LandTest(Base):
 
     def test_quota_refusal_parks_with_zero_reads_until_the_named_reset(self):
         """gh-quota-spiral (2026-11-17): a quota refusal was judged again every ~5 min while the login was dry, each
-        judge spending merge_hold's reads (glaeda-land 549 REST / 360 GraphQL an hour on gcp-agent-lane-5)."""
+        judge spending land_judge's reads (glaeda-land 549 REST / 360 GraphQL an hour on gcp-agent-lane-5)."""
         self.pr(LA)
         self.land()
         reset = self.t + 1800
@@ -22060,7 +22060,7 @@ class LandTest(Base):
         def quota_merge(argv, timeout, env):
             if argv[1:3] == ["pr", "merge"]:
                 self.w.calls.append(list(argv))
-                return subprocess.CompletedProcess(argv, 1, "", "merge-hold: refused [quota: not judged, retry]: "
+                return subprocess.CompletedProcess(argv, 1, "", "land-judge: refused [quota: not judged, retry]: "
                                                    f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z")
             return real(argv, timeout, env)
         self.q.run = quota_merge
@@ -22071,8 +22071,8 @@ class LandTest(Base):
         self.assertGreaterEqual(e["wakeAt"], reset)
 
     def test_a_step_github_refused_for_quota_parks_and_never_counts_toward_a_stop(self):
-        # cmux#42244 (2026-11-17 19:17Z): the update-branch merge_hold named was refused by the broker for the login's
-        # quota, in the broker's words, not merge_hold's; each judgment after it counted, and it stopped
+        # cmux#42244 (2026-11-17 19:17Z): the update-branch land_judge named was refused by the broker for the login's
+        # quota, in the broker's words, not land_judge's; each judgment after it counted, and it stopped
         # "3 identical refusals in a row" on a quota that reset minutes later.
         self.pr(LA)
         self.land()
@@ -22097,7 +22097,7 @@ class LandTest(Base):
         self.assertEqual(len(refused), gg.LAND_STREAK_STOP + 2)
         self.assertNotIn("stopped", [h["event"] for h in e["history"]])
         self.assertTrue(gg.LAND_STEP_QUOTA.search("shared content-creation cooldown: every lane's creates wait"))
-        self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # merge_hold's reason: unchanged
+        self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # land_judge's reason: unchanged
 
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
@@ -22118,8 +22118,8 @@ class LandTest(Base):
 
     def test_a_login_only_rest_mark_skips_no_judge(self):
         """gcp-agent-lane-1, 2026-11-17 18:41Z: one refused update-branch on the shared login latched REST, and the VM's
-        queue judged nothing while merge_hold's REST reads of the PR's repo go on the broker's read pool. A mark from a
-        refusal that named the login (login_only, leo-workspace tools/gh_latch.py) is merge_hold's to judge per repo
+        queue judged nothing while land_judge's REST reads of the PR's repo go on the broker's read pool. A mark from a
+        refusal that named the login (login_only, leo-workspace tools/gh_latch.py) is land_judge's to judge per repo
         (quota_held), not a stop for every entry; a REST mark without it still is."""
         self.pr(LA)
         self.land()
@@ -22243,7 +22243,7 @@ class LandTest(Base):
 
     def test_a_graphql_mark_holds_no_land(self):
         """gcp-agent-lane-1 2026-11-19: a GraphQL "until HH:38:59Z" mark held every due land ~30 min each hour while
-        REST had ~2000 left. merge_hold judges over REST (its quota_held reads only the REST latch)."""
+        REST had ~2000 left. land_judge judges over REST (its quota_held reads only the REST latch)."""
         self.pr(LA)
         self.land()
         self.latch("graphql", self.t + 1800, source="said", by="gh-quota")
@@ -22258,12 +22258,12 @@ class LandTest(Base):
 
     # -- the reset stagger (LAND_RESET_JUDGES_PER_MIN): K held entries, the latch lifts at t=0
 
-    # REST one merge_hold explain costs the login, from the broker host's own log over 11:37-13:37Z on 2026-11-19
+    # REST one land_judge explain costs the login, from the broker host's own log over 11:37-13:37Z on 2026-11-19
     # (host:glaeda-land: 1473 REST over 191 `pr view` rows, one per judgment): a `pr view` of its 15 fields (2, comments
     # and reviews over REST), `pulls/N` (~0.7), the head's check-runs (1), combined status (~0.35), Actions runs and
     # their jobs (~1.5 and ~0.65 charged, the rest 304s). Whole numbers: 2 + 1 + 1 + 1 + 1 + 1 = 7 live. A judgment
-    # handed the daemon's rollup snapshot (MERGE_HOLD_ROLLUP_SNAPSHOT) reads only the `pr view` and `pulls/N` (3) once
-    # merge_hold reads that snapshot (leo-workspace#5702, open): until then every judgment costs 7.
+    # handed the daemon's rollup snapshot (LAND_JUDGE_ROLLUP_SNAPSHOT) reads only the `pr view` and `pulls/N` (3) once
+    # land_judge reads that snapshot (leo-workspace#5702, open): until then every judgment costs 7.
     EXPLAIN_REST_LIVE = 7
     EXPLAIN_REST_SNAPSHOT = 3
 
@@ -22457,7 +22457,7 @@ class LandTest(Base):
         self.assert_merged_at(LB)
 
     def test_a_cached_head_no_read_confirms_is_judged_unpinned(self):
-        """No read since the latch cleared (the nudge goes unanswered): after LAND_FRESH_WAIT merge_hold is asked with
+        """No read since the latch cleared (the nudge goes unanswered): after LAND_FRESH_WAIT land_judge is asked with
         no --sha and reads the head itself, never the cache's old one."""
         self.nudge_reads = False
         self.pr(LA)
@@ -22497,7 +22497,7 @@ class LandTest(Base):
 
     def retries(self, n: int) -> None:
         for _ in range(n):
-            self.w.answers.append((3, {"ok": False, "code": "unreadable", "reason": "merge-hold: refused: unreadable",
+            self.w.answers.append((3, {"ok": False, "code": "unreadable", "reason": "land-judge: refused: unreadable",
                                        "next": "", "action": {"v": 1, "kind": "retry", "after_s": 120}}))
 
     def explained(self) -> list[str]:
@@ -22719,7 +22719,7 @@ class LandTest(Base):
         self.pr(LA)
         self.land()
         self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
-                                      reason="merge-hold: refused: REST reserve"))
+                                      reason="land-judge: refused: REST reserve"))
         e = self.tick(1)
         self.assertEqual((e["state"], (e["wait"] or {}).get("kind")), ("waiting", "quota"))
         self.github_head[self.KEY] = LB
@@ -22743,7 +22743,7 @@ class LandTest(Base):
         gaps = []
         for _ in range(6):
             self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
-                                          reason="merge-hold: refused: REST reserve"))
+                                          reason="land-judge: refused: REST reserve"))
             judged = len(self.w.explains())
             e = self.tick(1) if judged == 0 else self.tick(e["wakeAt"] - self.t)
             self.assertEqual(len(self.w.explains()), judged + 1)
@@ -22757,7 +22757,7 @@ class LandTest(Base):
         now = float(gg.dt.datetime(2026, 11, 17, 7, 0, 5, tzinfo=gg.dt.timezone.utc).timestamp())
         said = gg.land_quota_said("quota: not judged, retry after 07:37Z (reset); no attempt before 07:37Z", now)
         self.assertEqual(said - now, 37 * 60 + 59 - 5)
-        self.assertIsNone(gg.land_quota_said("merge-hold: refused: REST reserve", now))
+        self.assertIsNone(gg.land_quota_said("land-judge: refused: REST reserve", now))
         self.assertIsNone(gg.land_quota_said("no attempt before 09:30Z", now))  # past GitHub's hour
 
     def test_a_bad_request_or_entry_never_stalls_the_queue(self):
@@ -22882,16 +22882,16 @@ class LandTest(Base):
         self.assertNotIn("ago ago", line)
         self.assertIn("last merge running", gg.land_line({**e, "lastAction": {"kind": "merge"}}, time.time()))
 
-    def test_merge_hold_is_found_past_a_missing_configured_path(self):
-        """gcp-agent-lane-3, 2026-11-17: a lane VM has no ws-sync deploy, so the default merge_hold.py was missing and
+    def test_land_judge_is_found_past_a_missing_configured_path(self):
+        """gcp-agent-lane-3, 2026-11-17: a lane VM has no ws-sync deploy, so the default land-judge was missing and
         every land judged explain_failed and retried. The leo-workspace checkout's copy is found and run."""
-        checkout = Path(self.tmp.name) / "leo-workspace" / "tools" / "merge_hold.py"
+        checkout = Path(self.tmp.name) / "leo-workspace" / "tools" / "land-judge"
         checkout.parent.mkdir(parents=True)
         checkout.write_text("")
-        deploy = Path(self.tmp.name) / "no-ws-sync" / "merge_hold.py"
-        self.w.config["mergeHold"] = os.fspath(Path(self.tmp.name) / "gone" / "merge_hold.py")
-        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (deploy, checkout)):
-            self.assertEqual(self.q.merge_hold()[0], checkout)
+        deploy = Path(self.tmp.name) / "no-ws-sync" / "land-judge"
+        self.w.config["landJudge"] = os.fspath(Path(self.tmp.name) / "gone" / "land-judge")
+        with mock.patch.object(gg, "LAND_JUDGE_PATHS", (deploy, checkout)):
+            self.assertEqual(self.q.land_judge()[0], checkout)
             self.w.mh = os.fspath(checkout)
             self.pr(LA)
             self.land()
@@ -22900,19 +22900,19 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertEqual(self.w.explains()[0][1], os.fspath(checkout))
         # The configured path wins whenever it exists.
-        self.w.config["mergeHold"] = os.fspath(deploy)
+        self.w.config["landJudge"] = os.fspath(deploy)
         deploy.parent.mkdir(parents=True)
         deploy.write_text("")
-        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (checkout,)):
-            self.assertEqual(self.q.merge_hold()[0], deploy)
+        with mock.patch.object(gg, "LAND_JUDGE_PATHS", (checkout,)):
+            self.assertEqual(self.q.land_judge()[0], deploy)
 
-    def test_no_merge_hold_anywhere_the_worker_refuses_to_start_until_one_is_there(self):
+    def test_no_land_judge_anywhere_the_worker_refuses_to_start_until_one_is_there(self):
         """The startup check (the detector for a configured path that does not exist, used silently): with no
-        merge_hold.py at land.json's mergeHold or any default, the land worker judges and steps nothing, says why once
+        land-judge at land.json's landJudge or any default, the land worker judges and steps nothing, says why once
         (refused.json, a notice, `land status`) naming each path tried, and starts on the tick after one appears."""
-        gone = [Path(self.tmp.name) / d / "merge_hold.py" for d in ("conf", "deploy", "checkout")]
-        self.w.config["mergeHold"] = os.fspath(gone[0])
-        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", tuple(gone[1:])):
+        gone = [Path(self.tmp.name) / d / "land-judge" for d in ("conf", "deploy", "checkout")]
+        self.w.config["landJudge"] = os.fspath(gone[0])
+        with mock.patch.object(gg, "LAND_JUDGE_PATHS", tuple(gone[1:])):
             self.pr(LA)
             self.land()
             e = self.tick()
@@ -22920,9 +22920,9 @@ class LandTest(Base):
             self.assertEqual(self.w.explains(), [])  # nothing was run
             self.assertEqual(e["state"], "queued")  # held, not stopped: it lands once the worker starts
             refused = gg.read_json(gg.land_dir() / gg.LAND_REFUSED_FILE)
-            self.assertEqual(refused["code"], "merge_hold_missing")
+            self.assertEqual(refused["code"], "land_judge_missing")
             self.assertEqual(refused["tried"], [os.fspath(p) for p in gone])
-            self.assertIn("mergeHold", refused["next"])
+            self.assertIn("landJudge", refused["next"])
             self.assertEqual([n[0] for n in self.w.notices], ["land-refused"])  # said once, not every tick
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -22943,25 +22943,25 @@ class LandTest(Base):
         self.assertFalse((gg.land_dir() / gg.LAND_REFUSED_FILE).exists())
         self.assertEqual(self.w.notices[1][0], "land-started")
 
-    def test_land_refuses_to_queue_with_no_merge_hold(self):
-        gone = Path(self.tmp.name) / "conf" / "merge_hold.py"
+    def test_land_refuses_to_queue_with_no_land_judge(self):
+        gone = Path(self.tmp.name) / "conf" / "land-judge"
         said: list[str] = []
-        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()), \
-                mock.patch.object(gg, "land_config", return_value={"mergeHold": os.fspath(gone)}), \
+        with mock.patch.object(gg, "LAND_JUDGE_PATHS", ()), \
+                mock.patch.object(gg, "land_config", return_value={"landJudge": os.fspath(gone)}), \
                 mock.patch.object(gg, "say_waiting", side_effect=said.append):
             rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False)
         self.assertEqual(rc, gg.EXIT_FAIL)
-        self.assertIn(f"refused: merge_hold.py is not at any of {gone}", said[0])
+        self.assertIn(f"refused: land-judge is not at any of {gone}", said[0])
         self.assertIn("then glaeda-gh land o/r#1", said[0])
         self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json")) if gg.LandQueue.requests_dir().is_dir()
                          else [], [])
 
-    def test_explain_stops_when_merge_hold_vanishes_after_the_startup_check(self):
-        gone = Path(self.tmp.name) / "gone" / "merge_hold.py"
-        self.w.config["mergeHold"] = os.fspath(gone)
-        with mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()):
+    def test_explain_stops_when_land_judge_vanishes_after_the_startup_check(self):
+        gone = Path(self.tmp.name) / "gone" / "land-judge"
+        self.w.config["landJudge"] = os.fspath(gone)
+        with mock.patch.object(gg, "LAND_JUDGE_PATHS", ()):
             got = self.q.explain({"repo": "o/r", "number": 1}, LA)
-        self.assertEqual((got["code"], got["action"]["kind"]), ("merge_hold_missing", "stop"))
+        self.assertEqual((got["code"], got["action"]["kind"]), ("land_judge_missing", "stop"))
         self.assertIn("then glaeda-gh land o/r#1", got["next"])
 
     def test_upstream_host_reads_a_stale_landing_pr_itself(self):
@@ -23010,10 +23010,10 @@ class LandTest(Base):
         e["refresh"] = {}
         self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a fresh copy: no read
 
-    def test_a_stale_merge_hold_checkout_warns_once_and_clears(self):
-        """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its merge_hold refused every merge
+    def test_a_stale_land_judge_checkout_warns_once_and_clears(self):
+        """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its land_judge refused every merge
         as unreadable. The startup check warns (never refuses) once, prints in `land status`, and clears once."""
-        self.stale_why = "merge_hold.py's checkout /ws is stale: 30 commits behind origin/main (over 20)"
+        self.stale_why = "land-judge's checkout /ws is stale: 30 commits behind origin/main (over 20)"
         self.pr(LA)
         self.land()
         self.w.answers.append(ok_answer(LA))
@@ -23023,7 +23023,7 @@ class LandTest(Base):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             gg.cmd_land_status(None, False)
-        self.assertIn("WARNING: merge_hold.py's checkout /ws is stale", out.getvalue())
+        self.assertIn("WARNING: land-judge's checkout /ws is stale", out.getvalue())
         self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
         self.assertEqual(len([n for n in self.w.notices if n[0] == "land-checkout-stale"]), 1)  # said once
         self.stale_why = None
@@ -23039,7 +23039,7 @@ class LandTest(Base):
                    "rev-parse --path-format=absolute --git-path FETCH_HEAD": os.fspath(fetch)}
         git = lambda args: answers.get(" ".join(args))  # noqa: E731
         no_log = Path(self.tmp.name) / "no-deploys.log"  # never the host's own ws-sync record
-        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, now, git, no_log)
+        why = gg.land_checkout_behind(Path("/ws/tools/land-judge"), 20, 6.0, now, git, no_log)
         self.assertIn("28 commits behind origin/main (over 20)", why)
         self.assertIn("9.0 h newer than HEAD", why)
         self.assertIn("/ws/tools/ws-deploy --local", why)
@@ -23070,10 +23070,10 @@ class LandTest(Base):
         stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))  # noqa: E731
         log_path.write_text(f"{stamp(NOW - 1200)} deployed 38f0454..f2923c5 paths: tools/x\n"
                             f"{stamp(NOW - 600)} no-op f2923c5\n")
-        self.assertIsNone(gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path))
+        self.assertIsNone(gg.land_checkout_behind(Path("/ws/tools/land-judge"), 20, 6.0, NOW, git, log_path))
         # the newest run found main somewhere else: it says nothing of this checkout
         log_path.write_text(f"{stamp(NOW - 600)} no-op 0123456\n")
-        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path)
+        why = gg.land_checkout_behind(Path("/ws/tools/land-judge"), 20, 6.0, NOW, git, log_path)
         self.assertIn("main has not been fetched for 8.0 h", why)
         self.assertNotIn("stale", why)
         self.assertNotIn("last fetched", why)  # at its origin/main: main may have moved, the code is not known old
@@ -23082,57 +23082,57 @@ class LandTest(Base):
 
     def test_a_checkout_with_tracked_changes_is_not_current(self):
         """cosmic-gray, 2026-11-18: one unowned draft brief kept its shared checkout at cb2724750 (ws-deploy: "shared
-        checkout kept (tracked changes)"); nothing moves such a checkout, so its merge_hold is not trusted."""
+        checkout kept (tracked changes)"); nothing moves such a checkout, so its land_judge is not trusted."""
         git, log_path = self.checkout_git(NOW, "a" * 40, "a" * 40, dirty=" M briefs/draft.md")
-        why = gg.land_checkout_behind(Path("/ws/tools/merge_hold.py"), 20, 6.0, NOW, git, log_path)
+        why = gg.land_checkout_behind(Path("/ws/tools/land-judge"), 20, 6.0, NOW, git, log_path)
         self.assertIn("1 tracked change (someone's local edit", why)
         self.assertIn("/ws/tools/ws-deploy --local", why)
 
     def release(self) -> Path:
-        rel = Path(self.tmp.name) / "ws-sync" / "deploy" / "tools" / "merge_hold.py"
+        rel = Path(self.tmp.name) / "ws-sync" / "deploy" / "tools" / "land-judge"
         rel.parent.mkdir(parents=True, exist_ok=True)
         rel.write_text("raise SystemExit('not run in tests')\n")
-        patch = mock.patch.object(gg, "LAND_MERGE_HOLD", rel)
+        patch = mock.patch.object(gg, "LAND_JUDGE", rel)
         patch.start()
         self.addCleanup(patch.stop)
         return rel
 
     def test_a_stale_configured_checkout_falls_back_to_a_current_release_said_once(self):
-        """land.json's mergeHold pinned huge-blue's shared checkout. A configured merge_hold.py whose checkout is not
+        """land.json's landJudge pinned huge-blue's shared checkout. A configured land-judge whose checkout is not
         current is not run while the ws-sync release is: the land runs the release, said once, back when it clears."""
         rel = self.release()
-        whys = {self.w.mh: "merge_hold.py's checkout /ws is not current: 30 commits behind origin/main (over 20)"}
+        whys = {self.w.mh: "land-judge's checkout /ws is not current: 30 commits behind origin/main (over 20)"}
         self.q.behind = lambda mh, *a: whys.get(os.fspath(mh))
         self.q.now = self.t
         self.assertFalse(self.q.refuse())
-        self.assertEqual(self.q.merge_hold()[0], rel)
-        self.assertEqual([n[0] for n in self.w.notices], ["land-merge-hold-fallback"])
+        self.assertEqual(self.q.land_judge()[0], rel)
+        self.assertEqual([n[0] for n in self.w.notices], ["land-land-judge-fallback"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             gg.cmd_land_status(None, False)
-        self.assertIn(f"merge_hold.py runs from the ws-sync release {rel}, not {self.w.mh}", out.getvalue())
+        self.assertIn(f"land-judge runs from the ws-sync release {rel}, not {self.w.mh}", out.getvalue())
         self.assertNotIn("WARNING", out.getvalue())
         # the same finding with other numbers is not said again
         whys[self.w.mh] = whys[self.w.mh].replace("30 commits", "31 commits")
         self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
         self.q.refuse()
         self.assertEqual(len(self.w.notices), 1)
-        self.assertEqual(self.q.merge_hold()[0], rel)
+        self.assertEqual(self.q.land_judge()[0], rel)
         # current again: the configured one runs
         whys.clear()
         self.q.now += gg.LAND_MH_BEHIND_EVERY + 1
         self.q.refuse()
-        self.assertEqual(self.q.merge_hold()[0], Path(self.w.mh))
+        self.assertEqual(self.q.land_judge()[0], Path(self.w.mh))
         self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
-        self.assertEqual([n[0] for n in self.w.notices], ["land-merge-hold-fallback", "land-checkout-current"])
+        self.assertEqual([n[0] for n in self.w.notices], ["land-land-judge-fallback", "land-checkout-current"])
 
     def test_no_current_release_warns_naming_the_command_and_runs_the_checkout(self):
         rel = self.release()
-        why = "merge_hold.py's checkout /ws is not current: 2 tracked changes. next: /ws/tools/ws-deploy --local"
+        why = "land-judge's checkout /ws is not current: 2 tracked changes. next: /ws/tools/ws-deploy --local"
         self.q.behind = lambda mh, *a: why  # the release is not current either
         self.q.now = self.t
         self.q.refuse()
-        self.assertEqual(self.q.merge_hold()[0], Path(self.w.mh))
+        self.assertEqual(self.q.land_judge()[0], Path(self.w.mh))
         self.assertEqual([n[0] for n in self.w.notices], ["land-checkout-stale"])
         self.assertIn(f"no current ws-sync release to run instead ({rel} is not current either)", self.w.notices[0][2])
         self.assertIn("/ws/tools/ws-deploy --local", self.w.notices[0][2])
@@ -23162,19 +23162,19 @@ class LandTest(Base):
                 return subprocess.CompletedProcess(argv, 0, "no-op 12ee4b0\n", "")
             return self.w.run(argv, timeout, env)
         self.q.run = run
-        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.stale_why = "land-judge's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
         self.tick()
         self.assertEqual(ran, [[os.fspath(tool), "--local"]])
         self.tick()  # judged again at once after the refresh: current, the warning gone
         self.assertFalse((gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE).exists())
         self.assertGreater(self.q.mh_changed_at, float("-inf"))  # a retry_deadline stop before it is re-armed
-        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.stale_why = "land-judge's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
         self.tick(gg.LAND_MH_BEHIND_EVERY + 1)
         self.assertEqual(len(ran), 1)  # at most every LAND_MH_REFRESH_EVERY
         self.tick(gg.LAND_MH_REFRESH_EVERY)
         self.assertEqual(len(ran), 2)
-        self.w.config["mergeHoldRefresh"] = False
-        self.stale_why = "merge_hold.py's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
+        self.w.config["landJudgeRefresh"] = False
+        self.stale_why = "land-judge's checkout /ws is not current: last fetched 6.5 h ago (over 6)"
         self.tick(gg.LAND_MH_REFRESH_EVERY + gg.LAND_MH_BEHIND_EVERY)
         self.assertEqual(len(ran), 2)
 
@@ -23183,8 +23183,8 @@ class LandTest(Base):
         the checkout was current, and nothing removed the record a previous daemon wrote."""
         path = gg.land_dir() / gg.LAND_STALE_CHECKOUT_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        old = {"reason": "merge_hold.py's checkout /ws is stale: last fetched 6.5 h ago (over 6)",
-               "at": time.time() - 3 * gg.LAND_MH_BEHIND_EVERY, "mergeHold": "/ws/tools/merge_hold.py"}
+        old = {"reason": "land-judge's checkout /ws is stale: last fetched 6.5 h ago (over 6)",
+               "at": time.time() - 3 * gg.LAND_MH_BEHIND_EVERY, "landJudge": "/ws/tools/land-judge"}
         gg.write_json(path, old)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -23194,7 +23194,7 @@ class LandTest(Base):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             gg.cmd_land_status(None, False)
-        self.assertIn("WARNING: merge_hold.py's checkout /ws is stale", out.getvalue())
+        self.assertIn("WARNING: land-judge's checkout /ws is stale", out.getvalue())
         self.stale_why = None
         self.q = self.queue()  # a new daemon, its checkout current from its first check
         self.tick()
@@ -23215,8 +23215,8 @@ class LandTest(Base):
 
     def test_status_names_why_explain_failed(self):
         e = {"key": self.KEY, "state": "waiting", "explain": {"code": "explain_failed",
-                                                             "reason": "merge_hold explain exit 1: Traceback boom"}}
-        self.assertIn("explain_failed: merge_hold explain exit 1: Traceback boom", gg.land_line(e, time.time()))
+                                                             "reason": "land_judge explain exit 1: Traceback boom"}}
+        self.assertIn("explain_failed: land_judge explain exit 1: Traceback boom", gg.land_line(e, time.time()))
 
     def test_requester_defaults_to_the_queuing_session(self):
         keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
@@ -23366,7 +23366,7 @@ class LandTest(Base):
 
     def test_the_latch_holds_only_lands_with_no_unlatched_source(self):
         # huge-blue, 2026-11-18 15:24Z: the login's GraphQL latched, 382 open lands, workers busy=0, nothing judged,
-        # though merge_hold reads manaflow-ai through the lander App pools.
+        # though land_judge reads manaflow-ai through the lander App pools.
         self.latch_dir.mkdir(parents=True, exist_ok=True)
         (self.latch_dir / "rest-exhausted.json").write_text(json.dumps({"until": self.t + 3000, "at": self.t}))
         self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
@@ -23491,7 +23491,7 @@ class LandTest(Base):
 
 class LandForwardTest(Base):
     """land.json's "executor": a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15
-    cores, swap 9.4 of 10.7 GB, its land queue running merge_hold (base_red_excuse.py x5, pr_owner.py x2) for every
+    cores, swap 9.4 of 10.7 GB, its land queue running land_judge (base_red_excuse.py x5, pr_owner.py x2) for every
     queued PR. With an executor named, this host judges nothing: the executor's queue does, and tells the requester."""
 
     queue = LandTest.queue
@@ -23513,7 +23513,7 @@ class LandForwardTest(Base):
         super().setUp()
         self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
-        for patch in (mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", (Path(self.w.mh),)),
+        for patch in (mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),)),
                       mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(Path(self.tmp.name) / "gh-quota")})):
             patch.start()
             self.addCleanup(patch.stop)
@@ -23531,7 +23531,7 @@ class LandForwardTest(Base):
         saved = gg.BASE
         gg.BASE = self.exec_base
         try:
-            with mock.patch.object(gg, "land_config", return_value={"mergeHold": self.w.mh}), \
+            with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
                     mock.patch.object(gg, "daemon_running", return_value=True), \
                     mock.patch.object(gg, "policy_host", return_value="big-exec"), \
                     contextlib.redirect_stdout(io.StringIO()) as out:
@@ -23652,7 +23652,7 @@ class LandForwardTest(Base):
                 mock.patch.object(gg, "land_forward", side_effect=fwd), \
                 mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "coord"}), \
                 mock.patch.object(gg, "policy_host", return_value="cosmic"), \
-                mock.patch.object(gg, "LAND_MERGE_HOLD_PATHS", ()):  # no merge_hold here: none is needed
+                mock.patch.object(gg, "LAND_JUDGE_PATHS", ()):  # no land_judge here: none is needed
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(gg.main(["land", "o/r#1", "--json"]), 0)
             doc = json.loads(out.getvalue())
@@ -24440,15 +24440,15 @@ class BrokerFinalJobsJqTest(BrokerFinalJobsTest):
 
 class AuditByCallerTest(Base):
     def test_callers_are_grouped_and_ppids_are_one_unnamed_group(self) -> None:
-        lines = ["2026-11-17T08:00:00Z tool:merge_hold.py api repos/o/r/actions/jobs/1/logs",
-                 "2026-11-17T08:00:01Z tool:merge_hold.py api repos/o/r/actions/runs/2/jobs",
+        lines = ["2026-11-17T08:00:00Z tool:land-judge api repos/o/r/actions/jobs/1/logs",
+                 "2026-11-17T08:00:01Z tool:land-judge api repos/o/r/actions/runs/2/jobs",
                  "2026-11-17T08:00:02Z ppid-11 pr view 7 o/r",
                  "2026-11-17T08:00:03Z ppid-12 pr view 8 o/r",
                  "2026-11-17T08:00:04Z ws-check.0d9b2f6a-1111-2222-3333-444455556666 pr view 9 o/r",
                  "2026-11-17T08:00:05Z session:claude-1 api graphql"]
         rows = gg.audit_by_caller(lines)
         self.assertEqual([(r["caller"], r["calls"]) for r in rows],
-                         [("tool:merge_hold.py", 2), ("unnamed (ppid)", 2), ("session:claude-1", 1),
+                         [("tool:land-judge", 2), ("unnamed (ppid)", 2), ("session:claude-1", 1),
                           ("session:ws-check", 1)])
         self.assertEqual(rows[0]["top"][0]["calls"], 1)
 
@@ -24749,7 +24749,7 @@ class AlertToolMissingTest(unittest.TestCase):
 class QueuedNeverDoneTest(unittest.TestCase):
     """claude-sr2-coord (from cloud-prod-goals-2), 2026-11-18: "`glaeda-gh wait pr --until done` returned 'result:
     success' while checks were still queued. hq#13438 at 10b0ae08: after 184 s, with 7 pending. hq#13202 at
-    0a581929: after 1789 s, with 8 of 13 pending. merge_hold then refused both as checks_running." Both heads' jobs sat
+    0a581929: after 1789 s, with 8 of 13 pending. land_judge then refused both as checks_running." Both heads' jobs sat
     queued 30+ minutes on a busy runner pool (hq#13202: queued 15:01:35Z, still queued at 15:35Z, then ran) and the
     straggler cut (#2125) judged the head as if they were not there. Done and green never return while any check is
     queued or pending; a read with no data or partial data is inconclusive, never success."""
@@ -24888,7 +24888,7 @@ class QueuedNeverDoneTest(unittest.TestCase):
         """claude-sr2-coord-old: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success twice
         after 185-192 s while 7 jobs were queued on one runner label, counting only the 3 checks that had finished.
         Here the rollup shows the 3 finished checks only; the 7 queued jobs sit in 6 Actions runs at the head, some
-        with no check run yet. Done and green hold on the runs (merge_hold's unfinished_runs); a failed runs read
+        with no check run yet. Done and green hold on the runs (land_judge's unfinished_runs); a failed runs read
         ends the wait inconclusive at its deadline; once every run completed, the wait says success."""
         key = "pr:o/r#13397"
         head = "a6534f4df0f5a47207272a486e8997b420306150"
@@ -25090,7 +25090,7 @@ class BrokerVouchTest(CountingGhBase):
 
     def test_a_gate_or_a_landing_read_gets_the_ttl_alone(self) -> None:
         args = ["pr", "view", "7", "-R", "o/r"]
-        for name, value in (("GLAEDA_GH_CACHE_TTL", "90"), ("GH_QUOTA_LANDING_READ", "merge-hold")):
+        for name, value in (("GLAEDA_GH_CACHE_TTL", "90"), ("GH_QUOTA_LANDING_READ", "land-judge")):
             with self.subTest(env=name):
                 self.hold()
                 self.run_gh(args)

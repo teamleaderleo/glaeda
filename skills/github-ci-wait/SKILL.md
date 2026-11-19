@@ -232,12 +232,12 @@ glaeda-gh land status [OWNER/REPO#N] [--json]       # state, last step, refusals
 glaeda-gh land cancel OWNER/REPO#N
 ```
 
-- The daemon asks `merge_hold.py explain R N --sha HEAD --json` at the head its cache shows, and takes
+- The daemon asks `land-judge explain R N --sha HEAD --json` at the head its cache shows, and takes
   the step the answer's `action` names: the pinned squash merge, a pinned update-branch, `gh run rerun
   ID --failed`, a base change, `router-review R N --post` (once per head), or a wait on the PR's checks,
   a base run or a review comment. It never asks while the head's checks still run, and after an
   update-branch it judges nothing until the cache shows the new head.
-- Every `gh` goes through the gh-quota shim, so merge_hold judges every merge; without the shim it
+- Every `gh` goes through the gh-quota shim, so land_judge judges every merge; without the shim it
   merges nothing. The calls carry `CMUX_AGENT_SESSION=glaeda-land` and `MAY_MERGE_PATH=glaeda-land`.
 - It stops and tells the requester (`acpmux send --no-wait`, default this host/`$ACPMUX_SESSION_NAME`)
   only on a real stop: a BLOCK, a hold, a conflict, a step only a person can take, the PR or an

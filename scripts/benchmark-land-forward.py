@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """What `glaeda-gh land` costs the host it was asked on, for a queue of N PRs: processes spawned and their CPU seconds,
-old (this host runs the queue: merge_hold and its classifiers per PR) vs new (land.json "executor": it forwards).
+old (this host runs the queue: land_judge and its classifiers per PR) vs new (land.json "executor": it forwards).
 
 The same harness both ways: a real LandQueue from scripts/glaeda-gh over a temporary GLAEDA_GH_DIR, real subprocesses,
-and fakes for what would reach GitHub. The fake merge_hold.py starts two classifier children (as base_red_excuse.py and
+and fakes for what would reach GitHub. The fake land-judge starts two classifier children (as base_red_excuse.py and
 pr_owner.py are started by the real one) that each burn CLASSIFIER_CPU seconds of CPU; the fake gh shim merges at once.
 The fake executor is one program that takes the forwarded batch and answers it, as `reach HOST glaeda-gh land serve`
 does from this host's side. Every fake program logs one line when it starts, and the CPU is RUSAGE_CHILDREN's.
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLASSIFIER_CPU = 0.15
 HEAD = "a" * 40
 
-MERGE_HOLD = r'''
+LAND_JUDGE = r'''
 import json, os, subprocess, sys, time
 log = os.environ["BENCH_LOG"]
 if sys.argv[1] == "classify":
@@ -38,7 +38,7 @@ if sys.argv[1] == "classify":
     while time.process_time() < end:
         pass
     raise SystemExit(0)
-open(log, "a").write("merge_hold\n")
+open(log, "a").write("land_judge\n")
 for _ in ("base_red_excuse", "pr_owner"):
     subprocess.run([sys.executable, __file__, "classify"], check=True)
 repo, number, head = sys.argv[2], sys.argv[3], sys.argv[sys.argv.index("--sha") + 1]
@@ -76,15 +76,15 @@ def run(gg: object, mode: str, prs: int, tmp: Path, cpu: float = CLASSIFIER_CPU)
     log = tmp / mode / "spawned.log"
     bin_dir = tmp / mode / "bin"
     bin_dir.mkdir(parents=True)
-    mh = tmp / mode / "merge_hold.py"
-    mh.write_text(MERGE_HOLD)
+    mh = tmp / mode / "land-judge"
+    mh.write_text(LAND_JUDGE)
     gh = bin_dir / "gh"
     gh.write_text(GH)
     gh.chmod(0o755)
     exe = tmp / mode / "executor.py"
     exe.write_text(EXECUTOR)
     os.environ["BENCH_LOG"] = os.fspath(log)  # the forward runs with this process's environment
-    config = {"gh": os.fspath(gh), "mergeHold": os.fspath(mh), "python": sys.executable, "acpmux": "/bin/true",
+    config = {"gh": os.fspath(gh), "landJudge": os.fspath(mh), "python": sys.executable, "acpmux": "/bin/true",
               "env": {"BENCH_LOG": os.fspath(log), "BENCH_CPU": str(cpu)}}
     if mode == "new":
         config["executor"] = [sys.executable, os.fspath(exe)]
@@ -124,7 +124,7 @@ def main() -> int:
     gg = load()
     with tempfile.TemporaryDirectory(prefix="bench-land-forward-") as tmp:
         os.environ["GH_QUOTA_STATE"] = os.fspath(Path(tmp) / "gh-quota")
-        gg.LAND_MERGE_HOLD_PATHS = ()
+        gg.LAND_JUDGE_PATHS = ()
         # The queue logs JSON event lines to stdout: kept off it, so --json prints one JSON document alone.
         with contextlib.redirect_stdout(sys.stderr):
             results = [run(gg, mode, args.prs, Path(tmp), args.classifier_cpu) for mode in ("old", "new")]
