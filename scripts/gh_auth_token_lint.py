@@ -43,7 +43,7 @@ def python_hits(path: Path, text: str) -> list[tuple[int, str]]:
         for arg in node.args:
             if isinstance(arg, (ast.List, ast.Tuple)):
                 values = [literal(item) for item in arg.elts]
-                first = values[0] or ""
+                first = (values[0] if values else "") or ""
                 if len(values) >= 3 and values[1:3] == ["auth", "token"] and (
                         first in {"gh", "gh_path", "gh_bin"} or first.endswith("/gh")):
                     if not allowed(lines, node.lineno - 1):
