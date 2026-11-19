@@ -2574,7 +2574,7 @@ class Controller:
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
             # the daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET)
             left = getattr(self, "budget_end", float("inf")) - time.monotonic()
-            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left + 0.1))
+            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left) + deadline - budget)
             with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
                 doc = json.loads(response.read(MAX_BODY))
         except urllib.error.HTTPError as error:
@@ -4322,14 +4322,16 @@ class Daemon:
             if share is not None:
                 firing["share"] = share
         self.stale_now = self.stale_verdict()
-        if self.stale_now is not None:
-            self.stale_last = self.stale_record()
         if policy.get("stale", True):
             stale = self.stale_valve(self.stale_now, policy)
+            if isinstance(stale, tuple):
+                self.stale_now = stale  # the valve's word on it ("spent": a restart will not help) is the verdict
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
                 firing["stale"] = stale
+        if self.stale_now is not None:
+            self.stale_last = self.stale_record()
         changed = False
         for name, (level, text, data) in firing.items():
             last = self.alarms.get(name) or {}
@@ -8368,7 +8370,8 @@ class Daemon:
                 pages = self.read_feed()
             except WatchError as error:
                 return self.controller_down(error)
-            self.controller_failures = 0
+            if getattr(self, "controller_feed_error", None) is None:
+                self.controller_failures = 0
             self.controller_ok_at = self.now
             for page in pages:
                 for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):

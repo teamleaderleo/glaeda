@@ -22561,12 +22561,19 @@ class RefreshStallTest(AlarmBase):
 
     def test_a_spent_valve_tells_restart_not_to_help_either(self) -> None:
         # #2201 review: the alarm says another restart will not help once the valve's restart did not; the verdict
-        # restart reads says the same.
-        self.daemon.stale_now = ("warn", "text", {"kind": "pr", "age": 4000, "key": "newest", "valve": "spent"})
-        self.daemon.stale_reason = "no PR has been refreshed for 4000s"
-        self.assertEqual(self.daemon.stale_record()["restart"], False)
-        self.daemon.stale_now = ("warn", "text", {"kind": "pr", "age": 4000, "key": "newest", "valve": "restarting"})
-        self.assertEqual(self.daemon.stale_record()["restart"], True)
+        # daemon.json carries, which `restart` reads, says the same.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.stalled(gg.STALE_DATA_AFTER + 100)
+        gg.write_json(gg.BASE / "restart.json", {"at": self.daemon.clock() - 10, "valve": True, "ok": True})
+        self.daemon.check_alarms()
+        self.daemon.now = NOW + gg.TICK  # the valve judges from its second tick in a row (STALE_VALVE_TICKS)
+        self.daemon.check_alarms()
+        self.assertIn("did not help", self.daemon.stale_now[1])
+        self.assertIsNone(self.daemon.valve_due)
+        verdict = self.daemon.stale_record()
+        self.assertEqual((verdict["state"], verdict["restart"]), ("stale", False))
+        self.assertEqual(self.daemon.stale_last["restart"], False)
 
     def test_a_cleared_verdict_is_named_when_restart_finds_nothing_to_do(self) -> None:
         self.policy()
