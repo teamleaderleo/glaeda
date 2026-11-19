@@ -23719,6 +23719,77 @@ class StragglerTest(unittest.TestCase):
         self.assertEqual(len(seen["overflow-8vcpu-linux"]), 4)
 
 
+class AlertToolMissingTest(unittest.TestCase):
+    """machine-hygiene-2, 2026-11-19: glaeda-gh on huge-blue logged every straggler alert as `{"event":
+    "alert-unsent", "why": "no ~/Projects/leo-workspace/tools/coord_alert.py"}` (12 since 2026-11-18) because that tool
+    never merged (leo-workspace#5760 is still open), and nobody heard of it. A missing alert tool is a FIRE: the alert
+    goes by the alarm path glaeda-gh's other alarms use (tell-coordinator) as a FIRE naming the missing tool, and a FIRE
+    notice line is written even when no inbox tool is there at all."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.told = root / "told.txt"
+        self.cmd = root / "tell-coordinator"
+        self.cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.told}\n")
+        self.cmd.chmod(0o755)
+        for name, value in (("COORD_ALERT", root / "no-leo-workspace" / "coord_alert.py"), ("ALARM_CMD", self.cmd),
+                            ("NOTICES_DIR", root / "notices")):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, value)
+        self.procs: list[subprocess.Popen] = []
+        real = subprocess.Popen
+
+        def popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+            proc = real(*args, **kwargs)
+            self.procs.append(proc)
+            return proc
+        patch = mock.patch.object(gg.subprocess, "Popen", side_effect=popen)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def told_lines(self) -> list[str]:
+        for proc in self.procs:
+            proc.wait(10)
+        return self.told.read_text().splitlines() if self.told.exists() else []
+
+    def notices(self) -> list[dict]:
+        path = gg.NOTICES_DIR / "glaeda-gh.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_missing_alert_tool_sends_the_alert_as_a_fire_by_tell_coordinator(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            gg.coord_alert_spawn("WARN glaeda-gh on h: 6 job(s) on runner label l queued with no runner")
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--from glaeda-gh --severity fire FIRE ", told[0])
+        self.assertIn(os.fspath(gg.COORD_ALERT), told[0])
+        self.assertIn("6 job(s) on runner label l queued with no runner", told[0])
+        fires = [n for n in self.notices() if n["data"].get("severity") == "fire"]
+        self.assertEqual(len(fires), 1, self.notices())
+        self.assertTrue(fires[0]["text"].startswith("FIRE "), fires[0])
+        self.assertIn(os.fspath(gg.COORD_ALERT), fires[0]["text"])
+
+    def test_with_no_inbox_tool_either_the_fire_notice_line_is_still_written(self) -> None:
+        gg.ALARM_CMD = Path(self.tmp.name) / "no-tell-coordinator"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.coord_alert_spawn("WARN glaeda-gh on h: stragglers")
+        fires = [n for n in self.notices() if n["data"].get("severity") == "fire"]
+        self.assertEqual(len(fires), 1, self.notices())
+        self.assertIn(os.fspath(gg.COORD_ALERT), fires[0]["text"])
+        self.assertIn("alert-unsent", out.getvalue())
+
+    def test_a_present_alert_tool_keeps_its_own_route(self) -> None:
+        gg.COORD_ALERT.parent.mkdir(parents=True)
+        gg.COORD_ALERT.write_text("def send(text, sender, budget=0):\n    return 'test'\n")
+        with mock.patch.object(gg.subprocess, "Popen") as spawned:
+            gg.coord_alert_spawn("WARN x")
+        self.assertEqual(spawned.call_args.args[0][-2:], ["coord-alert", "WARN x"])
+        self.assertEqual(self.notices(), [])
+
+
 class QueuedNeverDoneTest(unittest.TestCase):
     """claude-sr2-coord (from cloud-prod-goals-2), 2026-11-18: "`glaeda-gh wait pr --until done` returned 'result:
     success' while checks were still queued. hq#13438 at 10b0ae08: after 184 s, with 7 pending. hq#13202 at
