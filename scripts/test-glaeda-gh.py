@@ -18528,6 +18528,204 @@ class LogJobTest(Base):
         self.assertEqual(self.rest_reads(), 10)  # the controller's 20 reads added none
 
 
+class LogScanTest(Base):
+    """`log search`, `log flaky` and `log errors` (Leo, 2026-11-19, on Vercel CI: agents ask CI logs a question
+    instead of fetching whole logs). Jobs come from the controller's timing records; logs from the kept copy or the
+    controller, never REST."""
+
+    FAIL_LOG = (b"2026-11-19T01:00:00.1Z ##[group]Run cargo test\n"
+                b"2026-11-19T01:00:01.1Z    Compiling acpmux v0.1.0\n"
+                b"2026-11-19T01:00:02.1Z test sessions::resume_keeps_order ... FAILED\n"
+                b"2026-11-19T01:00:02.2Z thread 'x' panicked at src/lib.rs:4:5:\n"
+                b"2026-11-19T01:00:02.3Z error[E0599]: no method named `foo`\n"
+                b"2026-11-19T01:00:02.4Z    --> src/lib.rs:9:3\n"
+                b"2026-11-19T01:00:02.5Z ##[endgroup]\n"
+                b"2026-11-19T01:00:03.1Z ##[group]Run python3 -m unittest\n"
+                b"2026-11-19T01:00:03.2Z FAIL: test_no_stray_sleep (__main__.FleetRuleLints.test_no_stray_sleep)\n"
+                b"2026-11-19T01:00:03.3Z ##[error]Process completed with exit code 1.\n"
+                b"2026-11-19T01:00:04.1Z Cleaning up orphan processes\n")
+    QUIET_LOG = (b"2026-11-19T01:00:00Z ##[group]Run make\n"
+                 b"2026-11-19T01:00:01Z linking cmux-tui\n"
+                 b"2026-11-19T01:00:02Z ##[endgroup]\n"
+                 b"2026-11-19T01:00:03Z ##[error]Process completed with exit code 2.\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.records: list[dict] = []
+        self.ctl_logs: dict[int, tuple[int, bytes]] = {}
+        self.ctl_reads: list[int] = []
+        self.rest_calls = 0
+        test = self
+
+        class Ctl:
+            def get(self, path: str, timeout: float | None = None) -> dict:
+                since = int(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["since"][0])
+                return {"records": [r for r in test.records if gg.iso_epoch(r["at"]) >= since], "more": False}
+
+        def controller_job_log(ctl: Any, repo: str, job: int) -> tuple[int, bytes]:
+            test.ctl_reads.append(job)
+            return test.ctl_logs.get(job, (404, b""))
+
+        patch = mock.patch.object(gg, "controller_job_log", controller_job_log)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ctl = Ctl()
+
+    def rest(self, repo: str, job: int) -> tuple[bool, bytes, str]:
+        self.rest_calls += 1
+        return True, self.FAIL_LOG, ""
+
+    def rec(self, job: int, name: str = "cargo test", conclusion: str = "failure", run: int = 1,
+            attempt: int = 1, minutes_ago: float = 10) -> None:
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes_ago * 60))
+        self.records.append({"at": at, "repo": "o/r", "workflow": "ci", "seg": "pr", "job": name, "id": job,
+                             "attempt": attempt, "conclusion": conclusion, "run": run, "seconds": 60})
+
+    def run_cmd(self, fn: Callable, *args: Any, **kw: Any) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fn(*args, controller=self.ctl, **kw)
+        return code, out.getvalue()
+
+    def test_search_names_the_jobs_that_printed_it_and_reads_no_rest(self) -> None:
+        self.rec(1, minutes_ago=30)
+        self.rec(2, minutes_ago=20)
+        self.rec(3, conclusion="success", minutes_ago=5)
+        self.ctl_logs[1] = (200, self.FAIL_LOG)
+        self.ctl_logs[2] = (200, self.QUIET_LOG)
+        code, text = self.run_cmd(gg.cmd_log_search, "o/r", r"error\[E0599\]", as_json=True)
+        doc = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual([m["id"] for m in doc["matches"]], [1])
+        self.assertEqual(doc["matches"][0]["url"], "https://github.com/o/r/actions/runs/1/job/1")
+        self.assertEqual((doc["jobs"], doc["scanned"]), (2, 2))  # the green job was not read
+        self.assertEqual(sorted(self.ctl_reads), [1, 2])
+        self.assertEqual(self.rest_calls, 0)
+        # the second search reads the kept copies: no controller read
+        self.run_cmd(gg.cmd_log_search, "o/r", "linking")
+        self.assertEqual(sorted(self.ctl_reads), [1, 2])
+
+    def test_search_stops_at_its_read_cap_and_says_how_many_it_left(self) -> None:
+        for job in range(1, 6):
+            self.rec(job, minutes_ago=60 - job)
+            self.ctl_logs[job] = (200, self.QUIET_LOG)
+        code, text = self.run_cmd(gg.cmd_log_search, "o/r", "nothing-prints-this", reads=2, as_json=True)
+        doc = json.loads(text)
+        self.assertEqual(code, 1)
+        self.assertEqual(doc["scanned"], 2)
+        self.assertEqual(doc["unread"], {"over --reads": 3})
+        self.assertEqual(self.ctl_reads, [5, 4])  # newest first
+
+    def test_search_gives_up_on_a_controller_that_stopped_answering(self) -> None:
+        for job in range(1, 8):
+            self.rec(job, minutes_ago=60 - job)
+            self.ctl_logs[job] = (0, b"")
+        _, text = self.run_cmd(gg.cmd_log_search, "o/r", "x", as_json=True)
+        self.assertEqual(len(self.ctl_reads), 3)
+        self.assertEqual(json.loads(text)["unread"], {"controller down": 7})  # read 3, the rest counted under it
+
+    def test_flaky_is_a_test_whose_job_passed_on_rerun(self) -> None:
+        self.rec(10, run=7, attempt=1, minutes_ago=50)  # failed, then the re-run passed
+        self.rec(11, run=7, attempt=2, conclusion="success", minutes_ago=40)
+        self.rec(12, run=8, minutes_ago=30)  # failed, never re-run
+        self.ctl_logs[10] = self.ctl_logs[12] = (200, self.FAIL_LOG)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", as_json=True)
+        doc = json.loads(text)
+        self.assertEqual(code, 0)
+        rows = {t["test"]: t for t in doc["tests"]}
+        self.assertEqual(set(rows), {"sessions::resume_keeps_order", "FleetRuleLints.test_no_stray_sleep"})
+        row = rows["FleetRuleLints.test_no_stray_sleep"]
+        self.assertEqual((row["verdict"], row["fails"], row["runs"], row["rerun_green"]), ("flaky", 2, 2, 1))
+        self.assertEqual(doc["jobs_rerun_green"], {"cargo test": 1})
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "resume", as_json=True)
+        self.assertEqual([t["test"] for t in json.loads(text)["tests"]], ["sessions::resume_keeps_order"])
+
+    def test_a_sibling_passing_in_the_same_attempt_or_a_record_without_a_run_is_no_rerun(self) -> None:
+        self.rec(40, run=9, attempt=1, minutes_ago=50)  # a matrix leg failed
+        self.rec(41, run=9, attempt=1, conclusion="success", minutes_ago=40)  # a sibling of the same name passed
+        self.rec(42, run=None, minutes_ago=30)
+        self.rec(43, run=None, conclusion="success", minutes_ago=20)
+        self.ctl_logs[40] = self.ctl_logs[42] = (200, self.FAIL_LOG)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "stray_sleep", as_json=True)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["tests"][0]["rerun_green"], doc["jobs_rerun_green"]), (1, 0, {}))
+
+    def test_a_bad_regex_is_a_usage_error_not_a_crash(self) -> None:
+        for call in (lambda: self.run_cmd(gg.cmd_log_flaky, "o/r", "("),
+                     lambda: self.run_cmd(gg.cmd_log_flaky, "o/r", job="["),
+                     lambda: self.run_cmd(gg.cmd_log_search, "o/r", "x", workflow="("),
+                     lambda: self.run_cmd(gg.cmd_log_search, "o/r", "(")):
+            with self.assertRaises(gg.WatchError):
+                call()
+
+    def test_a_cut_history_keeps_the_newest_jobs_and_says_so(self) -> None:
+        for job in range(1, 8):
+            self.rec(job, minutes_ago=100 - job)
+            self.ctl_logs[job] = (200, self.QUIET_LOG)
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3):
+            recs, cut = gg.log_records(self.ctl, "o/r", 0)
+            code, text = self.run_cmd(gg.cmd_log_search, "o/r", "linking")
+        self.assertEqual(([r["id"] for r in recs], cut), ([5, 6, 7], True))
+        self.assertEqual(set(recs[0]), set(gg.LOG_RECORD_FIELDS))  # steps and the rest are not kept
+        self.assertIn("history cut to the newest jobs", text)
+
+    def test_logs_past_a_stop_are_counted_under_its_reason(self) -> None:
+        for job in range(1, 6):
+            self.rec(job, minutes_ago=60 - job)
+            self.ctl_logs[job] = (429, b"")
+        _, text = self.run_cmd(gg.cmd_log_search, "o/r", "x", as_json=True)
+        self.assertEqual(json.loads(text)["unread"], {"controller log reads spent": 5})
+
+    def test_a_test_failing_on_every_run_without_a_green_rerun_repeats(self) -> None:
+        for job in range(20, 23):
+            self.rec(job, run=job, minutes_ago=30 - job % 10)
+            self.ctl_logs[job] = (200, self.FAIL_LOG)
+        code, text = self.run_cmd(gg.cmd_log_flaky, "o/r", "stray_sleep", as_json=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(text)["tests"][0]["verdict"], "repeats")
+
+    def test_failed_test_names_by_runner(self) -> None:
+        log = (b"test a::b ... FAILED\n"
+               b"        FAIL [   0.004s] acpmux tests::resume\n"
+               b"Test Case '-[CmuxTests.SidebarTests testHover]' failed (0.1 seconds).\n"
+               b"\xe2\x9c\x98 Test hoverCardOpens() recorded an issue at A.swift:3:1\n"
+               b"FAILED tests/test_x.py::test_y - assert 1\n"
+               b"ERROR: test_z (pkg.mod.Case)\n"
+               b"--- FAIL: TestGo (0.00s)\n"
+               b"  \xc3\x97 renders the chat 12ms\n"
+               b"  \xe2\x9c\x95 opens the menu (3 ms)\n"
+               b"  \xc3\x97 failed to resolve import `./x`\n"  # a diagnostic, not a test
+               b"Test Case 'SidebarTests.testLinux' failed (0.002 seconds)\n"
+               b"test a::b ... FAILED\n")
+        self.assertEqual(gg.log_failed_tests(log), [
+            "a::b", "acpmux tests::resume", "CmuxTests.SidebarTests testHover", "hoverCardOpens()",
+            "tests/test_x.py::test_y", "pkg.mod.Case.test_z", "TestGo", "renders the chat", "opens the menu",
+            "SidebarTests.testLinux"])
+
+    def test_errors_groups_error_lines_by_step(self) -> None:
+        found = gg.log_errors(self.FAIL_LOG)
+        self.assertEqual([s["step"] for s in found["steps"]], ["Run cargo test", "Run python3 -m unittest"])
+        self.assertEqual(found["steps"][0]["lines"], [
+            "test sessions::resume_keeps_order ... FAILED", "thread 'x' panicked at src/lib.rs:4:5:",
+            "error[E0599]: no method named `foo`", "   --> src/lib.rs:9:3"])
+        self.assertEqual(found["steps"][1]["lines"], ["FAIL: test_no_stray_sleep (__main__.FleetRuleLints.test_no_stray_sleep)",
+                                                      "Process completed with exit code 1."])
+        capped = gg.log_errors(self.FAIL_LOG, limit=2)
+        self.assertEqual((capped["total"], capped["shown"]), (6, 2))
+
+    def test_errors_of_a_step_with_no_error_line_shows_its_last_lines(self) -> None:
+        found = gg.log_errors(self.QUIET_LOG)
+        self.assertEqual(found["steps"], [{"step": "Run make", "lines": [
+            "linking cmux-tui", "Process completed with exit code 2."]}])
+
+    def test_errors_reads_one_log_like_log_job(self) -> None:
+        code, text = self.run_cmd(gg.cmd_log_errors, "O/r", 31, as_json=True, rest=self.rest)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["source"], doc["total"]), (0, "rest", 6))
+        self.run_cmd(gg.cmd_log_errors, "o/r", 31, rest=self.rest)
+        self.assertEqual(self.rest_calls, 1)  # the finished log was kept
+
+
 # ---------------------------------------------------------------- land: the queue that takes merge_hold's next steps
 
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
@@ -19916,6 +20114,26 @@ class LandTest(Base):
                 break
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"), e.get("waitBudget"))
+
+    def test_a_train_wait_gets_a_new_budget_with_each_holder_head(self):
+        # 2026-11-19: six hq PRs stopped retry_deadline "still train_wait" behind hq#13113, whose reservation moved to a
+        # new head mid-wait; one budget per waiting head spanned both reservations. Each holder head is its own budget.
+        self.pr(LA)
+        self.land()
+
+        def train(holder: str) -> tuple[int, dict]:
+            return refusal("train_wait", LA, {"kind": "retry", "after_s": 1800}, reason=(
+                "merge_hold: refused: a merge-train PR's rerun holds the base for a file this PR changes: o/r#13113 "
+                f"(label merge-train, head {holder}) lost the checked tree twice"))
+
+        self.w.answers += [train("5395c374953b")] * 4 + [train("f88b029f4655")] * 5
+        e = self.tick()
+        for _ in range(7):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))  # 8 judgments, ~3.5 h: under each holder head's 2 h
+        self.assertEqual(e["waitBudget"]["n"], 4, e["waitBudget"])
+        e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))  # one holder head, 2 h
 
     def test_a_retry_never_strikes_and_stops_at_its_deadline_naming_it(self):
         self.pr(LA)

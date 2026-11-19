@@ -4076,8 +4076,7 @@ class HookTest(unittest.TestCase):
                               ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next.yml", "fast-tier-fleet"),
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                              ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture"),
-                              ("cmux-next-tab-switch.yml", "frames")):
+                              ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
@@ -11156,6 +11155,31 @@ class GateTest(unittest.TestCase):
                                   "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge",
                                   "build-nightly-app")
         self.assertIsNone(hook.nightly_capacity_wait(untrusted, "push", ref, "build-nightly-app", "nightly.yml", "1"))
+
+    def test_the_fast_tier_waits_a_bounded_time_for_capacity(self) -> None:
+        """FAST_TIER_WAIT: cmux-next.yml's fast tier has a 20-minute timeout that counts its wait in "Set up runner",
+        and its run after admission takes 866 s p50 (856 owned fast tiers, 11-16 14Z to 11-19 01Z). Of the 191 that
+        waited 60 s or more for units, 3 passed; 141 of the 348 that ran out the 20 minutes had waited 60 s or more,
+        68202 s in all (run 44290763187 on ultra2: admitted at 1203 s, cancelled before its first step). So it is
+        refused after FAST_TIER_CAPACITY_WAIT_S, and cmux's owned-pool rescue re-runs it (hook_refused() reads the
+        step), instead of a timeout nobody re-runs. Any runner, the fast runner too; other jobs and repos unchanged."""
+        bound = hook.FAST_TIER_CAPACITY_WAIT_S
+        self.assertEqual(bound, 60.0)
+        self.assertLess(bound + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S + 866, 20 * 60,
+                        "a median run admitted at the bound still fits the 20-minute cap")
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        self.assertEqual(hook.fast_tier_capacity_wait("Manaflow-AI/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        for repo, workflow, job in (("someone/else", "cmux-next.yml", "fast-tier"),
+                                    (None, "cmux-next.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "cmux-next.yml", "swift-test"),
+                                    ("manaflow-ai/cmux", "ci.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "", "fast-tier")):
+            with self.subTest(repo=repo, workflow=workflow, job=job):
+                self.assertIsNone(hook.fast_tier_capacity_wait(repo, home, workflow, job))
+        # composes like the other bounds: a shorter explicit wait is kept
+        self.assertEqual(hook.bounded_wait(None, bound), bound)
+        self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
@@ -18305,6 +18329,29 @@ class DedicatedRunnerTest(unittest.TestCase):
             {**NIGHTLY, "labels": ["glaeda-runner-mini-std-nightly-next"]})
         self.assertIn("beside untrusted dedicated runner nightly-next",
                       fleet_labels.dedicated_runners(sibling, "mini-std")[1] or "")
+        # LAN_RELAY_ADAPTERS: a list is one host's adapter addresses on one port; a list of one is that string
+        adapters = ["172.20.1.6:22", "172.20.1.5:22"]
+        for value, expected in ((adapters, adapters), (["172.20.1.6:22"], "172.20.1.6:22"),
+                                (["010.0.0.1:22", "10.0.0.2:22", "192.168.1.1:22", "172.16.0.1:22"],
+                                 ["10.0.0.1:22", "10.0.0.2:22", "192.168.1.1:22", "172.16.0.1:22"])):
+            with self.subTest(value=value):
+                good, why = fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelay": value}), "mini-std")
+                self.assertIsNone(why)
+                self.assertEqual(good[0]["lanRelay"], expected)
+        five = [f"172.20.1.{i}:22" for i in range(1, 6)]
+        for value, needle in (([], "1 to 4 addresses"), (five, "1 to 4 addresses"),
+                              (["172.20.1.5:22", "8.8.8.8:22"], "RFC 1918"),
+                              (["172.20.1.5:22", "mini.local:22"], "IPv4:PORT"),
+                              (["172.20.1.5:22", 22], "IPv4:PORT"),
+                              (["172.20.1.5:22", "172.20.1.5:22"], "an address twice"),
+                              (["172.20.1.5:22", "172.20.1.6:2222"], "one port"),
+                              ({"a": "172.20.1.5:22"}, "IPv4:PORT")):
+            with self.subTest(value=value):
+                _, why = fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelay": value}), "mini-std")
+                self.assertIn(needle, why or "")
+        listed_untrusted = {**untrusted, "lanRelay": adapters}
+        for doc in (manifest_doc(listed_untrusted), manifest_doc({**route, "lanRelay": adapters}, dedicated_only=False)):
+            self.assertIn("runner.dedicatedOnly", fleet_labels.dedicated_runners(doc, "mini-std")[1] or "")
 
         def write(entry: dict) -> str:
             path = self.state / "mini-fleet.json"
@@ -18345,6 +18392,24 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
         self.assertFalse((socket_dir / "fleet-route.sock").exists())
         self.assertEqual(stat.S_IMODE(socket_dir.stat().st_mode), 0o700)
+        # LAN_RELAY_ADAPTERS: a list runs Apple's /bin/sh with the fixed loop over Apple's nc, the addresses as
+        # arguments in declared order; the same socket, no key, no environment
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            listed = self.invoke("--apply", "--manifest", write({**relayed, "lanRelay": adapters}), *args)
+        self.assertEqual(self.by_kind(listed)["relay"]["state"], "update")
+        relay = plistlib.loads((agents / f"{label}.relay.plist").read_bytes())
+        self.assertEqual(relay["ProgramArguments"],
+                         ["/bin/sh", "-c", cr.LAN_RELAY_LOOP, "glaeda-lan-relay", str(cr.LAN_RELAY_CONNECT_S),
+                          str(cr.LAN_RELAY_IDLE_S), "22", "172.20.1.6", "172.20.1.5"])
+        self.assertIn("/usr/bin/nc ", cr.LAN_RELAY_LOOP)
+        self.assertNotIn("172.", cr.LAN_RELAY_LOOP, "addresses are arguments, never script text")
+        self.assertEqual(relay["inetdCompatibility"], {"Wait": False})
+        self.assertEqual(relay["Sockets"]["Listener"]["SockPathName"], os.fspath(socket_dir / "fleet-route.sock"))
+        self.assertNotIn("EnvironmentVariables", relay)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            self.invoke("--apply", "--manifest", write(changed), *args)
         # a relay update while the runner has a job (that may be using it) changes nothing
         (self.state / "loaded.json").write_text(json.dumps([label, f"{label}.relay"]))
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
@@ -18398,6 +18463,44 @@ class DedicatedRunnerTest(unittest.TestCase):
             cr.remove_relay_socket(ctx, {"label": f"{label}.relay", "socket": os.fspath(elsewhere)})
             self.assertTrue(elsewhere.exists(), "never outside the relay directory")
             cr.remove_relay_socket(ctx, {"label": "unrelated"})
+
+    def test_a_lan_relay_list_forwards_to_the_first_adapter_address_that_connects(self) -> None:
+        """LAN_RELAY_ADAPTERS: the relay's loop runs nc to each declared address in order, stops at the first that
+        connects (any status but 1, nc's could-not-connect), hands that address the client's bytes intact, and fails
+        with 1 when none connects. A connected session that ends in an error is never retried elsewhere."""
+        fake = self.home / "fake-nc"
+        calls = self.home / "nc-calls"
+        # answers: address -> exit status; 0 echoes stdin (a connected session), 1 is "could not connect"
+        fake.write_text("#!/bin/sh\n"
+                        f'echo "$*" >> {shlex.quote(os.fspath(calls))}\n'
+                        'case "$5" in\n'
+                        '  172.20.1.6) exit 1 ;;\n'
+                        '  172.20.1.5) cat; exit 0 ;;\n'
+                        '  10.0.0.9) cat; exit 2 ;;\n'
+                        '  *) exit 1 ;;\n'
+                        'esac\n')
+        fake.chmod(0o755)
+        loop = cr.LAN_RELAY_LOOP.replace("/usr/bin/nc", os.fspath(fake))
+        self.assertNotEqual(loop, cr.LAN_RELAY_LOOP)
+
+        def relay(*addresses: str) -> subprocess.CompletedProcess:
+            calls.unlink(missing_ok=True)
+            return subprocess.run(["/bin/sh", "-c", loop, "glaeda-lan-relay", "5", "900", "22", *addresses],
+                                  input=b"SSH-2.0-client\r\n", capture_output=True, timeout=30)
+
+        moved = relay("172.20.1.6", "172.20.1.5")
+        self.assertEqual((moved.returncode, moved.stdout), (0, b"SSH-2.0-client\r\n"))
+        self.assertEqual(calls.read_text().splitlines(),
+                         ["-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"])
+        first = relay("172.20.1.5", "172.20.1.6")
+        self.assertEqual((first.returncode, first.stdout), (0, b"SSH-2.0-client\r\n"))
+        self.assertEqual(calls.read_text().splitlines(), ["-G 5 -w 900 172.20.1.5 22"], "the first that connects")
+        none = relay("172.20.1.6", "192.168.9.9")
+        self.assertEqual((none.returncode, none.stdout), (1, b""))
+        self.assertEqual(len(calls.read_text().splitlines()), 2)
+        broken = relay("10.0.0.9", "172.20.1.5")
+        self.assertEqual(broken.returncode, 2)
+        self.assertEqual(calls.read_text().splitlines(), ["-G 5 -w 900 10.0.0.9 22"], "a connected session ends it")
 
     def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))

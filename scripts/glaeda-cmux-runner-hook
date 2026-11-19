@@ -697,9 +697,8 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cu-driver-eval.yml's and screen-stream-eval.yml's eval (cmux-ci run --label measure). Each only submits its step and
 # waits, but waits longer than a compile client (job timeouts 420, 150 and 300 min), holding one gateway token; a
 # nightly signing drain on that mini then waits its hour. They start once a day each, one at a time per workflow.
-# cmux-next-hot-verify.yml's look, the feat-cmux-next half of a pull request's hot verify, submits cmuxterm-hq's
-# build-fleet/pr_capture/fleet-step-hot-verify.sh (cmux-ci run --class light --display; the step runs on a display
-# worker) and waits up to 75 min, once per eligible pull request head (a newer head cancels it).
+# cmux-next-hot-verify.yml's look is no longer here: the cmux-ci controller queues that display step itself from the
+# workflow's request job and posts the result from a completion callback, so no runner waits for it (cmux#46197).
 # native-sidebar-gallery.yml's capture also submits a display-worker step; its gateway runs only the client
 # and shell builtins, checks the exact source and artifact receipt, and leaves the archive in fleet storage.
 # cmux-next-tab-switch.yml's frames (an advisory pull request check; Leo, 2026-11-15, asked for CI on tab switching)
@@ -723,8 +722,7 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("fleet-compile-check.yml", "compile-check"), ("fleet-test-compile.yml", "compile"),
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                          ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture"),
-                          ("cmux-next-tab-switch.yml", "frames")})
+                          ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
@@ -2070,6 +2068,24 @@ STACK_SLOT_CAPACITY_WAIT_S = 300.0
 def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool) -> float | None:
     """`cap`, bounded to STACK_SLOT_CAPACITY_WAIT_S for a stack-blocker job on the nightly slot (STACK_SLOT_WAIT)."""
     return bounded_wait(cap, STACK_SLOT_CAPACITY_WAIT_S) if nightly_runner and tier == TIER_STACK else cap
+
+
+# FAST_TIER_WAIT: cmux-next.yml's fast tier has a 20-minute timeout-minutes that counts its wait in "Set up runner",
+# and its run after admission takes 866 s p50 and 1114 s p90 (856 owned fast tiers, 2026-11-16 14Z to 11-19 01Z).
+# Waiting with no limit (CAPACITY_WAIT) left it no time to run: of the 191 that waited 60 s or more for units, 3
+# passed, and 141 of the 348 that ran out the 20 minutes had waited 60 s or more, 68202 s of their caps in all
+# (run 44290763187 on ultra2: admitted at 1203 s, cancelled before its first step). cmux's owned-pool rescue moves
+# a job held in setup only after SETUP_WAIT_SECONDS (15 minutes) and once its siblings end, too late for that cap,
+# and it never re-runs a PR job GitHub timed out. So on any runner the fast tier waits this long at most and is then
+# refused: the rescue reads the refusal by its step (hook_refused()) and re-runs it, placed again.
+FAST_TIER_CAPACITY_WAIT_S = 60.0
+
+
+def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
+    """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
+    if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
+        return None
+    return FAST_TIER_CAPACITY_WAIT_S
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -14407,6 +14423,11 @@ def main(argv: list[str] | None = None) -> int:
                 repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                 os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
+            fast_bound = fast_tier_capacity_wait(repo, args.home_repo, job_workflow(), os.environ.get("GITHUB_JOB", ""))
+            cap = bounded_wait(cap, fast_bound)
+            if fast_bound is not None:
+                print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
+                      "then is refused so the owned-pool rescue re-runs it inside its 20-minute timeout", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(

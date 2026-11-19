@@ -907,6 +907,13 @@ no other admission takes a unit, every other runner's gate on the mini holds,
 and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
+cmux-next.yml's fast tier waits at most `FAST_TIER_CAPACITY_WAIT_S` (60 s) for units or
+tokens, on any runner, then is refused (FAST_TIER_WAIT). Its 20-minute timeout counts the
+wait in "Set up runner", and a run after admission takes 866 s p50: of 191 fast tiers that
+waited 60 s or more (2026-11-16 to 11-19), 3 passed, and 141 timeouts had spent 68202 s of
+their caps waiting. cmux's owned-pool rescue re-runs a refusal; it never re-runs a PR job
+GitHub timed out.
+
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
 in the job's own event payload (`GITHUB_EVENT_PATH`, no API call). They go ahead of DEV
@@ -1507,12 +1514,20 @@ declare `"lanRelay": "A.B.C.D:PORT"`, one private (RFC 1918) address and port, a
 - Nothing a job sends chooses the destination, and the address is in the member's manifest entry, never in a job.
 - Each connection ends at either side's EOF, after 5 s with no connect, or after 900 s with no byte either way. Between
   connections launchd only holds the socket.
+- One host with several wired adapters (one per Studio Display, so its LAN address depends on which display it is
+  plugged into) may list them instead: `"lanRelay": ["A.B.C.D:PORT", "A.B.C.E:PORT"]`, at most 4, distinct, every one RFC 1918, all on one port
+  (`LAN_RELAY_ADAPTERS`). Per connection launchd then starts Apple's `/bin/sh` with a fixed loop that runs
+  `/usr/bin/nc -G 5 -w 900 ADDRESS PORT` for each address in order and stops at the first that connects (nc exits 1
+  only when it could not connect; a connected session ends the loop whatever its status). The addresses are
+  arguments, never script text, and no name is resolved, so the trust stays these declared addresses of one host,
+  one port. A single string, or a list of one, keeps plain nc.
 - Refused: any address outside RFC 1918, an entry without `trustedRef` (so a pull request's code never runs beside the
   relay), and a member without `runner.dedicatedOnly` (so no other runner of the same user shares the Mac).
 - `glaeda-cmux-runner-fleet --apply --hosts M` installs it. Dropping the key, or `--uninstall`, boots it out and
   removes its plist and socket. mini-health counts it as glaeda's (`com.teamleaderleo.glaeda.*`).
 
-This deliberately crosses macOS Local Network privacy for one address and port on an owner-only mini.
+This deliberately crosses macOS Local Network privacy for one host (one address, or its declared adapter addresses)
+and one port on an owner-only mini.
 
 ### A runner in its own macOS account (`user`)
 
@@ -1693,8 +1708,7 @@ in at the producer's root. So one root job per root per mini:
   `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
   `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
-  steps run on the bench mini or a measure worker, and `cmux-next-hot-verify.yml`'s `look`, whose step runs on a
-  display worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
+  steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.

@@ -18,6 +18,11 @@
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
                                                         else one REST read; kept compressed for the next reader
+    glaeda-gh log errors OWNER/REPO JOB_ID [--max N] [--json]   that job's error-level lines by step, not the whole log
+    glaeda-gh log search OWNER/REPO PATTERN [--since 24h] [--job RE] [--workflow RE] [--conclusion failed|any|C]
+                                                        which recent jobs printed PATTERN (controller job history,
+                                                        kept logs only: no REST; --reads N caps controller reads)
+    glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
@@ -8930,6 +8935,12 @@ LAND_WAIT_STUCK = 4 * 3600.0
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
 LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
                   "rerun_failed": "the rerun of the cancelled jobs"}
+# A train_wait (another PR's merge-train reservation holds the base for a file this one changes) is a retry merge_hold
+# itself bounds: the reservation lives TRAIN_HOLD_S (1.5 h) from the holder's head, under the retry's 2 h. So its budget
+# is the reservation's, keyed on the holder and its head: a new holder head is a new reservation and a new budget. Keyed
+# on the waiting head alone, one budget spanned every holder head: 2026-11-19 hq#12558, #13035, #12713, #12590, #12844
+# and #12653 each stopped retry_deadline ("still train_wait") behind hq#13113's two heads, each a requeue by hand.
+LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head ([0-9a-f]{7,40})\)")
 # A cancelled job is rerun at most this many times per (head, run) (e["reruns"], take's rerun_failed): its rerun's checks
 # can finish within minutes, so the 2 h budget alone let a job cancelled every time (a concurrency group, a timeout
 # reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
@@ -10987,6 +10998,10 @@ class LandQueue:
         identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
         kind = str(act.get("kind"))
         key = head  # one budget per head, whatever kind of wait (LAND_WAIT_DEADLINE's comment)
+        train = LAND_TRAIN_HOLDER.search(str(answer.get("reason") or "")) \
+            if str(answer.get("code") or "") == "train_wait" else None
+        if train:
+            key = f"{head}|train:{train.group(1)}@{train.group(2)}"  # LAND_TRAIN_HOLDER's comment
         size = max(LAND_WAIT_DEADLINE[kind], 2 * land_seconds(act.get("timeout_s"), 0.0, 0.0))
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
@@ -20260,39 +20275,406 @@ def job_log_finished(text: bytes) -> bool:
     return JOB_LOG_DONE in text[-4096:]
 
 
+def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log
+                 ) -> tuple[bytes | None, str, str]:
+    """(log, source, why not) for JOB: kept here, else from the build controller, else one REST read. rest=None
+    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota."""
+    repo = repo.lower()
+    text = job_log_get(repo, job)
+    if text is not None:
+        return text, "cache", ""
+    ctl = Controller.from_env() if controller == "env" else controller
+    status = 0
+    if ctl is not None:
+        status, body = controller_job_log(ctl, repo, job)
+        if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
+            with contextlib.suppress(OSError):
+                job_log_put(repo, job, body)  # the controller serves only a finished job's log
+            return body, "controller", ""
+    if status == 410:
+        return None, "", "expired"
+    if rest is None and status == 200:
+        return None, "", "too large"
+    if rest is None:
+        return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
+            status, "not kept by the controller")
+    ok, body, why = rest(repo, job)
+    if not ok:
+        return None, "", why
+    if job_log_finished(body):
+        with contextlib.suppress(OSError):
+            job_log_put(repo, job, body)
+    return body, "rest", ""
+
+
 def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = rest_job_log) -> int:
     """Print JOB's log: kept here, else from the build controller, else one REST read. Exit 0 only with the log on
     stdout; anything else prints nothing there, so a caller reads GitHub itself."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log job takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
-    text, source = job_log_get(repo, job), "cache"
+    text, source, why = job_log_read(repo, job, controller, rest)
     if text is None:
-        ctl = Controller.from_env() if controller == "env" else controller
-        status = 0
-        if ctl is not None:
-            status, body = controller_job_log(ctl, repo, job)
-            if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
-                text, source = body, "controller"
-                with contextlib.suppress(OSError):
-                    job_log_put(repo, job, text)  # the controller serves only a finished job's log
-        if text is None and status == 410:
+        if why == "expired":
             print(f"glaeda-gh: GitHub has no log for {repo} job {job} any more (expired)", file=sys.stderr)
-            return EXIT_FAIL
-        if text is None:
-            ok, body, why = rest(repo, job)
-            if not ok:
-                print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
-                return EXIT_FAIL
-            text, source = body, "rest"
-            if job_log_finished(text):
-                with contextlib.suppress(OSError):
-                    job_log_put(repo, job, text)
+        else:
+            print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+        return EXIT_FAIL
     out = sys.stdout.buffer
     out.write(text)
     out.flush()
     if source != "cache" and full_output():
         print(f"glaeda-gh: {repo} job {job} read from the {source}", file=sys.stderr)
+    return EXIT_OK
+
+
+# `log search`, `log flaky` and `log errors`: what an agent asks of CI logs without fetching one whole. The jobs come
+# from the build controller's timing history (every finished job of the repository, 8 days, no GitHub read) and the
+# logs from job_log_read without REST (this host's kept copy, else the controller's, kept 72 h): a scan across
+# hundreds of jobs spends no user quota, and a log neither holds is reported unread, never fetched.
+LOG_SCAN_PAGE = 2000  # timing records per controller read (a record's step list keeps a page well under MAX_BODY)
+LOG_SCAN_PAGES = 200  # at most this many reads: 400,000 jobs, over a week of cmux
+LOG_SCAN_KEEP = 60000  # the newest records a scan keeps: only the newest have logs (72 h), and this bounds memory
+LOG_KEPT_S = 72 * 3600  # how long the controller keeps a read log (ghevents.JobLogRetention)
+LOG_RECORD_FIELDS = ("at", "id", "job", "run", "attempt", "conclusion", "workflow", "seg")
+LOG_SCAN_READS = 40  # default cap on logs read from the controller per command (kept copies are free)
+LOG_LINE_MAX = 300  # a printed log line is cut here
+LOG_FAILED = frozenset({"failure", "timed_out"})
+LOG_STAMP = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")
+LOG_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# A failing test's name, by runner: cargo test, nextest, XCTest, swift-testing, pytest, unittest, go, jest/vitest.
+LOG_TEST_FAILS = (
+    re.compile(r"^test (\S+) \.\.\. FAILED$"),
+    re.compile(r"^\s*(?:FAIL|TIMEOUT|SIGSEGV|SIGABRT) \[\s*[\d.]+s\]\s+(?:\(\d+/\d+\)\s+)?(\S+(?: \S+)?)\s*$"),
+    re.compile(r"Test Case '(?:-\[(\S+ \S+)\]|([\w.]+))' failed"),  # macOS `-[Class test]`, Linux `Class.test`
+    re.compile(r"✘ Test (\"[^\"]+\"|[\w.]+(?:\([^)]*\))?) (?:failed|recorded an issue)"),
+    re.compile(r"^FAILED (\S+::\S+)"),
+    re.compile(r"^(?:FAIL|ERROR): (\w+ \([\w.]+\))"),
+    re.compile(r"^\s*--- FAIL: (\S+)"),
+    # jest's ✕; vitest's × only with its duration, as diagnostics (miette, biome, turbo) print `× message` too
+    re.compile(r"^\s*(?:✕ (.+?)(?: \(\d+(?:\.\d+)? ?m?s\))?|× (.+?) \d+(?:\.\d+)? ?m?s)$"),
+)
+LOG_ERROR = re.compile(r"##\[error\]|^error(?:\[E\d+\])?:|: (?:fatal )?error:|^fatal( error)?:|panicked at|"
+                       r"^Traceback \(most recent call last\)|^\w*(?:Error|Exception): |^Error: |\bFAILED\b|"
+                       r"^FAIL[: ]|--- FAIL|✘|✕|npm ERR!|\berror TS\d+:|^E {3}")
+LOG_ERROR_FOLLOW = re.compile(r"^\s*--> \S+:\d+")  # rustc's location line under an error
+
+
+def log_line(raw: bytes | str) -> str:
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    return LOG_ANSI.sub("", LOG_STAMP.sub("", text.rstrip("\r\n")))
+
+
+def log_lines(text: bytes) -> list[str]:
+    return [log_line(raw) for raw in text.splitlines()]
+
+
+def log_failed_tests(text: bytes) -> list[str]:
+    """The failing tests a log names, each once, in order."""
+    seen: dict[str, None] = {}
+    for line in log_lines(text):
+        for pattern in LOG_TEST_FAILS:
+            match = pattern.search(line)
+            if match:
+                name = next(g for g in match.groups() if g is not None).strip().strip('"')
+                unit = re.fullmatch(r"(\w+) \(([\w.]+)\)", name)  # unittest: `test_x (__main__.Case.test_x)`
+                if unit:
+                    qual = unit.group(2).removeprefix("__main__.")
+                    name = qual if qual.endswith("." + unit.group(1)) else f"{qual}.{unit.group(1)}"
+                seen.setdefault(name, None)
+                break
+    return list(seen)
+
+
+def log_errors(text: bytes, limit: int = 40) -> dict:
+    """The error-level lines of one log, under the step (`##[group]`) that printed them, each once:
+    {"steps": [{"step", "lines"}], "total", "shown"}. A step that failed with no recognised error line gets its
+    last lines before the exit, so every red step says something."""
+    steps: list[dict] = []
+    step, tail, seen = "(setup)", [], set()
+    current: dict | None = None
+    total = shown = 0
+    follow = False
+
+    def add(line: str) -> None:
+        nonlocal current, total, shown
+        line = line[:LOG_LINE_MAX]
+        if line in seen:
+            return
+        seen.add(line)
+        total += 1
+        if shown >= limit:
+            return
+        if current is None or current["step"] != step:
+            current = {"step": step, "lines": []}
+            steps.append(current)
+        current["lines"].append(line)
+        shown += 1
+
+    for line in log_lines(text):
+        if line.startswith("##[group]"):
+            step, tail, follow = line[len("##[group]"):].strip()[:120] or "(step)", [], False
+            continue
+        if line.startswith("##[endgroup]"):
+            continue
+        if follow and LOG_ERROR_FOLLOW.match(line):
+            add(line.rstrip())
+            follow = False
+            continue
+        follow = False
+        if LOG_ERROR.search(line):
+            if "Process completed with exit code" in line and (current is None or current["step"] != step):
+                for before in tail[-5:]:
+                    add(before)
+            add(line.replace("##[error]", "", 1).strip())
+            follow = line.lstrip().startswith("error")
+        elif line.strip():
+            tail = (tail + [line.rstrip()])[-5:]
+    return {"steps": steps, "total": total, "shown": shown}
+
+
+def log_records(ctl: "Controller", repo: str, since: float, pages: int = LOG_SCAN_PAGES) -> tuple[list[dict], bool]:
+    """(finished job records of REPO since SINCE, oldest first, each cut to LOG_RECORD_FIELDS; whether older ones were
+    dropped). The controller answers oldest first, so the scan pages to the end and keeps the newest LOG_SCAN_KEEP:
+    only the newest jobs still have logs. Past PAGES reads the history is cut at its newest end too, and said."""
+    out: dict[int, dict] = {}
+    cursor, cut = int(since), False
+    for _ in range(pages):
+        doc = ctl.get(f"/v1/github/timing/records?repo={urllib.parse.quote(repo, safe='/')}&since={cursor}"
+                      f"&limit={LOG_SCAN_PAGE}", timeout=30)
+        recs = [r for r in doc.get("records") or [] if isinstance(r, dict)]
+        for r in recs:
+            if r.get("job") and r.get("id"):
+                out[int(r["id"])] = {k: r.get(k) for k in LOG_RECORD_FIELDS}
+        if len(out) > 2 * LOG_SCAN_KEEP:  # drop the oldest as it goes, so memory stays bounded
+            out = dict(sorted(out.items(), key=lambda kv: kv[1].get("at") or "")[-LOG_SCAN_KEEP:])
+            cut = True
+        last = max((iso_epoch(r.get("at")) or 0 for r in recs), default=0)
+        if not doc.get("more") or not recs:
+            break
+        cursor = int(last) if int(last) > cursor else cursor + 1  # a page all in one second moves on a second
+    else:
+        cut = True
+    kept = sorted(out.values(), key=lambda r: r.get("at") or "")
+    return kept[-LOG_SCAN_KEEP:], cut or len(kept) > LOG_SCAN_KEEP
+
+
+def log_regex(text: str | None, what: str, flags: int = 0) -> re.Pattern | None:
+    if not text:
+        return None
+    try:
+        return re.compile(text, flags)
+    except re.error as error:
+        raise WatchError(f"{what} is not a regular expression: {error}") from None
+
+
+def log_since(text: str) -> float:
+    match = re.fullmatch(r"(\d+)([mhd])", text.strip())
+    if not match:
+        raise WatchError(f"--since takes a duration such as 90m, 24h or 3d, not {text!r}")
+    return time.time() - int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def log_job_url(repo: str, r: dict) -> str:
+    return f"https://github.com/{repo}/actions/runs/{r.get('run') or 0}/job/{r['id']}"
+
+
+def log_pick(recs: list[dict], job: str | None, workflow: str | None, seg: str | None,
+             conclusion: str) -> list[dict]:
+    """The records a scan reads, newest first."""
+    job_re = log_regex(job, "--job", re.I)
+    wf_re = log_regex(workflow, "--workflow", re.I)
+    picked = []
+    for r in reversed(recs):
+        if job_re and not job_re.search(r.get("job") or ""):
+            continue
+        if wf_re and not wf_re.search(r.get("workflow") or ""):
+            continue
+        if seg and r.get("seg") != seg:
+            continue
+        if conclusion == "failed" and (r.get("conclusion") or "") not in LOG_FAILED:
+            continue
+        if conclusion not in ("failed", "any") and r.get("conclusion") != conclusion:
+            continue
+        picked.append(r)
+    return picked
+
+
+class LogScan:
+    """Read logs for a scan: kept copies free, at most `reads` from the controller, none over REST; tally the rest."""
+
+    def __init__(self, repo: str, reads: int, controller: Any):
+        self.repo, self.reads, self.controller = repo, reads, controller
+        self.read = self.down = 0
+        self.stopped = "over --reads"  # why a log past the cap was not read
+        self.unread: dict[str, int] = {}
+
+    def text(self, job: int) -> bytes | None:
+        kept = job_log_get(self.repo, job)
+        if kept is not None:
+            return kept
+        if self.read >= self.reads:
+            self.unread[self.stopped] = self.unread.get(self.stopped, 0) + 1
+            return None
+        self.read += 1
+        text, _, why = job_log_read(self.repo, job, self.controller, rest=None)
+        self.down = self.down + 1 if why == "controller down" else 0
+        if text is None:
+            self.unread[why] = self.unread.get(why, 0) + 1
+            if why == "controller log reads spent" or self.down >= 3:
+                self.reads = self.read  # no use asking again (one slow read is the controller reading GitHub)
+                self.stopped = why
+        return text
+
+    def note(self) -> str:
+        return ", ".join(f"{n} {why}" for why, n in sorted(self.unread.items(), key=lambda kv: -kv[1]))
+
+
+def log_scan_setup(repo: str, since: str, controller: Any) -> tuple[str, Any, list[dict], bool]:
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo):
+        raise WatchError("log search and log flaky take OWNER/REPO first")
+    ctl = Controller.from_env() if controller == "env" else controller
+    if ctl is None:
+        raise WatchError("no build controller configured (CMUX_CI_CONTROLLER): log search reads its job history")
+    # Older jobs' logs are gone from the controller (72 h) and every history page re-reads a day file there: a scan
+    # never asks for history it could not read the logs of.
+    recs, more = log_records(ctl, repo.lower(), max(log_since(since), time.time() - LOG_KEPT_S))
+    return repo.lower(), ctl, recs, more
+
+
+def cmd_log_search(repo: str, pattern: str, since: str = "24h", job: str | None = None, workflow: str | None = None,
+                   seg: str | None = None, conclusion: str = "failed", reads: int = LOG_SCAN_READS,
+                   limit: int = 20, as_json: bool = False, controller: Any = "env") -> int:
+    """Which recent jobs printed PATTERN: newest first, the first matching lines of each. Exit 0 with a match, 1
+    with none (the scan note says how many logs it could not read)."""
+    try:
+        regex = re.compile(pattern)
+    except re.error as error:
+        raise WatchError(f"PATTERN is not a regular expression: {error}") from None
+    repo, ctl, recs, more = log_scan_setup(repo, since, controller)
+    picked = log_pick(recs, job, workflow, seg, conclusion)
+    scan = LogScan(repo, reads, ctl)
+    matches, scanned = [], 0
+    for r in picked:
+        if len(matches) >= limit:
+            break
+        text = scan.text(int(r["id"]))
+        if text is None:
+            continue
+        scanned += 1
+        hits = [line[:LOG_LINE_MAX] for line in log_lines(text) if regex.search(line)]
+        if hits:
+            matches.append({"at": r.get("at"), "workflow": r.get("workflow"), "job": r.get("job"),
+                            "seg": r.get("seg"), "conclusion": r.get("conclusion"), "run": r.get("run"),
+                            "id": r["id"], "attempt": r.get("attempt"), "url": log_job_url(repo, r),
+                            "count": len(hits), "lines": hits[:3]})
+    out = {"repo": repo, "pattern": pattern, "jobs": len(picked), "scanned": scanned, "unread": scan.unread,
+           "history_cut": more, "matches": matches}
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        note = f"; unread: {scan.note()}" if scan.unread else ""
+        note += "; history cut to the newest jobs" if more else ""
+        print(f"{len(matches)} of {scanned} logs read printed /{pattern}/ ({len(picked)} {conclusion} jobs in "
+              f"--since {since}{note})")
+        for m in matches:
+            print(f"{(m['at'] or '')[:16]}Z {m['seg']} {m['workflow']} / {m['job']} ({m['conclusion']}, "
+                  f"{m['count']} lines) {m['url']}")
+            for line in m["lines"]:
+                print(f"    {line}")
+    return EXIT_OK if matches else EXIT_FAIL
+
+
+def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: str | None = None,
+                  reads: int = LOG_SCAN_READS * 2, limit: int = 20, as_json: bool = False,
+                  controller: Any = "env") -> int:
+    """Failing tests by name across recent failed jobs, and which of them are flaky: a test is flaky when the job
+    that failed on it passed when re-run (a later attempt of the same run). With TEST (a regex), only those tests.
+    Exit 0 when a flaky test is listed, 1 when none."""
+    test_re = log_regex(test, "TEST", re.I)
+    job_re = log_regex(job, "--job", re.I)
+    repo, ctl, recs, more = log_scan_setup(repo, since, controller)
+    # (run, job name) -> the latest attempt that passed. A re-run is a later attempt of the same run: a matrix sibling
+    # with the same name passing in the same attempt is not one, and a record without a run is never matched.
+    passed_attempt: dict[tuple, int] = {}
+    for r in recs:
+        if r.get("conclusion") == "success" and r.get("run"):
+            key = (r.get("run"), r.get("job"))
+            passed_attempt[key] = max(passed_attempt.get(key, 0), int(r.get("attempt") or 1))
+    failed = [r for r in reversed(recs) if (r.get("conclusion") or "") in LOG_FAILED
+              and (not job_re or job_re.search(r.get("job") or ""))]
+    scan = LogScan(repo, reads, ctl)
+    tests: dict[str, dict] = {}
+    jobs_rerun_green: dict[str, int] = {}
+    scanned = 0
+    for r in failed:
+        rerun_green = bool(r.get("run")) and \
+            passed_attempt.get((r.get("run"), r.get("job")), 0) > int(r.get("attempt") or 1)
+        if rerun_green:
+            jobs_rerun_green[r.get("job") or ""] = jobs_rerun_green.get(r.get("job") or "", 0) + 1
+        text = scan.text(int(r["id"]))
+        if text is None:
+            continue
+        scanned += 1
+        for name in log_failed_tests(text):
+            if test_re and not test_re.search(name):
+                continue
+            t = tests.setdefault(name, {"test": name, "fails": 0, "runs": set(), "rerun_green": 0, "jobs": set(),
+                                        "last": None, "url": None})
+            t["fails"] += 1
+            t["runs"].add(r.get("run"))
+            t["jobs"].add(r.get("job"))
+            t["rerun_green"] += int(rerun_green)
+            if t["last"] is None:
+                t["last"], t["url"] = r.get("at"), log_job_url(repo, r)
+    rows = []
+    for t in tests.values():
+        verdict = "flaky" if t["rerun_green"] else ("repeats" if len(t["runs"]) >= 3 else "once")
+        rows.append({"test": t["test"], "verdict": verdict, "fails": t["fails"], "runs": len(t["runs"]),
+                     "rerun_green": t["rerun_green"], "jobs": sorted(j for j in t["jobs"] if j),
+                     "last": t["last"], "url": t["url"]})
+    order = {"flaky": 0, "repeats": 1, "once": 2}
+    rows.sort(key=lambda x: (order[x["verdict"]], -x["rerun_green"], -x["fails"], x["test"]))
+    out = {"repo": repo, "test": test, "failed_jobs": len(failed), "scanned": scanned, "unread": scan.unread,
+           "history_cut": more, "tests": rows[:limit],
+           "jobs_rerun_green": dict(sorted(jobs_rerun_green.items(), key=lambda kv: -kv[1])[:limit])}
+    flaky = any(x["verdict"] == "flaky" for x in rows)
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+        return EXIT_OK if flaky else EXIT_FAIL
+    note = f"; unread: {scan.note()}" if scan.unread else ""
+    note += "; history cut to the newest jobs" if more else ""
+    print(f"{len(rows)} failing tests in {scanned} of {len(failed)} failed jobs, --since {since}{note}")
+    for x in rows[:limit]:
+        print(f"{x['verdict']:7} {x['test']}: failed {x['fails']}x in {x['runs']} runs, {x['rerun_green']} passed on "
+              f"re-run; {', '.join(x['jobs'][:2])}; last {(x['last'] or '')[:16]}Z {x['url']}")
+    if jobs_rerun_green and not test_re:
+        top = ", ".join(f"{name} ({n})" for name, n in list(out["jobs_rerun_green"].items())[:5])
+        print(f"jobs that went green on re-run: {top}")
+    return EXIT_OK if flaky else EXIT_FAIL
+
+
+def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
+                   rest: Callable = rest_job_log) -> int:
+    """One job's error-level lines by step, not its whole log. Exit 0 with its log read (a log with no error line
+    prints a count of 0), 1 without a log."""
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
+        raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
+    repo = repo.lower()
+    text, source, why = job_log_read(repo, job, controller, rest)
+    if text is None:
+        print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+        return EXIT_FAIL
+    found = log_errors(text, limit)
+    if as_json:
+        print(json.dumps({"repo": repo, "job": job, "source": source, **found}, sort_keys=True))
+        return EXIT_OK
+    more = f", {found['total'] - found['shown']} more past --max" if found["total"] > found["shown"] else ""
+    print(f"{repo} job {job}: {found['total']} error lines in {len(found['steps'])} steps{more}")
+    for s in found["steps"]:
+        print(f"[{s['step']}]")
+        for line in s["lines"]:
+            print(f"  {line}")
     return EXIT_OK
 
 
@@ -20502,6 +20884,35 @@ def parser() -> argparse.ArgumentParser:
     lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
     lj.add_argument("repo", metavar="OWNER/REPO")
     lj.add_argument("job", type=int, metavar="JOB_ID")
+    le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log")
+    le.add_argument("repo", metavar="OWNER/REPO")
+    le.add_argument("job", type=int, metavar="JOB_ID")
+    le.add_argument("--max", type=int, default=40, metavar="N", help="lines shown (default 40)")
+    le.add_argument("--json", action="store_true")
+    for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
+                                  "on the controller, never REST)"),
+                       ("flaky", "failing tests by name across recent failed jobs; flaky = the job passed on "
+                                 "re-run")):
+        ls = lgs.add_parser(kind, help=text)
+        ls.add_argument("repo", metavar="OWNER/REPO")
+        if kind == "search":
+            ls.add_argument("pattern", metavar="PATTERN", help="a Python regular expression")
+        else:
+            ls.add_argument("test", nargs="?", default=None, metavar="TEST", help="only tests matching this regex")
+        ls.add_argument("--since", default="24h" if kind == "search" else "72h",
+                        help="how far back: 90m, 24h, 72h (default %(default)s; at most 72 h, as long as the controller keeps logs)")
+        ls.add_argument("--job", default=None, metavar="REGEX", help="only jobs whose name matches")
+        if kind == "search":
+            ls.add_argument("--workflow", default=None, metavar="REGEX", help="only workflows whose name matches")
+            ls.add_argument("--seg", choices=("pr", "main", "queue", "other"), default=None,
+                            help="only jobs of this trigger")
+            ls.add_argument("--conclusion", default="failed",
+                            help="failed (default: failure or timed_out), any, or one conclusion (success)")
+        ls.add_argument("--reads", type=int, default=LOG_SCAN_READS if kind == "search" else LOG_SCAN_READS * 2,
+                        metavar="N", help="logs read from the controller at most (kept ones are free; default "
+                                          "%(default)s)")
+        ls.add_argument("--limit", type=int, default=20, metavar="N", help="rows shown (default 20)")
+        ls.add_argument("--json", action="store_true")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")
     b = sub.add_parser("budget", help="who spent the shared login's quota this hour, per host and caller, and "
@@ -20593,6 +21004,13 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_audit_by_caller(audit_lines(args.log or guard_log(), args.last), args.json)
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
+            if args.kind == "errors":
+                return cmd_log_errors(args.repo, args.job, args.max, args.json)
+            if args.kind == "search":
+                return cmd_log_search(args.repo, args.pattern, args.since, args.job, args.workflow, args.seg,
+                                      args.conclusion, args.reads, args.limit, args.json)
+            if args.kind == "flaky":
+                return cmd_log_flaky(args.repo, args.test, args.since, args.job, args.reads, args.limit, args.json)
             return cmd_log_job(args.repo, args.job)
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
