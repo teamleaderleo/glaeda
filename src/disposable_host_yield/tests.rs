@@ -393,15 +393,28 @@ fn host_first_workers_are_counted_by_their_runner_class() {
             _ => None,
         }
     };
-    assert_eq!(count_host_first_workers(listing, hooks), jobs(4, 1, 1, 1));
     assert_eq!(
-        count_host_first_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| None),
+        count_host_first_workers(listing, |runner| Ok(hooks(runner))),
+        jobs(4, 1, 1, 1)
+    );
+    assert_eq!(
+        count_host_first_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| Ok(
+            None
+        )),
         jobs(0, 0, 0, 0)
+    );
+    // A hook that exists but cannot be read is no reading: the host yields rather than miss a nightly.
+    assert_eq!(
+        count_host_first_workers(
+            "/x/actions-runner-glaeda-2/bin/Runner.Worker\n",
+            |_| Err(())
+        ),
+        None
     );
     // A flag word only counts whole: --nightly-runner-x is not the nightly slot.
     assert_eq!(
         count_host_first_workers("/x/actions-runner-glaeda-2/bin/Runner.Worker\n", |_| {
-            Some("--nightly-runner-x --dev-compile-runner-y".to_owned())
+            Ok(Some("--nightly-runner-x --dev-compile-runner-y".to_owned()))
         }),
         jobs(0, 0, 0, 0)
     );

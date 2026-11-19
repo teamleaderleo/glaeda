@@ -382,7 +382,11 @@ impl<E: TimedCommandExecutor> MacHostYield<E> {
             return None;
         }
         count_host_first_workers(&record.stdout, |runner| {
-            read_small(&runner.join(RUNNER_HOOK_SCRIPT)).ok()
+            match read_small(&runner.join(RUNNER_HOOK_SCRIPT)) {
+                Ok(text) => Ok(Some(text)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(()),
+            }
         })
     }
 
@@ -447,12 +451,13 @@ fn has_flag(text: &str, flags: &[&str]) -> bool {
 }
 
 /// Running jobs of the Mac's own priority runners in a `ps -axo comm=` listing. `hook_script` reads
-/// one runner install's job-started hook (`None` when it has none, as the hook's `runner_scope`
-/// reads it). An install is `actions-runner*`, or a lease runner's `runner` tree. Pure apart from
+/// one runner install's job-started hook (`Ok(None)` when it has none, as the hook's `runner_scope`
+/// reads it; `Err` when it cannot be read, which makes the whole listing unreadable, so the host
+/// yields). An install is `actions-runner*`, or a lease runner's `runner` tree. Pure apart from
 /// that reader.
 pub(crate) fn count_host_first_workers(
     listing: &str,
-    hook_script: impl Fn(&Path) -> Option<String>,
+    hook_script: impl Fn(&Path) -> Result<Option<String>, ()>,
 ) -> Option<HostFirstJobs> {
     let mut jobs = HostFirstJobs::default();
     let bump = |count: &mut u16| *count = count.saturating_add(1).min(MAX_COUNT);
@@ -479,7 +484,10 @@ pub(crate) fn count_host_first_workers(
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("actions-runner") || name == "runner")
             });
-        let hook = runner.and_then(&hook_script).unwrap_or_default();
+        let hook = match runner {
+            Some(runner) => hook_script(runner).ok()?.unwrap_or_default(),
+            None => String::new(),
+        };
         if command.contains("nightly") || has_flag(&hook, &NIGHTLY_RUNNER_FLAGS) {
             bump(&mut jobs.nightly);
         } else if has_flag(&hook, &PROMOTE_RUNNER_FLAGS) {
