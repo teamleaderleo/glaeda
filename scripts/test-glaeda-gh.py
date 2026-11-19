@@ -24104,6 +24104,41 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("GET", "/repos/someone-else/x/pulls/1"))
         self.assertIsNone(pool.owner_of("POST", "/repos/manaflow-ai/cmux/pulls"))
         self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
+        self.assertEqual(pool.source, "key")
+
+    def push_token(self, expires_in: float) -> None:
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + expires_in))
+        (self.creds / "ci-watch-token.json").write_text(json.dumps(
+            {"app_id": 1, "token": "ghs_pushed", "expires_at": at}))
+
+    def test_a_pushed_token_with_no_key_holds_the_app_for_reads(self) -> None:
+        """huge-blue holds no role key: the key home's pushed read-only token makes the daemon ask `token ci-watch`."""
+        self.push_token(3600)
+        pool = gg.AppPool()
+        self.assertTrue(pool.held_here())
+        self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
+        self.assertEqual(pool.source, "pushed")
+        self.assertEqual(pool.status()["source"], "pushed")
+
+    def test_an_expired_or_nearly_expired_pushed_token_holds_nothing(self) -> None:
+        for left in (-60, 60):
+            self.push_token(left)
+            pool = gg.AppPool()
+            self.assertFalse(pool.held_here(), left)
+            self.assertIsNone(pool.token("manaflow-ai"))
+        (self.creds / "ci-watch-token.json").write_text("{\"token\": \"ghs_x\", \"expires_at\": \"never\"}")
+        self.assertFalse(gg.AppPool().held_here())
+
+    def test_a_pushed_token_is_never_offered_a_write(self) -> None:
+        self.push_token(3600)
+        pool = gg.AppPool()
+        self.assertTrue(pool.held_here())
+        self.assertIsNone(pool.owner_of("POST", "/repos/manaflow-ai/cmux/actions/runs/1/rerun-failed-jobs"))
+        self.assertIsNone(pool.owner_of("PATCH", "/repos/manaflow-ai/cmux/issues/comments/1"))
+        mutation = {"query": "mutation($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
+        self.assertIsNone(pool.owner_of("POST", "/graphql", mutation))
+        query = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
+        self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
 
 
 if __name__ == "__main__":

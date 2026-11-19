@@ -157,8 +157,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged. A repo read
   (REST GET) of an owner leo-workspace's role Apps are on goes instead on the ci-watch App's installation
-  token when this host holds that App (~/.config/gh-app-tokens/ci-watch.*): `gh_app_token.py token
-  ci-watch`, also kept only in memory. Without it, or when the App refuses, the read is the login's, as
+  token when this host holds that App (~/.config/gh-app-tokens/ci-watch.*, or the read-only
+  ci-watch-token.json the key home pushes, while unexpired): `gh_app_token.py token ci-watch`, also
+  kept only in memory. Without it, or when the App refuses, the read is the login's, as
   before (AppPool). daemon.json appPool and `budget` say what the App served.
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
@@ -2329,7 +2330,10 @@ def gh_token() -> str:
 # Now a REST GET of a repo the role's Apps are installed on goes out on the ci-watch installation token when this host
 # holds that App (~/.config/gh-app-tokens/ci-watch.json and .pem, written by gh_app_token.py when the App was made):
 # the token is `gh_app_token.py token ci-watch --owner OWNER` (the copy next to the gh-quota shim gh_quota.py, which
-# caches it an hour), kept in memory, never written or logged. Writes, GraphQL, /rate_limit and every other repo stay
+# caches it an hour), kept in memory, never written or logged. A host with no key (huge-blue: the role keys live only
+# on the key home) holds the App too while the key home's pushed one-hour read-only token,
+# ~/.config/gh-app-tokens/ci-watch-token.json, is unexpired: `token ci-watch` answers with it there. Only reads (a REST
+# GET, a GraphQL query, never a mutation, never the outbox) are offered to the pool, so a read-only token is enough. Writes, GraphQL, /rate_limit and every other repo stay
 # on the login, so authorship (CLA, receipts) and the login's budget readings are as before. A host without the App,
 # a mint that fails, or an App answer that is refused (401, 403, 429) or under APP_POOL_FLOOR left sends the read on
 # the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
@@ -2339,6 +2343,7 @@ APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config
 APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
 APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
 APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the login this long
+APP_POOL_PUSHED_MIN_LEFT = 120.0  # a pushed token this close to its end is not asked for (gh_app_token.py's own floor)
 APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
 APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
 APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
@@ -2374,11 +2379,22 @@ class AppPool:
         self.graphql_served = 0
         self.graphql_points = 0
         self.graphql_seen: dict | None = None
+        self.source = ""  # "key" (the App's key is here) or "pushed" (a read-only token the key home pushed)
 
     def held_here(self) -> bool:
-        """Whether this host holds the role's App: its metadata and key files (a file test, no request)."""
-        return ((APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file()
-                and app_pool_tool() is not None)
+        """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
+        (ROLE-token.json, from the key home) with more than APP_POOL_PUSHED_MIN_LEFT to go (file reads, no request)."""
+        if app_pool_tool() is None:
+            return False
+        if (APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file():
+            self.source = "key"
+            return True
+        doc = read_json(APP_POOL_DIR / f"{self.role}-token.json")
+        expires = iso_epoch(doc.get("expires_at")) if isinstance(doc, dict) and doc.get("token") else None
+        if expires is not None and expires - self.clock() > APP_POOL_PUSHED_MIN_LEFT:
+            self.source = "pushed"
+            return True
+        return False
 
     def owners_from_config(self) -> list[str]:
         """machines/gh-app-roles.json `owners`, the accounts the role Apps are installed on, beside the tool."""
@@ -2410,7 +2426,8 @@ class AppPool:
             m = APP_POOL_REPO.match(path)
             if m:
                 owners.add(m.group(1).lower())
-        elif method == "POST" and path == "/graphql" and isinstance(body, dict):
+        elif (method == "POST" and path == "/graphql" and isinstance(body, dict)
+              and not re.match(r"\s*mutation\b", str(body.get("query") or ""))):
             variables = body.get("variables")
             if isinstance(variables, dict):
                 for key, value in variables.items():
@@ -2502,7 +2519,7 @@ class AppPool:
     def status(self) -> dict:
         now = self.clock()
         resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
-        return {"role": self.role, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
+        return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
                 "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
                 "graphqlSeen": self.graphql_seen}
