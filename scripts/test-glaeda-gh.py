@@ -20178,6 +20178,41 @@ class LandTest(Base):
                 self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
                 self.assertIn(f"it changes {files[-1]}, which 'rust workspaces' can read", json.dumps(e["history"]))
 
+    # cmuxterm-hq#14390 and #14405 (2026-11-19): merge_hold stopped each own_red on a job its runner refused at setup
+    # ("not excused: 'deleted-or-weakened-tests' was refused at setup by its runner; it gets re-run, never excused"),
+    # a red no change can cause, in a workflow with no inert-path rule. One --failed rerun, as for an unrelated red.
+    SETUP_REFUSED = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: "
+                     "'Native/OptChat/optchat-chief' was refused at setup by its runner; it gets re-run, never excused")
+
+    def setup_refused(self) -> tuple[int, dict]:
+        why = self.SETUP_REFUSED.format(head=LA)
+        return refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red", "why": why}, reason=why)
+
+    def test_a_job_refused_at_setup_is_rerun_once_with_no_path_rule_then_merged(self):
+        self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]  # a path the workflow reads: still no PR red
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.setup_refused())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"), e.get("history"))
+        self.assertIn("refused at setup", json.dumps(e["history"]))
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_job_refused_at_setup_again_after_its_rerun_stops_own_red(self):
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.setup_refused())
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.setup_refused())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+
     def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
         self.unrelated_world(["webviews/src/a.ts"])
         self.w.gh_rc["rerun"] = 1
