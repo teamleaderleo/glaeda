@@ -10774,7 +10774,7 @@ class GateTest(unittest.TestCase):
         self.assertIsInstance(doc["defaults"]["cpuHold"], bool)
         self.assertIsNot(hook._overload_marks(doc["defaults"].get("overloadHold", True)), False,
                          "defaults.overloadHold is false, true or a valid dict")
-        self.assertEqual(hook.gate_overload_marks(doc, "any-std-mini", 1_800_000_000.0), (2.0, 1.5, 80.0),
+        self.assertEqual(hook.gate_overload_marks(doc, "any-std-mini", 1_800_000_000.0), (2.0, 1.5, 95.0),
                          "the declared marks: hold past twice the cores")
         for host, entry in doc.get("hosts", {}).items():
             self.assertRegex(host, r"^[a-z0-9-]+$", "keys are hostname -s, lowercased")
@@ -19291,7 +19291,7 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIsNone(decide(warm + 60, 9.0, cover, 2, 14, 45.0, 0, 1, False, ncpu=14))
         self.assertEqual(decide(warm + 60, 2.1, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 3)
         # the host's safety brakes keep what it holds
-        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 85.0, 0, 1, False, ncpu=14), "host at 80%+")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 96.0, 0, 1, False, ncpu=14), "host at 95%+")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 2, False, ncpu=14), "memory pressure")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 1, True, ncpu=14), "thermal")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 1, 14, 45.0, 0, 1, False, ncpu=14), "one unit stays")
@@ -19852,14 +19852,14 @@ class CapacityArithmeticTest(unittest.TestCase):
     def test_one_rule_on_a_12_core_16_gib_host_and_a_30_core_96_gib_host(self) -> None:
         needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(3.4, 3000)})  # 4 cores, 3 GiB
         with self.host(12, 16, needs):
-            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (12, 12), "16 GiB less a 4 GiB floor")
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (12, 14), "16 GiB less a 1.6 GiB floor")
             ran, why = self.fill("test")
-        self.assertEqual(ran, 3, "12 cores / 4: cores bind before RAM (12 GiB / 3)")
+        self.assertEqual(ran, 3, "12 cores / 4: cores bind before RAM (14 GiB / 3)")
         self.assertIn("capacity: 0 of 12 units free", why)
         hook.close_all(self.held)
         self.held.clear()
         with self.host(30, 96, needs):
-            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (30, 84), "96 GiB less 12 GiB")
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (30, 86), "96 GiB less 9.6 GiB")
             ran, why = self.fill("test")
         self.assertEqual(ran, 7, "30 cores / 4, the same rule with the bigger host's numbers")
         self.assertIn("of 30 units free", why)
@@ -19871,40 +19871,40 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.capacity_cores(14), 14, "unmeasurable: the --capacity-units count")
 
     def test_a_ram_bound_host_refuses_on_ram(self) -> None:
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.5, 5500),  # 2 cores, 6 GiB
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.5, 6500),  # 2 cores, 7 GiB
                             f"{self.GUEST}/build-fleet-go.yml/huge": self.row(2.0, 20000)},  # 20 GiB, its own
                            {"isolated": self.row(2.0, 30000)})  # the class estimate: more than 16 GiB too
         with self.host(12, 16, needs):
             ran, why = self.fill("test")
-            self.assertEqual(ran, 2, "6 of 12 cores free, but 12 GiB of RAM fits two 6 GiB jobs")
-            self.assertTrue(why.startswith("capacity: 0 of 12 GiB of RAM free"), why)
-            self.assertIn("needs 6 GiB", why)
+            self.assertEqual(ran, 2, "6 of 12 cores free, but 14 GiB of RAM fits two 7 GiB jobs")
+            self.assertTrue(why.startswith("capacity: 0 of 14 GiB of RAM free"), why)
+            self.assertIn("needs 7 GiB", why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("test")
             self.assertTrue(ok, why)
             ok, why = self.take("huge")  # more than the host's RAM: it waits for a RAM-idle host, never refused
             self.assertFalse(ok)
-            self.assertTrue(why.startswith("capacity: 6 of 12 GiB of RAM free"), why)
+            self.assertTrue(why.startswith("capacity: 7 of 14 GiB of RAM free"), why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
-            self.assertIn("12/12 GiB", why, "it runs alone")
+            self.assertIn("14/14 GiB", why, "it runs alone")
             ok, why = self.take("test")
             self.assertFalse(ok)
-            self.assertIn("of 12 GiB of RAM free", why)
+            self.assertIn("of 14 GiB of RAM free", why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("unmeasured")  # only its class's 30 GiB estimate: it runs here alone too
             self.assertTrue(ok, why)
-            self.assertIn("12/12 GiB", why)
+            self.assertIn("14/14 GiB", why)
         hook.close_all(self.held)
         self.held.clear()
         with self.host(30, 96, needs):
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
-            self.assertIn("20/84 GiB", why)
+            self.assertIn("20/86 GiB", why)
         with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: "0"}):
             self.assertEqual(hook.mem_chunks_total(), 0, "the kill switch")
         with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: ""}):
@@ -19915,7 +19915,7 @@ class CapacityArithmeticTest(unittest.TestCase):
     def test_live_units_give_back_cores_never_ram(self) -> None:
         """LIVE_UNITS: a job's holder lets its unit files above the measured need go, so the next admission takes them;
         its RAM chunks stay held, so a job whose RAM does not fit what is really free is still refused."""
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 7000),  # 6 cores, 7 GiB
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 8000),  # 6 cores, 8 GiB
                             f"{self.GUEST}/build-fleet-go.yml/small": self.row(1.0, 4000)})  # 1 core, 4 GiB
         capacity = self.dir / "capacity"
         state = self.dir / "state"
@@ -19926,20 +19926,20 @@ class CapacityArithmeticTest(unittest.TestCase):
                                          os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
             self.assertTrue(ok, why)
             self.addCleanup(hook.release_holder, hook.holder_file(state))
-            self.assertIn("6/14 units+7/12 GiB", why)
+            self.assertIn("6/14 units+8/14 GiB", why)
             taken = lambda prefix, n: sum(not hook.probe(capacity / f"{prefix}-{i}") for i in range(n))  # noqa: E731
-            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (6, 7))
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 14)), (6, 8))
             hook.request_dynamic_release(state, 2, {"reason": "test"})
             deadline = time.monotonic() + 5
             while taken("unit", 14) > 2 and time.monotonic() < deadline:
                 time.sleep(hook.HOLDER_POLL_S)
-            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (2, 7), "cores go back, RAM stays")
-            # 12 cores are free now but only 5 GiB of RAM: a 7 GiB job is refused for RAM, a 4 GiB one fits
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 14)), (2, 8), "cores go back, RAM stays")
+            # 12 cores are free now but only 6 GiB of RAM: an 8 GiB job is refused for RAM, a 4 GiB one fits
             with mock.patch.object(hook, "hold", side_effect=self.keep):
                 ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
                                              os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
                 self.assertFalse(ok)
-                self.assertTrue(why.startswith("capacity: 5 of 12 GiB of RAM free"), why)
+                self.assertTrue(why.startswith("capacity: 6 of 14 GiB of RAM free"), why)
                 ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "small",
                                              os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
                 self.assertTrue(ok, why)
@@ -19983,7 +19983,7 @@ class CapacityArithmeticTest(unittest.TestCase):
                 ok, why = self.take("verify-signed-nightly", workflow="nightly.yml", repo=hook.DEFAULT_HOME_REPO,
                                     tier=hook.TIER_NIGHTLY, since=time.time())
             self.assertTrue(ok, why)
-            self.assertIn("2/12 GiB", why)
+            self.assertIn("2/14 GiB", why)
 
     def test_the_listener_gate_holds_for_ram(self) -> None:
         needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 6500)})
@@ -20335,10 +20335,10 @@ class SimDynamicTest(unittest.TestCase):
         self.assertIn("simulator", fits())
         self.held.append(hook.lock_file(self.capacity / "simulator.token", fcntl.LOCK_EX))
         self.assertIn("simulator", fits(), "copy 1 is free")
-        self.load = 9.0
+        self.load = 9.5
         self.assertNotIn("simulator", fits(), "copy 1 without headroom")
         self.load = 1.0
-        for c in range(1, 5):
+        for c in range(1, 6):
             self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
         self.assertNotIn("simulator", fits(), "every copy to the ceiling taken")
 
@@ -20371,9 +20371,9 @@ class SimDynamicTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(self.capacity, 10, sim),
                          "simulator-1 needs headroom: memory pressure level 2 is not green (>= 2)")
         self.pressure = 1
-        for c in range(1, 5):
+        for c in range(1, 6):
             self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
-        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 5 simulator tokens on this mini are taken")
+        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 6 simulator tokens on this mini are taken")
 
     def test_parse_swap_usage_reads_what_the_worker_reads(self) -> None:
         self.assertEqual(hook.parse_swap_usage("total = 2048.00M  used = 1003.25M  free = 1044.75M  (encrypted)"),
