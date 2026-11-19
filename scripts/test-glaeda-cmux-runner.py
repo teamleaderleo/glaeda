@@ -286,6 +286,10 @@ SAMPLE_EVENTS = {
     "teamleaderleo-fork-wrong-base": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": TEAMLEADER_FORK},
         "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
+    # OWN_CODE_ONLY: a same-repo pull request of another repository is not this job's own code.
+    "same-repo-pr-of-another-repo": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": {"full_name": "manaflow-ai/other", "fork": False}},
+        "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
     "cross-repo-pr-not-flagged-fork": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": {"full_name": "other/cmux", "fork": False}}, "base": {"repo": CMUX}}}, False),
     "deleted-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {
@@ -400,6 +404,74 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("sparse", result.stdout)
         self.assertTrue((full / ".build").is_dir() and (full / "Packages" / "B.swift").is_file())
+
+    def test_a_sparse_setting_masked_by_per_worktree_config_is_reset(self) -> None:
+        """cmux job 135147612854 (gcp-agent-lane-6, 2026-11-18; cmuxterm-hq#13682): .git/config said
+        core.sparseCheckout = true, config.worktree said false, so the effective config read clean. actions/checkout
+        unset extensions.worktreeConfig after its disable, the true came back, and its forced checkout applied the
+        old patterns and lost files. job-started reads each config file on its own and resets that workspace, so
+        the checkout writes every file. A workspace a full checkout left (config.worktree saying false, nothing
+        sparse) keeps its build caches."""
+        git_env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_AUTHOR_NAME": "t",
+                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+        def git(ws: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(ws), *args], env=git_env, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        def workspace(name: str) -> Path:
+            ws = self.dir / name / "_work" / "cmux" / "cmux"
+            (ws / "scripts" / "ci").mkdir(parents=True)
+            (ws / "Packages").mkdir()
+            (ws / "scripts" / "ci" / "a.sh").write_text("a\n")
+            (ws / "Packages" / "B.swift").write_text("b\n")
+            git(ws, "init", "-q", "-b", "main")
+            git(ws, "add", "-A")
+            git(ws, "commit", "-qm", "one")
+            git(ws, "sparse-checkout", "set", "scripts/ci")
+            git(ws, "sparse-checkout", "disable")
+            return ws
+
+        def actions_checkout(ws: Path) -> None:
+            # What actions/checkout runs on a full checkout of a reused workspace.
+            subprocess.run(["git", "-C", os.fspath(ws), "sparse-checkout", "disable"], env=git_env,
+                           capture_output=True, check=False)
+            subprocess.run(["git", "-C", os.fspath(ws), "config", "--local", "--unset-all",
+                            "extensions.worktreeConfig"], env=git_env, capture_output=True, check=False)
+            git(ws, "checkout", "-q", "--force", "-B", "main", "HEAD")
+
+        path = event(self.dir, "push", {"repository": CMUX})
+        masked = workspace("actions-runner-glaeda-2")
+        git(masked, "config", "--file", os.fspath(masked / ".git" / "config"), "core.sparseCheckout", "true")
+        self.assertEqual(git(masked, "config", "--bool", "--default", "false", "core.sparseCheckout"), "false")
+        self.assertEqual(git(masked, "status", "--porcelain"), "")
+        self.assertNotIn("S ", git(masked, "ls-files", "-v"))
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                               "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(masked)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sparse (in config)", result.stdout)
+        self.assertEqual(sorted(p.name for p in masked.iterdir()), [".git"])
+        self.assertFalse((masked / ".git" / "config.worktree").exists())
+        git(masked, "reset", "-q", "--hard", "HEAD")
+        actions_checkout(masked)
+        self.assertEqual((masked / "Packages" / "B.swift").read_text(), "b\n")
+        self.assertEqual(git(masked, "ls-files", "-v", "Packages/B.swift"), "H Packages/B.swift")
+
+        # The next job: that full checkout left config.worktree (sparseCheckout = false) and nothing sparse.
+        (masked / ".build").mkdir()
+        actions_checkout(masked)
+        self.assertTrue((masked / ".git" / "config.worktree").is_file())
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                               "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(masked)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("reset the", result.stdout)
+        self.assertTrue((masked / ".build").is_dir() and (masked / "Packages" / "B.swift").is_file())
+
+        # Without the hook, the same state loses the file: the case the test reproduces.
+        unhooked = workspace("actions-runner-glaeda-4")
+        git(unhooked, "config", "--file", os.fspath(unhooked / ".git" / "config"), "core.sparseCheckout", "true")
+        actions_checkout(unhooked)
+        self.assertFalse((unhooked / "Packages" / "B.swift").exists())
 
     def test_job_started_asks_glaeda_disk_only_about_a_workspace_past_the_bloat_minimum(self) -> None:
         """job-started runs glaeda-disk --own-runner-checkout (from /, in its own session, the workspace in its
@@ -3795,6 +3867,15 @@ class HookTest(unittest.TestCase):
 
     # ------------------------------------------------------------ the gateway runners (GATEWAY)
 
+    def test_cmux_kernel_free_fast_checks_cost_like_hqs(self) -> None:
+        """cmux fast-checks.yml's checks-mac (`cmux-ci test --setup kernel-free`) builds nothing in a canonical root:
+        it costs what hq's kernel-free fast checks cost as a guest (isolated), not an unlisted compile's 5 units with
+        the persistent-dd and root tokens."""
+        self.assertEqual(hook.job_class("checks-mac", "manaflow-ai/cmux", workflow="fast-checks.yml"),
+                         ("isolated", False))
+        self.assertEqual(hook.job_class("checks", "manaflow-ai/cmuxterm-hq", workflow="fast-checks.yml"),
+                         ("isolated", False))
+
     def test_the_sim_first_runner_admits_only_simulator_jobs(self) -> None:
         """SIM_FIRST: the sim-first runner listens on a full mini and its job's wait holds the mini's other runners, so
         only simulator jobs (the simulator and simulator-step classes) are admitted there; a build or compile routed
@@ -3995,8 +4076,7 @@ class HookTest(unittest.TestCase):
                               ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next.yml", "fast-tier-fleet"),
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                              ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture"),
-                              ("cmux-next-tab-switch.yml", "frames")):
+                              ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
@@ -9354,7 +9434,8 @@ class MemoryCapTest(unittest.TestCase):
             patcher = mock.patch.object(hook, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": ""})
+        # 50 GiB of RAM: the code marks (5% and 10%) are 2.5 and 5 GiB
+        patcher = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": "", hook.HOST_MEM_ENV: "51200"})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
@@ -9396,7 +9477,7 @@ class MemoryCapTest(unittest.TestCase):
     def test_settings_and_the_kill_switch(self) -> None:
         now = 1_800_000_000.0
         code = hook.gate_memory_cap(None, "x", now, raw="")
-        self.assertEqual(code, hook.MemoryCap(4096, 5120, 600.0), "on by default at the code marks")
+        self.assertEqual(code, hook.MemoryCap(2560, 5120, 600.0), "on by default at the code marks: 5% and 10% of 50 GiB")
         for raw in ("off", "0", "false", "OFF"):
             self.assertIsNone(hook.gate_memory_cap(None, "x", now, raw=raw), raw)
         later = datetime.datetime.fromtimestamp(now + 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -9413,8 +9494,18 @@ class MemoryCapTest(unittest.TestCase):
         self.assertIs(hook._memory_cap({"maxWaitMin": 61}), False, "no hold may outlast an hour")
         self.assertIs(hook._memory_cap({"maxWaitMin": float("inf")}), False)
         self.assertIsNone(hook.gate_memory_cap({"defaults": {"memoryCap": False}}, "x", now, raw=""))
+        # 2026-11-19 (Leo: "stretch everything till it's at like... 90% cpu/ram / we can be more wary at >95%"): the
+        # marks are a share of the RAM, so a 16 GiB mini takes jobs to 95% used and listens again at 90%.
+        self.assertEqual(hook.gate_memory_cap(None, "x", now, raw="", ram_mib=16384), hook.MemoryCap(819, 1638, 600.0))
+        self.assertEqual(hook.gate_memory_cap(None, "x", now, raw="", ram_mib=98304), hook.MemoryCap(4915, 9830, 600.0))
+        self.assertEqual(hook._memory_cap({"needPct": 2, "resumePct": 4}, 51200), hook.MemoryCap(1024, 2048, 600.0))
+        self.assertEqual(hook._memory_cap({"needGiB": 3, "needPct": 50}, 51200), hook.MemoryCap(3072, 5120, 600.0),
+                         "GiB wins over Pct")
+        self.assertIs(hook._memory_cap({"needPct": 0}, 51200), False)
+        self.assertIs(hook._memory_cap({"resumePct": 101}, 51200), False)
+        self.assertIs(hook._memory_cap({"needPct": 20, "resumePct": 10}, 51200), False, "resume under need")
         declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
-        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(4096, 5120, 600.0),
+        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(2560, 5120, 600.0),
                          "the declared cap")
 
     def test_reclaimable_and_short(self) -> None:
@@ -10592,15 +10683,15 @@ class GateTest(unittest.TestCase):
         busy[0] = hook.GATE_CPU_PAUSE
         self.assertEqual(gate.claimed(), "a fleet build holds the host lock", "the fleet's claim comes first")
 
-    def test_the_listener_gate_pauses_at_85_and_resumes_below_80_by_default(self) -> None:
+    def test_the_listener_gate_pauses_at_95_and_resumes_below_90_by_default(self) -> None:
         """With units that are cores, admission stops near the core count, and the gate is the margin for jobs
-        above their estimate: by default an idle listener stops at 85% sampled CPU and listens again below 80%.
+        above their estimate: by default an idle listener stops at 95% sampled CPU and listens again below 90%.
         The hook is loaded fresh without the GLAEDA_RUNNER_GATE_CPU_* overrides this module sets."""
         clean = {k: v for k, v in os.environ.items() if not k.startswith("GLAEDA_RUNNER_GATE_CPU_")}
         with mock.patch.dict(os.environ, clean, clear=True):
             fresh = load("glaeda_cmux_runner_hook_gate_defaults", HOOK)
         self.addCleanup(sys.modules.pop, "glaeda_cmux_runner_hook_gate_defaults", None)
-        self.assertEqual((fresh.GATE_CPU_PAUSE, fresh.GATE_CPU_RESUME), (85.0, 80.0))
+        self.assertEqual((fresh.GATE_CPU_PAUSE, fresh.GATE_CPU_RESUME), (95.0, 90.0))
         self.assertEqual(fresh.GATE_CPU_WINDOW_S, 60.0, "the marks apply to a 60 s average by default")
         busy = [0.0]
         gate = fresh.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
@@ -10610,14 +10701,14 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(fresh, "memory_pressure_level", return_value=1), \
                 mock.patch.object(fresh, "load_1min", return_value=1.0), \
                 mock.patch.object(fresh, "thermal_pressure_level", return_value=0):
-            for cpu, held in ((84.9, False), (85.0, True), (82.0, True), (80.0, True), (79.9, False), (84.0, False),
-                              (90.0, True)):
+            for cpu, held in ((94.9, False), (95.0, True), (92.0, True), (90.0, True), (89.9, False), (94.0, False),
+                              (99.0, True)):
                 busy[0] = cpu
                 why = gate.claimed()
                 self.assertEqual(why is not None, held, f"{cpu}% CPU: {why}")
                 if held:
                     self.assertTrue(why.startswith(fresh.SATURATED), why)
-                    self.assertIn("listening resumes below 80% CPU", why)
+                    self.assertIn("listening resumes below 90% CPU", why)
 
     def gate_settings_release(self, doc: object, tag: str = "r-20261030-test") -> Path:
         """A fake glaeda-update state dir whose current release carries `doc` as config/runner-gate.json."""
@@ -10686,7 +10777,7 @@ class GateTest(unittest.TestCase):
         self.assertIsInstance(doc["defaults"]["cpuHold"], bool)
         self.assertIsNot(hook._overload_marks(doc["defaults"].get("overloadHold", True)), False,
                          "defaults.overloadHold is false, true or a valid dict")
-        self.assertEqual(hook.gate_overload_marks(doc, "any-std-mini", 1_800_000_000.0), (2.0, 1.5, 80.0),
+        self.assertEqual(hook.gate_overload_marks(doc, "any-std-mini", 1_800_000_000.0), (2.0, 1.5, 95.0),
                          "the declared marks: hold past twice the cores")
         for host, entry in doc.get("hosts", {}).items():
             self.assertRegex(host, r"^[a-z0-9-]+$", "keys are hostname -s, lowercased")
@@ -10733,7 +10824,7 @@ class GateTest(unittest.TestCase):
         # the gate: with the CPU hold off (the declared default) a side listener is still held for overload,
         # a gui runner is not, and a hold past GATE_LOAD_MAX_HOLD_S listens anyway so no label is stranded
         update = self.gate_settings_release({"schema": hook.GATE_SETTINGS_SCHEMA, "defaults": {
-            "cpuHold": False, "overloadHold": {"pausePerCore": 2.0, "resumePerCore": 1.5, "cpuAtLeast": 80}}})
+            "cpuHold": False, "overloadHold": {"pausePerCore": 2.0, "resumePerCore": 1.5, "cpuAtLeast": 95}}})
         load = [100.0]
         for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
                             ("GATE_SETTINGS_DIR", os.fspath(update))):
@@ -11064,6 +11155,31 @@ class GateTest(unittest.TestCase):
                                   "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/pull/1/merge",
                                   "build-nightly-app")
         self.assertIsNone(hook.nightly_capacity_wait(untrusted, "push", ref, "build-nightly-app", "nightly.yml", "1"))
+
+    def test_the_fast_tier_waits_a_bounded_time_for_capacity(self) -> None:
+        """FAST_TIER_WAIT: cmux-next.yml's fast tier has a 20-minute timeout that counts its wait in "Set up runner",
+        and its run after admission takes 866 s p50 (856 owned fast tiers, 11-16 14Z to 11-19 01Z). Of the 191 that
+        waited 60 s or more for units, 3 passed; 141 of the 348 that ran out the 20 minutes had waited 60 s or more,
+        68202 s in all (run 44290763187 on ultra2: admitted at 1203 s, cancelled before its first step). So it is
+        refused after FAST_TIER_CAPACITY_WAIT_S, and cmux's owned-pool rescue re-runs it (hook_refused() reads the
+        step), instead of a timeout nobody re-runs. Any runner, the fast runner too; other jobs and repos unchanged."""
+        bound = hook.FAST_TIER_CAPACITY_WAIT_S
+        self.assertEqual(bound, 60.0)
+        self.assertLess(bound + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S + 866, 20 * 60,
+                        "a median run admitted at the bound still fits the 20-minute cap")
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        self.assertEqual(hook.fast_tier_capacity_wait("Manaflow-AI/cmux", home, "cmux-next.yml", "fast-tier"), bound)
+        for repo, workflow, job in (("someone/else", "cmux-next.yml", "fast-tier"),
+                                    (None, "cmux-next.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "cmux-next.yml", "swift-test"),
+                                    ("manaflow-ai/cmux", "ci.yml", "fast-tier"),
+                                    ("manaflow-ai/cmux", "", "fast-tier")):
+            with self.subTest(repo=repo, workflow=workflow, job=job):
+                self.assertIsNone(hook.fast_tier_capacity_wait(repo, home, workflow, job))
+        # composes like the other bounds: a shorter explicit wait is kept
+        self.assertEqual(hook.bounded_wait(None, bound), bound)
+        self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
@@ -11594,10 +11710,10 @@ class GateTest(unittest.TestCase):
                 why = self.short(small_gate)
                 self.assertIn("RUNNER_JOBS_DISK", why or "", "10 GiB + 5.3 GiB for its own job is not free at 12")
                 free["gib"] = 7.5
-                why = self.short(small_gate)
-                self.assertIn("DISK_SHORT_RECLAIM", why or "")
-                self.assertIn("7.5 GiB free, 8 GiB required", why or "")
-                self.assertIn("small jobs' measured peak", why or "")
+                # under its own 8 GiB peak and the hard floor no small job fits: a full disk, held (DISK_FULL_NO_LISTEN)
+                self.assertEqual(small_gate.low_disk(),
+                                 "disk full: under 8 GiB, where no job of this runner fits; reclaiming "
+                                 "(DISK_FULL_NO_LISTEN)")
                 self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup still aims at the floor")
         self.assertEqual(hook.side_fit_units(hook.runner_scope(small)), 1,
                          "a small runner never waits for room for the fast tier's units")
@@ -12017,6 +12133,179 @@ class GateTest(unittest.TestCase):
             self.assertEqual((stops, gate.watching), ([], (4343,)), "its Worker's exit freezes the listener too")
             gate.step()  # the job ended
         self.assertEqual(stops, [reserved])
+
+    def test_a_full_disk_seen_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
+        """DISK_FULL_NO_LISTEN at a job's end (review of glaeda#2188): a disk floor never watches or freezes a Worker,
+        but a full disk is no floor. Seen during a job, it stops the listener as that job ends, as a reservation does,
+        so the next job is not taken where it would fail; the job itself runs on."""
+        full = "disk full: under 10 GiB, where no job of this runner fits; reclaiming (DISK_FULL_NO_LISTEN)"
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4343]
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(gate, "low_disk", return_value=full):
+            gate.step(); gate.step()
+            self.assertEqual((stops, gate.watching), ([], (4343,)), "never stopped under its job; its Worker is watched")
+            gate.step()  # the job ended
+        self.assertEqual(stops, [full])
+        # a floor (low_disk None while a job runs) arms nothing: the listener takes its next job
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4444]
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(gate, "low_disk", return_value=None):
+            gate.step(); gate.step(); gate.step()
+        self.assertEqual((stops, gate.watching), ([], ()))
+
+    def suite_marker(self, since: float, want_gib: float = 30.0, pid: int | None = None) -> Path:
+        """SUITE_FIRST_HOLD: the fleet worker's disk-want marker in this test's capacity ledger, as the worker
+        writes it (build-fleet/cmd/worker fleet_disk_want.go)."""
+        capacity = self.tmp / "capacity"
+        capacity.mkdir(exist_ok=True)
+        marker = capacity / f"{hook.FLEET_DISK_WANT}{pid or os.getpid()}"
+        marker.write_text(json.dumps({"schema": "cmux-fleet-disk-want/v1", "since": since,
+                                      "want_bytes": int(want_gib * 1024**3), "free_bytes": 22 * 1024**3,
+                                      "who": "fleet worker test"}) + "\n")
+        return marker
+
+    def test_a_fleet_suite_step_waiting_for_disk_holds_an_idle_pool_listener_at_most_15_minutes(self) -> None:
+        """SUITE_FIRST_HOLD (2026-11-18: lent minis' PR jobs took every freed GiB while a fleet suite step waited for
+        disk for hours). The decision: "A pool listener on a lent mini holds while a fleet suite step there waits for
+        disk, but for at most 15 minutes per wait. ... Log each hold and its length." An idle pool listener holds
+        while free disk is under the step's want, with one reason every poll and one start line; its reclaim aims at
+        the want; the hold ends when the room is there, at the bound (from the wait's start), or when the wait goes,
+        each logged once with its length; past the bound it listens until that wait ends; a new wait holds again."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        capacity = self.tmp / "capacity"
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+        clock, free, logs, aims = {"t": 1_800_000_000.0}, {"gib": 22.0}, [], []
+        gate.evict_in_background = lambda _path, floor: aims.append(floor)
+        start = clock["t"]
+        marker = self.suite_marker(start)
+        with mock.patch.object(hook.shutil, "disk_usage",
+                               side_effect=lambda _p: mock.Mock(free=int(free["gib"] * 1024**3))), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook, "ADMIT_FRESH_S", 1e9), \
+                mock.patch.object(hook.time, "time", side_effect=lambda: clock["t"]):
+            whys = []
+            for _ in range(5):
+                whys.append(gate.suite_first())
+                clock["t"] += hook.GATE_POLL_S
+            self.assertTrue(whys[0] and hook.SUITE_FIRST in whys[0], whys)
+            self.assertEqual(len(set(whys)), 1, f"the same reason every poll, so the gate logs its hold once: {whys}")
+            self.assertEqual(aims[-1], 30.0, "reclaim aims at the step's want")
+            self.assertEqual(gate.suite_want_gib, 30.0, "low_disk's reclaim aims there too")
+            started = [line for line in logs if line.startswith("suite-first hold started")]
+            self.assertEqual(len(started), 1, logs)
+            # the room is there: the hold ends, logged once with its length
+            free["gib"] = 31.0
+            self.assertIsNone(gate.suite_first())
+            self.assertIsNone(gate.suite_first())
+            ended = [line for line in logs if line.startswith("suite-first hold ended")]
+            self.assertEqual(ended, [f"suite-first hold ended after {5 * hook.GATE_POLL_S:.0f} s: room "
+                                     f"({hook.SUITE_FIRST})"])
+            # the PR jobs write it down again within the same wait: it holds again, until 15 min from the wait's start
+            free["gib"] = 22.0
+            clock["t"] = start + 600
+            self.assertIsNotNone(gate.suite_first())
+            clock["t"] = start + hook.SUITE_FIRST_HOLD_S - 1
+            self.assertIsNotNone(gate.suite_first())
+            clock["t"] = start + hook.SUITE_FIRST_HOLD_S
+            self.assertIsNone(gate.suite_first(), "past the bound the PR job starts anyway")
+            self.assertTrue(logs[-1].startswith("suite-first hold ended after 300 s: bound"), logs[-1])
+            count = len(logs)
+            for _ in range(3):
+                clock["t"] += 60
+                self.assertIsNone(gate.suite_first(), "it listens until the wait ends")
+            self.assertEqual(len(logs), count, "nothing more is logged for a bounded wait")
+            self.assertIsNone(gate.suite_want_gib)
+            # a new wait (the worker leased, then waits again) holds again; its marker going ends that hold
+            marker = self.suite_marker(clock["t"])
+            self.assertIsNotNone(gate.suite_first())
+            self.assertTrue(logs[-1].startswith("suite-first hold started"), logs[-1])
+            clock["t"] += 42
+            marker.unlink()
+            self.assertIsNone(gate.suite_first())
+            self.assertEqual(logs[-1], f"suite-first hold ended after 42 s: wait gone ({hook.SUITE_FIRST})")
+        self.assertEqual(hook.SUITE_FIRST_HOLD_S, 15 * 60.0)
+
+    def test_a_fleet_suite_step_never_holds_the_nightly_dedicated_gateway_or_a_floorless_runner(self) -> None:
+        """SUITE_FIRST_HOLD holds pool runners only: the nightly's own listeners (their jobs come first), a dedicated
+        builder, a gateway runner (its clients build elsewhere) and a runner with no disk floor never hold for it."""
+        capacity = self.tmp / "capacity"
+        self.suite_marker(time.time())
+        logs: list[str] = []
+        texts = ("exec python3 /hook job-started --min-free-gib 30 --nightly-runner\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --trusted-next-signing\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --dedicated-admit /x/a.sh\n",
+                 "exec python3 /hook job-started --min-free-gib 30 --gateway-runner\n",
+                 "exec python3 /hook job-started --capacity-units 14\n")
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=5 * 1024**3)), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append):
+            for text in texts:
+                write_hook(self.runner, text)
+                gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+                gate.evict_in_background = lambda *_: self.fail("no reclaim for a runner that never holds")
+                self.assertIsNone(gate.suite_first(), text)
+                self.assertIsNone(gate.suite_first(busy=True), text)
+            write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+            gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state, capacity_dir=capacity)
+            gate.evict_in_background = lambda *_: None
+            self.assertIsNotNone(gate.suite_first(), "a pool runner does hold")
+        self.assertEqual(len(logs), 1, logs)
+
+    def test_a_stale_dead_or_malformed_fleet_disk_marker_is_no_wait_and_no_admission_waiter(self) -> None:
+        """FLEET_DISK_WANT is read as untrusted: a dead worker's, an old or a malformed marker is no wait (the dead and
+        old ones are removed), and no marker is an admission waiter, so no runner's turn order waits on it."""
+        capacity = self.tmp / "capacity"
+        now = time.time()
+        live = self.suite_marker(now)
+        wait = hook.fleet_disk_wait(capacity)
+        self.assertEqual((wait["pid"], wait["since"], wait["want_gib"]), (os.getpid(), now, 30.0))
+        self.assertEqual(hook.admission_waiters(capacity), [], "the fleet's disk want is no admission waiter")
+        live.unlink()
+        dead = self.suite_marker(now, pid=2147483646)
+        self.assertIsNone(hook.fleet_disk_wait(capacity))
+        self.assertFalse(dead.exists(), "a dead worker's marker is removed")
+        old = self.suite_marker(now)
+        os.utime(old, (now - hook.ADMIT_FRESH_S - 5, now - hook.ADMIT_FRESH_S - 5))
+        self.assertIsNone(hook.fleet_disk_wait(capacity))
+        self.assertFalse(old.exists(), "a marker the worker stopped refreshing is removed")
+        for body in ("not json", json.dumps({"since": now}), json.dumps({"since": True, "want_bytes": 1 << 30}),
+                     json.dumps({"since": now, "want_bytes": True}), json.dumps({"since": "inf", "want_bytes": 1 << 30}),
+                     json.dumps({"since": now, "want_bytes": 0}),
+                     '{"since": 1, "want_bytes": 1' + '0' * 400 + '}',  # past a float: OverflowError
+                     '{"since": ' + '[' * 30000 + ']' * 30000 + '}'):  # past the parser's depth: RecursionError
+            (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").write_text(body)
+            self.assertIsNone(hook.fleet_disk_wait(capacity), body)
+        (capacity / f"{hook.FLEET_DISK_WANT}{os.getpid()}").unlink()
+        tmp = self.suite_marker(now)
+        tmp.rename(tmp.with_name(tmp.name + ".tmp"))
+        self.assertIsNone(hook.fleet_disk_wait(capacity), "a half-written .tmp is not read")
+        self.assertIsNone(hook.fleet_disk_wait(None))
+
+    def test_a_suite_step_waiting_for_disk_during_a_job_stops_the_listener_only_as_the_job_ends(self) -> None:
+        """SUITE_FIRST_HOLD never stops, kills or freezes a running job: a listener takes its next job within a second
+        of its Worker's exit, faster than an idle look, so a wait seen during a job arms the stop at the job's end
+        (as a full disk does), reading only (no hold logged, no reclaim) until then; the job runs on."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        self.suite_marker(time.time())
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.capacity_dir = self.tmp / "capacity"
+        gate.worker_pids = lambda: [4343]
+        aims: list[float] = []
+        gate.evict_in_background = lambda _path, floor: aims.append(floor)
+        logs: list[str] = []
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(gate, "low_disk", return_value=None), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=22 * 1024**3)):
+            gate.step(); gate.step()
+            self.assertEqual((stops, gate.watching), ([], (4343,)), "never stopped under its job; its Worker is watched")
+            self.assertEqual((aims, [line for line in logs if "suite-first" in line]), ([], []),
+                             "a look during the job only reads")
+            gate.step()  # the job ended
+        self.assertEqual(len(stops), 1, stops)
+        self.assertIn(hook.SUITE_FIRST, stops[0])
+        self.assertEqual(len([line for line in logs if line.startswith("suite-first hold started")]), 1, logs)
 
     def drain(self, until: float | None = None, reason: str = "a relabel to a,b") -> Path:
         marker = self.runner / hook.RUNNER_DRAIN_FILE
@@ -12506,6 +12795,59 @@ class GateTest(unittest.TestCase):
             self.assertLessEqual(started[0] - begin, 2 * hook.DISK_RECLAIM_POLL_S, "stops waiting once room is there")
             self.assertTrue(any("the room is there" in line for line in logs), logs)
         self.assertLessEqual(hook.DISK_RECLAIM_WAIT_S, 30)
+
+    def test_a_disk_under_the_hard_floor_holds_the_listener_and_reclaims_until_a_job_fits(self) -> None:
+        """DISK_FULL_NO_LISTEN (cmux18, 2026-11-18 19:46Z: listeners started at 8.5 GiB free beside five jobs, which
+        wrote it to 1.8 GiB). Under the 10 GiB hard floor no job fits: the gate reclaims and holds its listener, logs
+        the hold once however many polls it lasts, and listens once reclaim brings the disk above the hard floor, where
+        a short disk only warns again (DISK_RECLAIM_NOW)."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free, clock, logs, procs, started = {"gib": 8.5}, {"t": 1000.0}, [], [], []
+
+        def popen(argv: list[str], **_: object) -> mock.Mock:
+            proc = mock.Mock(argv=argv)
+            proc.poll.return_value = None
+            procs.append(proc)
+            return proc
+
+        def sleep(seconds: float) -> None:
+            clock["t"] += seconds
+
+        gate.claimed = gate.low_disk
+        gate.reload = lambda: None
+        gate.registration_wait = lambda: False
+        gate.reserve = lambda _want: None
+        gate.keeps_reserve = lambda _why: False
+        gate.starved_step = lambda _why, _stop=None: None
+        gate.start = lambda: started.append(clock["t"])
+        with mock.patch.object(hook.shutil, "disk_usage",
+                               side_effect=lambda _p: mock.Mock(free=int(free["gib"] * 1024**3))), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
+                mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "wait_for_running_pass", return_value=False), \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "sleep", side_effect=sleep), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
+            for _ in range(5):
+                self.assertIsNone(gate.poll())
+                clock["t"] += hook.GATE_POLL_S
+            self.assertEqual(started, [], "no job fits under the hard floor: the listener stays off")
+            self.assertEqual([p.argv for p in procs], [["glaeda-disk", "30"]], "reclaim started")
+            holds = [line for line in logs if "DISK_FULL_NO_LISTEN" in line]
+            self.assertEqual(len(holds), 1, f"the hold is logged once, not every poll: {logs}")
+            self.assertTrue(holds[0].startswith("holding the listener off: disk full"), holds)
+            # the pass ends having freed room above the hard floor (still under one job's peak): it listens
+            procs[0].poll.return_value = 0
+            free["gib"] = 15.0
+            for _ in range(hook.GATE_CONFIRM + 1):
+                self.assertIsNone(gate.poll())
+                clock["t"] += hook.GATE_POLL_S
+            self.assertTrue(started, "above the hard floor a short disk only warns: the listener starts")
+            self.assertTrue(any("listening anyway" in line for line in logs), logs)
+
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
@@ -15575,7 +15917,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(json.loads(receipt_path.read_text())["registration"]["runnerId"], 4242)
         self.assertFalse(any(e["tool"] == "launchctl" for e in self.log()), "sandbox HOME never calls launchctl")
 
-        before = self.tree()
+        before = RunnerTest.tree(self)
         calls = len(self.log())
         second = self.invoke("--apply", "--labels", "cmux-extra")
         states = {a["state"] for a in second["actions"] if a["kind"] != "verify"}
@@ -15877,7 +16219,7 @@ class RunnerTest(unittest.TestCase):
         runner = self.home / "actions-runner-glaeda"
         runner.mkdir()
         (runner / "config.sh").write_text("#!/bin/sh\n")
-        before = self.tree()
+        before = RunnerTest.tree(self)
         receipt = self.invoke("--uninstall", "--apply")
         self.assertTrue(any("nothing is removed" in a.get("note", "") for a in receipt["actions"]))
         after = {k: v for k, v in self.tree().items() if not k.startswith(".local")}
@@ -17248,7 +17590,7 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
 
     def test_relabel_without_a_token_blocks_and_changes_nothing(self) -> None:
         self.invoke("--apply", "--labels", "ram48")
-        before = self.tree()
+        before = RunnerTest.tree(self)
         real_which = cr.which
         with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)), \
                 mock.patch.object(cr, "xcode_present", return_value=False):
@@ -17323,7 +17665,7 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
             self.assertTrue(again["ready"], again["blocking"])
             self.assertEqual({a["state"] for a in again["actions"] if a["kind"] != "verify"}, {"unchanged"})
 
-            before = self.tree()
+            before = RunnerTest.tree(self)
             stuck = self.invoke("--uninstall", "--apply", gh=False, expect=1)  # no way to deregister: touch nothing
             self.assertFalse(stuck["ready"])
             self.assertTrue(all(a["state"] == "blocked" for a in stuck["actions"]), stuck["actions"])
@@ -17506,6 +17848,11 @@ NIGHTLY = {"name": "nightly-next", "repo": "manaflow-ai/cmux",
            "env": {"NIGHTLY_BUILDER_RUNNER_DIR": "{runnerDir}", "PATH": "~/.local/bin"}}
 
 
+HQ_USER = {"name": "hq-two-mac-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+           "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-two-mac-a"], "admit": ["/usr/bin/true"],
+           "user": "cmuxci-gui-01"}
+
+
 def dedicated_manifest(*entries: dict) -> dict:
     manifest = copy.deepcopy(MANIFEST)
     manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"dedicated": [copy.deepcopy(e) for e in entries]}}
@@ -17551,6 +17898,183 @@ class DedicatedRunnerTest(unittest.TestCase):
         headless["hosts"]["mini-std"]["gui"] = False
         _, why = fleet_labels.dedicated_runners(headless, "mini-std")
         self.assertIn("gui: false", why or "")
+
+    def test_a_user_entry_is_validated(self) -> None:
+        """DEDICATED_USER (cmuxterm-hq#13863): "user" names the macOS account a trusted entry runs as. Never root, never the
+        member's own ssh_user, only with trustedRef, never with lanRelay or yieldToExclusive."""
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(HQ_USER), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(good[0]["user"], "cmuxci-gui-01")
+        good, _ = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(good[0]["user"])
+        untrusted = {k: v for k, v in HQ_USER.items() if k not in ("trustedRef", "trustedRepo")}
+        for entry, needle in (({**HQ_USER, "user": "root"}, "never root"), ({**HQ_USER, "user": "Bad User"}, "short name"),
+                              ({**HQ_USER, "user": 5}, "short name"), (untrusted, "needs trustedRef"),
+                              ({**HQ_USER, "yieldToExclusive": True}, "without lanRelay and yieldToExclusive"),
+                              ({**HQ_USER, "user": "cmux"}, "own ssh_user")):
+            with self.subTest(entry=entry):
+                manifest = dedicated_manifest(entry)
+                manifest["ssh_user"] = "cmux"
+                _, why = fleet_labels.dedicated_runners(manifest, "mini-std")
+                self.assertIn(needle, why or "")
+        relay = dedicated_manifest({**HQ_USER, "lanRelay": "10.0.0.2:22"})
+        relay["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+        _, why = fleet_labels.dedicated_runners(relay, "mini-std")
+        self.assertIn("without lanRelay", why or "")
+
+    def test_a_user_entry_installs_only_as_its_user_private_and_off_the_shared_ledger(self) -> None:
+        """DEDICATED_USER: run as anyone but its user, --dedicated refuses and changes nothing (so the member user's
+        apply never installs it). As its user: the home and the runner directory end 0700, its hook keeps its ledger
+        under its own state, it takes no capacity unit and writes no dedicatedOnly marker."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        manifest = dedicated_manifest(HQ_USER)
+        manifest["ssh_user"] = "cmux"
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["dedicatedOnly"] = True
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        before = RunnerTest.tree(self)
+        for me in ("cmux", None):
+            with self.subTest(me=me), mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                    mock.patch.object(cr, "current_user", return_value=me), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cr.main(["--output", "json", "--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                "--dedicated", "hq-two-mac-a"])
+            self.assertEqual(code, 2)
+            self.assertIn("runs as macOS user cmuxci-gui-01", err.getvalue())
+            self.assertEqual(RunnerTest.tree(self), before, "nothing changed")
+        self.home.chmod(0o755)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
+            receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                  "--dedicated", "hq-two-mac-a")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
+        self.assertEqual(self.by_kind(receipt)["private"]["state"], "create")
+        self.assertTrue(self.by_kind(receipt)["private"]["applied"])
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(runner.stat().st_mode & 0o777, 0o700)
+        ledger = self.home / ".local/state/glaeda/cmux-runner" / cr.USER_CAPACITY_DIR
+        hooks = runner / cr.HOOK_DIR
+        for name in ("job-started.sh", "job-completed.sh", "listen.sh"):
+            self.assertIn(f"--capacity-dir {ledger}", (hooks / name).read_text(), name)
+        started = (hooks / "job-started.sh").read_text()
+        self.assertNotIn("--capacity-units", started)
+        self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/other", started)
+        self.assertFalse((self.home / ".local/state/glaeda/cmux-runner" / cr.DEDICATED_ONLY_MARKER).exists())
+        # a re-run finds it private and changes nothing there
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None):
+            again = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                "--dedicated", "hq-two-mac-a")
+        self.assertEqual(self.by_kind(again)["private"]["state"], "unchanged")
+
+    def test_the_toolchain_check_takes_only_root_or_self_owned_unwritable_paths(self) -> None:
+        """PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry execs nothing another account can replace. Each path,
+        its target and every directory above must be owned by root or this account, with no group or other write."""
+        me = 5101
+        d, f, link = stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK
+
+        def table(**extra):
+            entries = {"/": (0, d | 0o755), "/usr": (0, d | 0o755), "/usr/bin": (0, d | 0o755),
+                       "/usr/bin/python3": (0, f | 0o755), "/opt": (0, d | 0o755),
+                       "/opt/homebrew": (501, d | 0o775), "/opt/homebrew/bin": (501, d | 0o775),
+                       "/opt/homebrew/bin/python3": (501, link | 0o755), "/Users": (0, d | 0o755),
+                       "/Users/gui": (me, d | 0o700), "/Users/gui/bin": (me, d | 0o755),
+                       "/Users/gui/bin/tool": (me, f | 0o755), "/Users/gui/open": (me, d | 0o777),
+                       "/Users/gui/cmux-made": (501, f | 0o755), **extra}
+
+            def lstat(path):
+                if path not in entries:
+                    raise FileNotFoundError(path)
+                uid, mode = entries[path]
+                return mock.Mock(st_uid=uid, st_mode=mode)
+            return lstat
+        lstat = table()
+        with mock.patch.object(cr.os.path, "realpath", side_effect=lambda x: x):
+            self.assertIsNone(cr.untrusted_exec("/usr/bin/python3", me, lstat))
+            self.assertIsNone(cr.untrusted_exec("/Users/gui/bin/tool", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/opt/homebrew/bin/python3", me, lstat))
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/Users/gui/cmux-made", me, lstat))
+            self.assertIn("writable by group or other", cr.untrusted_exec("/Users/gui/open", me, lstat))
+            self.assertIn("cannot be read", cr.untrusted_exec("/usr/bin/missing", me, lstat))
+            self.assertEqual(cr.untrusted_exec("relative/tool", me, lstat), "not an absolute path")
+            # an owner-written dir that is group-writable still fails (macOS /Applications is root:admin 0775)
+            self.assertIn("writable by group or other",
+                          cr.untrusted_exec("/usr/bin/python3", me, table(**{"/usr/bin": (0, d | 0o775)})))
+        # a symlink whose target fails is refused through its target
+        with mock.patch.object(cr.os.path, "realpath",
+                               side_effect=lambda x: "/opt/homebrew/bin/python3" if x == "/usr/bin/python3" else x):
+            self.assertIn("owned by uid 501", cr.untrusted_exec("/usr/bin/python3", me, lstat))
+
+    def test_a_user_entry_runs_a_protected_toolchain_and_refuses_an_unprotected_one(self) -> None:
+        """PROTECTED_TOOLCHAIN: with no --python a user entry's hooks run Apple's /usr/bin/python3; its agent, watch,
+        listener gate and .path hold only the system PATH and DEVELOPER_DIR is the Command Line Tools. A declared PATH
+        entry, an admit command or an interpreter that fails the check blocks the whole install, typed."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        entry = {**HQ_USER, "watch": ["/usr/bin/true"], "env": {"PATH": "~/.local/bin"}}
+        manifest = dedicated_manifest(entry)
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        argv = ["--output", "json", "--gh", os.fspath(self.gh), "--apply", "--manifest", os.fspath(path),
+                "--member", "mini-std", "--dedicated", "hq-two-mac-a"]
+        out = io.StringIO()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                mock.patch.object(cr, "untrusted_exec", return_value=None), contextlib.redirect_stdout(out):
+            self.assertEqual(cr.main(argv), 0, out.getvalue()[-2000:])
+        receipt = json.loads(out.getvalue())
+        self.assertEqual(receipt["actions"][0]["kind"], "toolchain")
+        self.assertEqual(receipt["actions"][0]["state"], "unchanged")
+        runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
+        hooks = runner / cr.HOOK_DIR
+        self.assertTrue((hooks / "job-started.sh").read_text().splitlines()[-1].startswith("exec /usr/bin/python3 "))
+        listen = (hooks / "listen.sh").read_text()
+        self.assertIn(f"export DEVELOPER_DIR={cr.PROTECTED_DEVELOPER_DIR}\nexport PATH={cr.PROTECTED_PATH}\n", listen)
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.hq-two-mac-a"
+        agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
+        self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
+        self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
+        self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
+        dot_path = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(dot_path, [f"{self.home}/.local/bin", *cr.PROTECTED_PATH.split(":")])
+        for dirs in (dot_path, watch["EnvironmentVariables"]["PATH"].split(":"), agent["EnvironmentVariables"]["PATH"].split(":")):
+            self.assertFalse([e for e in dirs if e.startswith(("/opt/homebrew", "/usr/local"))])
+        # the checked set: the interpreters, the Command Line Tools' python3, each PATH dir, the admit and watch commands
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
+            checked = []
+
+            def record(p, uid, lstat=None):
+                checked.append(p)
+                return "owned by uid 501, not root or this account" if p == f"{self.home}/.local/bin" else None
+            with mock.patch.object(cr, "untrusted_exec", side_effect=record), \
+                    contextlib.redirect_stdout(io.StringIO()) as out2:
+                code = cr.main([*argv[:-1], "hq-two-mac-a"])
+        self.assertEqual(code, 1)
+        doc = json.loads(out2.getvalue())
+        tool = doc["actions"][0]
+        self.assertEqual((tool["kind"], tool["state"], tool["missing"]), ("toolchain", "blocked", "protected-toolchain"))
+        self.assertIn(".local/bin", tool["note"])
+        for want in ("/usr/bin/python3", f"{cr.PROTECTED_DEVELOPER_DIR}/usr/bin/python3", "/usr/bin", "/sbin",
+                     "/usr/bin/true", sys.executable):
+            self.assertIn(want, checked)
+        self.assertFalse([a for a in doc["actions"][1:] if a.get("applied")], "nothing applied past a blocked toolchain")
+
+    def test_an_entry_without_a_user_refuses_another_account(self) -> None:
+        """An entry with no user is the member user's: run as another account (a hidden GUI user) it refuses."""
+        manifest = dedicated_manifest(NIGHTLY)
+        manifest["ssh_user"] = "cmux"
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cr.main(["--output", "json", "--manifest", os.fspath(path), "--member", "mini-std",
+                            "--dedicated", "nightly-next"])
+        self.assertEqual(code, 2)
+        self.assertIn("declares no user, so it is cmux's runner", err.getvalue())
 
     def test_an_entry_that_yields_to_exclusive_passes_the_opt_in_to_its_hook(self) -> None:
         good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
@@ -17805,6 +18329,29 @@ class DedicatedRunnerTest(unittest.TestCase):
             {**NIGHTLY, "labels": ["glaeda-runner-mini-std-nightly-next"]})
         self.assertIn("beside untrusted dedicated runner nightly-next",
                       fleet_labels.dedicated_runners(sibling, "mini-std")[1] or "")
+        # LAN_RELAY_ADAPTERS: a list is one host's adapter addresses on one port; a list of one is that string
+        adapters = ["172.20.1.6:22", "172.20.1.5:22"]
+        for value, expected in ((adapters, adapters), (["172.20.1.6:22"], "172.20.1.6:22"),
+                                (["010.0.0.1:22", "10.0.0.2:22", "192.168.1.1:22", "172.16.0.1:22"],
+                                 ["10.0.0.1:22", "10.0.0.2:22", "192.168.1.1:22", "172.16.0.1:22"])):
+            with self.subTest(value=value):
+                good, why = fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelay": value}), "mini-std")
+                self.assertIsNone(why)
+                self.assertEqual(good[0]["lanRelay"], expected)
+        five = [f"172.20.1.{i}:22" for i in range(1, 6)]
+        for value, needle in (([], "1 to 4 addresses"), (five, "1 to 4 addresses"),
+                              (["172.20.1.5:22", "8.8.8.8:22"], "RFC 1918"),
+                              (["172.20.1.5:22", "mini.local:22"], "IPv4:PORT"),
+                              (["172.20.1.5:22", 22], "IPv4:PORT"),
+                              (["172.20.1.5:22", "172.20.1.5:22"], "an address twice"),
+                              (["172.20.1.5:22", "172.20.1.6:2222"], "one port"),
+                              ({"a": "172.20.1.5:22"}, "IPv4:PORT")):
+            with self.subTest(value=value):
+                _, why = fleet_labels.dedicated_runners(manifest_doc({**route, "lanRelay": value}), "mini-std")
+                self.assertIn(needle, why or "")
+        listed_untrusted = {**untrusted, "lanRelay": adapters}
+        for doc in (manifest_doc(listed_untrusted), manifest_doc({**route, "lanRelay": adapters}, dedicated_only=False)):
+            self.assertIn("runner.dedicatedOnly", fleet_labels.dedicated_runners(doc, "mini-std")[1] or "")
 
         def write(entry: dict) -> str:
             path = self.state / "mini-fleet.json"
@@ -17845,6 +18392,24 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertIn("172.20.1.6", plistlib.loads((agents / f"{label}.relay.plist").read_bytes())["ProgramArguments"])
         self.assertFalse((socket_dir / "fleet-route.sock").exists())
         self.assertEqual(stat.S_IMODE(socket_dir.stat().st_mode), 0o700)
+        # LAN_RELAY_ADAPTERS: a list runs Apple's /bin/sh with the fixed loop over Apple's nc, the addresses as
+        # arguments in declared order; the same socket, no key, no environment
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            listed = self.invoke("--apply", "--manifest", write({**relayed, "lanRelay": adapters}), *args)
+        self.assertEqual(self.by_kind(listed)["relay"]["state"], "update")
+        relay = plistlib.loads((agents / f"{label}.relay.plist").read_bytes())
+        self.assertEqual(relay["ProgramArguments"],
+                         ["/bin/sh", "-c", cr.LAN_RELAY_LOOP, "glaeda-lan-relay", str(cr.LAN_RELAY_CONNECT_S),
+                          str(cr.LAN_RELAY_IDLE_S), "22", "172.20.1.6", "172.20.1.5"])
+        self.assertIn("/usr/bin/nc ", cr.LAN_RELAY_LOOP)
+        self.assertNotIn("172.", cr.LAN_RELAY_LOOP, "addresses are arguments, never script text")
+        self.assertEqual(relay["inetdCompatibility"], {"Wait": False})
+        self.assertEqual(relay["Sockets"]["Listener"]["SockPathName"], os.fspath(socket_dir / "fleet-route.sock"))
+        self.assertNotIn("EnvironmentVariables", relay)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "SOCKET_PATH_MAX", 4096):
+            self.invoke("--apply", "--manifest", write(changed), *args)
         # a relay update while the runner has a job (that may be using it) changes nothing
         (self.state / "loaded.json").write_text(json.dumps([label, f"{label}.relay"]))
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
@@ -17898,6 +18463,44 @@ class DedicatedRunnerTest(unittest.TestCase):
             cr.remove_relay_socket(ctx, {"label": f"{label}.relay", "socket": os.fspath(elsewhere)})
             self.assertTrue(elsewhere.exists(), "never outside the relay directory")
             cr.remove_relay_socket(ctx, {"label": "unrelated"})
+
+    def test_a_lan_relay_list_forwards_to_the_first_adapter_address_that_connects(self) -> None:
+        """LAN_RELAY_ADAPTERS: the relay's loop runs nc to each declared address in order, stops at the first that
+        connects (any status but 1, nc's could-not-connect), hands that address the client's bytes intact, and fails
+        with 1 when none connects. A connected session that ends in an error is never retried elsewhere."""
+        fake = self.home / "fake-nc"
+        calls = self.home / "nc-calls"
+        # answers: address -> exit status; 0 echoes stdin (a connected session), 1 is "could not connect"
+        fake.write_text("#!/bin/sh\n"
+                        f'echo "$*" >> {shlex.quote(os.fspath(calls))}\n'
+                        'case "$5" in\n'
+                        '  172.20.1.6) exit 1 ;;\n'
+                        '  172.20.1.5) cat; exit 0 ;;\n'
+                        '  10.0.0.9) cat; exit 2 ;;\n'
+                        '  *) exit 1 ;;\n'
+                        'esac\n')
+        fake.chmod(0o755)
+        loop = cr.LAN_RELAY_LOOP.replace("/usr/bin/nc", os.fspath(fake))
+        self.assertNotEqual(loop, cr.LAN_RELAY_LOOP)
+
+        def relay(*addresses: str) -> subprocess.CompletedProcess:
+            calls.unlink(missing_ok=True)
+            return subprocess.run(["/bin/sh", "-c", loop, "glaeda-lan-relay", "5", "900", "22", *addresses],
+                                  input=b"SSH-2.0-client\r\n", capture_output=True, timeout=30)
+
+        moved = relay("172.20.1.6", "172.20.1.5")
+        self.assertEqual((moved.returncode, moved.stdout), (0, b"SSH-2.0-client\r\n"))
+        self.assertEqual(calls.read_text().splitlines(),
+                         ["-G 5 -w 900 172.20.1.6 22", "-G 5 -w 900 172.20.1.5 22"])
+        first = relay("172.20.1.5", "172.20.1.6")
+        self.assertEqual((first.returncode, first.stdout), (0, b"SSH-2.0-client\r\n"))
+        self.assertEqual(calls.read_text().splitlines(), ["-G 5 -w 900 172.20.1.5 22"], "the first that connects")
+        none = relay("172.20.1.6", "192.168.9.9")
+        self.assertEqual((none.returncode, none.stdout), (1, b""))
+        self.assertEqual(len(calls.read_text().splitlines()), 2)
+        broken = relay("10.0.0.9", "172.20.1.5")
+        self.assertEqual(broken.returncode, 2)
+        self.assertEqual(calls.read_text().splitlines(), ["-G 5 -w 900 10.0.0.9 22"], "a connected session ends it")
 
     def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
@@ -18977,7 +19580,7 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIsNone(decide(warm + 60, 9.0, cover, 2, 14, 45.0, 0, 1, False, ncpu=14))
         self.assertEqual(decide(warm + 60, 2.1, cover, 6, 14, 45.0, 0, 1, False, ncpu=14)[0], 3)
         # the host's safety brakes keep what it holds
-        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 85.0, 0, 1, False, ncpu=14), "host at 80%+")
+        self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 96.0, 0, 1, False, ncpu=14), "host at 95%+")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 2, False, ncpu=14), "memory pressure")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 6, 14, 45.0, 0, 1, True, ncpu=14), "thermal")
         self.assertIsNone(decide(warm + 60, 1.0, cover, 1, 14, 45.0, 0, 1, False, ncpu=14), "one unit stays")
@@ -19538,14 +20141,14 @@ class CapacityArithmeticTest(unittest.TestCase):
     def test_one_rule_on_a_12_core_16_gib_host_and_a_30_core_96_gib_host(self) -> None:
         needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(3.4, 3000)})  # 4 cores, 3 GiB
         with self.host(12, 16, needs):
-            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (12, 12), "16 GiB less a 4 GiB floor")
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (12, 14), "16 GiB less a 1.6 GiB floor")
             ran, why = self.fill("test")
-        self.assertEqual(ran, 3, "12 cores / 4: cores bind before RAM (12 GiB / 3)")
+        self.assertEqual(ran, 3, "12 cores / 4: cores bind before RAM (14 GiB / 3)")
         self.assertIn("capacity: 0 of 12 units free", why)
         hook.close_all(self.held)
         self.held.clear()
         with self.host(30, 96, needs):
-            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (30, 84), "96 GiB less 12 GiB")
+            self.assertEqual((hook.capacity_cores(14), hook.mem_chunks_total()), (30, 86), "96 GiB less 9.6 GiB")
             ran, why = self.fill("test")
         self.assertEqual(ran, 7, "30 cores / 4, the same rule with the bigger host's numbers")
         self.assertIn("of 30 units free", why)
@@ -19557,40 +20160,40 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.capacity_cores(14), 14, "unmeasurable: the --capacity-units count")
 
     def test_a_ram_bound_host_refuses_on_ram(self) -> None:
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.5, 5500),  # 2 cores, 6 GiB
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.5, 6500),  # 2 cores, 7 GiB
                             f"{self.GUEST}/build-fleet-go.yml/huge": self.row(2.0, 20000)},  # 20 GiB, its own
                            {"isolated": self.row(2.0, 30000)})  # the class estimate: more than 16 GiB too
         with self.host(12, 16, needs):
             ran, why = self.fill("test")
-            self.assertEqual(ran, 2, "6 of 12 cores free, but 12 GiB of RAM fits two 6 GiB jobs")
-            self.assertTrue(why.startswith("capacity: 0 of 12 GiB of RAM free"), why)
-            self.assertIn("needs 6 GiB", why)
+            self.assertEqual(ran, 2, "6 of 12 cores free, but 14 GiB of RAM fits two 7 GiB jobs")
+            self.assertTrue(why.startswith("capacity: 0 of 14 GiB of RAM free"), why)
+            self.assertIn("needs 7 GiB", why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("test")
             self.assertTrue(ok, why)
             ok, why = self.take("huge")  # more than the host's RAM: it waits for a RAM-idle host, never refused
             self.assertFalse(ok)
-            self.assertTrue(why.startswith("capacity: 6 of 12 GiB of RAM free"), why)
+            self.assertTrue(why.startswith("capacity: 7 of 14 GiB of RAM free"), why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
-            self.assertIn("12/12 GiB", why, "it runs alone")
+            self.assertIn("14/14 GiB", why, "it runs alone")
             ok, why = self.take("test")
             self.assertFalse(ok)
-            self.assertIn("of 12 GiB of RAM free", why)
+            self.assertIn("of 14 GiB of RAM free", why)
             hook.close_all(self.held)
             self.held.clear()
             ok, why = self.take("unmeasured")  # only its class's 30 GiB estimate: it runs here alone too
             self.assertTrue(ok, why)
-            self.assertIn("12/12 GiB", why)
+            self.assertIn("14/14 GiB", why)
         hook.close_all(self.held)
         self.held.clear()
         with self.host(30, 96, needs):
             ok, why = self.take("huge")
             self.assertTrue(ok, why)
-            self.assertIn("20/84 GiB", why)
+            self.assertIn("20/86 GiB", why)
         with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: "0"}):
             self.assertEqual(hook.mem_chunks_total(), 0, "the kill switch")
         with self.host(12, 16, needs), mock.patch.dict(os.environ, {hook.RAM_LEDGER_ENV: ""}):
@@ -19601,7 +20204,7 @@ class CapacityArithmeticTest(unittest.TestCase):
     def test_live_units_give_back_cores_never_ram(self) -> None:
         """LIVE_UNITS: a job's holder lets its unit files above the measured need go, so the next admission takes them;
         its RAM chunks stay held, so a job whose RAM does not fit what is really free is still refused."""
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 7000),  # 6 cores, 7 GiB
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(5.5, 8000),  # 6 cores, 8 GiB
                             f"{self.GUEST}/build-fleet-go.yml/small": self.row(1.0, 4000)})  # 1 core, 4 GiB
         capacity = self.dir / "capacity"
         state = self.dir / "state"
@@ -19612,20 +20215,20 @@ class CapacityArithmeticTest(unittest.TestCase):
                                          os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
             self.assertTrue(ok, why)
             self.addCleanup(hook.release_holder, hook.holder_file(state))
-            self.assertIn("6/14 units+7/12 GiB", why)
+            self.assertIn("6/14 units+8/14 GiB", why)
             taken = lambda prefix, n: sum(not hook.probe(capacity / f"{prefix}-{i}") for i in range(n))  # noqa: E731
-            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (6, 7))
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 14)), (6, 8))
             hook.request_dynamic_release(state, 2, {"reason": "test"})
             deadline = time.monotonic() + 5
             while taken("unit", 14) > 2 and time.monotonic() < deadline:
                 time.sleep(hook.HOLDER_POLL_S)
-            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 12)), (2, 7), "cores go back, RAM stays")
-            # 12 cores are free now but only 5 GiB of RAM: a 7 GiB job is refused for RAM, a 4 GiB one fits
+            self.assertEqual((taken("unit", 14), taken(hook.MEM_UNIT, 14)), (2, 8), "cores go back, RAM stays")
+            # 12 cores are free now but only 6 GiB of RAM: an 8 GiB job is refused for RAM, a 4 GiB one fits
             with mock.patch.object(hook, "hold", side_effect=self.keep):
                 ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "test",
                                              os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
                 self.assertFalse(ok)
-                self.assertTrue(why.startswith("capacity: 5 of 12 GiB of RAM free"), why)
+                self.assertTrue(why.startswith("capacity: 6 of 14 GiB of RAM free"), why)
                 ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, total, "small",
                                              os.getpid(), state, repo=self.GUEST, workflow="build-fleet-go.yml")
                 self.assertTrue(ok, why)
@@ -19669,15 +20272,15 @@ class CapacityArithmeticTest(unittest.TestCase):
                 ok, why = self.take("verify-signed-nightly", workflow="nightly.yml", repo=hook.DEFAULT_HOME_REPO,
                                     tier=hook.TIER_NIGHTLY, since=time.time())
             self.assertTrue(ok, why)
-            self.assertIn("2/12 GiB", why)
+            self.assertIn("2/14 GiB", why)
 
     def test_the_listener_gate_holds_for_ram(self) -> None:
-        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 5500)})
+        needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(1.0, 6500)})
         with self.host(12, 16, needs):
             for _ in range(2):
                 self.assertTrue(self.take("test")[0])
             why = hook.mini_full(self.dir / "capacity", 12, hook.RunnerScope(units=12))
-            self.assertIn("only 0 of 12 GiB of RAM", why)
+            self.assertIn("only 0 of 14 GiB of RAM", why)
             self.assertIn(hook.UNITS_FULL, why, "a RAM hold reads as a units hold (SESSION_FIRST, reserves)")
             self.assertEqual(hook.fit_mem_chunks([20000, 3000], 12), 3, "a job that never fits holds nothing")
             self.assertEqual(hook.fit_mem_chunks([], 12), 1)
@@ -19691,7 +20294,7 @@ class CapacityArithmeticTest(unittest.TestCase):
                              capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         answer = json.loads(out.stdout)
-        self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 4096, "mem_chunks": 12,
+        self.assertEqual(answer["host"], {"cores": 12, "mem_mib": 16384, "mem_floor_mib": 1638, "mem_chunks": 14,
                                           "mem_chunk_mib": 1024})
         self.assertEqual(answer["classes"]["compile"], {"cores": 3, "mib": 9000})
         out = subprocess.run([sys.executable, os.fspath(HOOK), "needs", "--needs-file", os.fspath(self.dir / "x")],
@@ -19878,20 +20481,20 @@ class SimDynamicTest(unittest.TestCase):
         self.assertFalse(hook.probe(self.capacity / hook.SIM_GATE), "a copy past the first holds the gate shared")
 
     def test_the_ceiling_is_never_exceeded(self) -> None:
-        self.assertEqual(hook.sim_ceiling(), (5, "(32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5"))
-        for _ in range(5):
+        self.assertEqual(hook.sim_ceiling(), (6, "(32 GiB - 3.2 reserve) / 4.5 GiB (stock fallback) = 6"))
+        for _ in range(6):
             self.assertTrue(self.take()[0])
         ok, why = self.take()
         self.assertFalse(ok)
-        self.assertEqual(why, "capacity: all 5 simulator tokens are taken (ios-simulator is simulator)")
-        self.assertFalse((self.capacity / "simulator-5.token").exists(), "no copy past the ceiling is ever made")
-        self.assertEqual(hook.sim_copy_room(5, 0, self.capacity),
-                         "the ceiling is 5 simulators: (32 GiB - 6.4 reserve) / 4.5 GiB (stock fallback) = 5")
-        self.assertEqual(len(hook.sim_token_names()), 5)
+        self.assertEqual(why, "capacity: all 6 simulator tokens are taken (ios-simulator is simulator)")
+        self.assertFalse((self.capacity / "simulator-6.token").exists(), "no copy past the ceiling is ever made")
+        self.assertEqual(hook.sim_copy_room(6, 0, self.capacity),
+                         "the ceiling is 6 simulators: (32 GiB - 3.2 reserve) / 4.5 GiB (stock fallback) = 6")
+        self.assertEqual(len(hook.sim_token_names()), 6)
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(16 * 1024)}):
-            self.assertEqual(hook.sim_ceiling()[0], 2, "16 GiB: (16 - 4) / 4.5")
+            self.assertEqual(hook.sim_ceiling()[0], 3, "16 GiB: (16 - 1.6) / 4.5")
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: str(96 * 1024)}):
-            self.assertEqual(hook.sim_ceiling()[0], 17, "96 GiB: (96 - 19.2) / 4.5")
+            self.assertEqual(hook.sim_ceiling()[0], 19, "96 GiB: (96 - 9.6) / 4.5")
         with mock.patch.dict(os.environ, {hook.HOST_MEM_ENV: ""}), mock.patch.object(hook.sys, "platform", "linux"):
             self.assertEqual(hook.sim_ceiling(), (1, "RAM unmeasured"), "unmeasured: one per mini, as before")
 
@@ -19901,7 +20504,7 @@ class SimDynamicTest(unittest.TestCase):
         self.assertEqual(hook.sim_rss_mib(), (3846, "test-ios.yml/ios-simulator-build rss p90"))
         self.needs(jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
         self.assertEqual(hook.sim_rss_mib(), (5120, "test-ios.yml/ios-simulator-build rss p95"))
-        self.assertEqual(hook.sim_ceiling()[0], 5, "(32 - 6.4) / 5")
+        self.assertEqual(hook.sim_ceiling()[0], 5, "(32 - 3.2) / 5")
         self.needs(classes={"simulator": {"n": 40, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}},
                    jobs={hook.SIM_RSS_JOB_ROW: {**row, "rss_peak_mib_p95": 5120}})
         self.assertEqual(hook.sim_rss_mib(), (8192, "simulator rss p95"), "the class row first")
@@ -19909,30 +20512,30 @@ class SimDynamicTest(unittest.TestCase):
         self.needs(classes={"simulator": {"n": 4, "cores_p90": 0.2, "rss_peak_mib_p95": 8192}})
         self.assertEqual(hook.sim_rss_mib(), (hook.SIM_RSS_FALLBACK_MIB, "stock fallback"), "too few runs")
 
-    def test_copies_stop_at_80_percent_ram(self) -> None:
+    def test_copies_stop_at_90_percent_ram(self) -> None:
         self.assertTrue(self.take()[0])
-        os.environ[hook.HOST_MEM_FREE_ENV] = "33"  # 10.6 GiB free less 4.5 is 6.1 < 6.4
+        os.environ[hook.HOST_MEM_FREE_ENV] = "24"  # 7.7 GiB free less 4.5 is 3.2 < 3.2 (3.18 < 3.28)
         ok, why = self.take()
         self.assertFalse(ok)
         self.assertTrue(why.startswith("capacity:"), "a headroom refusal waits like any capacity wait")
-        self.assertIn("; simulator-1 needs headroom: free RAM 10.6 GiB less one simulator 4.5 GiB < 20% of 32 GiB",
+        self.assertIn("; simulator-1 needs headroom: free RAM 7.7 GiB less one simulator 4.5 GiB < 10% of 32 GiB",
                       why)
-        os.environ[hook.HOST_MEM_FREE_ENV] = "35"  # 11.2 - 4.5 = 6.7 >= 6.4
+        os.environ[hook.HOST_MEM_FREE_ENV] = "25"  # 8.0 - 4.5 = 3.5 >= 3.2
         self.assertTrue(self.take()[0])
-        os.environ[hook.HOST_MEM_FREE_ENV] = "60"
-        self.assertIn("free RAM 19.2 GiB less one simulator 16.0 GiB", hook.sim_copy_room(2, 16 * 1024, None),
+        os.environ[hook.HOST_MEM_FREE_ENV] = "55"
+        self.assertIn("free RAM 17.6 GiB less one simulator 16.0 GiB", hook.sim_copy_room(2, 16 * 1024, None),
                       "a job measured bigger than one simulator counts as itself")
         os.environ[hook.HOST_MEM_FREE_ENV] = "junk"
         self.assertIsNone(hook.sim_copy_room(2, 0, None), "unreadable: holds nothing")
 
-    def test_copies_stop_at_load_80_percent_of_the_cores(self) -> None:
+    def test_copies_stop_at_load_95_percent_of_the_cores(self) -> None:
         self.assertTrue(self.take()[0])
-        self.load = 7.9
+        self.load = 9.4
         self.assertTrue(self.take()[0])
-        self.load = 8.0
+        self.load = 9.5
         ok, why = self.take()
         self.assertFalse(ok)
-        self.assertIn("; simulator-2 needs headroom: load1 8.0 >= 0.8 x 10 cores", why)
+        self.assertIn("; simulator-2 needs headroom: load1 9.5 >= 0.95 x 10 cores", why)
 
     def test_copies_stop_on_pressure_and_on_growing_swap(self) -> None:
         self.assertTrue(self.take()[0])
@@ -20021,10 +20624,10 @@ class SimDynamicTest(unittest.TestCase):
         self.assertIn("simulator", fits())
         self.held.append(hook.lock_file(self.capacity / "simulator.token", fcntl.LOCK_EX))
         self.assertIn("simulator", fits(), "copy 1 is free")
-        self.load = 9.0
+        self.load = 9.5
         self.assertNotIn("simulator", fits(), "copy 1 without headroom")
         self.load = 1.0
-        for c in range(1, 5):
+        for c in range(1, 6):
             self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
         self.assertNotIn("simulator", fits(), "every copy to the ceiling taken")
 
@@ -20057,9 +20660,9 @@ class SimDynamicTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(self.capacity, 10, sim),
                          "simulator-1 needs headroom: memory pressure level 2 is not green (>= 2)")
         self.pressure = 1
-        for c in range(1, 5):
+        for c in range(1, 6):
             self.held.append(hook.lock_file(self.capacity / f"simulator-{c}.token", fcntl.LOCK_EX))
-        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 5 simulator tokens on this mini are taken")
+        self.assertEqual(hook.mini_full(self.capacity, 10, sim), "all 6 simulator tokens on this mini are taken")
 
     def test_parse_swap_usage_reads_what_the_worker_reads(self) -> None:
         self.assertEqual(hook.parse_swap_usage("total = 2048.00M  used = 1003.25M  free = 1044.75M  (encrypted)"),

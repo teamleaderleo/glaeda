@@ -3422,6 +3422,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("refs/heads/wt", self._git("-C", str(origin), "for-each-ref"))
 
     def test_checkouts_with_hidden_git_state_are_kept(self) -> None:
+        self.maxDiff = None
         root, origin = self._tmp_repos()
         # a clean, pushed clone that backs a worktree with an unpushed detached commit
         self._git("clone", "-q", str(origin), str(root / "main"))
@@ -3455,8 +3456,11 @@ class GlaedaDiskTest(unittest.TestCase):
         for d in root.iterdir():
             self._age(d)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        # the worktree outside keeps its repository, named (git_used_from_outside)
+        self.assertEqual(why.pop("main"), ("in-use", [
+            f"a repository in it is used from outside: {self.root / 'elsewhere'} (a linked worktree of "
+            f"{root / 'main/.git'}); kept"]))
         self.assertEqual(why, {
-            "main": ("git-checkout", ["other worktrees use this repository"]),
             "super": ("git-checkout", ["submodule sm: commits no remote confirms"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
@@ -3575,12 +3579,14 @@ class GlaedaDiskTest(unittest.TestCase):
             self._age(c)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         confirm = ["submodule sm: commits no remote confirms"]
+        verdict, reasons = why.pop("sub-worktree")  # the worktree outside keeps it, named (git_used_from_outside)
+        self.assertEqual(verdict, "in-use")
+        self.assertIn(f"{self.root / 'sub-wt'} (a linked worktree of", reasons[0])
         self.assertEqual(why, {
             "orphaned": ("git-checkout", confirm),
             "commit-tree": ("git-checkout", confirm),
             "expired": ("git-checkout", confirm),
             "embedded": ("git-checkout", confirm),
-            "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
             "local-fetch": ("git-checkout", confirm)})
 
     def test_local_remotes_never_vouch_for_commits(self) -> None:
@@ -8802,7 +8808,7 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["measured"], 13 * gd.GIB)
         self.assertEqual(got["reclaimable"], 3 * gd.GIB)
         self.assertEqual(got["accounting_gap"], 0)
-        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
 
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent
@@ -8824,7 +8830,7 @@ class VolumeCensusTest(unittest.TestCase):
         got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
         self.assertEqual(got["accounting_gap"], 0)
         self.assertEqual(got["measured"], got["used"])
-        self.assertEqual(got["residual"]["category"], gd.APFS_INVISIBLE)
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
         row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
         self.assertIn(f"unclassified:{self.root / 'plain'}", [c["category"] for c in row["children"]])
 
@@ -8915,7 +8921,11 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertIn("Xcode command line", gd.census_owner("/Library/Developer/CommandLineTools"))
         self.assertIn("installed apps", gd.census_owner("/Applications"))
         self.assertEqual(gd.census_owner("/Applicationsx"), "")
-        self.assertEqual(gd.census_owner(str(gd.HOME / ".acpmux")), "acpmux sessions (acpmux_store_reclaim)")
+        self.assertIn("~/.acpmux-supervised", gd.census_owner(str(gd.HOME / ".acpmux")))
+        self.assertIn("acpmux_store_reclaim", gd.census_owner(str(gd.HOME / ".acpmux-supervised")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "lanes/pool/cmux")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "out/.work/tag")))
+        self.assertEqual(gd.census_owner(str(gd.HOME / "out/tag")), "")
         census = {"complete": True, "at": 1.0, "rows": {"/opt": [gd.GIB, "unclassified", True]}}
         child = gd.census_coverage_row(census)["children"][0]
         self.assertEqual((child["category"], child["owner"]), ("unclassified:/opt", gd.census_owner("/opt")))
@@ -9083,6 +9093,45 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["dev"], self.root.stat().st_dev)
         self.assertNotIn("/gone/x", got["rows"])
         self.assertIn(str(self.root / "a"), got["rows"])
+
+    def test_linux_census_walks_the_volume_holding_home(self) -> None:
+        # a lane VM, 2026-11-18 (huge-blue 2026-11-16, glaeda#2021): census_roots() was [] off macOS, so 340G of a
+        # full root stayed "unwalked (no volume census yet)"
+        saved = (gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN)
+        self.addCleanup(lambda: (setattr(gd, "HOME", saved[0]), setattr(gd, "RUNNER_CACHE_PROFILE", saved[1]),
+                                 setattr(gd, "DARWIN", saved[2])))
+        gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN = self.root, False, False
+        self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        for role in ("devbox", "fleet-mini"):  # whatever role the lane VM's timer runs
+            with mock.patch.object(gd, "ROLE", role):
+                self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        gd.RUNNER_CACHE_PROFILE = True
+        self.assertEqual(gd.census_roots(), [])
+
+    def test_a_linux_census_opens_home_and_names_each_folder_beside_an_unreadable_one(self) -> None:
+        """A lane VM, 2026-11-18: "/home >=150.4G unreadable" named nothing; home's own folders are rows now."""
+        home = self.root / "home/cmux"
+        self.write("home/cmux/Projects/big", 256 * 1024)
+        self.write("home/cmux/.cache/x", 64 * 1024)
+        other = self.root / "home/someone-else"
+        other.mkdir(parents=True)
+        os.chmod(other, 0)
+        self.addCleanup(os.chmod, other, 0o755)
+        with mock.patch.object(gd, "DARWIN", False):
+            opened = gd.census_open_home(home)
+        self.assertIn(str(self.root / "home"), opened)
+        self.assertIn(str(home), opened)
+        self.assertNotIn("/", opened)
+        census = gd.census_pass([self.root], set(), None, now=50.0, path=self.state, open_also=opened)
+        self.assertTrue(census["complete"])
+        rows = census["rows"]
+        self.assertGreaterEqual(rows[str(home / "Projects")][0], 256 * 1024)
+        self.assertIn(str(home / ".cache"), rows)
+        if os.geteuid() != 0:  # root reads everything
+            self.assertEqual(rows[str(other)][1], "unreadable")
+        self.assertNotIn(str(self.root / "home"), rows)  # opened, never one lower bound
+        with mock.patch.object(gd, "DARWIN", True):
+            self.assertEqual(gd.census_open_home(home), frozenset())
 
     def test_census_du_never_enters_file_provider_trees(self) -> None:
         argv = gd._census_du_argv(self.root)
@@ -9688,7 +9737,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build",
+                                       *gd.LANE_TMP_FAMILY_IDS})
         self.assertEqual(next(f for f in fams if f.id == "tmp").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "user-cache").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "home-caches").platform, "linux")
@@ -9856,6 +9906,15 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
         return json.loads(receipt.read_text().splitlines()[-1]), err.getvalue()
 
+    def survey_mirror(self, unit: Path):
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        return next(i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit))
+
     def bundle_heads(self) -> dict[str, str]:
         heads = {}
         for b in sorted((self.home / "archive/glaeda-disk").glob("*.bundle")):
@@ -9883,6 +9942,105 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual({r: heads.get(r) for r in want}, want)
         self.assertEqual(heads.get(gd.ARCHIVE_REF + detached), detached)  # a commit only HEAD held
         self.assertTrue(any("bundled to" in r for r in rec["reasons"]))
+
+    def _unreachable_clone(self, how: str) -> tuple[Path, Path, dict, str]:
+        """A mirror unit whose clone (full, shallow or blob:none partial) holds an unpushed commit, a staged edit and
+        an untracked file, and whose origin no longer answers (a lane VM's private origin with no credentials)."""
+        unit, clone, env = self.mirror_unit(srv_commits=3)
+        srv = self.home / "srv"
+        for text in ("an old blob the partial clone never fetched\n", "the blob at origin's tip\n"):
+            (srv / "big.txt").write_text(text * 100)
+            subprocess.run(["git", "-C", str(srv), "add", "big.txt"], check=True, env=env)
+            subprocess.run(["git", "-C", str(srv), "commit", "-qm", "blob"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "config", "uploadpack.allowFilter", "true"], check=True, env=env)
+        shutil.rmtree(clone)
+        extra = {"shallow": ["--depth", "1"], "partial": ["--filter=blob:none"], "full": []}[how]
+        r = subprocess.run(["git", "clone", "-q", *extra, f"file://{srv}", str(clone)], capture_output=True, text=True,
+                           env={k: v for k, v in env.items() if k != "GIT_NO_LAZY_FETCH"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if how == "partial":  # the old blob is not here: a lazy fetch would have to ask origin for it
+            old = subprocess.run(["git", "-C", str(srv), "rev-parse", "HEAD~1:big.txt"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+            listed = subprocess.run(["git", "-C", str(clone), "rev-list", "--objects", "--all", "--missing=print"],
+                                    capture_output=True, text=True, check=True).stdout
+            self.assertIn("?" + old, listed.split())
+        (clone / "new.txt").write_text("committed only here\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-qm", "unpushed"], check=True, env=env)
+        (clone / "new.txt").write_text("staged edit\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        (clone / "notes.md").write_text("untracked\n")
+        subprocess.run(["git", "-C", str(clone), "remote", "set-url", "origin", "https://127.0.0.1:9/gone.git"],
+                       check=True, env=env)
+        head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        return unit, clone, env, head
+
+    def test_an_unreachable_origin_is_judged_by_its_last_fetched_refs(self) -> None:
+        """A lane VM's /tmp/bsz (12.7G) stayed whole as "remote origin of /tmp/bsz/cef-fix/.git did not answer"
+        (2026-11-18). A full, a shallow and a blob:none partial clone each lose nothing: the unpushed commit goes to a
+        verified bundle on top of what origin held at the last fetch, the uncommitted work to a patch and a tar."""
+        for how in ("full", "shallow", "partial"):
+            with self.subTest(how=how):
+                shutil.rmtree(self.home / "archive", ignore_errors=True)
+                shutil.rmtree(self.home / "srv", ignore_errors=True)
+                shutil.rmtree(self.home / ".cache/cmux-job", ignore_errors=True)
+                gd._DISCOVERED.clear()
+                unit, clone, env, head = self._unreachable_clone(how)
+                rec, err = self.apply_mirror(unit)
+                self.assertEqual(rec["outcome"], "reclaimed", (how, rec["reasons"], err))
+                self.assertFalse(unit.exists())
+                self.assertTrue(any("judged by its last-fetched refs" in r for r in rec["reasons"]), rec["reasons"])
+                bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+                self.assertTrue(bundles)
+                heads = {}
+                for b in bundles:
+                    out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True,
+                                         check=True).stdout
+                    heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.splitlines()})
+                self.assertEqual(heads.get("refs/heads/main"), head)
+                # the bundle holds only what origin lacked: it applies onto origin's history
+                subprocess.run(["git", "-C", str(self.home / "srv"), "fetch", "-q", str(bundles[0]),
+                                "refs/heads/main:refs/heads/restored"], check=True, env=env)
+                show = subprocess.run(["git", "-C", str(self.home / "srv"), "show", "restored:new.txt"],
+                                      capture_output=True, text=True, check=True).stdout
+                self.assertEqual(show, "committed only here\n")
+                archived = list((self.home / "archive/glaeda-disk").iterdir())
+                self.assertTrue(any(p.name.endswith(".patch") for p in archived), archived)
+                self.assertTrue(any(p.name.endswith(".tar.gz") for p in archived), archived)
+
+    def test_an_unreachable_origin_without_tracking_refs_bundles_the_whole_history(self) -> None:
+        unit, clone, env, head = self._unreachable_clone("full")
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/HEAD"], check=False, env=env)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_a_mirror_held_by_live_worktrees_elsewhere_names_them(self) -> None:
+        """A lane VM's /tmp/wt-rd (22.1G) holds a cmux mirror three checkouts under ~/Projects/checkouts still use:
+        kept, and the plan names each one that holds it."""
+        unit, clone, env = self.mirror_unit()
+        live = [self.home / "Projects/checkouts/cmux" / n for n in ("lane--a", "lane--b")]
+        for w in live:
+            self.git(clone, "worktree", "add", "-q", "--detach", str(w), env=env)
+        gone = self.home / "gone-wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(gone), env=env)
+        shutil.rmtree(gone)
+        why = gd.mirror_repos(unit)[0]
+        self.assertIn("held by 2 that still exist", why)
+        for w in live:
+            self.assertIn(str(w), why)
+        self.assertIn("1 whose tree is gone", why)
+        self.assertNotIn(str(gone), why)
+        held = self.survey_mirror(unit)  # kept by the plan itself, before any bundle (git_used_from_outside)
+        self.assertEqual(held.verdict, "in-use")
+        for w in live:
+            self.assertIn(f"{w} (a linked worktree of", " ".join(held.reasons))
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # and by the bundle step too
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(all((w / ".git").is_file() for w in live))
 
     def test_a_mirror_whose_bundle_fails_is_kept_and_alerts(self) -> None:
         unit, clone, env = self.mirror_unit()
@@ -10460,7 +10618,9 @@ class LinuxLayoutTest(unittest.TestCase):
         store = clone / ".git/modules/sub"
         store.mkdir(parents=True)
         try:
-            rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+            with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # the bundle step's own check
+                rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+            self.assertIn("cannot read", gd.git_used_from_outside(unit, fresh=True))  # the guard alone keeps it too
         finally:
             os.chmod(store, 0o755)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
@@ -10740,7 +10900,9 @@ class LinuxLayoutTest(unittest.TestCase):
         outside = self.home / "elsewhere"
         self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
         self.assertIn("has linked worktrees outside it", gd.mirror_repos(unit)[0])
-        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(self.survey_mirror(unit).verdict, "in-use")
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):
+            rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
         self.assertTrue((outside / ".git").is_file())
         shutil.rmtree(outside)  # a stale record: git worktree prune would drop it, but its HEAD is not judged here
@@ -14337,6 +14499,650 @@ class EvictLockQueueTest(unittest.TestCase):
         self.assertIn(f'b"{gd.EVICT_YIELD_MARK}"', text, "DISK_BOUND keeps its trigger on this exact phrase")
         self.assertIn(f'"{gd.EVICT_WAITERS}"', text, "DISK_BOUND looks for waiters where glaeda-disk puts them")
         self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
+
+
+class LaneVmFamiliesTest(unittest.TestCase):
+    """A Linux lane VM's own scratch, one item per session or tree: a dead acpmux session's TMPDIR, an abandoned
+    /tmp/wt-* worktree and /tmp/bsz go once nothing holds them and nothing below changed for 6 h; a live, unknown,
+    open or recent one stays, and a dry run deletes nothing (a lane VM at 100%, 4.2 GB free of 495 GB, 0.0G
+    reclaimable in 141 GiB)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        self.saved = (gd.HOME, gd.DARWIN, gd.ROLE, gd._ACPMUX_ROWS, gd._SESSION_ENV)
+        gd.HOME, gd.DARWIN, gd.ROLE = self.home, False, "devbox"
+        gd._DISCOVERED.clear()
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self.acpmux_home = self.home / ".acpmux"
+        self.acpmux_home.mkdir()
+        self.daemon = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "8ca84dc7"
+        self.daemon.mkdir(parents=True)
+        (self.daemon / ".home").write_text(str(self.acpmux_home))
+        other = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "b816f1eb"  # a test daemon's root: never ours
+        other.mkdir()
+        (other / ".home").write_text(str(self.base / "elsewhere/acpmux"))
+        self.rows: list[dict] | None = []
+        self.env_ids: tuple[frozenset[str], frozenset[str]] | None = (frozenset(), frozenset())
+        for name, fn in (("acpmux_rows", lambda fresh=False: self.rows),
+                         ("session_env", lambda fresh=False: self.env_ids)):
+            patcher = mock.patch.object(gd, name, side_effect=fn)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        envp = mock.patch.dict(os.environ, {"ACPMUX_HOME": str(self.acpmux_home)})
+        envp.start()
+        self.addCleanup(envp.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.DARWIN, gd.ROLE, gd._ACPMUX_ROWS, gd._SESSION_ENV = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def age(tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def session(self, sid: str, hours: float = 8.0) -> Path:
+        d = self.daemon / sid
+        out = d / "claude-1000/-home-x/abc/tasks"
+        out.mkdir(parents=True)
+        (out / "b1.output").write_bytes(b"o" * 4096)
+        self.age(d, hours)
+        return d
+
+    def lane(self, fid: str | None = None) -> list[gd.Family]:
+        return [f for f in gd.lane_vm_families(self.fake_tmp, os.getuid()) if fid is None or f.id == fid]
+
+    def acpmux_family(self) -> gd.Family:
+        fams = self.lane(gd.ACPMUX_SESSION_TMP)
+        self.assertEqual([f.root for f in fams], [self.daemon])  # only the root whose .home is ours
+        return fams[0]
+
+    def survey(self, fams: list[gd.Family], opened: list[str] | None = None, cmds: str = "") -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            # the pressure pass's window: max(0.5 h, the families' 6 h)
+            return {Path(i.path).name: i for i in gd.survey(fams, 0.5, 0)}
+
+    def apply(self, fams: list[gd.Family], items: list[gd.Item], opened: list[str] | None = None,
+              cmds: str = "", targets: dict[int, int] | None = None) -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)), \
+                mock.patch.object(gd, "command_lines", return_value=cmds or "ps"):
+            gd.apply(items, {f.id: f for f in fams}, receipt, targets, 0.5)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_a_dead_and_old_session_goes_and_live_unknown_or_recent_ones_stay(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        live = self.session("01a1e755-8220-725d-9347-29e5487b1770")
+        idle = self.session("01a1dbe9-997f-77e7-a6f1-87affeec5631")
+        unknown = self.session("01a1eed5-2368-7099-8c2d-b13b2ee2d8b2")
+        recent = self.session("01a1ed10-95d5-73d0-b783-fde207bce6cd")
+        # its top is old, but a task output five levels down was written an hour ago
+        os.utime(recent / "claude-1000/-home-x/abc/tasks/b1.output", (time.time() - 3600,) * 2)
+        self.rows = [
+            {"sessionId": dead.name, "status": "closed", "name": "restart-to-chat-fast", "cwd": "/home/x"},
+            {"sessionId": live.name, "status": "running", "name": "gh-budget-split", "cwd": "/home/x"},
+            {"sessionId": idle.name, "status": "idle", "name": "quiet", "cwd": "/home/x"},
+            {"sessionId": recent.name, "status": "closed", "name": "just-closed", "cwd": "/home/x"},
+        ]
+        fam = self.acpmux_family()
+        items = self.survey([fam])
+        self.assertEqual(items[dead.name].verdict, "reclaimable", items[dead.name].reasons)
+        self.assertEqual(items[live.name].verdict, "in-use")
+        self.assertIn("acpmux session gh-budget-split is running", items[live.name].reasons)
+        self.assertEqual(items[idle.name].verdict, "in-use")  # idle is alive: its next prompt resumes it
+        self.assertEqual(items[unknown.name].verdict, "in-use")
+        self.assertIn("a session acpmux does not list: liveness unknown", items[unknown.name].reasons)
+        self.assertEqual(items[recent.name].verdict, "recent")
+        self.assertGreaterEqual(items[dead.name].idle_hours, 7.9)
+        self.assertLess(items[recent.name].idle_hours, 1.1)
+        self.apply([fam], list(items.values()))
+        self.assertFalse(dead.exists())
+        for kept in (live, idle, unknown, recent):
+            self.assertTrue(kept.exists(), kept)
+        self.assertTrue((self.daemon / ".home").exists())  # the daemon's own marker is never an item
+
+    def test_a_dry_run_lists_the_plan_with_sizes_and_deletes_nothing(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        self.rows = [{"sessionId": dead.name, "status": "closed", "cwd": "/home/x"}]
+        wt = self.fake_tmp / "wt-rd"
+        (wt / "target").mkdir(parents=True)
+        (wt / "target/big").write_bytes(b"x" * 8192)
+        self.age(wt, 30)
+        fams = self.lane()
+        items = self.survey(fams)
+        self.assertEqual(items[dead.name].verdict, "reclaimable")
+        self.assertEqual(items["wt-rd"].verdict, "reclaimable", items["wt-rd"].reasons)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report(list(items.values()), [], 50, 0.5, fams={f.id: f for f in fams})
+        self.assertIn(str(dead), out.getvalue())
+        self.assertIn(str(wt), out.getvalue())
+        self.assertTrue(dead.exists())
+        self.assertTrue(wt.exists())
+        self.assertFalse((self.home / ".receipt.jsonl").exists())
+
+    def test_an_unreadable_session_list_or_process_table_keeps_every_session(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        fam = self.acpmux_family()
+        self.rows = None
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertTrue(any(r.startswith("acpmux session list unreadable: liveness unknown (") for r in item.reasons),
+                        item.reasons)
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        self.env_ids = None
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("process environments unreadable: liveness unknown", item.reasons)
+        self.assertTrue(dead.exists())
+
+    def test_a_closed_session_whose_process_still_runs_stays(self) -> None:
+        by_env = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        by_tmpdir = self.session("01a1c350-4f01-74c1-9295-f7e4b811ee44")
+        by_cmd = self.session("01a1d758-6831-7544-9381-9fd12e523a82")
+        by_file = self.session("01a1ddee-d636-772d-9bab-75e3316f7af2")
+        self.rows = [{"sessionId": d.name, "status": "closed"} for d in (by_env, by_tmpdir, by_cmd, by_file)]
+        self.env_ids = (frozenset({by_env.name}), frozenset({str(by_tmpdir)}))
+        fam = self.acpmux_family()
+        opened = [str(by_file / "claude-1000/-home-x/abc/tasks/b1.output")]
+        items = self.survey([fam], opened=opened, cmds=f"claude --resume {by_cmd.name}\n")
+        self.assertIn("a running process belongs to the session (ACPMUX_SESSION_ID)", items[by_env.name].reasons)
+        self.assertIn("a running process's TMPDIR is in it", items[by_tmpdir.name].reasons)
+        self.assertIn("a running command names its session id", items[by_cmd.name].reasons)
+        self.assertIn("open by a process", items[by_file.name].reasons)
+        self.assertEqual({i.verdict for i in items.values()}, {"in-use"})
+
+    def test_apply_reads_liveness_again_before_each_delete(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        fam = self.acpmux_family()
+        items = self.survey([fam])
+        self.assertEqual(items[dead.name].verdict, "reclaimable")
+        self.rows = [{"sessionId": dead.name, "status": "running"}]  # resumed since the survey
+        receipt = self.apply([fam], list(items.values()))
+        self.assertTrue(dead.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_a_closed_sessions_folder_goes_whole_as_acpmux_purges_it(self) -> None:
+        # a lane VM's closed sessions held test fixtures no bundle can hold: an empty `git init` with files in it
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        repo = dead / "autoland-web-subareas-3736ej4a/repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        self.age(dead, 8)
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        fam = self.acpmux_family()
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply([fam], [item])
+        self.assertFalse(dead.exists())
+
+    def test_a_worktree_or_bsz_clone_with_unpushed_work_is_bundled_first(self) -> None:
+        bsz = self.fake_tmp / "bsz"
+        repo = bsz / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "only here"], check=True, env=self.env)
+        self.age(bsz, 8)
+        fams = self.lane(gd.TMP_BSZ)
+        item = self.survey(fams)["bsz"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(bsz.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def test_tmp_worktrees_go_when_idle_and_unheld_and_are_pruned_from_their_repository(self) -> None:
+        origin = self.base / "origin"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True, env=self.env)
+        (origin / "f").write_text("x")
+        subprocess.run(["git", "-C", str(origin), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "c"], check=True, env=self.env)
+        trees = {}
+        for name in ("wt-rd", "wt-cwd", "wt-session", "wt-fresh"):
+            trees[name] = self.fake_tmp / name
+            subprocess.run(["git", "-C", str(origin), "worktree", "add", "-q", "-b", name, str(trees[name])],
+                           check=True, env=self.env)
+            (trees[name] / "target/debug").mkdir(parents=True)
+            (trees[name] / "target/debug/big").write_bytes(b"x" * 8192)
+            self.age(trees[name], 30)
+        os.utime(trees["wt-fresh"] / "target/debug/big", (time.time() - 600,) * 2)  # a build ten minutes ago
+        self.rows = [{"sessionId": "s", "status": "idle", "name": "lane-a", "cwd": str(trees["wt-session"] / "sub")}]
+        fams = self.lane(gd.TMP_WORKTREES)
+        items = self.survey(fams, opened=[str(trees["wt-cwd"])])
+        self.assertEqual(items["wt-rd"].verdict, "reclaimable", items["wt-rd"].reasons)
+        self.assertEqual(items["wt-cwd"].verdict, "in-use")
+        self.assertEqual(items["wt-session"].verdict, "in-use")
+        self.assertIn("the cwd of open acpmux session lane-a", items["wt-session"].reasons)
+        self.assertIn(items["wt-fresh"].verdict, ("recent", "git-checkout"))  # young: not due, so never reclaimable
+        self.apply(fams, list(items.values()), opened=[str(trees["wt-cwd"])])
+        self.assertFalse(trees["wt-rd"].exists())
+        for name in ("wt-cwd", "wt-session", "wt-fresh"):
+            self.assertTrue(trees[name].exists(), name)
+        listed = subprocess.run(["git", "-C", str(origin), "worktree", "list", "--porcelain"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertNotIn(str(trees["wt-rd"]), listed)  # pruned from its repository
+        refs = subprocess.run(["git", "-C", str(origin), "for-each-ref"], capture_output=True, text=True,
+                              check=True).stdout
+        self.assertIn("refs/heads/wt-rd", refs)  # its branch stays
+
+    def test_bsz_goes_by_age_and_no_open_file(self) -> None:
+        bsz = self.fake_tmp / "bsz"
+        (bsz / "tools").mkdir(parents=True)
+        (bsz / "tools/symmap.py").write_text("print(1)")
+        (bsz / "syms.txt").write_bytes(b"s" * 8192)
+        self.age(bsz, 30)
+        fams = self.lane(gd.TMP_BSZ)
+        self.assertEqual(self.survey(fams, opened=[str(bsz / "syms.txt")])["bsz"].verdict, "in-use")
+        self.assertEqual(self.survey(fams, cmds=f"python3 {bsz}/tools/symmap.py\n")["bsz"].verdict, "in-use")
+        item = self.survey(fams)["bsz"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(bsz.exists())
+
+    def test_never_delete_paths_and_another_daemons_root_are_never_items(self) -> None:
+        for name in ("wt-chromium", "wt-cmux-browser-fleet", "bsz-depot_tools"):
+            (self.fake_tmp / name).mkdir()
+            self.age(self.fake_tmp / name, 30)
+        other = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "b816f1eb" / "01a1eefa-23f5-7346-99e8-ed3e7c5b03ba"
+        other.mkdir()
+        self.age(other, 30)
+        self.rows = [{"sessionId": other.name, "status": "closed"}]
+        self.assertEqual([p for f in self.lane() for p in gd.candidates(f)], [])
+
+    def test_the_tmp_family_leaves_these_trees_to_their_own_families_on_linux(self) -> None:
+        with mock.patch.object(gd, "acpmux_daemon_roots", return_value=[]):
+            fams = {f.id: f for f in gd.default_families("devbox")}
+        tmp = fams["tmp"]
+        self.assertIn(f"acpmux-{os.getuid()}", tmp.skip)
+        self.assertEqual(sorted(tmp.skip_prefixes), ["bsz", "wt-"])
+        self.assertIn(gd.TMP_WORKTREES, fams)
+        self.assertIn(gd.TMP_BSZ, fams)
+        if "claude-scratchpad" in fams:  # only where /tmp/claude-<uid> exists
+            self.assertTrue(fams["claude-scratchpad"].deep_mtime)
+            self.assertEqual(fams["claude-scratchpad"].min_idle_hours, gd.LANE_SESSION_IDLE_HOURS)
+        gd.DARWIN = True
+        with mock.patch.object(gd, "darwin_user_tmp", return_value=None), \
+                mock.patch.object(gd, "darwin_code_sign_clones", return_value=None):
+            mac = {f.id: f for f in gd.default_families("devbox")}
+        self.assertNotIn(gd.TMP_WORKTREES, mac)  # a Mac's /tmp keeps its old rules
+        self.assertNotIn(gd.TMP_BSZ, mac)
+
+    def test_a_claude_scratch_folder_of_a_live_acpmux_session_stays(self) -> None:
+        root = self.fake_tmp / f"claude-{os.getuid()}"
+        live = root / "-home-x" / "01a1e755-8234-76eb-8439-d16cefbe14fa"
+        dead = root / "-home-x" / "11111111-d130-4269-bec8-dfbd1005913a"
+        for d in (live, dead):
+            (d / "tasks").mkdir(parents=True)
+            (d / "tasks/b.output").write_bytes(b"o" * 4096)
+        self.age(root, 30)
+        self.rows = [{"sessionId": "01a1e755-8220-725d-9347-29e5487b1770", "agentSessionId": live.name,
+                      "status": "ready", "name": "gh-budget-split"},
+                     {"sessionId": "01a1d212-4250-7272-94b4-33a324d4aed3", "agentSessionId": dead.name,
+                      "status": "closed"}]
+        fam = gd.Family("claude-scratchpad", root, True, "scratch", depth=2, git_disposable=True, nested_git=True,
+                        min_idle_hours=gd.LANE_SESSION_IDLE_HOURS, mirror_idle_hours=gd.LANE_SESSION_IDLE_HOURS,
+                        deep_mtime=True)
+        with mock.patch.object(gd, "claude_session_active", return_value=False):
+            items = self.survey([fam])
+        self.assertEqual(items[live.name].verdict, "in-use")
+        self.assertEqual(items[dead.name].verdict, "reclaimable", items[dead.name].reasons)
+
+    def test_deep_mtime_reads_a_walk_it_cannot_finish_as_now(self) -> None:
+        tree = self.fake_tmp / "deep"
+        (tree / "a/b/c/d/e").mkdir(parents=True)
+        (tree / "a/b/c/d/e/f").write_text("x")
+        self.age(tree, 30)
+        self.assertLess(gd.deep_newest_mtime(tree), time.time() - 29 * 3600)
+        self.assertGreater(gd.deep_newest_mtime(tree, budget=3), time.time() - 60)
+        os.utime(tree / "a/b/c/d/e/f", (time.time(),) * 2)
+        self.assertGreater(gd.deep_newest_mtime(tree), time.time() - 60)
+
+    def test_pressure_takes_the_least_recently_modified_first_and_stops_at_the_target(self) -> None:
+        older = self.session("01a1c350-4f01-74c1-9295-f7e4b811ee44", hours=90)
+        newer = self.session("01a1d212-4250-7272-94b4-33a324d4aed3", hours=10)
+        self.rows = [{"sessionId": d.name, "status": "closed"} for d in (older, newer)]
+        fam = self.acpmux_family()
+        items = list(self.survey([fam]).values())
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        dev = self.daemon.stat().st_dev
+        # free reaches the target once one item is gone
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda p: (0 if older.exists() and newer.exists()
+                                                                        else 1, 1)):
+            self.apply([fam], items, targets={dev: 1})
+        self.assertFalse(older.exists())  # least recently modified first
+        self.assertTrue(newer.exists())  # and the pass stopped at the target
+
+    def home_tree(self, name: str, entry: str, hours: float, size: int = 8192) -> Path:
+        p = self.home / name / entry
+        p.mkdir(parents=True)
+        (p / "blob").write_bytes(b"x" * size)
+        self.age(p, hours)
+        return p
+
+    def test_lab_trees_and_builder_output_in_home_go_by_age_and_no_holder(self) -> None:
+        old_tmp = self.home_tree("lab-tmp", "run-a", 8)
+        new_tmp = self.home_tree("lab-tmp", "run-b", 1)
+        held = self.home_tree("lab-tmp", "run-c", 8)
+        target = self.home_tree("lab-target", "debug", 8)
+        (target.parent / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        data = self.home_tree("lab-data", "set", 8)
+        tag = self.home_tree("out", "nightly-linux", 8)
+        envargs = self.home / "out/nightly-linux.envargs"
+        envargs.write_text("-e X=1\n")
+        work = self.home_tree("out", ".work", 80)  # worktree_reclaim's pressure cache: never ours
+        self.age(envargs, 8)
+        fams = self.lane()
+        self.assertTrue(gd.LANE_HOME_FAMILY_IDS <= {f.id for f in fams})
+        self.assertTrue(all(f.id in gd.SESSION_HOLD_FAMILY_IDS for f in fams if f.id in gd.LANE_HOME_FAMILY_IDS))
+        items = self.survey(fams, opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertEqual(items[p.name].verdict, "reclaimable", (p, items[p.name].reasons))
+        self.assertEqual(items[new_tmp.name].verdict, "recent")
+        self.assertEqual(items[held.name].verdict, "in-use")
+        self.assertNotIn(".work", items)
+        self.assertNotIn("CACHEDIR.TAG", [n for n, i in items.items() if i.verdict == "reclaimable"])
+        self.apply(fams, list(items.values()), opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertFalse(p.exists(), p)
+        for p in (new_tmp, held, work):
+            self.assertTrue(p.exists(), p)
+
+    def test_a_lab_tree_held_by_a_live_session_or_process_env_stays(self) -> None:
+        cwd = self.home_tree("lab-tmp", "lane-cwd", 30)
+        envd = self.home_tree("lab-tmp", "lane-env", 30)
+        self.rows = [{"sessionId": "s", "status": "ready", "name": "lab-lane", "cwd": str(cwd / "sub")}]
+        self.env_ids = (frozenset(), frozenset({str(envd / "t")}))
+        items = self.survey(self.lane("home-lab-tmp"))
+        self.assertIn("the cwd of open acpmux session lab-lane", items[cwd.name].reasons)
+        self.assertIn("a running process's TMPDIR is in it", items[envd.name].reasons)
+        self.rows = None
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 2: daemon socket not found"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        reasons = self.survey(self.lane("home-lab-tmp"))[cwd.name].reasons
+        self.assertIn("acpmux session list unreadable: liveness unknown "
+                      "(`acpmux ls` exited 2: daemon socket not found)", reasons)
+
+    def test_git_work_in_a_lab_tree_waits_12_hours_and_is_archived_first(self) -> None:
+        repo = self.home / "lab-data/repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "only here"], check=True, env=self.env)
+        self.age(repo, 8)
+        fams = self.lane("home-lab-data")
+        self.assertNotEqual(self.survey(fams)["repo"].verdict, "reclaimable")  # 8 h: under the 12 h git-work rule
+        self.age(repo, 13)
+        item = self.survey(fams)["repo"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(repo.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def wt_mirror(self, where: Path) -> Path:
+        """A bare mirror the way `wt` lays one out (.wt-mirrors/<owner>/<repo>.git), with one commit on main."""
+        src = self.base / "src"
+        if not src.exists():
+            subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True, env=self.env)
+            (src / "f").write_text("x")
+            subprocess.run(["git", "-C", str(src), "add", "f"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(src), "commit", "-qm", "c"], check=True, env=self.env)
+        mirror = where / ".wt-mirrors/manaflow-ai/cmux.git"
+        mirror.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(src), str(mirror)], check=True, env=self.env)
+        return mirror
+
+    def test_a_mirror_with_a_linked_worktree_outside_keeps_the_whole_item_on_every_path(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        checkout = self.home / "Projects/checkouts/cmux/lane--base-red-next-checks"
+        checkout.parent.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "lane/x", str(checkout)],
+                       check=True, env=self.env)
+        self.age(wt, 30)
+        fams = self.lane(gd.TMP_WORKTREES)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        why = next(r for r in item.reasons if r.startswith("a repository in it is used from outside"))
+        self.assertIn(str(checkout), why)
+        self.assertNotIn("its checkouts are mirrors", " ".join(item.reasons))
+        # an item judged reclaimable earlier is still kept by apply's fresh check
+        stale = gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None, item.platform)
+        self.apply(fams, [stale])
+        self.assertTrue(mirror.is_dir())
+        self.assertTrue((checkout / "f").exists())
+        # the same mirror once its outside worktree is gone (and pruned) goes
+        subprocess.run(["git", "-C", str(mirror), "worktree", "remove", "--force", str(checkout)], check=True,
+                       env=self.env)
+        self.age(wt, 30)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(wt.exists())
+
+    def test_a_record_naming_a_tree_inside_the_item_or_one_that_is_gone_does_not_hold_it(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "in", str(wt / "inside")],
+                       check=True, env=self.env)
+        gone = self.base / "gone-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "gone", str(gone)],
+                       check=True, env=self.env)
+        shutil.rmtree(gone)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_an_alternates_user_outside_keeps_the_item(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        user = self.home / "Projects/checkouts/cmux/lane--borrower"
+        subprocess.run(["git", "clone", "-q", "--shared", str(mirror), str(user)], check=True, env=self.env)
+        self.assertTrue((user / ".git/objects/info/alternates").exists())
+        why = gd.git_used_from_outside(wt, fresh=True)
+        self.assertIn(f"{user} (a checkout borrows its objects (alternates))", why)
+        other = self.home / "Projects/.wt-mirrors/o/borrower.git"
+        other.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", "--shared", str(mirror), str(other)], check=True, env=self.env)
+        shutil.rmtree(user)
+        self.assertIn(f"{other} (a wt mirror borrows its objects (alternates))", gd.git_used_from_outside(wt, fresh=True))
+        shutil.rmtree(other)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_a_closed_sessions_tmpdir_holding_a_used_mirror_is_kept_despite_its_plain_delete(self) -> None:
+        sid = "01a1d212-4250-7272-94b4-33a324d4aed3"
+        d = self.session(sid)
+        mirror = self.wt_mirror(d)
+        outside = self.base / "outside-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "o", str(outside)],
+                       check=True, env=self.env)
+        self.age(d, 30)
+        self.rows = [{"sessionId": sid, "status": "closed"}]
+        fam = self.acpmux_family()
+        item = self.survey([fam])[sid]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        self.apply([fam], [gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None,
+                                   item.platform)])
+        self.assertTrue(mirror.is_dir())
+
+    def test_a_walk_too_large_to_finish_keeps_the_item(self) -> None:
+        tree = self.fake_tmp / "bsz"
+        (tree / "a").mkdir(parents=True)
+        for n in range(5):
+            (tree / "a" / str(n)).write_text("x")
+        self.assertIn("too large", gd.git_used_from_outside(tree, fresh=True, budget=3))
+
+    def test_no_home_family_for_a_tree_that_is_missing_or_a_link(self) -> None:
+        (self.home / "lab-tmp").symlink_to(self.base)
+        ids = {f.id for f in self.lane()}
+        self.assertFalse(ids & gd.LANE_HOME_FAMILY_IDS)
+
+
+class AcpmuxListOverReachTest(unittest.TestCase):
+    """`reach HOST 'glaeda-disk ...'` is a non-interactive ssh shell: PATH /usr/bin:/bin, no acpmux relay. There
+    acpmux printed "other machines' sessions are not listed: cannot run the relay listing" on stderr, the reader took
+    stderr with stdout, its JSON failed to parse, and every lane VM item came out "acpmux session list unreadable"
+    (gcp-agent-lane-2, 2026-11-18: /tmp/bsz and /tmp/wt-rd, 0 reclaimable)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR)
+        gd.HOME = self.home
+        gd._ACPMUX_ROWS = False
+        self.bin = self.home / ".local/bin"
+        self.bin.mkdir(parents=True)
+        (self.home / ".acpmux").mkdir()
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home)}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR = self.saved
+        self.tmp.cleanup()
+
+    def fake_acpmux(self, body: str) -> Path:
+        exe = self.bin / "acpmux"
+        exe.write_text("#!/bin/sh\n" + body)
+        exe.chmod(0o755)
+        return exe
+
+    def test_a_relay_warning_on_stderr_does_not_spoil_the_list(self) -> None:
+        argv_log = self.home / "argv"
+        self.fake_acpmux(f'echo "$@" > {argv_log}\n'
+                         'echo "acpmux: other machines\' sessions are not listed: cannot run the relay '
+                         'listing \\"lane-gh\\"" >&2\n'
+                         'echo \'{"sessions": [{"sessionId": "a", "status": "closed", "peer": null},'
+                         ' {"sessionId": "b", "status": "ready", "peer": "huge-blue"}]}\'\n')
+        self.assertIsNone(shutil.which("acpmux"))  # not on the bare PATH: found in ~/.local/bin
+        rows = gd.acpmux_rows(fresh=True)
+        self.assertEqual(rows, [{"sessionId": "a", "status": "closed", "peer": None}])  # no peer's rows
+        self.assertEqual(gd.ACPMUX_ROWS_ERROR, "")
+        self.assertIn("--machine local", argv_log.read_text())
+
+    def test_a_failed_list_names_the_command_its_exit_code_and_stderr(self) -> None:
+        exe = self.fake_acpmux('echo "acpmux: cannot reach the daemon at /x/acpmux.sock" >&2\nexit 3\n')
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn(f"`{exe} ls --json --machine local", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("exited 3: acpmux: cannot reach the daemon at /x/acpmux.sock", gd.ACPMUX_ROWS_ERROR)
+        self.fake_acpmux("echo not json\n")
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("printed no JSON", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("not json", gd.ACPMUX_ROWS_ERROR)
+
+    def test_no_program_anywhere_is_named_with_where_it_looked(self) -> None:
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("no acpmux program on PATH (/usr/bin:/bin)", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn(str(self.bin / "acpmux"), gd.ACPMUX_ROWS_ERROR)
+        shutil.rmtree(self.home / ".acpmux")
+        self.assertEqual(gd.acpmux_rows(fresh=True), [])  # acpmux not used here: nothing to keep for it
+
+    def test_acpmux_bin_wins_over_path(self) -> None:
+        named = self.home / "named-acpmux"
+        named.write_text("#!/bin/sh\necho '{\"sessions\": []}'\n")
+        named.chmod(0o755)
+        with mock.patch.dict(os.environ, {"ACPMUX_BIN": str(named)}):
+            self.assertEqual(gd.acpmux_exe(), str(named))
+            self.assertEqual(gd.acpmux_rows(fresh=True), [])
+
+
+class OwnedElsewhereTest(unittest.TestCase):
+    """What other tools own on a Linux lane VM is named with its size, the owner's reasons and its commands, and
+    glaeda-disk deletes nothing there (a lane VM, 2026-11-18: ~/Projects/checkouts 104.6G and ~/.acpmux 56.5G kept with
+    no word on who frees them)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS)
+        gd.HOME = self.home
+        state = self.home / gd.WORKTREE_RECLAIM_STATE_REL
+        state.mkdir(parents=True)
+        gib = 1 << 30
+        (state / "checkout-keep-report.json").write_text(json.dumps({"at": time.time() - 1800, "rows": [
+            {"path": "a", "bytes": 11 * gib, "reasons": ["wt reclaim: owner liveness unknown here"]},
+            {"path": "b", "bytes": 9 * gib, "reasons": ["wt reclaim: owner liveness unknown here; 1 dirty files"]},
+            {"path": "c", "bytes": 2 * gib, "reasons": ["wt reclaim: owner session is running; live owner"]},
+        ], "total_bytes": 22 * gib}))
+        (state / "log.jsonl").write_text(
+            json.dumps({"kind": "summary", "mode": "pressure", "at": "2026-11-18T19:51:33+0000", "freed_gb": 0.0}) + "\n"
+            + json.dumps({"kind": "pressure_build", "path": "x"}) + "\n")
+        tool = self.home / gd.WORKTREE_RECLAIM_TOOL_REL
+        tool.parent.mkdir(parents=True)
+        tool.write_text("")
+        self.store = self.home / ".acpmux/sessions"
+        for sid in ("01a1d212-4250-7272-94b4-33a324d4aed3", "01a1e755-8220-725d-9347-29e5487b1770"):
+            (self.store / sid / "events").mkdir(parents=True)
+            (self.store / sid / "events/0").write_bytes(b"e" * 65536)
+        envp = mock.patch.dict(os.environ, {"ACPMUX_HOME": str(self.home / ".acpmux")})
+        envp.start()
+        self.addCleanup(envp.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS = self.saved
+        self.tmp.cleanup()
+
+    def test_it_names_what_the_checkout_and_acpmux_reclaimers_keep_and_how_to_run_them(self) -> None:
+        rows = [{"sessionId": "01a1d212-4250-7272-94b4-33a324d4aed3", "status": "closed"},
+                {"sessionId": "01a1e755-8220-725d-9347-29e5487b1770", "status": "running"}]
+        with mock.patch.object(gd, "acpmux_rows", return_value=rows):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("keep 22.0G in 3 (their keep report, 0.5h old)", text)
+        self.assertRegex(text, r"20\.0G\s+2\s+wt reclaim: owner liveness unknown here\n")
+        self.assertIn("worktree_reclaim's last pass: pressure at 2026-11-18T19:51:33+0000, freed 0.0 GB", text)
+        self.assertIn(f"acpmux store {self.store}: 1 closed sessions hold", text)
+        self.assertIn("acpmux_store_reclaim takes only", text)
+        self.assertIn("dry run: python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py plan", text)
+        self.assertIn("apply:   python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py pressure", text)
+        self.assertTrue(all(p.exists() for p in self.store.iterdir()))  # report only
+
+    def test_an_unreadable_session_list_is_named_not_guessed(self) -> None:
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 3: no daemon"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        with mock.patch.object(gd, "acpmux_rows", return_value=None):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("its closed sessions are unknown: `acpmux ls` exited 3: no daemon", text)
+
+    def test_a_supervised_store_is_acpmux_store_reclaims(self) -> None:
+        sup = self.home / ".acpmux-supervised"
+        sup.mkdir()
+        with mock.patch.dict(os.environ, {"ACPMUX_HOME": str(sup)}):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("acpmux_store_reclaim archives and purges its closed sessions", text)
+
+    def test_no_keep_report_says_who_writes_it(self) -> None:
+        (self.home / gd.WORKTREE_RECLAIM_STATE_REL / "checkout-keep-report.json").unlink()
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("no keep report (hygiene_reconciler writes", text)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads every folder")
+    def test_an_unreadable_census_row_says_who_owns_what_it_could_not_read(self) -> None:
+        tree = self.home / "lane-scratch"
+        (tree / "x/locked").mkdir(parents=True)
+        me = gd.pwd_name(os.getuid())
+        try:
+            (tree / "x/locked").chmod(0)
+            why = gd.unreadable_why(str(tree))
+            self.assertIn(f"{tree}/x/locked is owned by {me}, mode 0000", why)
+            tree.chmod(0)
+            self.assertEqual(gd.unreadable_why(str(tree)), f"owned by {me}, mode 0000")
+            row = gd.census_coverage_row({"complete": True, "at": 0, "rows": {str(tree): [5, "unreadable", False]}})
+            self.assertEqual(row["children"][0]["why"], f"owned by {me}, mode 0000")
+        finally:
+            tree.chmod(0o755)
+            (tree / "x/locked").chmod(0o755)
+        self.assertIn("cannot stat", gd.unreadable_why(str(self.home / "gone")))
 
 
 if __name__ == "__main__":

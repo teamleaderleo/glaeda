@@ -747,6 +747,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
         if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
             scope += " --yield-to-exclusive"
+    # DEDICATED_USER: the account's own ledger directory (dedicated_context), for every phase and the gate
+    own_ledger = f" --capacity-dir {shlex.quote(os.fspath(capacity_dir))}" if (dedicated or {}).get("user") else ""
+    scope += own_ledger
     trusted_entry = dedicated if (dedicated or {}).get("trustedRef") else None
     if trusted_entry:
         # A trusted runner.dedicated entry (glaeda_fleet_labels DEDICATED_TRUSTED) holds a trusted pool's labels:
@@ -814,11 +817,11 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     completed = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-completed hook (generated, receipt-owned). Never fails the job.\n"
-        f"{python} {hook} job-completed || true\n"
+        f"{python} {hook} job-completed{own_ledger} || true\n"
         "exit 0\n"
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
-            + ("" if ctx.capacity_units else " --no-waiters"))
+            + ("" if ctx.capacity_units else " --no-waiters") + own_ledger)
     # Listening with fewer free units (cores) than the label's costliest job only takes one to wait for units, and
     # a job waiting here holds every runner on the mini (cmuxterm-hq#661 Workstream 7). The iOS picker sends
     # isolated builds (mobile-core-package, ios-simulator-build) to glaeda-ios-sim; a session runner takes cmux-next's
@@ -831,6 +834,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     # (the hook's listener_env does the same for the run.sh the gate starts).
     xcode_apps = (ctx.member or {}).get("xcodeApps") or []
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
+        f"export DEVELOPER_DIR={PROTECTED_DEVELOPER_DIR}\nexport PATH={PROTECTED_PATH}\n"
+        if user_entry(ctx) else "") + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
     home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
@@ -940,7 +945,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
 def agent_plist(ctx: Context) -> dict[str, Any]:
     # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
     # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
-    path = WORKLOAD_PATH
+    path = PROTECTED_PATH if user_entry(ctx) else WORKLOAD_PATH
     if ctx.headless:
         # A system daemon survives a reboot without a GUI login. The helper waits for a
         # listener left by an in-flight apply, then hands the registration to listen.sh.
@@ -964,6 +969,9 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
             "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
             "PATH": path,
+            # PROTECTED_TOOLCHAIN: /usr/bin/python3 and the other xcrun shims resolve to the root-owned Command Line
+            # Tools, never an Xcode another admin account can write
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {}),
         },
         "StandardOutPath": os.fspath(ctx.log_path),
         "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
@@ -1218,6 +1226,9 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     if conflict:
         return [{"kind": "receipt", "path": os.fspath(ctx.receipt_path), "state": "blocked", "note": conflict}]
     actions: list[dict[str, Any]] = []
+    toolchain = plan_toolchain(ctx)
+    if toolchain is not None:  # PROTECTED_TOOLCHAIN: blocked here, nothing below is applied
+        actions.append(toolchain)
     ours = owned_dir(ctx, receipt)
     configured = (ctx.runner_dir / ".runner").is_file()
     exists = ctx.runner_dir.exists()
@@ -1241,6 +1252,9 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         if blocked_dir:
             act["state"] = "blocked"
         actions.append(act)
+    private = plan_private(ctx)
+    if private is not None:  # DEDICATED_USER: after the download made the runner directory, before the token lands
+        actions.append(private)
 
     reg = {"kind": "register", "scope": ctx.org or ctx.repo, "name": ctx.name, "labels": ctx.labels,
            "ephemeral": False}
@@ -1490,7 +1504,8 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
         act["state"], act["note"] = "failed", how
         return
     act["tarball"] = how
-    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=0o755)  # a rerun after a failed unpack
+    # a rerun after a failed unpack; a user entry's is 0700 from the start (DEDICATED_USER)
+    ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=PRIVATE_MODE if private_paths(ctx) else 0o755)
     # The marker lands first, so a failed unpack still leaves a directory this command owns.
     (ctx.runner_dir / MARKER).write_text(install_id + "\n")
     tar = which("tar", ("/usr/bin/tar",)) or "tar"
@@ -1501,13 +1516,14 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
     act["applied"] = True
 
 
-def runner_path(home: Path, *paths: str) -> str:
+def runner_path(home: Path, *paths: str, protected: bool = False) -> str:
     """The PATH a runner's .path keeps: Homebrew first (the workload PATH's order), every entry the given PATHs
-    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once."""
-    entries = ["/opt/homebrew/bin", "/usr/local/bin"]
+    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once. protected
+    (a user entry, PROTECTED_TOOLCHAIN): the given entries, then only the system directories."""
+    entries = [] if protected else ["/opt/homebrew/bin", "/usr/local/bin"]
     for path in paths:
         entries += path.split(":")
-    entries += [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
+    entries += PROTECTED_PATH.split(":") if protected else [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
     return ":".join(dict.fromkeys(e for e in entries if e))
 
 
@@ -1526,7 +1542,10 @@ def keep_runner_path(ctx: Context, before: str) -> None:
     (2026-10-26). Merge the .path that was there before with the new one and make sure Homebrew and ~/.cargo/bin
     are on it."""
     after = read_runner_path(ctx.runner_dir)
-    merged = runner_path(ctx.home, before, after)
+    merged = runner_path(ctx.home, before, after, protected=user_entry(ctx))
+    if user_entry(ctx):  # config.sh's PATH may name Homebrew; a user entry's .path holds only checked directories
+        merged = runner_path(ctx.home, *[":".join(e for e in (x or "").split(":") if e in declared_path(ctx))
+                                         for x in (before, after)], protected=True)
     if merged != after:
         write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
                      make_parent=False)
@@ -1859,6 +1878,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if act["state"] != "failed":
                 receipt_doc["runnerVersion"] = act["version"]
                 receipt_doc["runnerSha256"] = act["sha256"]
+        elif kind == "private" and state == "create":
+            apply_private(ctx, act)
         elif kind == "register" and state == "create":
             register(ctx, act)
             if act["state"] != "failed":
@@ -3036,7 +3057,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"glaeda-cmux-runner: cannot read manifest: {type(error).__name__}", file=sys.stderr)
             return 2
-        why = dedicated_context(ctx, args, manifest)
+        why = dedicated_context(ctx, args, manifest) or dedicated_user_refusal(ctx, manifest, args.member)
         if why:
             print(f"glaeda-cmux-runner: {why}", file=sys.stderr)
             return 2
@@ -3147,7 +3168,9 @@ def dedicated_only_refusal(ctx: Any, args: argparse.Namespace) -> str | None:
         marker.unlink(missing_ok=True)
         return None
     if dedicated_of(ctx) is not None:
-        if not getattr(ctx, "dedicated_only", False):
+        # a user entry (DEDICATED_USER) lives in its own account: this Mac's pool instances and marker are the member
+        # user's, in that user's home
+        if not getattr(ctx, "dedicated_only", False) or dedicated_of(ctx).get("user"):
             return None
         left = pool_installs(ctx.home)
         if left:
@@ -3221,6 +3244,13 @@ def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> 
     ctx.org, ctx.repo, ctx.group = entry["org"], entry["repo"], entry["group"]
     ctx.labels, ctx.labels_requested = list(entry["labels"]), True
     ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
+    if entry.get("user") and not args.python:
+        ctx.python = PROTECTED_PYTHON  # PROTECTED_TOOLCHAIN: Apple's shim, never a Homebrew python
+    if entry.get("user"):
+        # DEDICATED_USER: its hook keeps the ledger files it writes (a nightly-style disk waiter, the disk-low turn)
+        # under this account's own 0700 state, never in the member user's shared capacity directory, which it cannot
+        # write and whose waiters must not hold that user's PR runners for a probe
+        ctx.capacity_dir = ctx.home / ".local/state/glaeda/cmux-runner" / USER_CAPACITY_DIR
     if not args.min_free_gib:
         # the entry's own floor (its builder's), else the member's disk.min_free_gib
         summary, _ = fleet_labels().member_labels(manifest, args.member, lambda app: True)
@@ -3232,6 +3262,161 @@ def dedicated_of(ctx: Any) -> dict[str, Any] | None:
     """ctx's runner.dedicated entry (--dedicated), or None for a pool instance."""
     entry = getattr(ctx, "dedicated", None)
     return entry if isinstance(entry, dict) else None
+
+
+# DEDICATED_USER (glaeda_fleet_labels): a runner.dedicated entry with a user runs as that macOS account, never the
+# member's own user. glaeda-cmux-runner-fleet applies it over ssh as that user. Run as anyone else, --dedicated refuses
+# it, so a run as the member's user never installs it in that user's home; an entry without a user is the member user's
+# and refuses another account. The account's home and the runner directory are made 0700 (PRIVATE), so no other user
+# on the Mac (the PR runners' among them) can read its RUNNER_TEMP, _work or session state.
+USER_CAPACITY_DIR = "capacity"
+PRIVATE_MODE = 0o700
+
+
+def current_user() -> str | None:
+    """This process's macOS short name, or None when it cannot be read."""
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def dedicated_user_refusal(ctx: Context, manifest: Any, member: str) -> str | None:
+    """Why this account may not run ctx's runner.dedicated entry (DEDICATED_USER), or None."""
+    entry = dedicated_of(ctx) or {}
+    user, me = entry.get("user"), current_user()
+    if user:
+        if me != user:
+            return (f"runner.dedicated {entry.get('name')} runs as macOS user {user}, not {me or 'an unknown user'}: "
+                    f"glaeda-cmux-runner-fleet --apply installs it over ssh as {user}; nothing changed")
+        return None
+    host = ((manifest.get("hosts") or {}).get(member) or {}) if isinstance(manifest, dict) else {}
+    owner = (host.get("ssh_user") if isinstance(host, dict) else None) or \
+        (manifest.get("ssh_user") if isinstance(manifest, dict) else None)
+    if isinstance(owner, str) and me is not None and me != owner:
+        return (f"runner.dedicated {entry.get('name')} declares no user, so it is {owner}'s runner, not {me}'s; "
+                "nothing changed")
+    return None
+
+
+# PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry's runner holds a session and a token the member user's PR
+# jobs must never reach, and those jobs can write whatever the member user owns: Homebrew (/opt/homebrew, given to that
+# user by fleet provisioning), an Xcode it installed, its home. So everything the runner, its hooks and its agents exec
+# comes from a protected toolchain: Apple's /usr/bin/python3 with DEVELOPER_DIR pinned to the root-owned Command Line
+# Tools, a PATH of only the system directories (plus declared entries that pass the check), and admit and watch
+# commands that pass it. The check (untrusted_exec): the path, its resolved target and every directory above either are
+# owned by root or by this account and writable by neither group nor other. --dedicated on a user entry plans a
+# toolchain step that blocks the whole install, typed, when anything fails it.
+PROTECTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+PROTECTED_PYTHON = "/usr/bin/python3"
+PROTECTED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
+TOOLCHAIN_MISSING = "protected-toolchain"
+
+
+def user_entry(ctx: Any) -> bool:
+    """ctx is a runner.dedicated entry with a user (DEDICATED_USER)."""
+    return bool((dedicated_of(ctx) or {}).get("user"))
+
+
+def declared_path(ctx: Context) -> list[str]:
+    """The entry's declared PATH entries, expanded."""
+    return [e for e in dedicated_word(ctx, ((dedicated_of(ctx) or {}).get("env") or {}).get("PATH", "")).split(":") if e]
+
+
+def untrusted_exec(path: str, uid: int, lstat: Callable[[str], os.stat_result] = os.lstat) -> str | None:
+    """Why `path` is not safe for a user entry to exec or search (PROTECTED_TOOLCHAIN), or None. The path, its resolved
+    target and every directory above either must exist and be owned by root or uid, with no group or other write bit
+    (a symlink's own mode is not checked; its directory is). Pure but for lstat (and realpath)."""
+    if not path.startswith("/"):
+        return "not an absolute path"
+    for target in dict.fromkeys([os.path.normpath(path), os.path.realpath(path)]):
+        parts = Path(target).parts
+        for depth in range(1, len(parts) + 1):
+            here = os.path.join(*parts[:depth])
+            try:
+                st = lstat(here)
+            except OSError as error:
+                return f"{here}: cannot be read ({type(error).__name__})"
+            if st.st_uid not in (0, uid):
+                return f"{here} is owned by uid {st.st_uid}, not root or this account"
+            if not stat.S_ISLNK(st.st_mode) and st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return f"{here} is writable by group or other (mode {st.st_mode & 0o7777:o})"
+    return None
+
+
+def toolchain_paths(ctx: Context) -> list[str]:
+    """Everything a user entry's runner execs or searches: the installer's and the hooks' interpreter (and, for Apple's
+    shim, the Command Line Tools' python3 it runs), every PATH directory, and each absolute word of its admit and watch
+    commands that names a file."""
+    paths = [sys.executable, ctx.python or PROTECTED_PYTHON]
+    if (ctx.python or PROTECTED_PYTHON) == PROTECTED_PYTHON:
+        paths.append(f"{PROTECTED_DEVELOPER_DIR}/usr/bin/python3")
+    paths += runner_path(ctx.home, ":".join(declared_path(ctx)), protected=True).split(":")
+    entry = dedicated_of(ctx) or {}
+    for key in ("admit", "watch"):
+        words = [dedicated_word(ctx, w) for w in entry.get(key) or []]
+        paths += [w for i, w in enumerate(words) if i == 0 or (w.startswith("/") and os.path.isfile(w))]
+    return list(dict.fromkeys(paths))
+
+
+def plan_toolchain(ctx: Context) -> dict[str, Any] | None:
+    """The PROTECTED_TOOLCHAIN step of a user entry's install, first: blocked, typed, when any path fails the check."""
+    if not user_entry(ctx):
+        return None
+    refused = [{"path": ctx.show(p), "why": why} for p in toolchain_paths(ctx)
+               if (why := untrusted_exec(p, os.getuid()))]
+    act = {"kind": "toolchain", "state": "blocked" if refused else "unchanged", "python": ctx.python,
+           "path": PROTECTED_PATH, "developerDir": PROTECTED_DEVELOPER_DIR, "refused": refused}
+    if refused:
+        act["missing"] = TOOLCHAIN_MISSING
+        act["note"] = ("a user entry execs only root- or self-owned, group/other-unwritable paths: "
+                       + "; ".join(f"{r['path']}: {r['why']}" for r in refused))[:600]
+    return act
+
+
+def private_paths(ctx: Context) -> list[Path]:
+    """The paths a user entry keeps at PRIVATE_MODE: the account's home and its runner directory."""
+    return [ctx.home, ctx.runner_dir] if (dedicated_of(ctx) or {}).get("user") else []
+
+
+def path_mode(path: Path) -> int | None:
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return None if stat.S_ISLNK(st.st_mode) else st.st_mode & 0o777
+
+
+def plan_private(ctx: Context) -> dict[str, Any] | None:
+    """The PRIVATE step of a user entry's install: its home and runner directory at 0700. None for any other runner."""
+    paths = private_paths(ctx)
+    if not paths:
+        return None
+    modes = {os.fspath(p): path_mode(p) for p in paths}
+    ok = all(m == PRIVATE_MODE for m in modes.values())
+    return {"kind": "private", "state": "unchanged" if ok else "create", "user": (dedicated_of(ctx) or {}).get("user"),
+            "paths": list(modes), "modes": {k: (None if m is None else f"{m:o}") for k, m in modes.items()},
+            "note": "" if ok else "the account's home and runner directory become 0700: no other user reads its _work"}
+
+
+def apply_private(ctx: Context, act: dict[str, Any]) -> None:
+    """chmod 0700, then read the modes back (fresh post-effect observation): anything else fails the step."""
+    for path in private_paths(ctx):
+        try:
+            if os.path.islink(path):
+                raise OSError("a symlink")
+            os.chmod(path, PRIVATE_MODE)
+        except OSError as error:
+            act["state"], act["note"] = "failed", f"cannot make {ctx.show(path)} 0700 ({type(error).__name__})"
+            return
+    modes = {os.fspath(p): path_mode(p) for p in private_paths(ctx)}
+    act["modes"] = {k: (None if m is None else f"{m:o}") for k, m in modes.items()}
+    wrong = [k for k, m in modes.items() if m != PRIVATE_MODE]
+    if wrong:
+        act["state"], act["note"] = "failed", "not 0700 after chmod: " + ", ".join(ctx.show(Path(k)) for k in wrong)
+        return
+    act["applied"] = True
 
 
 def dedicated_word(ctx: Context, word: str) -> str:
@@ -3252,7 +3437,8 @@ def watch_env(ctx: Context) -> dict[str, str]:
     """The watch loop's env: the entry's env, with a declared PATH folded into the workload PATH (runner_path), never
     replacing it."""
     env = dedicated_env(ctx)
-    return {**env, "PATH": runner_path(ctx.home, env.get("PATH", ""))}
+    return {**env, "PATH": runner_path(ctx.home, env.get("PATH", ""), protected=user_entry(ctx)),
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {})}
 
 
 def watch_label(ctx: Context) -> str:
@@ -3308,9 +3494,18 @@ LAN_RELAY_NC = "/usr/bin/nc"
 LAN_RELAY_CONNECT_S = 5
 LAN_RELAY_IDLE_S = 900  # an ssh session quiet this long is closed; ssh's ServerAliveInterval keeps a live one open
 SOCKET_PATH_MAX = 103  # sockaddr_un.sun_path on macOS is 104 bytes with its NUL
+# LAN_RELAY_ADAPTERS: a lanRelay list (one host's adapter addresses, one port) runs Apple's /bin/sh with this fixed
+# loop instead of nc alone. It tries /usr/bin/nc to each declared address in order and stops at the first that
+# connects: nc exits 1 only when it could not connect (or set up), and once connected it exits with the session's
+# status, which ends the loop. Nothing waits on stdin before a connect, so the next address gets the client's bytes
+# intact. The addresses and port are positional arguments the manifest validated, never part of the script, and
+# both programs are Apple's, so the relay still has no non-Apple ancestor. A single address keeps plain nc.
+LAN_RELAY_SH = "/bin/sh"
+LAN_RELAY_LOOP = ('c=$1 w=$2 p=$3; shift 3; for a do /usr/bin/nc -G "$c" -w "$w" "$a" "$p"; s=$?; '
+                  '[ "$s" -eq 1 ] || exit "$s"; done; exit 1')
 
 
-def relay_of(ctx: Any) -> str | None:
+def relay_of(ctx: Any) -> str | list[str] | None:
     return (dedicated_of(ctx) or {}).get("lanRelay")
 
 
@@ -3328,10 +3523,16 @@ def relay_plist_path(ctx: Context) -> Path | None:
 
 
 def relay_plist(ctx: Context) -> dict[str, Any]:
-    address, port = relay_of(ctx).rsplit(":", 1)
+    relay = relay_of(ctx)
+    if isinstance(relay, list):  # LAN_RELAY_ADAPTERS: one port (glaeda_fleet_labels.lan_relay checked it)
+        port = relay[0].rsplit(":", 1)[1]
+        argv = [LAN_RELAY_SH, "-c", LAN_RELAY_LOOP, "glaeda-lan-relay", str(LAN_RELAY_CONNECT_S),
+                str(LAN_RELAY_IDLE_S), port, *(r.rsplit(":", 1)[0] for r in relay)]
+    else:
+        address, port = relay.rsplit(":", 1)
+        argv = [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S), address, port]
     return {"Label": relay_label(ctx),
-            "ProgramArguments": [LAN_RELAY_NC, "-G", str(LAN_RELAY_CONNECT_S), "-w", str(LAN_RELAY_IDLE_S),
-                                 address, port],
+            "ProgramArguments": argv,
             "inetdCompatibility": {"Wait": False},
             "Sockets": {"Listener": {"SockPathName": os.fspath(relay_socket(ctx)), "SockPathMode": 0o600,
                                      "SockType": "stream"}},
@@ -3424,10 +3625,13 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
     declared = [e for e in env.pop("PATH", "").split(":") if e]
     current = read_runner_path(ctx.runner_dir)
     kept_path = [e for e in current.split(":") if e and (e not in previous_path or e in declared)]
-    base = runner_path(ctx.home)  # what every runner's .path has anyway: never owned, never removed
+    if user_entry(ctx):  # PROTECTED_TOOLCHAIN: only checked directories stay on a user entry's .path
+        kept_path = [e for e in kept_path if e in declared or e in PROTECTED_PATH.split(":")]
+    # what every runner's .path has anyway: never owned, never removed
+    base = runner_path(ctx.home, protected=user_entry(ctx))
     owned_path = [e for e in declared if e not in base.split(":") and (e not in kept_path or e in previous_path)]
     if declared or previous_path:
-        merged = runner_path(ctx.home, ":".join(declared), ":".join(kept_path))
+        merged = runner_path(ctx.home, ":".join(declared), ":".join(kept_path), protected=user_entry(ctx))
         if merged != current:
             changed = True
             if write:

@@ -26,7 +26,7 @@ use crate::disposable_lima_worker::{
 };
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
-use crate::disposable_worker_reconciler::DisposableWorkerResources;
+use crate::disposable_worker_reconciler::{DisposableHostBudget, DisposableWorkerResources};
 use crate::github_scale_set_bridge::{
     GitHubAppKeychainConfig, InstallationTokenFileConfig, ScaleSetBridgeConfig,
     ScaleSetBridgeCredential, ScaleSetBridgeTarget,
@@ -86,7 +86,8 @@ impl fmt::Display for DisposableWorkerEnrollmentError {
 
 impl std::error::Error for DisposableWorkerEnrollmentError {}
 
-/// Validated construction inputs for one local, single-concurrency Scale Set service.
+/// Validated construction inputs for one local Scale Set service (one clone per host unless the
+/// enrollment names a `host` ceiling).
 ///
 /// The type deliberately has no serialization, path accessor, `Clone`, or derived `Debug`.
 pub struct DisposableWorkerEnrollment {
@@ -227,13 +228,14 @@ fn build_enrollment(
             )
         }
     };
+    let max_workers = wire.host.as_ref().map_or(1, |host| host.max_workers);
     let target = ScaleSetBridgeTarget::new(
         wire.scale_set.id,
         &wire.scale_set.name,
         wire.scale_set.runner_group_id,
         &wire.scale_set.labels,
         &wire.scale_set.owner,
-        1,
+        max_workers,
     )
     .map_err(|_| invalid_configuration())?;
     let bridge_config = ScaleSetBridgeConfig::with_credential(
@@ -262,6 +264,12 @@ fn build_enrollment(
         &prepared,
     )
     .map_err(|_| invalid_configuration())?;
+    let consumer_policy = match &wire.host {
+        None => consumer_policy,
+        Some(host) => consumer_policy
+            .with_host_budget(host_budget(host, resources)?)
+            .map_err(|_| invalid_configuration())?,
+    };
     let clone_runtime = DisposableCloneRuntime::new(
         state_root.clone(),
         limactl_program.clone(),
@@ -281,6 +289,29 @@ fn build_enrollment(
         clone_runtime,
         runner_runtime,
     })
+}
+
+/// The host budget an enrollment's `host` block names: up to `max_workers` clones whose memory
+/// reservations sum to at most `memory_bytes`. CPU and disk totals follow the worker ceiling (CPU is
+/// shared by the hypervisor; disk is admitted per clone against the filesystem at clone time).
+fn host_budget(
+    host: &HostWire,
+    resources: DisposableWorkerResources,
+) -> Result<DisposableHostBudget, DisposableWorkerEnrollmentError> {
+    let workers = u32::from(host.max_workers);
+    let total = DisposableWorkerResources::new(
+        resources
+            .cpu_millis()
+            .checked_mul(workers)
+            .ok_or_else(invalid_configuration)?,
+        host.memory_bytes,
+        resources
+            .disk_bytes()
+            .checked_mul(u64::from(workers))
+            .ok_or_else(invalid_configuration)?,
+    )
+    .map_err(|_| invalid_configuration())?;
+    DisposableHostBudget::new(host.max_workers, total).map_err(|_| invalid_configuration())
 }
 
 fn canonical_bytes(wire: &impl Serialize) -> Result<Vec<u8>, DisposableWorkerEnrollmentError> {
@@ -332,6 +363,18 @@ struct EnrollmentWire {
     github: GitHubWire,
     scale_set: ScaleSetWire,
     resources: ResourcesWire,
+    /// Optional per-host ceiling. Absent means one clone per host, and an enrollment without it
+    /// keeps its exact canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<HostWire>,
+}
+
+/// How many clones this host may run at once and the memory their reservations may sum to.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HostWire {
+    max_workers: u16,
+    memory_bytes: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -413,6 +456,7 @@ impl EnrollmentWireV1 {
             },
             scale_set: self.scale_set,
             resources: self.resources,
+            host: None,
         }
     }
 }
@@ -443,6 +487,10 @@ mod tests {
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn canonical_document() -> Vec<u8> {
+        canonical_document_with_host(None)
+    }
+
+    fn canonical_document_with_host(host: Option<HostWire>) -> Vec<u8> {
         canonical_bytes(&EnrollmentWire {
             schema_version: DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION,
             state_root: "/private/var/lib/smolrunner".to_owned(),
@@ -476,8 +524,55 @@ mod tests {
                 memory_bytes: 2 << 30,
                 disk_bytes: 20 << 30,
             },
+            host,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn host_block_sets_the_per_host_clone_ceiling_and_absence_keeps_one() {
+        let single = decode_disposable_worker_enrollment(&canonical_document())
+            .unwrap()
+            .into_parts();
+        assert_eq!(single.consumer_policy.host_budget().max_workers(), 1);
+        assert!(
+            !String::from_utf8(canonical_document())
+                .unwrap()
+                .contains("\"host\"")
+        );
+
+        let three =
+            decode_disposable_worker_enrollment(&canonical_document_with_host(Some(HostWire {
+                max_workers: 3,
+                memory_bytes: 6 << 30,
+            })))
+            .unwrap()
+            .into_parts();
+        let budget = three.consumer_policy.host_budget();
+        assert_eq!(budget.max_workers(), 3);
+        assert_eq!(budget.total().memory_bytes(), 6 << 30);
+        assert_eq!(budget.total().cpu_millis(), 6_000);
+
+        for refused in [
+            HostWire {
+                max_workers: 0,
+                memory_bytes: 6 << 30,
+            },
+            HostWire {
+                max_workers: 65,
+                memory_bytes: 1 << 40,
+            },
+            // Memory for less than one clone.
+            HostWire {
+                max_workers: 3,
+                memory_bytes: 1 << 30,
+            },
+        ] {
+            assert!(
+                decode_disposable_worker_enrollment(&canonical_document_with_host(Some(refused)))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
