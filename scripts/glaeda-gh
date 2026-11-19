@@ -10921,8 +10921,10 @@ class LandQueue:
         """E is judged: the latch no longer holds it (hold)."""
         mark = e.pop("latchHeld", None)
         if mark:
-            self.history(e, "latch_released", windows=mark.get("windows"),
-                         waited=round(self.now - float(mark.get("dueSince") or self.now)))
+            waited = max(0.0, self.now - float(mark.get("dueSince") or self.now))
+            # kept for the next judgment, whenever a worker takes it (LAND_WAIT_HELD): the latch has cleared by then
+            e["heldFor"] = float(e.get("heldFor") or 0.0) + waited
+            self.history(e, "latch_released", windows=mark.get("windows"), waited=round(waited))
 
     def parked(self, e: dict) -> bool:
         """True while E is parked on a quota refusal (park_quota): nothing is read for it. Past its wake it is judged
@@ -11624,13 +11626,14 @@ class LandQueue:
             return False
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
-        # Held by the login's latch while due, or parked on a quota refusal, since (LAND_WAIT_HELD)
-        latch = e.get("latchHeld") or {}
-        since = min(float(latch.get("dueSince") or self.now) if latch else self.now,
-                    float(e.pop("parkedSince", None) or self.now))
-        e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
-                 judging={"sha": sha, "at": self.now, "counts": counts, "held": max(0.0, self.now - since)})
         self.unhold(e)
+        # Held by the login's latch while due (unhold: heldFor), or parked on a quota refusal since (LAND_WAIT_HELD)
+        held = float(e.pop("heldFor", None) or 0.0)
+        parked = e.pop("parkedSince", None)
+        if isinstance(parked, (int, float)) and not isinstance(parked, bool):
+            held += max(0.0, self.now - float(parked))
+        e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
+                 judging={"sha": sha, "at": self.now, "counts": counts, "held": held})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)

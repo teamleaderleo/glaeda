@@ -20626,13 +20626,13 @@ class LandTest(Base):
         self.assertEqual(e["state"], "waiting", e.get("stop"))
         self.assertGreaterEqual(e["waitBudget"]["held"], 3 * 2400)
         # The backoff it chose still runs the budget out: a judgment that keeps failing for its own reason stops.
-        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 6
-        for _ in range(6):
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 16
+        for _ in range(16):
             e = self.tick(gg.LAND_RETRY_MAX + 1)
             if e["state"] == "stopped":
                 break
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertGreaterEqual(self.t - NOW - e["waitBudget"]["held"], 7200)
+        self.assertGreaterEqual(self.t - NOW - e["waitBudget"]["held"], gg.LAND_UNREAD_DEADLINE)
         self.assertIn("not judged, not counted", e["stop"]["reason"])
 
     def test_time_parked_on_quota_never_counts_toward_a_wait_deadline(self):
@@ -20667,13 +20667,13 @@ class LandTest(Base):
         self.t = (NOW // 86400 + 1) * 86400 + 3600
         self.pr(LA)
         self.land()
-        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 9
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 18
         e = self.tick()
         self.latch("rest", self.t + 2000)
         e = self.tick(130)  # due, under the latch
         e = self.tick(2000)
         self.clear_latch()
-        for _ in range(8):
+        for _ in range(17):
             e = self.tick(gg.LAND_RETRY_MAX + 1)
             if e["state"] == "stopped":
                 break
