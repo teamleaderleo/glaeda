@@ -286,6 +286,10 @@ SAMPLE_EVENTS = {
     "teamleaderleo-fork-wrong-base": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": TEAMLEADER_FORK},
         "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
+    # OWN_CODE_ONLY: a same-repo pull request of another repository is not this job's own code.
+    "same-repo-pr-of-another-repo": ("pull_request", {"repository": CMUX, "pull_request": {
+        "head": {"repo": {"full_name": "manaflow-ai/other", "fork": False}},
+        "base": {"repo": {"full_name": "manaflow-ai/other", "fork": False}}}}, False),
     "cross-repo-pr-not-flagged-fork": ("pull_request", {"repository": CMUX, "pull_request": {
         "head": {"repo": {"full_name": "other/cmux", "fork": False}}, "base": {"repo": CMUX}}}, False),
     "deleted-fork-pr": ("pull_request", {"repository": CMUX, "pull_request": {

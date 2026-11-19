@@ -14,6 +14,7 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * the event carries a pull_request whose head repository is an unapproved fork, is missing, or differs
     from the base repository (covers pull_request, pull_request_review, and friends); teamleaderleo/cmux is the
     one approved fork
+  * the event carries a pull_request whose base repository is not the job's own repository (OWN_CODE_ONLY)
   * the event name starts with pull_request but the payload has no pull_request object
   * a workflow_run was triggered from a different head repository
   * the repository is not in the allowlist baked in at install time
@@ -2986,6 +2987,12 @@ def decide(event_name: str | None, event: Any, repository: str | None,
         if not isinstance(head, dict):
             return False, "pull request head repository is missing (deleted fork?)"
         head_name, base_name = _repo_name(head), _repo_name(base)
+        # OWN_CODE_ONLY (Leo, 2026-11-19: "if 99.99999% of the code is ours, there's literally nothing to be concerned
+        # about if we literally dont allow forks to run on ours automatically"): owned runners take every own-branch
+        # job, so the one line held is that a pull request's code is the running repository's own. Its base must be
+        # this job's repository too, so a payload naming a same-repo pull request elsewhere admits nothing here.
+        if base_name is None or base_name != repo:
+            return False, f"pull request into {base_name or '(unknown)'}, not this job's repository {repo or '(unknown)'}"
         allowed_fork = (
             head.get("fork") is True
             and head_name in ALLOWED_FORK_REPOS
