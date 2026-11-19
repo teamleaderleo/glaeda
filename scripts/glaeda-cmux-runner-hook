@@ -59,7 +59,9 @@ With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2
 share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity; a gateway
 client takes its token and no host.lock, GATEWAY_NO_HOST_LOCK). When
 they are taken a cmux job waits for them, with no time limit, and logs what it waits for and who holds it
-(CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...".
+(CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...",
+not counting time a fleet build holds host.lock, which it waits out for up to --guest-host-wait in all
+(GUEST_HOST_WAIT).
 Only then does it trigger the same queued glaeda-disk --pressure pass job-completed does (below), never able to fail
 the job and never holding it.
 
@@ -1799,6 +1801,17 @@ def fit_mem_chunks(mibs: list[int], total: int) -> int:
 
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
+# GUEST_HOST_WAIT: a guest job GitHub has handed this runner meets a fleet build holding host.lock (it took the lock
+# between the listener gate's 2 s check and job-started). GitHub never moves a handed job, so refusing it after
+# GUEST_WAIT_S only failed it red: cmuxterm-hq's scheduled next-dogfood (run 44505512009, cmux19, 2026-11-19) was
+# refused after 600 s and the Benches rows it measures went a day stale. Time behind a holding fleet build does not
+# count against --guest-wait; the guest waits for the build to end, up to GUEST_HOST_WAIT_S in all, and the build
+# then waits for the job, as for any admitted job. Neither starves: the listener gates stop every idle runner here
+# while the build holds the host, the waiter holds no lock, and a fleet build holds a mini for about 20 min (hq
+# worker builds; the longest seen, the fleet-cas reader, 47 min, docs/CMUX_MINI_RUNNER.md "Why a gate"). The bound
+# keeps a stranded lock from holding the runner for a guest's whole job timeout.
+GUEST_HOST_WAIT_S = 3600.0
+FLEET_HOLDS_HOST = "capacity: a fleet build holds the host lock"
 # A DEV Release compile is placed again when the runner that accepted it is already full. GitHub cannot move a
 # job after it has entered runner setup, so the hook refuses after this short bounded wait; the owned-pool rescue
 # then re-runs it through placement, where an idle warm-cache mini (or the configured overflow) can take it.
@@ -6935,7 +6948,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                         preempted = preempt_yielding(host_lock, job or "a job", holder_pids(state_dir))
                         if preempted is None or not wait_host_shared(fd, PREEMPT_ADMISSION_WAIT_S):
                             os.close(fd)
-                            return False, ("capacity: a fleet build holds the host lock"
+                            return False, (FLEET_HOLDS_HOST
                                            + (f" ({preempted}, still held after {PREEMPT_ADMISSION_WAIT_S:g} s)"
                                               if preempted else ""))
                         print(f"{PREFIX}: {preempted}", flush=True)
@@ -14025,6 +14038,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="the repository whose job ids JOB_CLASSES names; other repos are guests (see job_class)")
     p.add_argument("--guest-wait", type=float, default=GUEST_WAIT_S,
                    help="seconds a guest job waits for room on a full mini before it is refused")
+    p.add_argument("--guest-host-wait", type=float, default=GUEST_HOST_WAIT_S,
+                   help="seconds a guest job waits in all while a fleet build holds the host lock (GUEST_HOST_WAIT)")
     p.add_argument("--gui-wait", type=float, default=None,
                    help="cap, in seconds, on a home-repository job's wait for capacity (default: no cap)")
     p.add_argument("--allow-event", action="append", default=[],
@@ -14510,6 +14525,8 @@ def main(argv: list[str] | None = None) -> int:
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
+            guest = is_guest(repo, args.home_repo)
+            host_waited, tried_at = 0.0, start  # GUEST_HOST_WAIT: a guest's time behind a fleet build holding host
             try:
                 while True:
                     if owner.gone():  # a cancelled job's hook must not keep queuing for units
@@ -14537,8 +14554,17 @@ def main(argv: list[str] | None = None) -> int:
                                     f"_work (pids {', '.join(map(str, stray[:8]))}), so the mini is not drained")
                     if held or not note.startswith("capacity:"):
                         break
-                    waited = time.monotonic() - start
-                    left = math.inf if cap is None else cap - waited
+                    now = time.monotonic()
+                    waited = now - start
+                    if guest and note.startswith(FLEET_HOLDS_HOST):
+                        host_waited += now - tried_at  # since the last try: the host was held at both ends
+                    tried_at = now
+                    if guest and cap is not None:
+                        # GUEST_HOST_WAIT: the fleet's hold does not count against the guest's bound for room; the
+                        # whole wait stays within --guest-host-wait
+                        left = min(cap - (waited - host_waited), max(cap, args.guest_host_wait) - waited)
+                    else:
+                        left = math.inf if cap is None else cap - waited
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])
