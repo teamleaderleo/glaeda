@@ -5569,7 +5569,7 @@ class Daemon:
         if item.get("uncertain"):
             # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
             # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
-            found, looked = self.post_find(item)
+            found, looked = self.post_find(item, actor)
             if found:
                 self.post_delivered(path, item, found, note="found after a lost answer")
                 return
@@ -5593,19 +5593,7 @@ class Daemon:
                 body["body"] = actor["note"] + "\n\n" + body["body"]
         write_json(path, {**item, "uncertain": True})  # a daemon that dies mid-request looks it up first
         try:
-            if actor:
-                if time.monotonic() >= self.tick_deadline or not self.secondary_admit("rest", 1):
-                    raise OutOfTime
-                headers = {"Authorization": "Bearer " + actor["token"], "Accept": "application/vnd.github+json",
-                           "Content-Type": "application/json", "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
-                status, h, raw = self.transport(method, API + api, headers, json.dumps(body).encode())
-                self.sent.append((self.now, "app"))
-                try:
-                    doc = json.loads(raw) if raw else None
-                except ValueError:
-                    raise WatchError("App write returned an unreadable response") from None
-            else:
-                status, h, doc = self.request(method, api, body, content=True)
+            status, h, doc = self.outbox_request(method, api, body, actor)
         except WatchError as error:
             self.post_at = self.now
             self.post_retry(path, item, describe(error), uncertain=True)
@@ -5637,7 +5625,7 @@ class Daemon:
         elif status == 401:
             self.post_retry(path, item, f"HTTP {status}")
         elif item["kind"] == "pr" and status == 422 and "already exists" in text:
-            found, _ = self.post_find(item)
+            found, _ = self.post_find(item, actor)
             self.post_finish(path, item, url=found.get("html_url") if found else None,
                              note="a pull request for this head is already open",
                              error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
@@ -5743,7 +5731,21 @@ class Daemon:
                     or h.get("x-ratelimit-remaining") == "0" or THROTTLED.search(text)):
                 self.post_hold_for(h, path, item)
 
-    def post_find(self, item: dict) -> tuple[dict | None, bool]:
+    def outbox_request(self, method: str, api: str, body: dict | None, actor: dict | None):
+        if not actor:
+            return self.request(method, api, body, content=method != "GET")
+        if time.monotonic() >= self.tick_deadline or not self.secondary_admit("rest", 1):
+            raise OutOfTime
+        headers = {"Authorization": "Bearer " + actor["token"], "Accept": "application/vnd.github+json",
+                   "Content-Type": "application/json", "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+        status, h, raw = self.transport(method, API + api, headers, json.dumps(body).encode() if body is not None else None)
+        self.sent.append((self.now, "app"))
+        try:
+            return status, h, json.loads(raw) if raw else None
+        except ValueError:
+            raise WatchError("App request returned an unreadable response") from None
+
+    def post_find(self, item: dict, actor: dict | None = None) -> tuple[dict | None, bool]:
         """(this write if it already landed, whether the look got an answer): the open PR for its head,
         or a comment or review with the same body posted since it was queued."""
         repo, since = item["repo"], dt.datetime.fromtimestamp(item["queuedAt"] - 60, dt.timezone.utc)
@@ -5755,10 +5757,10 @@ class Daemon:
         else:
             api = f"/repos/{repo}/pulls/{item['number']}/reviews?per_page=100"
         try:
-            status, h, doc = self.request("GET", api)
+            status, h, doc = self.outbox_request("GET", api, None, actor)
             last = re.search(r'<([^>]+)>;\s*rel="last"', h.get("link") or "")
             if status == 200 and last and last.group(1).startswith(API + "/"):
-                status, _, doc = self.request("GET", last.group(1)[len(API):])
+                status, _, doc = self.outbox_request("GET", last.group(1)[len(API):], None, actor)
         except WatchError:
             return None, False
         if status != 200 or not isinstance(doc, list):
