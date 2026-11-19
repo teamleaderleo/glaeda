@@ -17925,11 +17925,88 @@ class StaleDataTest(Base):
         self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
 
-    def test_direct_reads_through_the_broker_share_the_repo_parts_and_send_no_issue_probe(self) -> None:
+    def test_direct_reads_through_the_broker_share_the_repo_parts_and_vouch_for_the_pull_by_its_issue(self) -> None:
         """gcp-codex-lane-12, 2026-11-17 07:00-07:55Z: 166 direct reads made 1,571 of the VM's 1,857 broker GETs,
-        each asking the base's rulesets and the workflow list again (one process each, so repo_parts began empty) and
-        an issues/N probe whose answer, with no ETag through the broker, could never vouch for a kept pull. Two direct
-        reads of one PR, as two waits' processes make them: the second reads only what moves (the pull and the head)."""
+        each asking the base's rulesets and the workflow list again (one process each, so repo_parts began empty).
+        Broker host, 2026-11-19 10:42-12:42Z: glaeda-upstream's pulls/{n} was 4,554 broker reads, 322 of them login
+        REST, the top spender: the broker answered no ETag, so every direct read read the pull again. Three direct
+        reads of one PR, as three waits' processes make them, with a push elsewhere in the repo between (the pull's
+        own answer moves): the second asks only the issue, which vouches for the kept pull; a change to the PR itself
+        (its updated_at) reads the pull again."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[check_run("a")])
+        served: list[str] = []
+
+        def read() -> list[str]:
+            start = len(served)
+            self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
+                                              "began": time.time() - 700}))
+            return served[start:]
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")):
+            first = read()
+            self.gh.repo_pushes += 1  # a push anywhere in the repo: the pull's own answer is not the one kept
+            second = read()
+            self.gh.prs[("o", "r", 9)]["updatedAt"] = "y"  # the PR itself changed
+            third = read()
+        self.assertEqual((first.count("pulls/9"), first.count("issues/9")), (1, 0), first)  # no seed issue read
+        self.assertEqual((second.count("pulls/9"), second.count("issues/9")), (0, 1), second)
+        self.assertEqual((third.count("pulls/9"), third.count("issues/9")), (1, 1), third)
+        self.assertEqual(gg.read_cache("pr:o/r#9")["restParts"]["/repos/o/r/pulls/9"]["doc"]["updated_at"],
+                         self.gh.rest_pr(["", "repos", "o", "r", "pulls", "9"], "")["updated_at"])
+        print(f"\nthree direct reads of one PR through the broker: {len(served)} GETs ({served})")
+
+    def test_direct_reads_of_a_running_head_through_the_broker_take_the_suite_gate(self) -> None:
+        """A running PR read again through the broker: once the issue is kept (the second read), the third read is the
+        gate alone (issue, check suites, first status page), with no pull, check-run page or run list."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, checks=[workflow_check("build", 11, conclusion=None)])
+        served: list[str] = []
+        reads = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")):
+            for _ in range(3):
+                start = len(served)
+                self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
+                                                  "began": time.time() - 700}))
+                reads.append(served[start:])
+                self.gh.repo_pushes += 1
+        sha = "a" * 40
+        self.assertEqual(sorted(reads[2]), sorted(["issues/9", f"commits/{sha}/check-suites", f"commits/{sha}/status"]),
+                         reads)
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "PENDING")
+
+    def test_the_broker_transport_answers_an_unchanged_get_304_on_its_own_etag(self) -> None:
+        """The broker hands on no response header: broker_transport gives each 200 an ETag of its answer, so the
+        daemon's conditional reads (rest_part, rest_gate_holds) work through it as against GitHub."""
+        doc = {"id": 1, "state": "open"}
+
+        def fake(argv, timeout=None, input_text=None, env=None):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": doc}), "")
+        with mock.patch.object(gg, "run_bounded", fake):
+            send = gg.broker_transport(["/home/cmux/.local/bin/lane-gh", "call", "get"], lambda: time.monotonic() + 30)
+            url = "https://api.github.com/repos/o/r/issues/9"
+            status, h, raw = send("GET", url, {}, None)
+            self.assertEqual((status, json.loads(raw)), (200, doc))
+            etag = h["etag"]
+            self.assertEqual(send("GET", url, {"If-None-Match": etag}, None), (304, {"etag": etag}, b""))
+            doc = {"id": 1, "state": "closed"}
+            status, h2, raw = send("GET", url, {"If-None-Match": etag}, None)
+            self.assertEqual((status, json.loads(raw)["state"]), (200, "closed"))
+            self.assertNotEqual(h2["etag"], etag)
+
+    def test_direct_reads_through_the_broker_share_the_repo_parts(self) -> None:
+        """Two direct reads of one PR (one process each): the base's rulesets and the workflow list are read once."""
         config = Path(self.tmp.name) / "upstream.json"
         gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
         patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
@@ -17943,10 +18020,10 @@ class StaleDataTest(Base):
             for _ in range(2):
                 self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
                                                   "began": time.time() - 700}))
-        self.assertEqual([p for p in served if p.startswith("issues/")], [], served)
         self.assertEqual(len([p for p in served if p.startswith("rules/branches/")]), 1, served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
-        self.assertEqual(len([p for p in served if p == "pulls/9"]), 2, served)
+        # the second read's issue vouches for the kept pull (the test above)
+        self.assertEqual((served.count("pulls/9"), served.count("issues/9")), (1, 1), served)
         print(f"\ntwo direct reads of one PR through the broker: {len(served)} GETs ({served})")
         # past the TTL the next read asks them again
         later = time.time() + gg.REST_REPO_PART_TTL + 1

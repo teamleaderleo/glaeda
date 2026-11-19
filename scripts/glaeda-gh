@@ -2590,11 +2590,30 @@ def direct_env() -> dict:
     return {**os.environ, "LANE_GH_LANE": UPSTREAM_LANE}
 
 
+# The ETag broker_transport gives a 200: a hash of the answer's JSON (sorted keys), so the same GET asked with it as
+# If-None-Match reads as a 304 when the broker's answer is unchanged, as GitHub's own would. The broker hands on no
+# response header, so before this every direct read was a fresh 200 to the daemon: Daemon.etags was off for it,
+# rest_pull read pulls/N on every direct read, and rest_gate_holds (which needs the kept issue) never held. Broker
+# host, 2026-11-19 10:42-12:42Z (rest_breakdown get_reads): glaeda-upstream's pulls/{n} was 4,554 rows and 322 login
+# REST, the top (lane, tool, endpoint), beside commits/{sha}/check-runs 3,500, check-suites 3,015, status 2,071 and
+# actions/runs 1,905 rows. A pull's own answer can never come back unchanged on a busy repo (it embeds its
+# repositories' pushed_at): the issue it shares updated_at with vouches for it instead (Daemon.body_etags).
+BROKER_ETAG = 'W/"glaeda-broker-{}"'
+
+
+def broker_etag(data: Any) -> str:
+    """BROKER_ETAG of one broker answer's data."""
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return BROKER_ETAG.format(hashlib.sha256(raw).hexdigest()[:40])
+
+
 def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
     """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
     (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
     time.monotonic() bound) and at most UPSTREAM_DEADLINE. Answers GitHub's status and JSON as http() does; a
-    refusal with no GitHub status is a 502 whose message is the refusal. GraphQL and writes are never sent."""
+    refusal with no GitHub status is a 502 whose message is the refusal. GraphQL and writes are never sent. A 200
+    carries BROKER_ETAG and comes back 304 (no body) when the request's If-None-Match is that same ETag: the broker
+    was asked all the same, so the 304 saves the daemon's reads after it (rest_pull, rest_gate_holds), not this one."""
     exe = program_path(command[0])
 
     def send(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
@@ -2626,7 +2645,13 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
             return 502, {}, json.dumps({"message": f"direct: {why}"[:UPSTREAM_ERROR_MAX]}).encode()
-        return status, {}, json.dumps(answer.get("data")).encode()
+        data = answer.get("data")
+        if status != 200:
+            return status, {}, json.dumps(data).encode()
+        etag = broker_etag(data)
+        if (headers or {}).get("If-None-Match") == etag:
+            return 304, {"etag": etag}, b""
+        return status, {"etag": etag}, json.dumps(data).encode()
     return send
 
 
@@ -3024,6 +3049,15 @@ def slim_statuses(doc: dict) -> list[dict]:
 def slim_issue_gate(doc: dict) -> dict:
     """GET issues/N as rest_pull's change detector: only what says the PR changed."""
     return {k: doc.get(k) for k in ("number", "state", "updated_at")}
+
+
+def issue_names_pull(issue: Any, pull: Any) -> bool:
+    """Whether a slimmed issues/N answer (slim_issue_gate) still names a kept pull's number, state and updated_at:
+    nothing on the PR changed since that pull was read (a push, a title, a review, a label, a close or merge all move
+    the updated_at a pull and its issue share). rest_pull's vouch through the broker (Daemon.body_etags)."""
+    if not isinstance(issue, dict) or not isinstance(pull, dict) or not issue.get("updated_at"):
+        return False
+    return all(issue.get(k) == pull.get(k) for k in ("number", "state", "updated_at"))
 
 
 def slim_check_suites(doc: dict) -> dict:
@@ -3819,9 +3853,12 @@ class Daemon:
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
-        # False for that read too: the broker answers no ETag (broker_transport), so an issues/N read can never vouch
-        # for a kept pull (rest_pull's 304 probe) and is not sent (DIRECT_PARTS says what that read cost).
+        # False turns off rest_pull's issues/N probe (and its seed read): a transport whose answers carry no ETag.
         self.etags = True
+        # True for an upstream host's direct read (broker_transport): its ETags are hashes of the broker's answer
+        # (BROKER_ETAG), so rest_pull vouches for a kept pull by the issue still naming the pull's state and
+        # updated_at (a pull and its issue share it; issue_names_pull), and sends no seed issue read after a fresh pull.
+        self.body_etags = False
         # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
@@ -8413,21 +8450,26 @@ class Daemon:
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
         held = old.get(gate) or {}
         can_reuse = (reuse and self.etags and doc is not None and doc.get("mergeable") is not None
-                     and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX and bool(held.get("etag")))
+                     and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX
+                     and (bool(held.get("etag")) or self.body_etags))
         if can_reuse and gate not in parts:
             try:
                 self.head_part(old, parts, gate, slim_issue_gate)
             except WatchError:
                 parts.pop(gate, None)
             else:
-                if parts[gate].get("etag") == held.get("etag"):  # 304 (or shared now): unchanged since the kept pull
+                # 304 (or shared now): unchanged since the kept pull. Through the broker (body_etags): the issue
+                # still names the kept pull's state and updated_at, so no seed issue read is needed after a pull.
+                same = (issue_names_pull(parts[gate].get("doc"), doc) if self.body_etags
+                        else parts[gate].get("etag") == held.get("etag"))
+                if same:
                     parts[path] = kept
                     return doc, True
         pull = self.head_part(old, parts, path, slim_pull)
         parts[path] = {**parts[path], "at": self.now}
         if gate not in parts and held.get("etag") and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
             parts[gate] = held  # the issue answer kept still describes this pull
-        elif gate not in parts and self.etags and self.mode("rest") != "stop":
+        elif gate not in parts and self.etags and not self.body_etags and self.mode("rest") != "stop":
             try:  # the issue as of now, for the next read's question (shared: a kept ETag makes it a 304)
                 self.head_part(old, parts, gate, slim_issue_gate)
             except WatchError:
@@ -13998,7 +14040,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
         daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                         controller=None, upstream=None)
         daemon.reads_protection = False
-        daemon.etags = False
+        daemon.body_etags = True
     else:
         daemon = Daemon(controller=None, upstream=None)
     modes = (read_json(BASE / "daemon.json") or {}).get("modes")
@@ -15236,7 +15278,7 @@ def _direct_read(req: dict) -> str | None:
             daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                             controller=None, upstream=None)
             daemon.reads_protection = False
-            daemon.etags = False
+            daemon.body_etags = True
         else:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
@@ -15306,11 +15348,12 @@ def direct_read(req: dict) -> str | None:
 # A lane VM's direct reads (direct_read through the broker: a starved wait, the land worker's refresh) are one process
 # each, so the Daemon's repo_parts, which shares a repository's or base's answer between watches for
 # REST_REPO_PART_TTL, began empty every time, and every read asked for the base's rulesets and the repository's
-# workflow list again. And the broker answers no ETag, so rest_pull's issues/N probe could never vouch for anything.
+# workflow list again. And the broker answered no ETag, so rest_pull's issues/N probe could never vouch for anything.
 # gcp-codex-lane-12, 2026-11-17 07:00-07:55Z (lane-gh calls): 166 direct reads made 1,571 of the VM's 1,857 broker
 # GETs, every one an App or login request: rules/branches 166, actions/workflows 166, issues/N 228 among them. The
 # rulesets and workflow list are kept here for REST_REPO_PART_TTL, shared by every direct read on the host (the same
-# window the daemon gives them), and the probe is not sent (Daemon.etags): 7 GETs a read become 4, 9 become 6.
+# window the daemon gives them): 7 GETs a read become 4, 9 become 6. The probe is back since broker_transport gives
+# each answer an ETag of its own (BROKER_ETAG) and rest_pull vouches by the issue's updated_at (Daemon.body_etags).
 DIRECT_PARTS = "direct-parts.json"  # under BASE (read when used: tests move BASE)
 DIRECT_PARTS_RE = re.compile(r"^/repos/[^/]+/[^/]+/(?:rules/branches/[^?]+|actions/workflows)\?")
 DIRECT_PARTS_MAX = 200
