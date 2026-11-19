@@ -9753,6 +9753,8 @@ LAND_OWN_RED_JOB = re.compile(r"\bnot excused: '([^'\n]{1,200})'")
 # job that never started, STARTUP_FAILURE, is one)
 LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"})
 LAND_FILES_MAX = 3000  # GitHub lists at most this many files of a PR: a list that long may not be whole
+# merge_hold's words for a job its runner refused at setup (cmux scripts/ci/base_red_excuse.py)
+LAND_SETUP_REFUSED = "was refused at setup by its runner"
 LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
 
 
@@ -12119,39 +12121,44 @@ class LandQueue:
     def rerun_unrelated(self, e: dict, act: dict, answer: dict, head: str) -> bool:
         """An own_red stop whose red is in a job the PR's changed paths cannot affect (LAND_UNRELATED_REDS): one
         `gh run rerun RUN --failed` per (head, run), kept on the entry before it is sent, then a wait on the PR's
-        checks at HEAD. True when it took that step; False: the stop goes ahead, as before."""
+        checks at HEAD. A job its runner refused at setup (merge_hold: "it gets re-run, never excused") takes the
+        same one rerun with no inert-path rule: no change makes a runner refuse a job. True when it took that step;
+        False: the stop goes ahead, as before."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         checks = data.get("checks") if isinstance(data.get("checks"), list) else []
         head_ok = bool(SHA40.fullmatch(head)) and str(data.get("headRefOid") or "").lower() == head
         flow, run, why = land_own_red(answer, act, checks, head_ok)
-        rule = land_unrelated_rule(repo, flow, self.config()) if run else None
-        if run and rule is None:
+        setup = bool(run) and LAND_SETUP_REFUSED in f"{answer.get('reason') or ''} {act.get('why') or ''}"
+        rule = land_unrelated_rule(repo, flow, self.config()) if run and not setup else None
+        if run and rule is None and not setup:
             why = f"workflow '{flow}' has no inert-path rule, so the change can affect it"
+        take, files = setup or rule is not None, []
         done = f"{head}|{run}"
-        if rule is not None and done in (e.get("unrelatedReruns") or []):
-            rule, why = None, f"run {run} was already rerun once at {head[:12]}"
-        gh = self.gh() if rule is not None else None
-        if rule is not None and gh is None:
-            rule, why = None, "no gh-quota shim to read the PR's files through"
-        if rule is not None:
+        if take and done in (e.get("unrelatedReruns") or []):
+            take, why = False, f"run {run} was already rerun once at {head[:12]}"
+        gh = self.gh() if take else None
+        if take and gh is None:
+            take, why = False, "no gh-quota shim to read the PR's files through"
+        if take and rule is not None:
             # One JSON string per file, so a name keeps its exact characters (#2132 review F1: a stripped
             # " webviews/a.ts" matched an inert glob its real name does not)
             got = self.call([gh, "api", f"repos/{repo}/pulls/{number}/files?per_page=100", "--paginate",
                              "--jq", ".[].filename | @json"], LAND_GH_DEADLINE)
             files = land_file_names(got.stdout or "")
             if got.returncode != 0 or not files or len(files) >= LAND_FILES_MAX:
-                rule, why = None, (f"the PR's file list could not be read whole (exit {got.returncode}, "
+                take, why = False, (f"the PR's file list could not be read whole (exit {got.returncode}, "
                                    f"{len(files)} files)")
             elif touched := [f for f in files if not land_path_inert(f, rule)]:
-                rule, why = None, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
+                take, why = False, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
         with self.lock:
             self.check(e)
-            if rule is None:
+            if not take:
                 self.history(e, "no_unrelated_rerun", why=land_trim(why, 200))
                 return False
             e["unrelatedReruns"] = [*(e.get("unrelatedReruns") or []), done][-LAND_UNRELATED_KEEP:]
-            self.history(e, "unrelated_red", run=run, workflow=flow, files=len(files))
+            self.history(e, "unrelated_red", run=run, workflow=flow, files=len(files),
+                         **({"why": "refused at setup by its runner"} if setup else {}))
             self.claim(e, "rerun_failed", runs=[run], unrelated=True)
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
@@ -12162,7 +12169,8 @@ class LandQueue:
                 return False
             self.nudge(e["key"])
             self.wait(e, {"kind": "pr", "sha": head, "rerun": True, "runs": land_rerun_marks(checks, [run]),
-                          "why": f"reran run {run}, a red the change cannot affect"}, LAND_WAIT_DEFAULT)
+                          "why": f"reran run {run}, " + ("a job its runner refused at setup" if setup
+                                                         else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
     def push_step(self, e: dict, kind: str, head: str, args: list[str], **extra: Any) -> None:

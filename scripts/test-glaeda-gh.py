@@ -20207,11 +20207,14 @@ class LandTest(Base):
         self.land()
         self.w.answers.append(self.setup_refused())
         self.tick()
+        self.pr_red(True, running=True)
+        self.tick()
         self.pr_red(True)
         self.w.answers.append(self.setup_refused())
         e = self.tick()
         self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
         self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
 
     def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
         self.unrelated_world(["webviews/src/a.ts"])
