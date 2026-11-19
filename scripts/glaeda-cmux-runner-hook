@@ -518,6 +518,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # cmux-next-ios kit tests: swift test on the Mac, then xcodebuild test in one booted
                         # simulator; the picker sends it to the sim-first runner too.
                         ("cmux-next-ios-kit.yml", "kit-tests"): "simulator-step",
+                        # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
+                        # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
+                        ("fast-checks.yml", "checks-mac"): "isolated",
                         ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -5647,6 +5650,18 @@ def workspace_damage(ws: Path) -> str:
 
     if git("config", "--bool", "--default", "false", "core.sparseCheckout").stdout.strip() == "true":
         return "sparse"
+    # A sparse setting the effective config hides: with extensions.worktreeConfig, config.worktree's
+    # `sparseCheckout = false` (what `sparse-checkout disable` wrote) masks a `true` in .git/config.
+    # actions/checkout then unsets extensions.worktreeConfig after its disable, the `true` comes back, and its
+    # `checkout --force` applies the old patterns (cmux job 135147612854 on gcp-agent-lane-6, 2026-11-18: 53541
+    # skip-worktree entries, scripts/ci/cmux-machine-linux-bytes.sh missing; cmuxterm-hq#13682). So every config
+    # file is read on its own. Per-worktree config alone is no damage: every full actions/checkout leaves a
+    # config.worktree saying `sparseCheckout = false`, so resetting on it would rewrite the tree every job.
+    git_dir = ws / ".git"
+    for config in (git_dir / "config", git_dir / "config.worktree"):
+        if config.is_file() and git("config", "--file", os.fspath(config), "--bool", "--default", "false",
+                                    "core.sparseCheckout").stdout.strip() == "true":
+            return f"sparse (in {config.name})"
     listed = git("ls-files", "-v")
     if listed.returncode != 0 or any(line.startswith("S ") for line in listed.stdout.splitlines()):
         return "with skip-worktree entries"

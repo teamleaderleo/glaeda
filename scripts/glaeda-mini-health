@@ -2212,6 +2212,16 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
                                "the root glaeda-daemon-heal pass reinstalls it" if stale else
                                "root: the release's glaeda-runner-hygiene --user "
                                f"{a.get('user') or '<account>'} --apply (docs/RUNNER_ACCOUNT_HYGIENE.md)"))
+        # A CI mini with no enrolled account: the root pass keeps the host's root census alone (rootCensus).
+        census = hygiene.get("rootCensus") if isinstance(hygiene.get("rootCensus"), dict) else {}
+        if census.get("state") in ("stale", "error"):
+            stale = census["state"] == "stale"
+            out.append(finding("disk_root_census_stale", "warn" if stale else "error",
+                               f"the host's root census (glaeda-disk --root-census) is not its release's: "
+                               f"{census.get('why')}", "pending" if stale else "impossible",
+                               "the root glaeda-daemon-heal pass reinstalls it" if stale else
+                               "root: the release's glaeda-runner-hygiene --root-census --apply "
+                               "(docs/RUNNER_ACCOUNT_HYGIENE.md)"))
         sandbox = report.get("sandbox") if isinstance(report.get("sandbox"), dict) else {}
         if sandbox.get("needs_operator"):  # the root heal would reboot a second time within its window: a person's
             out.append(finding("sandboxd_wedged", "error", str(sandbox["needs_operator"])[:400], "impossible",

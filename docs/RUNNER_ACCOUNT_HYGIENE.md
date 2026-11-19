@@ -53,6 +53,22 @@ own census, so a CI mini's `accounting_gap` is only what no folder holds (APFS
 snapshots, purgeable and open-deleted blocks) and never "unreadable". The fleet
 user's own walks keep their privacy guards.
 
+A CI mini needs no enrolled account to have the census. When no account is
+enrolled, the root `glaeda-daemon-heal` pass keeps the census on its own with
+its release's `glaeda-runner-hygiene --root-census --check`, and `--apply` when
+stale. A host counts as a CI mini when its fleet user (the owner of
+`/Users/Shared/cmux-build-fleet`) runs runners glaeda-cmux-runner enrolled:
+`~/actions-runner*` with a `.runner` config and `glaeda-hooks`. An EC2 Mac or
+cmux-lawrence never counts. The report carries the result as
+`runnerHygiene.rootCensus`, and `glaeda-mini-health` raises
+`disk_root_census_stale` on it. Where an account is enrolled, that account's
+job keeps the census, so the plist has one writer. By hand, as root:
+
+```sh
+sudo glaeda-runner-hygiene --root-census --apply   # the census alone, no account
+glaeda-runner-hygiene --root-census --check        # read-only: current or stale, and why
+```
+
 The allowlist is five families: Xcode `DerivedData`, cmux job caches,
 GhosttyKit caches, CUA recordings, and CUA frame caches. Each item must be
 idle for at least 168 hours. A pressure wake happens every 15 minutes; when
