@@ -550,7 +550,8 @@ def attestation(path: Path) -> tuple[bool | None, str]:
         return None, "no gh on this host"
     # a local check: `gh auth status` calls the API, so a spent quota made it say "not signed in"
     try:
-        token = subprocess.run([gh, "auth", "status", "--hostname", "github.com"], capture_output=True,
+        # gh-auth-token-lint: allow presence-only: never read the credential or use it for API calls.
+        token = subprocess.run([gh, "auth", "token"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, f"gh not signed in ({type(e).__name__})"
