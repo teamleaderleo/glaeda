@@ -18,6 +18,11 @@
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
                                                         else one REST read; kept compressed for the next reader
+    glaeda-gh log errors OWNER/REPO JOB_ID [--max N] [--json]   that job's error-level lines by step, not the whole log
+    glaeda-gh log search OWNER/REPO PATTERN [--since 24h] [--job RE] [--workflow RE] [--conclusion failed|any|C]
+                                                        which recent jobs printed PATTERN (controller job history,
+                                                        kept logs only: no REST; --reads N caps controller reads)
+    glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
@@ -150,7 +155,12 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   under the cap is only a share-pace log line ("nothing to do, projection only"), as the cap holds the hour. Each is a notice line in
   ~/.local/state/notices/glaeda-gh.jsonl and a `tell-coordinator --from glaeda-gh` (WARN, or FIRE under the
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
-- The token comes from `gh auth token` and stays in memory; it is never written or logged.
+- The token comes from `gh auth token` and stays in memory; it is never written or logged. A repo read
+  (REST GET) of an owner leo-workspace's role Apps are on goes instead on the ci-watch App's installation
+  token when this host holds that App (~/.config/gh-app-tokens/ci-watch.*, or the read-only
+  ci-watch-token.json the key home pushes, while unexpired): `gh_app_token.py token ci-watch`, also
+  kept only in memory. Without it, or when the App refuses, the read is the login's, as
+  before (AppPool). daemon.json appPool and `budget` say what the App served.
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
   carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
@@ -512,6 +522,11 @@ MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
 DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down (it re-executes on update)
+# `read` (an upstream serving its downstreams) looks this long before answering "not running", which each downstream
+# stores on every key it asked for. huge-blue's glaeda-gh took 9 s to restart (2026-11-18, 21:10:12-21:10:21) against
+# DOWN_GRACE's 5, so every lane VM was told it was down. Twice that, and well inside UPSTREAM_DEADLINE. Kept apart
+# from DOWN_GRACE, which a local `status`, `budget` or `restart` pays in full whenever the daemon really is down.
+UPSTREAM_DOWN_GRACE = 20.0
 # A wait that finds the daemon down keeps waiting this long before it gives up: launchd holds a
 # respawn back for up to ThrottleInterval (30 s) after a short run, and on 10-20 every wait that
 # exited in that window had its session kickstart the daemon again, killing the one just started.
@@ -581,10 +596,19 @@ UPSTREAM_MAX_KEYS = 200  # keys per upstream read (and per `read`); a longer lis
 UPSTREAM_KINDS = ("pr", "run", "comment", "head")  # a head is read for a named consumer, on its budget there
 CONSUMER_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a head consumer's name (checks --consumer, read's consumer)
 UPSTREAM_ERROR_MAX = 300
+# errorFrom on a cache entry whose error is an upstream outage this host stored (upstream_read), not an error the
+# upstream gave for the key: the upstream's next answer clears it, whether or not it has data for the key.
+UPSTREAM_OUTAGE = "upstream-outage"
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+# Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
+# 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
+# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
+# what is left of it (Controller.budget_end); the first failure takes the controller out for CONTROLLER_RETRY and more
+# (controller_down), and REST, GitHub's own reads and the cache serve meanwhile.
+CONTROLLER_TICK_BUDGET = 4.0
 CONTROLLER_DEADLINE = 6  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
@@ -684,6 +708,7 @@ STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above h
 STALE_PACED_ADVICE = ("A restart would not read any sooner: the pace above is too slow for what waits are blocked on; "
                       "raise graphqlPerMinute in the policy, or block fewer waits at once.")
 STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE}  # verdicts a restart cannot fix
+STALE_NO_RESTART = tuple(STALE_ADVICE)  # stall_cause verdicts a restart cannot fix: the alarm, the valve and `restart` agree
 # Reads a wait or a due land is blocked on go first in every window; watches nothing is blocked on still get one batch
 # (one REST read) at least this often, per kind, so a blocked set past the pace cannot starve them (review of #2199).
 PLAIN_FLOOR_EVERY = 60.0
@@ -1032,7 +1057,7 @@ RUN_FIELDS = """__typename ... on WorkflowRun { databaseId runAttempt event crea
 workflow { name } checkSuite { status conclusion commit { oid } branch { name } } }"""
 STEPS_QUERY = """query($ids: [ID!]!) { rateLimit { limit remaining resetAt cost }
 nodes(ids: $ids) { ... on CheckRun { id steps(first: 100) { nodes { name conclusion } } } } }"""
-TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9_]{20,251}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
+TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,2048}|github_pat_[A-Za-z0-9_]{20,251}|[0-9a-f]{40})")
 
 
 class WatchError(RuntimeError):
@@ -2322,6 +2347,221 @@ def gh_token() -> str:
     return token
 
 
+# ---------------------------------------------------------------- the ci-watch App pool (reads off the login)
+
+# Leo, 2026-11-18: "you use the apps where they're useful, and it just does it automatically, so no agents necessarily
+# even have to think about it." leo-workspace machines/gh-app-roles.json gives glaeda-gh to the ci-watch role, but that
+# routing lives in the gh-quota shim (tools/gh_app_token.py route), and this daemon talks to GitHub itself with
+# `gh auth token`, so all its reads (about 295 REST an hour on one host that day) stayed on the account's login.
+# Now a REST GET of a repo the role's Apps are installed on goes out on the ci-watch installation token when this host
+# holds that App (~/.config/gh-app-tokens/ci-watch.json and .pem, written by gh_app_token.py when the App was made):
+# the token is `gh_app_token.py token ci-watch --owner OWNER` (the copy next to the gh-quota shim gh_quota.py, which
+# caches it an hour), kept in memory, never written or logged. A host with no key (huge-blue: the role keys live only
+# on the key home) holds the App too while the key home's pushed one-hour read-only token,
+# ~/.config/gh-app-tokens/ci-watch-token.json, is unexpired: `token ci-watch` answers with it there. Only reads (a REST
+# GET, a GraphQL query, never a mutation, never the outbox) are offered to the pool, so a read-only token is enough. Writes, GraphQL, /rate_limit and every other repo stay
+# on the login, so authorship (CLA, receipts) and the login's budget readings are as before. A host without the App,
+# a mint that fails, or an App answer that is refused (401, 403, 429) or under APP_POOL_FLOOR left sends the read on
+# the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
+# not charged to restShare and their rate headers are not the login's budget: daemon.json appPool says what they spent.
+APP_POOL_ROLE = "ci-watch"
+APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config/gh-app-tokens")
+APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
+APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
+APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the login this long
+APP_POOL_PUSHED_MIN_LEFT = 120.0  # a pushed token this close to its end is not asked for (gh_app_token.py's own floor)
+APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
+APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
+APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
+APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
+
+
+def app_pool_tool() -> Path | None:
+    """gh_app_token.py beside the gh-quota shim's gh_quota.py (leo-workspace tools/), or None."""
+    with contextlib.suppress(OSError, RuntimeError):
+        cli = PACE_CLI.resolve().parent / "gh_app_token.py"
+        if cli.is_file():
+            return cli
+    return None
+
+
+class AppPool:
+    """The ci-watch role's installation tokens on this host, per owner, for the daemon's repo reads (see above)."""
+
+    def __init__(self, role: str = APP_POOL_ROLE, mint: Callable[[str], str | None] | None = None,
+                 owners: Callable[[], list[str]] | None = None, ready: Callable[[], bool] | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.role, self.clock = role, clock
+        self.mint_fn = mint or self.mint_with_tool
+        self.owners_fn = owners or self.owners_from_config
+        self.ready_fn = ready or self.held_here
+        self.owners_at: tuple[frozenset[str], float] = (frozenset(), float("-inf"))  # (owners, read again after)
+        self.tokens: dict[str, tuple[str, float]] = {}  # owner (lowercase) -> (token, use until)
+        self.unreadable: dict[str, float] = {}  # installation/repository/resource scope -> on the login until then
+        self.rest_until: dict[str, float] = {}  # owner (lowercase) -> not asked again before this
+        self.why = ""  # the last reason the pool was passed over, for daemon.json (never a token)
+        self.served = self.fell_back = 0
+        self.seen: dict | None = None  # the App's last rate headers: {"limit", "remaining", "reset"}
+        self.graphql_served = 0
+        self.graphql_points = 0
+        self.graphql_seen: dict | None = None
+        self.source = ""  # "key" (the App's key is here) or "pushed" (a read-only token the key home pushed)
+
+    def held_here(self) -> bool:
+        """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
+        (ROLE-token.json, from the key home) with more than APP_POOL_PUSHED_MIN_LEFT to go (file reads, no request)."""
+        if app_pool_tool() is None:
+            return False
+        if (APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file():
+            self.source = "key"
+            return True
+        doc = read_json(APP_POOL_DIR / f"{self.role}-token.json")
+        expires = iso_epoch(doc.get("expires_at")) if isinstance(doc, dict) and doc.get("token") else None
+        if expires is not None and expires - self.clock() > APP_POOL_PUSHED_MIN_LEFT:
+            self.source = "pushed"
+            return True
+        return False
+
+    def owners_from_config(self) -> list[str]:
+        """machines/gh-app-roles.json `owners`, the accounts the role Apps are installed on, beside the tool."""
+        cli = app_pool_tool()
+        doc = read_json(cli.parent.parent / "machines" / "gh-app-roles.json") if cli else None
+        owners = doc.get("owners") if isinstance(doc, dict) else None
+        return [o.lower() for o in owners if isinstance(o, str)] if isinstance(owners, list) else []
+
+    def mint_with_tool(self, owner: str) -> str | None:
+        cli = app_pool_tool()
+        if cli is None:
+            return None
+        try:
+            result = run_bounded([sys.executable, "-I", os.fspath(cli), "token", self.role, "--owner", owner])
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        token = result.stdout.strip()
+        return token if result.returncode == 0 and TOKEN_RE.fullmatch(token) else None
+
+    def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
+        """The sole repository owner a read may go to the pool for, else None.
+
+        GraphQL is routed only when its variables name one owner (the daemon's aliased PR/run queries). An opaque
+        query or one spanning owners stays on the login, so an App token can never change viewer or cross-owner
+        semantics.
+        """
+        owners: set[str] = set()
+        if method == "GET":
+            m = APP_POOL_REPO.match(path)
+            if m:
+                owners.add(m.group(1).lower())
+        elif (method == "POST" and path == "/graphql" and isinstance(body, dict)
+              and not re.match(r"\s*mutation\b", str(body.get("query") or ""))):
+            variables = body.get("variables")
+            if isinstance(variables, dict):
+                for key, value in variables.items():
+                    if APP_POOL_GRAPHQL_OWNER.fullmatch(str(key)) and isinstance(value, str):
+                        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", value):
+                            owners.add(value.lower())
+                    elif re.fullmatch(r"u\d+", str(key)) and isinstance(value, str):
+                        match = APP_POOL_GRAPHQL_URL.match(value)
+                        if match:
+                            owners.add(match.group(1).lower())
+        if len(owners) != 1:
+            return None
+        now = self.clock()
+        if self.owners_at[1] <= now:  # the config is read once per APP_POOL_TTL, not per request
+            self.owners_at = (frozenset(self.owners_fn()), now + APP_POOL_TTL)
+        owner = next(iter(owners))
+        return owner if owner in self.owners_at[0] else None
+
+    def token(self, owner: str) -> str | None:
+        """OWNER's installation token, or None: the read then goes on the login, as it always did."""
+        now = self.clock()
+        if self.rest_until.get(owner, 0.0) > now:
+            return None
+        held = self.tokens.get(owner)
+        if held and held[1] > now:
+            return held[0]
+        self.tokens.pop(owner, None)
+        if not self.ready_fn():
+            self.why = f"no {self.role} App on this host"
+            self.rest_until[owner] = now + APP_POOL_REST
+            return None
+        token = self.mint_fn(owner)
+        if not token:
+            self.why = f"gh_app_token.py token {self.role} --owner {owner} gave no token"
+            self.rest_until[owner] = now + APP_POOL_REST
+            return None
+        self.tokens[owner] = (token, now + APP_POOL_TTL)
+        return token
+
+    @staticmethod
+    def scope(owner: str, method: str, path: str, body: dict | None = None) -> str:
+        """Key a refusal to the installation and resource that produced it, never the whole owner pool."""
+        if path == "/graphql":
+            repos = set()
+            for key, value in (body or {}).get("variables", {}).items():
+                if re.fullmatch(r"r\d+", str(key)) and isinstance(value, str):
+                    repos.add(str(value).lower())
+                elif re.fullmatch(r"u\d+", str(key)) and isinstance(value, str):
+                    match = APP_POOL_GRAPHQL_URL.match(value)
+                    if match:
+                        repos.add(match.group(2).lower())
+            return "graphql:" + owner + (":" + ",".join(repos) if repos else "")
+        return f"{method} {path.split('?', 1)[0]}"
+
+    def covers(self, scope: str) -> bool:
+        """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks)."""
+        return self.unreadable.get(scope, 0.0) <= self.clock()
+
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
+        """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
+        the pool; a 403 or 404 of one route (a permission or repository the App lacks: branch protection needs
+        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST."""
+        now = self.clock()
+        try:
+            remaining, reset = int(headers.get("x-ratelimit-remaining", "")), float(headers.get("x-ratelimit-reset", ""))
+            self.seen = {"limit": int(headers.get("x-ratelimit-limit") or 0), "remaining": remaining, "reset": reset}
+        except ValueError:
+            remaining, reset = None, None
+        limited = status == 429 or (status == 403 and (remaining == 0 or bool(headers.get("retry-after"))
+                                                       or bool(SECONDARY.search(message)))
+                     or (status == 200 and bool(re.search(r"RATE_LIMITED|rate limit", message, re.I))))
+        if status == 401 or limited:
+            self.tokens.pop(owner, None)
+            spent = remaining == 0 and reset is not None and reset > now
+            self.rest_until[owner] = min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST
+            self.why = f"the {self.role} App answered HTTP {status}"
+            self.fell_back += 1
+            return False
+        if status in {403, 404} or (status == 200 and bool(re.search(r"FORBIDDEN|NOT_FOUND", message))):
+            self.unreadable[scope] = now + APP_POOL_ROUTE_REST
+            self.fell_back += 1
+            return False
+        if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
+            self.rest_until[owner] = max(self.rest_until.get(owner, 0.0), reset)  # this answer still counts
+            self.why = f"the {self.role} App is under its floor ({remaining} left)"
+        self.served += 1
+        return True
+
+    def status(self) -> dict:
+        now = self.clock()
+        resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
+        return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
+                "resting": resting or None, "why": self.why or None,
+                "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
+                "graphqlSeen": self.graphql_seen}
+
+    def graphql_answered(self, rate: dict, points: int) -> None:
+        """Keep an App GraphQL answer in the App pool; it must never become the login's budget or pacing data."""
+        self.graphql_served += 1
+        self.graphql_points += points
+        if isinstance(rate, dict):
+            try:
+                self.graphql_seen = {"limit": int(rate["limit"]), "remaining": int(rate["remaining"]),
+                                     "reset": iso_epoch(rate.get("resetAt"))}
+            except (KeyError, TypeError, ValueError):
+                pass
+
+
 # ---------------------------------------------------------------- upstream (a host with no login)
 
 
@@ -2434,6 +2674,15 @@ def run_upstream(command: list[str], request: dict) -> dict:
     return answer
 
 
+def upstream_read_at(cached: dict | None) -> float | None:
+    """When a key's cache entry was last really read (its fetchedAt), looking through an outage stored on it since
+    (readAt); None for a key never read. Kept on the outage so its end restores it (Daemon.upstream_outage_over)."""
+    if not isinstance(cached, dict):
+        return None
+    at = cached.get("readAt") if cached.get("errorFrom") == UPSTREAM_OUTAGE else cached.get("fetchedAt")
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+
 def read_request(text: str) -> list[tuple[str, bool, bool, str | None]]:
     """The (key, jobs, wait, consumer) of each key in one upstream request line; WatchError on anything else. `wait`
     (optional) says a wait downstream is blocked on the key, so this host's daemon treats it as waited
@@ -2498,7 +2747,7 @@ def cmd_read(text: str) -> int:
     items = read_request(text)
     readers = read_readers(text)
     times = read_times(text)
-    if not daemon_running(grace=DOWN_GRACE):
+    if not daemon_running(grace=UPSTREAM_DOWN_GRACE):
         print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
         return EXIT_DOWN
     broken = daemon_failing()
@@ -2514,7 +2763,9 @@ def cmd_read(text: str) -> int:
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "jobsAt", "missing", "restRun", "restRunAt")
+            # errorFrom, readAt: an outage of this host's own upstream, which a downstream clears once this host answers
+            k: cached.get(k) for k in ("data", "dataAt", "error", "errorFrom", "readAt", "fetchedAt", "jobs", "jobsAt",
+                                       "missing", "restRun", "restRunAt")
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
@@ -2572,6 +2823,9 @@ class Controller:
         try:
             budget = CONTROLLER_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
+            # the daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET)
+            left = getattr(self, "budget_end", float("inf")) - time.monotonic()
+            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left) + deadline - budget)
             with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
                 doc = json.loads(response.read(MAX_BODY))
         except urllib.error.HTTPError as error:
@@ -3240,6 +3494,78 @@ def jobs_attempt(jobs: list[dict] | None) -> int:
     return max((j.get("run_attempt") or 0 for j in jobs or []), default=0)
 
 
+# A completed run attempt's job list, kept on disk with no expiry (2026-11-17, Leo: "so claude desktop shows rate limit
+# on hover of the github links sometimes"; the shared REST pool at 0/5000, its top route GET .../actions/runs/{id}/jobs
+# at 56 an hour, read by this daemon for a lane VM's `--jobs` watches relayed by the broker). A watched `--jobs` run was
+# read again each cycle a reader touched it, and its job list with it, long after the attempt had finished: a completed
+# attempt's jobs never change (a re-run is a new attempt, with a new run_attempt), so once a list is read with the run
+# completed at that attempt and every job listed completed, read_jobs answers it from here with no request. A run still
+# moving reads its list as before, with If-None-Match. Keyed by (repo, run id, attempt) like the lane-gh broker's kept
+# actions/runs/N/attempts/A/jobs (cmuxterm-hq tools/lane-gh-broker/parts/36-immutable-cache.py), under BASE beside the
+# job-log cache (BASE/logs) and evicted the same way: least recently read first past ATTEMPT_JOBS_MAX_BYTES. It holds
+# the default (filter=latest) list read_jobs reads, slimmed (slim_jobs), so it outlives the run's cache entry
+# (CACHE_KEEP) and a watch dropped and registered again later.
+ATTEMPT_JOBS_DIR = "run-jobs"
+ATTEMPT_JOBS_MAX_BYTES = 64 * 1024 * 1024  # a slimmed 50-job list is ~8 KB gzip'd: several thousand attempts
+
+
+def attempt_jobs_done(run: dict | None, jobs: Any) -> int | None:
+    """The attempt a job list is final for, else None: the run (as read with or before the list) completed at that
+    attempt, the list is not empty, every job in it completed, and its newest job is of that attempt. A job a
+    `needs:` held back is listed by then: the run completes only after every job it will run has."""
+    if not isinstance(run, dict) or run.get("status") != "completed" or not isinstance(jobs, list) or not jobs:
+        return None
+    attempt = run.get("run_attempt") or 1
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return None
+    if not all(isinstance(j, dict) and j.get("status") == "completed" for j in jobs) or jobs_attempt(jobs) != attempt:
+        return None
+    # A run that did not pass lists a job that did not either; a list that does not (caught between a "re-run failed
+    # jobs" dropping the failed ones and listing their new attempt, say) is not kept: the next read asks again.
+    if run.get("conclusion") not in RUN_OK and all(j.get("conclusion") in RUN_OK for j in jobs):
+        return None
+    return attempt
+
+
+def attempt_jobs_path(repo: str, run_id: int, attempt: int) -> Path:
+    owner, name = repo.lower().split("/", 1)
+    return BASE / ATTEMPT_JOBS_DIR / owner / name / f"{int(run_id)}.{int(attempt)}.json.gz"
+
+
+def attempt_jobs_get(repo: str, run_id: int, attempt: int) -> list[dict] | None:
+    """The kept job list of that completed attempt, or None. A hit is marked used (its mtime) for eviction."""
+    path = attempt_jobs_path(repo, run_id, attempt)
+    try:
+        with open(path, "rb") as f:
+            doc = json.loads(gzip.decompress(f.read()))
+    except (OSError, EOFError, ValueError, zlib.error):
+        return None  # missing or damaged: a miss, and the next read replaces it
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(j, dict) for j in jobs):
+        return None
+    with contextlib.suppress(OSError):
+        os.utime(path)
+    return jobs
+
+
+def attempt_jobs_put(repo: str, run_id: int, attempt: int, jobs: list[dict]) -> None:
+    """Keep that completed attempt's job list, replaced whole, then evict past the cap. Never raises: a full disk
+    only means the next read asks GitHub."""
+    path = attempt_jobs_path(repo, run_id, attempt)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(tmp, "wb") as f:
+            f.write(gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
+                                              "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return
+    kept_evict(BASE / ATTEMPT_JOBS_DIR, ".json.gz", ATTEMPT_JOBS_MAX_BYTES)
+
+
 # ---------------------------------------------------------------- daemon
 
 
@@ -3510,8 +3836,12 @@ def read_rollup(key: str) -> dict | None:
 
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env", upstream: Any = "config") -> None:
+                 controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         self.transport = transport
+        self.last_request_source = "login"  # credential used by the most recent request (App or login)
+        # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
+        # the login.
+        self.app_pool: AppPool | None = AppPool(clock=lambda: self.clock()) if app_pool == "auto" else app_pool
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
@@ -3531,6 +3861,7 @@ class Daemon:
         self.controller_down_until = 0.0
         self.controller_feed_at = float("-inf")
         self.controller_failures = 0
+        self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
@@ -3612,6 +3943,9 @@ class Daemon:
         self.in_call: dict[str, Any] | None = None
         self.last_call: dict[str, Any] | None = None
         self.stall_said: dict[str, str] = {}  # kind -> the cause stall_cause last logged (said once per cause)
+        self.stale_now: tuple[str, str, dict] | str | None = None  # this tick's stale verdict (stale_verdict)
+        self.stale_reason = ""  # the reason the alarm that verdict came from gave (stall_cause's sentence)
+        self.stale_last: dict[str, Any] | None = None  # the last verdict that was not fresh (stale_record)
         self.defer_why: dict[str, tuple[float, str]] = {}  # kind -> (when, why) its reads were last deferred
         self.blocked: dict[str, int] = {}  # kind -> open watches a wait or a due land is blocked on (oldest_data)
         self.paced_at: dict[str, float] = {}  # kind -> when graphqlPerMinute last held its reads (batched)
@@ -4063,6 +4397,7 @@ class Daemon:
         hold = self.quota_hold(kind)
         quota = f" Quota: {hold[0]}." if hold else ""
         cause = self.stall_cause(kind)
+        self.stale_reason = cause["text"]
         self.say_stall(kind, cause, age_s, where)
         advice = STALE_ADVICE.get(cause["verdict"], STALE_RESTART_ADVICE)
         said = "" if cause["verdict"] in STALE_ADVICE and errors == "none recorded" else f" Recent errors: {errors}."
@@ -4071,6 +4406,59 @@ class Daemon:
                 f"fresh.{quota} Reads: {cause['text']}.{said} {advice} {STALE_DUMP_ADVICE}.")
         return level, text, {"kind": kind, "age": age_s, "key": where, "cause": cause["verdict"],
                              **({"quota": hold[0]} if hold else {})}
+
+    def stale_verdict(self) -> tuple[str, str, dict] | str | None:
+        """THE stale predicate, once a tick (check_alarms): waited data past STALE_DATA_AFTER (stale_alarm), else no PR
+        refreshed that long (stall_alarm). The alarm sends it, the valve acts on it, and daemon.json "stale"
+        (stale_record) carries it with its one reason, which `restart` (daemon_starved) reads instead of judging
+        again from other numbers. air-blue 2026-11-18 22:4xZ: the alarm said "no PR refreshed for 2196s ... `glaeda-gh
+        restart` restarts a daemon in this state" and `restart` answered "under 600s old; nothing to restart"."""
+        self.stale_reason = ""
+        verdict = self.stale_alarm()
+        if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
+            stall = self.stall_alarm()
+            verdict = stall if stall is not None else verdict
+        return verdict
+
+    def stale_record(self) -> dict[str, Any]:
+        """daemon.json "stale": this tick's stale_verdict as {"state": fresh | held | stale, "kind", "age", "key",
+        "restart" (whether a restart can help: what the alarm advises and `restart` does), "reason", "at"}, and the
+        last verdict that was not fresh, within ALARM_EVERY, under "last" (`restart` says it cleared since)."""
+        v = self.stale_now
+        rec: dict[str, Any] = {"at": round(self.now, 3)}
+        if isinstance(v, tuple):
+            data = v[2]
+            rec.update(state="stale", level=v[0], kind=data.get("kind"), age=data.get("age"), key=data.get("key"),
+                       restart=data.get("cause") not in STALE_NO_RESTART and data.get("valve") != "spent",
+                       reason=self.stale_reason)
+        elif v == "held":
+            stale = {k: a for k, a in (getattr(self, "stale_waited", None) or {}).items()
+                     if isinstance(a, (int, float)) and a > STALE_DATA_AFTER}
+            kind = max(stale, key=stale.get, default="pr")
+            age = stale.get(kind, (getattr(self, "newest_data", None) or {}).get("pr"))
+            rec.update(state="held", kind=kind, age=int(age) if isinstance(age, (int, float)) else None,
+                       restart=False, reason=self.held_why(kind))
+        else:
+            rec.update(state="fresh", restart=False, reason="")
+            last = self.stale_last
+            if last is not None and self.now - last["at"] < ALARM_EVERY:
+                rec["last"] = last
+        return rec
+
+    def held_why(self, kind: str) -> str:
+        """Why old data of KIND is explained (stale_explained, catching_up): the reason a held verdict gives."""
+        if (getattr(self, "upstream_status", None) or {}).get("state") == "ok":
+            return "this host reads GitHub through an upstream, whose daemon reads it"
+        hold = self.quota_hold(kind) if kind in CYCLES else None
+        if hold is not None:
+            return hold[0]
+        if self.quota_starved():
+            return "GitHub's quota is spent (GraphQL stopped, REST at its share)"
+        since = self.catching_up(kind)
+        if since is not None:
+            return (f"the quota held these reads until {int(since)}s ago and the daemon is reading the backlog it "
+                    "left, waited data first")
+        return "the quota holds these reads back"
 
     def stall_alarm(self) -> tuple[str, str, dict] | str | None:
         """The refresh loop's own pulse, beside stale_alarm (which needs a wait blocked on old data): when even the
@@ -4093,6 +4481,7 @@ class Daemon:
         # Why the reads did not happen (stall_cause), as stale_alarm says it: a budget that defers them is no fault a
         # restart fixes, and the valve does not restart for it (stale_valve, "deferred")
         cause = self.stall_cause("pr")
+        self.stale_reason = cause["text"]
         advice = STALE_ADVICE.get(cause["verdict"], STALE_RESTART_ADVICE)
         said = "" if cause["verdict"] in STALE_ADVICE and errors == "none recorded" else f" Recent errors: {errors}."
         text = (f"{level.upper()} glaeda-gh on {policy_host()}: no PR has been refreshed for {age_s}s (over "
@@ -4228,16 +4617,17 @@ class Daemon:
             share = self.share_alarm(self.rest_cap(), rows)
             if share is not None:
                 firing["share"] = share
+        self.stale_now = self.stale_verdict()
         if policy.get("stale", True):
-            verdict = self.stale_alarm()
-            if not isinstance(verdict, tuple):  # no wait starved: the refresh loop itself may still be (stall_alarm)
-                stall = self.stall_alarm()
-                verdict = stall if stall is not None else verdict
-            stale = self.stale_valve(verdict, policy)
+            stale = self.stale_valve(self.stale_now, policy)
+            if isinstance(stale, tuple):
+                self.stale_now = stale  # the valve's word on it ("spent": a restart will not help) is the verdict
             if stale == "held":
                 held.add("stale")
             elif stale is not None:
                 firing["stale"] = stale
+        if self.stale_now is not None:
+            self.stale_last = self.stale_record()
         changed = False
         for name, (level, text, data) in firing.items():
             last = self.alarms.get(name) or {}
@@ -4643,21 +5033,63 @@ class Daemon:
         creation) holds the outbox, not the read buckets.
         free: /rate_limit, which counts against no primary limit. Counting it as a REST request
         would overstate the spend of the very call that reads the spend."""
+        self.last_request_source = "login"
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         bucket = "graphql" if path == "/graphql" else "rest"
+        if self.upstream() is not None:
+            raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
+        raw_body = json.dumps(body).encode() if body is not None else None
+        pool = self.app_pool
+        owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
+                 and not self.writing else None)
+        route = route_of(method, path)
+        scope = pool.scope(owner, method, path, body) if owner else ""
+        app_token = pool.token(owner) if owner and pool.covers(scope) else None
+        if app_token:
+            self.last_request_source = "app"
+            headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
+                       "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+            if etag:
+                headers["If-None-Match"] = etag
+            if raw_body is not None:
+                headers["Content-Type"] = "application/json"
+            try:
+                status, h, raw = self.transport(method, API + path, headers, raw_body)
+            except BaseException:
+                self.note_spend("rest", route, 0)  # the App's pool, never the login's share
+                raise
+            try:
+                doc = json.loads(raw) if raw else None
+            except ValueError:
+                doc = None
+            if isinstance(doc, dict):
+                errors = doc.get("errors")
+                error_text = " ".join(str(e.get("type") or "") + " " + str(e.get("message") or "")
+                                      for e in errors if isinstance(e, dict)) if isinstance(errors, list) else ""
+                message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
+            else:
+                message = ""
+            if pool.answered(owner, scope, status, h, message):
+                self.note_spend("rest", route, 0)
+                self.sent.append((self.now, "app"))
+                return status, h, doc
+            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
+            # refused: the same read goes on the login at once, as it would have without the App
+            self.last_request_source = "login"
+            if self.mode(bucket) == "stop" and self.clock() >= self.secondary_until:
+                raise WatchError(f"{pool.role} App refused {scope}; login {bucket} is under its reserve")
+        # The login's secondary hold (this daemon's, the pacer's, or a latch mark another caller wrote) holds the login
+        # only: an App installation token has its own limits, so an App read above goes on while it lasts.
         if not self.secondary_admit(bucket, 1):
             # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
             raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
-        if self.upstream() is not None:
-            raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
                    "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
         if etag:
             headers["If-None-Match"] = etag
-        raw_body = json.dumps(body).encode() if body is not None else None
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
         # The outbox -- a write and the lookups that keep it from landing twice -- is what sessions
@@ -5714,7 +6146,11 @@ class Daemon:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
         mode = self.mode(path)
-        if mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped()):
+        app_mine = self.app_entries_eligible(kind, mine, path)
+        if app_mine:
+            mine = app_mine
+            mode = "normal"
+        if (mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped())) and not app_mine:
             # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
             # whose job list is not read yet, the one read the share does not hold back, whichever
@@ -6108,7 +6544,9 @@ class Daemon:
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
-            if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
+            kind = e["key"].split(":", 1)[0]
+            app_ok = bool(self.app_entries_eligible(kind, [e], "rest"))
+            if (self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[kind])) and not app_ok:
                 self.to_graphql(over_rest[i:], spilled)
                 break
             sent = len(self.sent)
@@ -6303,7 +6741,10 @@ class Daemon:
         self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what)
-                for what in ("rest", "rest304", "graphql", "free", "write")}
+                for what in ("rest", "rest304", "graphql", "free", "write", "kept")}
+        app_reads = sum(1 for _, w in self.sent if w == "app")  # on the ci-watch App (AppPool), never the login's
+        if app_reads:
+            hour["app"] = app_reads
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
         graphql_by: dict[str, dict[str, int]] = {}
@@ -6332,7 +6773,7 @@ class Daemon:
                   "newestData": dict(self.newest_data),
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
-                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
+                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER, "stale": self.stale_record(),
                   "staleWhy": self.stale_why(), "progress": self.progress(), "staleCause": self.stale_causes(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
@@ -6347,6 +6788,8 @@ class Daemon:
         status["healthy"] = stall is None
         if stall is not None:
             status["stalled"] = {"kind": "pr", "age": int(self.newest_data["pr"] or 0), "explained": stall == "held"}
+        if self.app_pool is not None and (self.app_pool.served or self.app_pool.fell_back or self.app_pool.why):
+            status["appPool"] = self.app_pool.status()
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -6474,27 +6917,37 @@ class Daemon:
             self.errors.append(why)
             self.upstream_status = {"state": "failing", "error": why, "at": self.now}
             for e in due:  # the data is kept; a status names the outage instead of showing it as current
-                self.store(e["key"], e["cache"], error=why)
+                self.store(e["key"], e["cache"], error=why, errorFrom=UPSTREAM_OUTAGE, readAt=upstream_read_at(e["cache"]))
             return
         self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
         self.upstream_denials(got)
+        # The upstream answered, so the outage is over for every key sent, whether it has data for the key or not:
+        # each `continue` below clears it (upstream_outage_over); every store() after them drops errorFrom anyway.
         for e in due:
             entry = got.get(e["key"])
             if not isinstance(entry, dict):
+                self.upstream_outage_over(e)
                 continue  # the upstream has not read it yet: asked again in UPSTREAM_NEW
             data = entry.get("data") if isinstance(entry.get("data"), dict) else None
             error = entry.get("error") if isinstance(entry.get("error"), str) else None
             if data is None and error is None:
+                self.upstream_outage_over(e)
                 continue  # registered there, not read yet
             at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
             mine = (e["cache"] or {}).get("dataAt")
             if data is not None and isinstance(at, (int, float)) and isinstance(mine, (int, float)) and at < mine:
+                self.upstream_outage_over(e)
                 continue  # a wait's own read here (direct_read) is newer: the upstream's older one never replaces it
             fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
                                       "missing": entry.get("missing") is True,
                                       # provenance: a controller-only finish stays unconfirmed downstream too
                                       "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
                                       "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
+            if error and entry.get("errorFrom") == UPSTREAM_OUTAGE:
+                # the upstream's own upstream was down: cleared as this host's is, back to its last real read
+                read_at = entry.get("readAt")
+                fields.update(errorFrom=UPSTREAM_OUTAGE, readAt=min(self.now, float(read_at)) if isinstance(
+                    read_at, (int, float)) and not isinstance(read_at, bool) else None)
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
             shown = entry.get("restRunAt")  # when the upstream's GitHub read last showed restRun (run_unconfirmed)
@@ -6506,12 +6959,38 @@ class Daemon:
                 if isinstance(vouched, (int, float)) and not isinstance(vouched, bool):
                     fields["updatedAtAt"] = min(self.now, float(vouched))
             if isinstance(entry.get("jobs"), list):
-                fields["jobs"] = entry["jobs"]
+                # this host's ETag (and a list it found final) vouch for its own last read, not the upstream's list:
+                # a 304 on that ETag must not confirm this one as a completed attempt's (attempt_jobs_put)
+                fields.update(jobs=entry["jobs"], jobsEtag=None, jobsDone=None)
                 # when the upstream read that job list, so a downstream `--jobs` look is answered (once_answered)
                 jobs_at = entry.get("jobsAt")
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
                     fields["jobsAt"] = min(self.now, float(jobs_at))
             self.store(e["key"], e["cache"], **fields)
+
+    def upstream_outage_over(self, e: dict) -> None:
+        """A key the upstream answered with nothing to store no longer names an outage this host stored on it
+        (2026-11-18: huge-blue's 9 s restart showed as "not running on the upstream host" on lane VMs for 30 min).
+        An error the upstream gave for the key itself carries no errorFrom and stays. Nothing was read, so the entry goes
+        back to what it was before the outage: fetchedAt the last real read (readAt), or no entry at all for a key never
+        read. The outage's own fetchedAt would tell once_answered a one-off `status` was answered, and drop its watch."""
+        if (e["cache"] or {}).get("errorFrom") != UPSTREAM_OUTAGE:
+            return
+        cache = cache_dir() / file_name(e["key"])
+        with bounded_lock(cache_dir() / ".write.lock") as held:
+            if not held:
+                self.errors.append(f"{e['key']}: cache write lock timeout")
+                return
+            current = read_json(cache)
+            if not isinstance(current, dict) or current.get("errorFrom") != UPSTREAM_OUTAGE:
+                return  # written since this tick read it
+            read_at = current.get("readAt")
+            known = isinstance(read_at, (int, float)) and not isinstance(read_at, bool)
+            if not known and current.get("data") is None:
+                cache.unlink(missing_ok=True)  # never read: as before the outage, asked again in UPSTREAM_NEW
+                return
+            current = {k: v for k, v in current.items() if k not in ("errorFrom", "readAt")}
+            write_json(cache, {**current, "error": None, **({"fetchedAt": float(read_at)} if known else {})})
 
     def upstream_denials(self, got: dict) -> None:
         """A head consumer the upstream refused for its budget is denied here too (this host's consumers ledger), so
@@ -6660,6 +7139,42 @@ class Daemon:
         return {"pr": self.fetch_prs, "comment": self.fetch_comments, "run": self.fetch_runs_graphql,
                 "head": self.fetch_heads}
 
+    def app_request_for(self, kind: str, entries: list[dict], bucket: str) -> tuple[str, str, dict] | None:
+        """Return the representative App request when one installation can answer the whole read."""
+        pool = self.app_pool
+        if pool is None or not entries:
+            return None
+        if bucket == "rest":
+            _, owner, repo, value = split_key(entries[0]["key"])
+            paths = {"pr": f"/repos/{owner}/{repo}/pulls/{value}",
+                     "run": f"/repos/{owner}/{repo}/actions/runs/{value}",
+                     "comment": f"/repos/{owner}/{repo}/issues/{value}",
+                     "head": f"/repos/{owner}/{repo}/commits/{value}/check-runs"}
+            path = paths.get(kind)
+            return ("GET", path, {}) if path else None
+        if kind == "run":
+            query, variables = run_query([e["key"] for e in entries])
+        elif kind in ("pr", "comment"):
+            query, variables = pr_query([e["key"] for e in entries], kind)
+        else:
+            return None
+        return "POST", "/graphql", {"query": query, "variables": variables}
+
+    def app_entries_eligible(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
+        """Entries that can be served by the held App without touching the login quota."""
+        pool = self.app_pool
+        request = self.app_request_for(kind, entries, bucket)
+        if pool is None or request is None:
+            return []
+        method, path, body = request
+        owner = pool.owner_of(method, path, body)
+        if owner is None:
+            return []
+        scope = pool.scope(owner, method, path, body)
+        if pool.token(owner) is None or not pool.covers(scope):
+            return []
+        return entries
+
     @property
     def rest_fetch(self) -> dict[str, Callable[[dict], None]]:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
@@ -6693,7 +7208,8 @@ class Daemon:
         to_rest: list[dict] = []
         while queue:
             chunk = queue.pop(0)
-            if self.mode("graphql") == "stop" or self.gql_down():
+            if ((self.mode("graphql") == "stop" and not self.app_entries_eligible(kind, chunk, "graphql"))
+                    or self.gql_down()):
                 return to_rest + chunk + [e for c in queue for e in c]
             if not self.gql_room():
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
@@ -6894,7 +7410,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
                               if k in base})
             entry.update(fields)
             if "data" in fields and "updatedAtAt" not in fields:
@@ -6996,11 +7512,16 @@ class Daemon:
         rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
-        self.gql_log.append((self.now, self.gql_reason, points))
-        self.note_spend("graphql", self.gql_reason, 1, points)
+        if self.last_request_source == "app":
+            # The App has its own GraphQL bucket. Do not let its rateLimit answer stop or pace the login.
+            if self.app_pool is not None:
+                self.app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
+        else:
+            self.gql_log.append((self.now, self.gql_reason, points))
+            self.note_spend("graphql", self.gql_reason, 1, points)
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
-        if rate:
+        if rate and self.last_request_source != "app":
             self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
         return doc, None
 
@@ -7773,6 +8294,20 @@ class Daemon:
                           # past the REST share, once per attempt, answered or not: an error or an empty
                           # list would otherwise be asked for again every cycle, past the share
                           and (self.rest_room(1) or prior.get("jobsTried") != attempt))
+        # A completed attempt's list, read once already (here, or kept on disk by any watch of the run before): no
+        # request, in any mode. A re-run is a new attempt, which this run read shows, so it misses and is read.
+        if (e["jobs"] or failed_attempt) and run.get("status") == "completed":
+            kept = prior.get("jobs") if prior.get("jobsDone") == attempt and isinstance(prior.get("jobs"), list) \
+                else attempt_jobs_get(f"{owner}/{repo}", int(run_id), attempt)
+            if kept is not None and attempt_jobs_done(run, kept) == attempt:
+                fields.update(jobs=kept, jobsAt=self.now, jobsDone=attempt)
+                if kept is not prior.get("jobs"):
+                    fields["jobsEtag"] = None  # the kept ETag was another list's: a 304 on it must not keep this one
+                if failed_attempt:
+                    fields["jobsTried"] = attempt
+                self.sent.append((self.now, "kept"))  # a job list answered with no request (budget: hour.kept)
+                self.store(e["key"], e["cache"], **fields)
+                return
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too
@@ -7790,6 +8325,13 @@ class Daemon:
                 self.deferred.add(e["key"])
             else:
                 self.errors.append(f"{e['key']} jobs: {jdoc}")
+            if jstate in ("fresh", "same"):
+                done = attempt_jobs_done(run, fields["jobs"] if jstate == "fresh" else prior.get("jobs"))
+                if done is not None:  # final: the next read of this attempt sends nothing (above)
+                    fields["jobsDone"] = done
+                    if prior.get("jobsDone") != done:
+                        attempt_jobs_put(f"{owner}/{repo}", int(run_id), done,
+                                         fields["jobs"] if jstate == "fresh" else prior["jobs"])
         self.store(e["key"], e["cache"], **fields)
 
     def rest_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
@@ -8190,14 +8732,25 @@ class Daemon:
 
     def read_feed(self) -> list[dict]:
         """The feed pages after the cursor. The first call only learns the cursor; a reset (the
-        controller lost its state) starts over, so every watched run gets a fresh baseline."""
+        controller lost its state) starts over, so every watched run gets a fresh baseline. A page after the first
+        that fails ends the read with the pages before it (the cursor is past them: dropping them would lose their
+        runs' on-event hooks) and leaves its error in controller_feed_error."""
+        self.controller_feed_error = None
         if self.controller_cursor is None:
             doc = self.controller.events(None)
             self.controller_cursor, self.controller_seen = doc["cursor"], {}
             return [doc]
         pages = []
         for _ in range(FEED_PAGES):
-            doc = self.controller.events(self.controller_cursor)
+            if pages and not self.controller_room():
+                break  # the tick's controller budget is spent: the backlog continues next tick, from the cursor
+            try:
+                doc = self.controller.events(self.controller_cursor)
+            except WatchError as error:
+                if not pages:
+                    raise
+                self.controller_feed_error = error
+                break
             if doc.get("reset"):
                 self.controller_cursor, self.controller_seen = doc["cursor"], {}
                 return [doc]
@@ -8236,7 +8789,25 @@ class Daemon:
         self.follow_controller()
         if self.controller is None or self.now < self.controller_down_until:
             return
-        deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        with contextlib.suppress(AttributeError):  # (a controller object without the attribute just is not cut)
+            self.controller.budget_end = self.controller_budget_end
+        try:
+            self.read_controller(entries)
+        finally:
+            self.controller_budget_end = float("inf")
+            with contextlib.suppress(AttributeError):
+                self.controller.budget_end = float("inf")
+
+    def controller_room(self) -> bool:
+        """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
+        CONTROLLER_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never started to be
+        cut short by the budget: that cut would read as the controller failing, and take it out (#2201 review)."""
+        return (self.controller is not None and self.now >= self.controller_down_until
+                and time.monotonic() + CONTROLLER_TIMEOUT <= self.controller_budget_end)
+
+    def read_controller(self, entries: list[dict]) -> None:
+        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
         pages: list[dict] = []
         if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
             self.controller_feed_at = self.now
@@ -8244,7 +8815,8 @@ class Daemon:
                 pages = self.read_feed()
             except WatchError as error:
                 return self.controller_down(error)
-            self.controller_failures = 0
+            if getattr(self, "controller_feed_error", None) is None:
+                self.controller_failures = 0
             self.controller_ok_at = self.now
             for page in pages:
                 for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
@@ -8262,12 +8834,13 @@ class Daemon:
         for key, e in runs.items():
             if key in self.controller_seen:
                 continue
-            if time.monotonic() > deadline:
+            if not self.controller_room():
                 break  # the rest get their baseline on the next tick; REST covers them meanwhile
             _, owner, repo, run_id = split_key(key)
             try:
                 run = self.controller.run(run_id)
             except WatchError as error:
+                self.controller_feed_error = None
                 return self.controller_down(error)
             known = run is not None and (run.get("repo") or "").lower() == f"{owner}/{repo}"
             self.controller_seen[key] = known
@@ -8282,7 +8855,10 @@ class Daemon:
             self.nudge(entries, page)
             self.merge_comments(entries, page)
         self.controller_filled = {k for k, known in self.controller_seen.items() if known}
-        if pages:
+        if pages and getattr(self, "controller_feed_error", None) is not None:
+            error, self.controller_feed_error = self.controller_feed_error, None
+            return self.controller_down(error)
+        if pages and self.now >= self.controller_down_until:  # an on-event lookup above may have taken it out
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
 
@@ -8386,12 +8962,17 @@ class Daemon:
         repo, run_id, attempt = str(run.get("repo") or "").lower(), int(run.get("id")), int(run.get("attempt") or 1)
         if given is not None:
             return on_event_job(given, name)
-        if self.controller is not None and hasattr(self.controller, "run_jobs"):
+        if self.controller_room() and hasattr(self.controller, "run_jobs"):
             try:
                 doc = self.controller.run_jobs(repo, run_id, attempt)
-            except WatchError as error:
+            except NoReceiver as error:  # no run-jobs endpoint (or a brief 503): the feed is still served
                 doc = {}
-                self.errors.append(f"on-event run-jobs: {describe(error)}")
+                self.errors.append(f"on-event jobs of {repo}/{run_id}/{attempt}: {describe(error)}")
+            except WatchError as error:
+                # One failure takes the controller out (CONTROLLER_TICK_BUDGET's comment): each pending run asking it
+                # again was how a timing-out controller took 17.1 s of the tick
+                doc = {}
+                self.controller_down(error)
             job = on_event_job(doc.get("jobs") if doc.get("known") else None, name)
             if job is not None:
                 return job
@@ -8643,6 +9224,13 @@ LAND_MH_BEHIND_COMMITS = 20
 LAND_MH_BEHIND_HOURS = 6.0
 LAND_MH_BEHIND_EVERY = 600.0
 LAND_MH_BEHIND_DEADLINE = 10.0
+# The check refreshes such a checkout itself, never only warns: it runs the `tools/ws-deploy --local` its warning names
+# (beside merge_hold.py) off the tick, bounded by LAND_MH_REFRESH_DEADLINE, at most every LAND_MH_REFRESH_EVERY, then
+# judges the checkout again. gcp-agent-lane-6, 2026-11-19: `land status` warned "last fetched 6.5 h ago" while
+# cmux#46208 and #46210 stopped retry_deadline ("waited 10152 s ... still unreadable"), and nothing ran the command the
+# warning named. land.json "mergeHoldRefresh": false turns it off.
+LAND_MH_REFRESH_EVERY = 1800.0
+LAND_MH_REFRESH_DEADLINE = 600.0
 LAND_WS_SYNC_LOG = Path(os.environ.get("WS_SYNC_STATE") or Path.home() / ".cache/ws-sync") / "deploys.log"
 LAND_WS_SYNC_SEEN = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (?:no-op ([0-9a-f]{7,40})\b|deployed [0-9a-f]+\.\.([0-9a-f]{7,40})\b)")
 LAND_WS_SYNC_TAIL = 16384  # bytes of the record read: hours of 10-minute runs
@@ -8840,7 +9428,11 @@ LAND_TAG = "glaeda-land"  # who the gh-quota call log and may_merge's landing re
 # CMUX_AGENT_SESSION alone names the caller, so ~/.local/state/gh-quota/calls.jsonl says session:glaeda-land and the
 # manual-ops detector can tell these calls from a person's.
 LAND_ENV = ON_EVENT_ENV + ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_HOST", "SSH_AUTH_SOCK")
-LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GLAEDA_GH_AGENT": LAND_TAG}
+# Every lander's read (merge_hold, post-merge checks, rerun lookup) is a landing read and routes to the lander App.
+# Writes still follow gh-app-roles.json: merge/update-branch use the lander role where permitted, while comments,
+# reviews and PR edits keep the account login so their author and CLA semantics do not change.
+LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GLAEDA_GH_AGENT": LAND_TAG,
+                 "GH_QUOTA_LANDING_READ": "merge-hold"}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 LAND_WORKERS = 4
 LAND_WORKERS_MAX = 16
@@ -8903,11 +9495,27 @@ LAND_WAIT_STUCK = 4 * 3600.0
 LAND_WAIT_DEADLINE = {"wait_comment": 7200.0, "retry": 7200.0, "rerun_failed": 7200.0}
 LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a judgment merge_hold could not make",
                   "rerun_failed": "the rerun of the cancelled jobs"}
+# A train_wait (another PR's merge-train reservation holds the base for a file this one changes) is a retry merge_hold
+# itself bounds: the reservation lives TRAIN_HOLD_S (1.5 h) from the holder's head, under the retry's 2 h. So its budget
+# is the reservation's, keyed on the holder and its head: a new holder head is a new reservation and a new budget. Keyed
+# on the waiting head alone, one budget spanned every holder head: 2026-11-19 hq#12558, #13035, #12713, #12590, #12844
+# and #12653 each stopped retry_deadline ("still train_wait") behind hq#13113's two heads, each a requeue by hand.
+LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head ([0-9a-f]{7,40})\)")
 # A cancelled job is rerun at most this many times per (head, run) (e["reruns"], take's rerun_failed): its rerun's checks
 # can finish within minutes, so the 2 h budget alone let a job cancelled every time (a concurrency group, a timeout
 # reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
 # "rerun_failed_cap". A new head starts the count again.
 LAND_RERUN_CAP = 3
+# A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (merge_hold could not judge:
+# an old merge_hold checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
+# 5xx, LAND_STEP_TRANSIENT). It is queued again once merge_hold's checkout was refreshed or turned current after the
+# stop (retry_deadline), else LAND_REARM_AFTER after it, at most LAND_REARM_CAP times per entry per UTC day. Its wait
+# budget and transient count are kept, so a judgment that still reads the same stops it again at once (one probe, not
+# another 2 h); one that reads clean goes on. gcp-agent-lane-6, 2026-11-19: cmux#46208 and #46210 stayed stopped
+# retry_deadline behind a stale merge_hold checkout, each landing only on a requeue by hand.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|[a-z_]+_transient)$")
+LAND_REARM_AFTER = 3600.0
+LAND_REARM_CAP = 3
 # An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
 # requester once: landing the predecessor again, or merging it, resumes the whole chain, and nobody re-queues the PRs
 # behind it (before, each stopped at once: cmux#46237, #46217, #46236 behind #46157, #46183, #46220). Past it, it
@@ -8955,6 +9563,13 @@ LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2})
 LAND_STEP_BACKOFF = 60.0
 LAND_STEP_BACKOFF_MAX = 1800.0
 LAND_STEP_STOP = 6  # 60+120+240+480+960 s of backoff (~31 min) before the 6th identical refusal stops it
+# A step that timed out (exit 124: LandQueue.call's bound) or that GitHub answered 5xx is transient: it never counts
+# toward LAND_STEP_STOP. It backs off on its own count (e["stepTransient"], per head) and stops "<kind>_transient" only
+# after LAND_RETRY_STREAK_STOP in a row, a stop LAND_REARM_CODES re-arms. cmux#46145, 2026-11-19: five broker refusals
+# and one "timed out after 120s" stopped it update_branch_refused, the timeout counted as the sixth.
+LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d\d (?:Bad Gateway|Service Unavailable"
+                                 r"|Gateway Time-?out|Internal Server Error)\b|\bconnection (?:reset|timed out)\b",
+                                 re.I)
 # A refusal whose step is an update-branch (merge_hold's action kind "update_branch", any code: tip_merge, stale_green,
 # ws_check_stale_base, startup_failure, red_not_excused with --needs-newer-base) is taken, not counted. Before, the
 # judgment counted it toward LAND_STREAK_STOP before the step ran, so an update refused once or twice at a head (or
@@ -9688,6 +10303,9 @@ class LandQueue:
         self.behind_at = float("-inf")
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
         self.mh_fallback: tuple[Path, Path] | None = None  # (merge_hold.py configured, the release run instead)
+        self.mh_refresh_at = float("-inf")  # when refresh_checkout last started ws-deploy (LAND_MH_REFRESH_EVERY)
+        self.mh_refreshing = False
+        self.mh_changed_at = float("-inf")  # when merge_hold's checkout was refreshed or turned current (rearm)
         self.latched: tuple[str, int] | None = None
         # The latch a previous daemon saw holding (land/latch.json): a restart or re-exec inside one hold is the same
         # window (hold), not a new one; its end is still logged and still marks latch_cleared.
@@ -9854,7 +10472,8 @@ class LandQueue:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
-                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now)
+                     waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
+                     stepTransient=None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
@@ -9887,6 +10506,9 @@ class LandQueue:
                     if self.now - float(e.get("updated") or 0) > LAND_KEEP:
                         (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                         del self.entries[key]
+                    elif e["state"] == "stopped" and key not in self.jobs:
+                        with self.lock:
+                            self.rearm(e)  # judged from the next pass
                     continue
                 if key in self.jobs:
                     continue
@@ -10212,16 +10834,21 @@ class LandQueue:
             why += (f"; no current ws-sync release to run instead ({release} "
                     + ("is not current either)" if release.is_file() and not same else
                        "is this checkout)" if same else "does not exist)"))
+        if why is not None and use is None:
+            self.refresh_checkout(mh)  # what the warning names, run here rather than only said
         key = None if why is None else (re.sub(r"\d+(?:\.\d+)?|(?<=change)s\b", "N", why), os.fspath(use) if use else None)
         if key == self.stale_checkout:
             if why is not None:  # the same finding: keep the file's numbers current for `land status`, say nothing
                 write_json(path, {**(read_json(path) or {}), "reason": why, "checkedAt": self.now})
+            else:  # current from this daemon's first check: an earlier daemon's warning must not outlive it
+                path.unlink(missing_ok=True)
             return
         was = self.mh_fallback
         self.stale_checkout = key
         self.mh_fallback = (mh, use) if use is not None else None
         if why is None:
             path.unlink(missing_ok=True)
+            self.mh_changed_at = self.now  # a retry_deadline stop before it is re-armed (rearm)
             log({"event": "land-checkout-current", "mergeHold": os.fspath(mh)})
             if was is not None:
                 self.notice("land-checkout-current", "info", f"glaeda land: merge_hold.py runs from {mh} again "
@@ -10238,6 +10865,61 @@ class LandQueue:
         write_json(path, {"reason": why, "at": self.now, "mergeHold": os.fspath(mh)})
         log({"event": "land-checkout-stale", "reason": why})
         self.notice("land-checkout-stale", "warn", f"glaeda land: {why}", {"mergeHold": os.fspath(mh)})
+
+    def refresh_checkout(self, mh: Path) -> None:
+        """Run `tools/ws-deploy --local` beside MH, the step check_behind's warning names (LAND_MH_REFRESH_EVERY's
+        comment): off the tick, bounded, at most every LAND_MH_REFRESH_EVERY; the checkout is judged again on the next
+        tick. Its outcome goes to the log and the stale-checkout record (`land status`)."""
+        tool = mh.parent / "ws-deploy"
+        if self.mh_refreshing or self.now - self.mh_refresh_at < LAND_MH_REFRESH_EVERY \
+                or self.config().get("mergeHoldRefresh") is False or not tool.is_file():
+            return
+        self.mh_refresh_at, self.mh_refreshing = self.now, True
+        argv, started = [os.fspath(tool), "--local"], self.now
+
+        def go() -> None:
+            try:
+                got = self.call(argv, LAND_MH_REFRESH_DEADLINE)
+            finally:
+                self.mh_refreshing = False
+            said = land_tail(f"{got.stderr or ''}\n{got.stdout or ''}".strip(), 200)
+            log({"event": "land-checkout-refresh", "argv": argv, "rc": got.returncode, "out": said})
+            path = land_dir() / LAND_STALE_CHECKOUT_FILE
+            rec = read_json(path)
+            if isinstance(rec, dict):
+                write_json(path, {**rec, "refresh": {"at": started, "rc": got.returncode, "out": said}})
+            if got.returncode == 0:
+                self.mh_changed_at = started
+            self.behind_at = float("-inf")  # judged again on the next tick
+
+        if self.inline:
+            go()
+        else:
+            threading.Thread(target=go, name="land-checkout-refresh", daemon=True).start()
+
+    def rearm(self, e: dict) -> bool:
+        """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if not LAND_REARM_CODES.match(code):
+            return False
+        at = float(st.get("at") or 0)
+        cleared = code == "retry_deadline" and self.mh_changed_at > at
+        if not cleared and self.now - at < LAND_REARM_AFTER:
+            return False
+        day = land_day(self.now)
+        r = e.get("rearms") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        if n >= LAND_REARM_CAP:
+            return False
+        e["rearms"] = {"day": day, "n": n + 1}
+        e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
+                 lastStop=st, dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
+        why = "merge_hold's checkout was refreshed" if cleared else f"{self.now - at:.0f} s after the stop"
+        self.history(e, "rearmed", code=code, why=why, n=n + 1)
+        log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
+        self.save(e)
+        return True
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -10960,6 +11642,10 @@ class LandQueue:
         identical-refusal streak and counts toward nothing; True when the wait's budget is spent and E is stopped."""
         kind = str(act.get("kind"))
         key = head  # one budget per head, whatever kind of wait (LAND_WAIT_DEADLINE's comment)
+        train = LAND_TRAIN_HOLDER.search(str(answer.get("reason") or "")) \
+            if str(answer.get("code") or "") == "train_wait" else None
+        if train:
+            key = f"{head}|train:{train.group(1)}@{train.group(2)}"  # LAND_TRAIN_HOLDER's comment
         size = max(LAND_WAIT_DEADLINE[kind], 2 * land_seconds(act.get("timeout_s"), 0.0, 0.0))
         b = e.get("waitBudget") or {}
         if b.get("key") != key:
@@ -11248,6 +11934,7 @@ class LandQueue:
             e["preStepHead"] = head if got.returncode == 0 else ""
             if got.returncode == 0:
                 e.pop("stepFail", None)
+                e.pop("stepTransient", None)
             if got.returncode == 0 and kind == "update_branch":
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
@@ -11296,6 +11983,7 @@ class LandQueue:
             self.nudge(e["key"])
             if got.returncode == 0:
                 e.pop("stepFail", None)
+                e.pop("stepTransient", None)
                 self.wait(e, {"kind": "retry", "why": "filled the mirror merge_hold could not read"}, NUDGE_MIN * 3)
             else:
                 named = self.step_refused(e, "fetch", head, got)
@@ -11373,6 +12061,21 @@ class LandQueue:
                           "next"}, float(NUDGE_MIN))
             return None
         cls = land_step_class(out)
+        if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):
+            # A timeout or a 5xx: never counted toward LAND_STEP_STOP (LAND_STEP_TRANSIENT's comment)
+            last = e.get("stepTransient") or {}
+            n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+            e["stepTransient"] = {"head": head, "kind": kind, "count": n, "at": self.now}
+            self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=0, transient=n)
+            if n >= LAND_RETRY_STREAK_STOP:
+                self.stop(e, f"{kind}_transient", f"the {kind} merge_hold named timed out or met a GitHub 5xx {n} "
+                          f"times in a row at {head[:12]}: {land_trim(land_tail(out), 300)}",
+                          f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+                return None
+            after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+            self.wait(e, {"kind": "retry", "why": f"{kind} at {head[:12]} transient ({cls}): backoff {after:.0f} s"},
+                      after)
+            return None
         # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
         # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
         sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
@@ -11820,7 +12523,29 @@ def land_status_doc(target: str | None) -> dict:
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
-            else None, "stale": stale if isinstance(stale, dict) else None}
+            else None, "stale": stale if land_stale_fresh(stale, time.time()) else None,
+            "stoppedByCause": land_stopped_by_cause(entries)}
+
+
+def land_stale_fresh(stale: Any, now: float) -> bool:
+    """Whether check_behind's record STALE was written or confirmed within 2 x LAND_MH_BEHIND_EVERY: an older one is a
+    verdict no running check holds any more. gcp-agent-lane-6, 2026-11-19: `land status` printed a 17:40Z "last fetched
+    6.5 h ago" warning 15 h later, its checkout at origin/main, fetched minutes before, ws-deploy a no-op."""
+    if not isinstance(stale, dict) or not stale.get("reason"):
+        return False
+    seen = [float(v) for v in (stale.get("at"), stale.get("checkedAt"))
+            if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return bool(seen) and now - max(seen) <= 2 * LAND_MH_BEHIND_EVERY
+
+
+def land_stopped_by_cause(entries: list[dict]) -> dict[str, int]:
+    """Stopped entries counted by their stop code, the detector's read of `land status` (stoppedByCause)."""
+    out: dict[str, int] = {}
+    for e in entries:
+        if e.get("state") == "stopped":
+            code = str((e.get("stop") or {}).get("code") or "unknown")
+            out[code] = out.get(code, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def cmd_land_status(target: str | None, as_json: bool) -> int:
@@ -11840,6 +12565,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
     entries, counts, refused = doc["entries"], doc.get("steps") or {}, doc.get("refused")
+    doc["stoppedByCause"] = land_stopped_by_cause(entries)
     if as_json:
         print(json.dumps(doc, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
@@ -11853,7 +12579,10 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: merge_hold.py runs from the ws-sync release {stale['fallback']}, not "
               f"{stale.get('mergeHold')}: {stale['reason']}")
     elif isinstance(stale, dict) and stale.get("reason"):
-        print(f"glaeda land: WARNING: {stale['reason']}")
+        ran = stale.get("refresh") if isinstance(stale.get("refresh"), dict) else {}
+        print(f"glaeda land: WARNING: {stale['reason']}" + (
+            f" (the land ran ws-deploy --local itself at {utc_clock(float(ran.get('at') or 0))}: exit {ran.get('rc')}"
+            f"{': ' + ran['out'] if ran.get('rc') and ran.get('out') else ''})" if ran else ""))
     if refused:
         print(f"glaeda land: REFUSED to start since {utc_clock(float(refused.get('at') or 0))}: "
               f"{refused.get('reason')}\nnext: {refused.get('next')}")
@@ -11880,6 +12609,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     def fmt(d: dict) -> str:
         return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda x: -x[1])) or "none"
     print(f"steps taken today: {fmt(today)}; last 7 days: {fmt(week)}")
+    print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
     if target and not entries:
         return EXIT_FAIL
     return EXIT_OK
@@ -12234,6 +12964,10 @@ def first_heartbeat(now: float | None = None) -> None:
     status.pop("staleWaited", None)  # the previous process's starvation is not this one's (daemon_starved)
     for stale in ("newestData", "stalled", "healthy"):  # nor its stalled refresh loop (stall_alarm)
         status.pop(stale, None)
+    before = status.pop("stale", None)  # nor its verdict (stale_record): kept only as the last one, for `restart`
+    if isinstance(before, dict):
+        last = before if before.get("state") in ("held", "stale") else before.get("last")
+        status["stale"] = {"state": "starting", **({"last": last} if isinstance(last, dict) else {})}
     write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
@@ -12799,6 +13533,17 @@ def daemon_starved(status: Any = None) -> dict | None:
     status = read_json(BASE / "daemon.json") if status is None else status
     if not isinstance(status, dict):
         return None
+    verdict = status.get("stale")
+    if isinstance(verdict, dict) and verdict.get("state") in ("fresh", "held", "stale"):
+        # the daemon's own verdict, the one its alarm and valve acted on (stale_verdict): never judged again here
+        if verdict["state"] == "fresh":
+            return None
+        at = status.get("at") if isinstance(status.get("at"), (int, float)) else time.time()
+        age = verdict.get("age") if isinstance(verdict.get("age"), (int, float)) else 0
+        reason = str(verdict.get("reason") or "") or None
+        helps = verdict.get("restart") is True
+        return {"kind": verdict.get("kind") or "pr", "age": age + max(0.0, time.time() - at), "quota": not helps,
+                "why": None if helps else reason, "cause": reason}
     stale = status.get("staleWaited")
     if not isinstance(stale, dict):
         return None
@@ -14750,7 +15495,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                 rest_at = prior["restAt"]
         entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun", "restRunAt", "rerunAt"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restParts", "restRun", "restRunAt", "rerunAt"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
@@ -15815,7 +16560,16 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
-                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes")
+                  f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes, "
+                  f"{hour.get('kept', 0)} completed-attempt job lists answered from disk (no request)"
+                  + (f", {hour['app']} REST on the {APP_POOL_ROLE} App (not the login)" if hour.get("app") else ""))
+        pool = status.get("appPool")
+        if isinstance(pool, dict):
+            seen = pool.get("seen") if isinstance(pool.get("seen"), dict) else {}
+            print(f"{pool.get('role', APP_POOL_ROLE)} App pool: {pool.get('served', 0)} reads served, "
+                  f"{pool.get('fellBack', 0)} sent again on the login"
+                  + (f", {seen.get('remaining')}/{seen.get('limit')} left" if seen.get("remaining") is not None else "")
+                  + (f"; resting: {pool['why']}" if pool.get("resting") and pool.get("why") else ""))
         share = status.get("restShare")
         if isinstance(share, dict):
             print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
@@ -16050,7 +16804,7 @@ GIT_CONFIG_SECTION_NAME_RE = re.compile(r"[A-Za-z0-9-]+")
 GIT_CONFIG_KEY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$")
 GIT_CONFIG_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
 # GitHub's own credential shapes, never written to the shared log whatever slot they arrived in
-BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
+BROKER_SECRET_RE = re.compile(r"gh[posur]_[A-Za-z0-9._-]{20,}|github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE)
 # How long git may take to say what this checkout's remotes are. Two forks in front of a real gh
 # call, so it is bounded like everything else here: a checkout on a hung mount declines, which
 # costs one request, rather than hanging the call. Tighter than SUBPROCESS_DEADLINE because nothing
@@ -19776,8 +20530,15 @@ def cmd_restart(force: bool = False) -> int:
                   "A restart would not read any sooner; a wait reads its own target once (direct_read).")
             return EXIT_OK
         if running and lag is None and starved is None and not force:
+            status = read_json(BASE / "daemon.json")
+            last = ((status.get("stale") if isinstance(status, dict) else None) or {}).get("last")
+            cleared = ""
+            if isinstance(last, dict) and isinstance(last.get("at"), (int, float)):
+                cleared = (f" The daemon's last stale verdict, at {utc_clock(last['at'])} ({last.get('kind')} data "
+                           f"{last.get('age')}s old: {last.get('reason') or last.get('state')}), cleared since.")
             print("glaeda-gh: the daemon is running, its heartbeat is fresh and the data its waits are blocked on is "
-                  f"under {STALE_DATA_AFTER}s old; nothing to restart. If a wait printed an older warning, re-run it.")
+                  f"under {STALE_DATA_AFTER}s old; nothing to restart.{cleared} If a wait printed an older warning, "
+                  "re-run it.")
             return EXIT_OK
         if starved is not None:
             slowed = f" The quota slows it ({starved['why']}), which alone should not leave it this old." \
@@ -20157,19 +20918,25 @@ def job_log_put(repo: str, job: int, text: bytes) -> None:
 def job_logs_evict(max_bytes: int | None = None, now: float | None = None) -> dict:
     """Remove the least recently read logs until the rest fit in max_bytes, and temporary files a crash left.
     {"removed", "bytes"}. A reader that has a log open keeps reading it."""
-    max_bytes = JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    return kept_evict(BASE / JOB_LOG_DIR, ".log.gz", JOB_LOG_MAX_BYTES if max_bytes is None else max_bytes, now)
+
+
+def kept_evict(root: Path, suffix: str, max_bytes: int, now: float | None = None) -> dict:
+    """Under ROOT/OWNER/REPO: remove the least recently read SUFFIX files until the rest fit in max_bytes, and
+    temporary files a crash left (older than JOB_LOG_TMP_KEEP). {"removed", "bytes"}. The job-log cache and the kept
+    completed-attempt job lists (attempt_jobs_put) share it."""
     now = time.time() if now is None else now
     kept: list[tuple[float, int, Path]] = []
     removed = 0
     with contextlib.suppress(OSError):
-        for owner in (BASE / JOB_LOG_DIR).iterdir():
+        for owner in root.iterdir():
             for repo in (owner.iterdir() if owner.is_dir() else ()):
                 for p in (repo.iterdir() if repo.is_dir() else ()):
                     try:
                         st = p.stat()
                     except OSError:
                         continue
-                    if p.name.endswith(".log.gz") and not p.name.startswith("."):
+                    if p.name.endswith(suffix) and not p.name.startswith("."):
                         kept.append((st.st_mtime, st.st_size, p))
                     elif p.name.endswith(".tmp") and now - st.st_mtime > JOB_LOG_TMP_KEEP:
                         with contextlib.suppress(OSError):
@@ -20226,39 +20993,406 @@ def job_log_finished(text: bytes) -> bool:
     return JOB_LOG_DONE in text[-4096:]
 
 
+def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log
+                 ) -> tuple[bytes | None, str, str]:
+    """(log, source, why not) for JOB: kept here, else from the build controller, else one REST read. rest=None
+    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota."""
+    repo = repo.lower()
+    text = job_log_get(repo, job)
+    if text is not None:
+        return text, "cache", ""
+    ctl = Controller.from_env() if controller == "env" else controller
+    status = 0
+    if ctl is not None:
+        status, body = controller_job_log(ctl, repo, job)
+        if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
+            with contextlib.suppress(OSError):
+                job_log_put(repo, job, body)  # the controller serves only a finished job's log
+            return body, "controller", ""
+    if status == 410:
+        return None, "", "expired"
+    if rest is None and status == 200:
+        return None, "", "too large"
+    if rest is None:
+        return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
+            status, "not kept by the controller")
+    ok, body, why = rest(repo, job)
+    if not ok:
+        return None, "", why
+    if job_log_finished(body):
+        with contextlib.suppress(OSError):
+            job_log_put(repo, job, body)
+    return body, "rest", ""
+
+
 def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = rest_job_log) -> int:
     """Print JOB's log: kept here, else from the build controller, else one REST read. Exit 0 only with the log on
     stdout; anything else prints nothing there, so a caller reads GitHub itself."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log job takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
-    text, source = job_log_get(repo, job), "cache"
+    text, source, why = job_log_read(repo, job, controller, rest)
     if text is None:
-        ctl = Controller.from_env() if controller == "env" else controller
-        status = 0
-        if ctl is not None:
-            status, body = controller_job_log(ctl, repo, job)
-            if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
-                text, source = body, "controller"
-                with contextlib.suppress(OSError):
-                    job_log_put(repo, job, text)  # the controller serves only a finished job's log
-        if text is None and status == 410:
+        if why == "expired":
             print(f"glaeda-gh: GitHub has no log for {repo} job {job} any more (expired)", file=sys.stderr)
-            return EXIT_FAIL
-        if text is None:
-            ok, body, why = rest(repo, job)
-            if not ok:
-                print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
-                return EXIT_FAIL
-            text, source = body, "rest"
-            if job_log_finished(text):
-                with contextlib.suppress(OSError):
-                    job_log_put(repo, job, text)
+        else:
+            print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+        return EXIT_FAIL
     out = sys.stdout.buffer
     out.write(text)
     out.flush()
     if source != "cache" and full_output():
         print(f"glaeda-gh: {repo} job {job} read from the {source}", file=sys.stderr)
+    return EXIT_OK
+
+
+# `log search`, `log flaky` and `log errors`: what an agent asks of CI logs without fetching one whole. The jobs come
+# from the build controller's timing history (every finished job of the repository, 8 days, no GitHub read) and the
+# logs from job_log_read without REST (this host's kept copy, else the controller's, kept 72 h): a scan across
+# hundreds of jobs spends no user quota, and a log neither holds is reported unread, never fetched.
+LOG_SCAN_PAGE = 2000  # timing records per controller read (a record's step list keeps a page well under MAX_BODY)
+LOG_SCAN_PAGES = 200  # at most this many reads: 400,000 jobs, over a week of cmux
+LOG_SCAN_KEEP = 60000  # the newest records a scan keeps: only the newest have logs (72 h), and this bounds memory
+LOG_KEPT_S = 72 * 3600  # how long the controller keeps a read log (ghevents.JobLogRetention)
+LOG_RECORD_FIELDS = ("at", "id", "job", "run", "attempt", "conclusion", "workflow", "seg")
+LOG_SCAN_READS = 40  # default cap on logs read from the controller per command (kept copies are free)
+LOG_LINE_MAX = 300  # a printed log line is cut here
+LOG_FAILED = frozenset({"failure", "timed_out"})
+LOG_STAMP = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")
+LOG_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# A failing test's name, by runner: cargo test, nextest, XCTest, swift-testing, pytest, unittest, go, jest/vitest.
+LOG_TEST_FAILS = (
+    re.compile(r"^test (\S+) \.\.\. FAILED$"),
+    re.compile(r"^\s*(?:FAIL|TIMEOUT|SIGSEGV|SIGABRT) \[\s*[\d.]+s\]\s+(?:\(\d+/\d+\)\s+)?(\S+(?: \S+)?)\s*$"),
+    re.compile(r"Test Case '(?:-\[(\S+ \S+)\]|([\w.]+))' failed"),  # macOS `-[Class test]`, Linux `Class.test`
+    re.compile(r"✘ Test (\"[^\"]+\"|[\w.]+(?:\([^)]*\))?) (?:failed|recorded an issue)"),
+    re.compile(r"^FAILED (\S+::\S+)"),
+    re.compile(r"^(?:FAIL|ERROR): (\w+ \([\w.]+\))"),
+    re.compile(r"^\s*--- FAIL: (\S+)"),
+    # jest's ✕; vitest's × only with its duration, as diagnostics (miette, biome, turbo) print `× message` too
+    re.compile(r"^\s*(?:✕ (.+?)(?: \(\d+(?:\.\d+)? ?m?s\))?|× (.+?) \d+(?:\.\d+)? ?m?s)$"),
+)
+LOG_ERROR = re.compile(r"##\[error\]|^error(?:\[E\d+\])?:|: (?:fatal )?error:|^fatal( error)?:|panicked at|"
+                       r"^Traceback \(most recent call last\)|^\w*(?:Error|Exception): |^Error: |\bFAILED\b|"
+                       r"^FAIL[: ]|--- FAIL|✘|✕|npm ERR!|\berror TS\d+:|^E {3}")
+LOG_ERROR_FOLLOW = re.compile(r"^\s*--> \S+:\d+")  # rustc's location line under an error
+
+
+def log_line(raw: bytes | str) -> str:
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    return LOG_ANSI.sub("", LOG_STAMP.sub("", text.rstrip("\r\n")))
+
+
+def log_lines(text: bytes) -> list[str]:
+    return [log_line(raw) for raw in text.splitlines()]
+
+
+def log_failed_tests(text: bytes) -> list[str]:
+    """The failing tests a log names, each once, in order."""
+    seen: dict[str, None] = {}
+    for line in log_lines(text):
+        for pattern in LOG_TEST_FAILS:
+            match = pattern.search(line)
+            if match:
+                name = next(g for g in match.groups() if g is not None).strip().strip('"')
+                unit = re.fullmatch(r"(\w+) \(([\w.]+)\)", name)  # unittest: `test_x (__main__.Case.test_x)`
+                if unit:
+                    qual = unit.group(2).removeprefix("__main__.")
+                    name = qual if qual.endswith("." + unit.group(1)) else f"{qual}.{unit.group(1)}"
+                seen.setdefault(name, None)
+                break
+    return list(seen)
+
+
+def log_errors(text: bytes, limit: int = 40) -> dict:
+    """The error-level lines of one log, under the step (`##[group]`) that printed them, each once:
+    {"steps": [{"step", "lines"}], "total", "shown"}. A step that failed with no recognised error line gets its
+    last lines before the exit, so every red step says something."""
+    steps: list[dict] = []
+    step, tail, seen = "(setup)", [], set()
+    current: dict | None = None
+    total = shown = 0
+    follow = False
+
+    def add(line: str) -> None:
+        nonlocal current, total, shown
+        line = line[:LOG_LINE_MAX]
+        if line in seen:
+            return
+        seen.add(line)
+        total += 1
+        if shown >= limit:
+            return
+        if current is None or current["step"] != step:
+            current = {"step": step, "lines": []}
+            steps.append(current)
+        current["lines"].append(line)
+        shown += 1
+
+    for line in log_lines(text):
+        if line.startswith("##[group]"):
+            step, tail, follow = line[len("##[group]"):].strip()[:120] or "(step)", [], False
+            continue
+        if line.startswith("##[endgroup]"):
+            continue
+        if follow and LOG_ERROR_FOLLOW.match(line):
+            add(line.rstrip())
+            follow = False
+            continue
+        follow = False
+        if LOG_ERROR.search(line):
+            if "Process completed with exit code" in line and (current is None or current["step"] != step):
+                for before in tail[-5:]:
+                    add(before)
+            add(line.replace("##[error]", "", 1).strip())
+            follow = line.lstrip().startswith("error")
+        elif line.strip():
+            tail = (tail + [line.rstrip()])[-5:]
+    return {"steps": steps, "total": total, "shown": shown}
+
+
+def log_records(ctl: "Controller", repo: str, since: float, pages: int = LOG_SCAN_PAGES) -> tuple[list[dict], bool]:
+    """(finished job records of REPO since SINCE, oldest first, each cut to LOG_RECORD_FIELDS; whether older ones were
+    dropped). The controller answers oldest first, so the scan pages to the end and keeps the newest LOG_SCAN_KEEP:
+    only the newest jobs still have logs. Past PAGES reads the history is cut at its newest end too, and said."""
+    out: dict[int, dict] = {}
+    cursor, cut = int(since), False
+    for _ in range(pages):
+        doc = ctl.get(f"/v1/github/timing/records?repo={urllib.parse.quote(repo, safe='/')}&since={cursor}"
+                      f"&limit={LOG_SCAN_PAGE}", timeout=30)
+        recs = [r for r in doc.get("records") or [] if isinstance(r, dict)]
+        for r in recs:
+            if r.get("job") and r.get("id"):
+                out[int(r["id"])] = {k: r.get(k) for k in LOG_RECORD_FIELDS}
+        if len(out) > 2 * LOG_SCAN_KEEP:  # drop the oldest as it goes, so memory stays bounded
+            out = dict(sorted(out.items(), key=lambda kv: kv[1].get("at") or "")[-LOG_SCAN_KEEP:])
+            cut = True
+        last = max((iso_epoch(r.get("at")) or 0 for r in recs), default=0)
+        if not doc.get("more") or not recs:
+            break
+        cursor = int(last) if int(last) > cursor else cursor + 1  # a page all in one second moves on a second
+    else:
+        cut = True
+    kept = sorted(out.values(), key=lambda r: r.get("at") or "")
+    return kept[-LOG_SCAN_KEEP:], cut or len(kept) > LOG_SCAN_KEEP
+
+
+def log_regex(text: str | None, what: str, flags: int = 0) -> re.Pattern | None:
+    if not text:
+        return None
+    try:
+        return re.compile(text, flags)
+    except re.error as error:
+        raise WatchError(f"{what} is not a regular expression: {error}") from None
+
+
+def log_since(text: str) -> float:
+    match = re.fullmatch(r"(\d+)([mhd])", text.strip())
+    if not match:
+        raise WatchError(f"--since takes a duration such as 90m, 24h or 3d, not {text!r}")
+    return time.time() - int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def log_job_url(repo: str, r: dict) -> str:
+    return f"https://github.com/{repo}/actions/runs/{r.get('run') or 0}/job/{r['id']}"
+
+
+def log_pick(recs: list[dict], job: str | None, workflow: str | None, seg: str | None,
+             conclusion: str) -> list[dict]:
+    """The records a scan reads, newest first."""
+    job_re = log_regex(job, "--job", re.I)
+    wf_re = log_regex(workflow, "--workflow", re.I)
+    picked = []
+    for r in reversed(recs):
+        if job_re and not job_re.search(r.get("job") or ""):
+            continue
+        if wf_re and not wf_re.search(r.get("workflow") or ""):
+            continue
+        if seg and r.get("seg") != seg:
+            continue
+        if conclusion == "failed" and (r.get("conclusion") or "") not in LOG_FAILED:
+            continue
+        if conclusion not in ("failed", "any") and r.get("conclusion") != conclusion:
+            continue
+        picked.append(r)
+    return picked
+
+
+class LogScan:
+    """Read logs for a scan: kept copies free, at most `reads` from the controller, none over REST; tally the rest."""
+
+    def __init__(self, repo: str, reads: int, controller: Any):
+        self.repo, self.reads, self.controller = repo, reads, controller
+        self.read = self.down = 0
+        self.stopped = "over --reads"  # why a log past the cap was not read
+        self.unread: dict[str, int] = {}
+
+    def text(self, job: int) -> bytes | None:
+        kept = job_log_get(self.repo, job)
+        if kept is not None:
+            return kept
+        if self.read >= self.reads:
+            self.unread[self.stopped] = self.unread.get(self.stopped, 0) + 1
+            return None
+        self.read += 1
+        text, _, why = job_log_read(self.repo, job, self.controller, rest=None)
+        self.down = self.down + 1 if why == "controller down" else 0
+        if text is None:
+            self.unread[why] = self.unread.get(why, 0) + 1
+            if why == "controller log reads spent" or self.down >= 3:
+                self.reads = self.read  # no use asking again (one slow read is the controller reading GitHub)
+                self.stopped = why
+        return text
+
+    def note(self) -> str:
+        return ", ".join(f"{n} {why}" for why, n in sorted(self.unread.items(), key=lambda kv: -kv[1]))
+
+
+def log_scan_setup(repo: str, since: str, controller: Any) -> tuple[str, Any, list[dict], bool]:
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo):
+        raise WatchError("log search and log flaky take OWNER/REPO first")
+    ctl = Controller.from_env() if controller == "env" else controller
+    if ctl is None:
+        raise WatchError("no build controller configured (CMUX_CI_CONTROLLER): log search reads its job history")
+    # Older jobs' logs are gone from the controller (72 h) and every history page re-reads a day file there: a scan
+    # never asks for history it could not read the logs of.
+    recs, more = log_records(ctl, repo.lower(), max(log_since(since), time.time() - LOG_KEPT_S))
+    return repo.lower(), ctl, recs, more
+
+
+def cmd_log_search(repo: str, pattern: str, since: str = "24h", job: str | None = None, workflow: str | None = None,
+                   seg: str | None = None, conclusion: str = "failed", reads: int = LOG_SCAN_READS,
+                   limit: int = 20, as_json: bool = False, controller: Any = "env") -> int:
+    """Which recent jobs printed PATTERN: newest first, the first matching lines of each. Exit 0 with a match, 1
+    with none (the scan note says how many logs it could not read)."""
+    try:
+        regex = re.compile(pattern)
+    except re.error as error:
+        raise WatchError(f"PATTERN is not a regular expression: {error}") from None
+    repo, ctl, recs, more = log_scan_setup(repo, since, controller)
+    picked = log_pick(recs, job, workflow, seg, conclusion)
+    scan = LogScan(repo, reads, ctl)
+    matches, scanned = [], 0
+    for r in picked:
+        if len(matches) >= limit:
+            break
+        text = scan.text(int(r["id"]))
+        if text is None:
+            continue
+        scanned += 1
+        hits = [line[:LOG_LINE_MAX] for line in log_lines(text) if regex.search(line)]
+        if hits:
+            matches.append({"at": r.get("at"), "workflow": r.get("workflow"), "job": r.get("job"),
+                            "seg": r.get("seg"), "conclusion": r.get("conclusion"), "run": r.get("run"),
+                            "id": r["id"], "attempt": r.get("attempt"), "url": log_job_url(repo, r),
+                            "count": len(hits), "lines": hits[:3]})
+    out = {"repo": repo, "pattern": pattern, "jobs": len(picked), "scanned": scanned, "unread": scan.unread,
+           "history_cut": more, "matches": matches}
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        note = f"; unread: {scan.note()}" if scan.unread else ""
+        note += "; history cut to the newest jobs" if more else ""
+        print(f"{len(matches)} of {scanned} logs read printed /{pattern}/ ({len(picked)} {conclusion} jobs in "
+              f"--since {since}{note})")
+        for m in matches:
+            print(f"{(m['at'] or '')[:16]}Z {m['seg']} {m['workflow']} / {m['job']} ({m['conclusion']}, "
+                  f"{m['count']} lines) {m['url']}")
+            for line in m["lines"]:
+                print(f"    {line}")
+    return EXIT_OK if matches else EXIT_FAIL
+
+
+def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: str | None = None,
+                  reads: int = LOG_SCAN_READS * 2, limit: int = 20, as_json: bool = False,
+                  controller: Any = "env") -> int:
+    """Failing tests by name across recent failed jobs, and which of them are flaky: a test is flaky when the job
+    that failed on it passed when re-run (a later attempt of the same run). With TEST (a regex), only those tests.
+    Exit 0 when a flaky test is listed, 1 when none."""
+    test_re = log_regex(test, "TEST", re.I)
+    job_re = log_regex(job, "--job", re.I)
+    repo, ctl, recs, more = log_scan_setup(repo, since, controller)
+    # (run, job name) -> the latest attempt that passed. A re-run is a later attempt of the same run: a matrix sibling
+    # with the same name passing in the same attempt is not one, and a record without a run is never matched.
+    passed_attempt: dict[tuple, int] = {}
+    for r in recs:
+        if r.get("conclusion") == "success" and r.get("run"):
+            key = (r.get("run"), r.get("job"))
+            passed_attempt[key] = max(passed_attempt.get(key, 0), int(r.get("attempt") or 1))
+    failed = [r for r in reversed(recs) if (r.get("conclusion") or "") in LOG_FAILED
+              and (not job_re or job_re.search(r.get("job") or ""))]
+    scan = LogScan(repo, reads, ctl)
+    tests: dict[str, dict] = {}
+    jobs_rerun_green: dict[str, int] = {}
+    scanned = 0
+    for r in failed:
+        rerun_green = bool(r.get("run")) and \
+            passed_attempt.get((r.get("run"), r.get("job")), 0) > int(r.get("attempt") or 1)
+        if rerun_green:
+            jobs_rerun_green[r.get("job") or ""] = jobs_rerun_green.get(r.get("job") or "", 0) + 1
+        text = scan.text(int(r["id"]))
+        if text is None:
+            continue
+        scanned += 1
+        for name in log_failed_tests(text):
+            if test_re and not test_re.search(name):
+                continue
+            t = tests.setdefault(name, {"test": name, "fails": 0, "runs": set(), "rerun_green": 0, "jobs": set(),
+                                        "last": None, "url": None})
+            t["fails"] += 1
+            t["runs"].add(r.get("run"))
+            t["jobs"].add(r.get("job"))
+            t["rerun_green"] += int(rerun_green)
+            if t["last"] is None:
+                t["last"], t["url"] = r.get("at"), log_job_url(repo, r)
+    rows = []
+    for t in tests.values():
+        verdict = "flaky" if t["rerun_green"] else ("repeats" if len(t["runs"]) >= 3 else "once")
+        rows.append({"test": t["test"], "verdict": verdict, "fails": t["fails"], "runs": len(t["runs"]),
+                     "rerun_green": t["rerun_green"], "jobs": sorted(j for j in t["jobs"] if j),
+                     "last": t["last"], "url": t["url"]})
+    order = {"flaky": 0, "repeats": 1, "once": 2}
+    rows.sort(key=lambda x: (order[x["verdict"]], -x["rerun_green"], -x["fails"], x["test"]))
+    out = {"repo": repo, "test": test, "failed_jobs": len(failed), "scanned": scanned, "unread": scan.unread,
+           "history_cut": more, "tests": rows[:limit],
+           "jobs_rerun_green": dict(sorted(jobs_rerun_green.items(), key=lambda kv: -kv[1])[:limit])}
+    flaky = any(x["verdict"] == "flaky" for x in rows)
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+        return EXIT_OK if flaky else EXIT_FAIL
+    note = f"; unread: {scan.note()}" if scan.unread else ""
+    note += "; history cut to the newest jobs" if more else ""
+    print(f"{len(rows)} failing tests in {scanned} of {len(failed)} failed jobs, --since {since}{note}")
+    for x in rows[:limit]:
+        print(f"{x['verdict']:7} {x['test']}: failed {x['fails']}x in {x['runs']} runs, {x['rerun_green']} passed on "
+              f"re-run; {', '.join(x['jobs'][:2])}; last {(x['last'] or '')[:16]}Z {x['url']}")
+    if jobs_rerun_green and not test_re:
+        top = ", ".join(f"{name} ({n})" for name, n in list(out["jobs_rerun_green"].items())[:5])
+        print(f"jobs that went green on re-run: {top}")
+    return EXIT_OK if flaky else EXIT_FAIL
+
+
+def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
+                   rest: Callable = rest_job_log) -> int:
+    """One job's error-level lines by step, not its whole log. Exit 0 with its log read (a log with no error line
+    prints a count of 0), 1 without a log."""
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
+        raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
+    repo = repo.lower()
+    text, source, why = job_log_read(repo, job, controller, rest)
+    if text is None:
+        print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+        return EXIT_FAIL
+    found = log_errors(text, limit)
+    if as_json:
+        print(json.dumps({"repo": repo, "job": job, "source": source, **found}, sort_keys=True))
+        return EXIT_OK
+    more = f", {found['total'] - found['shown']} more past --max" if found["total"] > found["shown"] else ""
+    print(f"{repo} job {job}: {found['total']} error lines in {len(found['steps'])} steps{more}")
+    for s in found["steps"]:
+        print(f"[{s['step']}]")
+        for line in s["lines"]:
+            print(f"  {line}")
     return EXIT_OK
 
 
@@ -20468,6 +21602,35 @@ def parser() -> argparse.ArgumentParser:
     lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
     lj.add_argument("repo", metavar="OWNER/REPO")
     lj.add_argument("job", type=int, metavar="JOB_ID")
+    le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log")
+    le.add_argument("repo", metavar="OWNER/REPO")
+    le.add_argument("job", type=int, metavar="JOB_ID")
+    le.add_argument("--max", type=int, default=40, metavar="N", help="lines shown (default 40)")
+    le.add_argument("--json", action="store_true")
+    for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
+                                  "on the controller, never REST)"),
+                       ("flaky", "failing tests by name across recent failed jobs; flaky = the job passed on "
+                                 "re-run")):
+        ls = lgs.add_parser(kind, help=text)
+        ls.add_argument("repo", metavar="OWNER/REPO")
+        if kind == "search":
+            ls.add_argument("pattern", metavar="PATTERN", help="a Python regular expression")
+        else:
+            ls.add_argument("test", nargs="?", default=None, metavar="TEST", help="only tests matching this regex")
+        ls.add_argument("--since", default="24h" if kind == "search" else "72h",
+                        help="how far back: 90m, 24h, 72h (default %(default)s; at most 72 h, as long as the controller keeps logs)")
+        ls.add_argument("--job", default=None, metavar="REGEX", help="only jobs whose name matches")
+        if kind == "search":
+            ls.add_argument("--workflow", default=None, metavar="REGEX", help="only workflows whose name matches")
+            ls.add_argument("--seg", choices=("pr", "main", "queue", "other"), default=None,
+                            help="only jobs of this trigger")
+            ls.add_argument("--conclusion", default="failed",
+                            help="failed (default: failure or timed_out), any, or one conclusion (success)")
+        ls.add_argument("--reads", type=int, default=LOG_SCAN_READS if kind == "search" else LOG_SCAN_READS * 2,
+                        metavar="N", help="logs read from the controller at most (kept ones are free; default "
+                                          "%(default)s)")
+        ls.add_argument("--limit", type=int, default=20, metavar="N", help="rows shown (default 20)")
+        ls.add_argument("--json", action="store_true")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")
     b = sub.add_parser("budget", help="who spent the shared login's quota this hour, per host and caller, and "
@@ -20559,6 +21722,13 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_audit_by_caller(audit_lines(args.log or guard_log(), args.last), args.json)
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
+            if args.kind == "errors":
+                return cmd_log_errors(args.repo, args.job, args.max, args.json)
+            if args.kind == "search":
+                return cmd_log_search(args.repo, args.pattern, args.since, args.job, args.workflow, args.seg,
+                                      args.conclusion, args.reads, args.limit, args.json)
+            if args.kind == "flaky":
+                return cmd_log_flaky(args.repo, args.test, args.since, args.job, args.reads, args.limit, args.json)
             return cmd_log_job(args.repo, args.job)
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)

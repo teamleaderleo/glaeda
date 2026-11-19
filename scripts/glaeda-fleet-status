@@ -124,7 +124,7 @@ CHILD_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "SSH_AUTH_SOCK
              "XDG_CONFIG_HOME", "GH_HOST", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR",
              "CMUX_CI_TOKEN_FILE", "CMUX_CI_TOKEN", "CMUX_CI_CONTROLLER", "GLAEDA_MINI_FLEET_MANIFEST",
              "GLAEDA_CMUX_ROOT")
-SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+\S+|"
+SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+\S+|"
                        r"(?i:(?:token|secret|password)\s*[=:]\s*)\S+)")
 PRIVATE_HOME_RE = re.compile(r"/Users/[^/\s'\"]+")
 # A fix becomes a command only when every ;/&& part is: optional VAR=value words, a known program or a

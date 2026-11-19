@@ -173,7 +173,7 @@ impl ScaleSetBridgeTarget {
     ) -> Result<Self, ScaleSetBridgeError> {
         if id == 0
             || runner_group_id == 0
-            || max_capacity != 1
+            || !(1..=crate::disposable_worker_reconciler::MAX_HOST_WORKERS).contains(&max_capacity)
             || !bounded_token(name, 100)
             || !bounded_token(owner, 100)
             || labels.is_empty()
@@ -2316,10 +2316,24 @@ mod tests {
                 1,
                 &["smolrunner".to_owned()],
                 "smolrunner-host",
-                2,
+                65,
             )
             .is_err()
         );
+        // A per-host ceiling above one is accepted up to the bridge program's own bound.
+        for max_capacity in [2, 3, 64] {
+            assert!(
+                ScaleSetBridgeTarget::new(
+                    23,
+                    "smolrunner",
+                    1,
+                    &["smolrunner".to_owned()],
+                    "smolrunner-host",
+                    max_capacity,
+                )
+                .is_ok()
+            );
+        }
         let key = GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap();
         assert_eq!(format!("{key:?}"), "[REDACTED]");
     }

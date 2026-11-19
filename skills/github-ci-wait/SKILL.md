@@ -315,7 +315,11 @@ never a raw API loop:
 ## Fine to do directly
 
 - Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `glaeda-gh post`.
-- Logs: `gh run view RUN_ID --log-failed` once a run has failed.
+- Logs: ask a question instead of reading a whole log. `glaeda-gh log errors OWNER/REPO JOB_ID` prints one
+  job's error-level lines by step. `glaeda-gh log search OWNER/REPO 'PATTERN' --since 24h` names the recent
+  jobs that printed it. `glaeda-gh log flaky OWNER/REPO [TEST]` lists failing tests by name and marks the ones
+  whose job passed on re-run. Both scans read the build controller's job history and kept logs, never REST.
+  `glaeda-gh log job` prints the whole log when you need it.
 - One-off reads across many PRs: a single batched GraphQL query with aliases
   (`p0: repository(owner:, name:) { pullRequest(number:) { ... } } p1: ...`) through `gh api graphql`.
   GraphQL has its own 5000-point quota, and one aliased query costs about 1 point.

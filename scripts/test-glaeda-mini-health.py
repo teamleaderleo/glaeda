@@ -2697,6 +2697,20 @@ class DaemonHeal(Base):
         f = self.run_once()["findings"]
         self.assertEqual([(x["id"], x["severity"]) for x in f], [("disk_root_copy_stale:all", "error")])
 
+    def test_an_unenrolled_ci_minis_root_census_is_reported_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        for state, severity, fix in (("stale", "warn", "pending"), ("error", "error", "impossible")):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": {
+                "state": state, "why": "root census plist missing", "action": "reinstall"}}}))
+            f = [x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"]
+            self.assertEqual([(x["severity"], x["auto_fix"]) for x in f], [(severity, fix)])
+            self.assertIn("root census plist missing", f[0]["evidence"])
+        for census in ({"state": "current"}, {"state": "skipped", "why": "not a CI mini"}):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": census}}))
+            self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"], [])
+
 
 class DaemonHealLiveness(Base):
     """An installed copy that is unloaded, or whose passes stopped, is no healthy healer."""

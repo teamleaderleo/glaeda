@@ -13522,7 +13522,9 @@ class DeadItemsTest(unittest.TestCase):
                           "cmux21-lvm-0", "cmux21-lvm-2", "cmux21-lvm-3"},
                          "Lima's own _ entries (_config, _disks, _networks, ...) and dot entries are never items")
         cmds = "/opt/homebrew/bin/limactl start cmux21-lvm-2 --tty=false\n"
-        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
+        # the slot's claim names ai.manaflow.cmux-linux-vm: installed here, whatever this test host has
+        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)), \
+                mock.patch.object(gd, "launchd_job_installed", return_value=True):
             items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
         self.assertEqual(items["cmux-old-lvm-9"].verdict, "reclaimable", items["cmux-old-lvm-9"].reasons)
         self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
@@ -13850,6 +13852,653 @@ class CacheBudgetTest(unittest.TestCase):
         path.write_text('{"at": 1, "dev": 1, "bytes": Infinity}')
         fam = gd.Family("cmux-seeds", self.root, True, "")
         self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
+
+
+
+class HeldReasonTest(unittest.TestCase):
+    """Every held item in a dry run says what holds it, its last use and whether it is stale (glaeda#2060 follow-up)."""
+
+    def test_a_recent_item_with_no_reason_names_its_window_and_owner(self) -> None:
+        fam = gd.Family(gd.TART_VMS, Path("/x"), True, "vm", owner="Tart", min_idle_hours=48)
+        hold = gd.hold_record(fam, "recent", [], 36.7, 48.0, False)
+        self.assertEqual(hold["by"], "idle 36.7h, inside its 48h window (owner: Tart)")
+        self.assertEqual((hold["last_use_hours"], hold["window_hours"], hold["stale"]), (36.7, 48.0, False))
+        self.assertIsNone(gd.hold_record(fam, "reclaimable", [], 99, 48.0, True))
+
+    def test_a_held_item_past_its_window_is_stale_and_names_its_holder(self) -> None:
+        fam = gd.Family("home-scratch", Path("/x"), True, "")
+        hold = gd.hold_record(fam, "in-use", ["named by /Users/x/.codex/config.toml"], 355.7, 1.0, True)
+        self.assertEqual(hold["by"], "named by /Users/x/.codex/config.toml")
+        self.assertTrue(hold["stale"])
+        report_only = gd.Family("cmux-git-mirror", Path("/x"), False, "", owner="cmux CI")
+        self.assertFalse(gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["stale"],
+                         "a report-only family is never stale: nothing may delete it")
+        self.assertIn("report-only", gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["by"])
+
+    def test_the_summary_counts_nested_items_once_and_splits_stale_bytes(self) -> None:
+        items = [gd.Item("a", "/r/a", 10, 50, "in-use", ["open by a process"],
+                         hold={"by": "open by a process", "stale": True}),
+                 gd.Item("a", "/r/a/b", 4, 50, "in-use", [], hold={"by": "x", "stale": True}),
+                 gd.Item("c", "/r/c", 5, 1, "recent", [], hold={"by": "idle", "stale": False}),
+                 gd.Item("d", "/r/d", 7, 9, "reclaimable", [])]
+        summary = gd.held_summary(items)
+        self.assertEqual((summary["bytes"], summary["stale_bytes"]), (15, 10))
+        self.assertEqual(summary["by"][0], {"why": "a: open by a process", "bytes": 10})
+        gd.fill_holds([extra := gd.Item("xcode-apps", "/A/Xcode.app", 1, 0.0, "report-only", ["no pin"])])
+        self.assertEqual(extra.hold["by"], "no pin")
+
+
+class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
+    """A fleet lease no longer turns the budget off: only what its job used since it began stays (Leo, 2026-11-18)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.list = self.root / "fleet-reservations.json"
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z",
+                                         "aliases": {}, "reservations": [
+                                             {"id": "lease-1", "owner": "node:lane", "hosts": ["mini-a"],
+                                              "from": "2026-11-18T18:30:00Z", "until": "2026-11-18T20:30:00Z"}]}))
+        self.during = gd.reservation_time("2026-11-18T19:00:00Z")
+        self.addCleanup(gd.LEASE.clear)
+
+    def test_an_active_lease_records_when_it_began_and_a_failed_read_does_not(self) -> None:
+        why = gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json")
+        self.assertIn("lease-1", why)
+        self.assertEqual(gd.RESERVATION_SINCE, gd.reservation_time("2026-11-18T18:30:00Z"))
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json"))
+        self.assertIsNone(gd.RESERVATION_SINCE, "fails closed: floor-only, as before")
+
+    def test_only_what_was_used_since_the_lease_began_is_held(self) -> None:
+        fam = gd.Family("xcode-derived-data", self.root, True, "")
+        old, new = make(self.root / "old", age_hours=48), make(self.root / "new", age_hours=0)
+        gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
+        self.assertEqual(gd.lease_holds(fam, old), "")
+        self.assertIn("the leased job's own", gd.lease_holds(fam, new))
+        self.assertEqual(gd.lease_holds(fam, new, used=time.time() - 7200), "", "the survey's own last use counts")
+        gd.LEASE.clear()
+        self.assertEqual(gd.lease_holds(fam, new), "", "no lease: nothing held by one")
+
+    def test_a_host_reservation_references_only_the_paths_it_names_never_the_fleet_root(self) -> None:
+        fleet = self.root / "fleet"
+        (fleet / "ci/source-packages").mkdir(parents=True)
+        job = fleet / "cache/job-a"
+        job.mkdir(parents=True)
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "since": int(time.time()) - 60, "until": int(time.time()) + 3600,
+            "owner": "node:lane", "paths": [os.fspath(fleet), os.fspath(job)]}))
+        gd._LIVE_REFERENCES.clear()
+        self.addCleanup(gd._LIVE_REFERENCES.clear)
+        refs = gd.live_artifact_references(fleet)
+        self.assertFalse(gd.artifact_referenced(fleet / "ci/source-packages", refs), refs)
+        self.assertTrue(gd.artifact_referenced(job, refs), refs)
+
+
+class BuildStateUnderBudgetTest(unittest.TestCase):
+    """The build state no family held (build-fleet slots and package stores, runner leftovers, home folders, aside
+    trees) is judged by staleness and counted by the host cache budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.fleet = self.root / "fleet"
+        self.runner = self.home / "actions-runner-glaeda-11"
+        (self.runner / "glaeda-hooks").mkdir(parents=True)
+        (self.runner / ".runner").write_text("{}")
+        for v in ("bin.2.338.0", "bin.2.338.2", "externals.2.338.0", "externals.2.338.2"):
+            (self.runner / v).mkdir()
+        (self.runner / "bin").symlink_to("bin.2.338.2")
+        (self.runner / "externals").symlink_to("externals.2.338.2")
+        for d in ("_work/_tool/Python", "_work/_update", "_diag", "_work/cmux"):
+            (self.runner / d).mkdir(parents=True, exist_ok=True)
+        (self.fleet / "xcode/next-release/DerivedData").mkdir(parents=True)
+        (self.fleet / "ci/source-packages").mkdir(parents=True)
+        (self.fleet / "ci-ios-packages/source-packages").mkdir(parents=True)
+        home = mock.patch.object(gd, "HOME", self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        gd._DISCOVERED.clear()
+
+    def fams(self) -> list:
+        return gd.build_state_families(self.home, self.fleet)
+
+    def test_the_families_find_each_kind_and_count_toward_the_budget(self) -> None:
+        fams = self.fams()
+        found = {(f.id, os.fspath(p.relative_to(self.root))) for f in fams for p in gd.candidates(f)}
+        self.assertLessEqual({
+            (gd.FLEET_RELEASE_DD, "fleet/xcode/next-release/DerivedData"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci/source-packages"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci-ios-packages/source-packages"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/bin.2.338.0"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_tool"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_update")}, found)
+        self.assertNotIn((gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/cmux"), found)
+        for f in fams:
+            self.assertIn(f.id, gd.BUDGET_FAMILY_IDS)
+            self.assertEqual(f.min_idle_hours, gd.BUILD_STATE_STALE_HOURS)
+        for fid in ("home-scratch", "retired-runner", gd.INTERRUPTED):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+
+    def test_the_current_runner_version_and_a_live_job_keep_theirs(self) -> None:
+        leftovers = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root == self.runner)
+        self.assertIn("current version", gd.build_state_held(leftovers, self.runner / "bin.2.338.2", ""))
+        self.assertEqual(gd.build_state_held(leftovers, self.runner / "bin.2.338.0", ""), "")
+        work = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root.name == "_work")
+        job = f"{self.runner}/bin.2.338.2/Runner.Worker spawnclient 1 2\n"
+        self.assertIn("a job runs on actions-runner-glaeda-11",
+                      gd.build_state_held(work, self.runner / "_work/_tool", job))
+        self.assertEqual(gd.build_state_held(work, self.runner / "_work/_tool", ""), "")
+
+    def test_stale_means_hours_untouched_whatever_the_job_count(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        with mock.patch.object(gd, "jobs_since_use", return_value=500), mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_due(fam, 4.2, 12.0), (False, None))
+            self.assertEqual(gd.item_due(fam, 12.5, 12.0), (True, None))
+
+    def test_a_held_slot_lock_keeps_the_release_build(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        dd = self.fleet / "xcode/next-release/DerivedData"
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "no lock file: no holder")
+        lock = self.fleet / "xcode/next-release/lock"
+        lock.write_text('{"pid": 999999999}')
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "a dead pid holds nothing")
+        lock.write_text(json.dumps({"pid": os.getpid()}))
+        self.assertIn("live process", gd.build_state_held(fam, dd, ""))
+        lock.write_text("")
+        with open(lock) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertIn("holds its slot lock", gd.build_state_held(fam, dd, ""))
+
+    def test_the_budget_gives_a_home_rooted_family_only_its_own_folders(self) -> None:
+        scratch = gd.Family("home-scratch", self.home, True, "", skip=("Library",), skip_prefixes=(".", "actions-runner"))
+        aside = gd.Family(gd.INTERRUPTED, self.home, True, "")
+        sizes = {os.fspath(self.home / "cu-rewrite-build"): 5, os.fspath(self.home / "Library/Caches/x"): 7,
+                 os.fspath(self.home / ".glaeda-disk-deleting-rig-10354"): 3,
+                 os.fspath(self.home / "actions-runner-glaeda-11/_diag"): 11}
+        by = gd._budget_dev_bytes([scratch, aside], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {"home-scratch": 5, gd.INTERRUPTED: 3}})
+
+
+class KeptAsideRestoreTest(unittest.TestCase):
+    """An aside tree kept for a git change goes back to its path once stale, for its family to judge again."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.aside = make(self.root / ".glaeda-disk-deleting-simsurface-rig-10354", age_hours=615)
+        self.marker = gd.mirror_keep_marker(self.aside)
+        self.marker.write_text("kept")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        self.fam = gd.Family(gd.INTERRUPTED, self.root, True, "")
+        gd._DISCOVERED.clear()
+
+    def test_its_origin_is_its_name_without_prefix_or_pid(self) -> None:
+        self.assertEqual(gd.aside_origin(self.aside), self.root / "simsurface-rig")
+        self.assertIsNone(gd.aside_origin(self.root / "simsurface-rig"))
+
+    def test_a_stale_one_goes_back_and_a_fresh_or_blocked_one_stays(self) -> None:
+        self.assertIn("stale", gd.kept_aside_stale(self.aside))
+        self.assertIn("stale", gd.keep_verdict(self.fam, self.aside), "the dry run says so")
+        os.utime(self.marker)
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "a marker touched lately: not stale")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        (self.root / "simsurface-rig").mkdir()
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "its path is taken: it stays aside")
+        (self.root / "simsurface-rig").rmdir()
+        receipt = self.root / "receipt.jsonl"
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam], receipt), 1)
+        self.assertTrue((self.root / "simsurface-rig/blob").is_file())
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(json.loads(receipt.read_text())["operation"], "restore-kept-aside")
+
+    def test_a_process_in_it_keeps_it_aside(self) -> None:
+        with mock.patch.object(gd, "process_evidence", return_value=([], f"vim {self.aside}/x\n")):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam]), 0)
+        self.assertTrue(self.aside.is_dir())
+
+
+class TartLimaReferencesTest(unittest.TestCase):
+    """Tart and Lima VMs something references stay uncapped with a reason naming what; the rest are stale and join
+    the host cache budget (Leo, 2026-11-18: "there are dozens if not hundreds of gb of build stuff that just keep
+    getting accumulated. it's too much"; glaeda#2060's budget freed 0 GiB on a 460 GiB mini whose ~100 GiB of VMs sat
+    outside it). The fixtures are that mini's: cumv15-1 running, cloned from cumv15-build, and cmux-linux-bake."""
+
+    ECID = "AAAAAAAAAAA="
+    LVM_LABEL = "ai.manaflow.cmux-linux-vm"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "HOME", self.home))
+        stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
+        stack.enter_context(mock.patch.dict(gd._LAUNCHD_INSTALLED, {}, clear=True))
+        gd._DISCOVERED.clear()
+        self.addCleanup(gd._DISCOVERED.clear)
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tart_vm(self, name: str, hours: float, ecid: str | None = None) -> Path:
+        vm = self.home / ".tart/vms" / name
+        vm.mkdir(parents=True)
+        config = {"os": "darwin", **({"ecid": ecid} if ecid else {})}
+        (vm / "config.json").write_text(json.dumps(config))
+        (vm / "disk.img").write_bytes(b"\0" * 4096)
+        (vm / "nvram.bin").write_bytes(b"\0" * 64)
+        self.age(vm, hours)
+        return vm
+
+    def lima_vm(self, name: str, hours: float, yaml: str = "vmType: vz\n", disk: bytes = b"\0" * 4096) -> Path:
+        vm = self.home / ".lima" / name
+        vm.mkdir(parents=True)
+        (vm / "lima.yaml").write_text(yaml)
+        (vm / "diffdisk").write_bytes(disk)
+        self.age(vm, hours)
+        return vm
+
+    def claim(self, vm: Path, owner: str | None, hours: float) -> None:
+        doc = {"why": "the Linux worker VMs base image (build-fleet/mini-ops/linux-vm)"}
+        if owner is not None:
+            doc["owner"] = owner
+        (vm / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+        self.age(vm, hours)
+
+    def lock(self, vm: Path) -> None:
+        """Hold the VM's config.json lock the way `tart run` does (its PIDLock)."""
+        holder = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                                   "fcntl.lockf(fd, fcntl.LOCK_EX)\n"
+                                   "print('locked', flush=True)\n"
+                                   "time.sleep(60)\n", os.fspath(vm / "config.json")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+    def fam(self, fid: str) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == fid)
+
+    def survey(self, *fids: str) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {Path(i.path).name: i for i in gd.survey([self.fam(f) for f in fids], 12, 0)}
+
+    def test_the_measured_mini_keeps_its_clone_source_and_its_configured_base_with_reasons(self) -> None:
+        build = self.tart_vm("cumv15-build", 36.7, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)  # `tart clone cumv15-build cumv15-1`, then `tart run`
+        self.lock(running)
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["cumv15-1"].verdict, "in-use", items["cumv15-1"].reasons)
+            self.assertIn("tart runs it (its config.json lock is held)", items["cumv15-1"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", items["cumv15-build"].reasons)
+            self.assertIn("clone source of running VM cumv15-1", items["cumv15-build"].reasons)
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept")
+            why = "; ".join(items["cmux-linux-bake"].reasons)
+            self.assertIn(f"launchd job {self.LVM_LABEL} is installed", why)
+            self.assertIn("the Linux worker VMs' base", why)
+            # referenced VMs are no cache: none of their bytes count toward the budget, however old
+            sizes = {os.fspath(build): 29 * gd.GIB, os.fspath(running): 30 * gd.GIB, os.fspath(bake): 40 * gd.GIB}
+            fams = [self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)]
+            self.assertEqual(gd._budget_dev_bytes(fams, sizes), {})
+
+    def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
+        base = self.tart_vm("ubase", 30 * 24, self.ECID)
+        clone = self.tart_vm("vm0", 26 * 24, self.ECID)  # stopped since 2026-10-19 (cmux23), cloned from ubase
+        orphan = self.tart_vm("vm5", 26 * 24, "BBBBBBBBBBB=")  # its source is gone
+        young = self.tart_vm("vm6", 10, "CCCCCCCCCCC=")  # stale, but inside the 48 h window while under budget
+        gone_job = self.lima_vm("cmux-old-lvm-1", 26 * 24)
+        self.claim(gone_job, "ai.manaflow.cmux-retired-vm", 26 * 24)
+        person = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(person, "leo", 26 * 24)
+        unknowable = self.lima_vm("cmux21-lvm-0", 26 * 24)
+        self.claim(unknowable, self.LVM_LABEL, 26 * 24)
+        installed = {"ai.manaflow.cmux-retired-vm": False, self.LVM_LABEL: None}
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["ubase"].verdict, "kept", items["ubase"].reasons)
+        self.assertIn("clone source of VM vm0", items["ubase"].reasons)
+        self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertTrue(items["vm0"].reasons[-1].startswith("stale: a stopped clone of ubase"), items["vm0"].reasons)
+        self.assertEqual(items["vm5"].verdict, "reclaimable", items["vm5"].reasons)
+        self.assertIn("stale: nothing references it", items["vm5"].reasons[-1])
+        self.assertEqual(items["vm6"].verdict, "recent")
+        self.assertIn("stale: nothing references it", items["vm6"].reasons[-1], "a recent VM says why too")
+        self.assertEqual(items["cmux-old-lvm-1"].verdict, "reclaimable", items["cmux-old-lvm-1"].reasons)
+        self.assertIn("claim by ai.manaflow.cmux-retired-vm is stale: no such launchd job",
+                      items["cmux-old-lvm-1"].reasons[-1])
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "a person's claim still holds")
+        self.assertIn("claimed by leo", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["cmux21-lvm-0"].verdict, "kept", "a job launchd cannot be asked about keeps its claim")
+        # every Tart/Lima item names what references it or why it is stale
+        for name, item in items.items():
+            self.assertTrue(item.reasons, name)
+        # the stale ones count toward the budget, the referenced ones do not
+        sizes = {os.fspath(p): 10 * gd.GIB for p in (base, clone, orphan, young, gone_job, person, unknowable)}
+        sizes[os.fspath(clone / "disk.img")] = 9 * gd.GIB  # inside a counted VM: counted once
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            by = gd._budget_dev_bytes([self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {gd.TART_VMS: 30 * gd.GIB, gd.LIMA_VMS: 10 * gd.GIB}})
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            gd.apply(list(items.values()), {f: self.fam(f) for f in (gd.TART_VMS, gd.LIMA_VMS)}, receipt, None, 12)
+        for vm in (clone, orphan, gone_job):
+            self.assertFalse(vm.exists(), receipt.read_text())
+        for vm in (base, young, person, unknowable):
+            self.assertTrue(vm.exists())
+
+    def test_over_the_budget_a_stale_vm_goes_past_an_hour_and_a_referenced_one_stays(self) -> None:
+        base = self.tart_vm("cumv15-build", 3, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)
+        self.lock(running)
+        stale = self.tart_vm("aside-1", 3, "BBBBBBBBBBB=")
+        lima_stale = self.lima_vm("cmux-old-lvm-2", 3)
+        dev = self.home.stat().st_dev
+        self.assertIn(gd.TART_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertIn(gd.LIMA_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "BUDGET_WARM_DEVS", frozenset({dev})):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
+            self.assertTrue(gd.budget_only(self.fam(gd.TART_VMS), items["aside-1"], 12))
+            self.assertEqual(items["cmux-old-lvm-2"].verdict, "reclaimable", items["cmux-old-lvm-2"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", "referenced: no budget takes it")
+            self.assertEqual(items["cumv15-1"].verdict, "in-use")
+        # under the budget the 48 h window holds
+        items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["aside-1"].verdict, "recent")
+        self.assertTrue(base.exists() and stale.exists() and lima_stale.exists())
+
+    def test_a_lima_instance_named_as_another_ones_source_is_referenced(self) -> None:
+        base = self.lima_vm("cmux-linux-bake-v2", 26 * 24)
+        self.lima_vm("cmux21-lvm-1", 26 * 24, yaml=f"images:\n- location: {self.home}/.lima/cmux-linux-bake-v2/basedisk\n")
+        backing = f"{self.home}/.lima/cmux-linux-bake-v1/basedisk".encode()
+        header = bytearray(gd.QCOW2_MAGIC + (3).to_bytes(4, "big") + (512).to_bytes(8, "big")
+                           + len(backing).to_bytes(4, "big"))
+        disk = bytes(header) + b"\0" * (512 - len(header)) + backing + b"\0" * 64
+        v1 = self.lima_vm("cmux-linux-bake-v1", 26 * 24)
+        self.lima_vm("cmux21-lvm-2", 26 * 24, disk=disk)
+        old = self.lima_vm("cmux-linux-bake-v0", 26 * 24)  # an old base no instance names any more
+        self.assertEqual(gd.lima_named_instances(self.home / ".lima/cmux21-lvm-2"), {"cmux-linux-bake-v1"})
+        items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items[base.name].verdict, "kept", items[base.name].reasons)
+        self.assertIn("clone source of VM cmux21-lvm-1", items[base.name].reasons)
+        self.assertEqual(items[v1.name].verdict, "kept")
+        self.assertIn("clone source of VM cmux21-lvm-2", items[v1.name].reasons)
+        self.assertEqual(items[old.name].verdict, "reclaimable")
+        self.assertEqual(items["cmux21-lvm-1"].verdict, "reclaimable")
+        self.assertIn("stale: a stopped clone of cmux-linux-bake-v2", items["cmux21-lvm-1"].reasons[-1])
+
+    def test_never_delete_still_wins(self) -> None:
+        self.tart_vm("vm0", 26 * 24)
+        with mock.patch.object(gd, "NEVER_DELETE", (*gd.NEVER_DELETE, ".tart/vms/vm0")):
+            self.assertEqual(gd.candidates(self.fam(gd.TART_VMS)), [])
+
+    def test_launchd_job_installed_reads_plists_then_launchctl(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "x.plist").write_bytes(plistlib.dumps({"Label": self.LVM_LABEL}))
+        fake = self.root / "launchctl"
+        with mock.patch.object(gd, "LAUNCHCTL", os.fspath(fake)):
+            self.assertTrue(gd.launchd_job_installed(self.LVM_LABEL), "a plist naming the label")
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "no launchctl: cannot tell")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find service \\"$2\\" in domain" >&2\nexit 113\n')
+            fake.chmod(0o755)
+            self.assertIs(gd.launchd_job_installed("ai.manaflow.gone"), False)
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find domain for port" >&2\nexit 1\n')
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "an unreadable domain is no answer")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\ncase "$2" in gui/*) exit 0;; esac\nexit 113\n')
+            self.assertTrue(gd.launchd_job_installed("ai.manaflow.gone"), "loaded without a plist we read")
+
+
+class EvictLockQueueTest(unittest.TestCase):
+    """evict.lock's bounded hold and fair queue. A fleet mini, 2026-11-18 05:31 to 10:22: the runner hook's DISK_BOUND
+    ran pass after pass, each taking evict.lock, while 35 floor evictions and 27 LaunchAgent, launchd and build-worker
+    runs skipped as eviction_busy, about as often as they ran."""
+
+    _main_run = GlaedaDiskTest._main_run
+    _queue = GlaedaDiskTest._queue
+    receipt = GlaedaDiskTest.receipt
+    tearDown = GlaedaDiskTest.tearDown
+
+    def setUp(self) -> None:
+        GlaedaDiskTest.setUp(self)
+        for name in ("EVICT_LOCK", "EVICT_OWNER", "_EVICT_TICKET", "_EVICT_RANK", "_EVICT_HANDLE", "_EVICT_TAKEN_AT",
+                     "_EVICT_HALTS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd.EVICT_LOCK, gd.EVICT_OWNER = self.root / "evict.lock", self.root / "evict.owner.json"
+        gd._EVICT_TICKET, gd._EVICT_RANK, gd._EVICT_HANDLE = None, 1, None
+        self.waiters = gd.evict_waiters_dir()
+        run = mock.patch.dict(gd.RUN, clear=True)
+        run.start()
+        self.addCleanup(run.stop)
+
+    def sleeper(self) -> subprocess.Popen:
+        """A live process of this test's own, standing in for a waiting run."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child
+
+    def dead_pid(self) -> int:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def ticket(self, rank: int, pid: int, age_s: float = 0.0) -> str:
+        self.waiters.mkdir(parents=True, exist_ok=True)
+        name = f"{rank}-{int((time.time() - age_s) * 1e9):020d}-{pid}.ticket"
+        (self.waiters / name).write_text("{}")
+        return name
+
+    def test_the_queue_serves_floor_waiters_first_then_first_come_and_skips_dead_tickets(self) -> None:
+        live = self.sleeper().pid
+        early = self.ticket(1, live, age_s=10)
+        floor = self.ticket(0, live, age_s=5)
+        late = self.ticket(1, live, age_s=1)
+        dead = self.ticket(1, self.dead_pid(), age_s=3)
+        stale = self.ticket(1, live, age_s=gd.EVICT_TICKET_STALE_S + 10)
+        self.assertEqual(gd.evict_waiters(), [floor, early, late], "a floor waiter goes ahead; then FIFO")
+        self.assertFalse((self.waiters / dead).exists(), "a dead waiter's ticket is cleared")
+        self.assertTrue((self.waiters / stale).exists(), "a stale one (pid reused) is only ignored")
+        mine = self.waiters / late
+        self.assertEqual(gd.evict_queue_ahead(mine), [floor, early])
+        self.assertEqual(gd.evict_queue_ahead(None), [floor, early, late], "a run with no ticket is behind all")
+
+    def test_a_queued_acquire_never_jumps_a_live_waiter(self) -> None:
+        self.ticket(1, self.sleeper().pid, age_s=1)
+        self.assertIsNone(gd.acquire_evict_lock(queued=True), "the free lock is the waiter's turn")
+        handle = gd.acquire_evict_lock()  # drain and runner-cache-profile runs: the lock alone decides, as before
+        self.assertIsNotNone(handle)
+        gd.release_evict_lock(handle)
+        gd._EVICT_RANK = 0  # a floor run's ticket goes ahead of the waiting LaunchAgent's
+        mine = gd.take_evict_ticket()
+        self.assertEqual(json.loads(mine.read_text())["floor"], True)
+        handle = gd.acquire_evict_lock(queued=True)
+        self.assertIsNotNone(handle, "first in line: its turn")
+        gd.release_evict_lock(handle)
+        gd.drop_evict_ticket()
+        self.assertFalse(mine.exists())
+        self.assertIsNone(gd._EVICT_TICKET)
+
+    def test_the_holder_yields_between_items_only_past_its_slice_with_a_waiter(self) -> None:
+        gd._EVICT_HANDLE, gd._EVICT_HALTS = object(), 0
+        gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "the first deletion's check never yields")
+        self.assertEqual(gd.evict_yield_halt(), "", "past the slice, but nobody waits")
+        self.ticket(1, self.sleeper().pid)
+        why = gd.evict_yield_halt()
+        self.assertTrue(why.startswith(gd.EVICT_YIELD_MARK), why)
+        self.assertEqual(gd.RUN["evict_yielded"], 1)
+        self.assertEqual(gd.evict_yield_halt(), gd.EVICT_YIELD_MARK, "once it yields, every later step stops")
+        self.assertEqual(gd.with_evict_yield(None)(), gd.EVICT_YIELD_MARK)
+        gd.RUN.clear()
+        gd._EVICT_HALTS, gd._EVICT_TAKEN_AT = 1, time.monotonic()
+        self.assertEqual(gd.evict_yield_halt(), "", "within its slice the holder keeps deleting")
+        self.assertEqual(gd.with_evict_yield(lambda: "busy host")(), "busy host", "the caller's halt still stops it")
+        gd._EVICT_RANK, gd._EVICT_TAKEN_AT = 0, time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "a floor holder does not yield to a run the floor does not need")
+        self.ticket(0, self.sleeper().pid)
+        self.assertTrue(gd.evict_yield_halt().startswith(gd.EVICT_YIELD_MARK), "it yields to another floor run")
+        gd.RUN.clear()
+        gd._EVICT_HANDLE = None
+        self.assertEqual(gd.evict_yield_halt(), "", "after the release (the gc, the repacks) there is nothing to yield")
+
+    def test_only_a_bounded_run_waits_and_with_half_its_bound(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.RUN_DEADLINE_ENV, None)
+            self.assertEqual(gd.queue_wait_until(True), 0.0, "no bound: it skips at once, as before")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 100)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(15 < left <= 20, f"half of the 40 s left before the margin: {left}")
+            self.assertEqual(gd.queue_wait_until(False), 0.0)
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}):  # the LaunchAgent's
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(385 < left <= 390, f"half of its 780 s left: {left}")
+            self.assertGreater(left, gd.EVICT_SLICE_S, "still longer than a holder's slice")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 3600)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(gd.EVICT_WAIT_FLOOR_S - 5 < left <= gd.EVICT_WAIT_FLOOR_S, f"capped: {left}")
+        self.assertGreater(gd.EVICT_WAIT_FLOOR_S, gd.EVICT_SLICE_S, "a waiter outlasts a holder's whole slice")
+
+    def test_a_launchagent_run_waits_its_turn_and_its_run_line_says_how_long(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited in the queue and ran instead of skipping")
+        self.assertEqual((row["evict_queue_position"], row["evict_floor_wait"]), (1, None))
+        self.assertIsInstance(row["evict_wait_s"], float)
+        self.assertIn("evict.lock queue: this run's turn came", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "its ticket is gone once served")
+        survey.assert_called()
+
+    def test_a_queued_run_whose_bound_runs_out_skips_as_busy_and_says_where_it_stood(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 60.2)}
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_queue_position"]), ("eviction_busy", 1))
+        self.assertIsNotNone(row["evict_wait_s"])
+        self.assertIn("wait in the queue (place 1) ended with it still evicting", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "a waiter that leaves takes its ticket with it")
+        survey.assert_not_called()
+
+    def test_a_newcomer_with_no_bound_does_not_take_a_free_lock_a_waiter_is_due(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        self.ticket(1, self.sleeper().pid)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"], rows[-1]["evict_wait_s"]), (0, "eviction_busy", None))
+        slept.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_bounded_waiter_behind_an_older_one_runs_once_that_one_is_gone(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        older = self.sleeper()
+        self.ticket(1, older.pid, age_s=1)
+        import threading
+        leave = threading.Timer(0.3, lambda: (older.kill(), older.wait()))
+        leave.start()
+        self.addCleanup(leave.cancel)
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.02), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        row = rows[-1]
+        self.assertEqual((status, row["skipped"], row["evict_queue_position"]), (0, None, 2))
+        self.assertGreaterEqual(row["evict_wait_s"], 0.2, "it waited for the older waiter, not just for the lock")
+        survey.assert_called()
+
+    def test_a_pass_yields_through_its_halt_and_says_so_for_the_hooks_bound(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        seen = []
+
+        def reap(receipt, halt=None, **kw):  # a step main() hands its halt to after the families' deletions
+            gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+            self.ticket(0, self.sleeper().pid)
+            seen.extend([halt(), halt()])
+            return 0
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "saturation_halt", return_value=lambda: ""), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", side_effect=reap), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(seen[0], "", "the first item always goes")
+        self.assertTrue(seen[1].startswith(gd.EVICT_YIELD_MARK), seen)
+        self.assertEqual(rows[-1]["evict_yielded"], 1)
+        self.assertIn(f"{gd.EVICT_YIELD_MARK}: 1 waiting", self.said)
+
+    def test_a_run_that_yielded_leaves_the_hooks_claimed_triggers_for_the_next_pass(self) -> None:
+        for yielded, kept in ((2, True), (None, False)):
+            with self.subTest(yielded=yielded):
+                claimed = self.root / "hook-pass.pending.claimed"
+                claimed.touch()
+                fd = os.open(self.root / "hook-pass.lock", os.O_RDWR | os.O_CREAT, 0o600)
+
+                def impl(args):
+                    gd.RUN["evict_yielded"] = yielded
+                    return 0
+                with mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), mock.patch.object(gd, "_HOOK_PASS_FD", fd), \
+                        mock.patch.object(gd, "_main_impl", side_effect=impl), \
+                        mock.patch.object(gd, "launch_background_census"), \
+                        mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}):
+                    self.assertEqual(gd._logged_main(["--pressure", "--apply"]), 0)
+                self.assertEqual(claimed.exists(), kept)
+
+    def test_the_hooks_bound_reads_the_same_queue_and_yield_words(self) -> None:
+        text = (ROOT / "scripts/glaeda-cmux-runner-hook").read_text()
+        self.assertIn(f'b"{gd.EVICT_YIELD_MARK}"', text, "DISK_BOUND keeps its trigger on this exact phrase")
+        self.assertIn(f'"{gd.EVICT_WAITERS}"', text, "DISK_BOUND looks for waiters where glaeda-disk puts them")
+        self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
 
 
 class LaneVmFamiliesTest(unittest.TestCase):
