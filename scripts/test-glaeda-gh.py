@@ -21730,7 +21730,9 @@ class LandTest(Base):
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
         sent = self.w.sent()
         self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        self.assertTrue(all("latch" in s[-1] and "leo-workspace#5944" in s[-1] for s in sent), sent)
+        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
+                            and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
         self.assertEqual(len(self.w.sent()), 3, "told once")
         # The next clear: at once, past no spread, oldest wake first
@@ -22502,7 +22504,10 @@ class LandTest(Base):
         def ready(argv, timeout, env):
             if argv[0] == "/fake/ready":
                 asked.append(list(argv))
-                return subprocess.CompletedProcess(argv, 0 if argv[-1] == "o" else 1, "", "")
+                if argv[-1] == "o":
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", f"gh-app-token: not ready for {argv[-1]}: "
+                                                                f"no App pool here serves {argv[-1]}\n")
             return run(argv, timeout, env)
         self.q.run = ready
         self.pr(LA)
@@ -22516,6 +22521,13 @@ class LandTest(Base):
         self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p's have none: held, as before
         self.assertEqual(sorted({a[-1] for a in asked}), ["o", "p"])
         self.assertLessEqual(len(asked), 2, "asked once per owner per LAND_LATCH_FREE_EVERY")
+        # huge-blue, 2026-11-19: the starved-latch notice quotes ready's own reason (teamleaderleo: no App pool serves
+        # it), not a fixed "leo-workspace#5944"
+        self.assertEqual(self.q.latch_free_why(self.q.entries["pr:p/r#2"]), "no App pool here serves p")
+        self.assertEqual(gg.latch_free_reason(subprocess.CompletedProcess([], 124, "", "timed out after 10s")),
+                         "timed out after 10s")
+        self.assertEqual(gg.latch_free_reason(subprocess.CompletedProcess([], 2, "", "")),
+                         "the latch-free check exited 2")
 
     def test_the_pool_line_says_where_every_open_land_is(self):
         # huge-blue, 2026-11-18 16:11Z on: "busy 0, gated 0, snapshotWaiting 2, open 399" every 5 min, and nothing
