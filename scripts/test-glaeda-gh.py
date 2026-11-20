@@ -22217,6 +22217,7 @@ class LandTest(Base):
         Returns REST per minute after the lift (judgments x EXPLAIN_REST_*), the judgments per minute, and when
         each PR merged."""
         self.w.config["resetJudgesPerMinute"] = per_minute
+        self.w.config["windowShare"] = {"rest": 0, "graphql": 0}  # the stagger alone (the window cap: its own test)
         self.q = self.queue()
         pending: set[str] = set()
         self.q.watch = self.q.peek = pending.add
@@ -22339,6 +22340,56 @@ class LandTest(Base):
         waits = {n: (self.q.entries[f"pr:o/r#{n}"].get("wait") or {}).get("kind") for n in heads}
         return {"judged": len(judged), "perEntry": max(sum(1 for _, m in judged if m == n) for n in heads),
                 "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300)}
+
+    def test_the_host_cap_keeps_a_windows_judgments_under_its_share_and_judges_a_merge_ready_entry_first(self):
+        """gcp-agent-lane-1, 2026-11-20: the land queue sent 135 calls in the ten minutes after the 01:38Z reset with 31
+        entries waiting, and GraphQL is the pool that stalls every lane (the coordinator: "put the per-host, per-window
+        cap (merge-ready entries first)"). 40 entries whose judgments answer a plain "unreadable" (retried every
+        LAND_RETRY_DEFAULT) and one judged ok at its head with its merge step next: one window's judgments stay under
+        LAND_WINDOW_SHARE of each pool at LAND_JUDGE_COST each, its first ten minutes under the ramp's slice, and the
+        merge-ready entry is judged first. An entry left out says so."""
+        k = 40
+        heads = {n: format(0xC0 + n, "040x") for n in range(1, k + 2)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        self.q.now = self.t
+        self.q.ingest()  # the requests become entries, nothing judged yet
+        ready = self.q.entries[f"pr:o/r#{k + 1}"]
+        ready["explain"] = {"at": self.t - 60, "ok": True, "code": "", "head": heads[k + 1],
+                            "action": {"kind": "merge", "sha": heads[k + 1]}}
+        judged: list[tuple[float, int]] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                judged.append((self.t, n))
+                if n == k + 1:
+                    rc, doc = ok_answer(heads[n])
+                    doc["action"]["number"] = n
+                    self.w.answers.append((rc, doc))
+                else:
+                    self.w.answers.append(refusal("unreadable", heads[n], None))
+            return real(argv, timeout, env)
+        self.q.run = run
+        start = self.t
+        while self.t < start + gg.LAND_WINDOW_S - 30:
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(30)
+        most = min(gg.LAND_WINDOW_SHARE[p] * gg.LAND_POOL / gg.LAND_JUDGE_COST[p] for p in gg.LAND_JUDGE_COST)
+        first10 = sum(1 for at, _ in judged if at < start + 600)
+        if os.environ.get("LAND_RESET_PROFILE"):
+            print("PROFILE", json.dumps({"judged": len(judged), "first10": first10, "cap": int(most),
+                                         "first": judged[0][1] if judged else None}))
+        self.assertEqual(judged[0][1], k + 1, judged[:3])
+        self.assertLessEqual(len(judged), most)
+        self.assertLessEqual(first10, most * (600 + gg.LAND_WINDOW_RAMP) / gg.LAND_WINDOW_S + 1)
+        self.assertEqual(self.q.entries[f"pr:o/r#{k + 1}"]["state"], "merged")
+        capped = [e for e in self.q.entries.values() if e.get("windowCapped")]
+        self.assertTrue(capped)
+        self.assertIn("not judged this window: host cap", gg.land_line(capped[0], self.t, latch=None))
 
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them

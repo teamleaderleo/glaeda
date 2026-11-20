@@ -9828,6 +9828,21 @@ LAND_LATCH_STARVED_WINDOWS = 2
 # empty within ~8 minutes of every reset.
 LAND_RESET_JUDGES_PER_MIN = 2
 LAND_RESET_STAGGER_S = 3600.0
+# The host's cap on judgments per quota window (LandQueue.window_room): each judgment is charged LAND_JUDGE_COST of
+# each pool, and a window's judgments spend at most land.json "windowShare" (else LAND_WINDOW_SHARE) of each pool's
+# LAND_POOL, REST and GraphQL counted apart, however many entries wait. Within a window the cap opens in step with the
+# clock (LAND_WINDOW_RAMP ahead of it), so the reset's first minutes get a slice, not the whole window. A window starts
+# at the login latch's clear (its reset) or, with none, at the first judgment past the last window's end. An entry the
+# cap leaves out keeps its place (judge_order) and says so (land_line: "not judged this window: host cap"). Measured
+# on the broker client gcp-agent-lane-1 from gh-quota's calls.jsonl: one judgment sent about 5 calls, 2-3 of them
+# GraphQL-shaped (`pr view`, `api graphql`; 01:38-01:48Z 2026-11-20: 116 over ~23 judgments, 44 GraphQL; 22:38-22:50Z
+# 2026-11-19: 517 over ~63, 217 GraphQL), and the queue sent 135 calls in the ten minutes after the 01:38Z reset with
+# 31 entries waiting. GraphQL is the pool that runs out on a lane VM (the broker's read Apps answer REST gets only).
+LAND_POOL = 5000.0  # each pool per login per hour (REST core, GraphQL points)
+LAND_JUDGE_COST = {"rest": 5.0, "graphql": 3.0}
+LAND_WINDOW_SHARE = {"rest": 0.10, "graphql": 0.05}
+LAND_WINDOW_S = 3600.0
+LAND_WINDOW_RAMP = 600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
@@ -10608,6 +10623,8 @@ class LandQueue:
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
         self.reset_judged: list[float] = []  # when each latch-held entry's judgment started (reset_staggered)
+        self.window: dict[str, float] | None = None  # this quota window's start and spend (window_room), read lazily
+        self.pass_capped = 0  # this pass's judgments the window cap left for a later window
         self.pass_staggered = 0  # this pass's latch-held judgments that waited for their place in the stagger
         # owner -> (asked at, has an unlatched source, why not: the check's own reason, quoted by hold's notice)
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
@@ -10782,6 +10799,7 @@ class LandQueue:
         self.pass_latch = latch
         self.pass_latched = 0
         self.pass_staggered = 0
+        self.pass_capped = 0
         for key in sorted(self.entries, key=self.judge_order):
             try:
                 e = self.entries[key]
@@ -11412,7 +11430,7 @@ class LandQueue:
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
              "open": sum(states.values()), "states": states, "waits": waits,
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
-             "latched": self.pass_latched, "staggered": self.pass_staggered, "due": len(due), "dueLatchHeld": held,
+             "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
@@ -11442,7 +11460,71 @@ class LandQueue:
             self.save(e)
         return True
 
-    def judge_order(self, key: str) -> tuple[int, int, float]:
+    def window_shares(self) -> dict[str, float]:
+        """land.json "windowShare" ({"rest": r, "graphql": g}, each 0..1; 0 leaves that pool uncapped), else
+        LAND_WINDOW_SHARE."""
+        given = self.config().get("windowShare")
+        out = dict(LAND_WINDOW_SHARE)
+        if isinstance(given, dict):
+            for pool, value in given.items():
+                if pool in out and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    out[pool] = min(1.0, max(0.0, float(value)))
+        return out
+
+    def window_now(self) -> dict[str, float]:
+        """This quota window's record ({"start", "rest", "graphql"}: what its judgments were charged), kept in the land
+        dir so a restart does not open a second full window. A new one starts at the login latch's clear (the reset)
+        or, once LAND_WINDOW_S has passed, now."""
+        if self.window is None:
+            doc = read_json(land_dir() / "window.json")
+            self.window = {k: float(doc.get(k) or 0.0) for k in ("start", "rest", "graphql")} \
+                if isinstance(doc, dict) else {"start": float("-inf"), "rest": 0.0, "graphql": 0.0}
+        w = self.window
+        if self.latch_cleared > w["start"] and self.latch_cleared <= self.now:
+            self.window = w = {"start": self.latch_cleared, "rest": 0.0, "graphql": 0.0}
+        elif self.now >= w["start"] + LAND_WINDOW_S:
+            self.window = w = {"start": self.now, "rest": 0.0, "graphql": 0.0}
+        return w
+
+    def window_room(self, e: dict) -> bool:
+        """Whether one more judgment fits this window's share of every capped pool (LAND_WINDOW_SHARE's comment), the
+        share opened in step with the clock. Left out: noted once per window in E's history, its status says when the
+        next window opens, counted in the pass's land-pool line ("capped")."""
+        w = self.window_now()
+        opened = min(1.0, (self.now - w["start"] + LAND_WINDOW_RAMP) / LAND_WINDOW_S)
+        for pool, share in self.window_shares().items():
+            if share and w[pool] + LAND_JUDGE_COST[pool] > share * LAND_POOL * opened:
+                break
+        else:
+            return True
+        self.pass_capped += 1
+        if float((e.get("windowCapped") or {}).get("start") or float("-inf")) != w["start"]:
+            e["windowCapped"] = {"start": w["start"], "at": self.now, "pool": pool, "next": w["start"] + LAND_WINDOW_S}
+            self.history(e, "window_capped", pool=pool, spent=round(w[pool]), next=utc_clock(w["start"] + LAND_WINDOW_S))
+            self.save(e)
+        return False
+
+    def window_charge(self, e: dict) -> None:
+        """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk."""
+        w = self.window_now()
+        for pool, cost in LAND_JUDGE_COST.items():
+            w[pool] += cost
+        e.pop("windowCapped", None)
+        write_json(land_dir() / "window.json", w)
+
+    def judge_tier(self, e: dict) -> int:
+        """The cap's order (window_room leaves the last out): 0, judged ok at the head the cache shows with its merge
+        step next; 1, due with a step its last refusal named (update-branch, rerun, review); 2, the rest."""
+        x = e.get("explain") or {}
+        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        kind = str((x.get("action") or {}).get("kind") or "")
+        if x.get("ok") and kind == "merge" and head and str(x.get("head") or "").lower() == head:
+            return 0
+        if kind in ("update_branch", "rerun_failed", "review", "retarget") and self.due(e):
+            return 1
+        return 2
+
+    def judge_order(self, key: str) -> tuple[int, int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
         longest: a PR the cache shows CLEAN with no check running (one merge away) ahead of the rest, then by when it
         began to wait, its last judgment or else when it was queued (both on disk, so a restart does not start over
@@ -11457,13 +11539,14 @@ class LandQueue:
         head = str(data.get("headRefOid") or "")
         ready = data.get("state") == "OPEN" and data.get("mergeStateStatus") == "CLEAN" \
             and not land_checks_running(data, head)
+        tier = self.judge_tier(e)
         if self.due(e):
-            return (0 if ready else 1), 0, self.due_since(e)
+            return tier, (0 if ready else 1), 0, self.due_since(e)
         at = (e.get("explain") or {}).get("at")
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = e.get("created")
         since = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
-        return (0 if ready else 1), 1, since
+        return tier, (0 if ready else 1), 1, since
 
     def submit(self, key: str, fn: Callable[..., None], *args: Any) -> None:
         if self.inline:
@@ -11849,10 +11932,13 @@ class LandQueue:
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
             return False
+        if not self.window_room(e):
+            return False  # this window's share is spent: judged in a later one, its place kept
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
         if land_latch_held(e):
             self.reset_judged.append(self.now)  # a place in the stagger (reset_staggered)
+        self.window_charge(e)
         e.pop("staggeredAt", None)
         self.unhold(e)
         # Held by the login's latch while due (unhold: heldFor), or parked on a quota refusal since (LAND_WAIT_HELD)
@@ -12981,6 +13067,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
         bits.append(f"held by the login latch until {time.strftime('%H:%MZ', time.gmtime(float(latch[1])))}"
                     f" ({held.get('windows')} window{'s' if held.get('windows') != 1 else ''}, due since "
                     f"{utc_clock(float(held.get('dueSince') or 0))})")
+    elif (e.get("windowCapped") or {}) and e["state"] in ("queued", "waiting") \
+            and float(e["windowCapped"].get("next") or 0) > now:
+        bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
+                    f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
