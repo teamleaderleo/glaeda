@@ -9997,6 +9997,7 @@ LAND_NO_LANE = re.compile(r"lease acquisition requires a lane session")
 LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
+LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
 LAND_HANDOFF_DEADLINE = 60.0
 
 
@@ -12551,6 +12552,31 @@ class LandQueue:
             self.wait(e, {"kind": "retry", "why": f"the hand-off to the broker host's land queue was refused: "
                           f"backoff {after:.0f} s"}, after)
 
+    def broker_land(self, e: dict, sha: str) -> subprocess.CompletedProcess:
+        """A lane VM's pinned merge of E at SHA, sent straight to the broker's land (`lane-gh call land`), as a gh
+        merge's (rc, stdout, stderr): rc 0 only when the broker's envelope and its data both say ok, else the broker's
+        words on stderr, so the step's quota park (LAND_STEP_QUOTA) and owner hand-off (LAND_NOT_OWNER) read them as
+        they read gh's. The broker judges the merge itself (merge_hold on its host) before it merges, and this queue
+        judged it ok at SHA just before: the VM's gh would run a third, local merge_hold pass in between. lw#5963 at
+        6f74ddb7, gcp-agent-lane-1, 2026-11-19: judged ok 23:47:37Z, and its `gh pr merge` ran the shim's full
+        merge_hold pass again for 202 s before the broker's land answered 409 "REST rate limit is spent for login
+        until 00:38Z": the window was gone inside its own merge step."""
+        lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
+        got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"],
+                         json.dumps({"number": int(e["number"]), "sha": sha}, sort_keys=True)], LAND_MERGE_DEADLINE, e)
+        envelope: Any = None
+        with contextlib.suppress(ValueError):
+            envelope = json.loads(got.stdout or "")
+        doc = envelope.get("data") if isinstance(envelope, dict) else None
+        if got.returncode == 0 and isinstance(envelope, dict) and envelope.get("ok") is True \
+                and not envelope.get("error") and (not isinstance(doc, dict) or doc.get("ok") is not False):
+            return subprocess.CompletedProcess(got.args, 0, got.stdout, got.stderr)
+        why = envelope.get("error") if isinstance(envelope, dict) else ""
+        if not why and isinstance(doc, dict):
+            why = doc.get("error") or doc.get("reason") or ""
+        said = " ".join(str(w) for w in (why, got.stderr) if w) or f"lane-gh call land: exit {got.returncode}"
+        return subprocess.CompletedProcess(got.args, got.returncode or 1, got.stdout, said)
+
     def do_merge(self, e: dict, sha: str, answer: dict) -> None:
         if not SHA40.fullmatch(sha):
             with self.lock:
@@ -12574,8 +12600,11 @@ class LandQueue:
         repo, number = e["repo"], str(e["number"])
         with self.lock:
             self.claim(e, "merge", sha=sha)
-        got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
-                        LAND_MERGE_DEADLINE, e)
+        if self.broker_client():
+            got = self.broker_land(e, sha)
+        else:
+            got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
+                            LAND_MERGE_DEADLINE, e)
         said = f"{got.stderr or ''} {got.stdout or ''}"
         if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
             with self.lock:  # the shim's merge_hold judged it on a spent quota: parked, and no `pr view` after it

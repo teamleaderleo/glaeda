@@ -19427,6 +19427,14 @@ class LandWorld:
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
             rc, out, err = self.handoff
             return subprocess.CompletedProcess(argv, rc, out + "\n", err)
+        if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land"]:
+            # the broker's land: the same merge knobs a host's `gh pr merge` reads, in lane-gh's envelope
+            rc = self.gh_rc.get("merge", 0)
+            if rc == 0:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": {
+                    "ok": True, "merged": True}}, indent=1) + "\n", "")
+            err = self.gh_err.get("merge", "merge refused")
+            return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": err}, indent=1) + "\n", "")
         if argv[0] in ("/fake/git", "/fake/lane-gh"):
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
@@ -19436,7 +19444,8 @@ class LandWorld:
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
-                merged = any(c[1:3] == ["pr", "merge"] and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
+                merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"])
+                             and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 if self.view_err is not None:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
@@ -21488,7 +21497,9 @@ class LandTest(Base):
         self.assertEqual(gg.land_lane({"requester": ""}), "")
 
     LANE_STEPS = {
-        "merge": (lambda: ok_answer(LA), lambda c: c[1:3] == ["pr", "merge"]),
+        # a host's `gh pr merge`, or a lane VM's straight to the broker's land (broker_land)
+        "merge": (lambda: ok_answer(LA),
+                  lambda c: c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]),
         "update_branch": (lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
                           lambda c: "update-branch" in " ".join(c)),
         "rerun_failed": (lambda: refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}),
@@ -21628,6 +21639,34 @@ class LandTest(Base):
             self.w.answers.append(ok_answer(LA))
             e = self.tick()
         self.assertEqual((len(self.handoffs()), e["state"]), (1, "forwarded"))
+
+    def broker_lands(self) -> list[list[str]]:
+        return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land"]]
+
+    def test_a_lane_vms_merge_judged_ok_goes_to_the_brokers_land_with_no_local_merge_hold_pass(self):
+        # lw#5963 at 6f74ddb7, gcp-agent-lane-1, 2026-11-19: judged ok 23:47:37Z; its merge step's `gh pr merge` ran the
+        # shim's whole merge_hold pass again (202 s) before the broker's land answered 409 on a spent login. The broker
+        # judges the merge itself: the step sends the pinned merge to it, and the VM's gh merges nothing.
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        [call] = self.broker_lands()
+        self.assertEqual((call[3], json.loads(call[4])), ("o/r", {"number": 1, "sha": LA}))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], len(self.w.explains())), ("merged", 1))
+
+    def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "HTTP 409: GitHub's REST rate limit is spent for login until 00:38Z (reset)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.broker_lands()), 1)
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"))
 
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
@@ -23282,7 +23321,11 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.tick()
-        self.assert_merged_at(LA)  # o: the broker's read App covers it, judged and merged under the copied mark
+        # o: the broker's read App covers it, judged under the copied mark and sent to the broker's land
+        self.assertEqual([json.loads(c[4]) for c in self.w.calls if c[:3] == ["/fake/lane-gh", "call", "land"]],
+                         [{"number": 1, "sha": LA}])
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
         self.assertEqual(self.q.entries["pr:p/r#2"]["state"], "queued")  # p: not covered, held as before
         self.assertIn("covers o, not p", self.q.latch_free_why(self.q.entries["pr:p/r#2"]))
         self.assertEqual(asked, [], "a broker client never asks the ready command")
