@@ -5740,7 +5740,9 @@ class FleetBudgetTest(Base):
         # kept for FLEET_BUDGET_TTL: a second ask reads no host
         self.assertEqual(gg.fleet_budget(now + 30, fetch=fetch, view=view)["at"], now)
         self.assertEqual(len(calls), 3)
-        gg.fleet_budget(now + gg.FLEET_BUDGET_TTL + 1, fetch=fetch, view=view)
+        # past the TTL from when the read ended, not from NOW: a slow runner's sweep must not keep it fresh (router
+        # review of glaeda#2252, F3: a 1.1 s sweep left the cache valid at NOW + TTL + 1, "3 != 6")
+        gg.fleet_budget(doc["keptFrom"] + gg.FLEET_BUDGET_TTL + 1, fetch=fetch, view=view)
         self.assertEqual(len(calls), 6)
         text = "\n".join(gg.fleet_lines(doc))
         self.assertIn("REST 12/5000 left", text)
@@ -5828,7 +5830,7 @@ class FleetBudgetTest(Base):
                 clock[0] += 75.0  # the VM phase ends 75 s after the sweep started
             return reports.get(host) or {"error": "unreachable (exit 4: x)"}
         view = lambda: {"ok": False, "error": "no lane-gh here"}  # noqa: E731
-        with mock.patch.object(gg, "FLEET_BUDGET_TIMER", lambda: clock[0], create=True), \
+        with mock.patch.object(gg, "FLEET_BUDGET_CLOCK", lambda: now + clock[0]), \
                 mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_LANE_VMS": "gcp-agent-lane-9"}):
             first = gg.fleet_budget(now, fetch=fetch, view=view)
             swept = len(asked)
@@ -5838,6 +5840,43 @@ class FleetBudgetTest(Base):
             self.assertEqual(first["keptFrom"], now + 75)
             gg.fleet_budget(now + 136, fetch=fetch, view=view)  # 61 s after it ended: read again
             self.assertEqual(len(asked), 2 * swept)
+
+    def test_a_kept_answer_drops_a_reading_whose_window_reset_since(self) -> None:
+        """Router review of glaeda#2252, F1: a sweep that crossed a quota reset kept showing the ended window's
+        "12/5000 left" (and its unattributed gap) for another minute. Served from the cache after the reset, that
+        pool's reading is dropped; the other pool's stays."""
+        now = time.time()
+        reports = self.reports(now)
+        reports["far"]["budget"]["rest"]["reset"] = now + 20  # REST resets 20 s after the read; GraphQL in 300 s
+        fetch = lambda h, local: reports.get(h) or {"error": "unreachable (exit 4: x)"}  # noqa: E731
+        view = lambda: {"ok": False, "error": "no lane-gh here"}  # noqa: E731
+        with mock.patch.object(gg, "FLEET_BUDGET_CLOCK", lambda: now):
+            first = gg.fleet_budget(now, fetch=fetch, view=view)
+            self.assertEqual(first["account"]["rest"]["remaining"], 12)
+            self.assertIsNotNone(first["total"]["unattributed"]["rest"])
+            kept = gg.fleet_budget(now + 30, fetch=lambda h, local: self.fail(f"read {h} again"), view=view)
+        self.assertEqual(kept["at"], now)
+        self.assertNotIn("rest", kept["account"])
+        self.assertIsNone(kept["total"]["unattributed"]["rest"])
+        self.assertEqual(kept["account"]["graphql"]["remaining"], 2500)
+        self.assertNotIn("12/5000 left", "\n".join(gg.fleet_lines(kept)))
+
+    def test_the_ttl_runs_from_the_wall_clock_when_the_read_ended(self) -> None:
+        """Router review of glaeda#2252, F2: a start time plus a monotonic length put keptFrom a second past the real
+        end after a backward clock step, so a caller right after started another sweep under the lock."""
+        now, asked = time.time(), []
+        reports = self.reports(now)
+
+        def fetch(host: str, local: bool) -> dict:
+            asked.append(host)
+            return reports.get(host) or {"error": "unreachable (exit 4: x)"}
+        view = lambda: {"ok": False, "error": "no lane-gh here"}  # noqa: E731
+        with mock.patch.object(gg, "FLEET_BUDGET_CLOCK", lambda: now - 1.0):  # the clock stepped back 1 s mid-sweep
+            doc = gg.fleet_budget(now, fetch=fetch, view=view)
+        self.assertEqual(doc["keptFrom"], now - 1.0)
+        swept = len(asked)
+        gg.fleet_budget(now - 1.0, fetch=fetch, view=view)  # a caller right after, on the stepped-back clock
+        self.assertEqual(len(asked), swept)
 
     def test_a_lane_vm_named_twice_is_read_once(self) -> None:
         """Router review of glaeda#2248, F3: GLAEDA_GH_BUDGET_LANE_VMS=lane,lane started two reads of one VM, and the

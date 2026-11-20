@@ -448,7 +448,7 @@ SPENDERS_TOP = 3
 # already stale when written, so the next caller swept again (router review of glaeda#2248, F1).
 FLEET_BUDGET_FILE = "fleet-budget.json"
 FLEET_BUDGET_TTL = 60.0
-FLEET_BUDGET_TIMER = time.monotonic  # how long a read took (a test steps it)
+FLEET_BUDGET_CLOCK = time.time  # when a read ended (a test steps it)
 FLEET_HOST_TIMEOUT = 25.0  # one host's ssh and its gh-quota usage; past it the host is "unreachable (timed out)"
 FLEET_BUDGET_HOSTS = ("huge-blue", "cosmic-gray", "air-blue")  # the shared login's hosts, if the registry is not found
 FLEET_CALLERS_TOP = 8  # callers per host in the text; --json keeps every one
@@ -17159,8 +17159,7 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
         cached = read_json(path)
         kept = cached.get("keptFrom", cached.get("at")) if isinstance(cached, dict) else None
         if isinstance(kept, (int, float)) and not isinstance(kept, bool) and 0 <= clock - kept < FLEET_BUDGET_TTL:
-            return cached
-        started = FLEET_BUDGET_TIMER()
+            return budget_served(cached, clock)
         doc: dict[str, Any] = {"at": clock, "thisHost": policy_host(), "hardReserve": hard_reserve()}
         try:
             seen = view()
@@ -17170,9 +17169,29 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
             doc.update(source="spend_view", view=seen["data"])
         else:
             doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
-        doc["keptFrom"] = clock + max(0.0, FLEET_BUDGET_TIMER() - started)
+        # when the read ended, by the wall clock read then (router review of glaeda#2252, F2: a start time plus a
+        # monotonic length put it past the real end after a backward clock step)
+        doc["keptFrom"] = FLEET_BUDGET_CLOCK()
         write_json(path, doc)
         return doc
+
+
+def budget_served(doc: dict, clock: float) -> dict:
+    """A kept host-sweep answer as of CLOCK: a pool's account reading or gh-quota mark whose window reset since it was
+    read is dropped, with that pool's unattributed gap. Router review of glaeda#2252, F1: a 75 s sweep that crossed a
+    reset kept showing "0/5000 left" from the window that had ended for another minute."""
+    account, marks = dict(doc.get("account") or {}), dict(doc.get("exhausted") or {})
+    gone = [b for b, r in account.items() if not isinstance(r, dict) or float(r.get("reset") or 0) <= clock]
+    gone += [b for b, m in marks.items() if not isinstance(m, dict) or float(m.get("until") or 0) <= clock]
+    if not gone:
+        return doc
+    out = {**doc, "account": {b: r for b, r in account.items() if b not in gone},
+           "exhausted": {b: m for b, m in marks.items() if b not in gone}}
+    total = doc.get("total")
+    if isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
+        out["total"] = {**total, "unattributed": {b: None if b in gone else g
+                                                  for b, g in total["unattributed"].items()}}
+    return out
 
 
 def hhmm(epoch: Any) -> str:
