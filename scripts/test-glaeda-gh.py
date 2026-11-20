@@ -82,7 +82,7 @@ gg.APP_POOL_DIR = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-app-pool-{os
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
 # Nor may a test's alarm reach the host's coordinator, or its notices.
 gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "tell-coordinator"
-os.environ.pop(gg.SURGE_INBOX_ENV, None)  # nor its surge inbox
+gg.COORD_ALERT = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "coord_alert.py"
 # Nor may a pool alarm run the host's own gh-quota for its spenders list.
 gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-spenders-{os.getpid()}" / "gh-quota")
 # Nor may the outbox ask (or extend) the host's own create pause: only a test that names a command has one.
@@ -25319,7 +25319,7 @@ class StragglerTest(unittest.TestCase):
     def test_a_bad_seen_file_is_read_as_empty(self) -> None:
         gg.BASE.mkdir(parents=True, exist_ok=True)
         (gg.BASE / gg.STRAGGLER_SEEN).write_text(json.dumps({"seen": {"l": {"k": ["x", "y"]}}, "noticed": {"l": "z"}}))
-        with mock.patch.object(gg, "straggler_route_spawn"):
+        with mock.patch.object(gg, "coord_alert_spawn"):
             data, get = self.head()
             for _ in range(3):
                 data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
@@ -25351,14 +25351,14 @@ class StragglerTest(unittest.TestCase):
 
     def test_one_notice_per_label_over_every_head(self) -> None:
         sent: list[str] = []
-        spawn = mock.patch.object(gg, "straggler_route_spawn", side_effect=lambda text, *_: sent.append(text))
+        spawn = mock.patch.object(gg, "coord_alert_spawn", side_effect=sent.append)
         spawn.start()
         self.addCleanup(spawn.stop)
         for number in (45147, 44602, 45356):
             data, get = self.head(number=number)
             for _ in range(3):
                 data = gg.straggler_pass(f"pr:o/r#{number}", data, self.now, get)
-        # each label's notice is routed once (straggler_route_spawn), naming the label and what ends such a job
+        # each label's notice reaches the coordinator once (coord_alert), naming the label and what ends such a job
         self.assertEqual(len(sent), 2, sent)
         self.assertTrue(all("has a runner" in text and "rerun is refused while its run runs" in text for text in sent))
         lines = [json.loads(line) for line in (gg.NOTICES_DIR / "glaeda-gh.jsonl").read_text().splitlines()]
@@ -25375,83 +25375,75 @@ class StragglerTest(unittest.TestCase):
         self.assertEqual(len(seen["overflow-8vcpu-linux"]), 4)
 
 
-class StragglerRouteTest(unittest.TestCase):
-    """Leo, 2026-11-20 21:24Z (ask 14, the coordinator flood): a stragglers notice went to every coordinator through
-    coord_alert, once an hour per runner label per host. It now goes to the sessions waiting on the heads it names and
-    to the surge inbox a host names (GLAEDA_GH_SURGE_INBOX), never to a coordinator, and its notice line stays."""
+class AlertToolMissingTest(unittest.TestCase):
+    """machine-hygiene-2, 2026-11-19: glaeda-gh on huge-blue logged every straggler alert as `{"event":
+    "alert-unsent", "why": "no ~/Projects/leo-workspace/tools/coord_alert.py"}` (12 since 2026-11-18) because that tool
+    never merged (leo-workspace#5760 is still open), and nobody heard of it. A missing alert tool is a FIRE: the alert
+    goes by the alarm path glaeda-gh's other alarms use (tell-coordinator) as a FIRE naming the missing tool, and a FIRE
+    notice line is written even when no inbox tool is there at all."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        for name, value in (("BASE", root / "gh"), ("NOTICES_DIR", root / "notices")):
+        self.told = root / "told.txt"
+        self.cmd = root / "tell-coordinator"
+        self.cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.told}\n")
+        self.cmd.chmod(0o755)
+        for name, value in (("COORD_ALERT", root / "no-leo-workspace" / "coord_alert.py"), ("ALARM_CMD", self.cmd),
+                            ("NOTICES_DIR", root / "notices")):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, value)
-        env = mock.patch.dict(os.environ, {}, clear=False)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop(gg.SURGE_INBOX_ENV, None)
-        self.now = float(int(time.time()))
+        self.procs: list[subprocess.Popen] = []
+        real = subprocess.Popen
 
-    def watch(self, key: str, readers: dict[str, float]) -> None:
-        gg.watch_dir().mkdir(parents=True, exist_ok=True)
-        (gg.watch_dir() / gg.file_name(key)).write_text(json.dumps({"key": key, "readers": readers}))
+        def popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+            proc = real(*args, **kwargs)
+            self.procs.append(proc)
+            return proc
+        patch = mock.patch.object(gg.subprocess, "Popen", side_effect=popen)
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def test_reader_session_names_only_sessions(self) -> None:
-        cases = {"session:merge-queue-2:agent:helper": "merge-queue-2",
-                 "gcp-agent-lane-2/session:ws-check": "gcp-agent-lane-2/ws-check",
-                 "tool:lane-gh-broker": "", "gcp-agent-lane-5/tool:lane-gh-broker": "", "": "",
-                 "session:": "", "session:a b": "", "h;rm/session:x": ""}
-        for reader, want in cases.items():
-            self.assertEqual(gg.reader_session(reader), want, reader)
+    def told_lines(self) -> list[str]:
+        for proc in self.procs:
+            proc.wait(10)
+        return self.told.read_text().splitlines() if self.told.exists() else []
 
-    def test_owners_are_the_heads_session_readers(self) -> None:
-        self.watch("head:o/r@a", {"session:lane-a": self.now, "tool:lane-gh-broker": self.now})
-        self.watch("head:o/r@b", {"h2/session:lane-b:agent:x": self.now, "session:old": self.now - 10 * 86400})
-        self.assertEqual(gg.straggler_owners(["head:o/r@a", "head:o/r@b", "head:o/r@missing"], self.now),
-                         ["h2/lane-b", "lane-a"])
+    def notices(self) -> list[dict]:
+        path = gg.NOTICES_DIR / "glaeda-gh.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
 
-    def test_never_a_coordinator_and_notice_only_when_nobody_reads(self) -> None:
-        self.assertFalse(hasattr(gg, "coord_alert_spawn"))
-        self.assertFalse(hasattr(gg, "COORD_ALERT"))
-        self.watch("head:o/r@a", {"tool:lane-gh-broker": self.now})
-        out = io.StringIO()
-        with mock.patch.object(gg.subprocess, "Popen") as spawned, contextlib.redirect_stdout(out):
-            gg.straggler_route_spawn("WARN x", "l", ["head:o/r@a"], self.now)
-        spawned.assert_not_called()
-        self.assertIn("straggler-notice-only", out.getvalue())
-
-    def test_spawn_carries_owners_and_inbox(self) -> None:
-        self.watch("head:o/r@a", {"session:lane-a": self.now})
-        os.environ[gg.SURGE_INBOX_ENV] = "surge-inbox post"
-        with mock.patch.object(gg.subprocess, "Popen") as spawned:
-            gg.straggler_route_spawn("WARN x", "l", ["head:o/r@a"], self.now)
-        argv = spawned.call_args.args[0]
-        self.assertEqual(argv[-2], "straggler-route")
-        self.assertEqual(json.loads(argv[-1]), {"text": "WARN x", "label": "l", "owners": ["lane-a"],
-                                                "inbox": "surge-inbox post"})
-
-    def test_send_tells_each_owner_by_notice_then_the_inbox(self) -> None:
-        calls: list[list[str]] = []
-
-        def run(argv: list[str], **_: Any) -> subprocess.CompletedProcess:
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        payload = json.dumps({"text": "WARN y", "label": "lbl", "owners": ["lane-a", "h/lane-b"], "inbox": "inbox post"})
-        with mock.patch.object(gg.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(gg.straggler_route_send(payload), gg.EXIT_OK)
-        self.assertEqual([c[3] for c in calls[:2]], ["lane-a", "h/lane-b"])
-        self.assertTrue(all(c[1:3] == ["send", "--no-wait"] and "--notice" in c and "glaeda-gh" in c for c in calls[:2]))
-        self.assertEqual(calls[2], ["inbox", "post", "--kind", "stragglers", "--key", "lbl", "--sender", "glaeda-gh",
-                                    "WARN y"])
-
-    def test_send_fails_only_when_no_route_took_it(self) -> None:
-        payload = json.dumps({"text": "WARN z", "label": "l", "owners": ["lane-a"], "inbox": ""})
-        failed = subprocess.CompletedProcess([], 1, "", "no_session")
-        with mock.patch.object(gg.subprocess, "run", return_value=failed), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(gg.straggler_route_send(payload), gg.EXIT_FAIL)
+    def test_a_missing_alert_tool_sends_the_alert_as_a_fire_by_tell_coordinator(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(gg.straggler_route_send("not json"), gg.EXIT_FAIL)
+            gg.coord_alert_spawn("WARN glaeda-gh on h: 6 job(s) on runner label l queued with no runner")
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--from glaeda-gh --severity fire FIRE ", told[0])
+        self.assertIn(os.fspath(gg.COORD_ALERT), told[0])
+        self.assertIn("6 job(s) on runner label l queued with no runner", told[0])
+        fires = [n for n in self.notices() if n["data"].get("severity") == "fire"]
+        self.assertEqual(len(fires), 1, self.notices())
+        self.assertTrue(fires[0]["text"].startswith("FIRE "), fires[0])
+        self.assertIn(os.fspath(gg.COORD_ALERT), fires[0]["text"])
+
+    def test_with_no_inbox_tool_either_the_fire_notice_line_is_still_written(self) -> None:
+        gg.ALARM_CMD = Path(self.tmp.name) / "no-tell-coordinator"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.coord_alert_spawn("WARN glaeda-gh on h: stragglers")
+        fires = [n for n in self.notices() if n["data"].get("severity") == "fire"]
+        self.assertEqual(len(fires), 1, self.notices())
+        self.assertIn(os.fspath(gg.COORD_ALERT), fires[0]["text"])
+        self.assertIn("alert-unsent", out.getvalue())
+
+    def test_a_present_alert_tool_keeps_its_own_route(self) -> None:
+        gg.COORD_ALERT.parent.mkdir(parents=True)
+        gg.COORD_ALERT.write_text("def send(text, sender, budget=0):\n    return 'test'\n")
+        with mock.patch.object(gg.subprocess, "Popen") as spawned:
+            gg.coord_alert_spawn("WARN x")
+        self.assertEqual(spawned.call_args.args[0][-2:], ["coord-alert", "WARN x"])
+        self.assertEqual(self.notices(), [])
 
 
 class QueuedNeverDoneTest(unittest.TestCase):
@@ -25468,7 +25460,7 @@ class QueuedNeverDoneTest(unittest.TestCase):
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.NOTICES_DIR = Path(self.tmp.name) / "notices"
         self.now = float(int(time.time()))
-        spawn = mock.patch.object(gg, "straggler_route_spawn")
+        spawn = mock.patch.object(gg, "coord_alert_spawn")
         spawn.start()
         self.addCleanup(spawn.stop)
 

@@ -15114,7 +15114,7 @@ def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_
                     f"past {int(bound // 60)} min on {len(heads)} watched head(s), e.g. {key_name(next(iter(heads)))}. "
                     f"{STRAGGLER_STEP.format(label=label)}")
             notice_line(now, "stragglers", "warn", text, {"label": label, "jobs": jobs, "heads": sorted(heads)})
-            straggler_route_spawn(text, label, sorted(heads), now)
+            coord_alert_spawn(text)
             noticed[label] = now
         seen = {label: heads for label, heads in seen.items() if heads}
         with contextlib.suppress(OSError, ValueError, TypeError):
@@ -15128,94 +15128,63 @@ def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_
 # on that label, a cancel, or a new push ends it.
 STRAGGLER_STEP = ("Nothing starts it until runner label {label} has a runner (runner capacity's owner); a rerun is "
                   "refused while its run runs, and a new push queues it under the runner variables then in force")
-# Where a stragglers notice goes besides its notice line (the fleet's notices reconciler reads that file). Never the
-# coordinators: Leo, 2026-11-20 21:24Z, ask 14 of that list (the coordinator flood). Until then each label's notice
-# went to coord_alert, i.e. to every coordinator, once an hour per label per host, about runner capacity none of them
-# owns. Now it goes to the sessions waiting on the heads it names (the watches' session readers: the lanes that own
-# those PRs), and to the surge inbox when this host names one: GLAEDA_GH_SURGE_INBOX is a command (split like a shell
-# line) run as `CMD --kind stragglers --key LABEL --sender glaeda-gh TEXT`. With neither, the notice line is the route.
-SURGE_INBOX_ENV = "GLAEDA_GH_SURGE_INBOX"
-STRAGGLER_OWNERS_MAX = 8  # sessions told per notice, at most: a label on fifty heads tells eight lanes, not fifty
-STRAGGLER_SEND_DEADLINE = 30.0  # one acpmux send or inbox call, at most
-SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+COORD_ALERT = Path(os.environ.get("GLAEDA_GH_COORD_ALERT")
+                   or Path.home() / "Projects/leo-workspace/tools/coord_alert.py")
 
 
-def reader_session(reader: str) -> str:
-    """The acpmux target of a watch reader that is a session ("[HOST/]session:NAME[:agent:X]" -> "[HOST/]NAME"), ""
-    for a tool or anything else (a broker's reads name no lane)."""
-    host, _, rest = reader.rpartition("/")
-    if not rest.startswith("session:"):
-        return ""
-    name = rest[len("session:"):].split(":agent:", 1)[0]
-    if not SESSION_NAME.fullmatch(name) or (host and not SESSION_NAME.fullmatch(host)):
-        return ""
-    return f"{host}/{name}" if host else name
-
-
-def straggler_owners(heads: list[str], now: float) -> list[str]:
-    """The sessions reading HEADS' watches lately (readers_of), at most STRAGGLER_OWNERS_MAX, sorted."""
-    owners: set[str] = set()
-    for key in heads:
-        doc = read_json(watch_dir() / file_name(key))
-        if not isinstance(doc, dict) or doc.get("key") != key:
-            continue
-        readers = readers_of(doc, now) or ({doc["reader"]: now} if isinstance(doc.get("reader"), str) else {})
-        owners.update(t for t in (reader_session(r) for r in readers) if t)
-    return sorted(owners)[:STRAGGLER_OWNERS_MAX]
-
-
-def straggler_route_spawn(text: str, label: str, heads: list[str], now: float) -> None:
-    """TEXT to the owning lanes and the surge inbox (straggler_route_send), in a process of its own so its bounded
-    sends never hold a tick. Logged, never raised; never a coordinator."""
-    owners = straggler_owners(heads, now)
-    inbox = os.environ.get(SURGE_INBOX_ENV, "").strip()
-    if not owners and not inbox:
-        log({"event": "straggler-notice-only", "label": label, "why": f"no session reads its heads and no "
-             f"{SURGE_INBOX_ENV}: the notice line is its route", "text": text})
+def coord_alert_spawn(text: str) -> None:
+    """TEXT to the coordinator through leo-workspace's coord_alert (its routes: tell-coordinator, acpmux, then lane-gh
+    send on a lane VM), in a process of its own so its bounded routes never hold a tick. Logged, never raised.
+    With no coord_alert, the alert is a FIRE (coord_alert_missing), never only a log line."""
+    if not COORD_ALERT.is_file():
+        coord_alert_missing(text)
         return
-    payload = json.dumps({"text": text, "label": label, "owners": owners, "inbox": inbox})
     try:
-        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "straggler-route", payload],
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "coord-alert", text],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
     except OSError as error:
-        log({"event": "straggler-unsent", "why": describe(error), "text": text})
+        log({"event": "alert-unsent", "why": describe(error), "text": text})
 
 
-def straggler_route_send(payload: str) -> int:
-    """`glaeda-gh straggler-route JSON`: one acpmux notice to each owner, then the surge inbox command, each bounded
-    and logged. EXIT_OK when at least one route took it."""
+def coord_alert_missing(text: str) -> None:
+    """TEXT with no coord_alert to send it: a FIRE naming the missing tool, as a notice line (written even with no
+    inbox tool) and through the alarm path the daemon's other alarms use (ALARM_CMD, tell-coordinator), with TEXT in
+    it. 2026-11-19: coord_alert.py never merged (leo-workspace#5760 open), and huge-blue logged 12 straggler alerts
+    as alert-unsent over a day while nobody heard of any."""
+    fire = (f"FIRE glaeda-gh on {policy_host()}: its alert tool {COORD_ALERT} is missing, so this alert came by "
+            f"{ALARM_CMD.name} instead; restore the tool or set GLAEDA_GH_COORD_ALERT. The alert: {text}")
+    notice_line(time.time(), "alert-tool-missing", "fire", fire, {"tool": os.fspath(COORD_ALERT)})
+    if not (ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK)):
+        log({"event": "alert-unsent", "why": f"no {COORD_ALERT} and no {ALARM_CMD}", "text": text})
+        return
     try:
-        doc = json.loads(payload)
-        text, label = str(doc["text"]), str(doc["label"])
-        owners = [str(o) for o in doc.get("owners") or []]
-        inbox = str(doc.get("inbox") or "")
-    except (ValueError, KeyError, TypeError) as error:
-        log({"event": "straggler-unsent", "why": f"bad payload: {describe(error)}"})
+        subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as error:
+        log({"event": "alert-unsent", "why": f"no {COORD_ALERT}; {ALARM_CMD}: {describe(error)}", "text": text})
+        return
+    log({"event": "alert", "alarm": "stragglers", "via": f"{ALARM_CMD} (no {COORD_ALERT}: FIRE)", "text": text})
+
+
+def coord_alert_send(text: str) -> int:
+    """`glaeda-gh coord-alert TEXT`: coord_alert.send(TEXT, "glaeda-gh"), the route it took logged (with no
+    coord_alert, coord_alert_missing's FIRE)."""
+    if not COORD_ALERT.is_file():
+        coord_alert_missing(text)
+        return EXIT_OK
+    try:
+        spec = importlib.util.spec_from_file_location("coord_alert", COORD_ALERT)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = module  # before exec_module: a dataclass in the module looks its module up here
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        via = module.send(text, "glaeda-gh", budget=180)
+    except Exception as error:  # noqa: BLE001  an alert's failure is logged, never raised
+        log({"event": "alert-unsent", "why": describe(error), "text": text})
         return EXIT_FAIL
-    title = text if len(text) <= 200 else text[:199] + "…"
-    acpmux = shutil.which("acpmux") or "acpmux"
-    calls = [(f"lane {o}", [acpmux, "send", "--no-wait", o, "--notice", "--severity", "warn", "--sender", "glaeda-gh",
-                            "--title", title] + ([text] if title != text else [])) for o in owners]
-    if inbox:
-        try:
-            calls.append(("surge inbox", shlex.split(inbox) + ["--kind", "stragglers", "--key", label,
-                                                              "--sender", "glaeda-gh", text]))
-        except ValueError as error:
-            log({"event": "straggler-unsent", "via": "surge inbox", "why": f"{SURGE_INBOX_ENV}: {describe(error)}"})
-    took = []
-    for via, argv in calls:
-        try:
-            got = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                 timeout=STRAGGLER_SEND_DEADLINE)
-            ok, why = got.returncode == 0, (got.stderr or got.stdout or "").strip()[:200]
-        except (OSError, subprocess.SubprocessError) as error:
-            ok, why = False, describe(error)
-        log({"event": "straggler-routed" if ok else "straggler-unsent", "via": via, "label": label,
-             **({} if ok else {"why": why})})
-        if ok:
-            took.append(via)
-    return EXIT_OK if took else EXIT_FAIL
+    log({"event": "alert", "alarm": "stragglers", "via": via or None, "text": text})
+    return EXIT_OK if via else EXIT_FAIL
 
 
 def queued_any(data: dict) -> list[dict]:
@@ -23119,9 +23088,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"broker {BROKER_CONTRACT}")
             return EXIT_OK
         return cmd_gh(raw[1:])
-    if raw[:1] == ["straggler-route"] and len(raw) == 2:
-        # Not a command anyone types: straggler_notice's notice to the owning lanes (straggler_route_spawn).
-        return straggler_route_send(raw[1])
+    if raw[:1] == ["coord-alert"] and len(raw) == 2:
+        # Not a command anyone types: straggler_notice's alert, in its own process (coord_alert_spawn).
+        return coord_alert_send(raw[1])
     if raw[:1] == ["wait-resume"] and len(raw) == 2:
         # Not a command anyone types: BLOCKER hands a `wait pr|run` back here (resume_wait).
         try:
