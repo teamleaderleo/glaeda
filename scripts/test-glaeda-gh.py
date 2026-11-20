@@ -744,6 +744,45 @@ class StatusStateTest(unittest.TestCase):
                          {"status / cmux-next/compile": "error"})
 
 
+class HeadRunOrderTest(unittest.TestCase):
+    """head_data's `runs` (head_data's `runs`): every check run at a head with its own id and times, over GraphQL and
+    REST alike, and `checks --json` serves it, so a reader can order a replay against its shard's newest rerun from the
+    cache (leo-workspace merge_hold's webview verdict; cmux#46128, #46236, #46782 sat 6 h on green heads)."""
+
+    @staticmethod
+    def node(name: str, ident: int, started: str, done: str, conclusion: str = "SUCCESS") -> dict:
+        return {"__typename": "CheckRun", "databaseId": ident, "name": name, "status": "COMPLETED",
+                "conclusion": conclusion, "startedAt": started, "completedAt": done,
+                "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": "CI"}}}}
+
+    def test_graphql_nodes_keep_every_run_with_its_id_and_times(self) -> None:
+        runs: dict = {}
+        statuses: dict = {}
+        order: dict = {}
+        gg.fold_contexts([self.node("web / react-apps-check (1)", 20, "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z"),
+                          self.node("web / react-apps-check (1)", 10, "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z",
+                                    "FAILURE")], runs, statuses, {}, order=order)
+        data = gg.head_data("a" * 40, runs, statuses, {}, order)
+        self.assertEqual(data["found"]["CI / web / react-apps-check (1)"], ["completed", "success"])
+        self.assertEqual(data["runs"]["CI / web / react-apps-check (1)"],
+                         [[10, "completed", "failure", "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z"],
+                          [20, "completed", "success", "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z"]])
+        self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
+
+    def test_rest_nodes_keep_them_too_and_no_order_writes_none(self) -> None:
+        nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "web / react-apps-base-check", "status": "completed",
+                                                  "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
+                                                  "completed_at": "2026-11-20T03:05:00Z", "app": "github-actions"}]},
+                                 [], [], set())
+        runs: dict = {}
+        order: dict = {}
+        gg.fold_contexts(nodes, runs, {}, {}, order=order)
+        self.assertEqual(gg.head_data("b" * 40, runs, {}, {}, order)["runs"],
+                         {"github-actions / web / react-apps-base-check":
+                          [[7, "completed", "success", "2026-11-20T03:00:00Z", "2026-11-20T03:05:00Z"]]})
+        self.assertNotIn("runs", gg.head_data("b" * 40, runs, {}, {}))
+
+
 class FakeController:
     """Stands in for the cmux build controller: /v1/github/runs/<id> and the change feed. A change
     to `runs` shows up in the feed, as a webhook delivery would; suites and comments are queued."""
@@ -2183,8 +2222,10 @@ class UpstreamTest(Base):
         key = gg.parse_key("head", f"o/r@{sha}")
         gg.register(key, consumer="compile-fallback")
         found = {"CI / compile (verdict: ok)": ["completed", "success"], "status / ci/compile": ["completed", "success"]}
+        order = {"CI / compile (verdict: ok)": [[5, "completed", "success", "2026-11-20T01:00:00Z", "2026-11-20T01:02:00Z"]]}
         now = time.time()
-        self.answers[key] = {"data": {"sha": sha, "found": found, "ids": {}, "settled": True}, "dataAt": now - 2,
+        self.answers[key] = {"data": {"sha": sha, "found": found, "ids": {}, "settled": True, "runs": order},
+                             "dataAt": now - 2,
                              "fetchedAt": now - 2, "budgets": {"compile-fallback": {"spent": 1, "limit": 3,
                                                                                     "deniedAt": None}}}
         self.daemon.tick(now=NOW)
@@ -2203,6 +2244,7 @@ class UpstreamTest(Base):
         doc = json.loads(out.getvalue())
         self.assertEqual(code, gg.EXIT_OK)
         self.assertEqual(doc["heads"][sha]["found"], found)
+        self.assertEqual(doc["heads"][sha]["runs"], order)  # each run's id and times (head_data's `runs`)
         self.assertTrue(doc["heads"][sha]["settled"])
         # an upstream older than head keys refuses a request that has one: the PRs' read is a request of its own
         gg.register("pr:o/r#7")

@@ -3606,7 +3606,7 @@ def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
 
 
 HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage endCursor} nodes{__typename
-... on CheckRun{databaseId name status conclusion startedAt checkSuite{databaseId app{slug}
+... on CheckRun{databaseId name status conclusion startedAt completedAt checkSuite{databaseId app{slug}
 workflowRun{databaseId event workflow{name databaseId}}}}
 ... on StatusContext{context state description}}}}"""
 
@@ -3675,7 +3675,8 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
             + contexts + suites + "}}}")
 
 
-def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "") -> None:
+def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
+                  order: dict | None = None) -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
     (`status / context` -> (status, conclusion, state)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys
     another repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD).
@@ -3697,18 +3698,31 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
         runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
+        if order is not None:  # head_data's `runs`: each run's own id and times (head_data's `runs`)
+            order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
+                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or ""])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
 
 
-def head_data(sha: str, runs: dict, statuses: dict, ids: dict) -> dict:
+# A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
+# conclusion, startedAt, completedAt]. `found` keeps one verdict per name and no order, so a reader could not tell a
+# replay that ran after its shard's newest rerun from an older one: leo-workspace merge_hold's webview verdict could
+# only hold on the cache (Codex F1 on lw#4070), and while the shared login's GraphQL hour was spent its live read and
+# the head's own check reads all failed, so cmux#46128, #46236 and #46782 sat at glaeda land's 6 h retry deadline on
+# green heads (2026-11-20). With each run's id and times the cache orders a head as its live check runs do. A reader
+# that finds no `runs` (an entry written before this) has no ordering evidence, as before.
+def head_data(sha: str, runs: dict, statuses: dict, ids: dict, order: dict | None = None) -> dict:
     found = {key: list(newest_verdict(rs)) for key, rs in runs.items()}
     found.update({key: list(value[:2]) for key, value in statuses.items()})
     # no check yet is not "all finished": a push's checks appear a few seconds later
     running = any(st != "completed" for rs in runs.values() for _, st, _ in rs)
     settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
     states = {key: value[2] for key, value in statuses.items() if len(value) > 2}
-    return {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
+    data = {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
+    if order is not None:
+        data["runs"] = {key: sorted(rs, key=lambda r: int(r[0] or 0)) for key, rs in order.items()}
+    return data
 
 
 def _bounded(value: Any, default: float, low: float, high: float) -> float:
@@ -8213,10 +8227,11 @@ class Daemon:
         runs: dict = {}
         statuses: dict = {}
         ids: dict = {}
+        order: dict = {}  # head_data's `runs`
         for n, (owner, repo, contexts) in enumerate(sources):
             prefix = f"{owner}/{repo}: " if n else ""  # the head's own checks keep their names
             for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
-                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix)
+                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix, order)
                 page = contexts.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
@@ -8234,8 +8249,8 @@ class Daemon:
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
         for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
-            fold_contexts(nodes, runs, statuses, ids, prefix)
-        return head_data(sha, runs, statuses, ids)
+            fold_contexts(nodes, runs, statuses, ids, prefix, order)
+        return head_data(sha, runs, statuses, ids, order)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -8727,8 +8742,9 @@ class Daemon:
         found: dict = {}
         statuses_by: dict = {}
         ids: dict = {}
-        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids)
-        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids),
+        order: dict = {}  # head_data's `runs`
+        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids, order=order)
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids, order),
                    restParts=parts, via="rest")
         self.head_answered(e["key"])
 
@@ -16521,6 +16537,8 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
                           "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh}
+            if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
+                heads[sha]["runs"] = data["runs"]
         elif sha in missing:
             unread[sha] = "no such commit"
         else:
