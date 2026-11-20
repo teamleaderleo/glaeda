@@ -13787,7 +13787,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
-                    remove(p, boundary_root=fam.boundary_root, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
+                    remove(p, **({"boundary_root": fam.boundary_root} if fam.boundary_root is not None else {}), after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
                            else cmux_next_ci_tui_recheck(fam, p) if cmux_next_ci_tui_tree(fam, p)
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
