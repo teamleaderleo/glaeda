@@ -555,6 +555,11 @@ SOCKET_TIMEOUT = 20  # each connect, TLS handshake and read
 HTTP_DEADLINE = 45  # one whole GitHub request, from connect to the last body byte
 SUBPROCESS_DEADLINE = 20  # gh auth token, launchctl, ps: killed with their whole process group after
 TICK_BUDGET = 90  # seconds a tick may spend starting requests
+# A REST read the tick's budget cut off partway resumes on its next try within this long: the shared answers its cut
+# attempts got (repo_part, head_part) stand for it past their TTL, and its data is dated from the first attempt. Before,
+# each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
+# longer than what a tick had left after the reads ahead of it never stored anything, try after try.
+RESUME_MAX = 300.0
 WATCHDOG_CYCLES = 5
 WATCHDOG_AFTER = WATCHDOG_CYCLES * CYCLE  # the loop silent this long is hung: exit EXIT_WATCHDOG
 EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
@@ -636,7 +641,6 @@ STALE_RUN_REREAD = 180
 # failure at once, "data 0s ago", while GitHub had attempt 2 queued). The daemon reads it once for that
 # (Daemon.due); when GitHub cannot be read this long (a spent quota), the wait rules on what it has, as before.
 RUN_CONFIRM_MAX = STALE_RUN_REREAD
-WAIT_PRIORITY = STALE_RUN_REREAD  # in a busy tick, a waited key is read as if this much longer unread
 # The client's own controller long-poll before it hands its wait to the daemon (subscribe_wait). That poll does not
 # see the cache, so a finish the daemon reads from GitHub (a lost delivery, STALE_RUN_REREAD) reaches the waiter
 # only when it ends: at 300 s, a run finished at 20:46:40Z released its waiter at 20:51:16Z, 2 min after the
@@ -3954,6 +3958,8 @@ class Daemon:
         # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
         self.confirming: dict[str, tuple[dict, Any]] = {}
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: answers every watch on them shares
+        self.cut_reads: dict[str, float] = {}  # key -> the tick its REST read was first cut off partway (RESUME_MAX)
+        self.resume_key, self.resume_from = "", float("inf")  # the read resuming now, and since when its parts stand
         self.job_lists_asked: dict[str, float] = {}  # a run's job-list page -> the tick that last asked it
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
@@ -6248,22 +6254,20 @@ class Daemon:
 
     def rest_order(self, entries: list[dict]) -> list[dict]:
         """The order a tick reads REST keys in. A finished run a wait only needs confirmed (wait_confirms) goes first:
-        one read each, and then it is an ordinary key. Keys the last tick ran out of time for go next, ahead of new ones
-        of either kind (due() put them first only within their kind, so deferred runs still sat behind every new
-        PR), oldest deferral first, so a newer one (a new watch, never read) cannot overtake a key deferred tick
-        after tick, except that a deferred key a wait is blocked on goes ahead of every deferred plain one. Then the
-        longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited first on a tie (two
-        never-read keys). The deferred rank can starve plain keys while blocked ones fill the share; tick() keeps
-        them a floor (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
+        one read each, and then it is an ordinary key. Every key a wait is blocked on (an interactive wait, a due land)
+        goes next, deferred or not: those the last tick ran out of time for first, oldest deferral first, then the
+        longest unread (never read first). Then the plain watches: the deferred ones, oldest deferral first, so a newer
+        one (a new watch, never read) cannot overtake a key deferred tick after tick; then the longest unread. The
+        blocked rank can starve plain keys while blocked ones fill the tick; tick() keeps them a floor
+        (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
         carried = self.deferred_before
-        # Among the deferred, a key a wait is blocked on (an interactive wait, a due land) goes ahead of every plain
-        # watch: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait; and at
-        # 21:5xZ a WAIT_PRIORITY head start was not enough, the share's few reads a minute went to older deferrals.
-        return sorted(entries, key=lambda e: (not self.wait_confirms(e), e["key"] not in carried,
-                                              not (e["key"] in carried and self.waited(e)),
-                                              carried.get(e["key"], 0.0),
-                                              self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
-                                              not self.waited(e)))
+        # A key a wait is blocked on goes ahead of every plain watch, deferred or not. huge-blue 2026-11-18 19:56Z: 740
+        # deferred keys, mostly plain watches, ahead of every wait, so deferred waited keys were ranked first; but a
+        # waited key read once (so not deferred) still sorted behind every deferred plain key when it came due again.
+        # huge-blue 2026-11-20 12:0xZ, 1154 deferred keys and ~4 PR reads a tick: every waited read cost a whole tick
+        # behind the backlog before it ranked (huge_blue_waited_age, TickBudgetTest).
+        return sorted(entries, key=lambda e: (not self.wait_confirms(e), not self.waited(e), e["key"] not in carried,
+                                              carried.get(e["key"], 0.0), self.last_read(e)))
 
     def fed(self, key: str) -> bool:
         """Whether the controller's webhooks cover this key's repository now: its feed answered within
@@ -6690,6 +6694,10 @@ class Daemon:
                 self.to_graphql(over_rest[i:], spilled)
                 break
             sent = len(self.sent)
+            self.resume_key, self.resume_from = "", float("inf")
+            cut = self.cut_reads.pop(e["key"], None)
+            if cut is not None and self.now - cut <= RESUME_MAX:
+                self.resume_key, self.resume_from = e["key"], cut
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
                     self.rest_fetch[e["key"].split(":", 1)[0]](e)
@@ -6700,6 +6708,10 @@ class Daemon:
                 if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
                     self.rest_tried[e["key"]] = self.now
                     self.deferred_since.pop(e["key"], None)
+                    # its next try resumes from what this one got (RESUME_MAX), dated from the first cut attempt
+                    self.cut_reads[e["key"]] = min(self.resume_from, self.now) if self.resume_key == e["key"] else self.now
+                elif cut is not None:
+                    self.cut_reads[e["key"]] = cut  # not sent this time: still resumable
                 break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
@@ -6717,6 +6729,7 @@ class Daemon:
                 self.plain_at["rest"] = self.now
             # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
             self.deferred_since.pop(e["key"], None)
+        self.resume_key, self.resume_from = "", float("inf")
         for e in self.jobs_only:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):
@@ -6851,6 +6864,7 @@ class Daemon:
         self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
@@ -7552,6 +7566,8 @@ class Daemon:
             if base:
                 entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
                               if k in base})
+            if key == self.resume_key and fields.get("dataAt") == self.now:
+                fields = {**fields, "dataAt": self.resume_from}  # its oldest part's tick: no newer than that
             entry.update(fields)
             if "data" in fields and "updatedAtAt" not in fields:
                 # updatedAtAt says when `data`'s head and updatedAt were last read from GitHub together (a whole
@@ -8534,7 +8550,8 @@ class Daemon:
             new[path] = kept
             return absent
         shared = self.repo_parts.get(path)
-        if shared is None or self.now - shared["at"] >= ttl:
+        # (a resumed read, RESUME_MAX, keeps what its cut attempts got: shared["at"] is never older than resume_from)
+        if shared is None or (self.now - shared["at"] >= ttl and shared["at"] < self.resume_from):
             lent = (shared or {}).get("part") or {}
             seed = {path: lent} if lent.get("etag") and "doc" in lent else old
             scratch: dict = {}

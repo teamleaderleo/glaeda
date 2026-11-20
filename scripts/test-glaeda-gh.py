@@ -6538,9 +6538,9 @@ class TickBudgetTest(Base):
         waited = self.entry("pr:o/r#2", "rest", NOW - 100, waited=True, deferred=True)
         self.daemon.deferred_before = {"pr:o/r#1": NOW - 60, "pr:o/r#2": NOW - 10}
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
-        # a rank, not a head start (huge-blue 2026-11-18 21:5xZ: WAIT_PRIORITY was not enough at the share's few reads
+        # a rank, not a head start (huge-blue 2026-11-18 21:5xZ: a head start was not enough at the share's few reads
         # a minute): a plain watch deferred long before still goes after it
-        self.daemon.deferred_before["pr:o/r#1"] = NOW - 10 - gg.WAIT_PRIORITY - 1
+        self.daemon.deferred_before["pr:o/r#1"] = NOW - 3600
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
 
     def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
@@ -6673,25 +6673,51 @@ class TickBudgetTest(Base):
         new_run = {"key": "run:o/r/1", "cache": None, "waitedAt": NOW}
         self.assertEqual(self.order([new_pr, new_run]), ["run:o/r/1", "pr:o/r#1"])
 
-    def test_deferred_keys_go_ahead_of_waited_new_ones(self) -> None:
+    def test_a_waited_key_goes_ahead_of_deferred_plain_ones_though_not_deferred_itself(self) -> None:
+        """huge-blue 2026-11-20 12:0xZ: a waited key read once (so not deferred) sorted behind every deferred plain
+        watch (1154 there) when it came due again; it waited out a whole tick before it ranked."""
         old = self.entry("pr:o/r#1", "rest", NOW - 30, deferred=True)
-        waited = self.entry("run:o/r/2", "controller", NOW - 3600, waited=True)
-        self.assertEqual(self.order([waited, old]), ["pr:o/r#1", "run:o/r/2"])
+        waited = self.entry("run:o/r/2", "controller", NOW - 60, waited=True)
+        self.assertEqual(self.order([old, waited]), ["run:o/r/2", "pr:o/r#1"])
+        new = self.entry("pr:o/r#3", "rest", NOW - 3600)
+        self.assertEqual(self.order([new, old, waited]), ["run:o/r/2", "pr:o/r#1", "pr:o/r#3"],
+                         "plain: a deferred key still goes ahead of one not deferred")
 
     def test_waiters_kept_busy_do_not_starve_an_unwaited_key(self) -> None:
-        """A waited key is aged WAIT_PRIORITY, not ranked absolutely: with waited runs due every cycle and room for
-        one read a tick, an unwaited run unread longer than that still gets its turn."""
+        """Waited keys are ranked first, oldest read first; the unwaited ones follow, never-read and longest unread
+        first, and tick() gives the first of them the floor (PLAIN_FLOOR_EVERY): with waited runs due every cycle and
+        room for one read a tick, an unwaited run still gets its turn once a minute."""
         self.daemon.now = NOW
         cached = lambda key, at: {"key": key, "cache": {"source": "rest", "fetchedAt": at}, "waitedAt": None}
-        old = cached("run:o/r/9", NOW - gg.WAIT_PRIORITY - 60)
-        waited = [{**cached(f"run:o/r/{i}", NOW - 30), "waitedAt": NOW} for i in range(1, 4)]
+        old = cached("run:o/r/9", NOW - 600)
+        waited = [{**cached(f"run:o/r/{i}", NOW - 30 - i), "waitedAt": NOW} for i in range(1, 4)]
         fresh_unwaited = cached("run:o/r/8", NOW - 10)
         never = {"key": "run:o/r/7", "cache": None, "waitedAt": None}
         entries = [fresh_unwaited, *waited, old, never]
-        ordered = self.order(entries)
-        self.assertEqual(ordered[:2], ["run:o/r/7", "run:o/r/9"],
-                         "a never-read key, then one unread past the waiters' head start")
-        self.assertEqual(ordered[-1], "run:o/r/8", "a fresh unwaited key waits behind the waiters")
+        self.assertEqual(self.order(entries), ["run:o/r/3", "run:o/r/2", "run:o/r/1", "run:o/r/7", "run:o/r/9",
+                                               "run:o/r/8"])
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for i in (1, 2, 3):
+            self.gh.runs[i] = {"id": i, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+            gg.register(f"run:o/r/{i}", waited=True)
+        self.gh.runs[9] = {"id": 9, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+        gg.register("run:o/r/9")
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()  # one read a tick
+            order.extend([e["key"], "cut"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(int(gg.PLAIN_FLOOR_EVERY // gg.CYCLE) * 4 + 4):
+                self.daemon.tick(NOW + t * gg.CYCLE)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertIn("run:o/r/9", order, "the floor reads the unwaited run")
 
     def test_pr_batches_left_over_go_first_next_tick(self) -> None:
         keys = []
@@ -6725,6 +6751,116 @@ class TickBudgetTest(Base):
         self.daemon.tick(NOW + gg.TICK)  # not a full cycle: the deferred PR is read again, with its steps
         self.assertEqual(self.gh.step_queries, [["CR_1"]])
         self.assertEqual(gg.read_cache("pr:o/r#1")["data"]["checks"][0]["failedSteps"], ["Run selected tests"])
+
+    def test_a_read_longer_than_a_tick_resumes_instead_of_starting_over(self) -> None:
+        """huge-blue 2026-11-20 12:0xZ: a waited PR's REST read (~25 s a read there, more for a big head) cut off by the
+        tick's budget asked everything again on its next try (head parts keep 15 s, ticks are ~90 s apart), so a read
+        longer than what a tick had left never stored, try after try (pr data 16334 s old). The next try resumes from
+        what the cut attempts got, and the data is dated from the first attempt."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 7200},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 7200}}
+        self.daemon.paths["pr"] = "rest"
+        checks = [{**check_run(f"c{i}", "IN_PROGRESS", None), "id": f"CR_{i}", "databaseId": 100 + i} for i in range(250)]
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=checks)
+        gg.register("pr:o/r#1", waited=True)
+        self.daemon.deferred.add("pr:o/r#1")
+        inner, count = self.daemon.transport, [0]
+        per_tick = 4  # fewer than one read of this PR asks (pull, issue, suites, 3 check pages, statuses, runs, ...)
+
+        def transport(method, url, headers, body):
+            count[0] += 1
+            if count[0] % per_tick == 0:
+                self.daemon.tick_deadline = float("-inf")
+            return inner(method, url, headers, body)
+        self.daemon.transport = transport
+        stored_at = None
+        for t in range(8):
+            now = NOW + t * (gg.TICK_BUDGET + gg.TICK)
+            with mock.patch.object(gg.time, "time", return_value=now):
+                gg.register("pr:o/r#1", waited=True)
+            count[0] = 0
+            self.daemon.tick(now)
+            cached = gg.read_cache("pr:o/r#1") or {}
+            if cached.get("data") is not None:
+                stored_at = (t, cached["dataAt"])
+                break
+        self.assertIsNotNone(stored_at, "the read never finished: each try started over")
+        tick, data_at = stored_at
+        self.assertGreater(tick, 0, "(the read does not fit in one tick here)")
+        self.assertLess(data_at, NOW + tick * (gg.TICK_BUDGET + gg.TICK), "dated from its first attempt, not now")
+
+    def huge_blue_waited_age(self, plain: int = 1000, waited_checks: tuple[int, ...] = (450, 450, 450),
+                             request_s: float = 4.0, hours: float = 1.0) -> dict:
+        """huge-blue 2026-11-20 12:0xZ, simulated with the real tick() and REST PR read against FakeGitHub: PLAIN watches
+        nobody waits on (30 checks each), every one deferred by earlier ticks (1154 there), and a PR per WAITED_CHECKS
+        a wait is blocked on (the big one is cmuxterm-hq's shape: 450 checks, five check-run pages and failed jobs' step
+        reads), all over REST with GraphQL stopped and the App pool serving (no login share holds a read). Each request
+        takes REQUEST_S of the tick's TICK_BUDGET (~25 s a PR read there, 22 pr reads in 600 s). The answer: the oldest
+        data a waited PR had when a tick ended, over HOURS of simulated time, and the reads each kind stored."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 99999},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 99999}}
+        self.daemon.paths["pr"] = "rest"
+        self.daemon.rest_room = lambda cost: True  # the App pool's reads: never the login's share
+        self.daemon.past_share = lambda: False
+
+        def pr(n: int, count: int) -> None:
+            checks = []
+            for i in range(count):
+                status = "IN_PROGRESS" if i % 3 == 0 else "COMPLETED"
+                c = check_run(f"job{i}", status, None if status == "IN_PROGRESS" else "FAILURE" if i % 7 == 0 else "SUCCESS")
+                c.update({"id": f"CR_{n}_{i}", "databaseId": n * 1000 + i,
+                          "checkSuite": {"app": {"slug": "github-actions"},
+                                         "workflowRun": {"databaseId": n * 10 + i % 4, "workflow": {"name": "CI"}}}})
+                checks.append(c)
+            node = pr_node(n, checks=checks)
+            node["headRefOid"] = f"{n:040x}"
+            self.gh.prs[("o", "r", n)] = node
+        plain_keys = [f"pr:o/r#{n}" for n in range(1, plain + 1)]
+        waited_keys = [f"pr:o/r#{90001 + i}" for i in range(len(waited_checks))]
+        for key in plain_keys:
+            pr(int(key.split("#")[1]), 30)
+        for key, count in zip(waited_keys, waited_checks):
+            pr(int(key.split("#")[1]), count)
+        clock = [NOW]
+        with mock.patch.object(gg.time, "time", side_effect=lambda: clock[0]):
+            for key in plain_keys + waited_keys:
+                gg.register(key, waited=key in waited_keys, began=NOW if key in waited_keys else None)
+        for i, key in enumerate(plain_keys):  # deferred by earlier ticks, oldest first
+            self.daemon.deferred.add(key)
+            self.daemon.deferred_since[key] = NOW - 3600 + i
+        inner, spent = self.daemon.transport, [0.0]
+
+        def transport(method, url, headers, body):
+            self.daemon.tick_deadline -= request_s  # the request's share of the tick's budget
+            spent[0] += request_s
+            return inner(method, url, headers, body)
+        self.daemon.transport = transport
+        worst, stored = 0.0, {"plain": 0, "waited": 0}
+        while clock[0] < NOW + hours * 3600:
+            with mock.patch.object(gg.time, "time", side_effect=lambda: clock[0]):
+                for key in waited_keys:  # the waits' touches (TOUCH_EVERY): blocked on them all along
+                    gg.register(key, waited=True)
+            for key in plain_keys + waited_keys:  # read lately (the broker's answers touch them)
+                os.utime(gg.watch_dir() / gg.file_name(key), (clock[0], clock[0]))
+            before = {k: (gg.read_cache(k) or {}).get("dataAt") for k in plain_keys + waited_keys}
+            spent[0] = 0.0
+            self.daemon.tick(clock[0])
+            for key, at in before.items():
+                if (gg.read_cache(key) or {}).get("dataAt") != at:
+                    stored["waited" if key in waited_keys else "plain"] += 1
+            for key in waited_keys:
+                worst = max(worst, clock[0] - ((gg.read_cache(key) or {}).get("dataAt") or NOW))
+            clock[0] += spent[0] + gg.TICK
+        return {"waitedAgeMax": round(worst), **stored}
+
+    def test_waited_keys_stay_fresh_behind_a_huge_deferred_backlog(self) -> None:
+        """Before: 3600 s (the big waited PR never stored once in the hour: each try was cut off and started over) and,
+        with every waited read fitting, a waited read every other tick behind the deferred backlog. After: every
+        waited key read within a tick or two, the big one resuming across ticks."""
+        got = self.huge_blue_waited_age()
+        print(f"\nhuge-blue shape: {got}", file=sys.stderr)
+        self.assertLess(got["waitedAgeMax"], gg.STALE_DATA_AFTER, got)
+        self.assertGreater(got["plain"], 0, "the floor still reads the plain backlog")
 
 
 CHILD_PRELUDE = """
