@@ -9876,6 +9876,14 @@ LAND_RESET_STAGGER_S = 3600.0
 # GraphQL-shaped (`pr view`, `api graphql`; 01:38-01:48Z 2026-11-20: 116 over ~23 judgments, 44 GraphQL; 22:38-22:50Z
 # 2026-11-19: 517 over ~63, 217 GraphQL), and the queue sent 135 calls in the ten minutes after the 01:38Z reset with
 # 31 entries waiting. GraphQL is the pool that runs out on a lane VM (the broker's read Apps answer REST gets only).
+# A judgment the cap leaves out only for GraphQL (REST still fits, or is uncapped) is not skipped: it is judged from this
+# host's caches (`land_judge explain --cache-only LAND_CACHE_ONLY_MAX_AGE`), which sends nothing to GitHub and is
+# charged nothing. A webview verdict glaeda-gh's checks cache holds in run order, the daemon's rollup snapshot and the
+# gh shim's kept answers judge it; an "ok" there is advisory and the merge it names is judged live by the shim, as any
+# merge is. A judgment the caches cannot make ("cacheMiss") keeps its place under the cap, as before, with no strike.
+# The coordinator, 2026-11-20: right after the GraphQL reset glaeda land held PRs "not judged this window: host cap
+# (graphql)" while their verdict was a cache read away (cmux#46128, #46236, #46782 had sat 6 h on unreadable reads).
+LAND_CACHE_ONLY_MAX_AGE = 900  # merge_hold's own --cache-only bound (its CACHE_ONLY_MAX_S)
 LAND_POOL = 5000.0  # each pool per login per hour (REST core, GraphQL points)
 LAND_JUDGE_COST = {"rest": 5.0, "graphql": 3.0}
 LAND_WINDOW_SHARE = {"rest": 0.10, "graphql": 0.05}
@@ -11532,10 +11540,16 @@ class LandQueue:
         next window opens, counted in the pass's land-pool line ("capped")."""
         w = self.window_now()
         opened = min(1.0, (self.now - w["start"] + LAND_WINDOW_RAMP) / LAND_WINDOW_S)
-        for pool, share in self.window_shares().items():
-            if share and w[pool] + LAND_JUDGE_COST[pool] > share * LAND_POOL * opened:
-                break
-        else:
+        over = [pool for pool, share in self.window_shares().items()
+                if share and w[pool] + LAND_JUDGE_COST[pool] > share * LAND_POOL * opened]
+        e.pop("cacheOnlyJudge", None)
+        if not over:
+            return True
+        pool = over[0]
+        if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == w["start"]:
+            # Only GraphQL is capped: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
+            # One that missed already this window waits for the next, as any capped entry does.
+            e["cacheOnlyJudge"] = w["start"]
             return True
         self.pass_capped += 1
         # Held by the cap from here to its judgment: not counted toward its wait's deadline (LAND_WAIT_HELD), as a
@@ -11549,10 +11563,11 @@ class LandQueue:
         return False
 
     def window_charge(self, e: dict) -> None:
-        """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk."""
+        """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk; a cache-only judgment
+        (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
         for pool, cost in LAND_JUDGE_COST.items():
-            w[pool] += cost
+            w[pool] += 0.0 if e.get("cacheOnlyJudge") == w["start"] else cost
         e.pop("windowCapped", None)
         write_json(land_dir() / "window.json", w)
 
@@ -12073,6 +12088,9 @@ class LandQueue:
                     "action": {"v": 1, "kind": "stop", "stop": "land_judge_missing", "why": why}}
         argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
+        cache_only = e.pop("cacheOnlyJudge", None)
+        if cache_only is not None:
+            argv += ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]  # GraphQL's share is spent this window
         snap, _ = self.snapshot(e["key"], sha)
         extra = {}
         if snap is not None:
@@ -12100,6 +12118,21 @@ class LandQueue:
                     "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
         if got.returncode != 0:
             answer["ok"] = False
+        if cache_only is not None and answer.get("cacheMiss") \
+                and not LAND_STEP_QUOTA.search(str(answer.get("reason") or "")):  # a quota refusal parks as before
+            # The caches could not judge it: it keeps its place under the cap until the next window, no strike, and
+            # the time it waits there is not counted toward its wait's deadline (cappedSince, LAND_WAIT_HELD).
+            nxt = float(cache_only) + LAND_WINDOW_S
+            with self.lock:
+                e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now}
+                e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt}
+                e.setdefault("cappedSince", self.now)
+                self.history(e, "window_capped", pool="graphql", cacheOnly="miss", next=utc_clock(nxt))
+            return {"ok": False, "code": "host_cap", "head": sha, "cacheMiss": True,
+                    "reason": f"not judged this window: host cap (graphql), and this host's caches could not judge it "
+                              f"({land_trim(answer.get('reason'), 200)})",
+                    "next": f"none (judged again once the next window opens at {utc_clock(nxt)})",
+                    "action": {"v": 1, "kind": "retry", "after_s": max(LAND_RETRY_DEFAULT, nxt - self.now)}}
         return answer
 
     def check(self, e: dict) -> None:
