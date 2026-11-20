@@ -5,11 +5,11 @@
 
 huge-blue's calls.log on 2026-11-17 (24 h): cmux runs/N/jobs 6,883, cmux jobs/N/logs 5,822, cmuxterm-hq runs/N/jobs
 2,727, cmuxterm-hq jobs/N/logs 2,577. Most come from the lane-gh broker's ci_log (ci_wait, ws_check_post: a finished
-run's job list, then every job's log, again per retry and per post) and merge_hold. This replays a day shaped like
+run's job list, then every job's log, again per retry and per post) and land-judge. This replays a day shaped like
 that: runs start through the day and finish ~20 minutes later; a quarter of the job-list reads come while the run is
 still going, the rest after it, spread over the next hours (exponential gaps); every job log is read only after the
 run finished, about twice per job; a tenth of the runs are rerun 30 minutes after they finished (a new attempt, new
-job ids); 30% of job-list reads carry a --jq (merge_hold's shape), the rest are raw (the broker's). glaeda's daemon is
+job ids); 30% of job-list reads carry a --jq (land-judge's shape), the rest are raw (the broker's). glaeda's daemon is
 modelled as watching every run (ci_wait waits on each), refreshing a finished one every TERMINAL_REFRESH.
 
 Every call goes through cmd_gh in this process on a simulated clock; the real gh is a stand-in that answers from the
