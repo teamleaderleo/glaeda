@@ -3884,6 +3884,8 @@
   "to": "2026-11-14"
  },
  "hosts": [
+  "cmux-austin-mini-0",
+  "cmux-austin-mini-1",
   "cmux10s-mac-mini",
   "cmux11s-mac-mini",
   "cmux12s-mac-mini",
@@ -3896,9 +3898,9 @@
   "cmux23",
   "cmux8s-mac-mini",
   "cmux9s-mac-mini",
+  "cmuxs-mac-mini",
   "cmuxs-mac-mini-3",
-  "cmuxs-mac-mini-5",
-  "cmuxs-mac-mini-6",
+  "cmuxs-mac-mini-4",
   "ultra2"
  ]
 }
