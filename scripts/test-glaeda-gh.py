@@ -22309,7 +22309,7 @@ class LandTest(Base):
             self.assertEqual(after["snapshots"], k, after)
         self.assertLess(out[(30, cap)]["first5Live"], out[(30, 0)]["first5Live"])
 
-    def quota_unreadable_profile(self, k: int, minutes: int, until: float) -> dict:
+    def quota_unreadable_profile(self, k: int, minutes: int, until: float, words: str = "") -> dict:
         """K due entries, no latch on this host, each judgment answered "unreadable" with the words merge_hold gives
         when the gh-quota shim refused its read: the login's GraphQL spent "until" UNTIL. Ticks MINUTES; returns the
         judgments made (each a merge_hold explain, its REST spent before the refused read) and each entry's wait."""
@@ -22317,6 +22317,8 @@ class LandTest(Base):
         reason = (f"merge-hold: refused o/r {{n}}: its head could not be read: no fresh head-matching PR answer: "
                   f"gh-quota: refused: GitHub's GraphQL rate limit is spent for login until {stamp}Z (reset); next: "
                   f"retry after {stamp}Z (reset); nothing is sent to GitHub before then (why: guard-why)")
+        if words:
+            reason = words.replace("{stamp}", stamp)  # WORDS: another wording of the same refusal, {stamp} its HH:MM
         heads = {n: format(0xB0 + n, "040x") for n in range(1, k + 1)}
         for n, head in heads.items():
             key = f"pr:o/r#{n}"
@@ -22407,6 +22409,16 @@ class LandTest(Base):
         self.assertEqual(p["perEntry"], 1, p)
         self.assertEqual(p["judged"], k, p)
         self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+
+    def test_an_unreadable_judgment_in_the_brokers_rate_limited_words_is_parked_too(self):
+        """lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z: "unreadable" in the broker's words ("gh api graphql
+        failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"), which LAND_UNREAD_QUOTA
+        did not read, so it took the 120 s retry until the reset."""
+        words = ("merge_hold: refused: the reds at {n} could not be read for base_red_excuse.py: RuntimeError: GraphQL: "
+                 "gh api graphql failed: until {stamp}Z (reset); not sent, retry after {stamp}Z; reason: [RATE_LIMITED] "
+                 "GitHub's GraphQL limit. Retry once GitHub answers")
+        p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
+        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
 
     def tearDown_entries(self) -> None:
         """A fresh queue directory for the next profile: no entry, request or latch left from the last."""

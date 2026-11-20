@@ -9690,7 +9690,11 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # GraphQL rate limit is spent for login until 23:38Z"; each took the 120 s retry (LAND_RETRY_DEFAULT) and spent about 5
 # REST (`pr view`, check-runs, runs) before its refused read. The 44 explains after an "unreadable" answer took 262 of
 # session glaeda-land's 568 REST in those 12 min, with glaeda#2234's stagger loaded (it caps only latch-held entries).
-LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent")
+# The broker's own words for the same refusal count too: lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z, was
+# "unreadable" with "gh api graphql failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"
+# and took the 120 s retry until the reset.
+LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent"
+                               r"|\[RATE_LIMITED\]|not sent, retry after \d\d:\d\dZ")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as merge_hold's. Read on a step's output only, never on merge_hold's reason (which
 # can quote a red job's log). Before, only merge_hold's words parked a step: cmux#42244's update-branch was refused
