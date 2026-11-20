@@ -21668,6 +21668,26 @@ class LandTest(Base):
         self.assertEqual(len(self.broker_lands()), 1)
         self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"))
 
+    def test_alternating_broker_land_refusals_are_not_read_as_one_and_never_stop_the_entry(self):
+        # Router review of glaeda#2239, F1: broker_land kept the indented envelope in stdout, so land_step_class read
+        # every refusal with no `refused [code` as its last line, `}`. A lease busy and read Apps busy, alternating,
+        # then counted as LAND_STEP_STOP identical refusals and stopped the entry; on a host they keep it waiting.
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        said = ("land: the lane lease for o/r#1 is held by another session; try again after it is released",
+                "get: the broker's read Apps are busy for o; try again in 60 s")
+        e = {}
+        for i in range(gg.LAND_STEP_STOP + 2):
+            self.w.gh_err["merge"] = said[i % 2]
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+        self.assertEqual(len(self.broker_lands()), gg.LAND_STEP_STOP + 2)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        # each refusal is counted as itself: the last one (read Apps busy) is a first, not an eighth
+        self.assertEqual((e["stepFail"]["class"], e["stepFail"]["count"]), (gg.land_step_class(said[1]), 1))
+
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
         self.broker = True

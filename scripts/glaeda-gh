@@ -12574,8 +12574,12 @@ class LandQueue:
         why = envelope.get("error") if isinstance(envelope, dict) else ""
         if not why and isinstance(doc, dict):
             why = doc.get("error") or doc.get("reason") or ""
-        said = " ".join(str(w) for w in (why, got.stderr) if w) or f"lane-gh call land: exit {got.returncode}"
-        return subprocess.CompletedProcess(got.args, got.returncode or 1, got.stdout, said)
+        said = "\n".join(str(w).strip() for w in (got.stderr, why) if str(w or "").strip()) \
+            or f"lane-gh call land: exit {got.returncode}"
+        # The decoded refusal last, with no envelope in stdout: land_step_class names a refusal with no `refused [code`
+        # by its last line, which for the indented envelope was `}`, so two different refusals (a lease busy, read
+        # Apps busy) read as one, and six alternating ones stopped the entry (router review of glaeda#2239, F1).
+        return subprocess.CompletedProcess(got.args, got.returncode or 1, "", said)
 
     def do_merge(self, e: dict, sha: str, answer: dict) -> None:
         if not SHA40.fullmatch(sha):
