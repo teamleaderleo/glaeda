@@ -688,6 +688,13 @@ STALE_CATCH_UP = STALE_DATA_AFTER
 # once per STALE_VALVE_COOLDOWN (restart.json "valve"): a second starvation that soon is not one a restart fixes.
 STALE_VALVE_TICKS = 2
 STALE_VALVE_COOLDOWN = 1800
+# The one-key rule below (the daemon reads its other waited keys, so one stale key is no reason to drop the land
+# queue's judgments) has an end: a key this old after its nudged reads (they go first every tick) is a read loop that
+# cannot reach it, and a restart is what clears that. huge-blue, 2026-11-20 03:2xZ, 04:2xZ, 05:2xZ: pr data 10446 s old
+# (pr:manaflow-ai/cmux#47751 at 6751 s on the last), "backlog: 7 pr reads stored", ticks 91.8 s in "read rest", the
+# valve answering "one_key" every tick, and a person running `glaeda-gh restart` each time. Above 3963 s, which the
+# 11-18 incident's rule was made for, and below the hours a person waited.
+STALE_ONE_KEY_MAX = 2 * 3600
 # Read progress (daemon.json "progress", Daemon.stall_cause): the reads this daemon stored per kind over this window,
 # where its ticks spent their time (each top-level phase, the waits for a GraphQL slot, GitHub's answers) and the
 # request in flight. huge-blue, 2026-11-18: pr data for waits 3088 s, then 748 s 18 min after a restart, old behind a
@@ -1816,6 +1823,8 @@ class Edges:
             return [ip for ip in override.split("=", 1)[1].split(",") if ip]
         try:
             infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except DeadlineTimeout:  # http()'s alarm is one-shot: swallowed here, the rest of the request has no deadline
+            raise
         except OSError:
             return []
         return list(dict.fromkeys(info[4][0] for info in infos))
@@ -1837,6 +1846,8 @@ class Edges:
                     with plain.open(urllib.request.Request(query, headers={"Accept": "application/dns-json"}),
                                     timeout=2) as answer:
                         records = json.loads(answer.read(65536)).get("Answer") or []
+                except DeadlineTimeout:
+                    raise
                 except (OSError, HTTPException, ValueError, AttributeError):
                     continue
                 for record in records:
@@ -1857,12 +1868,17 @@ class Edges:
     def attempt(ip: str, port: int, host: str, context: ssl.SSLContext, timeout: float):
         try:
             raw = socket.create_connection((ip, port), timeout=EDGE_CONNECT_TIMEOUT)
+        except DeadlineTimeout:  # the request's hard deadline (a TimeoutError): not a dead edge, and not to be retried
+            raise
         except TimeoutError:
             raise EdgeFailed("connect-timeout") from None
         except OSError:
             raise EdgeFailed("connect-failed") from None
         try:
             tls = context.wrap_socket(raw, server_hostname=host)
+        except DeadlineTimeout:
+            raw.close()
+            raise
         except TimeoutError:
             raw.close()
             raise EdgeFailed("tls-timeout") from None
@@ -4540,7 +4556,9 @@ class Daemon:
             # a fresh daemon would read them no sooner, and drop every land judgment in flight besides. The alarm says
             # what holds them.
             return level, text, {**data, "valve": data["cause"]}
-        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER:
+        age = data.get("age")
+        stuck = isinstance(age, (int, float)) and age > STALE_ONE_KEY_MAX  # STALE_ONE_KEY_MAX's comment
+        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER and not stuck:
             # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
             # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
             # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read

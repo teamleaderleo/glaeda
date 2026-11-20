@@ -227,6 +227,32 @@ class Classify(unittest.TestCase):
         self.assertFalse(gg.edge_refused(403, {"Retry-After": "60"}))
         self.assertFalse(gg.edge_refused(200, {}))
 
+    def test_a_hard_deadline_is_never_read_as_a_dead_edge(self):
+        # http()'s SIGALRM deadline is one-shot and a TimeoutError: attempt() read it as "connect-timeout", marked the
+        # edge bad and retried on another edge with no deadline left (huge-blue 2026-11-20: reads URLError for minutes)
+        real = socket.create_connection
+
+        def deadline(*args, **kwargs):
+            raise gg.DeadlineTimeout("no complete answer within 45s")
+
+        socket.create_connection = deadline
+        try:
+            with self.assertRaises(gg.DeadlineTimeout):
+                gg.Edges.attempt("127.0.0.9", 443, "api.github.com", ssl.create_default_context(), 20)
+        finally:
+            socket.create_connection = real
+        real_gai = socket.getaddrinfo
+
+        def late(*args, **kwargs):
+            raise gg.DeadlineTimeout("late")
+
+        socket.getaddrinfo = late
+        try:
+            with self.assertRaises(gg.DeadlineTimeout):
+                gg.Edges.resolve("api.github.com")
+        finally:
+            socket.getaddrinfo = real_gai
+
 
 if __name__ == "__main__":
     unittest.main()

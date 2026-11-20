@@ -15228,6 +15228,21 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.check_alarms()
         self.assertIsNotNone(self.daemon.valve_due)
 
+    def test_the_valve_restarts_for_one_stale_key_the_nudge_did_not_clear_past_two_hours(self) -> None:
+        # huge-blue, 2026-11-20 03:2xZ, 04:2xZ, 05:2xZ: one PR's data 6751 to 10446 s old, "backlog" (other keys read),
+        # the valve answering one_key every tick, and a person running `glaeda-gh restart` each time
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": gg.STALE_ONE_KEY_MAX + 1.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 30.0}
+        self.daemon.read_done = {**self.daemon.read_done, "pr": [NOW - 30]}
+        for i in range(2):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNotNone(self.daemon.valve_due, "an hours-old key is a read loop that cannot reach it")
+        self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
+        self.assertIn("restarting itself now", self.told_lines()[-1])
+
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
         stale = ("warn", "x", {"kind": "pr"})
