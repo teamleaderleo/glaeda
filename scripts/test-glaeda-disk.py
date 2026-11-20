@@ -9645,6 +9645,61 @@ class MediaTourDerivedDataTest(unittest.TestCase):
             self.assertTrue(gd.floor_hold_only(self.fam, item, 12), "it waits for the floor stop like warm builds")
 
 
+class TipLoopWorkTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.state = self.home / "Library/Application Support/hq-tip-loop/state"
+        (self.state / "work").mkdir(parents=True)
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            self.fam = next(f for f in gd.default_families() if f.id == "hq-tip-loop-work")
+            self.assertNotIn(self.fam.id, [f.id for f in gd.default_families("devbox")])
+
+    def work(self, name, hours):
+        path = self.fam.root / name
+        make(path / "nightly/build/Products/nested", age_hours=hours)
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_old_work_goes_but_recent_deep_writes_and_sibling_receipts_stay(self):
+        old, recent, deep = self.work("old", 48), self.work("recent", 23), self.work("deep", 48)
+        (deep / "nightly/build/Products/nested/blob").touch()
+        receipts = [make(self.state / name / "receipt", age_hours=96)
+                    for name in ("receipts", "outbox", "candidates")]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            self.assertEqual(next(i.verdict for i in items if i.path == str(old)), "reclaimable")
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(all(p.exists() for p in [recent, deep, *receipts]))
+
+    def test_work_opened_after_the_survey_is_kept(self):
+        path = self.work("inflight", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        with mock.patch.object(gd, "process_evidence", return_value=([str(path / "build-a1.log")], "")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(path.exists())
+
+    def test_unknown_process_evidence_preserves_old_work(self):
+        path = self.work("unknown", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+        with mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("probe unavailable")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(path.exists())
+
+
 class SparkleAppcastTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

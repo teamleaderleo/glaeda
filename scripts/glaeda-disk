@@ -5190,6 +5190,13 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         bazel_user = pwd.getpwuid(uid).pw_name
     if DARWIN and bazel_user:
         fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
+    if DARWIN and role == "fleet-mini":
+        # The tip loop writes per-commit clones/builds here, not user checkouts. Its
+        # candidate apps and delivery receipts are siblings, outside this family.
+        fams.append(Family("hq-tip-loop-work", HOME / "Library/Application Support/hq-tip-loop/state/work", True,
+                           "the tip loop fetches the commit and builds it again", git_disposable=True, nested_git=True,
+                           min_idle_hours=24.0, max_idle_hours=24.0, mirror_idle_hours=24.0, deep_mtime=True,
+                           owner="hq tip-loop", rebuild_minutes=30, platform="macos"))
     if DARWIN:  # the owned cmux minis
         # These roots contain disposable build products outside the CI hot tier. Keep Chromium's
         # source tree under cmux-browser-fleet/build, but allow old top-level tour artifacts and
