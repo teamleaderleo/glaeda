@@ -5783,6 +5783,38 @@ class FleetBudgetTest(Base):
         self.assertIn("no lane-gh here; read each host instead", text)
         self.assertIn("(0 of 3 hosts read; unread: here, far, down; a lower bound)", text)
 
+    def test_a_lane_vm_no_read_host_carries_is_read_itself_and_summed_once(self) -> None:
+        """The coordinator, 2026-11-20: "budget can't read lane VMs ('no broker:VM row'), so the biggest spender is
+        invisible" (cosmic-gray 23:39Z the night before: 280 of 542 REST unattributed). A lane VM that no read host's
+        broker rows carry is read itself (its own gh-quota log) and summed once; one already in a read host's
+        broker:VM rows is not read again; one whose own read fails stays unread, with why."""
+        now = time.time()
+        reports = self.reports(now)
+        reports["gcp-agent-lane-9"] = {"budget": {}, "daemon": None,
+                                       "usage": [{"caller": "session:glaeda-land", "rest": 386, "graphql": 117}]}
+        asked: list[str] = []
+
+        def fetch(host: str, local: bool) -> dict:
+            asked.append(host)
+            return reports.get(host) or {"error": "unreachable (exit 4: x)"}
+        vms = "gcp-agent-lane-5,gcp-agent-lane-9,gcp-agent-lane-7"
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_LANE_VMS": vms}):
+            doc = gg.fleet_budget(now, fetch=fetch, view=lambda: {"ok": False, "error": "no lane-gh here"})
+        total = doc["total"]
+        self.assertNotIn("gcp-agent-lane-5", asked)  # far's broker:gcp-agent-lane-5 rows carry it
+        self.assertEqual(sorted(h for h in asked if h.startswith("gcp-")), ["gcp-agent-lane-7", "gcp-agent-lane-9"])
+        self.assertEqual(total["laneVms"]["read"], ["gcp-agent-lane-9"])
+        self.assertEqual((total["rest"], total["graphql"]), (7 + 2250 + 386, 3 + 440 + 117))
+        self.assertEqual(list(total["laneVms"]["unread"]), ["gcp-agent-lane-7"])
+        self.assertIn("its own log was not read: unreachable (exit 4: x)",
+                      total["laneVms"]["unread"]["gcp-agent-lane-7"])
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("gcp-agent-lane-9 (a lane VM no read host's broker rows carry: its own log): REST 386, "
+                      "GraphQL 117", text)
+        self.assertIn("session:glaeda-land", text)
+        self.assertIn("gcp-agent-lane-7: no broker:gcp-agent-lane-7 row on any read host, and its own log was not "
+                      "read", text)
+
     def test_unread_host_is_not_zero_and_the_total_is_a_lower_bound(self) -> None:
         """2026-11-19 on cosmic-gray: three Linux hosts "reported 0" while unread, and the sum explained
         far less than the ~3000 REST spent. A host or lane VM whose spend was not read is unread with its reason."""

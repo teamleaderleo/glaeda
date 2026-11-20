@@ -17012,10 +17012,9 @@ def fetch_host(host: str, local: bool) -> dict:
     return report
 
 
-def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
-    """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT."""
-    hosts = fleet_hosts()
-    me = hosts[0]
+def sweep_rows(names: list[str], me: str, clock: float, fetch: Callable[[str, bool], dict]) -> dict[str, dict]:
+    """Each of NAMES read at once, one fetch each, joined within FLEET_HOST_TIMEOUT: its summarize_host row, or
+    {"ok": False, "error"}."""
     reports: dict[str, dict] = {}
 
     def one(host: str) -> None:
@@ -17024,19 +17023,40 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
         except Exception as error:  # a host's read is never the command failing
             reports[host] = {"error": f"unreachable ({type(error).__name__})"}
 
-    threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in hosts]
+    threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in names]
     for t in threads:
         t.start()
     for t in threads:
         t.join(FLEET_HOST_TIMEOUT + 5)
     rows: dict[str, dict] = {}
-    for host in hosts:
+    for host in names:
         report = dict(reports.get(host) or {"error": "unreachable (no answer)"})
         rows[host] = {"ok": False, "error": report["error"]} if report.get("error") else summarize_host(report, clock)
+    return rows
+
+
+def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
+    """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT. Then each lane VM
+    no read host's broker:VM rows carry is read itself (its own gh-quota log names every call it sent through its
+    broker), so a VM whose broker host is unread or idle is a row of its own, not "no broker:VM row". The coordinator,
+    2026-11-20: "budget can't read lane VMs ('no broker:VM row'), so the biggest spender is invisible" (cosmic-gray at
+    23:39Z the night before: 280 of 542 REST unattributed). Only the VMs no read host carries are read: none when every
+    broker host answers."""
+    hosts = fleet_hosts()
+    me = hosts[0]
+    rows = sweep_rows(hosts, me, clock, fetch)
     if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
         rows[me]["brokerClient"] = True
-    doc = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
-    doc["total"] = sweep_tally(doc, fleet_lane_vms())
+    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    vms = fleet_lane_vms()
+    carried = set(sweep_tally(doc, [])["laneVms"]["brokered"]) | set(rows)
+    missing = [vm for vm in vms if vm not in carried]
+    vm_rows = sweep_rows(missing, me, clock, fetch) if missing else {}
+    for row in vm_rows.values():
+        if row.get("ok"):
+            row["brokerClient"] = True
+    doc["laneVmRows"] = vm_rows
+    doc["total"] = sweep_tally(doc, vms)
     return doc
 
 
@@ -17089,11 +17109,23 @@ def sweep_tally(doc: dict, lane_vms: list[str]) -> dict:
             continue  # already in brokered[host]'s broker:VM rows
         rest += h.get("rest") or 0
         gql += h.get("graphql") or 0
-    covered = set(read) | set(brokered)
-    vms_unread = {vm: "no broker:" + vm + " row on any read host (idle, or its broker host is unread)"
+    vm_read: list[str] = []
+    vm_why: dict[str, str] = {}
+    for vm, h in (doc.get("laneVmRows") or {}).items():
+        if vm in brokered or vm in hosts:
+            continue  # counted in a read host's broker:VM rows or as a host: never twice
+        if not h.get("ok") or h.get("unread"):
+            vm_why[vm] = f"no broker:{vm} row on any read host, and its own log was not read: " \
+                + str(h.get("error") or h.get("unread") or "unreachable")
+            continue
+        vm_read.append(vm)
+        rest += h.get("rest") or 0
+        gql += h.get("graphql") or 0
+    covered = set(read) | set(brokered) | set(vm_read)
+    vms_unread = {vm: vm_why.get(vm) or "no broker:" + vm + " row on any read host (idle, or its broker host is unread)"
                   for vm in lane_vms if vm not in covered and vm not in unread}
     out: dict[str, Any] = {"rest": rest, "graphql": gql, "hosts": len(hosts), "read": read, "unread": unread,
-                           "laneVms": {"brokered": brokered, "unread": vms_unread},
+                           "laneVms": {"brokered": brokered, "read": vm_read, "unread": vms_unread},
                            "lowerBound": bool(unread or vms_unread)}
     gaps: dict[str, Any] = {}
     for bucket, spent in (("rest", rest), ("graphql", gql)):
@@ -17230,11 +17262,20 @@ def sweep_lines(doc: dict) -> list[str]:
         if rest_of:
             out.append(f"    ... {len(rest_of)} more callers: REST {sum(c['rest'] for c in rest_of)}, "
                        f"GraphQL {sum(c['graphql'] for c in rest_of)}")
+    for vm in (tally.get("laneVms") or {}).get("read") or []:
+        h = (doc.get("laneVmRows") or {}).get(vm) or {}
+        out.append(f"  {vm} (a lane VM no read host's broker rows carry: its own log): REST {h.get('rest', 0)}, "
+                   f"GraphQL {h.get('graphql', 0)}")
+        for c in (h.get("callers") or [])[:FLEET_CALLERS_TOP]:
+            out.append(f"    {c['caller']:<40} REST {c['rest']:>5}  GraphQL {c['graphql']:>5}")
     unread = tally.get("unread") or {}
     vms_unread = (tally.get("laneVms") or {}).get("unread") or {}
     if vms_unread:
         out.append(f"  lane VMs unread ({len(vms_unread)}: no broker:VM row on any read host; idle, or its broker host "
                    f"is unread): {', '.join(vms_unread)}")
+        for vm, why in vms_unread.items():
+            if "its own log was not read" in why:
+                out.append(f"    {vm}: {why}")
     read_n, hosts_n = len(tally.get("read") or []), tally.get("hosts", 0)
     names = ", ".join(unread) + ("; " if unread and vms_unread else "") \
         + (f"{len(vms_unread)} lane VMs" if vms_unread else "")
