@@ -704,6 +704,9 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-tab-switch.yml's frames (an advisory pull request check; Leo, 2026-11-15, asked for CI on tab switching)
 # submits scripts/measure/tab-switch.sh (cmux-ci run --class exclusive --measurement --display) for a pull request
 # head that touches a tab, a pane or the chat pane, and waits at most 130 min (1 h queue, 1 h step), once per head.
+# fleet-rd-host-macos.yml's check (advisory, cmux#43689) submits scripts/ci/cmux-tui-rust-check.sh rd-host
+# (cmux-ci run --class isolated --os macos) for a pull request that changes cmux-rd-host, and only greps the
+# client's log; it waits at most 80 min (20 min queue, 1 h run). Without it every run was refused here.
 # GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
 # while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
 # cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
@@ -722,7 +725,8 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("fleet-compile-check.yml", "compile-check"), ("fleet-test-compile.yml", "compile"),
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
-                          ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames")})
+                          ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
+                          ("fleet-rd-host-macos.yml", "check")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and

@@ -6133,7 +6133,16 @@ class FleetBudgetTest(Base):
         done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
                               env={**env, "HOME": os.fspath(self.home)})
         self.assertEqual(gg.parse_host_report(done.stdout)["usage"][0]["rest"], 762)
-        link.unlink()  # neither path: no usage, never an error from the host
+        # huge-blue 2026-11-20: no link at all, only leo-workspace's tools/gh_quota.py ("gave nothing" for this host)
+        tool = self.home / "Projects/leo-workspace/tools/gh_quota.py"
+        tool.parent.mkdir(parents=True)
+        tool.write_text('#!/bin/sh\necho \'[{"caller": "session:y", "rest": 9, "graphql": 0}]\'\n', encoding="utf-8")
+        tool.chmod(0o755)
+        link.unlink()
+        done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
+                              env={**env, "HOME": os.fspath(self.home)})
+        self.assertEqual(gg.parse_host_report(done.stdout)["usage"][0]["caller"], "session:y")
+        tool.unlink()  # no path: no usage, never an error from the host
         done = subprocess.run(["sh", "-c", gg.FLEET_HOST_SCRIPT], capture_output=True, text=True, timeout=30,
                               env={**env, "HOME": os.fspath(self.home)})
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -6542,6 +6551,113 @@ class TickBudgetTest(Base):
         # a minute): a plain watch deferred long before still goes after it
         self.daemon.deferred_before["pr:o/r#1"] = NOW - 3600
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
+
+    def test_the_newest_ask_of_a_head_never_tried_is_read_first(self) -> None:
+        """huge-blue 2026-11-20 17:1xZ: 20 never-read heads due, about 3 read a tick, and a new merge gate's head read
+        4.5 min after it was asked. Newest ask first, a failed head after every untried one, and all of them ahead of a
+        deferred one-read confirmation."""
+        def head(c: str, asked: float, cache: dict | None = None) -> dict:
+            return {"key": f"head:o/r@{c * 40}", "cache": cache, "consumers": {"merge-hold": asked}, "waitedAt": None}
+        old, new, mid = head("a", NOW - 400), head("b", NOW - 2), head("c", NOW - 100)
+        failed = head("d", NOW - 1, {"error": "rest: HTTP 502", "data": None, "fetchedAt": NOW - 30})
+        prs = [self.entry(f"pr:o/r#{n}", "rest", NOW - 1000, deferred=True) for n in range(1, 3)]
+        self.daemon.deferred_before = {e["key"]: NOW - 500 for e in prs + [old]}
+        with mock.patch.object(self.daemon, "wait_confirms", side_effect=lambda e: e["key"] == "pr:o/r#2"):
+            order = self.order(prs + [old, failed, mid, new])
+        self.assertEqual(order[:4], [new["key"], mid["key"], old["key"], failed["key"]])
+        self.assertEqual(order[4], "pr:o/r#2", "the confirmation after the heads")
+
+    def test_an_asked_head_with_no_answer_goes_ahead_of_the_deferred_backlog(self) -> None:
+        """huge-blue 2026-11-20: `glaeda-gh checks` for a new SHA stayed "unread" for 10+ min over REST, behind ~1000
+        carried PR deferrals. An asked head that holds no answer is read first; one that has an answer is ordinary."""
+        sha = "c" * 40
+        head = {"key": f"head:o/r@{sha}", "cache": None, "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        errored = {"key": f"head:o/r@{'d' * 40}", "cache": {"error": "graphql: partial", "data": None, "fetchedAt": NOW - 1},
+                   "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        answered = {"key": f"head:o/r@{'e' * 40}", "cache": {"data": {"found": {}}, "dataAt": NOW - 90, "fetchedAt": NOW - 90},
+                    "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        stale_ask = {"key": f"head:o/r@{'f' * 40}", "cache": None, "consumers": {"merge-hold": NOW - 5000}, "waitedAt": None}
+        prs = [self.entry(f"pr:o/r#{n}", "rest", NOW - 1000, deferred=True) for n in range(1, 4)]
+        self.daemon.deferred_before = {e["key"]: NOW - 500 + i for i, e in enumerate(prs)}
+        order = self.order(prs + [answered, stale_ask, errored, head])
+        self.assertEqual(set(order[:2]), {head["key"], errored["key"]})
+        self.assertEqual(order[2:5], [e["key"] for e in prs])
+
+    def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
+        """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
+        and an asked head with no answer, or a wait's key, is still read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("pr:o/r#9", waited=True)
+        sha = "c" * 40
+        gg.register(f"head:o/r@{sha}", consumer="merge-hold")
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_PLAIN_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            status = self.daemon.tick(NOW)
+        self.assertEqual(sorted(read), sorted([f"head:o/r@{sha}", "pr:o/r#9"]))
+        self.assertEqual(status["deferred"], 3, "the plain PRs wait for the next tick")
+        read.clear()
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual({"pr:o/r#1", "pr:o/r#2", "pr:o/r#3"} - set(read), set(), "and are read first then")
+
+    def test_an_asked_head_with_no_answer_goes_first_over_graphql(self) -> None:
+        """huge-blue 2026-11-20 15:45Z: with pr moved to GraphQL, a fresh merge-hold head sat unread behind 828 due PRs:
+        heads are never "waited", so they only had their round robin turn after the plain PRs. An asked head with no
+        answer is read first, before any plain or waited PR."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("pr:o/r#9", waited=True)
+        sha = "c" * 40
+        gg.register(f"head:o/r@{sha}", consumer="merge-hold")
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        calls: list[tuple[str, list[str]]] = []
+
+        def batched(kind, entries, fetch):
+            if entries:
+                calls.append((kind, [e["key"] for e in entries]))
+            return []
+        with mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(calls[0], ("head", [f"head:o/r@{sha}"]), calls)
+        self.assertIn(("pr", ["pr:o/r#9"]), calls)
+
+    def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
+        """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
+        left, and `checks --consumer merge-hold` said "unread (not read yet)" until the hour turned. A head with no
+        answer is read over REST then, within HEAD_DIRECT_MAX an hour; an answered one and the PRs still wait."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2129, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        self.daemon.rest_minutes = {int(NOW // 60): 10000}  # the share is spent
+        sha, old = "c" * 40, "d" * 40
+        gg.register(f"head:o/r@{sha}", consumer="merge-hold")
+        gg.register(f"head:o/r@{old}", consumer="merge-hold")
+        gg.write_json(gg.cache_dir() / gg.file_name(f"head:o/r@{old}"), {"key": f"head:o/r@{old}", "data": {"found": {}}, "dataAt": NOW - 5000,
+                                                          "fetchedAt": NOW - 5000})
+        gg.register("pr:o/r#1", waited=True)
+        read: list[str] = []
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+            self.assertEqual(read, [f"head:o/r@{sha}"])
+            self.assertEqual(len(self.daemon.head_direct_at), 1)
+            # the hourly bound holds: none more past it
+            read.clear()
+            gg.register(f"head:o/r@{'e' * 40}", consumer="merge-hold")
+            self.daemon.head_direct_at = [NOW] * gg.HEAD_DIRECT_MAX
+            self.daemon.tick(NOW + gg.TICK)
+            self.assertEqual(read, [])
+            # and the login's REST under its floor reads none either
+            self.daemon.head_direct_at = []
+            self.daemon.budget["rest"]["remaining"] = 100
+            self.daemon.tick(NOW + 2 * gg.TICK)
+            self.assertEqual(read, [])
 
     def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
         """due() put a deferred key first only within its kind, so a deferred run sat behind every new PR."""
@@ -22898,6 +23014,24 @@ class LandTest(Base):
                  "GitHub's GraphQL limit. Retry once GitHub answers")
         p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
         self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
+
+    def test_an_unreadable_judgment_this_hosts_own_guards_refused_is_parked_not_counted(self):
+        """gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553 and #12558 stopped retry_deadline after about 6 h of
+        "unreadable" judgments in the words of this host's own guards (the gh-quota shim's cache-only miss, glaeda-gh's
+        sweep guard), which LAND_UNREAD_QUOTA did not read: each took the 120 s retry and counted toward the PR's
+        deadline. They name no reset, so the entry parks on LAND_QUOTA_BACKOFF: a few judgments in 20 minutes, never one
+        every 120 s, and the wait is the quota's."""
+        for words in ("merge-hold: refused o/r {n}: its head could not be read: no fresh head-matching PR answer: "
+                      "gh-quota: refused: cache-only: not held in this host's caches within 900 s (GET pr view)",
+                      "merge_hold: refused: base_red_excuse.py exit 1 at {n}: glaeda-gh's sweep guard refused its "
+                      "job-list reads (at most 30 runs or jobs per caller in 10 minutes), so no red was judged: "
+                      "glaeda-gh: refused: this caller read the jobs of 30 different runs or jobs in the last 10 "
+                      "minutes"):
+            with self.subTest(words=words[:60]):
+                p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
+                self.assertLessEqual(p["perEntry"], 3, p)  # LAND_QUOTA_BACKOFF doubling, not the 120 s retry (10)
+                self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+                self.tearDown_entries()
 
     def tearDown_entries(self) -> None:
         """A fresh queue directory for the next profile: no entry, request or latch left from the last."""

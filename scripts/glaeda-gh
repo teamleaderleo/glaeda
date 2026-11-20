@@ -431,7 +431,12 @@ ALARM_PACE_SHARE = 0.5
 # Who spent the pool on this host, for the alarm to name: leo-workspace tools/gh_quota.py `usage --json`, which counts
 # every caller on the login here (the gh shim's sessions and tools, this daemon, the lane-gh broker's VMs). This
 # daemon's own routes are a fraction of it (11:23Z: about 13 a minute of the 158).
-SPENDERS_CMD = os.environ.get("GLAEDA_GH_SPENDERS_CMD") or os.fspath(Path.home() / ".local/bin/gh-quota")
+# The first of GH_QUOTA_PATHS present (FLEET_GH_QUOTA_PATHS, the same list for a remote host's shell). huge-blue
+# 2026-11-20: neither link existed there (host-baseline links only the gh shim), so `budget` said "huge-blue (this host):
+# unread (gh-quota usage gave nothing)" while tools/gh_quota.py in its leo-workspace checkout answered at once.
+GH_QUOTA_PATHS = (".local/bin/gh-quota", ".local/lib/gh-quota/bin/gh-quota", "Projects/leo-workspace/tools/gh_quota.py")
+SPENDERS_CMD = os.environ.get("GLAEDA_GH_SPENDERS_CMD") or os.fspath(next(
+    (Path.home() / p for p in GH_QUOTA_PATHS if os.access(Path.home() / p, os.X_OK)), Path.home() / GH_QUOTA_PATHS[0]))
 SPENDERS_TIMEOUT = 10.0
 SPENDERS_TOP = 3
 # `budget` across hosts (fleet_budget): who spent the login's quota this hour, every host signed in to it at once.
@@ -560,6 +565,9 @@ TICK_BUDGET = 90  # seconds a tick may spend starting requests
 # each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
 # longer than what a tick had left after the reads ahead of it never stored anything, try after try.
 RESUME_MAX = 300.0
+REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
+# tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
+# (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
 WATCHDOG_CYCLES = 5
 WATCHDOG_AFTER = WATCHDOG_CYCLES * CYCLE  # the loop silent this long is hung: exit EXIT_WATCHDOG
 EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
@@ -765,6 +773,11 @@ GQL_BLIND_TTL = 3600  # a run GraphQL answered null for is read over REST this l
 RUN_MISSING_RETRY = 600  # a run no read ever showed (GraphQL and REST both say none) is asked about this rarely
 HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
 CONSUMER_WINDOW = 3600
+# An asked head with no answer (`glaeda-gh checks` on a new SHA) is read over REST even when this daemon's REST share is
+# spent and GraphQL is stopped, while the login's REST is above its floor: at most this many such reads an hour, each
+# also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
+# REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
+HEAD_DIRECT_MAX = 60
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
@@ -4064,6 +4077,8 @@ class Daemon:
         self.alarm_procs: list[subprocess.Popen] = []  # tell-coordinator runs not yet reaped
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
+        self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
         self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
@@ -6261,13 +6276,65 @@ class Daemon:
         blocked rank can starve plain keys while blocked ones fill the tick; tick() keeps them a floor
         (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
         carried = self.deferred_before
-        # A key a wait is blocked on goes ahead of every plain watch, deferred or not. huge-blue 2026-11-18 19:56Z: 740
-        # deferred keys, mostly plain watches, ahead of every wait, so deferred waited keys were ranked first; but a
-        # waited key read once (so not deferred) still sorted behind every deferred plain key when it came due again.
-        # huge-blue 2026-11-20 12:0xZ, 1154 deferred keys and ~4 PR reads a tick: every waited read cost a whole tick
-        # behind the backlog before it ranked (huge_blue_waited_age, TickBudgetTest).
-        return sorted(entries, key=lambda e: (not self.wait_confirms(e), not self.waited(e), e["key"] not in carried,
-                                              carried.get(e["key"], 0.0), self.last_read(e)))
+        # A head a consumer asked for that holds no answer yet (`glaeda-gh checks` on a new SHA) goes first of all, ahead
+        # of the carried backlog: it is read once a retry cycle at most and paid by its consumer's cap, so it cannot
+        # crowd the PRs out, and its asker waits on it (huge-blue 2026-11-20: unread for 10+ min behind ~1000 PRs).
+        # Among the deferred, a key a wait is blocked on (an interactive wait, a due land) goes ahead of every plain
+        # watch: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait; and at
+        # 21:5xZ a WAIT_PRIORITY head start was not enough, the share's few reads a minute went to older deferrals.
+        # Among those heads the one asked last goes first, and one never tried ahead of one that failed: under a backlog of
+        # asked heads (huge-blue 2026-11-20 17:1xZ: 20 never-read heads due, about 3 read a tick over a slow REST, GraphQL
+        # out) a new merge gate's head was read 4.5 min after it was asked, first in, first out behind asks whose waiters
+        # had mostly given up. Newest first serves the live waiter within a tick; the older asks are read as the burst
+        # drains, and a head nobody asks for again leaves at HEAD_INTEREST. They go ahead of the confirmations too: one
+        # head read answers a merge gate, a confirmation only a run wait that already has its finish.
+        # Then a key a wait is blocked on goes ahead of every plain watch, deferred or not: a waited key read once (so not
+        # deferred) sorted behind every deferred plain key when it came due again. huge-blue 2026-11-20 12:0xZ, 1154
+        # deferred keys and ~4 PR reads a tick: every waited read cost a whole tick behind the backlog before it ranked
+        # (huge_blue_waited_age, TickBudgetTest).
+        return sorted(entries, key=lambda e: (not self.head_unanswered(e), self.head_rank(e),
+                                              not self.wait_confirms(e),
+                                              not self.waited(e),
+                                              e["key"] not in carried,
+                                              carried.get(e["key"], 0.0),
+                                              self.last_read(e)))
+
+    def head_rank(self, e: dict) -> tuple[bool, float]:
+        """An asked head with no answer: (tried and failed, minus its newest ask), so the newest ask of a head never tried
+        sorts first (rest_order); (False, 0.0) for any other key."""
+        if not self.head_unanswered(e):
+            return False, 0.0
+        failed = bool((e.get("cache") or {}).get("error"))
+        return failed, -max((e.get("consumers") or {}).values(), default=0.0)
+
+    def head_direct_room(self) -> bool:
+        """Whether one more asked head with no answer may be read over REST past the daemon's share: the login's REST is
+        neither stopped nor under its floor, no secondary hold, and fewer than HEAD_DIRECT_MAX such reads this hour."""
+        self.head_direct_at = [t for t in self.head_direct_at if self.now - t < CONSUMER_WINDOW]
+        return (self.mode("rest") != "stop" and self.rest_above_floor() and self.clock() >= self.secondary_until
+                and len(self.head_direct_at) < HEAD_DIRECT_MAX)
+
+    def due_heads_direct(self, mine: list[dict]) -> list[dict]:
+        """The asked heads with no answer read over REST this tick though the daemon's REST share is spent and GraphQL
+        is stopped: a merge gate waits on each, and one head is a few requests. Charged to their consumers' caps
+        (due_heads), and to HEAD_DIRECT_MAX."""
+        asked = sorted((e for e in mine if self.head_unanswered(e)), key=self.head_rank)
+        if not asked or not self.head_direct_room():
+            return []
+        due = self.due_heads(asked, "normal")
+        out = due[:HEAD_DIRECT_MAX - len(self.head_direct_at)]
+        for e in due[len(out):]:
+            self.refund(e["key"])  # past the hourly bound: not read, so not charged
+            self.attempted.pop(e["key"], None)
+        self.head_direct_at += [self.now] * len(out)
+        return out
+
+    def head_unanswered(self, e: dict) -> bool:
+        """A head watch a consumer asked for within HEAD_INTEREST that holds no answer (never read, or only errors):
+        what an on-demand `glaeda-gh checks` is waiting on."""
+        if not e["key"].startswith("head:") or (e.get("cache") or {}).get("data"):
+            return False
+        return any(self.now - t < HEAD_INTEREST for t in (e.get("consumers") or {}).values())
 
     def fed(self, key: str) -> bool:
         """Whether the controller's webhooks cover this key's repository now: its feed answered within
@@ -6307,6 +6374,8 @@ class Daemon:
                                   and (e["cache"] or {}).get("jobsTried") != (((e["cache"] or {}).get("data") or {}).get("run_attempt") or 1)]
                 for e in self.jobs_only:
                     self.attempted[e["key"]] = self.now
+            if kind == "head":
+                self.heads_direct = self.due_heads_direct(mine)
             return []
         if kind == "head":
             # REST lean only because the daemon is past its own share (the yield): consumers are admitted as when
@@ -6592,6 +6661,7 @@ class Daemon:
         self.spill = []
         self.policy = daemon_policy()
         self.jobs_only = []
+        self.heads_direct = []
         self.settle_rest()  # a counter whose window ended leaves the reading to the others
         self.settle_counters("graphql")
         if self.failing is None:
@@ -6633,12 +6703,17 @@ class Daemon:
         # points read it first, and only what is left reads the rest (huge-blue 2026-11-18 21:5xZ: waited pr data
         # 3403 s old at 40 points/min while unblocked watches took the points).
         # The watches nothing is blocked on keep a floor first (PLAIN_FLOOR_EVERY): one batch of them per kind.
-        blocked = {kind: [e for e in due[kind] if self.waited(e)] for kind in kinds}
+        # An asked head with no answer (`checks` on a new SHA, a merge gate waiting on it) counts as blocked too, and the
+        # blocked heads go first: huge-blue 2026-11-20 15:45Z, a fresh merge-hold head sat unread behind 828 due PRs once
+        # pr moved to GraphQL (heads are never "waited", so they only had their round robin turn after the plain PRs).
+        urgent = lambda e: self.waited(e) or self.head_unanswered(e)  # noqa: E731
+        blocked = {kind: [e for e in due[kind] if urgent(e)] for kind in kinds}
+        blocked["head"].sort(key=self.head_rank)  # the newest ask of a head never tried first (rest_order)
         floor: set[str] = set()
-        for kind in kinds[first:] + kinds[:first]:
+        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
             if over[kind] != "graphql":
                 continue
-            plain = [e for e in due[kind] if not self.waited(e)]
+            plain = [e for e in due[kind] if not urgent(e)]
             # (a minute with none read since it was first due: a fresh daemon's first tick is no starvation)
             if plain and blocked[kind] and self.now - self.plain_at.setdefault(kind, self.now) >= PLAIN_FLOOR_EVERY:
                 chunk = plain[:max(1, self.batch[kind])]
@@ -6659,7 +6734,7 @@ class Daemon:
             if over[kind] == "graphql":
                 before = len(self.gql_log)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, [e for e in due[kind] if not self.waited(e) and e["key"] not in floor],
+                    spilled += self.batched(kind, [e for e in due[kind] if not urgent(e) and e["key"] not in floor],
                                             self.graphql_fetch[kind])
                 if len(self.gql_log) > before:
                     self.plain_at[kind] = self.now
@@ -6685,15 +6760,23 @@ class Daemon:
             # the floor (PLAIN_FLOOR_EVERY): the first watch nothing is blocked on goes next after the confirmations
             confirms = [e for e in over_rest if self.wait_confirms(e)]
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
+        plain_until = time.monotonic() + REST_PLAIN_BUDGET
         try:
             for i, e in enumerate(over_rest):
+                if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e)
+                                                            or self.head_unanswered(e)):
+                    self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order
+                    continue
                 # A read is admitted only when its worst case fits in the share, so the share holds at a
                 # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
                 kind = e["key"].split(":", 1)[0]
                 app_ok = bool(self.app_entries_eligible(kind, [e], "rest"))
                 if (self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[kind])) and not app_ok:
-                    self.to_graphql(over_rest[i:], spilled)
-                    break
+                    if kind == "head" and self.head_unanswered(e) and self.head_direct_room():
+                        self.head_direct_at.append(self.now)  # past the share, within HEAD_DIRECT_MAX (due_heads_direct)
+                    else:
+                        self.to_graphql(over_rest[i:], spilled)
+                        break
                 sent = len(self.sent)
                 self.resume_key, self.resume_from = "", float("inf")
                 cut = self.cut_reads.pop(e["key"], None)
@@ -6740,6 +6823,16 @@ class Daemon:
                     self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']} jobs: {describe(error)}")
+        for i, e in enumerate(self.heads_direct):
+            try:
+                with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
+                    self.fetch_head_rest(e)
+            except OutOfTime:
+                self.defer(self.heads_direct[i:])
+                break
+            except Exception as error:  # noqa: BLE001
+                self.refund(e["key"])
+                self.errors.append(f"{e['key']}: {describe(error)}")
         try:
             with self.phase("read waited"):
                 self.read_waited(entries, {e["key"] for e in prs + runs})
@@ -9763,8 +9856,15 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # The broker's own words for the same refusal count too: lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z, was
 # "unreadable" with "gh api graphql failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"
 # and took the 120 s retry until the reset.
+# This host's own read guards refuse for the same reason and say so in their own words: the gh-quota shim in
+# cache-only mode ("cache-only: not held in this host's caches") and glaeda-gh's sweep guard ("this caller read the
+# jobs of 30 different runs or jobs in the last 10 minutes"). gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553
+# and #12558 each stopped retry_deadline after about 6 h ("12928 s due and not judged, not counted" beside 21874 s
+# counted); the counted judgments were these words, each taking the 120 s retry and counting toward the PR's deadline.
 LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent"
-                               r"|\[RATE_LIMITED\]|not sent, retry after \d\d:\d\dZ")
+                               r"|\[RATE_LIMITED\]|not sent, retry after \d\d:\d\dZ"
+                               r"|cache-only: not held in this host's caches"
+                               r"|glaeda-gh(?:'s sweep guard refused|: refused: this caller read the jobs of)")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as land_judge's. Read on a step's output only, never on land_judge's reason (which
 # can quote a red job's log). Before, only land_judge's words parked a step: cmux#42244's update-branch was refused
@@ -16790,7 +16890,7 @@ def spend_lines(spend: Any) -> list[str]:
 # links ~/.local/lib/gh-quota/bin/gh-quota beside the gh shim. 2026-11-17: two hosts with only the second answered
 # "gh-quota usage gave nothing" and read as 0 REST while one of them alone spent about 760 an hour, so most of the
 # login's hour looked like calls from nowhere.
-FLEET_GH_QUOTA_PATHS = ("$HOME/.local/bin/gh-quota", "$HOME/.local/lib/gh-quota/bin/gh-quota")
+FLEET_GH_QUOTA_PATHS = tuple(f"$HOME/{p}" for p in GH_QUOTA_PATHS)
 FLEET_HOST_SCRIPT = (
     'd="${GLAEDA_GH_DIR:-$HOME/.cache/glaeda/gh}"; '
     'echo "@@budget"; cat "$d/budget.json" 2>/dev/null; echo; '
