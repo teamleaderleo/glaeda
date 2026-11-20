@@ -478,6 +478,21 @@ jobs:
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
 
+  # Python 3.9 compatibility is independent of the native script suite. In run 44640775409
+  # that suite passed, but left only 17 seconds for the updater before the shared timeout.
+  mini-python-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+
       # The PR minis run the LAN fetch broker under macOS's /usr/bin/python3, which is 3.9.
       - name: Set up the minis' Python
         id: mini-python
@@ -877,7 +892,7 @@ jobs:
   ci-status:
     name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda') }}
-    needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
+    needs: [changes, go, scripts, mini-python-tests, runner-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
