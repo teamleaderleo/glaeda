@@ -981,6 +981,10 @@ class MiniSetupTest(unittest.TestCase):
         for name in ms.LINUX_UNITS:
             expected = (ROOT / "ops/systemd" / name).read_bytes().replace(b"@GLAEDA_ROLE@", b"devbox")
             self.assertEqual((units / name).read_bytes(), expected, name)
+        self.assertIn(
+            b"Environment=PATH=%h/.local/lib/gh-quota/bin:%h/.local/bin:",
+            (units / "glaeda-gh.service").read_bytes(),
+        )
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         self.assertTrue((self.home / ".local/state").is_dir())
