@@ -566,6 +566,44 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(fam.reclaimable and fam.git_disposable and not fam.bulk_sizes)
         self.assertIn("com.apple.", fam.skip_prefixes)
 
+    def test_node_products_go_by_age_only_on_a_mini_no_cmux_runner_reaches(self) -> None:
+        """NODE_PRODUCTS_UNREAD (cmux24, 2026-11-20): node-products is bounded only by a cmux job, so on a mini whose
+        runners all serve other repositories it goes by age; any runner that may take a cmux job, an org runner of
+        manaflow-ai, or an unreadable config keeps it report only."""
+        users = self.root / "Users"
+
+        def runner(home: str, name: str, url: str | None) -> None:
+            r = users / home / name
+            r.mkdir(parents=True)
+            (r / ".runner").write_text("{not json" if url is None else json.dumps({"gitHubUrl": url}))
+
+        (users / "Shared" / "cmux-build-fleet").mkdir(parents=True)
+        runner("cmux", "actions-runner-glaeda-hq-census", "https://github.com/manaflow-ai/cmuxterm-hq")
+        runner("cmux", "actions-runner-glaeda-hq-report", "https://github.com/manaflow-ai/cmuxterm-hq")
+        runner("other", "actions-runner-x", "https://github.com/teamleaderleo/glaeda")
+        (users / "cmux" / "actions-runner-unconfigured").mkdir()
+        self.assertFalse(gd.cmux_runner_on_host(users), "only HQ and glaeda runners: no cmux reader")
+        for url in ("https://github.com/manaflow-ai/cmux", "https://github.com/Manaflow-AI/cmux.git",
+                    "https://github.com/manaflow-ai", None):
+            shutil.rmtree(users / "pool", ignore_errors=True)
+            runner("pool", "actions-runner-glaeda-1", url)
+            self.assertTrue(gd.cmux_runner_on_host(users), url)
+        self.assertTrue(gd.cmux_runner_on_host(self.root / "missing"), "an unreadable /Users fails closed")
+        shutil.rmtree(users / "pool")
+        fleet = users / "Shared" / "cmux-build-fleet"
+        (fleet / "node-products").mkdir()
+        saved = (gd.DARWIN, gd.cmux_runner_on_host, gd.FLEET_ROOT)
+        try:
+            gd.DARWIN, gd.FLEET_ROOT = True, fleet
+            for on_host in (False, True):
+                gd.cmux_runner_on_host = lambda on_host=on_host: on_host
+                fam = next(f for f in gd.default_families() if f.id == "cmux-node-products")
+                self.assertEqual(fam.reclaimable, not on_host)
+                if not on_host:
+                    self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+        finally:
+            gd.DARWIN, gd.cmux_runner_on_host, gd.FLEET_ROOT = saved
+
     def _clone_tree(self) -> tuple[Path, Path]:
         user_tmp, clones = self.root / "T", self.root / "X"
         user_tmp.mkdir()

@@ -1910,6 +1910,37 @@ class HookTest(unittest.TestCase):
             hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() - 1, busy=lambda _r: False)
         self.assertTrue((pr / "_work" / "cmux" / "cmux").exists())
 
+    def test_idle_runner_eviction_takes_an_idle_dedicated_runners_work_past_an_hour(self) -> None:
+        """cmux24, 2026-11-20: a mini with only HQ's dedicated runners; a dedicated job short of disk "removed 0 idle
+        runners' work dir(s)" because every runner was dedicated. An idle dedicated runner's work unused for an hour
+        now goes; one used within the hour, one keeping warm state by role (ROLE_KEEP_MARKER) and a busy one stay."""
+        old = time.time() - 2 * 3600
+
+        def dedicated(name: str, age: float | None) -> Path:
+            runner = self.dir / f"actions-runner-glaeda-{name}"
+            checkout = runner / "_work" / "cmuxterm-hq" / "cmuxterm-hq"
+            (checkout / ".git").mkdir(parents=True)
+            (checkout / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+            write_hook(runner, "exec python3 /hook job-started --min-free-gib 30 --dedicated-admit /a.sh\n")
+            if age is not None:
+                for p in (checkout / ".git" / "HEAD", checkout / ".git", checkout, checkout.parent, runner / "_work"):
+                    os.utime(p, (age, age))
+            return checkout
+
+        stale = dedicated("hq-census", old)
+        fresh = dedicated("hq-fleet-route", None)
+        kept = dedicated("nightly-next", old)
+        (kept.parents[2] / hook.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(kept)]))
+        busy = dedicated("hq-report", old)
+        with mock.patch.object(hook, "free_gib", return_value=1.0):
+            note = hook.evict_idle_runners(self.dir, os.fspath(self.dir), 30, time.monotonic() + 60,
+                                           busy=lambda r: r.name == "actions-runner-glaeda-hq-report")
+        self.assertIn("removed 1 idle runners' work dir(s), skipped 1 busy runner(s)", note)
+        self.assertFalse(stale.exists(), "an idle dedicated runner's work unused for an hour goes")
+        self.assertTrue(fresh.exists(), "one used within the hour stays")
+        self.assertTrue(kept.exists(), "one kept by role stays")
+        self.assertTrue(busy.exists(), "a busy one stays")
+
     def test_a_job_the_runner_takes_during_an_eviction_waits_for_it_and_gets_its_workspace_back(self) -> None:
         """The busy check and the rename are one step under the runner's EVICT_RUNNER_LOCK: a job the runner acquires
         meanwhile waits in job-started for that lock (wait_runner_work) before any of its steps runs, and finds its

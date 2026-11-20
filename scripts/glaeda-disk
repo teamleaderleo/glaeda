@@ -1261,6 +1261,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "2bd1bb546c93508b79e94e4fe836b3798dd87ede6264fd889ebfcbf4b689fea1",
     "6f0315903ea64141e419b8fd7ea6014efdc02fea4d3f636603e020a32ef44ca6",
     "3eb9db30429a8c15644f4ad069605209f7354296d0d1f0a0e575e7d8dfcd6a54",
+    "81e78f7dc1354ce0330807f3a229eb471b953497d98a7c19a085b944a68326f3",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5013,6 +5014,62 @@ def hq_cache_family(root: Path | None = None) -> Family:
 CMUX_DEBUG_APP_PREFIX = "com.cmuxterm.app.debug."  # a tagged DEV build's bundle id, never a release app's
 
 
+# NODE_PRODUCTS_UNREAD: cmux's node product cache (FLEET_ROOT/node-products, up to 24 GiB) is bounded only by
+# node_product_cache.py, which only a cmux CI job runs. A mini that left the cmux pool for other runners keeps what
+# its last cmux job left there for good: cmux24 (2026-11-20) runs only HQ's owner-only dedicated runners and sat at
+# 20 GiB free under the 30 GiB floor with /Users/Shared/cmux-build-fleet at 23 of /Users/Shared's 25 GiB. On a mini
+# where no runner of any account can take a manaflow-ai/cmux job, the family goes by age instead of report only.
+CMUX_RUNNER_OWNER = "manaflow-ai"
+CMUX_RUNNER_REPO = "cmux"
+
+
+def runner_serves_cmux(runner: Path) -> bool:
+    """Whether a GitHub runner directory can take a manaflow-ai/cmux job: its .runner gitHubUrl names that repository
+    or the manaflow-ai organization (an org runner takes any of its repositories). Unreadable or unparseable is
+    True."""
+    try:
+        doc = json.loads((runner / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return True
+    url = doc.get("gitHubUrl") if isinstance(doc, dict) else None
+    if not isinstance(url, str):
+        return True
+    m = re.fullmatch(r"https://github\.com/([^/\s]+)(?:/([^/\s]+?))?(?:\.git)?/?", url.strip())
+    if m is None:
+        return True
+    owner, repo = m.group(1).lower(), (m.group(2) or "").lower()
+    return owner == CMUX_RUNNER_OWNER and repo in ("", CMUX_RUNNER_REPO)
+
+
+def cmux_runner_on_host(users: Path | None = None) -> bool:
+    """Whether any account on this Mac may run a manaflow-ai/cmux CI job: a configured runner directory
+    (actions-runner*/.runner) in any home under /Users that serves cmux (runner_serves_cmux). Fails closed: off macOS,
+    an unreadable /Users, home or runner directory reads as True."""
+    if users is None:
+        if not DARWIN:
+            return True
+        users = Path("/Users")
+    try:
+        homes = [h for h in users.iterdir() if h.is_dir() and not h.is_symlink()]
+    except OSError:
+        return True
+    for home in homes:
+        try:
+            runners = [r for r in home.iterdir() if r.name.startswith("actions-runner")]
+        except OSError:
+            if home.name in ("Shared", "Guest"):  # no account runs from these
+                continue
+            return True
+        for runner in runners:
+            try:
+                configured = (runner / ".runner").exists()
+            except OSError:
+                return True
+            if configured and runner_serves_cmux(runner):
+                return True
+    return False
+
+
 PERSONAL_BUILD_FAMILY = "personal-build"
 PERSONAL_BUILDS = ("cmux-personal-build",)  # ~/Projects/<name>: someone's own build tree, kept and named
 
@@ -5248,10 +5305,19 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         fams.append(Family("cmux-git-mirror", Path("/Users/Shared/cmux-build-fleet/git"), False,
                            "report only: kept by role, the fleet git mirror jobs fetch from",
                            owner="glaeda-git-mirror", platform="macos"))
-        # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB).
-        fams.append(Family("cmux-node-products", Path("/Users/Shared/cmux-build-fleet/node-products"), False,
-                           "report only: its owner evicts LRU to a 24 GiB budget",
-                           owner="cmux node_product_cache.py", platform="macos"))
+        # Bounded by its owner: node_product_cache.py evicts LRU to CMUX_NODE_PRODUCT_CACHE_MAX_BYTES (24 GiB). Only a
+        # cmux job runs that owner, so on a mini no cmux job reaches (cmux_runner_on_host) nothing ever evicts it: it
+        # goes by age there (NODE_PRODUCTS_UNREAD).
+        if cmux_runner_on_host():
+            fams.append(Family("cmux-node-products", FLEET_ROOT / "node-products", False,
+                               "report only: its owner evicts LRU to a 24 GiB budget",
+                               owner="cmux node_product_cache.py", platform="macos"))
+        else:
+            fams.append(Family("cmux-node-products", FLEET_ROOT / "node-products", True,
+                               "a cmux job on this mini, if one comes back, builds the product again",
+                               min_idle_hours=DEFAULT_AGE_HOURS,
+                               owner="cmux node_product_cache.py (no cmux runner on this mini)",
+                               rebuild_minutes=2, platform="macos"))
         if mirror_host:
             fams.append(Family(HOME_SCRATCH_FAMILY, HOME, True, "the lane that left it clones or builds it again",
                                skip=HOME_SCRATCH_KEEP, skip_prefixes=HOME_SCRATCH_KEEP_PREFIXES, git_disposable=True,

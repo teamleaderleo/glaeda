@@ -4730,6 +4730,43 @@ def prejob_evict(path: str, min_free_gib: float, explicit: str | None, wait_s: f
 #     refused only if both left it short.
 NIGHTLY_DISK_WANT = "disk"
 IDLE_EVICT_TRASH = ".glaeda-evict-"  # a renamed work dir being deleted; a leftover one is garbage by construction
+# A dedicated runner's idle work goes too (evict_idle_runners), unless it keeps warm state by role (glaeda-disk's
+# ROLE_KEEP_MARKER, which glaeda-cmux-runner --dedicated writes for the nightly-next builder) or a job of it used that
+# work within DEDICATED_WORK_IDLE_HOURS (glaeda-disk's DEFAULT_AGE_HOURS, Leo's one hour). cmux24 (2026-11-20) runs
+# only HQ's owner-only dedicated runners: at 20 GiB free a dedicated job's eviction "removed 0 idle runners' work
+# dir(s)", because every runner it looked at was dedicated and skipped.
+ROLE_KEEP_MARKER = ".glaeda-keep.json"
+DEDICATED_WORK_IDLE_HOURS = 1.0
+
+
+def runner_work_last_use(runner: Path) -> float:
+    """When a job of this runner last used its work: the newest mtime of its _work, each checkout's git bookkeeping
+    (a checkout step rewrites the index, HEAD and FETCH_HEAD) and its _diag Worker logs (a job writes one from start
+    to end). Anything unreadable reads as now."""
+    times = [0.0]
+    try:
+        times.append((runner / "_work").stat().st_mtime)
+        for work in idle_work_dirs(runner):
+            for p in (work, work / ".git", *(work / ".git" / n for n in ("index", "HEAD", "FETCH_HEAD"))):
+                with contextlib.suppress(FileNotFoundError):
+                    times.append(p.lstat().st_mtime)
+        with contextlib.suppress(FileNotFoundError), os.scandir(runner / "_diag") as logs:
+            for e in logs:
+                if e.name.startswith("Worker_"):
+                    with contextlib.suppress(FileNotFoundError):
+                        times.append(e.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return time.time()
+    return max(times)
+
+
+def dedicated_work_evictable(runner: Path, now: float | None = None) -> bool:
+    """A dedicated runner whose idle work a nightly job short of disk may take: no role keep marker, and its work
+    unused for DEDICATED_WORK_IDLE_HOURS."""
+    now = time.time() if now is None else now
+    if os.path.lexists(runner / ROLE_KEEP_MARKER):
+        return False
+    return now - runner_work_last_use(runner) >= DEDICATED_WORK_IDLE_HOURS * 3600
 
 
 def builder_reserve_gib(home: Path, skip: Path | None = None) -> float:
@@ -4966,9 +5003,9 @@ def wait_runner_work(workspace: Path | None, wait_s: float = EVICT_TIMEOUT_S) ->
 def evict_idle_runners(home: Path, path: str, target_gib: float, deadline: float,
                        busy: Callable[[Path], bool] | None = None) -> str:
     """For a nightly job short of disk (NIGHTLY_DISK_RESERVE): take the idle_work_dirs of every runner under home
-    that is not a dedicated builder and has no job (take_runner_work; runner_busy_now counts anything it cannot read
-    as busy), least recently used runner first, and delete them, until free disk reaches target_gib or the deadline
-    (monotonic) passes. A note; never raises."""
+    that has no job (take_runner_work; runner_busy_now counts anything it cannot read as busy) and is a pool runner
+    or a dedicated one whose work may go (dedicated_work_evictable), least recently used runner first, and delete
+    them, until free disk reaches target_gib or the deadline (monotonic) passes. A note; never raises."""
     busy = busy or runner_busy_now
     before = free_or_none(path)
     removed, skipped = 0, 0
@@ -4976,7 +5013,9 @@ def evict_idle_runners(home: Path, path: str, target_gib: float, deadline: float
         runners = []
         for runner in home.glob("actions-runner-glaeda*"):
             work = runner / "_work"
-            if runner.is_symlink() or work.is_symlink() or not work.is_dir() or runner_scope(runner).dedicated:
+            if runner.is_symlink() or work.is_symlink() or not work.is_dir():
+                continue
+            if runner_scope(runner).dedicated and not dedicated_work_evictable(runner):
                 continue
             for trash in work.glob(f"{IDLE_EVICT_TRASH}*"):  # an earlier eviction ran out of time or died
                 if time.monotonic() < deadline:
@@ -14157,7 +14196,9 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
             if swept := sweep_dead_holders(args.state_dir):
                 print(f"{PREFIX}: removed {len(swept)} dead lock holder file(s): {', '.join(swept)}", flush=True)
-    if args.phase == "job-started" and not args.dedicated_admit:
+    # every runner, a dedicated one too: another job's eviction may take an idle dedicated runner's work
+    # (dedicated_work_evictable), so its job waits for that the same way
+    if args.phase == "job-started":
         note = None
         with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
             note = wait_runner_work(JOB_CWD)
