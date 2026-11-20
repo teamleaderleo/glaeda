@@ -5815,6 +5815,48 @@ class FleetBudgetTest(Base):
         self.assertIn("gcp-agent-lane-7: no broker:gcp-agent-lane-7 row on any read host, and its own log was not "
                       "read", text)
 
+    def test_a_slow_sweep_is_kept_its_ttl_from_when_it_ended(self) -> None:
+        """Router review of glaeda#2248, F1: the lane VMs' read is a third FLEET_HOST_TIMEOUT phase, and a 75 s sweep
+        timed from its start was past the 60 s TTL when written, so the next caller swept all three phases again."""
+        now, clock, asked = time.time(), [0.0], []
+        reports = self.reports(now)
+        reports["gcp-agent-lane-9"] = {"budget": {}, "daemon": None, "usage": []}
+
+        def fetch(host: str, local: bool) -> dict:
+            asked.append(host)
+            if host == "gcp-agent-lane-9":
+                clock[0] += 75.0  # the VM phase ends 75 s after the sweep started
+            return reports.get(host) or {"error": "unreachable (exit 4: x)"}
+        view = lambda: {"ok": False, "error": "no lane-gh here"}  # noqa: E731
+        with mock.patch.object(gg, "FLEET_BUDGET_TIMER", lambda: clock[0], create=True), \
+                mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_LANE_VMS": "gcp-agent-lane-9"}):
+            first = gg.fleet_budget(now, fetch=fetch, view=view)
+            swept = len(asked)
+            again = gg.fleet_budget(now + 80, fetch=fetch, view=view)  # 80 s after it started, 5 s after it ended
+            self.assertEqual(len(asked), swept)
+            self.assertEqual(again["at"], first["at"])
+            self.assertEqual(first["keptFrom"], now + 75)
+            gg.fleet_budget(now + 136, fetch=fetch, view=view)  # 61 s after it ended: read again
+            self.assertEqual(len(asked), 2 * swept)
+
+    def test_a_lane_vm_named_twice_is_read_once(self) -> None:
+        """Router review of glaeda#2248, F3: GLAEDA_GH_BUDGET_LANE_VMS=lane,lane started two reads of one VM, and the
+        last to finish won, so a failed read could replace a good one."""
+        now, asked = time.time(), []
+        reports = self.reports(now)
+        reports["gcp-agent-lane-9"] = {"budget": {}, "daemon": None,
+                                       "usage": [{"caller": "session:glaeda-land", "rest": 386, "graphql": 117}]}
+
+        def fetch(host: str, local: bool) -> dict:
+            asked.append(host)
+            return reports.get(host) or {"error": "unreachable (exit 4: x)"}
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_BUDGET_LANE_VMS": "gcp-agent-lane-9, gcp-agent-lane-9"}):
+            doc = gg.fleet_budget(now, fetch=fetch, view=lambda: {"ok": False, "error": "no lane-gh here"})
+        self.assertEqual(asked.count("gcp-agent-lane-9"), 1)
+        self.assertEqual(doc["total"]["laneVms"]["read"], ["gcp-agent-lane-9"])
+        self.assertEqual(gg.sweep_rows(["far", "far"], "here", now, fetch).keys(), {"far"})
+        self.assertEqual(asked.count("far"), 2)  # once in the sweep, once in sweep_rows
+
     def test_unread_host_is_not_zero_and_the_total_is_a_lower_bound(self) -> None:
         """2026-11-19 on cosmic-gray: three Linux hosts "reported 0" while unread, and the sum explained
         far less than the ~3000 REST spent. A host or lane VM whose spend was not read is unread with its reason."""

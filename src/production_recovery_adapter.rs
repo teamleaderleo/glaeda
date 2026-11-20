@@ -819,14 +819,19 @@ mod tests {
         }
     }
 
+    // PID and clock alone collided between two tests of one binary (glaeda#2244's CI): a counter keeps each
+    // fixture path distinct (router review of glaeda#2249, F1).
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn real_fixture() -> (PathBuf, RunnerEnrollmentReceipt, PathBuf, FreshIdentity) {
         let root = std::env::temp_dir().join(format!(
-            "glaeda-admission-{}-{}",
+            "glaeda-admission-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(&root).unwrap();

@@ -443,9 +443,12 @@ SPENDERS_TOP = 3
 # Where lane-gh does not answer (a host that is no broker client), each host is one `reach HOST sh -c ...` printing
 # the files it already keeps (budget.json, daemon.json) and its `gh-quota usage --json`; an ssh that fails or times
 # out is that host "unreachable", never the command failing. Either answer is kept FLEET_BUDGET_TTL, so any number of
-# sessions asking cost one read a minute.
+# sessions asking cost one read a minute. The TTL runs from when the read ended ("keptFrom"), not from its "at": the
+# host sweep then the lane VMs' is up to three FLEET_HOST_TIMEOUT phases, and a 75 s sweep timed from its start was
+# already stale when written, so the next caller swept again (router review of glaeda#2248, F1).
 FLEET_BUDGET_FILE = "fleet-budget.json"
 FLEET_BUDGET_TTL = 60.0
+FLEET_BUDGET_TIMER = time.monotonic  # how long a read took (a test steps it)
 FLEET_HOST_TIMEOUT = 25.0  # one host's ssh and its gh-quota usage; past it the host is "unreachable (timed out)"
 FLEET_BUDGET_HOSTS = ("huge-blue", "cosmic-gray", "air-blue")  # the shared login's hosts, if the registry is not found
 FLEET_CALLERS_TOP = 8  # callers per host in the text; --json keeps every one
@@ -17023,6 +17026,7 @@ def sweep_rows(names: list[str], me: str, clock: float, fetch: Callable[[str, bo
         except Exception as error:  # a host's read is never the command failing
             reports[host] = {"error": f"unreachable ({type(error).__name__})"}
 
+    names = list(dict.fromkeys(names))  # one read per name (router review of glaeda#2248, F3)
     threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in names]
     for t in threads:
         t.start()
@@ -17040,8 +17044,9 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     no read host's broker:VM rows carry is read itself (its own gh-quota log names every call it sent through its
     broker), so a VM whose broker host is unread or idle is a row of its own, not "no broker:VM row". The coordinator,
     2026-11-20: "budget can't read lane VMs ('no broker:VM row'), so the biggest spender is invisible" (cosmic-gray at
-    23:39Z the night before: 280 of 542 REST unattributed). Only the VMs no read host carries are read: none when every
-    broker host answers."""
+    23:39Z the night before: 280 of 542 REST unattributed). Only the VMs no read host carries are read, but that
+    includes an idle VM whose broker host answered with no row for it: one `reach` per such VM per sweep, all at once
+    within FLEET_HOST_TIMEOUT, at most once per FLEET_BUDGET_TTL (router review of glaeda#2248, F2)."""
     hosts = fleet_hosts()
     me = hosts[0]
     rows = sweep_rows(hosts, me, clock, fetch)
@@ -17064,8 +17069,8 @@ def fleet_lane_vms() -> list[str]:
     """The lane VMs that spend the login through a broker: GLAEDA_GH_BUDGET_LANE_VMS (comma-separated; set and empty
     is none), else the fleet registry's machines marked agent_vm and not retired."""
     env = os.environ.get("GLAEDA_GH_BUDGET_LANE_VMS")
-    if env is not None:
-        return [v.strip() for v in env.split(",") if v.strip()]
+    if env is not None:  # each name once: two reads of one VM race, and a failed one could replace a good one (F3)
+        return list(dict.fromkeys(v.strip() for v in env.split(",") if v.strip()))
     for doc in fleet_registries():
         machines = doc.get("machines")
         if isinstance(machines, dict) and machines:
@@ -17152,9 +17157,10 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
         fcntl.flock(lock, fcntl.LOCK_EX)
         clock = time.time() if now is None else now
         cached = read_json(path)
-        if isinstance(cached, dict) and isinstance(cached.get("at"), (int, float)) \
-                and 0 <= clock - cached["at"] < FLEET_BUDGET_TTL:
+        kept = cached.get("keptFrom", cached.get("at")) if isinstance(cached, dict) else None
+        if isinstance(kept, (int, float)) and not isinstance(kept, bool) and 0 <= clock - kept < FLEET_BUDGET_TTL:
             return cached
+        started = FLEET_BUDGET_TIMER()
         doc: dict[str, Any] = {"at": clock, "thisHost": policy_host(), "hardReserve": hard_reserve()}
         try:
             seen = view()
@@ -17164,6 +17170,7 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
             doc.update(source="spend_view", view=seen["data"])
         else:
             doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
+        doc["keptFrom"] = clock + max(0.0, FLEET_BUDGET_TIMER() - started)
         write_json(path, doc)
         return doc
 

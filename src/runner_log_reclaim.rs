@@ -814,14 +814,19 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
 
+    // PID and clock alone collided between two tests of one binary (glaeda#2244's CI): a counter keeps each
+    // fixture path distinct (router review of glaeda#2249, F1).
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn fixture() -> (PathBuf, RunnerEnrollmentReceipt) {
         let temp = std::env::temp_dir().join(format!(
-            "glaeda-runner-log-reclaim-{}-{}",
+            "glaeda-runner-log-reclaim-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&temp).expect("temp root");
         let temp = fs::canonicalize(temp).expect("canonical fixture");
