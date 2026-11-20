@@ -16,6 +16,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -40,10 +41,12 @@ BAD_IP = "127.0.0.3"    # edge A: what the system resolver gives
 
 class Edge:
     """A fake api.github.com edge at IP:PORT. mode: ok (200 with rate-limit headers), drop (every SYN dropped),
-    403 (a bare 403, as the bad edge answered), 403rl (a 403 with rate-limit headers: GitHub's own refusal)."""
+    403 (a bare 403, as the bad edge answered), 403rl (a 403 with rate-limit headers: GitHub's own refusal), once
+    (200, then the connection is closed with no Connection: close, as GitHub closes an idle kept one).
+    hits: connections accepted; requests: requests answered."""
 
     def __init__(self, ip: str, port: int, mode: str, cert: Path, key: Path):
-        self.ip, self.mode, self.hits = ip, mode, 0
+        self.ip, self.mode, self.hits, self.requests = ip, mode, 0, 0
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((ip, port))
@@ -87,7 +90,15 @@ class Edge:
                     buf += data
                 head, _, buf = buf.partition(b"\r\n\r\n")
                 path = head.split(b" ")[1].decode()
-                if self.mode == "ok":
+                length = int((re.search(rb"(?im)^content-length:\s*(\d+)", head) or [b"", b"0"])[1])
+                while len(buf) < length:
+                    data = tls.recv(4096)
+                    if not data:
+                        return
+                    buf += data
+                buf = buf[length:]
+                self.requests += 1
+                if self.mode in ("ok", "once"):
                     status, extra = "200 OK", "X-RateLimit-Limit: 60\r\nX-RateLimit-Remaining: 59\r\n"
                 elif self.mode == "403rl":
                     status, extra = "403 Forbidden", "X-RateLimit-Limit: 60\r\nX-RateLimit-Remaining: 0\r\n"
@@ -96,6 +107,8 @@ class Edge:
                 body = json.dumps({"edge": self.ip, "path": path}).encode()
                 tls.sendall(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}"
                             f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                if self.mode == "once":
+                    return
         except (OSError, ssl.SSLError, IndexError):
             pass
         finally:
@@ -160,9 +173,11 @@ class EdgeRetry(unittest.TestCase):
         gg.log = self.logged.append
         if hasattr(gg, "EDGE"):
             gg.EDGE.reset()
+        gg.KEPT.drop()
 
     def tearDown(self):
         gg.log = self.saved_log
+        gg.KEPT.drop()
         os.environ.clear()
         os.environ.update(self.saved_env)
         self.good.close()
@@ -211,6 +226,42 @@ class EdgeRetry(unittest.TestCase):
         self.assertEqual((status, body["edge"]), (200, GOOD_IP))
         [line] = self.retries()
         self.assertEqual((line["from"], line["to"], line["why"]), (BAD_IP, GOOD_IP, "edge-403"))
+
+    def test_reads_ride_one_kept_connection(self):
+        # huge-blue, 2026-11-20: a new TCP and TLS connection per request, on a path that lost about two SYNs in five,
+        # made each REST read ~2-4 s (7 s connects) where a kept connection answered in 0.2 s.
+        os.environ["GLAEDA_EDGE_TEST_RESOLVE"] = f"api.github.com={GOOD_IP}"
+        for _ in range(3):
+            self.assertEqual(self.zen(), (200, {"edge": GOOD_IP, "path": "/zen"}))
+        status, _, _ = gg.http("POST", gg.API + "/graphql", {"Content-Type": "application/json"},
+                               json.dumps({"query": "query{viewer{login}}", "variables": {}}).encode())
+        self.assertEqual(status, 200)
+        self.assertEqual((self.good.hits, self.good.requests), (1, 4))
+        self.assertEqual(gg.EDGE.last_ip(), GOOD_IP)
+
+    def test_a_write_never_rides_or_is_sent_again(self):
+        os.environ["GLAEDA_EDGE_TEST_RESOLVE"] = f"api.github.com={GOOD_IP}"
+        self.zen()
+        gg.http("POST", gg.API + "/repos/o/r/issues/1/comments", {}, b'{"body": "x"}')
+        gg.http("POST", gg.API + "/graphql", {}, json.dumps({"query": "mutation{x}", "variables": {}}).encode())
+        self.assertEqual((self.good.hits, self.good.requests), (3, 3))  # each write on its own connection
+        self.assertFalse(gg.keepalive_ok("DELETE", gg.API + "/repos/o/r/issues/1/labels/x", None))
+
+    def test_a_kept_connection_closed_by_the_server_is_read_again_on_a_new_one(self):
+        self.good.mode = "once"
+        os.environ["GLAEDA_EDGE_TEST_RESOLVE"] = f"api.github.com={GOOD_IP}"
+        self.assertEqual(self.zen()[0], 200)
+        time.sleep(0.2)  # the edge has closed it
+        self.assertEqual(self.zen()[0], 200)
+        self.assertEqual((self.good.hits, self.good.requests), (2, 2))
+
+    def test_an_idle_kept_connection_is_not_reused(self):
+        os.environ["GLAEDA_EDGE_TEST_RESOLVE"] = f"api.github.com={GOOD_IP}"
+        self.zen()
+        conn, host, _ = gg.KEPT.local.conn
+        gg.KEPT.local.conn = (conn, host, time.monotonic() - gg.KEEPALIVE_IDLE - 1)
+        self.zen()
+        self.assertEqual(self.good.hits, 2)
 
     def test_rate_limited_403_is_not_retried(self):
         self.bad = Edge(BAD_IP, self.good.port, "403rl", self.cert, self.key)

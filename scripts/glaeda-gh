@@ -320,6 +320,7 @@ import shlex
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -367,6 +368,7 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # reset (or a re-exec, or a stop below the reserve) every watched PR is due in the same tick, and a burst of them is
 # what the shared login cannot spend for lands. Past it the reads wait for the next tick, first in line (deferred).
 GRAPHQL_PER_MINUTE = 40
+GQL_EXPECT_LAST = 5  # a kind's last queries gql_expected takes the most of
 # A key a wait is blocked on (here, or a lane VM's through the broker) while the reserve alone stops GraphQL
 # (Daemon.read_waited). huge-blue, 2026-11-16: GraphQL under the fleet's 1000-point reserve 5.5 of 14 hours, REST at
 # the daemon's share or under its own reserve for most of them, and every read stopped with it: 151 PR reads in the
@@ -2033,12 +2035,105 @@ def hard_deadline(seconds: float, error: type[BaseException] = DeadlineTimeout):
         signal.signal(signal.SIGALRM, previous)
 
 
+# Kept-alive connections. Every request used to open its own TCP and TLS connection (urllib's opener closes it after
+# one answer). huge-blue, 2026-11-20 20:0xZ: from there about two connects in five to api.github.com lost their SYN
+# (a 7 s connect, or EDGE_CONNECT_TIMEOUT and a retry on another edge; 498 edge-retry lines in the log's tail, 287 with
+# no edge left), so the daemon's REST reads averaged 4.3 s each (626 s of GitHub time for 146 requests in ten minutes)
+# while a request on an open connection took 0.2-0.5 s, and its ticks spent ~600 s per 600 s in "read rest". Now each
+# thread keeps one connection to api.github.com open for the next read (KEPT). Only reads ride it: a GET, or a
+# GraphQL query that is not a mutation, and only those are sent again, once, on a new connection when a kept one
+# turns out closed (GitHub closes idle ones; nothing was answered). A write (the outbox's POSTs, DELETEs, mutations)
+# opens its own connection as before, so a write is never sent twice. A connection idle past KEEPALIVE_IDLE is closed
+# rather than reused: a NAT or firewall may have dropped it, and a read on a dead one waits SOCKET_TIMEOUT.
+KEEPALIVE_IDLE = 20.0
+KEEPALIVE_RETRY = (http_client.RemoteDisconnected, http_client.BadStatusLine, http_client.CannotSendRequest,
+                   ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                   ssl.SSLEOFError, ssl.SSLZeroReturnError)
+GRAPHQL_MUTATION = re.compile(rb'"query"\s*:\s*"\s*mutation\b')
+
+
+class KeptConnections:
+    """One kept-alive connection to api.github.com per thread (http.client is not thread-safe)."""
+
+    def __init__(self) -> None:
+        self.local = threading.local()
+        self.opened = 0  # connections opened, for tests and benchmarks
+
+    def drop(self) -> None:
+        held = getattr(self.local, "conn", None)
+        self.local.conn = None
+        if held is not None:
+            with contextlib.suppress(Exception):
+                held[0].close()
+
+    def take(self, host: str) -> tuple[http_client.HTTPSConnection, bool]:
+        """(a connection, whether it was kept from an earlier request)."""
+        held = getattr(self.local, "conn", None)
+        if held is not None and held[1] == host and time.monotonic() - held[2] < KEEPALIVE_IDLE:
+            return held[0], True
+        self.drop()
+        self.opened += 1
+        return EdgeHTTPSConnection(host, timeout=SOCKET_TIMEOUT), False
+
+    def request(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, dict, bytes]:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        target = parts.path + (f"?{parts.query}" if parts.query else "")
+        while True:
+            conn, kept = self.take(host)
+            self.local.conn = None  # held by this request only; given back below once its answer is whole
+            try:
+                if kept:
+                    EDGE.local.ip = getattr(conn, "edge_ip", None)
+                conn.request(method, target, body=body, headers=headers)
+                response = conn.getresponse()
+                data = response.read(MAX_BODY)
+                whole = response.isclosed() or not response.read(1)
+            except KEEPALIVE_RETRY:
+                with contextlib.suppress(Exception):
+                    conn.close()
+                if kept:
+                    continue  # the kept connection was closed under it: nothing was answered, a new one reads it
+                raise
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    conn.close()
+                raise
+            if not kept:
+                conn.edge_ip = EDGE.last_ip()
+            if whole and not response.will_close:
+                self.local.conn = (conn, host, time.monotonic())
+            else:
+                conn.close()
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, data
+
+
+KEPT = KeptConnections()
+
+
+def keepalive_ok(method: str, url: str, body: bytes | None) -> bool:
+    """Whether this request may ride a kept connection, and be sent again on a new one (KEPT): a read to api.github.com
+    with no proxy in the way."""
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host not in EDGE_HOSTS:
+        return False
+    proxies = urllib.request.getproxies()
+    if (proxies.get("https") or proxies.get("all")) and not urllib.request.proxy_bypass(host):
+        return False  # through a proxy: urllib's opener, as before
+    if method == "GET":
+        return True
+    return method == "POST" and url == API + "/graphql" and not GRAPHQL_MUTATION.search(body or b"")
+
+
 def http(method: str, url: str, headers: dict[str, str], body: bytes | None = None) -> tuple[int, dict, bytes]:
     if not url.startswith(API + "/"):
         raise WatchError("refusing a request outside api.github.com")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    kept = keepalive_ok(method, url, body)
 
     def once() -> tuple[int, dict, bytes]:
+        if kept:
+            return KEPT.request(method, url, headers, body)
         try:
             with GITHUB_OPENER.open(request, timeout=SOCKET_TIMEOUT) as response:
                 return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read(MAX_BODY)
@@ -2054,6 +2149,7 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
                 # The edge's own 403 (no rate-limit headers): GitHub never saw the request. Once more, elsewhere.
                 # With no other edge known, the edge's 403 is the answer, as before.
                 EDGE.mark_bad(edge)
+                KEPT.drop()  # kept to the refusing edge: the retry dials another
                 if EDGE.candidates(urllib.parse.urlsplit(url).hostname or "", {edge}):
                     EDGE.local.ip = None
                     try:
@@ -4260,7 +4356,8 @@ class Daemon:
             return None
         if not [t for t in self.read_done.get(kind, []) if self.now - t < READ_PROGRESS_WINDOW]:
             return None
-        costs = [points for at, why, points in self.gql_log if why == kind and self.now - at < READ_PROGRESS_WINDOW]
+        now = self.clock()
+        costs = [points for at, why, points in self.gql_log if why == kind and now - at < READ_PROGRESS_WINDOW]
         if not costs:
             return None
         per_query = sum(costs) / len(costs)
@@ -6002,7 +6099,7 @@ class Daemon:
         status, h, doc = self.request("POST", "/graphql", {"query": query, "variables": variables}, content=True)
         rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) and isinstance(rate.get("cost"), int) else 1
-        self.gql_log.append((self.now, reason, cost))
+        self.gql_log.append((self.clock(), reason, cost))
         self.note_spend("graphql", reason, 1, cost)
         return status, h, doc
 
@@ -7462,7 +7559,7 @@ class Daemon:
             if ((self.mode("graphql") == "stop" and not self.app_entries_eligible(kind, chunk, "graphql"))
                     or self.gql_down()):
                 return to_rest + chunk + [e for c in queue for e in c]
-            if not self.gql_room():
+            if not self.gql_room(self.gql_expected(kind)):
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
                 self.defer(chunk + [e for c in queue for e in c],
@@ -7772,7 +7869,7 @@ class Daemon:
             if self.app_pool is not None:
                 self.app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
-            self.gql_log.append((self.now, self.gql_reason, points))
+            self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
             self.note_spend("graphql", self.gql_reason, 1, points)
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
@@ -7892,16 +7989,38 @@ class Daemon:
                                                                       bool(c.get("required"))) for c in first)
 
     def gql_minute_points(self) -> int:
-        """GraphQL points this daemon spent in the last 60 s (graphqlPerMinute)."""
-        return sum(points for at, _why, points in self.gql_log if self.now - at < 60)
+        """GraphQL points this daemon spent in the last 60 s (graphqlPerMinute), by the clock the points were logged
+        with (clock(): the wall clock, or the pinned one a test drives tick(now=...) with).
 
-    def gql_room(self) -> bool:
-        """Whether one more GraphQL query fits under the per-minute ceiling (policy graphqlPerMinute)."""
-        return self.gql_minute_points() < self.policy.get("graphqlPerMinute", GRAPHQL_PER_MINUTE)
+        Both used to be the tick's start (self.now), which stands still for a whole tick while its queries go out over
+        up to TICK_BUDGET and more, and the outbox's queries (post_between) were logged by the wall clock: two clocks
+        for one counter. huge-blue, 2026-11-20: ticks of ~90 s; a tick's first 40 points kept "this minute" full for the
+        rest of the tick, so every later batch was deferred ("41 of 40 points this minute") though the real minute had
+        room, and the next tick, its start 90 s on, found the window empty and spent 40 at once: bursts, and fewer
+        points a minute than the pace allows."""
+        now = self.clock()
+        return sum(points for at, _why, points in self.gql_log if now - at < 60)
+
+    def gql_expected(self, why: str) -> int:
+        """The points the next query of WHY is expected to cost: the most of its last GQL_EXPECT_LAST queries in
+        READ_PROGRESS_WINDOW, else 1."""
+        now = self.clock()
+        costs = [points for at, w, points in self.gql_log if w == why and now - at < READ_PROGRESS_WINDOW]
+        return max(costs[-GQL_EXPECT_LAST:], default=1)
+
+    def gql_room(self, cost: int = 1) -> bool:
+        """Whether one more GraphQL query of COST points fits under the per-minute ceiling (policy graphqlPerMinute).
+        The cost counts: a gate that asked only "under the ceiling?" let a 39th point admit a query of several, the
+        "41 of 40 points this minute" huge-blue showed. A query costing more than the whole pace still goes out
+        alone, in a minute with nothing else spent, or it could never be read."""
+        spent = self.gql_minute_points()
+        pace = self.policy.get("graphqlPerMinute", GRAPHQL_PER_MINUTE)
+        return spent < pace and (spent == 0 or spent + max(1, cost) <= pace)
 
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
-        return sum(points for at, why, points in self.gql_log if why == "pr-pages" and self.now - at < 3600)
+        now = self.clock()
+        return sum(points for at, why, points in self.gql_log if why == "pr-pages" and now - at < 3600)
 
     def add_last_real_contexts(self, node: dict, suites: list[str] | str, runs: dict[str, list[dict]],
                                runs_error: str | None) -> str | None:

@@ -3482,6 +3482,49 @@ class BalanceTest(Base):
         self.assertEqual(len(self.gh.gql_calls()), 1)
         self.assertEqual(gg.read_cache("pr:o/r#21")["data"]["number"], 21)
 
+    def test_the_pace_counts_points_by_the_wall_clock_not_the_ticks_start(self) -> None:
+        """huge-blue, 2026-11-20: ticks of ~90 s, and every GraphQL point was logged at the tick's start (self.now),
+        which stands still for the whole tick. A tick's first 40 points kept "this minute" full until the tick ended
+        ("41 of 40 points this minute", every later batch deferred) though the real minute had room, and the next
+        tick, 90 s on, found the window empty and spent 40 at once. Points are logged and counted by one clock."""
+        d = self.daemon
+        d.policy = {**d.policy, "graphqlPerMinute": 40}
+        wall = [NOW]
+        d.now, d.clock_real = NOW, True  # tick() at NOW, its clock pinned there; the wall clock moves on
+        with mock.patch.object(gg.time, "time", side_effect=lambda: wall[0]):
+            d.gql_reason = "pr"
+            d.gql_log.append((d.clock(), "pr", 40))  # a tick's first query, at its start
+            self.assertFalse(d.gql_room())
+            wall[0] = NOW + 61  # the same tick, a minute later: its own points have left the window
+            self.assertTrue(d.gql_room(), "the tick's own start held the window shut")
+            # the outbox's query, logged mid-tick by the wall clock, counts in the same window as the reads'
+            d.gql_log.append((d.clock(), "outbox", 30))
+            self.assertEqual(d.gql_minute_points(), 30)
+
+    def test_the_pace_admits_a_query_only_when_its_cost_fits(self) -> None:
+        """A gate that only asked "under 40?" let a 39th point admit a query of several ("41 of 40 points this minute").
+        A query is admitted when its expected cost (the most of its kind's last queries) fits; one costing more than
+        the whole pace still goes out alone, in a minute with nothing else spent."""
+        d = self.daemon
+        d.policy = {**d.policy, "graphqlPerMinute": 40}
+        d.gql_log = [(NOW - 50, "pr", 3)] * 12 + [(NOW - 5, "comment", 1)] * 2  # 38 points this minute
+        d.now = NOW
+        self.assertEqual(d.gql_expected("pr"), 3)
+        self.assertEqual(d.gql_expected("run"), 1)  # none of its kind yet
+        self.assertFalse(d.gql_room(d.gql_expected("pr")), "38 + 3 is past 40")
+        self.assertTrue(d.gql_room(d.gql_expected("comment")))
+        d.gql_log = []
+        self.assertTrue(d.gql_room(55), "a query costing past the pace is read alone, not never")
+        # batched() asks the cost: a 3-point PR batch at 38 waits for the next minute instead of making 41
+        self.gh.prs[("o", "r", 22)] = pr_node(22, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        d.gql_log = [(NOW - 50, "pr", 3)] * 12 + [(NOW - 5, "comment", 1)] * 2
+        gg.register("pr:o/r#22")
+        d.tick(NOW)
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertIn("pr:o/r#22", d.deferred)
+        self.assertLessEqual(d.gql_minute_points(), 40)
+
     def test_a_refresh_of_every_pr_after_a_reset_is_spread_over_minutes(self) -> None:
         """Every watched PR due at once (a reset, a re-exec, a stop below the reserve): at most graphqlPerMinute
         points a minute go out, the rest first in line next tick, so the shared login sees no burst."""
