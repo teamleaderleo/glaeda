@@ -9871,7 +9871,7 @@ LAND_OWN_RED_JOB = re.compile(r"\bnot excused: '([^'\n]{1,200})'")
 # job that never started, STARTUP_FAILURE, is one)
 LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"})
 LAND_FILES_MAX = 3000  # GitHub lists at most this many files of a PR: a list that long may not be whole
-# merge_hold's words for a job its runner refused at setup (cmux scripts/ci/base_red_excuse.py)
+# land-judge's words for a job its runner refused at setup (cmux scripts/ci/base_red_excuse.py)
 LAND_SETUP_REFUSED = "was refused at setup by its runner"
 LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
 
@@ -12306,7 +12306,7 @@ class LandQueue:
     def rerun_unrelated(self, e: dict, act: dict, answer: dict, head: str) -> bool:
         """An own_red stop whose red is in a job the PR's changed paths cannot affect (LAND_UNRELATED_REDS): one
         `gh run rerun RUN --failed` per (head, run), kept on the entry before it is sent, then a wait on the PR's
-        checks at HEAD. A job its runner refused at setup (merge_hold: "it gets re-run, never excused") takes the
+        checks at HEAD. A job its runner refused at setup (land-judge: "it gets re-run, never excused") takes the
         same one rerun with no inert-path rule: no change makes a runner refuse a job. True when it took that step;
         False: the stop goes ahead, as before."""
         repo, number = e["repo"], str(e["number"])
@@ -12628,10 +12628,10 @@ class LandQueue:
         """A lane VM's pinned merge of E at SHA, sent straight to the broker's land (`lane-gh call land`), as a gh
         merge's (rc, stdout, stderr): rc 0 only when the broker's envelope and its data both say ok, else the broker's
         words on stderr, so the step's quota park (LAND_STEP_QUOTA) and owner hand-off (LAND_NOT_OWNER) read them as
-        they read gh's. The broker judges the merge itself (merge_hold on its host) before it merges, and this queue
-        judged it ok at SHA just before: the VM's gh would run a third, local merge_hold pass in between. lw#5963 at
+        they read gh's. The broker judges the merge itself (land-judge on its host) before it merges, and this queue
+        judged it ok at SHA just before: the VM's gh would run a third, local land-judge pass in between. lw#5963 at
         6f74ddb7, gcp-agent-lane-1, 2026-11-19: judged ok 23:47:37Z, and its `gh pr merge` ran the shim's full
-        merge_hold pass again for 202 s before the broker's land answered 409 "REST rate limit is spent for login
+        land-judge pass again for 202 s before the broker's land answered 409 "REST rate limit is spent for login
         until 00:38Z": the window was gone inside its own merge step."""
         lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
         got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"],

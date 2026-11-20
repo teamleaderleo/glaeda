@@ -20408,10 +20408,10 @@ class LandTest(Base):
                 self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
                 self.assertIn(f"it changes {files[-1]}, which 'rust workspaces' can read", json.dumps(e["history"]))
 
-    # cmuxterm-hq#14390 and #14405 (2026-11-19): merge_hold stopped each own_red on a job its runner refused at setup
+    # cmuxterm-hq#14390 and #14405 (2026-11-19): land-judge stopped each own_red on a job its runner refused at setup
     # ("not excused: 'deleted-or-weakened-tests' was refused at setup by its runner; it gets re-run, never excused"),
     # a red no change can cause, in a workflow with no inert-path rule. One --failed rerun, as for an unrelated red.
-    SETUP_REFUSED = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: "
+    SETUP_REFUSED = ("land-judge: refused: base_red_excuse.py exit 1 at {head}: not excused: "
                      "'Native/OptChat/optchat-chief' was refused at setup by its runner; it gets re-run, never excused")
 
     def setup_refused(self) -> tuple[int, dict]:
@@ -21729,9 +21729,9 @@ class LandTest(Base):
     def broker_lands(self) -> list[list[str]]:
         return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land"]]
 
-    def test_a_lane_vms_merge_judged_ok_goes_to_the_brokers_land_with_no_local_merge_hold_pass(self):
+    def test_a_lane_vms_merge_judged_ok_goes_to_the_brokers_land_with_no_local_land_judge_pass(self):
         # lw#5963 at 6f74ddb7, gcp-agent-lane-1, 2026-11-19: judged ok 23:47:37Z; its merge step's `gh pr merge` ran the
-        # shim's whole merge_hold pass again (202 s) before the broker's land answered 409 on a spent login. The broker
+        # shim's whole land-judge pass again (202 s) before the broker's land answered 409 on a spent login. The broker
         # judges the merge itself: the step sends the pinned merge to it, and the VM's gh merges nothing.
         self.broker = True
         self.pr(LA)
@@ -22367,11 +22367,11 @@ class LandTest(Base):
         self.assertLess(out[(30, cap)]["first5Live"], out[(30, 0)]["first5Live"])
 
     def quota_unreadable_profile(self, k: int, minutes: int, until: float) -> dict:
-        """K due entries, no latch on this host, each judgment answered "unreadable" with the words merge_hold gives
+        """K due entries, no latch on this host, each judgment answered "unreadable" with the words land-judge gives
         when the gh-quota shim refused its read: the login's GraphQL spent "until" UNTIL. Ticks MINUTES; returns the
-        judgments made (each a merge_hold explain, its REST spent before the refused read) and each entry's wait."""
+        judgments made (each a land-judge explain, its REST spent before the refused read) and each entry's wait."""
         stamp = time.strftime("%H:%M", time.gmtime(until))
-        reason = (f"merge-hold: refused o/r {{n}}: its head could not be read: no fresh head-matching PR answer: "
+        reason = (f"land-judge: refused o/r {{n}}: its head could not be read: no fresh head-matching PR answer: "
                   f"gh-quota: refused: GitHub's GraphQL rate limit is spent for login until {stamp}Z (reset); next: "
                   f"retry after {stamp}Z (reset); nothing is sent to GitHub before then (why: guard-why)")
         heads = {n: format(0xB0 + n, "040x") for n in range(1, k + 1)}
@@ -22400,10 +22400,10 @@ class LandTest(Base):
 
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them
-        "unreadable" with merge_hold's reason quoting the gh-quota shim ("GitHub's GraphQL rate limit is spent for
+        "unreadable" with land-judge's reason quoting the gh-quota shim ("GitHub's GraphQL rate limit is spent for
         login until 23:38Z"), 40 of them re-judging an entry already "unreadable" at an unchanged head; session
         glaeda-land spent 568 REST, about 9 a judgment (each `pr view`, check-runs and runs read before the refused
-        GraphQL read). LAND_QUOTA_REFUSAL read only merge_hold's own "quota: not judged", so these took the
+        GraphQL read). LAND_QUOTA_REFUSAL read only land-judge's own "quota: not judged", so these took the
         "unreadable" retry every LAND_RETRY_DEFAULT (120 s) until the reset. Now such a judgment parks the entry until
         the reset its words name, as a "quota" answer does: one judgment per entry per window, however many are
         queued."""
