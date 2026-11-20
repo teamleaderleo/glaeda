@@ -570,6 +570,9 @@ RESUME_MAX = 300.0
 REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
 # tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
 # (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
+REST_WAITED_BUDGET = 30  # seconds for ordinary waited reads in one tick; a large waited set must not hold the daemon in
+# one sequential REST phase long enough to trip the stale valve. Finished confirmations and unanswered heads remain
+# urgent after this slice, so a new merge gate is still filled promptly.
 WATCHDOG_CYCLES = 5
 WATCHDOG_AFTER = WATCHDOG_CYCLES * CYCLE  # the loop silent this long is hung: exit EXIT_WATCHDOG
 EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
@@ -6908,12 +6911,23 @@ class Daemon:
             confirms = [e for e in over_rest if self.wait_confirms(e)]
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
         plain_until = time.monotonic() + REST_PLAIN_BUDGET
+        waited_until = time.monotonic() + REST_WAITED_BUDGET
+        waited_started = False
         try:
             for i, e in enumerate(over_rest):
                 if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e)
                                                             or self.head_unanswered(e)):
                     self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order
                     continue
+                # Waited entries are urgent, but an entire backlog must not keep one sequential REST phase alive for
+                # minutes. Keep the first starved key's turn (rest_order puts the most-starved one first), then defer
+                # ordinary waited entries after the slice; confirmations and unanswered heads remain urgent.
+                ordinary_wait = self.waited(e) and not (self.wait_confirms(e) or self.head_unanswered(e))
+                if ordinary_wait:
+                    if waited_started and time.monotonic() >= waited_until:
+                        self.defer(over_rest[i:])
+                        break
+                    waited_started = True
                 # A read is admitted only when its worst case fits in the share, so the share holds at a
                 # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
                 kind = e["key"].split(":", 1)[0]

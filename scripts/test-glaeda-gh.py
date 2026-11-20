@@ -6648,6 +6648,20 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW + gg.TICK)
         self.assertEqual({"pr:o/r#1", "pr:o/r#2", "pr:o/r#3"} - set(read), set(), "and are read first then")
 
+    def test_a_waited_rest_backlog_gets_one_turn_then_yields_to_the_next_tick(self) -> None:
+        """A large waited set must not hold one sequential REST phase past its bounded slice."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        gg.register("pr:o/r#1", waited=True)
+        gg.register("pr:o/r#2", waited=True)
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_WAITED_BUDGET", -1), \
+                mock.patch.object(gg, "REST_PLAIN_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])):
+            status = self.daemon.tick(NOW)
+        self.assertEqual(read, ["pr:o/r#1"], "the most-starved waited PR keeps its first turn")
+        self.assertEqual(status["deferred"], 1, "the rest of the waited backlog yields")
+
     def test_an_asked_head_with_no_answer_goes_first_over_graphql(self) -> None:
         """huge-blue 2026-11-20 15:45Z: with pr moved to GraphQL, a fresh merge-hold head sat unread behind 828 due PRs:
         heads are never "waited", so they only had their round robin turn after the plain PRs. An asked head with no
