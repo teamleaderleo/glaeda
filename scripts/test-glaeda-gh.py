@@ -25959,8 +25959,9 @@ class AppPoolHostTest(unittest.TestCase):
 
     def push_token(self, expires_in: float) -> None:
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + expires_in))
-        (self.creds / "ci-watch-token.json").write_text(json.dumps(
-            {"app_id": 1, "token": "ghs_pushed", "expires_at": at}))
+        path = self.creds / "ci-watch-token.json"
+        path.write_text(json.dumps({"app_id": 1, "owner": "manaflow-ai", "token": APP_TOKEN, "expires_at": at}))
+        path.chmod(0o600)
 
     def test_a_pushed_token_with_no_key_holds_the_app_for_reads(self) -> None:
         """huge-blue holds no role key: the key home's pushed read-only token makes the daemon ask `token ci-watch`."""
@@ -25970,6 +25971,27 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
         self.assertEqual(pool.source, "pushed")
         self.assertEqual(pool.status()["source"], "pushed")
+
+    def test_a_pushed_token_works_without_the_workspace_helper(self) -> None:
+        """Keyless hosts must use the pushed token even when ws-sync has not deployed its helper."""
+        self.push_token(3600)
+        gg.PACE_CLI = Path(self.tmp.name) / "missing/gh"
+        pool = gg.AppPool()
+        self.assertTrue(pool.held_here())
+        self.assertEqual(pool.owner_of("GET", "/repos/manaflow-ai/cmux/pulls/1"), "manaflow-ai")
+        self.assertEqual(pool.token("manaflow-ai"), APP_TOKEN)
+        self.assertEqual(pool.source, "pushed")
+
+    def test_an_owner_specific_pushed_token_supplies_its_owner_without_the_helper(self) -> None:
+        path = self.creds / "ci-watch@teamleaderleo-token.json"
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        path.write_text(json.dumps({"app_id": 1, "owner": "teamleaderleo", "token": APP_TOKEN, "expires_at": at}))
+        path.chmod(0o600)
+        gg.PACE_CLI = Path(self.tmp.name) / "missing/gh"
+        pool = gg.AppPool()
+        self.assertTrue(pool.held_here())
+        self.assertEqual(pool.owner_of("GET", "/repos/teamleaderleo/leo-workspace/pulls/1"), "teamleaderleo")
+        self.assertEqual(pool.token("teamleaderleo"), APP_TOKEN)
 
     def test_an_expired_or_nearly_expired_pushed_token_holds_nothing(self) -> None:
         for left in (-60, 60):

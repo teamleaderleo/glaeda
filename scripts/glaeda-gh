@@ -2426,6 +2426,53 @@ def app_pool_tool() -> Path | None:
     return None
 
 
+def app_pool_pushed_path(role: str, owner: str) -> Path:
+    """The key home's pushed token filename for ROLE and OWNER."""
+    owner = owner.lower()
+    name = f"{role}-token.json" if owner == "manaflow-ai" else f"{role}@{owner}-token.json"
+    return APP_POOL_DIR / name
+
+
+def app_pool_pushed_token(role: str, owner: str, now: float | None = None) -> str | None:
+    """Read a valid pushed installation token without requiring the workspace helper or an API request."""
+    now = time.time() if now is None else now
+    path = app_pool_pushed_path(role, owner)
+    try:
+        if path.stat().st_mode & 0o077:  # pushed credentials are private to this user
+            return None
+    except OSError:
+        return None
+    doc = read_json(path)
+    if not isinstance(doc, dict) or not isinstance(doc.get("app_id"), int):
+        return None
+    token = str(doc.get("token") or "")
+    if not TOKEN_RE.fullmatch(token):
+        return None
+    recorded_owner = doc.get("owner")
+    if recorded_owner is not None and str(recorded_owner).lower() != owner.lower():
+        return None
+    expires = iso_epoch(str(doc.get("expires_at") or ""))
+    if expires is None or expires - now <= APP_POOL_PUSHED_MIN_LEFT:
+        return None
+    return token
+
+
+def app_pool_pushed_owners(role: str, now: float | None = None) -> list[str]:
+    """Owners represented by usable pushed token filenames (no network or helper needed)."""
+    owners: set[str] = set()
+    try:
+        paths = list(APP_POOL_DIR.iterdir())
+    except OSError:
+        return []
+    legacy = f"{role}-token.json"
+    for path in paths:
+        if path.name == legacy:
+            owners.add("manaflow-ai")
+        elif path.name.startswith(f"{role}@") and path.name.endswith("-token.json"):
+            owners.add(path.name[len(role) + 1:-len("-token.json")].lower())
+    return sorted(owner for owner in owners if app_pool_pushed_token(role, owner, now))
+
+
 class AppPool:
     """The ci-watch role's installation tokens on this host, per owner, for the daemon's repo reads (see above)."""
 
@@ -2451,14 +2498,11 @@ class AppPool:
     def held_here(self) -> bool:
         """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
         (ROLE-token.json, from the key home) with more than APP_POOL_PUSHED_MIN_LEFT to go (file reads, no request)."""
-        if app_pool_tool() is None:
-            return False
-        if (APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file():
+        tool = app_pool_tool()
+        if tool is not None and (APP_POOL_DIR / f"{self.role}.json").is_file() and (APP_POOL_DIR / f"{self.role}.pem").is_file():
             self.source = "key"
             return True
-        doc = read_json(APP_POOL_DIR / f"{self.role}-token.json")
-        expires = iso_epoch(doc.get("expires_at")) if isinstance(doc, dict) and doc.get("token") else None
-        if expires is not None and expires - self.clock() > APP_POOL_PUSHED_MIN_LEFT:
+        if app_pool_pushed_owners(self.role, self.clock()):
             self.source = "pushed"
             return True
         return False
@@ -2468,18 +2512,24 @@ class AppPool:
         cli = app_pool_tool()
         doc = read_json(cli.parent.parent / "machines" / "gh-app-roles.json") if cli else None
         owners = doc.get("owners") if isinstance(doc, dict) else None
-        return [o.lower() for o in owners if isinstance(o, str)] if isinstance(owners, list) else []
+        if isinstance(owners, list):
+            configured = [o.lower() for o in owners if isinstance(o, str)]
+            if configured:
+                return configured
+        return app_pool_pushed_owners(self.role, self.clock())
 
     def mint_with_tool(self, owner: str) -> str | None:
         cli = app_pool_tool()
-        if cli is None:
-            return None
-        try:
-            result = run_bounded([sys.executable, "-I", os.fspath(cli), "token", self.role, "--owner", owner])
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        token = result.stdout.strip()
-        return token if result.returncode == 0 and TOKEN_RE.fullmatch(token) else None
+        if cli is not None:
+            try:
+                result = run_bounded([sys.executable, "-I", os.fspath(cli), "token", self.role, "--owner", owner])
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            if result is not None:
+                token = result.stdout.strip()
+                if result.returncode == 0 and TOKEN_RE.fullmatch(token):
+                    return token
+        return app_pool_pushed_token(self.role, owner, self.clock())
 
     def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
         """The sole repository owner a read may go to the pool for, else None.
