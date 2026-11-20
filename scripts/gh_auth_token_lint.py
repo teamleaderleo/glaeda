@@ -39,7 +39,7 @@ def python_hits(path: Path, text: str) -> list[tuple[int, str]]:
         tree = ast.parse(text, filename=str(path))
     except SyntaxError:
         return []
-    lines = text.splitlines()
+    lines = re.split(r"\r\n|\r|\n", text)
     hits: list[tuple[int, str]] = []
     # A comparison against a mocked argv or a table of command prefixes does not
     # execute anything. Inspect command arguments and directly assigned argv.
@@ -72,7 +72,7 @@ SHELL_TOKEN = re.compile(r"(?<![\w-])gh[ \t]+auth[ \t]+token\b")
 
 def shell_hits(path: Path, text: str) -> list[tuple[int, str]]:
     hits: list[tuple[int, str]] = []
-    lines = text.splitlines()
+    lines = re.split(r"\r\n|\r|\n", text)
     for number, raw in enumerate(lines, 1):
         code = raw.split("#", 1)[0]
         if "gh" not in code or "auth" not in code or "token" not in code:
@@ -98,7 +98,7 @@ def scan(root: Path) -> list[str]:
             continue
         if not all(word in text for word in ("gh", "auth", "token")):
             continue
-        is_python = path.suffix == ".py" or text.startswith("#!") and "python" in text.splitlines()[0]
+        is_python = path.suffix == ".py" or text.startswith("#!") and "python" in text.partition("\n")[0]
         rel = path.relative_to(root)
         hits = python_hits(rel, text) if is_python else shell_hits(rel, text)
         findings.extend(f"{path.relative_to(root)}:{line}: {why}" for line, why in hits)
