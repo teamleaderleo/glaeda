@@ -96,4 +96,4 @@ confirm its hash and a scheduled receipt before claiming rollout. The 24-host in
 loop only on Ultra2. Incident and host receipts: manaflow-ai/cmuxterm-hq#15138.
 
 Detector: `TipLoopWorkTest` in `scripts/test-glaeda-disk.py` exercises survey/apply, deep activity,
-post-survey liveness and unavailable evidence; mini-setup's existing byte-copy check covers installation.
+post-survey liveness, unavailable evidence, symlinked roots/ancestors and a post-survey redirect into outbox; mini-setup's existing byte-copy check covers installation.

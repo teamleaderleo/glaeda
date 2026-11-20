@@ -9691,6 +9691,31 @@ class TipLoopWorkTest(unittest.TestCase):
             gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
         self.assertTrue(path.exists())
 
+    def test_symlinked_root_or_ancestor_is_never_enumerated(self):
+        for root in (self.fam.root, self.state, self.state.parent, self.home / "Library"):
+            with self.subTest(root=root):
+                aside = root.with_name(root.name + "-original")
+                root.rename(aside)
+                root.symlink_to(aside, target_is_directory=True)
+                try:
+                    self.assertEqual(gd.candidates(self.fam), [])
+                    self.assertEqual(gd.interrupted_families([self.fam]), [])
+                finally:
+                    root.unlink()
+                    aside.rename(root)
+
+    def test_root_redirected_to_outbox_after_survey_is_kept(self):
+        old = self.work("old", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            outbox = self.state / "outbox"
+            self.fam.root.rename(outbox)
+            self.fam.root.symlink_to(outbox, target_is_directory=True)
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue((outbox / old.name).is_dir())
+        self.assertIn("changed:root-boundary", (self.home / "receipt.jsonl").read_text())
+
     def test_unknown_process_evidence_preserves_old_work(self):
         path = self.work("unknown", 48)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):

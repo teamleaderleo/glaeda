@@ -10216,7 +10216,7 @@ LIMA_VMS = "lima-vms"
 # a missing claim would let --dead take it after TART_VM_IDLE_HOURS; it stays by name as well as by its claim
 LIMA_BASE_NAMES = frozenset({"cmux-linux-bake"})
 LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
-ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS}  # walked only when tart_root_safe(root)
+ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS, "hq-tip-loop-work"}  # walked only when tart_root_safe(root)
 
 
 def lima_vm_held(path: Path, cmds: str) -> str:
@@ -13620,7 +13620,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if not cmds:
                     print("refusing to delete the rest: ps failed", file=sys.stderr)
                     break
-        if fam.retired_only and not owner_retired(fam):
+        if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
+            outcome = "changed:root-boundary"
+        elif fam.retired_only and not owner_retired(fam):
             outcome = "changed:owner-loaded"
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
