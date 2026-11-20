@@ -15175,8 +15175,10 @@ def incident_recovered(step: dict, what: str) -> str:
 
 def incident_send(text: str, level: str, source_key: str) -> None:
     """An incident's alert by the sender-side ledger: tell-coordinator (coord_inbox) with --source-key SOURCE_KEY,
-    which sends a key once and folds a tool's fyi into its digest; on a host without it (a lane VM: coord_inbox install
-    skips a broker client) coord_alert's routes, as before. In the background; logged, never raised."""
+    which sends a key once and folds a tool's fyi into its digest. Never coord_alert (forum-surge-inbox, 2026-11-20:
+    straggler_notice must stop calling coord_alert_spawn, whose acpmux and lane-gh routes start a coordinator prompt per
+    host): on a host without tell-coordinator (a lane VM) the incident stays in the ledger (incidents.jsonl, the
+    notice line), which the forum adapter and NOW read. In the background; logged, never raised."""
     if ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK):
         try:
             subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, "--source-key",
@@ -15185,8 +15187,9 @@ def incident_send(text: str, level: str, source_key: str) -> None:
             log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "text": text})
             return
         except OSError as error:
-            log({"event": "alert-unsent", "why": describe(error), "sourceKey": source_key, "text": text})
-    coord_alert_spawn(text)
+            log({"event": "alert-ledger-only", "why": describe(error), "sourceKey": source_key, "text": text})
+            return
+    log({"event": "alert-ledger-only", "why": f"no {ALARM_CMD}", "sourceKey": source_key, "text": text})
 
 
 def notice_line(now: float, kind: str, level: str, text: str, data: dict) -> None:

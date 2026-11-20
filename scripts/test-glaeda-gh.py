@@ -25435,19 +25435,22 @@ class StragglerTest(unittest.TestCase):
         self.assertEqual({x["channel"] for x in ledger}, {"ops/glaeda-stragglers"})
 
     def test_one_notice_per_label_over_every_head(self) -> None:
-        sent: list[str] = []
-        spawn = mock.patch.object(gg, "coord_alert_spawn", side_effect=sent.append)
+        sent: list[tuple[str, str, str]] = []
+        spawn = mock.patch.object(gg, "incident_send", side_effect=lambda *a: sent.append(a))
         spawn.start()
         self.addCleanup(spawn.stop)
-        self.addCleanup(setattr, gg, "ALARM_CMD", gg.ALARM_CMD)
-        gg.ALARM_CMD = Path(self.tmp.name) / "no-tell-coordinator"  # a lane VM: coord_alert's routes
+        direct = mock.patch.object(gg, "coord_alert_spawn")
+        never = direct.start()
+        self.addCleanup(direct.stop)
         for number in (45147, 44602, 45356):
             data, get = self.head(number=number)
             for _ in range(3):
                 data = gg.straggler_pass(f"pr:o/r#{number}", data, self.now, get)
-        # each label's notice reaches the coordinator once (coord_alert), naming the label and what ends such a job
+        # each label's incident reaches the coordinator once (the keyed sender), naming the label and what ends it
         self.assertEqual(len(sent), 2, sent)
-        self.assertTrue(all("has a runner" in text and "rerun is refused while its run runs" in text for text in sent))
+        self.assertTrue(all("has a runner" in text and "rerun is refused while its run runs" in text
+                            for text, _, _ in sent))
+        self.assertEqual({(level, key.rsplit(":", 2)[1]) for _, level, key in sent}, {("warn", "open")})
         lines = [json.loads(line) for line in (gg.NOTICES_DIR / "glaeda-gh.jsonl").read_text().splitlines()]
         kinds = sorted((line["kind"], line["data"]["label"]) for line in lines)
         self.assertEqual(kinds, [("stragglers", "overflow-16vcpu-linux"),
@@ -25460,6 +25463,27 @@ class StragglerTest(unittest.TestCase):
         self.assertEqual(len((gg.NOTICES_DIR / "glaeda-gh.jsonl").read_text().splitlines()), 2)
         seen = json.loads((gg.BASE / gg.STRAGGLER_SEEN).read_text())["seen"]
         self.assertEqual(len(seen["overflow-8vcpu-linux"]), 4)
+        # the detector: hours of repeated observations make no further send and never a coord_alert_spawn
+        for hour in range(1, 6):
+            data, get = self.head(number=44413)
+            gg.straggler_pass("pr:o/r#44413", data, self.now + hour * gg.STRAGGLER_NOTICE_EVERY, get)
+        self.assertEqual(len(sent), 2, sent)
+        never.assert_not_called()
+
+    def test_a_lane_vm_with_no_tell_coordinator_keeps_the_incident_in_its_ledger(self) -> None:
+        """No tell-coordinator (a lane VM): the incident is in incidents.jsonl and the notice line, never coord_alert's
+        per-host coordinator prompt."""
+        self.addCleanup(setattr, gg, "ALARM_CMD", gg.ALARM_CMD)
+        gg.ALARM_CMD = Path(self.tmp.name) / "no-tell-coordinator"
+        with mock.patch.object(gg, "coord_alert_spawn") as never, contextlib.redirect_stdout(io.StringIO()) as out:
+            for hour in range(3):
+                data, get = self.head()
+                gg.straggler_pass("pr:o/r#45147", data, self.now + hour * gg.STRAGGLER_NOTICE_EVERY, get)
+        never.assert_not_called()
+        self.assertEqual(out.getvalue().count('"alert-ledger-only"'), 2, out.getvalue())
+        ledger = [json.loads(x) for x in (gg.BASE / gg.INCIDENT_LEDGER).read_text().splitlines()]
+        self.assertEqual(sorted((x["thread"], x["event"]) for x in ledger),
+                         [("overflow-16vcpu-linux", "open"), ("overflow-8vcpu-linux", "open")])
 
 
 class AlertToolMissingTest(unittest.TestCase):
