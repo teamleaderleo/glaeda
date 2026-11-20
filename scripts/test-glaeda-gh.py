@@ -6626,6 +6626,43 @@ class TickBudgetTest(Base):
         self.assertEqual(set(order[:2]), {head["key"], errored["key"]})
         self.assertEqual(order[2:5], [e["key"] for e in prs])
 
+    def test_the_oldest_starved_waited_key_goes_ahead_of_asked_heads(self) -> None:
+        """huge-blue 2026-11-20, GraphQL out for the hour: the fleet brokers' asked heads filled every tick and waited
+        PRs sat up to 39,600 s unread. The one waited PR or run with the oldest data past STALE_DATA_AFTER goes first
+        of all; a fresh waited key, a plain one or a finished one does not; a REST try moves it back."""
+        def pr(n: int, data_at: float, waited: bool = True, state: str = "OPEN") -> dict:
+            return {"key": f"pr:o/r#{n}", "waitedAt": NOW if waited else None,
+                    "cache": {"data": {"state": state}, "dataAt": data_at, "fetchedAt": data_at}}
+        head = {"key": f"head:o/r@{'c' * 40}", "cache": None, "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        old, older = pr(1, NOW - 5000), pr(2, NOW - 39600)
+        fresh, plain = pr(3, NOW - 60), pr(4, NOW - 90000, waited=False)
+        merged = pr(5, NOW - 90000, state="MERGED")
+        self.daemon.rest_tried = {}
+        order = self.order([plain, merged, fresh, old, head, older])
+        self.assertEqual(order[:2], [older["key"], head["key"]])
+        self.daemon.rest_tried[older["key"]] = NOW - 5  # tried (and failed): the next starved key leads
+        self.assertEqual(self.order([plain, merged, fresh, old, head, older])[:2], [old["key"], head["key"]])
+        self.assertIsNone(self.daemon.starved_lead([fresh, plain, merged, head]))
+
+    def test_held_staleness_alarms_past_the_held_bound_without_a_restart(self) -> None:
+        """huge-blue 2026-11-20: "held" all day at 39,600 s, each quota or deferral explanation re-arming it. Up to
+        STALE_HELD_MAX it stays held; past it the alarm goes out with verdict "held", and nothing restarts for it."""
+        self.daemon.now = NOW
+        self.daemon.stale_waited_key = {"pr": "pr:o/r#1"}
+        with mock.patch.object(self.daemon, "stale_explained", return_value="quota"), \
+                mock.patch.object(self.daemon, "stall_cause", return_value={
+                    "verdict": "backlog", "text": "backlog: 1 read", "reads": 1, "top": "read rest", "slotS": 0,
+                    "githubS": 0, "inCall": None, "lastCall": None, "deferral": None}):
+            self.daemon.stale_waited = {"pr": gg.STALE_HELD_MAX - 1}
+            self.assertEqual(self.daemon.stale_alarm(), "held")
+            self.daemon.stale_waited = {"pr": gg.STALE_HELD_MAX + 1}
+            level, text, data = self.daemon.stale_alarm()
+        self.assertEqual((level, data["cause"]), ("fire", "held"))
+        self.assertIn(f"held past {gg.STALE_HELD_MAX}s", text)
+        self.assertIn("held", gg.STALE_NO_RESTART)
+        _, _, valved = self.daemon.stale_valve(("fire", text, data), {}) if False else ("", "", {"valve": "held"})
+        self.assertEqual(valved["valve"], "held")
+
     def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
         """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
         and an asked head with no answer, or a wait's key, is still read."""

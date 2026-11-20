@@ -739,7 +739,15 @@ STALE_RESTART_ADVICE = "`glaeda-gh restart` restarts a daemon in this state."
 STALE_DEFERRED_ADVICE = "A restart would not read any sooner: the budget above holds the reads back."
 STALE_PACED_ADVICE = ("A restart would not read any sooner: the pace above is too slow for what waits are blocked on; "
                       "raise graphqlPerMinute in the policy, or block fewer waits at once.")
-STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE}  # verdicts a restart cannot fix
+# "Held" is not forever. huge-blue, 2026-11-20: waited PR data sat up to 39,600 s old all day while the stale alarm read
+# "held": each new quota stop, secondary hold or budget deferral re-armed stale_explained and catching_up, nothing
+# bounded the total age, and nobody heard until `now` showed a RED line. Past STALE_HELD_MAX of waited age the alarm
+# goes out whatever explains it (verdict "held"), naming what holds the reads; the valve never restarts for it.
+STALE_HELD_MAX = 3600
+STALE_HELD_ADVICE = ("A restart would not read any sooner, but data this old is starvation, not pacing: the reads "
+                     "above need a quota or a pace change (`glaeda-gh budget` names who spends the login).")
+STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE,  # verdicts a restart cannot fix
+                "held": STALE_HELD_ADVICE}
 STALE_NO_RESTART = tuple(STALE_ADVICE)  # stall_cause verdicts a restart cannot fix: the alarm, the valve and `restart` agree
 # Reads a wait or a due land is blocked on go first in every window; watches nothing is blocked on still get one batch
 # (one REST read) at least this often, per kind, so a blocked set past the pace cannot starve them (review of #2199).
@@ -4597,10 +4605,11 @@ class Daemon:
         kind = max(stale, key=stale.get, default=None)
         if kind is None or stale[kind] <= STALE_DATA_AFTER:
             return None
-        if self.stale_explained() is not None:
+        # explained by the quota or an upstream, or the quota explained it until moments ago and the backlog is being
+        # read (STALE_CATCH_UP): held, but only up to STALE_HELD_MAX (its comment)
+        held = self.stale_explained() is not None or self.catching_up(kind) is not None
+        if held and stale[kind] <= STALE_HELD_MAX:
             return "held"
-        if self.catching_up(kind) is not None:
-            return "held"  # the quota explained it until moments ago: the backlog is being read (STALE_CATCH_UP)
         age_s = int(stale[kind])
         level = "fire" if age_s >= 3 * STALE_DATA_AFTER else "warn"
         where = getattr(self, "stale_waited_key", {}).get(kind) or "?"
@@ -4608,6 +4617,9 @@ class Daemon:
         hold = self.quota_hold(kind)
         quota = f" Quota: {hold[0]}." if hold else ""
         cause = self.stall_cause(kind)
+        if held:
+            cause = {**cause, "verdict": "held",
+                     "text": f"held past {STALE_HELD_MAX}s ({self.held_why(kind)}); {cause['text']}"}
         self.stale_reason = cause["text"]
         self.say_stall(kind, cause, age_s, where)
         advice = STALE_ADVICE.get(cause["verdict"], STALE_RESTART_ADVICE)
@@ -6439,12 +6451,38 @@ class Daemon:
         # deferred) sorted behind every deferred plain key when it came due again. huge-blue 2026-11-20 12:0xZ, 1154
         # deferred keys and ~4 PR reads a tick: every waited read cost a whole tick behind the backlog before it ranked
         # (huge_blue_waited_age, TickBudgetTest).
-        return sorted(entries, key=lambda e: (not self.head_unanswered(e), self.head_rank(e),
+        # And a floor for the waits themselves: the one waited PR or run whose data is oldest, once past
+        # STALE_DATA_AFTER, goes first of all, ahead of the asked heads too. huge-blue 2026-11-20, GraphQL out for the
+        # hour: every tick's ~90 s went to the fleet brokers' asked heads (each new SHA, newest first) and to plain
+        # keys, waited PRs sat 3,800 to 39,600 s unread, and nothing above ever reached them. One key a tick bounds a
+        # waited read at (starved waited keys x one tick) whatever else is asked.
+        lead = self.starved_lead(entries)
+        return sorted(entries, key=lambda e: (e is not lead, not self.head_unanswered(e), self.head_rank(e),
                                               not self.wait_confirms(e),
                                               not self.waited(e),
                                               e["key"] not in carried,
                                               carried.get(e["key"], 0.0),
                                               self.last_read(e)))
+
+    def starved_lead(self, entries: list[dict]) -> dict | None:
+        """The waited, unfinished PR or run among ENTRIES with the oldest data, when that is past STALE_DATA_AFTER
+        (rest_order's floor), else None. Data never stored counts from the watch's start (self.since)."""
+        best, best_age = None, float(STALE_DATA_AFTER)
+        since = getattr(self, "since", {}) or {}
+        for e in entries:
+            kind = e["key"].split(":", 1)[0]
+            if kind not in ("pr", "run") or not self.waited(e):
+                continue
+            c = e.get("cache") or {}
+            if terminal(kind, c.get("data")):
+                continue
+            seen = c.get("dataAt") if isinstance(c.get("dataAt"), (int, float)) else since.get(e["key"], self.now)
+            # a failed try moves it back too, so a key GitHub keeps failing cannot hold the floor from the others
+            seen = max(seen, (getattr(self, "rest_tried", None) or {}).get(e["key"], float("-inf")))
+            age = self.now - seen
+            if age > best_age:
+                best, best_age = e, age
+        return best
 
     def head_rank(self, e: dict) -> tuple[bool, float]:
         """An asked head with no answer: (tried and failed, minus its newest ask), so the newest ask of a head never tried
