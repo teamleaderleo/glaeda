@@ -15275,9 +15275,11 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1)
-        self.assertTrue(told[0].startswith("--from glaeda-gh --severity fire FIRE"), told[0])
+        self.assertRegex(told[0], r"^--from glaeda-gh --severity fire --source-key stale:\S+@\S+:open:1 FIRE")
 
-    def test_the_stale_alarm_escalates_to_fire_once_and_resends_hourly(self) -> None:
+    def test_the_stale_alarm_escalates_to_fire_once_and_never_resends_hourly(self) -> None:
+        """forum-surge-inbox, 2026-11-20: the stale alarm said the same host's stale PR data again every hour it lasted.
+        One incident: its WARN, its FIRE (news), then nothing however long it stays stale."""
         self.policy()
         self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 700.0}, {"pr": "pr:o/r#5"}
         self.daemon.check_alarms()
@@ -15285,12 +15287,81 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.now, self.daemon.stale_waited = NOW + 1200, {"pr": 1900.0}
         self.daemon.check_alarms()  # worse: a FIRE goes out at once
         self.daemon.now, self.daemon.stale_waited = NOW + 1300, {"pr": 2000.0}
-        self.daemon.check_alarms()  # still FIRE, within the hour: nothing new
+        self.daemon.check_alarms()  # still FIRE: nothing new
         levels = [line.split()[3] for line in self.told_lines()]
         self.assertEqual(levels, ["warn", "fire"])
-        self.daemon.now = NOW + 1200 + gg.ALARM_EVERY + 1
-        self.daemon.check_alarms()
-        self.assertEqual(len(self.told_lines()), 3, "a stale alarm still firing is said again each hour")
+        for hours in range(1, 6):  # 15,762 s on huge-blue: five more hours of the same incident
+            self.daemon.now = NOW + 1200 + hours * gg.ALARM_EVERY + 1
+            self.daemon.stale_waited = {"pr": 1900.0 + hours * gg.ALARM_EVERY}
+            self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 2, told)
+        self.assertIn("Incident stale:", told[0])
+        self.assertIn("sent once", told[0])
+        self.assertIn("--source-key", told[1])
+        state = gg.read_json(gg.BASE / gg.INCIDENTS_FILE)["open"]
+        (inc,) = state.values()
+        self.assertEqual((inc["level"], inc["repeats"], inc["sends"]), ("fire", 6, 2))
+        events = [json.loads(x)["event"] for x in (gg.BASE / gg.INCIDENT_LEDGER).read_text().splitlines()]
+        self.assertEqual(events, ["open", "escalate"])  # repeats counted on the incident, not a line each tick
+
+    def stale_ticks(self, pattern: str, start: float, step: float = 30.0) -> float:
+        """One check_alarms per STEP seconds from START, PATTERN's characters each a tick: s stale, f fresh, h held
+        (the quota explains it). Returns the clock after the last tick."""
+        now = start
+        for c in pattern:
+            self.daemon.now = now
+            self.daemon.backoff = {"rest": now + 600, "graphql": now + 600} if c == "h" else {"rest": 0.0, "graphql": 0.0}
+            self.daemon.stale_waited = {"pr": 700.0} if c in "sh" else {}
+            self.daemon.stale_waited_key = {"pr": "pr:o/r#5"}
+            self.daemon.check_alarms()
+            now += step
+        return now
+
+    def test_a_stale_flap_is_the_same_incident_and_recovery_is_said_once(self) -> None:
+        """Recurrence inside INCIDENT_CLOSE_AFTER is the incident already sent; quiet that long closes it with one
+        recovery, naming the repeats held back."""
+        self.policy()
+        quiet = int(gg.INCIDENT_CLOSE_AFTER // 30)
+        now = self.stale_ticks("ss" + "f" * 10 + "sss" + "f" * 10 + "s", NOW)  # flapping, 5 min apart
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)  # one incident, one send
+        now = self.stale_ticks("f" * (quiet + 2), now)
+        told = self.told_lines()
+        self.assertEqual(len(told), 2, told)
+        self.assertIn("--severity info", told[1])
+        self.assertIn("recovered: waited PR data is fresh again", told[1])
+        self.assertIn("repeat(s) held back", told[1])
+        self.assertRegex(told[1], r"--source-key stale:\S+:recover ")
+        self.assertEqual(gg.read_json(gg.BASE / gg.INCIDENTS_FILE)["open"], {})
+        events = [json.loads(x)["event"] for x in (gg.BASE / gg.INCIDENT_LEDGER).read_text().splitlines()]
+        self.assertEqual(events, ["open", "quiet", "recur", "quiet", "recur", "quiet", "recover"])
+        # the stale view past a recovery is a fresh incident: a new id, sent again
+        self.stale_ticks("s", now)
+        told = self.told_lines()
+        self.assertEqual(len(told), 3, told)
+        first, fresh = (re.search(r"Incident (stale:\S+?@\S+?Z)", t).group(1) for t in (told[0], told[2]))
+        self.assertNotEqual(first, fresh)
+
+    def test_a_held_stale_view_never_recovers_its_incident(self) -> None:
+        """Held (the quota explains the old data) keeps the incident open: neither a repeat sent nor a recovery."""
+        self.policy()
+        self.stale_ticks("s" + "h" * (int(gg.INCIDENT_CLOSE_AFTER // 30) + 5) + "s", NOW)
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertEqual(len(gg.read_json(gg.BASE / gg.INCIDENTS_FILE)["open"]), 1)
+
+    def test_a_restart_keeps_the_open_incident(self) -> None:
+        """incidents.json outlives the daemon: a fresh process on the same stale view sends nothing."""
+        self.policy()
+        self.stale_ticks("s", NOW)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.clock_real, again.policy, again.now = False, self.daemon.policy, NOW + 2 * gg.ALARM_EVERY
+        again.stale_waited, again.stale_waited_key = {"pr": 700.0}, {"pr": "pr:o/r#5"}
+        again.check_alarms()
+        for p in again.alarm_procs:
+            p.wait(10)
+        self.assertEqual(len(self.told_lines()), 1)
 
     def test_a_graphql_reserve_stop_is_the_recorded_stale_reason(self) -> None:
         """huge-blue 2026-11-11: the shared GraphQL quota sat at the fleet's reserve; GraphQL stopped, REST lean but
@@ -25310,11 +25381,66 @@ class StragglerTest(unittest.TestCase):
                 self.assertEqual("required, queued with no runner past 30 min (the wait goes on)" in said,
                                  needed and all(s == "QUEUED" for _, s, _, _ in mix), (mix, said))
 
+    def test_a_label_incident_is_sent_once_by_its_source_key_recovers_once_and_returns_fresh(self) -> None:
+        """forum-surge-inbox, 2026-11-20: each host's straggler notice went to the coordinator again every hour a label
+        stayed short. With tell-coordinator here, each label's incident goes by it with its incident id as
+        --source-key (coord_inbox's sender ledger), never coord_alert; later hours only count; an hour plus
+        INCIDENT_CLOSE_AFTER with no straggler on the label is one recovery; stragglers after that, a fresh incident."""
+        told = Path(self.tmp.name) / "told.txt"
+        cmd = Path(self.tmp.name) / "tell-coordinator"
+        cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {told}\n")
+        cmd.chmod(0o755)
+        self.addCleanup(setattr, gg, "ALARM_CMD", gg.ALARM_CMD)
+        gg.ALARM_CMD = cmd
+        procs: list[subprocess.Popen] = []
+        real = subprocess.Popen
+
+        def popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+            procs.append(real(*args, **kwargs))
+            return procs[-1]
+
+        def lines() -> list[str]:
+            for proc in procs:
+                proc.wait(10)
+            return told.read_text().splitlines() if told.exists() else []
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(gg, "coord_alert_spawn", side_effect=AssertionError("coord_alert with tell-coordinator")):
+            for hour in range(4):  # four hours of the same two short labels (hour 0 reads the jobs; 1 opens)
+                data, get = self.head()
+                gg.straggler_pass("pr:o/r#45147", data, self.now + hour * gg.STRAGGLER_NOTICE_EVERY, get)
+            sent = lines()
+            self.assertEqual(len(sent), 2, sent)
+            self.assertTrue(all("--severity warn --source-key stragglers:" in s and ":open:1 WARN" in s for s in sent))
+            # the head's stragglers end; a pass with nothing queued, then the hour seen keeps and the close window
+            done = self.now + 4 * gg.STRAGGLER_NOTICE_EVERY
+            quiet = gg.parse_pr(pr_node(45147))
+            quiet["headRefOid"] = self.HEAD
+            gg.straggler_notice("pr:o/r#45147", quiet, done)
+            gg.straggler_notice("pr:o/r#45147", quiet, done + gg.STRAGGLER_NOTICE_EVERY)
+            gg.straggler_notice("pr:o/r#45147", quiet, done + gg.STRAGGLER_NOTICE_EVERY + gg.INCIDENT_CLOSE_AFTER)
+            sent = lines()
+            self.assertEqual(len(sent), 4, sent)
+            self.assertTrue(all("--severity info" in s and "recovered: no watched head has a straggler" in s
+                                and "2 repeat(s) held back" in s for s in sent[2:]), sent[2:])
+            # stragglers again: a fresh incident per label, sent again
+            later = done + 3 * gg.STRAGGLER_NOTICE_EVERY
+            data, get = self.head()
+            gg.straggler_pass("pr:o/r#45147", data, later, get)
+            sent = lines()
+            self.assertEqual(len(sent), 6, sent)
+            self.assertEqual(len({re.search(r"--source-key (\S+)", s).group(1) for s in sent}), 6)
+        ledger = [json.loads(x) for x in (gg.BASE / gg.INCIDENT_LEDGER).read_text().splitlines()]
+        self.assertEqual([x["event"] for x in ledger if x["thread"] == "overflow-8vcpu-linux"],
+                         ["open", "quiet", "recover", "open"])
+        self.assertEqual({x["channel"] for x in ledger}, {"ops/glaeda-stragglers"})
+
     def test_one_notice_per_label_over_every_head(self) -> None:
         sent: list[str] = []
         spawn = mock.patch.object(gg, "coord_alert_spawn", side_effect=sent.append)
         spawn.start()
         self.addCleanup(spawn.stop)
+        self.addCleanup(setattr, gg, "ALARM_CMD", gg.ALARM_CMD)
+        gg.ALARM_CMD = Path(self.tmp.name) / "no-tell-coordinator"  # a lane VM: coord_alert's routes
         for number in (45147, 44602, 45356):
             data, get = self.head(number=number)
             for _ in range(3):
