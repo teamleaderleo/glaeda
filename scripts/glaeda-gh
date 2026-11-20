@@ -17228,19 +17228,21 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
 
 
 def budget_served(doc: dict, clock: float) -> dict:
-    """A kept host-sweep answer as of CLOCK: a pool's account reading or gh-quota mark whose window reset since it was
-    read is dropped, with that pool's unattributed gap. Router review of glaeda#2252, F1: a 75 s sweep that crossed a
-    reset kept showing "0/5000 left" from the window that had ended for another minute."""
+    """A kept host-sweep answer as of CLOCK: an account reading whose window reset since it was read is dropped, with
+    its pool's unattributed gap (the gap is that reading's used count less what the hosts' logs hold); a gh-quota mark
+    whose "until" passed is dropped by itself. Router review of glaeda#2252, F1: a 75 s sweep that crossed a reset kept
+    showing "0/5000 left" from the window that had ended for another minute. Each on its own clock (review of
+    glaeda#2253, F1): a short retry mark ending used to drop its pool's still-current reading and gap too."""
     account, marks = dict(doc.get("account") or {}), dict(doc.get("exhausted") or {})
-    gone = [b for b, r in account.items() if not isinstance(r, dict) or float(r.get("reset") or 0) <= clock]
-    gone += [b for b, m in marks.items() if not isinstance(m, dict) or float(m.get("until") or 0) <= clock]
-    if not gone:
+    reset = {b for b, r in account.items() if not isinstance(r, dict) or float(r.get("reset") or 0) <= clock}
+    ended = {b for b, m in marks.items() if not isinstance(m, dict) or float(m.get("until") or 0) <= clock}
+    if not reset and not ended:
         return doc
-    out = {**doc, "account": {b: r for b, r in account.items() if b not in gone},
-           "exhausted": {b: m for b, m in marks.items() if b not in gone}}
+    out = {**doc, "account": {b: r for b, r in account.items() if b not in reset},
+           "exhausted": {b: m for b, m in marks.items() if b not in ended}}
     total = doc.get("total")
-    if isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
-        out["total"] = {**total, "unattributed": {b: None if b in gone else g
+    if reset and isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
+        out["total"] = {**total, "unattributed": {b: None if b in reset else g
                                                   for b, g in total["unattributed"].items()}}
     return out
 

@@ -5904,6 +5904,25 @@ class FleetBudgetTest(Base):
         self.assertEqual(kept["account"]["graphql"]["remaining"], 2500)
         self.assertNotIn("12/5000 left", "\n".join(gg.fleet_lines(kept)))
 
+    def test_a_mark_that_ends_before_the_readings_reset_leaves_the_reading_and_its_gap(self) -> None:
+        """Router review of glaeda#2253, F1: a kept answer dropped a pool's reading and gap whenever that pool's gh-quota
+        mark ended, so a short retry mark ending cleared a reading still current. Each expires on its own clock."""
+        now = time.time()
+        reports = self.reports(now)  # far's REST reading resets at now + 900
+        (self.home / "state").mkdir(parents=True, exist_ok=True)
+        (self.home / "state" / "rest-exhausted.json").write_text(json.dumps({"until": now + 20, "at": now}))
+        fetch = lambda h, local: reports.get(h) or {"error": "unreachable (exit 4: x)"}  # noqa: E731
+        view = lambda: {"ok": False, "error": "no lane-gh here"}  # noqa: E731
+        with mock.patch.object(gg, "FLEET_BUDGET_CLOCK", lambda: now):
+            first = gg.fleet_budget(now, fetch=fetch, view=view)
+            self.assertIn("rest", first["exhausted"])
+            gap = first["total"]["unattributed"]["rest"]
+            self.assertIsNotNone(gap)
+            kept = gg.fleet_budget(now + 30, fetch=lambda h, local: self.fail(f"read {h} again"), view=view)
+        self.assertNotIn("rest", kept["exhausted"])  # the mark ended at now + 20
+        self.assertEqual(kept["account"]["rest"]["remaining"], 12)  # the reading's window runs to now + 900
+        self.assertEqual(kept["total"]["unattributed"]["rest"], gap)
+
     def test_the_ttl_runs_from_the_wall_clock_when_the_read_ended(self) -> None:
         """Router review of glaeda#2252, F2: a start time plus a monotonic length put keptFrom a second past the real
         end after a backward clock step, so a caller right after started another sweep under the lock."""
