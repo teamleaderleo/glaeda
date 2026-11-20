@@ -9671,7 +9671,7 @@ class TipLoopWorkTest(unittest.TestCase):
         return path
 
     def test_old_work_goes_but_recent_deep_writes_and_sibling_receipts_stay(self):
-        old, recent, deep = self.work("old", 48), self.work("recent", 23), self.work("deep", 48)
+        old, recent, deep = self.work("old", 48), self.work("recent", 0.5), self.work("deep", 48)
         (deep / "nightly/build/Products/nested/blob").touch()
         receipts = [make(self.state / name / "receipt", age_hours=96)
                     for name in ("receipts", "outbox", "candidates")]

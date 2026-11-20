@@ -5195,7 +5195,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # candidate apps and delivery receipts are siblings, outside this family.
         fams.append(Family("hq-tip-loop-work", HOME / "Library/Application Support/hq-tip-loop/state/work", True,
                            "the tip loop fetches the commit and builds it again", git_disposable=True, nested_git=True,
-                           min_idle_hours=24.0, max_idle_hours=24.0, mirror_idle_hours=24.0, deep_mtime=True,
+                           min_idle_hours=DEFAULT_AGE_HOURS, max_idle_hours=DEFAULT_AGE_HOURS,
+                           mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, deep_mtime=True,
                            owner="hq tip-loop", rebuild_minutes=30, platform="macos"))
     if DARWIN:  # the owned cmux minis
         # These roots contain disposable build products outside the CI hot tier. Keep Chromium's

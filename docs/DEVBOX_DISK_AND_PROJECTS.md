@@ -84,7 +84,7 @@ processes, sockets, mounts and the post-archive rechecks still veto deletion.
 ## Tip-loop work on CI Macs
 
 The `hq-tip-loop-work` family owns only `~/Library/Application Support/hq-tip-loop/state/work/*`
-on `fleet-mini` Macs. Work idle for 24 hours may be reclaimed; deep writes refresh its age, live
+on `fleet-mini` Macs. Work idle for the existing one-hour fleet window may be reclaimed; deep writes refresh its age, live
 processes/open files keep it, and unavailable evidence preserves it. Existing mirror archival protects
 unpushed Git work. Sibling candidates, receipts and delivery outbox are outside the cleanup root.
 
