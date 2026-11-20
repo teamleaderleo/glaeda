@@ -22393,6 +22393,37 @@ class LandTest(Base):
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap", gg.land_line(capped[0], self.t, latch=None))
 
+    def test_an_entry_held_only_by_the_host_cap_is_never_stopped_by_its_wait_deadline(self):
+        """Router review of glaeda#2244, F1: the cap's waits counted toward a wait's deadline. Its 200-entry simulation
+        stopped an "unreadable" entry after four judgments over 25,470 s although its retries asked for 420 s, the rest
+        spent waiting its turn under the cap. Here 10 entries answer a plain "unreadable" (each a 120 s retry) under a
+        cap of four judgments' GraphQL a window, for longer than LAND_UNREAD_DEADLINE: none is stopped on its
+        deadline."""
+        self.w.config["windowShare"] = {"rest": 0, "graphql": 4 * gg.LAND_JUDGE_COST["graphql"] / gg.LAND_POOL}
+        k = 10
+        heads = {n: format(0xD0 + n, "040x") for n in range(1, k + 1)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        judged: list[int] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[4])
+                judged.append(n)
+                self.w.answers.append(refusal("unreadable", heads[n], None))
+            return real(argv, timeout, env)
+        self.q.run = run
+        start = self.t
+        while self.t < start + gg.LAND_UNREAD_DEADLINE + 2 * gg.LAND_WINDOW_S:
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(60)
+        stops = {key: (e.get("stop") or {}).get("code") for key, e in self.q.entries.items() if e["state"] == "stopped"}
+        self.assertGreater(len(judged), k)  # every entry judged, some more than once: the cap opened each window
+        self.assertEqual(stops, {})
+
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them
         "unreadable" with merge_hold's reason quoting the gh-quota shim ("GitHub's GraphQL rate limit is spent for

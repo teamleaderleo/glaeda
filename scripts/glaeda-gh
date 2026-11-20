@@ -11502,6 +11502,10 @@ class LandQueue:
         else:
             return True
         self.pass_capped += 1
+        # Held by the cap from here to its judgment: not counted toward its wait's deadline (LAND_WAIT_HELD), as a
+        # latch or a quota park is. Router review of glaeda#2244, F1: a 200-entry simulation stopped an "unreadable"
+        # entry after four judgments over 25,470 s although its retries asked for 420 s, the rest waiting its turn.
+        e.setdefault("cappedSince", self.now)
         if float((e.get("windowCapped") or {}).get("start") or float("-inf")) != w["start"]:
             e["windowCapped"] = {"start": w["start"], "at": self.now, "pool": pool, "next": w["start"] + LAND_WINDOW_S}
             self.history(e, "window_capped", pool=pool, spent=round(w[pool]), next=utc_clock(w["start"] + LAND_WINDOW_S))
@@ -11947,9 +11951,11 @@ class LandQueue:
         self.unhold(e)
         # Held by the login's latch while due (unhold: heldFor), or parked on a quota refusal since (LAND_WAIT_HELD)
         held = float(e.pop("heldFor", None) or 0.0)
-        parked = e.pop("parkedSince", None)
-        if isinstance(parked, (int, float)) and not isinstance(parked, bool):
-            held += max(0.0, self.now - float(parked))
+        # a park then the cap's wait after it: one span from the earlier (the two overlap, never counted twice)
+        since = [float(v) for v in (e.pop("parkedSince", None), e.pop("cappedSince", None))
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if since:
+            held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held})
         e.pop("dueLate", None)
@@ -12945,7 +12951,7 @@ class LandQueue:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
                  stop={"code": code, "reason": land_trim(reason), "next": land_trim(nxt), "at": self.now})
-        for held in ("parkedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing (LAND_WAIT_HELD)
+        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing
             e.pop(held, None)
         self.history(e, "stopped", code=code, reason=land_trim(reason, 160))
         self.save(e)
