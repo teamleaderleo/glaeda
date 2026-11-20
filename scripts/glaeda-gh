@@ -15159,7 +15159,7 @@ def straggler_owners(heads: list[str], now: float) -> list[str]:
         doc = read_json(watch_dir() / file_name(key))
         if not isinstance(doc, dict) or doc.get("key") != key:
             continue
-        readers = readers_of(doc, now)  # within IDLE_EXPIRY only: a long-gone session is told nothing
+        readers = readers_of(doc, now) or ({doc["reader"]: now} if isinstance(doc.get("reader"), str) else {})
         owners.update(t for t in (reader_session(r) for r in readers) if t)
     return sorted(owners)[:STRAGGLER_OWNERS_MAX]
 
