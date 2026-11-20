@@ -6543,6 +6543,44 @@ class TickBudgetTest(Base):
         self.daemon.deferred_before["pr:o/r#1"] = NOW - 10 - gg.WAIT_PRIORITY - 1
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
 
+    def test_an_asked_head_with_no_answer_goes_ahead_of_the_deferred_backlog(self) -> None:
+        """huge-blue 2026-11-20: `glaeda-gh checks` for a new SHA stayed "unread" for 10+ min over REST, behind ~1000
+        carried PR deferrals. An asked head that holds no answer is read first; one that has an answer is ordinary."""
+        sha = "c" * 40
+        head = {"key": f"head:o/r@{sha}", "cache": None, "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        errored = {"key": f"head:o/r@{'d' * 40}", "cache": {"error": "graphql: partial", "data": None, "fetchedAt": NOW - 1},
+                   "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        answered = {"key": f"head:o/r@{'e' * 40}", "cache": {"data": {"found": {}}, "dataAt": NOW - 90, "fetchedAt": NOW - 90},
+                    "consumers": {"merge-hold": NOW - 5}, "waitedAt": None}
+        stale_ask = {"key": f"head:o/r@{'f' * 40}", "cache": None, "consumers": {"merge-hold": NOW - 5000}, "waitedAt": None}
+        prs = [self.entry(f"pr:o/r#{n}", "rest", NOW - 1000, deferred=True) for n in range(1, 4)]
+        self.daemon.deferred_before = {e["key"]: NOW - 500 + i for i, e in enumerate(prs)}
+        order = self.order(prs + [answered, stale_ask, errored, head])
+        self.assertEqual(set(order[:2]), {head["key"], errored["key"]})
+        self.assertEqual(order[2:5], [e["key"] for e in prs])
+
+    def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
+        """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
+        and an asked head with no answer, or a wait's key, is still read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("pr:o/r#9", waited=True)
+        sha = "c" * 40
+        gg.register(f"head:o/r@{sha}", consumer="merge-hold")
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_PLAIN_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            status = self.daemon.tick(NOW)
+        self.assertEqual(sorted(read), sorted([f"head:o/r@{sha}", "pr:o/r#9"]))
+        self.assertEqual(status["deferred"], 3, "the plain PRs wait for the next tick")
+        read.clear()
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual({"pr:o/r#1", "pr:o/r#2", "pr:o/r#3"} - set(read), set(), "and are read first then")
+
     def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
         """due() put a deferred key first only within its kind, so a deferred run sat behind every new PR."""
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},

@@ -555,6 +555,9 @@ SOCKET_TIMEOUT = 20  # each connect, TLS handshake and read
 HTTP_DEADLINE = 45  # one whole GitHub request, from connect to the last body byte
 SUBPROCESS_DEADLINE = 20  # gh auth token, launchctl, ps: killed with their whole process group after
 TICK_BUDGET = 90  # seconds a tick may spend starting requests
+REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
+# tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
+# (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
 WATCHDOG_CYCLES = 5
 WATCHDOG_AFTER = WATCHDOG_CYCLES * CYCLE  # the loop silent this long is hung: exit EXIT_WATCHDOG
 EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
@@ -6247,14 +6250,25 @@ class Daemon:
         never-read keys). The deferred rank can starve plain keys while blocked ones fill the share; tick() keeps
         them a floor (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
         carried = self.deferred_before
+        # A head a consumer asked for that holds no answer yet (`glaeda-gh checks` on a new SHA) goes first of all, ahead
+        # of the carried backlog: it is read once a retry cycle at most and paid by its consumer's cap, so it cannot
+        # crowd the PRs out, and its asker waits on it (huge-blue 2026-11-20: unread for 10+ min behind ~1000 PRs).
         # Among the deferred, a key a wait is blocked on (an interactive wait, a due land) goes ahead of every plain
         # watch: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait; and at
         # 21:5xZ a WAIT_PRIORITY head start was not enough, the share's few reads a minute went to older deferrals.
-        return sorted(entries, key=lambda e: (not self.wait_confirms(e), e["key"] not in carried,
+        return sorted(entries, key=lambda e: (not self.wait_confirms(e), not self.head_unanswered(e),
+                                              e["key"] not in carried,
                                               not (e["key"] in carried and self.waited(e)),
                                               carried.get(e["key"], 0.0),
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
+
+    def head_unanswered(self, e: dict) -> bool:
+        """A head watch a consumer asked for within HEAD_INTEREST that holds no answer (never read, or only errors):
+        what an on-demand `glaeda-gh checks` is waiting on."""
+        if not e["key"].startswith("head:") or (e.get("cache") or {}).get("data"):
+            return False
+        return any(self.now - t < HEAD_INTEREST for t in (e.get("consumers") or {}).values())
 
     def fed(self, key: str) -> bool:
         """Whether the controller's webhooks cover this key's repository now: its feed answered within
@@ -6672,7 +6686,11 @@ class Daemon:
             # the floor (PLAIN_FLOOR_EVERY): the first watch nothing is blocked on goes next after the confirmations
             confirms = [e for e in over_rest if self.wait_confirms(e)]
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
+        plain_until = time.monotonic() + REST_PLAIN_BUDGET
         for i, e in enumerate(over_rest):
+            if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e) or self.head_unanswered(e)):
+                self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order
+                continue
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
             kind = e["key"].split(":", 1)[0]
