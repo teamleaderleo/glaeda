@@ -4842,8 +4842,33 @@ class Daemon:
         if self.stale_now is not None:
             self.stale_last = self.stale_record()
         changed = False
+        # the stale alarm goes by its incident (incident_update), not by the hour: one send per incident and its news
+        incident_key = f"stale:{policy_host()}"
+        stale_steps = incident_update(
+            self.now, "stale", {incident_key} if "stale" in firing or "stale" in held else set(),
+            {incident_key: (firing["stale"][0], firing["stale"][2].get("valve") == "restarting")}
+            if "stale" in firing else {})
+        stale_step = (stale_steps or {}).get(incident_key)
+        if stale_step is not None and stale_step["event"] == "recover":
+            self.send_alarm("stale", "info", incident_recovered(stale_step, "waited PR data is fresh again"),
+                            {"incident": stale_step["incident"]["id"], "event": "recover"},
+                            source_key=f"{stale_step['incident']['id']}:recover")
         for name, (level, text, data) in firing.items():
             last = self.alarms.get(name) or {}
+            if name == "stale":
+                if stale_step is None or not stale_step["send"]:  # held by its incident (or the ledger busy: next tick)
+                    if last.get("cleared") or not last:  # back after a clear: still the incident already sent
+                        self.alarms[name] = {**{k: v for k, v in last.items() if k != "cleared"},
+                                             "at": last.get("at", self.now), "level": last.get("level", level)}
+                        changed = True
+                    continue
+                inc = stale_step["incident"]
+                self.send_alarm(name, level, text + incident_said(stale_step),
+                                {**data, "incident": inc["id"], "event": stale_step["event"]},
+                                source_key=f"{inc['id']}:{stale_step['event']}:{inc['sends']}")
+                self.alarms[name] = {"at": self.now, "level": level, "text": text, "incident": inc["id"]}
+                changed = True
+                continue
             # worse: it became a FIRE, or another REST window (GitHub keeps two core counters) is the one running dry
             worse = level == "fire" and last.get("level") != "fire" or (
                 isinstance(last.get("reset"), (int, float)) and abs(last["reset"] - data.get("reset", last["reset"]))
@@ -4936,8 +4961,9 @@ class Daemon:
         """One notice line (notice_line) at the daemon's time."""
         notice_line(self.now, kind, level, text, data)
 
-    def send_alarm(self, name: str, level: str, text: str, data: dict) -> None:
-        """The notice line, then tell-coordinator in the background: a slow or missing inbox never holds a tick."""
+    def send_alarm(self, name: str, level: str, text: str, data: dict, source_key: str = "") -> None:
+        """The notice line, then tell-coordinator in the background: a slow or missing inbox never holds a tick.
+        SOURCE_KEY (an incident event's id) goes as --source-key, so coord_inbox sends that key once."""
         log({"event": "alarm", "alarm": name, "level": level, "text": text})
         self.write_notice(name, level, text, data)
         if not (ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK)):
@@ -4945,7 +4971,8 @@ class Daemon:
             return
         try:
             self.alarm_procs.append(subprocess.Popen(
-                [os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, text],
+                [os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level,
+                 *(["--source-key", source_key] if source_key else []), text],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True))
         except OSError as error:
@@ -15026,6 +15053,126 @@ def straggler_pass(key: str, data: dict, now: float, get: Callable[[str, list[st
     return merged
 
 
+# The incident ledger: one alert per incident, not one per hour it lasts. forum-surge-inbox, 2026-11-20, after the
+# stale alarm said the same host's stale PR data again every ALARM_EVERY for hours (huge-blue: 15,762 s old) and each
+# host's straggler notice repeated hourly per label; Leo: "when it gets to states like this all of you need to be able
+# to temporarily let the messages go to some inbox that you later categorize/read". An incident opens on its
+# condition's first firing and is sent then. While it is open a repeat is counted, never sent (NOW's glaeda line and
+# daemon.json carry the ongoing state); only news is: a WARN becoming a FIRE, or what the caller calls news (the stale
+# valve restarting the daemon). Quiet for INCIDENT_CLOSE_AFTER closes it with one recovery naming the repeats held
+# back; firing again inside that window is the same incident (a flap), after it a fresh one with a new id. Held (the
+# quota or an upstream explains the old data) keeps it open and is never a recovery. incidents.json holds the open
+# ones; incidents.jsonl every decision (sent or held), so the sender's own rate can be counted beside the
+# recipient's, with the agent forum's work-post fields (cmuxterm-hq RFD 0018: channel, thread, kind, key) for its
+# producer adapter. Each send also carries its incident id as tell-coordinator's --source-key, coord_inbox's own
+# ledger, so a lost incidents.json still sends one message per incident event.
+INCIDENTS_FILE = "incidents.json"
+INCIDENT_LEDGER = "incidents.jsonl"
+INCIDENT_CLOSE_AFTER = 1800.0  # seconds the condition stays quiet before its incident closes (recovered)
+INCIDENT_LEDGER_KEEP = 2000  # lines incidents.jsonl keeps (trimmed past a quarter more)
+
+
+def incident_ledger_line(now: float, key: str, inc: dict, event: str, sent: bool, level: str) -> None:
+    """One decision in incidents.jsonl, with the forum's work-post fields. Logged, never raised."""
+    scope, _, thread = key.partition(":")
+    line = {"ts": utc_stamp(now), "at": round(now, 3), "host": policy_host(), "key": key, "incident": inc.get("id"),
+            "event": event, "sent": sent, "level": level, "repeats": int(num(inc.get("repeats"))),
+            "sends": int(num(inc.get("sends"))), "channel": f"ops/glaeda-{scope}", "thread": thread or policy_host(),
+            "kind": "receipt" if event == "recover" else "blocker" if level == "fire" else "warn"}
+    try:
+        path = BASE / INCIDENT_LEDGER
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as out:
+            out.write(json.dumps(line, sort_keys=True) + "\n")
+        lines = path.read_text().splitlines()
+        if len(lines) > INCIDENT_LEDGER_KEEP * 5 // 4:
+            tmp = path.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(lines[-INCIDENT_LEDGER_KEEP:]) + "\n")
+            tmp.replace(path)
+    except OSError as error:
+        log({"event": "incident-ledger-failed", "error": describe(error)})
+
+
+def incident_update(now: float, scope: str, active: set[str], fired: dict[str, tuple[str, bool]],
+                    close_after: float = INCIDENT_CLOSE_AFTER) -> dict[str, dict] | None:
+    """One pass of SCOPE's incidents (keys "SCOPE:..."): each key in FIRED fired with (level, news); a key in ACTIVE
+    and not FIRED is still on (held, or between a caller's own notices); every other open incident of SCOPE is quiet.
+    Returns {key: {"event", "send", "incident"}} for the keys whose incident changed (open, escalate, news, repeat,
+    recur, quiet, recover), or None when the ledger's lock was not had in time (nothing decided: the next pass is)."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    out: dict[str, dict] = {}
+    with bounded_lock(BASE / f"{INCIDENTS_FILE}.lock") as held:
+        if not held:
+            return None
+        doc = read_json(BASE / INCIDENTS_FILE)
+        incidents = doc.get("open") if isinstance(doc, dict) and isinstance(doc.get("open"), dict) else {}
+        incidents = {k: v for k, v in incidents.items() if isinstance(v, dict) and isinstance(v.get("id"), str)}
+        changed = False
+        for key, (level, news) in fired.items():
+            inc = incidents.get(key)
+            if inc is None:
+                inc = {"id": f"{key}@{utc_stamp(now)}", "opened": now, "level": level, "repeats": 0, "sends": 1,
+                       "seen": now}
+                event, send = "open", True
+            else:
+                flap = inc.pop("quietSince", None) is not None
+                if level == "fire" and inc.get("level") != "fire":
+                    inc["level"], event, send = "fire", "escalate", True
+                elif news:
+                    event, send = "news", True
+                else:
+                    inc["repeats"] = int(num(inc.get("repeats"))) + 1
+                    event, send = ("recur" if flap else "repeat"), False
+                inc["sends"] = int(num(inc.get("sends"))) + (1 if send else 0)
+                inc["seen"] = now
+            incidents[key] = inc
+            changed = True
+            out[key] = {"event": event, "send": send, "incident": dict(inc)}
+            if event != "repeat":  # a repeat is only counted: one line a tick would be the flood again, kept locally
+                incident_ledger_line(now, key, inc, event, send, level)
+        for key in [k for k in incidents if k.startswith(scope + ":") and k not in fired]:
+            inc = incidents[key]
+            if key in active:
+                if inc.pop("quietSince", None) is not None:
+                    out[key] = {"event": "recur", "send": False, "incident": dict(inc)}
+                    incident_ledger_line(now, key, inc, "recur", False, str(inc.get("level") or "warn"))
+                    changed = True
+                continue
+            if "quietSince" not in inc:
+                inc["quietSince"] = now
+                out[key] = {"event": "quiet", "send": False, "incident": dict(inc)}
+                incident_ledger_line(now, key, inc, "quiet", False, str(inc.get("level") or "warn"))
+                changed = True
+            elif now - num(inc["quietSince"]) >= close_after:
+                del incidents[key]
+                inc = {**inc, "closed": now, "sends": int(num(inc.get("sends"))) + 1}
+                out[key] = {"event": "recover", "send": True, "incident": inc}
+                incident_ledger_line(now, key, inc, "recover", True, "info")
+                changed = True
+        if changed:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                write_json(BASE / INCIDENTS_FILE, {"open": incidents})
+    return out
+
+
+def incident_said(step: dict) -> str:
+    """What an incident's sent alert adds to its text: its id, and that repeats are held."""
+    inc = step["incident"]
+    if step["event"] == "open":
+        return (f" Incident {inc['id']}: this is sent once; repeats are held until it recovers "
+                f"({int(INCIDENT_CLOSE_AFTER // 60)} min quiet), and only a FIRE or a valve restart is sent again.")
+    return (f" Incident {inc['id']}, open {int((num(inc.get('seen')) - num(inc.get('opened'))) // 60)} min, "
+            f"{int(num(inc.get('repeats')))} repeat(s) held.")
+
+
+def incident_recovered(step: dict, what: str) -> str:
+    """The one line an incident's recovery sends."""
+    inc = step["incident"]
+    return (f"glaeda-gh on {policy_host()}: incident {inc['id']} recovered: {what}, quiet for "
+            f"{int(INCIDENT_CLOSE_AFTER // 60)} min (opened {utc_stamp(num(inc.get('opened')))}, "
+            f"{int(num(inc.get('repeats')))} repeat(s) held back).")
+
+
 def notice_line(now: float, kind: str, level: str, text: str, data: dict) -> None:
     """One notice line (cmuxterm-hq tools/fleet-reconcilers/notices.py's schema) in NOTICES_DIR/glaeda-gh.jsonl."""
     line = {"ts": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(timespec="seconds"),
@@ -15068,6 +15215,7 @@ def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_
         for s in found:
             heads = seen.setdefault(s["label"], {})
             heads[key] = [(heads.get(key) or [0])[0] + 1, now]
+        due: dict[str, str] = {}
         for label, heads in seen.items():
             if not heads or now - noticed.get(label, 0.0) < STRAGGLER_NOTICE_EVERY:
                 continue
@@ -15076,8 +15224,22 @@ def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_
                     f"past {int(bound // 60)} min on {len(heads)} watched head(s), e.g. {key_name(next(iter(heads)))}. "
                     f"{STRAGGLER_STEP.format(label=label)}")
             notice_line(now, "stragglers", "warn", text, {"label": label, "jobs": jobs, "heads": sorted(heads)})
-            coord_alert_spawn(text)
+            due[f"stragglers:{label}"] = text
             noticed[label] = now
+        # the hourly notice line per label stays; the coordinator hears each label's incident once (incident_update),
+        # and once more when no head has had a straggler on it for the hour seen keeps plus INCIDENT_CLOSE_AFTER
+        steps = incident_update(now, "stragglers", {f"stragglers:{label}" for label, heads in seen.items() if heads},
+                                {key: ("warn", False) for key in due})
+        if steps is None:  # the ledger busy: these labels are due again on the next pass, not in an hour
+            for key in due:
+                noticed.pop(key.partition(":")[2], None)
+            steps = {}
+        for key, step in steps.items():
+            if step["event"] == "recover":
+                coord_alert_spawn(incident_recovered(step, f"no watched head has a straggler on runner label "
+                                                           f"{key.partition(':')[2]}"))
+            elif step["send"] and key in due:
+                coord_alert_spawn(due[key] + incident_said(step))
         seen = {label: heads for label, heads in seen.items() if heads}
         with contextlib.suppress(OSError, ValueError, TypeError):
             write_json(BASE / STRAGGLER_SEEN, {"seen": seen, "noticed": {
