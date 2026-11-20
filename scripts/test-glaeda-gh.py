@@ -8636,7 +8636,7 @@ class HeadChecksTest(Base):
         self.gh.suites[SHA_A] = [{"id": i, "latest": 0, "runs": []} for i in ids]
         self.daemon.now = NOW
         room = iter([True, False])
-        with mock.patch.object(self.daemon, "gql_room", side_effect=lambda: next(room)):
+        with mock.patch.object(self.daemon, "gql_room", side_effect=lambda cost=1: next(room)):
             runs, error = self.daemon.suite_runs(ids)
         self.assertIsNone(error)
         self.assertEqual([runs[i] for i in ids[:100]], [[]] * 100)
@@ -18092,7 +18092,7 @@ class LandSnapshotTest(Base):
         self.daemon.deferred_since = {k: NOW - 100 + i for i, k in enumerate(keys)}
         self.daemon.batch["pr"] = 2
         room = iter([True])
-        self.daemon.gql_room = lambda: next(room, False)  # one query's room this tick: the rest stay deferred
+        self.daemon.gql_room = lambda cost=1: next(room, False)  # one query's room this tick: the rest stay deferred
         for waiting in (False, True):
             with self.subTest(waiting=waiting):
                 self.land.entries["pr:o/r#10"] = {"state": "queued", **(
