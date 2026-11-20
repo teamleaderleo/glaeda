@@ -23048,6 +23048,22 @@ class LandTest(Base):
         self.assertEqual(p["judged"], k, p)
         self.assertEqual(set(p["waits"].values()), {"quota"}, p)
 
+    def test_a_webview_unreadable_judgment_the_quota_refused_is_parked(self):
+        """merge_hold's webview-specific unreadable code is still a quota state when its reason names the refusal."""
+        self.pr(LA)
+        self.land()
+        self.w.answers.append((3, {
+            "ok": False,
+            "code": "webview_unreadable",
+            "head": LA,
+            "action": {"kind": "retry", "after_s": 60},
+            "reason": "its webview verdict could not be read: gh-quota: refused: GitHub's GraphQL rate limit "
+                       "is spent for login until 23:38Z (reset); retry after 23:38Z",
+        }))
+        e = self.tick()
+        self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), e)
+        self.assertIsNone(e.get("stop"))
+
     def test_an_unreadable_judgment_in_the_brokers_rate_limited_words_is_parked_too(self):
         """lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z: "unreadable" in the broker's words ("gh api graphql
         failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"), which LAND_UNREAD_QUOTA

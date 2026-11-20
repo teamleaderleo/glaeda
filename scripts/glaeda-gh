@@ -9965,7 +9965,11 @@ LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a ju
 # must not end a land ... and let a stuck read never count toward the three-strike stop." Still bounded: a read that
 # never completes stops retry_deadline at LAND_UNREAD_DEADLINE, and re-arms (LAND_REARM_*) as before.
 LAND_UNREAD_DEADLINE = 6 * 3600.0
-LAND_UNREAD_CODES = frozenset({"unreadable"})
+# merge_hold gives a webview-specific code after its live verdict reader has been
+# unable to read the head.  When the reason is the gh-quota refusal below, that
+# code is the login's temporary state too; it must be parked until reset rather
+# than treated as a PR-level webview stop.
+LAND_UNREAD_CODES = frozenset({"unreadable", "webview_unreadable"})
 # A train_wait (another PR's merge-train reservation holds the base for a file this one changes) is a retry land_judge
 # itself bounds: the reservation lives TRAIN_HOLD_S (1.5 h) from the holder's head, under the retry's 2 h. So its budget
 # is the reservation's, keyed on the holder and its head: a new holder head is a new reservation and a new budget. Keyed
