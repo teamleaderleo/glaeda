@@ -6660,8 +6660,10 @@ class TickBudgetTest(Base):
         self.assertEqual((level, data["cause"]), ("fire", "held"))
         self.assertIn(f"held past {gg.STALE_HELD_MAX}s", text)
         self.assertIn("held", gg.STALE_NO_RESTART)
-        _, _, valved = self.daemon.stale_valve(("fire", text, data), {}) if False else ("", "", {"valve": "held"})
-        self.assertEqual(valved["valve"], "held")
+        self.daemon.stale_streak = gg.STALE_VALVE_TICKS
+        _, _, valved = self.daemon.stale_valve(("fire", text, data), {})
+        self.assertEqual(valved["valve"], "held")  # the valve does not restart for it
+        self.assertIsNone(self.daemon.valve_due)
 
     def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
         """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
