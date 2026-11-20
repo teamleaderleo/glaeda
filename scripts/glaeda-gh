@@ -733,7 +733,8 @@ PLAIN_FLOOR_EVERY = 60.0
 # serve registers SIGUSR1 (faulthandler): every thread's stack goes to the daemon's stderr (the unit's journal) and it
 # goes on serving. huge-blue, 2026-11-18: a stalled daemon's threads (one on a futex) could only be guessed at.
 STALE_DUMP_ADVICE = ("Where each thread is: kill -USR1 <daemon pid> (daemon.json pid); the stacks go to the daemon's "
-                     "stderr (journalctl --user -u glaeda-gh -n 200, or the unit's StandardError file)")
+                     "stderr: on Linux ~/.local/state/glaeda-gh.err (the unit's StandardError=append:, so not the "
+                     "journal), on a Mac ~/Library/Logs/glaeda-gh.err")
 DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
 DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
@@ -5122,11 +5123,19 @@ class Daemon:
                 headers["If-None-Match"] = etag
             if raw_body is not None:
                 headers["Content-Type"] = "application/json"
+            # Timed as "github" like a login request: huge-blue, 2026-11-20 12:0xZ, "read rest 596.0, github 40.0" in
+            # a window where most reads went out on the App, so nobody could tell GitHub's answers from local work.
+            self.in_call = {"what": f"{method} {route} (app)", "since": time.monotonic()}
             try:
                 status, h, raw = self.transport(method, API + path, headers, raw_body)
             except BaseException:
                 self.note_spend("rest", route, 0)  # the App's pool, never the login's share
                 raise
+            finally:
+                took = time.monotonic() - self.in_call["since"]
+                self.note_spent("github", took)
+                self.last_call = {"what": self.in_call["what"], "tookS": round(took, 1), "at": round(self.now, 3)}
+                self.in_call = None
             try:
                 doc = json.loads(raw) if raw else None
             except ValueError:
