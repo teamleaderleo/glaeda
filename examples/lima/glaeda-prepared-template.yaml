@@ -52,9 +52,11 @@ containerd:
 
 vmOpts:
   vz:
+    # Apple's Rosetta, shared read-only at /mnt/lima-rosetta and registered as the x86_64 binfmt handler, so x64
+    # job binaries run on these arm64 clones. It is the one host share the guest gets; verify allows exactly it.
     rosetta:
-      enabled: false
-      binfmt: false
+      enabled: true
+      binfmt: true
 
 video:
   display: none

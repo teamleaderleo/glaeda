@@ -1030,10 +1030,17 @@ mod tests {
         let location = prepared_template.guest_image_location();
         let digest = prepared_template.guest_image_digest().as_str();
 
-        for input in [
-            include_str!("../examples/lima/glaeda-work.yaml"),
-            include_str!("../examples/lima/glaeda-interactive.yaml"),
-            include_str!("../examples/lima/glaeda-prepared-template.yaml"),
+        // Only the production runner template shares Rosetta (x64 job binaries on arm64 clones).
+        for (input, rosetta) in [
+            (include_str!("../examples/lima/glaeda-work.yaml"), false),
+            (
+                include_str!("../examples/lima/glaeda-interactive.yaml"),
+                false,
+            ),
+            (
+                include_str!("../examples/lima/glaeda-prepared-template.yaml"),
+                true,
+            ),
         ] {
             let document: serde_yaml::Value = serde_yaml::from_str(input).unwrap();
             assert_eq!(
@@ -1066,11 +1073,11 @@ mod tests {
             assert_eq!(document["containerd"]["user"].as_bool(), Some(false));
             assert_eq!(
                 document["vmOpts"]["vz"]["rosetta"]["enabled"].as_bool(),
-                Some(false)
+                Some(rosetta)
             );
             assert_eq!(
                 document["vmOpts"]["vz"]["rosetta"]["binfmt"].as_bool(),
-                Some(false)
+                Some(rosetta)
             );
             assert_eq!(document["video"]["display"].as_str(), Some("none"));
             assert_eq!(document["propagateProxyEnv"].as_bool(), Some(false));
