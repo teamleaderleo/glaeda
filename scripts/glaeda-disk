@@ -646,6 +646,7 @@ class Family:
     # entries follow the normal idle window and are protected when a live lease names them.
     stale_before: float | None = None
     allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
+    boundary_root: Path | None = None  # deletion stays relative to an opened, no-symlink root
     reference_root: Path | None = None  # root containing lease/job markers for this family
     # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
     # and no git check keeps it; process, socket and job-marker checks still do.
@@ -5190,14 +5191,15 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         bazel_user = pwd.getpwuid(uid).pw_name
     if DARWIN and bazel_user:
         fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
-    if DARWIN and role == "fleet-mini":
+    tip_work = HOME / "Library/Application Support/hq-tip-loop/state/work"
+    if DARWIN and role == "fleet-mini" and tart_root_safe(tip_work):
         # The tip loop writes per-commit clones/builds here, not user checkouts. Its
         # candidate apps and delivery receipts are siblings, outside this family.
-        fams.append(Family("hq-tip-loop-work", HOME / "Library/Application Support/hq-tip-loop/state/work", True,
+        fams.append(Family("hq-tip-loop-work", tip_work, True,
                            "the tip loop fetches the commit and builds it again", git_disposable=True, nested_git=True,
                            min_idle_hours=DEFAULT_AGE_HOURS, max_idle_hours=DEFAULT_AGE_HOURS,
                            mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, deep_mtime=True,
-                           owner="hq tip-loop", rebuild_minutes=30, platform="macos"))
+                           owner="hq tip-loop", rebuild_minutes=30, platform="macos", boundary_root=tip_work))
     if DARWIN:  # the owned cmux minis
         # These roots contain disposable build products outside the CI hot tier. Keep Chromium's
         # source tree under cmux-browser-fleet/build, but allow old top-level tour artifacts and
@@ -7334,7 +7336,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
     for fam in fams:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
-        if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
+        if (fam.boundary_root is not None or fam.id in ROOT_SAFE_FAMILIES) and not tart_root_safe(fam.boundary_root or fam.root):
             continue  # a symlinked or out-of-HOME Tart store is someone else's, its aside trees too (#1813)
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
@@ -7360,12 +7362,15 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
                     INTERRUPTED, d, True, "nothing: a deletion glaeda-disk started and did not finish",
                     files=True, include=(DELETING_PREFIX,), build_output=True, min_bytes=0,
                     max_idle_hours=0.0, owner="glaeda-disk remove()", rebuild_minutes=0.1,
-                    allow_stale_protected=fam.allow_stale_protected, platform=fam.platform)
+                    allow_stale_protected=fam.allow_stale_protected, platform=fam.platform,
+                    boundary_root=fam.boundary_root)
     return [parents[k] for k in sorted(parents)]
 
 
-def finish_deletion(path: Path) -> None:
+def finish_deletion(path: Path, *, boundary_root: Path | None = None) -> None:
     """Delete an aside tree in place: it already has its deleting name, so a second rename adds nothing."""
+    if boundary_root is not None:
+        return remove_bound(path, boundary_root, interrupted=True)
     if toolchain_held(path, fresh=True):
         raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
@@ -10048,15 +10053,15 @@ def tart_root_safe(root: Path) -> bool:
     try:
         home = Path(os.path.realpath(HOME))
         rel = Path(os.path.abspath(root)).relative_to(os.path.abspath(HOME))
-    except ValueError:
+        walk = Path(os.path.abspath(HOME))
+        for part in rel.parts:
+            walk = walk / part
+            if walk.is_symlink():
+                return False
+        real = Path(os.path.realpath(root))
+        return real != home and home in real.parents and real.is_dir()
+    except (OSError, ValueError):
         return False
-    walk = Path(os.path.abspath(HOME))
-    for part in rel.parts:
-        walk = walk / part
-        if walk.is_symlink():
-            return False
-    real = Path(os.path.realpath(root))
-    return real != home and home in real.parents and real.is_dir()
 
 
 def tart_walk(root: Path) -> tuple[list[Path], list[Path]]:
@@ -10504,7 +10509,7 @@ def vm_budget_counted(fam: "Family", path: Path) -> bool:
 
 
 def candidates(fam: Family) -> list[Path]:
-    if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
+    if (fam.boundary_root is not None or fam.id in ROOT_SAFE_FAMILIES) and not tart_root_safe(fam.boundary_root or fam.root):
         return []
     if fam.id == TART_IMAGES:
         level = tart_image_dirs(fam.root)
@@ -13385,8 +13390,60 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
     return record
 
 
-def remove(path: Path, after_rename=None) -> None:
+@contextlib.contextmanager
+def deletion_parent(path: Path, boundary_root: Path):
+    """Pin every parent with openat/O_NOFOLLOW; a later path redirect cannot redirect deletion."""
+    if sys.version_info < (3, 11) or not shutil.rmtree.avoids_symlink_attacks:
+        raise OSError("bound deletion requires fd-safe rmtree (Python 3.11+)")
+    if not tart_root_safe(boundary_root) or not path.parent.is_relative_to(boundary_root):
+        raise OSError("refusing changed deletion root")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with contextlib.ExitStack() as stack:
+        fd = os.open(HOME, flags)
+        stack.callback(os.close, fd)
+        for part in path.parent.relative_to(HOME).parts:
+            fd = os.open(part, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield fd
+
+
+def remove_bound(path: Path, boundary_root: Path, after_rename=None, *, interrupted=False):
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
+    with deletion_parent(path, boundary_root) as parent_fd:
+        st = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode) or st.st_dev != os.fstat(parent_fd).st_dev:
+            raise OSError("refusing symlink or mount point")
+        if interrupted:
+            if not DELETING_RE.fullmatch(path.name):
+                raise OSError("refusing a tree without the deleting name")
+            try:
+                os.stat(mirror_keep_marker(path).name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError("refusing kept deletion tree")
+        name = path.name
+        if stat.S_ISDIR(st.st_mode):
+            if not interrupted:
+                name = f"{DELETING_PREFIX}{path.name}-{os.getpid()}"
+                os.rename(path.name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            if after_rename is not None:
+                if not tart_root_safe(boundary_root):
+                    raise OSError("refusing callback through changed deletion root")
+                after_rename()
+            # No pathname-based chmod retry: an unreadable tree stays incomplete rather than following a link.
+            shutil.rmtree(name, dir_fd=parent_fd)
+        elif stat.S_ISREG(st.st_mode):
+            os.unlink(name, dir_fd=parent_fd)
+        else:
+            raise OSError("refusing special file")
+
+
+def remove(path: Path, after_rename=None, *, boundary_root: Path | None = None) -> None:
     """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+    if boundary_root is not None:
+        return remove_bound(path, boundary_root, after_rename)
     if toolchain_held(path, fresh=True):
         raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
@@ -13620,7 +13677,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if not cmds:
                     print("refusing to delete the rest: ps failed", file=sys.stderr)
                     break
-        if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
+        if (fam.boundary_root is not None or fam.id in ROOT_SAFE_FAMILIES) and not tart_root_safe(fam.boundary_root or fam.root):
             outcome = "changed:root-boundary"
         elif fam.retired_only and not owner_retired(fam):
             outcome = "changed:owner-loaded"
@@ -13717,7 +13774,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 elif tmp_canonical_root(fam, p):
                     gone = remove_canonical_root(p)  # the whole root, likewise only under its token
                 elif i.family == INTERRUPTED:
-                    finish_deletion(p)
+                    finish_deletion(p, boundary_root=fam.boundary_root)
                     gone = True
                 elif media_tour_dd(fam, p):
                     gone = remove_media_tour_dd(p)  # only under the tour's tag lock: a tour may claim the slot now
@@ -13730,7 +13787,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
-                    remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
+                    remove(p, boundary_root=fam.boundary_root, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
                            else cmux_next_ci_tui_recheck(fam, p) if cmux_next_ci_tui_tree(fam, p)
                            else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY

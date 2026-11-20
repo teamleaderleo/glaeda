@@ -97,3 +97,11 @@ loop only on Ultra2. Incident and host receipts: manaflow-ai/cmuxterm-hq#15138.
 
 Detector: `TipLoopWorkTest` in `scripts/test-glaeda-disk.py` exercises survey/apply, deep activity,
 post-survey liveness, unavailable evidence, symlinked roots/ancestors and a post-survey redirect into outbox; mini-setup's existing byte-copy check covers installation.
+
+Bound cleanup pins the parent directory with no-symlink `openat` traversal and deletes
+relative to its descriptor, including interrupted deletion trees. A pathname redirected
+after the scan cannot redirect deletion into delivery state. Inaccessible roots are skipped.
+This family requires Python 3.11+ and fd-safe `shutil.rmtree`; older runtimes preserve the
+work and report an incomplete cleanup. Read-only trees remain incomplete rather than
+using a pathname-based chmod retry. The regression tests redirect the root immediately
+before the recursive unlink for both normal and interrupted deletion.

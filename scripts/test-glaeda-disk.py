@@ -9716,6 +9716,51 @@ class TipLoopWorkTest(unittest.TestCase):
         self.assertTrue((outbox / old.name).is_dir())
         self.assertIn("changed:root-boundary", (self.home / "receipt.jsonl").read_text())
 
+    def test_unreadable_ancestor_does_not_abort_family_discovery(self):
+        original = Path.is_symlink
+        def inaccessible(path):
+            if path == self.state:
+                raise PermissionError("state is not traversable")
+            return original(path)
+        with mock.patch.object(Path, "is_symlink", inaccessible), mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            families = gd.default_families()
+        self.assertNotIn(self.fam.id, [f.id for f in families])
+        self.assertTrue(families, "other cleanup families remain available")
+
+    def test_final_delete_cannot_follow_a_root_redirect(self):
+        old = self.work("old", 48)
+        saved = make(self.state / "outbox" / f"{gd.DELETING_PREFIX}old-{os.getpid()}" / "saved-receipt", age_hours=48)
+        original = gd.shutil.rmtree
+        def redirect(name, *args, **kwargs):
+            self.fam.root.rename(self.state / "work-original")
+            self.fam.root.symlink_to(self.state / "outbox", target_is_directory=True)
+            return original(name, *args, **kwargs)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            with mock.patch.object(gd.shutil, "rmtree", side_effect=redirect):
+                gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(saved.exists(), "deletion is relative to the pinned parent, never the redirected outbox")
+        self.assertFalse((self.state / "work-original" / old.name).exists())
+
+    def test_interrupted_delete_inherits_and_pins_the_original_boundary(self):
+        name = f"{gd.DELETING_PREFIX}old-99999"
+        aside = self.work(name, 48)
+        families = gd.interrupted_families([self.fam])
+        self.assertEqual(len(families), 1)
+        interrupted = families[0]
+        self.assertEqual(interrupted.boundary_root, self.fam.root)
+        saved = make(self.state / "outbox" / name / "saved-receipt", age_hours=48)
+        original = gd.shutil.rmtree
+        def redirect(child, *args, **kwargs):
+            self.fam.root.rename(self.state / "work-original")
+            self.fam.root.symlink_to(self.state / "outbox", target_is_directory=True)
+            return original(child, *args, **kwargs)
+        with mock.patch.object(gd.shutil, "rmtree", side_effect=redirect):
+            gd.finish_deletion(aside, boundary_root=interrupted.boundary_root)
+        self.assertTrue(saved.exists())
+        self.assertFalse((self.state / "work-original" / name).exists())
+        self.assertEqual(gd.candidates(interrupted), [])
+
     def test_unknown_process_evidence_preserves_old_work(self):
         path = self.work("unknown", 48)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
