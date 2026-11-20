@@ -6789,6 +6789,19 @@ class TickBudgetTest(Base):
         self.assertGreater(tick, 0, "(the read does not fit in one tick here)")
         self.assertLess(data_at, NOW + tick * (gg.TICK_BUDGET + gg.TICK), "dated from its first attempt, not now")
 
+    def test_a_read_stored_since_the_cut_is_not_replaced_by_the_resumed_one(self) -> None:
+        """Review of glaeda#2256 (F1): a cut read whose key another read stored since (GraphQL, a wait's read) starts
+        over instead of resuming, so parts from before that read never replace its newer data or date it back."""
+        self.daemon.now = NOW
+        self.daemon.cut_reads["pr:o/r#1"] = NOW - 100
+        self.daemon.store("pr:o/r#1", None, data={"state": "OPEN"}, dataAt=NOW - 50, via="graphql")
+        self.assertNotIn("pr:o/r#1", self.daemon.cut_reads, "stored since the cut: not resumable")
+        self.daemon.cut_reads["pr:o/r#1"] = NOW - 100
+        self.daemon.resume_key, self.daemon.resume_from = "pr:o/r#1", NOW - 100
+        self.daemon.store("pr:o/r#1", None, data={"state": "OPEN"}, dataAt=NOW, via="rest")
+        self.daemon.resume_key, self.daemon.resume_from = "", float("inf")
+        self.assertEqual(gg.read_cache("pr:o/r#1")["dataAt"], NOW - 100, "a resumed read is dated from its first try")
+
     def huge_blue_waited_age(self, plain: int = 1000, waited_checks: tuple[int, ...] = (450, 450, 450),
                              request_s: float = 4.0, hours: float = 1.0) -> dict:
         """huge-blue 2026-11-20 12:0xZ, simulated with the real tick() and REST PR read against FakeGitHub: PLAIN watches

@@ -6685,51 +6685,55 @@ class Daemon:
             # the floor (PLAIN_FLOOR_EVERY): the first watch nothing is blocked on goes next after the confirmations
             confirms = [e for e in over_rest if self.wait_confirms(e)]
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
-        for i, e in enumerate(over_rest):
-            # A read is admitted only when its worst case fits in the share, so the share holds at a
-            # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
-            kind = e["key"].split(":", 1)[0]
-            app_ok = bool(self.app_entries_eligible(kind, [e], "rest"))
-            if (self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[kind])) and not app_ok:
-                self.to_graphql(over_rest[i:], spilled)
-                break
-            sent = len(self.sent)
+        try:
+            for i, e in enumerate(over_rest):
+                # A read is admitted only when its worst case fits in the share, so the share holds at a
+                # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
+                kind = e["key"].split(":", 1)[0]
+                app_ok = bool(self.app_entries_eligible(kind, [e], "rest"))
+                if (self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[kind])) and not app_ok:
+                    self.to_graphql(over_rest[i:], spilled)
+                    break
+                sent = len(self.sent)
+                self.resume_key, self.resume_from = "", float("inf")
+                cut = self.cut_reads.pop(e["key"], None)
+                data_at = (read_cache(e["key"]) or {}).get("dataAt") if cut is not None else None
+                if cut is not None and self.now - cut <= RESUME_MAX and not (isinstance(data_at, (int, float))
+                                                                             and data_at >= cut):
+                    self.resume_key, self.resume_from = e["key"], cut
+                try:
+                    with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
+                        self.rest_fetch[e["key"].split(":", 1)[0]](e)
+                except OutOfTime:
+                    # No reason: a tick spent waiting for GraphQL slots ends here too, and a stall the valve must act on
+                    # would read as a budget's deferral (review of glaeda#2189, F1)
+                    self.defer(over_rest[i:])
+                    if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
+                        self.rest_tried[e["key"]] = self.now
+                        self.deferred_since.pop(e["key"], None)
+                        # its next try resumes from what this one got (RESUME_MAX), dated from the first cut attempt
+                        self.cut_reads[e["key"]] = min(self.resume_from, self.now) if self.resume_key == e["key"] else self.now
+                    elif cut is not None:
+                        self.cut_reads[e["key"]] = cut  # not sent this time: still resumable
+                    break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
+                except Exception as error:  # noqa: BLE001
+                    self.errors.append(f"{e['key']}: {describe(error)}")
+                    self.refresh_note("rest", describe(error), key_name(e["key"]), "retry next cycle")
+                else:
+                    stored = read_cache(e["key"]) or {}
+                    if stored.get("error") and stored.get("fetchedAt") == self.now:
+                        self.refresh_note("rest", stored["error"], key_name(e["key"]), "retry next cycle")
+                if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
+                    # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
+                    self.to_graphql(over_rest[i:], spilled)
+                    break
+                self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
+                if not self.waited(e):
+                    self.plain_at["rest"] = self.now
+                # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
+                self.deferred_since.pop(e["key"], None)
+        finally:
             self.resume_key, self.resume_from = "", float("inf")
-            cut = self.cut_reads.pop(e["key"], None)
-            if cut is not None and self.now - cut <= RESUME_MAX:
-                self.resume_key, self.resume_from = e["key"], cut
-            try:
-                with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
-                    self.rest_fetch[e["key"].split(":", 1)[0]](e)
-            except OutOfTime:
-                # No reason: a tick spent waiting for GraphQL slots ends here too, and a stall the valve must act on
-                # would read as a budget's deferral (review of glaeda#2189, F1)
-                self.defer(over_rest[i:])
-                if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
-                    self.rest_tried[e["key"]] = self.now
-                    self.deferred_since.pop(e["key"], None)
-                    # its next try resumes from what this one got (RESUME_MAX), dated from the first cut attempt
-                    self.cut_reads[e["key"]] = min(self.resume_from, self.now) if self.resume_key == e["key"] else self.now
-                elif cut is not None:
-                    self.cut_reads[e["key"]] = cut  # not sent this time: still resumable
-                break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
-            except Exception as error:  # noqa: BLE001
-                self.errors.append(f"{e['key']}: {describe(error)}")
-                self.refresh_note("rest", describe(error), key_name(e["key"]), "retry next cycle")
-            else:
-                stored = read_cache(e["key"]) or {}
-                if stored.get("error") and stored.get("fetchedAt") == self.now:
-                    self.refresh_note("rest", stored["error"], key_name(e["key"]), "retry next cycle")
-            if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
-                # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
-                self.to_graphql(over_rest[i:], spilled)
-                break
-            self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
-            if not self.waited(e):
-                self.plain_at["rest"] = self.now
-            # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
-            self.deferred_since.pop(e["key"], None)
-        self.resume_key, self.resume_from = "", float("inf")
         for e in self.jobs_only:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):
@@ -7568,6 +7572,8 @@ class Daemon:
                               if k in base})
             if key == self.resume_key and fields.get("dataAt") == self.now:
                 fields = {**fields, "dataAt": self.resume_from}  # its oldest part's tick: no newer than that
+            elif fields.get("dataAt") is not None:
+                self.cut_reads.pop(key, None)  # read since (GraphQL, a wait's read): nothing older may replace it
             entry.update(fields)
             if "data" in fields and "updatedAtAt" not in fields:
                 # updatedAtAt says when `data`'s head and updatedAt were last read from GitHub together (a whole
@@ -8636,7 +8642,8 @@ class Daemon:
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
         self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
-        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest", restFullAt=self.now)
+        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest",
+                   restFullAt=min(self.now, self.resume_from))
 
     def rest_gate_holds(self, e: dict, prior: dict, old: dict, root: str, number: Any) -> bool:
         """The REST PR read's gate (PR_REST_FULL_EVERY): True when the issue, the head's check suites and its first
@@ -8705,7 +8712,7 @@ class Daemon:
                     parts[path] = kept
                     return doc, True
         pull = self.head_part(old, parts, path, slim_pull)
-        parts[path] = {**parts[path], "at": self.now}
+        parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}  # (a resumed read: its first try's)
         if gate not in parts and held.get("etag") and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
             parts[gate] = held  # the issue answer kept still describes this pull
         elif gate not in parts and self.etags and self.mode("rest") != "stop":
