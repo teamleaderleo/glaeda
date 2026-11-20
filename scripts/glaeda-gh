@@ -6268,12 +6268,27 @@ class Daemon:
         # Among the deferred, a key a wait is blocked on (an interactive wait, a due land) goes ahead of every plain
         # watch: huge-blue 2026-11-18 19:56Z, 740 deferred keys, mostly plain watches, ahead of every wait; and at
         # 21:5xZ a WAIT_PRIORITY head start was not enough, the share's few reads a minute went to older deferrals.
-        return sorted(entries, key=lambda e: (not self.wait_confirms(e), not self.head_unanswered(e),
+        # Among those heads the one asked last goes first, and one never tried ahead of one that failed: under a backlog of
+        # asked heads (huge-blue 2026-11-20 17:1xZ: 20 never-read heads due, about 3 read a tick over a slow REST, GraphQL
+        # out) a new merge gate's head was read 4.5 min after it was asked, first in, first out behind asks whose waiters
+        # had mostly given up. Newest first serves the live waiter within a tick; the older asks are read as the burst
+        # drains, and a head nobody asks for again leaves at HEAD_INTEREST. They go ahead of the confirmations too: one
+        # head read answers a merge gate, a confirmation only a run wait that already has its finish.
+        return sorted(entries, key=lambda e: (not self.head_unanswered(e), self.head_rank(e),
+                                              not self.wait_confirms(e),
                                               e["key"] not in carried,
                                               not (e["key"] in carried and self.waited(e)),
                                               carried.get(e["key"], 0.0),
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
+
+    def head_rank(self, e: dict) -> tuple[bool, float]:
+        """An asked head with no answer: (tried and failed, minus its newest ask), so the newest ask of a head never tried
+        sorts first (rest_order); (False, 0.0) for any other key."""
+        if not self.head_unanswered(e):
+            return False, 0.0
+        failed = bool((e.get("cache") or {}).get("error"))
+        return failed, -max((e.get("consumers") or {}).values(), default=0.0)
 
     def head_direct_room(self) -> bool:
         """Whether one more asked head with no answer may be read over REST past the daemon's share: the login's REST is
@@ -6286,7 +6301,7 @@ class Daemon:
         """The asked heads with no answer read over REST this tick though the daemon's REST share is spent and GraphQL
         is stopped: a merge gate waits on each, and one head is a few requests. Charged to their consumers' caps
         (due_heads), and to HEAD_DIRECT_MAX."""
-        asked = [e for e in mine if self.head_unanswered(e)]
+        asked = sorted((e for e in mine if self.head_unanswered(e)), key=self.head_rank)
         if not asked or not self.head_direct_room():
             return []
         due = self.due_heads(asked, "normal")
@@ -6676,6 +6691,7 @@ class Daemon:
         # pr moved to GraphQL (heads are never "waited", so they only had their round robin turn after the plain PRs).
         urgent = lambda e: self.waited(e) or self.head_unanswered(e)  # noqa: E731
         blocked = {kind: [e for e in due[kind] if urgent(e)] for kind in kinds}
+        blocked["head"].sort(key=self.head_rank)  # the newest ask of a head never tried first (rest_order)
         floor: set[str] = set()
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
             if over[kind] != "graphql":

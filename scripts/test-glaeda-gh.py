@@ -6552,6 +6552,21 @@ class TickBudgetTest(Base):
         self.daemon.deferred_before["pr:o/r#1"] = NOW - 10 - gg.WAIT_PRIORITY - 1
         self.assertEqual(self.order([plain, waited]), ["pr:o/r#2", "pr:o/r#1"])
 
+    def test_the_newest_ask_of_a_head_never_tried_is_read_first(self) -> None:
+        """huge-blue 2026-11-20 17:1xZ: 20 never-read heads due, about 3 read a tick, and a new merge gate's head read
+        4.5 min after it was asked. Newest ask first, a failed head after every untried one, and all of them ahead of a
+        deferred one-read confirmation."""
+        def head(c: str, asked: float, cache: dict | None = None) -> dict:
+            return {"key": f"head:o/r@{c * 40}", "cache": cache, "consumers": {"merge-hold": asked}, "waitedAt": None}
+        old, new, mid = head("a", NOW - 400), head("b", NOW - 2), head("c", NOW - 100)
+        failed = head("d", NOW - 1, {"error": "rest: HTTP 502", "data": None, "fetchedAt": NOW - 30})
+        prs = [self.entry(f"pr:o/r#{n}", "rest", NOW - 1000, deferred=True) for n in range(1, 3)]
+        self.daemon.deferred_before = {e["key"]: NOW - 500 for e in prs + [old]}
+        with mock.patch.object(self.daemon, "wait_confirms", side_effect=lambda e: e["key"] == "pr:o/r#2"):
+            order = self.order(prs + [old, failed, mid, new])
+        self.assertEqual(order[:4], [new["key"], mid["key"], old["key"], failed["key"]])
+        self.assertEqual(order[4], "pr:o/r#2", "the confirmation after the heads")
+
     def test_an_asked_head_with_no_answer_goes_ahead_of_the_deferred_backlog(self) -> None:
         """huge-blue 2026-11-20: `glaeda-gh checks` for a new SHA stayed "unread" for 10+ min over REST, behind ~1000
         carried PR deferrals. An asked head that holds no answer is read first; one that has an answer is ordinary."""
