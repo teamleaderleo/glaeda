@@ -8,6 +8,12 @@ use glaeda::{
     },
     rolling_tip_ledger_store::{RollingTipLedgerStore, RollingTipLedgerStoreError},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Two tests in one process can read the clock in the same nanosecond (a coarse clock, parallel test
+// threads): the counter keeps each temp path its own. glaeda#2244's CI, 2026-11-20: two
+// rolling_tip_ledger_store tests shared one journal and each read the other's partial line.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn stream() -> TipStream {
     TipStream::new(
@@ -152,12 +158,13 @@ fn reordered_event_is_rejected_on_open() {
 
 fn tempfile_path() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "glaeda-tip-ledger-{}-{}.jsonl",
+        "glaeda-tip-ledger-{}-{}-{}.jsonl",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
-            .as_nanos()
+            .as_nanos(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_file(&root);
     root
