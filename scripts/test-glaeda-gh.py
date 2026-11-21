@@ -19814,10 +19814,15 @@ class ConcurrentWaitsRestTest(Base):
         self.daemon.paths["pr"] = "graphql"
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "rest", "a run over REST is a free 304 when unchanged: not weighted")
-        # REST far richer: PRs still move
+        # REST far richer and its reads measured fast (a kept connection, ~0.5 s a PR): PRs still move
         self.daemon.budget["rest"]["remaining"] = 4900
         self.daemon.budget["graphql"]["remaining"] = 1100
+        self.daemon.read_secs = [(NOW - 30 * i, "pr", "rest", 0.5, 1) for i in range(20)]
         self.assertEqual(self.daemon.route("pr"), "rest")
+        # The same quotas with REST at its default seconds a read: GraphQL's 1000 points read more PRs a second
+        self.daemon.paths["pr"] = "graphql"
+        self.daemon.read_secs = []
+        self.assertEqual(self.daemon.route("pr"), "graphql")
 
     def test_read_cost_is_measured_from_the_spend_log(self) -> None:
         self.daemon.now = NOW
