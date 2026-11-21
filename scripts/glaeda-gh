@@ -17,6 +17,10 @@
     glaeda-gh wait file PATH [--exists|--gone] [--contains REGEX] [--timeout S]   a file, instead of a sleep loop
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
     glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 14:40:05Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
+        --timeout S is "no change for S": every change a wait sees (a check or job started or finished, a comment, a
+        file growing, a process using CPU) moves its deadline, so a wait ends on the outcome while things move and
+        at S when nothing does; --max S is the hard ceiling from the start (default 4x --timeout); --json's
+        ended_by names what ended it (success, failure, ..., no-progress, ceiling). `wait until` counts from the start.
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
@@ -62,7 +66,7 @@
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
     glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
-                   [--json]                             land a PR: the daemon asks land_judge, takes each step it
+                   [--max S] [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
                                                         pinned merge) and tells the requester on a merge or a stop;
                                                         --sha lands only that head (another stops it: head_moved)
@@ -8081,10 +8085,10 @@ class Daemon:
     def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
         """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
         if (isinstance(req, dict) and req.get("stale") is not None and waiter_alive(req.get("pid"))
-                and now <= float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
+                and now <= wait_deadline(req) + WAITS_LEFTOVER):
             return None  # handed back (below): its blocker takes it to resume_wait within WAITS_CHECK
         if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
-                or now > float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
+                or now > wait_deadline(req) + WAITS_LEFTOVER):
             drop_wait(rid)
             return False
         if req.get("code") is None:
@@ -15111,6 +15115,19 @@ def land_print_answer(out: dict, as_json: bool, key: str, where: str) -> None:
                     "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
 
 
+def land_progress(entry: Any) -> Any:
+    """What of a land entry counts as it moving, for `land --wait` (Leash): its state, its wait and every other field
+    but the times a re-read rewrites, so a land that is still taking steps keeps its wait alive."""
+    def strip(v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: strip(x) for k, x in v.items()
+                    if not (k.endswith("At") or k in ("at", "checked", "until", "now", "seen", "touched"))}
+        if isinstance(v, list):
+            return [strip(x) for x in v]
+        return v
+    return json.dumps(strip(entry), sort_keys=True, default=str) if isinstance(entry, dict) else None
+
+
 def land_forward_exit(out: dict, wait: float) -> int:
     state = out.get("state")
     if out.get("code") in LAND_REQUEST_REFUSED:
@@ -15123,7 +15140,8 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
-                       as_json: bool, sha: str = "", override: dict | None = None) -> int:
+                       as_json: bool, sha: str = "", override: dict | None = None,
+                       ceiling: float | None = None) -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -15134,6 +15152,7 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
+        | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
         | ({"override": override} if override else {})
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
@@ -15143,7 +15162,8 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
                                             override=override))
     if not why:
         try:
-            out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
+            # the executor waits up to --max while the land keeps moving (an older one: --timeout in all)
+            out = land_forward(executor, req, LAND_FORWARD_DEADLINE + (req.get("max") or wait))
         except WatchError as error:
             why = str(error)
         else:
@@ -15272,7 +15292,7 @@ def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
-             pin: str | None = None, override: dict | None = None) -> int:
+             pin: str | None = None, override: dict | None = None, ceiling: float | None = None) -> int:
     """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
@@ -15298,7 +15318,8 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
-        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override)
+        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
+                                  ceiling)
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -15318,18 +15339,22 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if no_lane and not as_json:
         say_waiting(f"glaeda-gh land: {no_lane}")
     running = daemon_running()
-    deadline = time.monotonic() + wait
+    leash = Leash(wait, ceiling)  # --timeout is no change in the land's entry for that long, up to --max
     entry = None
     while True:
         entry = read_json(LandQueue.entries_dir() / file_name(key))
         picked = isinstance(entry, dict) and entry.get("requestId") == rid
-        if not running or (picked and (wait <= 0 or entry.get("state") in LAND_DONE)) or time.monotonic() >= deadline:
+        if picked:
+            leash.see(land_progress(entry))
+        if not running or (picked and (wait <= 0 or entry.get("state") in LAND_DONE)) or leash.left() <= 0:
             break
         time.sleep(0.5 if not picked else 1.0)
     picked = isinstance(entry, dict) and entry.get("requestId") == rid
     state = entry.get("state") if picked else "requested"
     out = {"ok": running, "key": key, "state": state, "requester": requester, "request": rid,
            "entry": entry if picked else None, "lane": lane}
+    if wait > 0 and running and state not in ("merged", "stopped", "cancelled"):
+        out.update(leash.fields())
     if no_lane:
         out["laneWarning"] = no_lane
     if not running:
@@ -15473,11 +15498,17 @@ def cmd_land_serve(text: str) -> int:
     entry = None
     if op == "land":
         wait = req.get("wait") if isinstance(req.get("wait"), (int, float)) else 0
-        deadline = time.monotonic() + max(0.0, min(float(wait), 86400.0))  # as a local `land --wait`
+        ceiling = req.get("max") if isinstance(req.get("max"), (int, float)) and req.get("max") > 0 else None
+        # as a local `land --wait`: no change for WAIT, never past its --max (or a day)
+        leash = Leash(max(0.0, min(float(wait), 86400.0)),
+                      None if ceiling is None else min(float(ceiling), 86400.0))
+        leash.ceiling = min(leash.ceiling, 86400.0)
         while running:
             entry = read_json(LandQueue.entries_dir() / file_name(key))
             picked = isinstance(entry, dict) and entry.get("requestId") == rid
-            if (picked and (wait <= 0 or entry.get("state") in LAND_DONE)) or time.monotonic() >= deadline:
+            if picked:
+                leash.see(land_progress(entry))
+            if (picked and (wait <= 0 or entry.get("state") in LAND_DONE)) or leash.left() <= 0:
                 break
             time.sleep(0.5 if not picked else 1.0)
     picked = isinstance(entry, dict) and entry.get("requestId") == rid
@@ -17479,7 +17510,108 @@ def wait_command(req: dict) -> str:
         parts += ["--sha", str(req["sha"])]
     if req.get("jobs"):
         parts.append("--jobs")
-    return " ".join(parts + ["--timeout", f"{float(req['timeout']):g}"])
+    return " ".join(parts + ["--timeout", f"{float(req['timeout']):g}"]
+                    + ([] if wait_max(req) == default_wait_max(float(req["timeout"])) else
+                       ["--max", f"{wait_max(req):g}"]))
+
+
+# The leash (Leo, 2026-11-21: "if it's too short, it's like bullshit because it just instantly flails over when it
+# dies ... We can listen for success outputs"). `--timeout S` was a total wall-clock bound: a run that was still
+# starting jobs and finishing steps at S ended "timeout" all the same, and its `next:` was the same wait again, so an
+# agent re-waited a run that had never stopped moving. Now --timeout is "no progress for S": the deadline is S past
+# the last time the waited thing's observed state changed (wait_progress_mark: a PR's checks, head or state; a run's
+# status, attempt, updated_at and, with --jobs, its jobs and steps; a comment thread's comments; a file's size and
+# mtime; a process's CPU time). A wait whose target does not move still ends at S, exactly as before. --max is the
+# hard ceiling from the wait's start (default WAIT_MAX_TIMES x --timeout), so a target that keeps moving forever is
+# still not waited on forever. The outcome says which ended it: `ended_by` success, failure, ..., no-progress or
+# ceiling.
+WAIT_MAX_TIMES = 4
+
+
+def default_wait_max(timeout: float) -> float:
+    return WAIT_MAX_TIMES * float(timeout)
+
+
+def wait_max(req: dict) -> float:
+    """The wait's hard ceiling, seconds from its start: never under its --timeout."""
+    ceiling = req.get("max")
+    ceiling = default_wait_max(float(req["timeout"])) if not isinstance(ceiling, (int, float)) or \
+        isinstance(ceiling, bool) else float(ceiling)
+    return max(float(req["timeout"]), ceiling)
+
+
+def wait_moved_at(req: dict) -> float:
+    """When the waited thing last changed as this wait saw it (its start, before any change)."""
+    moved = req.get("moved") if isinstance(req.get("moved"), dict) else {}
+    at = moved.get("at")
+    began = float(req["began"])
+    return max(began, float(at)) if isinstance(at, (int, float)) and not isinstance(at, bool) else began
+
+
+def wait_deadline(req: dict) -> float:
+    """When the wait ends with no answer: --timeout past the last change it saw, and never past its --max."""
+    began = float(req["began"])
+    return min(began + wait_max(req), wait_moved_at(req) + float(req["timeout"]))
+
+
+def wait_ended_by(req: dict, now: float) -> str:
+    """What ended a wait that got no answer: its ceiling, or --timeout with nothing changing."""
+    return "ceiling" if now - float(req["began"]) >= wait_max(req) and \
+        wait_moved_at(req) + float(req["timeout"]) > float(req["began"]) + wait_max(req) else "no-progress"
+
+
+def run_progress_print(data: dict, jobs: Any) -> Any:
+    """What of a run counts as it moving: its status, conclusion, attempt and updated_at, and each job's and step's."""
+    steps = []
+    for j in jobs if isinstance(jobs, list) else []:
+        if isinstance(j, dict):
+            steps.append([j.get("id"), j.get("status"), j.get("conclusion"),
+                          [[s.get("number"), s.get("status"), s.get("conclusion")]
+                           for s in j.get("steps") or [] if isinstance(s, dict)]])
+    return [data.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at")] + [steps]
+
+
+def wait_progress_print(kind: str, entry: dict | None) -> str | None:
+    """A fingerprint of what a `wait pr|run|comment` watches, or None before anything was read. Read times are left
+    out on purpose: a re-read that finds the same state is not progress."""
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+    if kind == "run":
+        mark: Any = run_progress_print(data, (entry or {}).get("jobs"))
+    elif kind == "comment":
+        mark = [[c.get("id"), c.get("updatedAt") or c.get("createdAt")]
+                for c in data.get("comments") or [] if isinstance(c, dict)]
+    else:
+        mark = [data.get(k) for k in ("state", "headRefOid", "mergeable", "checkState")] + [
+            [c.get("name"), c.get("status"), c.get("conclusion"), c.get("startedAt"), c.get("completedAt")]
+            for c in data.get("checks") or [] if isinstance(c, dict)]
+    return hashlib.sha256(json.dumps(mark, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def wait_progress_mark(req: dict, mark: str | None, now: float, seen: str = "") -> bool:
+    """Note what the wait sees now in REQ["moved"] ({"print", "at", "seen"}); True when it changed since the last
+    look. The first thing read is where it starts, not a change: a target that never moves ends at --timeout."""
+    if mark is None:
+        return False
+    moved = req.get("moved") if isinstance(req.get("moved"), dict) else None
+    if moved is None:
+        req["moved"] = {"print": mark, "at": float(req["began"]), "seen": seen, "changes": 0}
+        return False
+    if moved.get("print") == mark:
+        return False
+    req["moved"] = {"print": mark, "at": now, "seen": seen, "changes": int(moved.get("changes") or 0) + 1}
+    return True
+
+
+def wait_leash_fields(req: dict, now: float) -> dict:
+    """What a wait that got no answer says about why it ended: --json's ended_by, last_progress_at and its limits."""
+    moved = req.get("moved") if isinstance(req.get("moved"), dict) else {}
+    out = {"ended_by": wait_ended_by(req, now), "no_progress_s": float(req["timeout"]), "max_s": wait_max(req),
+           "progress_changes": int(moved.get("changes") or 0)}
+    if moved.get("changes"):
+        out["last_progress_at"] = utc_clock(wait_moved_at(req))
+    return out
 
 
 # A wait that cannot read its target must say so, name the bucket and the reset, and name a next step that can end
@@ -17703,8 +17835,9 @@ def progress_line(req: dict, state: str, now: float | None = None) -> str:
     """What a wait says every WAIT_PROGRESS_EVERY while it blocks. BLOCKER prints the same words."""
     now = time.time() if now is None else now
     began, timeout = float(req["began"]), float(req["timeout"])
-    return (f"glaeda-gh: still waiting on {req['key']}: {int(max(0.0, now - began))}s of {timeout:g}s, "
-            f"deadline {utc_clock(began + timeout)}" + (f"; {state}" if state else ""))
+    return (f"glaeda-gh: still waiting on {req['key']}: {int(max(0.0, now - began))}s, no change for "
+            f"{int(max(0.0, now - wait_moved_at(req)))}s of {timeout:g}s, deadline {utc_clock(wait_deadline(req))} "
+            f"(moves while it progresses; ceiling {utc_clock(began + wait_max(req))})" + (f"; {state}" if state else ""))
 
 
 # A progress line that repeats the one before it is not information. teamleaderleo/leo-workspace#7188, 2026-11-21
@@ -17841,9 +17974,20 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
         state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
-        deadline = utc_clock(float(req["began"]) + float(req["timeout"]))
+        deadline = utc_clock(wait_deadline(req))
         blocked = blocked_now(kind)
-        return fail_fields("timeout", f"waited {waited} s for {name} (deadline {deadline}); last seen: {state}",
+        now = time.time()
+        moved = req.get("moved") if isinstance(req.get("moved"), dict) else {}
+        changes = int(moved.get("changes") or 0)
+        last = (f"last change {utc_clock(wait_moved_at(req))} ({changes} change(s) seen)" if changes
+                else "no change since the wait began")
+        if wait_ended_by(req, now) == "ceiling":
+            # still moving at its --max: the same wait again is a wait on something that is going (it can end)
+            return fail_fields("timeout", f"waited {waited} s for {name}, its ceiling (--max {wait_max(req):g}), while "
+                               f"it was still changing ({last}); last seen: {state}",
+                               blocked_next(req, blocked) if blocked else wait_command(req))
+        return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
+                           f"(deadline {deadline}; {last}); last seen: {state}",
                            blocked_next(req, blocked) if blocked else wait_command(req))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
@@ -18126,7 +18270,8 @@ def resolve_sha(sha: str) -> tuple[str, bool]:
     return (full, True) if full else (sha, False)
 
 
-def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: float) -> str:
+def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: float,
+                 ceiling: float | None = None, leash: bool = True) -> str:
     """What this wait is about, printed before it blocks.
 
     The point is what its *absence* means. A `wait` started from an agent session's foreground
@@ -18146,7 +18291,9 @@ def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: fl
     return (f"glaeda-gh: waiting on {key} until {until}"
             + (f" at {sha}{'' if exact else '... (a prefix: it must match the head GitHub shows)'}"
                if sha else "")
-            + f", giving up after {timeout:g}s (at {deadline_clock(timeout)})")
+            + (f", giving up after {timeout:g}s with no change (at {deadline_clock(timeout)} unless it changes; "
+               f"ceiling {deadline_clock(max(timeout, default_wait_max(timeout) if ceiling is None else ceiling))})"
+               if leash else f", giving up after {timeout:g}s (at {deadline_clock(timeout)})"))
 
 
 def seconds(text: str) -> float:
@@ -18243,10 +18390,13 @@ def say_waiting(line: str) -> None:
 
 
 def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                 sha: str | None, exact: bool, grace: float, settle: float = SETTLE_GRACE) -> dict:
+                 sha: str | None, exact: bool, grace: float, settle: float = SETTLE_GRACE,
+                 ceiling: float | None = None) -> dict:
     """What a `wait pr|run` is ruled on: the same fields whether the client polls (cmd_wait) or the
-    daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts."""
+    daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts.
+    TIMEOUT is "no change for this long" and CEILING (--max) the bound from `began` (wait_deadline)."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
+            "max": max(timeout, default_wait_max(timeout) if ceiling is None else ceiling),
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
             "began": time.time(), "verbose": full_output()}
 
@@ -18340,6 +18490,9 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         return EXIT_FAIL, render(key, entry, as_json, {"result": "failure", "waited_s": waited, **not_found_fields(key)},
                                  until, grace, bool(req.get("verbose")))
     data = (entry or {}).get("data")
+    if fresh and data:
+        # a fresh read: whether the target moved since the last one stretches this wait's deadline (wait_deadline)
+        wait_progress_mark(req, wait_progress_print(kind, entry), now)
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
@@ -18395,7 +18548,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         merged = kind == "pr" and data.get("state") == "MERGED" and result == EXIT_OK
         outcome_name = {EXIT_OK: "merged" if merged else "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
                         EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
-        extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
+        extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited, "ended_by": outcome_name}
         if kind == "pr" and result == EXIT_NOTHING:
             extra["note"] = (f"no check or status reported on this head within {int(settle)}s of its push: "
                              "its CI has not started (not a pass)")
@@ -18427,7 +18580,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     # the build controller's feed does not cover its repository, because a covered run's finish still arrives over
     # the feed, costing no quota at all. Measured 2026-11-21: a `wait run` on an uncovered repository held its whole
     # timeout against a bucket whose reset was past the end of it, and its refusal named a reset in the past.
-    deadline = began + float(req["timeout"])
+    deadline = wait_deadline(req)
     # Cached data this wait can use is no reason to sit out the hold either (glaeda#2311, 2026-11-21: a wait holding
     # one fresh read of "18 passed, 1 pending" spent its remaining 28 min on a bucket whose reset was 15 min past its
     # deadline). What settles it is whether the data in hand can still rule with no further read: every transition
@@ -18439,7 +18592,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                               f"{owner}/{repo}", settle) is None)
     blocked = blocked_before_deadline(kind, key, deadline, now) if stuck else None
     if blocked:
-        extra = {"result": "timeout", "waited_s": waited,
+        extra = {"result": "timeout", "waited_s": waited, "ended_by": "blocked",
                  "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
                          f"deadline ({utc_clock(deadline)}): waiting the rest of it reads "
                          "nothing"}
@@ -18448,14 +18601,14 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     unread = (data or {}).get("checksPageError") or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
-    if now - began >= req["timeout"] and kind == "pr" and until in ("done", "green") and data and unread:
+    if now >= deadline and kind == "pr" and until in ("done", "green") and data and unread:
         # the deadline passed on a read that never came back whole: not a pass and not a plain timeout
-        extra = {"result": "inconclusive", "waited_s": waited,
+        extra = {"result": "inconclusive", "waited_s": waited, **wait_leash_fields(req, now),
                  "note": f"the last read of this PR was partial ({unread}): its checks are unknown"}
         extra.update(wait_outcome(req, EXIT_INCONCLUSIVE, entry, waited))
         return EXIT_INCONCLUSIVE, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
-    if now - began >= req["timeout"]:
-        extra = {"result": "timeout", "waited_s": waited}
+    if now >= deadline:
+        extra = {"result": "timeout", "waited_s": waited, **wait_leash_fields(req, now)}
         if req.get("runsUnfinished"):
             extra["note"] = "Actions runs at the head not finished: " + ", ".join(req["runsUnfinished"])
         if sha and entry and entry.get("data"):
@@ -18531,7 +18684,8 @@ def inconclusive_note(data: dict, now: float) -> str:
 
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-             sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int:
+             sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE,
+             ceiling: float | None = None) -> int:
     """The polling wait: this process re-reads the cache until wait_step decides. `wait pr|run` uses it
     only when the daemon cannot rule on the wait itself (subscribe_wait). Says the waiting line once,
     before it blocks; poll_wait does not, so a wait handed back to it (resume_wait) is not said twice."""
@@ -18542,8 +18696,8 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
     # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
     blocked_note = blocked_start_line(key, kind)
-    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
-    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle))
+    say_waiting(waiting_line(key, until, sha, exact, timeout, ceiling) + (f"\n{blocked_note}" if blocked_note else ""))
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling))
 
 
 # A wait whose target was never read once learns why at WAIT_DIAGNOSE_AFTER instead of STALE_DATA_AFTER (600 s, and
@@ -18769,7 +18923,7 @@ def poll_wait(req: dict) -> int:
                 state = progress_update(seen, req, read_cache(req["key"]), time.time())
                 if state is not None:
                     say_waiting(progress_line(req, state))
-        time.sleep(min(WAIT_POLL, max(0.1, req["began"] + timeout - time.time())))
+        time.sleep(min(WAIT_POLL, max(0.1, wait_deadline(req) - time.time())))
 
 
 WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
@@ -18817,7 +18971,7 @@ while :; do
       [ -n "$state" ] && last=$state  # an empty read is a read that did not happen, not a new state: keeping the
       # last state it printed is what stops the same paragraph coming back after one poll found the file missing
       # or half-written (docs/handbook/missing-read-counted-as-a-value.md)
-      printf '%s\n' "glaeda-gh: still waiting on $GLAEDA_WAIT_KEY: $((${GLAEDA_WAIT_ELAPSED:-0} + SECONDS))s of ${GLAEDA_WAIT_TIMEOUT}s, deadline $GLAEDA_WAIT_DEADLINE${state:+; $state}" 1>&2 2>/dev/null 3<&- &
+      printf '%s\n' "glaeda-gh: still waiting on $GLAEDA_WAIT_KEY: $((${GLAEDA_WAIT_ELAPSED:-0} + SECONDS))s, ends after ${GLAEDA_WAIT_TIMEOUT}s with no change, deadline $GLAEDA_WAIT_DEADLINE${state:+; $state}" 1>&2 2>/dev/null 3<&- &
       sayer=$!
     fi
   fi
@@ -18861,13 +19015,18 @@ def waits_dir() -> Path:
 
 def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                        sha: str | None, exact: bool, grace: float, pid: int, began: float | None = None,
-                       settle: float = SETTLE_GRACE) -> str:
+                       settle: float = SETTLE_GRACE, ceiling: float | None = None,
+                       moved: dict | None = None) -> str:
     """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
-    without one. Interest is registered at once, as a polling wait does. Returns the request's id."""
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
+    without one. Interest is registered at once, as a polling wait does. Returns the request's id. A handoff
+    (BEGAN) passes the TIMEOUT left of it, its CEILING from BEGAN, and what it has seen move (MOVED)."""
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling)
     if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
         req["timeout"] += max(0.0, req["began"] - began)
         req["began"] = began
+        req["max"] = max(req["timeout"], default_wait_max(req["timeout"]) if ceiling is None else ceiling)
+    if isinstance(moved, dict):
+        req["moved"] = moved
     rid = f"{pid}-{os.urandom(4).hex()}"
     waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
@@ -18950,7 +19109,8 @@ def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int
 
 
 def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                   sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int:
+                   sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE,
+                   ceiling: float | None = None) -> int:
     """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
     asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
     held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
@@ -18962,8 +19122,9 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     The waiting line is said exactly once: by cmd_wait on the first fallback, here before BLOCKER
     otherwise -- say_waiting writes fd 2 directly, so nothing is left buffered across the exec -- and
     not again on the late fallback, which goes straight to poll_wait."""
-    if not (0 <= timeout <= WAITS_MAX_TIMEOUT) or not os.access(BASH, os.X_OK) or not serving_waits():
-        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle)
+    if not (0 <= max(timeout, default_wait_max(timeout) if ceiling is None else ceiling) <= WAITS_MAX_TIMEOUT) \
+            or not os.access(BASH, os.X_OK) or not serving_waits():
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle, ceiling)
     key = parse_key(kind, target)
     exact = True
     if sha:
@@ -18971,8 +19132,8 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
     # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
     blocked_note = blocked_start_line(key, kind)
-    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
+    say_waiting(waiting_line(key, until, sha, exact, timeout, ceiling) + (f"\n{blocked_note}" if blocked_note else ""))
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
         register(key, jobs, waited=True, began=req["began"])
@@ -18987,13 +19148,11 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         timeout = max(0.0, timeout - (time.monotonic() - started))
     try:
         rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid(),
-                                 began=req["began"], settle=settle)
+                                 began=req["began"], settle=settle, ceiling=req["max"], moved=req.get("moved"))
     except OSError:
-        late = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
-        late["timeout"] += max(0.0, late["began"] - req["began"])
-        late["began"] = req["began"]
+        late = dict(req)  # the same start, limits and what it has seen move
         return poll_wait(late)
-    block(rid, timeout, req)
+    block(rid, wait_deadline(req) - time.time(), req)
     return EXIT_DOWN  # not reached
 
 
@@ -19007,8 +19166,11 @@ def block(rid: str, left: float, req: dict | None = None) -> None:
     os.environ.pop("GLAEDA_WAIT_PROGRESS", None)
     if req is not None:
         began, timeout = float(req["began"]), float(req["timeout"])
+        # LEFT runs to the no-change deadline as it stands now (wait_deadline); a change the daemon sees moves it,
+        # and at LEFT the blocker hands back to resume_wait, which blocks again to the moved deadline
         os.environ.update({"GLAEDA_WAIT_KEY": str(req["key"]), "GLAEDA_WAIT_TIMEOUT": f"{timeout:g}",
-                    "GLAEDA_WAIT_DEADLINE": utc_clock(began + timeout),
+                    "GLAEDA_WAIT_DEADLINE": f"{utc_clock(wait_deadline(req))} unless it changes (ceiling "
+                                            f"{utc_clock(began + wait_max(req))})",
                     "GLAEDA_WAIT_ELAPSED": str(int(max(0.0, time.time() - began))),
                     "GLAEDA_WAIT_PROGRESS": str(WAIT_PROGRESS_EVERY)})
     os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
@@ -19036,7 +19198,7 @@ def resume_wait(rid: str) -> int:
         say_waiting("glaeda-gh: this wait's request is gone; run the wait again")
         say_waiting("next: glaeda-gh wait --help")
         return EXIT_DOWN
-    left = float(req["began"]) + float(req["timeout"]) - time.time()
+    left = wait_deadline(req) - time.time()  # moved by every change the daemon saw (wait_progress_mark)
     if left > 0 and serving_waits() and req.get("stale") is None:  # (a stale one was handed back on purpose)
         register(req["key"], bool(req.get("jobs")), waited=True, began=float(req["began"]))
         block(rid, left, req)
@@ -19105,8 +19267,81 @@ def file_ready(pattern: str, mode: str, contains: re.Pattern | None) -> str | No
     return None
 
 
+class Leash:
+    """The no-change deadline of a wait that runs in this process (file, pid, comment, land --wait): TIMEOUT past the
+    last change it saw (see), never past CEILING from its start (wait_deadline's rule, on the monotonic clock)."""
+
+    def __init__(self, timeout: float, ceiling: float | None = None) -> None:
+        self.timeout = float(timeout)
+        self.ceiling = max(self.timeout, default_wait_max(self.timeout) if ceiling is None else float(ceiling))
+        self.start = self.moved = time.monotonic()
+        self.mark: Any = None
+        self.changes = 0
+
+    def see(self, mark: Any) -> bool:
+        """Note what the wait sees; True when it changed (the first look is where it starts, not a change)."""
+        if mark is None:
+            return False
+        if self.mark is None:
+            self.mark = mark
+            return False
+        if mark == self.mark:
+            return False
+        self.mark, self.moved, self.changes = mark, time.monotonic(), self.changes + 1
+        return True
+
+    def deadline(self) -> float:
+        return min(self.start + self.ceiling, self.moved + self.timeout)
+
+    def left(self) -> float:
+        return self.deadline() - time.monotonic()
+
+    def ended_by(self) -> str:
+        return "ceiling" if self.moved + self.timeout > self.start + self.ceiling else "no-progress"
+
+    def fields(self) -> dict:
+        out: dict[str, Any] = {"ended_by": self.ended_by(), "no_progress_s": self.timeout, "max_s": self.ceiling,
+                               "progress_changes": self.changes}
+        if self.changes:
+            out["last_progress_at"] = utc_clock(time.time() - (time.monotonic() - self.moved))
+        return out
+
+    def words(self) -> str:
+        """Why it ended, for the text form."""
+        if self.ended_by() == "ceiling":
+            return f"its ceiling of {self.ceiling:g}s, still changing ({self.changes} change(s))"
+        return (f"no change for {self.timeout:g}s" + (f" ({self.changes} change(s) before that)"
+                                                       if self.changes else ""))
+
+
+def file_progress(pattern: str) -> Any:
+    """What of a file wait's glob counts as it moving: each match's size and mtime (a log being written)."""
+    path = os.path.expanduser(pattern)
+    out = []
+    for found in sorted(glob.glob(path) if glob.has_magic(path) else [path]):
+        with contextlib.suppress(OSError):
+            info = os.stat(found)
+            out.append((found, info.st_size, info.st_mtime_ns))
+    return out
+
+
+def pid_cpu(pid: int) -> Any:
+    """A process's CPU time so far (utime+stime ticks from /proc; `ps -o time=` without it, which cmd_wait_pid asks
+    at most every ZOMBIE_CHECK_S): a process that is computing is progressing. None when it cannot be read."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        return subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=5).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonempty",
-                  contains: str | None = None) -> int:
+                  contains: str | None = None, ceiling: float | None = None) -> int:
     """Block until a file exists and is not empty (`[ -s FILE ]`), exists (--exists), or is gone (--gone),
     optionally with a line matching --contains. PATH may be a glob. Local stat calls only; no GitHub."""
     try:
@@ -19116,20 +19351,22 @@ def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonem
     if contains and mode == "gone":
         raise WatchError("--contains does not apply to --gone")
     say_waiting(waiting_line(target, mode + (f" and matching {contains}" if contains else ""),
-                             None, True, timeout))
-    start = time.monotonic()
+                             None, True, timeout, ceiling))
+    leash = Leash(timeout, ceiling)
+    start = leash.start
     while True:
         found = file_ready(target, mode, pattern)
         waited = int(time.monotonic() - start)
         if found is not None:
-            print(json.dumps({"result": "success", "path": found, "waited_s": waited}) if as_json
-                  else f"glaeda-gh: {found} {'is gone' if mode == 'gone' else 'is ready'} after {waited}s")
+            print(json.dumps({"result": "success", "path": found, "waited_s": waited, "ended_by": "success"})
+                  if as_json else f"glaeda-gh: {found} {'is gone' if mode == 'gone' else 'is ready'} after {waited}s")
             return EXIT_OK
-        if time.monotonic() - start >= timeout:
-            print(json.dumps({"result": "timeout", "path": target, "waited_s": waited}) if as_json
-                  else f"glaeda-gh: {target} not ready after {waited}s (timeout)")
+        leash.see(file_progress(target))  # a file still being written is not a stalled one
+        if leash.left() <= 0:
+            print(json.dumps({"result": "timeout", "path": target, "waited_s": waited, **leash.fields()}) if as_json
+                  else f"glaeda-gh: {target} not ready after {waited}s (timeout: {leash.words()})")
             return EXIT_TIMEOUT
-        time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
+        time.sleep(min(WAIT_FILE_POLL, max(0.05, leash.left())))
 
 
 # Without /proc (macOS) the zombie check forks `ps`, so a pid wait runs it at most this often per pid; kill -0 still
@@ -19162,21 +19399,27 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
-def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
-    """Block until the process exits (the `while kill -0 PID` loop). Exit 0 when it is gone, 2 on timeout."""
+def cmd_wait_pid(target: str, timeout: float, as_json: bool, ceiling: float | None = None) -> int:
+    """Block until the process exits (the `while kill -0 PID` loop). Exit 0 when it is gone, 2 once its CPU time has
+    not moved for TIMEOUT (or at CEILING)."""
     if not target.isdigit() or not 0 < int(target) < 2 ** 31:
         raise WatchError(f"wait pid takes a process id, not {target!r}")
-    pid, start = int(target), time.monotonic()
-    say_waiting(waiting_line(f"pid {pid}", "it exits", None, True, timeout))
+    pid = int(target)
+    say_waiting(waiting_line(f"pid {pid}", "it exits", None, True, timeout, ceiling))
+    leash = Leash(timeout, ceiling)
+    start, cpu_at = leash.start, -ZOMBIE_CHECK_S
     while pid_alive(pid):
         waited = int(time.monotonic() - start)
-        if time.monotonic() - start >= timeout:
-            print(json.dumps({"result": "timeout", "pid": pid, "waited_s": waited}) if as_json
-                  else f"glaeda-gh: process {pid} still running after {waited}s (timeout)")
+        if time.monotonic() - cpu_at >= min(ZOMBIE_CHECK_S, max(1.0, timeout / 4)):
+            cpu_at = time.monotonic()
+            leash.see(pid_cpu(pid))  # a process still using CPU is working, not hung
+        if leash.left() <= 0:
+            print(json.dumps({"result": "timeout", "pid": pid, "waited_s": waited, **leash.fields()}) if as_json
+                  else f"glaeda-gh: process {pid} still running after {waited}s (timeout: {leash.words()})")
             return EXIT_TIMEOUT
-        time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
+        time.sleep(min(WAIT_FILE_POLL, max(0.05, leash.left())))
     waited = int(time.monotonic() - start)
-    print(json.dumps({"result": "success", "pid": pid, "waited_s": waited}) if as_json
+    print(json.dumps({"result": "success", "pid": pid, "waited_s": waited, "ended_by": "success"}) if as_json
           else f"glaeda-gh: process {pid} exited after {waited}s")
     return EXIT_OK
 
@@ -19211,7 +19454,7 @@ def cmd_wait_until(target: str, timeout: float, as_json: bool) -> int:
     on each pass, so a pool spent again on the way is waited out too. Exit 0 at the time, 2 on --timeout."""
     start = time.monotonic()
     deadline = until_epoch(target, time.time())
-    say_waiting(waiting_line(f"until {target}", "the time comes", None, True, timeout))
+    say_waiting(waiting_line(f"until {target}", "the time comes", None, True, timeout, leash=False))
     while deadline is not None and time.time() < deadline:
         waited = int(time.monotonic() - start)
         if time.monotonic() - start >= timeout:
@@ -19361,7 +19604,7 @@ def comment_matches(c: dict, author: str | None, pattern: re.Pattern | None, sin
 
 
 def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | None = None,
-                     match: str | None = None, since: str | None = None) -> int:
+                     match: str | None = None, since: str | None = None, ceiling: float | None = None) -> int:
     """Wait for a comment on an issue or PR by `author` whose body matches `match`, posted after
     `since` (by default after this wait began). Exits 0 with the comment, 1 when the issue does not
     exist, 2 on timeout."""
@@ -19372,7 +19615,8 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
         raise WatchError(f"--match is not a regular expression: {error}") from None
     began, start = time.time(), time.monotonic()
     say_waiting(waiting_line(key, "a comment" + (f" by {author}" if author else "")
-                             + (f" matching {match}" if match else ""), None, True, timeout))
+                             + (f" matching {match}" if match else ""), None, True, timeout, ceiling))
+    leash = Leash(timeout, ceiling)
     since_id, since_time = parse_since(since, began)
     touched = -TOUCH_EVERY
     warned = False
@@ -19422,14 +19666,16 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
                     print(f"  ... {len(body) - 40} more lines")
                 print(f"result: success\nwaited_s: {waited}")
             return EXIT_OK
-        if now - start >= timeout:
+        if entry and (entry.get("fetchedAt") or 0) >= began:
+            leash.see(wait_progress_print("comment", entry))  # a thread still being written in counts as moving
+        if leash.left() <= 0:
             newer = sum(1 for c in comments if comment_matches(c, None, None, since_id, since_time, edits))
             where = "since the wait began" if not since else f"after {since}"
             hint = "; to include a reply posted before the wait, pass --since with your own comment's URL" if not since else ""
-            emit(key, entry, as_json, {"result": "timeout", "waited_s": waited,
-                                       "note": f"{newer} comments {where}, none matched{hint}"})
+            emit(key, entry, as_json, {"result": "timeout", "waited_s": waited, **leash.fields(),
+                                       "note": f"{newer} comments {where}, none matched{hint} ({leash.words()})"})
             return EXIT_TIMEOUT
-        time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
+        time.sleep(min(WAIT_POLL, max(0.1, leash.left())))
 
 
 def controller_line(ctl: dict) -> str:
@@ -26154,7 +26400,13 @@ def parser() -> argparse.ArgumentParser:
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
             s.add_argument("--timeout", type=seconds, default=3600,
-                           help="seconds (default 3600); exit 2 after")
+                           help="seconds with no change in what it waits on (default 3600): every change it sees "
+                                "(a check or job started or finished, a comment, a file growing, CPU used) moves "
+                                "the deadline; exit 2 once nothing changed for this long, or at --max. `wait "
+                                "until` alone counts it from the start")
+            s.add_argument("--max", type=seconds, default=None, metavar="S",
+                           help=f"the hard ceiling from the start, however much it changes (default "
+                                f"{WAIT_MAX_TIMES}x --timeout); --json's ended_by says which ended it")
             s.add_argument("--sha", "--head", dest="sha", metavar="SHA",
                            help="the commit you pushed (git rev-parse HEAD): other heads count as pending; "
                                 "--head is the same flag")
@@ -26305,8 +26557,10 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
                     help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
-                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
-                         "--timeout is the same")
+                    help="wait for it to merge or stop until its queue entry has not changed for S seconds (exit 0 "
+                         "merged, 1 stopped, 2 still going); --timeout is the same")
+    ld.add_argument("--max", dest="max_wait", type=seconds, default=None, metavar="S",
+                    help=f"with --wait: the hard ceiling from the start (default {WAIT_MAX_TIMES}x --wait)")
     ld.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
@@ -26660,7 +26914,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
             override = land_override(args.override_reason, args.override_receipt)
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override)
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,
+                            args.max_wait)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:
@@ -26692,21 +26947,23 @@ def main(argv: list[str] | None = None) -> int:
             if args.exists and args.gone:
                 raise WatchError("wait file takes one of --exists and --gone")
             return cmd_wait_file(args.target, args.timeout, args.json,
-                                 "gone" if args.gone else "exists" if args.exists else "nonempty", args.contains)
+                                 "gone" if args.gone else "exists" if args.exists else "nonempty", args.contains,
+                                 args.max)
         if args.kind == "until":
             return cmd_wait_until(args.target, args.timeout, args.json)
         if args.kind == "pid":
-            return cmd_wait_pid(args.target, args.timeout, args.json)
+            return cmd_wait_pid(args.target, args.timeout, args.json, args.max)
         if args.exists or args.gone or args.contains:
             raise WatchError("--exists, --gone and --contains are for wait file")
         if args.kind == "comment":
             if args.sha or args.jobs or args.until != "green":
                 raise WatchError("wait comment takes --author, --match and --since, not --sha, --jobs or --until")
-            return cmd_wait_comment(args.target, args.timeout, args.json, args.author, args.match, args.since)
+            return cmd_wait_comment(args.target, args.timeout, args.json, args.author, args.match, args.since,
+                                    args.max)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
         return subscribe_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
-                              args.rescue_grace, args.settle)
+                              args.rescue_grace, args.settle, args.max)
     except WatchError as error:
         # Through say_waiting for its stdout reason: this handler covers `wait --json`, so with
         # stderr closed `print(file=None)` made a bad-argument message the first line of the
