@@ -24477,6 +24477,91 @@ class LandTest(Base):
         (gg.cache_dir() / gg.file_name(self.KEY)).unlink()
         self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), "no read at all")
 
+    def test_a_pin_the_head_has_already_passed_is_refused_at_the_request(self):
+        """A pin is trusted as given, because the cache's head is routinely older than the head an agent just pushed
+        and pinned (pin_wait). An *ancestor* of the cached head is the other direction and is certain: 2026-11-21 a
+        lane landed leo-workspace#7547 pinned fc1415273c, the commit its own head had merged minutes before, and the
+        row waited in pinWait for a head that was already gone while GitHub was down. One local `merge-base
+        --is-ancestor` tells the two apart and costs no quota."""
+        def git(rest: list[str]) -> str | None:
+            # git's own answers: "" (no output) when the command succeeded, None when it failed. This checkout holds
+            # every commit asked about, and LA is an ancestor of LB.
+            if rest[:2] == ["cat-file", "-e"]:
+                return "" if rest[2].split("^")[0] in (LA, LA[:12], LB) else None
+            return ("" if rest[:2] == ["merge-base", "--is-ancestor"] and LA.startswith(rest[2])
+                    and rest[3] == LB else None)
+        said = gg.land_pin_behind_refusal("o/r", 1, LA, LB, git)
+        self.assertIsNotNone(said)
+        why, nxt = said
+        self.assertIn(f"--match-head-commit {LA[:12]} is an ancestor of o/r#1's head {LB[:12]}", why)
+        self.assertIn("stop head_moved", why)
+        self.assertEqual(nxt, f"glaeda-gh land o/r#1 --match-head-commit {LB}")
+        self.assertEqual(said, gg.land_pin_behind_refusal("o/r", 1, LA[:12], LB, git))  # a short pin reads the same
+        # Every other case refuses nothing: the pin *is* the head, the pin is a newer commit than the cached head
+        # (which is the normal pinned land), this checkout does not hold both commits, or git could not answer.
+        self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LB, LB, git))
+        self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LB, LA, git))
+        self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LA, "", git))
+        self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, "", LB, git))
+        self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LA, LB, lambda rest: None))
+        # The cached head it judges against: only an open PR read inside the bound says one.
+        now = time.time()
+        self.store_pr(land_pr(LB), at=now)
+        self.assertEqual(gg.land_cached_head(self.KEY, gg.LAND_PIN_BEHIND_AGE), LB)
+        for data, at, why in ((land_pr(LB), now - gg.LAND_PIN_BEHIND_AGE - 1, "older than the bound"),
+                              (land_pr(LB), now + 600, "stamped in the future"),
+                              (land_pr(LB, state="MERGED"), now, "not open"),
+                              ({"state": "OPEN"}, now, "no head stored")):
+            self.store_pr(data, at=at)
+            self.assertEqual(gg.land_cached_head(self.KEY, gg.LAND_PIN_BEHIND_AGE), "", why)
+        (gg.cache_dir() / gg.file_name(self.KEY)).unlink()
+        self.assertEqual(gg.land_cached_head(self.KEY, gg.LAND_PIN_BEHIND_AGE), "", "no read at all")
+
+    def test_land_refuses_a_pin_behind_the_head_and_names_the_head_to_pin(self):
+        """The request answers it: nothing is queued, nothing is read from GitHub, and the step is the same command
+        with the head the cache holds."""
+        def bounded(argv: list[str], timeout: float | None = None, **kw: object) -> gg.subprocess.CompletedProcess:
+            self.assertEqual(argv[0], "git")
+            rest = argv[1:]
+            ok = rest[:2] == ["cat-file", "-e"] or rest == ["merge-base", "--is-ancestor", LA, LB]
+            return gg.subprocess.CompletedProcess(argv, 0 if ok else 1, "", "")
+        self.pr(LB)
+        self.store_pr(land_pr(LB))
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "run_bounded", side_effect=bounded), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        self.assertIn(f"is an ancestor of o/r#1's head {LB[:12]}", said[0])
+        self.assertIn(f"next: glaeda-gh land o/r#1 --match-head-commit {LB}", said[0])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json"))
+                         if gg.LandQueue.requests_dir().is_dir() else [], [])
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "run_bounded", side_effect=bounded), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, LA)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]),
+                         (gg.EXIT_FAIL, False, "land_pin_behind", self.KEY))
+        self.assertIn("land_pin_behind", gg.LAND_REQUEST_REFUSED)  # a forwarded request carries it back unchanged
+        # The pinned land of the head itself is queued as always: the check answers only the ancestor case.
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "run_bounded", side_effect=bounded), contextlib.redirect_stdout(out):
+            gg.cmd_land("o/r#1", [], "host/lane", 0, True, LB)
+        doc = json.loads(out.getvalue())
+        self.assertNotIn("land_pin_behind", json.dumps(doc))
+        self.assertEqual(doc["key"], self.KEY)
+        self.assertTrue(doc.get("request"), doc)  # queued (the daemon is not running in this test, hence no merge)
+
     CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
                         'request-branch","status":"422"}')

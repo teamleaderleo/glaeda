@@ -15644,7 +15644,8 @@ def land_queued_by() -> str:
     return reader if "/" in reader else f"{policy_host()}/{reader}"
 
 
-# A pin the caller passes is trusted as given, with no head read: the merge's own --match-head-commit (and land_judge's
+# A pin the caller passes is trusted as given, with no head read, bar the one wrong pin a local git call can prove
+# (land_pin_behind_refusal): the merge's own --match-head-commit (and land_judge's
 # --sha) refuse a head that moved, and the executor stops head_moved on a read that shows another one. Reading the head
 # here first (`gh api repos/R/pulls/N`) was what refused under a short quota: transcript-lessons (cmuxterm-hq#16805)
 # found a spent shared quota blocking push, PR create and land 9 times in 7 sessions, `land --sha` among them with
@@ -15702,10 +15703,66 @@ def check_land_pin(repo: str, number: int, pin: str | None,
                          f"then glaeda-gh land {repo}#{number} --match-head-commit THAT")
 
 
+# How old this host's last read of a PR may be for a pin to be judged against its head: a day, because the judgment
+# below is not "the head is not the pin" (which a stale read gets wrong, pin_wait's own case) but "the pin is an
+# ancestor of that head", which no later push can undo -- a branch only grows, and a force-push back onto an ancestor
+# of its own tip is not a thing lands here meet. 2026-11-21: leo-workspace#7547 was landed pinned fc1415273c, the
+# commit its own head 67646e98d6 had merged minutes earlier, and sat in pinWait nudging for its pinned head while
+# GitHub was down, because a pin is trusted as given.
+LAND_PIN_BEHIND_AGE = 86400.0
+
+
+def land_pin_behind_refusal(repo: str, number: int, pin: str, head: str,
+                            git: Callable[[list[str]], str | None] | None = None) -> tuple[str, str] | None:
+    """(why, the step that clears it) when PIN is provably an older commit of the same branch than HEAD, this host's
+    cached head of REPO#NUMBER, else None. No GitHub read: the proof is `git merge-base --is-ancestor` in the checkout
+    the caller ran in, and a checkout that does not have both commits proves nothing and refuses nothing.
+
+    A pin the caller passes is trusted as given (the comment above check_land_pin), and it has to be: the cache's head
+    is routinely older than the head an agent just pushed and pinned, so "the cached head is not the pin" is no reason
+    to refuse. An *ancestor* is the other direction and is certain -- the pinned commit is already in the head's
+    history, so the head moved past it before the request -- and such a land can only stop head_moved later, or wait
+    out its pin for a head that will never come back.
+
+    GIT runs git and returns its stdout, or None when it failed, so a command that prints nothing on success (both of
+    these) answers "" when it succeeded."""
+    if not pin or not SHA40.fullmatch(head or "") or not land_head_moved(pin.lower(), head.lower()):
+        return None
+
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    if any(git(["cat-file", "-e", f"{sha}^{{commit}}"]) is None for sha in (pin, head)):
+        return None  # this checkout does not hold both commits: it cannot tell which came first
+    if git(["merge-base", "--is-ancestor", pin, head]) is None:
+        return None  # not an ancestor (or git could not say): a pin of a head newer than the cache, which is normal
+    name = f"{repo}#{number}"
+    return (f"--match-head-commit {pin[:12]} is an ancestor of {name}'s head {head[:12]}, by this host's last read of "
+            f"it and this checkout's history: the head moved past that commit before the request, so the land would "
+            f"wait out its checks and stop head_moved (or wait for a head that is already gone). Pin the head itself",
+            f"glaeda-gh land {name} --match-head-commit {head}")
+
+
+def land_cached_head(key: str, max_age: float) -> str:
+    """The head this host's cache holds for KEY, when its read is at most MAX_AGE old and says the PR is open, else "".
+    A failed, absent or stale read says nothing, as it does for land_draft_refusal."""
+    cached = read_cache(key) or {}
+    data, at = cached.get("data"), cached.get("dataAt")
+    if cached.get("error") or not isinstance(data, dict) or not isinstance(at, (int, float)) \
+            or isinstance(at, bool) or not 0 <= time.time() - at <= max_age \
+            or data.get("state") != "OPEN" or data.get("merged"):
+        return ""
+    return str(data.get("headRefOid") or "").lower()
+
+
 # The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
 # the executor unchanged (cmd_land_forwarded prints them and drops the staged copy, land_forward_exit fails on them),
 # because the executor is the host that holds the cache and the land-judge the answer came from.
-LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft")
+LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft", "land_pin_behind")
 
 
 def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple[str, str] | None:
@@ -15735,6 +15792,15 @@ def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple
             f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}{pinned}")
 
 
+def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool) -> int:
+    """Print one request-time refusal (LAND_REQUEST_REFUSED) the way `land` prints them, and its exit code."""
+    if as_json:
+        print(json.dumps({"ok": False, "key": key, "code": code, "reason": why, "next": nxt}, sort_keys=True))
+    else:
+        say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
+    return EXIT_FAIL
+
+
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
              pin: str | None = None, override: dict | None = None) -> int:
     """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
@@ -15750,16 +15816,14 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if draft is not None:
         # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
         # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment).
-        why, nxt = draft
-        if as_json:
-            print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": why, "next": nxt},
-                             sort_keys=True))
-        else:
-            say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
-        return EXIT_FAIL
+        return land_request_refused(key, "land_draft", *draft, as_json=as_json)
     # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
+    behind = land_pin_behind_refusal(repo, number, sha, land_cached_head(key, LAND_PIN_BEHIND_AGE)) if sha else None
+    if behind is not None:
+        # Same place, same reason as the draft answer: a pin the head has already passed can only stop later.
+        return land_request_refused(key, "land_pin_behind", *behind, as_json=as_json)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
