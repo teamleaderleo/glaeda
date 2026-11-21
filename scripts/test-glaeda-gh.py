@@ -4899,6 +4899,39 @@ class ClientTest(Base):
         self.assertIn(".out.state", gg.WAIT_FILES)
         self.assertIn('$out.state', gg.BLOCKER)
 
+    def test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty(self) -> None:
+        """A key the daemon has not read when status's wait ends gets one direct read (as wait's starved branch),
+        then status answers from the cache; a refused read (quota, upstream) leaves the old "no data yet" (3)."""
+        reads: list[dict] = []
+
+        def fill(req: dict) -> None:
+            reads.append(req)
+            self.put(req["key"], gg.parse_pr(pr_node(7, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=fill), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#7"])
+        self.assertEqual(json.loads(out.getvalue())["data"]["checkState"], "SUCCESS")
+        # a key whose cache already answers is never read again, and a refusal is not an answer
+        reads.clear()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=lambda req: reads.append(req) or gg.DIRECT_QUOTA), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+            self.assertEqual(reads, [])
+            self.assertEqual(gg.cmd_status("pr", "o/r#8", False, True, first_wait=0), gg.EXIT_DOWN)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#8"])
+
     def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
