@@ -26415,13 +26415,23 @@ def positional_capacity(p: argparse.ArgumentParser) -> float:
 
 
 def spelled_long_flag(word: str, options: dict[str, bool]) -> str | None:
-    """WORD as one of OPTIONS' long flags, an abbreviation of one included: argparse's `allow_abbrev` is on,
-    so `--contain` is `--contains` and `--time` is `--timeout`. None when it is no long flag of this command,
-    or an abbreviation several of them answer to (which argparse refuses itself)."""
+    """WORD as one of OPTIONS' long flags, however this tool would come to read it: canonical, in another of
+    its case conventions (`--statusKey` is `--status-key`, what `flag_spelling_synonym` makes of it), or an
+    abbreviation (argparse's `allow_abbrev` is on, so `--contain` is `--contains` and `--time` is
+    `--timeout`). None when it is no long flag of this command, or a spelling several of them answer to,
+    which this tool and argparse both refuse themselves.
+
+    Every reader of a flag's name goes through here, so a flag's value is read as its value in each
+    spelling the call would be accepted in: a spelling only one reader knows made a call that parses look
+    like a call with one positional word too many (re-review of #2381)."""
     if not word.startswith("--") or word in ("--", "---"):
         return None
     if word in options:
         return word
+    key = normalized_flag(word)
+    spellings = [option for option in options if normalized_flag(option) == key]
+    if spellings:
+        return spellings[0] if len(spellings) == 1 else None
     hits = [option for option in options if option.startswith(word)]
     return hits[0] if len(hits) == 1 else None
 
