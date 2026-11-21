@@ -4495,6 +4495,7 @@ class Daemon:
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
+        self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
         self.clock_real = True  # tick(now=...) in tests pins the clock
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
         # GitHub's secondary limit holds the outbox until then
@@ -5650,6 +5651,8 @@ class Daemon:
         bucket = "graphql" if path == "/graphql" else "rest"
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
+        if not content and not free:
+            self.post_due()  # a read phase never holds a queued write past its spacing
         raw_body = json.dumps(body).encode() if body is not None else None
         pool = self.app_pool
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
@@ -5917,6 +5920,7 @@ class Daemon:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Land-gating writes first (outbox_gate), then oldest first; a write waiting
         out its own retry is skipped."""
+        self.post_tried = self.now
         self.adopt_pace_hold()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
@@ -5950,6 +5954,17 @@ class Daemon:
             finally:
                 self.writing = False
             return
+
+    def post_due(self) -> None:
+        """post_between on the outbox's own clock, asked before every read request: once POST_SPACING has passed since
+        post_tick last ran, the outbox gets its turn, under every hold post_tick keeps (the pacer, the secondary limit,
+        the content pause). Between batches alone was not enough: on huge-blue 2026-11-21 15:4xZ a pass took ~95 s,
+        most of it the REST loop, which had no post_between, so posts went out ~95 s apart (0.6-0.7 a minute) while
+        writes came in at 1.15 a minute and review receipts waited up to 173 min."""
+        clock = time.time() if self.clock_real else self.now
+        if self.writing or clock - self.post_tried < POST_SPACING:
+            return
+        self.post_between()
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""

@@ -14867,6 +14867,37 @@ class PostTest(unittest.TestCase):
             code = gg.cmd_post_status(item["id"], 2, False)
         self.assertEqual((code, out.getvalue()), (0, "posted-url\n"))
 
+    def test_a_read_request_gives_the_outbox_its_turn_once_spacing_passed(self) -> None:
+        """huge-blue 2026-11-21: posts went out once per ~95 s pass, because the REST loop never asked the outbox.
+        Every read request now does (post_due), on the outbox's clock, and the outbox's own requests never recurse."""
+        first = self.queue("comment", "o/r#7", "--body", "one")
+        second = self.queue("comment", "o/r#8", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "u1"}), (200, {}, {"n": 1}), (201, {}, {"html_url": "u2"}),
+                           (200, {}, {"n": 2}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+        d.now = NOW + gg.POST_SPACING - 1  # within the spacing: the read goes alone
+        d.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET"])
+        self.assertEqual(gg.post_state(second["id"])["state"], "queued")
+        d.now = NOW + gg.POST_SPACING  # the spacing passed mid read phase: the write goes first
+        d.request("GET", "/repos/o/r/pulls/2")
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "POST", "GET"])
+        self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+        self.assertEqual(d.now, NOW + gg.POST_SPACING)  # the read keeps its own clock
+
+    def test_a_read_request_keeps_the_outbox_holds(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        d, t = self.daemon((200, {}, {}), (200, {}, {}))
+        d.clock_real = False
+        d.now = NOW
+        d.post_hold = NOW + 600  # a secondary-limit hold on the outbox
+        d.request("GET", "/repos/o/r/pulls/1")
+        d.now = NOW + gg.POST_SPACING * 2
+        d.request("GET", "/repos/o/r/pulls/2")
+        self.assertEqual([c[0] for c in t.calls], ["GET", "GET"])
+
     def test_tick_posts_first_and_reports_the_outbox(self) -> None:
         self.queue("comment", "o/r#7", "--body", "x")
         self.queue("comment", "o/r#8", "--body", "y")
