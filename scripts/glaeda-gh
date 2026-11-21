@@ -887,12 +887,12 @@ RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*
 
 
 def outbox_gate(item: Any) -> bool:
-    """A write a merge waits on: queued with --gate, a review's APPROVE or REQUEST_CHANGES, or a comment whose first
+    """A write a merge waits on: queued with --gate, or a comment whose first
     line is a review receipt (router-review's `Review (...): SHIP at SHA`). These go out ahead of every other queued
     write, so a SHIP never waits behind a hundred awareness comments while the login's create pause spaces them."""
     if not isinstance(item, dict):
         return False
-    if item.get("gate") is True or item.get("kind") == "review" and item.get("event") in {"APPROVE", "REQUEST_CHANGES"}:
+    if item.get("gate") is True:
         return True
     body = str(item.get("body") or "")
     first = next((line for line in body.splitlines() if line.strip()), "").strip()
