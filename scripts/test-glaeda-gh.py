@@ -25889,6 +25889,71 @@ class LandTest(Base):
         self.assertIn("lane-gh call get: quota", e["stop"]["reason"])
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
 
+    def refuse_for_quota(self) -> None:
+        """Every direct read is refused as direct_read refuses one on a spent login, until fresh_head is set."""
+        def refresh(key: str) -> str | None:
+            self.w.refreshed.append(key)
+            if self.fresh_head is None:
+                return gg.DIRECT_QUOTA
+            self.w.set_pr(key, land_pr(self.fresh_head), self.t)
+            return None
+        self.q.refresh = refresh
+
+    def test_a_pinned_land_whose_reads_are_refused_for_quota_holds_until_the_reset_and_reads_again(self):
+        """cmuxterm-hq#16608, 2026-11-21 23:05Z and 23:15Z: stopped pin_unread on "3 direct reads of the PR failed, the
+        last: GitHub's quota for this read is spent" while GraphQL read 0/5000 until 23:38Z. A refusal for the spent
+        quota is not counted: the entry holds (window_capped, naming the reset) until the window resets, then reads
+        the PR again and lands on the read that shows the pin."""
+        self.nudge_reads = False
+        self.pr(LA)
+        reset = self.t + 3 * gg.NUDGE_MIN * gg.LAND_PIN_READ_FAILS + 600
+        self.refuse_for_quota()
+        self.land_pinned(LB)
+        e = self.tick(1)
+        while not self.w.refreshed:
+            self.give_reading("graphql", 0, reset)
+            e = self.tick(1)
+        e = self.tick(1)  # the next pass reads the refusal: held, not counted
+        self.assertNotEqual(e["state"], "stopped")
+        capped = e.get("windowCapped") or {}
+        self.assertEqual((capped.get("pool"), capped.get("next"), capped.get("pinRead")), ("graphql", reset, True))
+        line = [h for h in e["history"] if h.get("event") == "window_capped"][-1]
+        self.assertEqual((line.get("next"), line.get("pinRead")), (gg.utc_clock(reset), "quota"))
+        self.assertFalse(e["pinWait"].get("directFails"))
+        while self.t < reset - 2:  # held: no read until the reset, however long
+            self.give_reading("graphql", 0, reset)
+            e = self.tick(min(30.0, reset - 2 - self.t))
+        self.assertEqual((len(self.w.refreshed), e["state"], self.w.explains()), (1, "queued", []))
+        self.give_reading("graphql", 5000, reset + 3600)
+        self.fresh_head = LB
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(4):
+            self.tick(1)
+        self.assertEqual(len(self.w.refreshed), 2)
+        self.assert_merged_at(LB)
+
+    def test_a_pinned_land_refused_for_quota_with_no_reset_known_is_not_counted(self):
+        """No reading or refusal names the reset: the refusals are still not counted (no pin_unread), the PR is read
+        again on the usual cadence; real read errors after them still count and stop it."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.refuse_for_quota()
+        self.land_pinned(LB)
+        e = self.tick(1)
+        while len(self.w.refreshed) < gg.LAND_PIN_READ_FAILS + 1:
+            e = self.tick(1)
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertFalse(e["pinWait"].get("directFails"))
+        self.assertIn("pin_read_quota", [h.get("event") for h in e["history"]])
+        self.refresh = type(self).refresh.__get__(self)
+        self.q.refresh = self.refresh  # real failures ("lane-gh call get: quota" names no spent quota) count
+        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+            e = self.tick(1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pin_unread"))
+        self.assertIn("lane-gh call get: quota", e["stop"]["reason"])
+
     def test_a_pinned_land_with_failed_direct_reads_short_of_the_stop_merges_on_the_read_that_works(self):
         """Only failures in a row stop it: LAND_PIN_READ_FAILS - 1 failed reads, then one that shows the pin, and it
         is judged and merged."""

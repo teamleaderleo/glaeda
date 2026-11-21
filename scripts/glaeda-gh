@@ -11869,6 +11869,15 @@ def land_command_wait(act: dict, answer: dict, head: str) -> dict:
     return act
 
 
+def land_read_quota(error: str) -> bool:
+    """Whether a direct read's ERROR is a refusal for the login's spent quota (direct_read's DIRECT_QUOTA, or the
+    gh-quota shim's, the broker's or a step's words for it: LAND_UNREAD_QUOTA, LAND_STEP_QUOTA), not a failed read.
+    cmuxterm-hq#16608, 2026-11-21 23:05Z and 23:15Z: a pinned land stopped pin_unread on three such refusals while
+    GraphQL read 0/5000 until 23:38Z."""
+    text = str(error or "")
+    return DIRECT_QUOTA in text or bool(LAND_UNREAD_QUOTA.search(text) or LAND_STEP_QUOTA.search(text))
+
+
 def land_quota_said(text: str, now: float) -> float | None:
     """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
     NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
@@ -13206,6 +13215,25 @@ class LandQueue:
             self.save(e)
         return True
 
+    def spent_until(self, error: str) -> tuple[str, float, dict | None] | None:
+        """(pool, when it resets, the reading) for a read refused because the login's quota is spent (ERROR): the pool
+        whose fresh live count is spent to the reserve (pace_next's spent case), the latest reset when both are, else
+        the reset the refusal's own words name (land_quota_said), else the login latch's end; None when none says."""
+        spent = []
+        for pool, cost in LAND_JUDGE_COST.items():
+            seen = self.reading(pool) if self.reading is not None else None
+            if land_reading_state(seen, None, self.now) == "fresh" \
+                    and float(seen["remaining"]) - hard_reserve_floor()[pool] < cost:
+                spent.append((pool, float(seen["reset"]), seen))
+        if spent:
+            return max(spent, key=lambda got: got[1])
+        said = land_quota_said(error, self.now)
+        if said is not None:
+            return "said", said, None
+        if self.latched is not None and float(self.latched[1]) > self.now:
+            return str(self.latched[0]), float(self.latched[1]), None
+        return None
+
     def pace_next(self, pool: str, w: dict) -> tuple[float, dict | None] | None:
         """When POOL's next judgment may start under the login's live count (the pace comment above LAND_JUDGE_COST),
         and the reading it came from; None when the pool is unpaced (no fresh reading)."""
@@ -13594,7 +13622,9 @@ class LandQueue:
 
         Bounded: a nudge that brings no read within NUDGE_MIN is followed by a direct read of the PR (refresh_job), as
         on a host that reads through its upstream; LAND_PIN_READ_FAILS failed direct reads in a row stop the entry
-        (pin_unread), naming the pin, the cached head and the read's error to its requester."""
+        (pin_unread), naming the pin, the cached head and the read's error to its requester. A read refused for the
+        login's spent quota (land_read_quota) is not counted: the entry holds until the window resets (spent_until,
+        kept as windowCapped with pinRead), then reads again."""
         pin = str(e.get("pinSha") or "")
         if head and not land_head_moved(pin, head):
             e["pinSeen"] = True
@@ -13615,6 +13645,29 @@ class LandQueue:
         if not isinstance(w, dict):
             w = e["pinWait"] = {"since": self.now, "cached": head[:12]}
             self.history(e, "pin_wait", pin=pin[:12], cached=head[:12])
+            self.save(e)
+        refused = w.pop("quotaRefused", None)
+        if refused:
+            # The direct read was refused for the login's spent quota: not counted toward pin_unread. The entry holds,
+            # as a capped one does (windowCapped, cappedSince), until that window resets, then reads again.
+            got = self.spent_until(str(refused))
+            if got is not None and got[1] > self.now:
+                pool, until, seen = got
+                e["windowCapped"] = {"start": until, "at": self.now, "pool": pool, "next": until, "pinRead": True,
+                                     "remaining": (seen or {}).get("remaining"), "reset": (seen or {}).get("reset")}
+                e.setdefault("cappedSince", self.now)
+                self.history(e, "window_capped", pool=pool, pinRead="quota", next=utc_clock(until),
+                             remaining=(seen or {}).get("remaining"))
+            else:  # no reset known: read again on the usual cadence (NUDGE_MIN), still not counted
+                self.history(e, "pin_read_quota", error=land_trim(str(refused), 120))
+            self.save(e)
+        capped = e.get("windowCapped") or {}
+        if capped.get("pinRead"):
+            if float(capped.get("next") or 0) > self.now:
+                return True  # held until the reset: no read, no judgment of the cached head
+            e.pop("windowCapped", None)
+            w.pop("readAt", None)  # the window reset: read again now
+            self.history(e, "pin_read_again", pool=capped.get("pool"))
             self.save(e)
         fails = int(w.get("directFails") or 0)
         if fails >= LAND_PIN_READ_FAILS:
@@ -13753,7 +13806,10 @@ class LandQueue:
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
             w = e.get("pinWait")
             if isinstance(w, dict) and w.get("directAt") is not None:  # a pinned land's direct read (pin_wait)
-                w["directFails"] = int(w.get("directFails") or 0) + 1 if error else 0
+                if error and land_read_quota(error):
+                    w["quotaRefused"] = land_trim(error, 160)  # the login's state, not the PR's: held, not counted
+                else:
+                    w["directFails"] = int(w.get("directFails") or 0) + 1 if error else 0
                 w["directError"] = land_trim(error, 160) if error else None
             log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error})
             self.save(e)
