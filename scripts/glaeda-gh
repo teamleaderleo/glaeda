@@ -21,7 +21,8 @@
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
                                                         else one REST read; kept compressed for the next reader
-    glaeda-gh log errors OWNER/REPO JOB_ID [--max N] [--json]   that job's error-level lines by step, not the whole log
+    glaeda-gh log errors OWNER/REPO JOB_ID|RUN_ID [--max N] [--json]   that job's error-level lines by step, not the
+                                                        whole log; a run id reads every failed job of that run
     glaeda-gh log search OWNER/REPO PATTERN [--since 24h] [--job RE] [--workflow RE] [--conclusion failed|any|C]
                                                         which recent jobs printed PATTERN (controller job history,
                                                         kept logs only: no REST; --reads N caps controller reads)
@@ -25859,10 +25860,15 @@ def cmd_log_job(repo: str, job: int, controller: Any = "env", rest: Callable = r
     repo = repo.lower()
     text, source, why = job_log_read(repo, job, controller, rest)
     if text is None:
+        # A run id typed here can only be named, never served: this command's contract is one log on stdout.
+        try:
+            hint = run_id_hint(repo, job, run_jobs_typed_as_a_job(repo, job, controller))
+        except (WatchError, OSError) as error:
+            hint = f"; whether {job} is a run id went unchecked: {error}"
         if why == "expired":
-            print(f"glaeda-gh: GitHub has no log for {repo} job {job} any more (expired)", file=sys.stderr)
+            print(f"glaeda-gh: GitHub has no log for {repo} job {job} any more (expired){hint}", file=sys.stderr)
         else:
-            print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+            print(f"glaeda-gh: no log for {repo} job {job}: {why}{hint}", file=sys.stderr)
         return EXIT_FAIL
     out = sys.stdout.buffer
     out.write(text)
@@ -26076,7 +26082,7 @@ class LogScan:
 
 def log_scan_setup(repo: str, since: str, controller: Any) -> tuple[str, Any, list[dict], bool]:
     if not re.fullmatch(rf"{NAME}/{NAME}", repo):
-        raise WatchError("log search and log flaky take OWNER/REPO first")
+        raise WatchError("a log scan (search, flaky, a run id given to errors) takes OWNER/REPO first")
     ctl = Controller.from_env() if controller == "env" else controller
     if ctl is None:
         raise WatchError("no build controller configured (CMUX_CI_CONTROLLER): log search reads its job history")
@@ -26198,27 +26204,89 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
     return EXIT_OK if flaky else EXIT_FAIL
 
 
+def run_jobs_typed_as_a_job(repo: str, number: int, controller: Any) -> list[dict] | None:
+    """REPO's finished jobs of run NUMBER, newest first, or None when no run of REPO by that number finished inside
+    the window the controller keeps logs for.
+
+    A run id and a job id are both bare integers, so neither the caller nor argparse can tell one from the other:
+    `log errors manaflow-ai/cmuxterm-hq 44950653493` (a run id, copied from the run's own page) answered "no log
+    for job 44950653493", which reads as a job whose log has expired. The reader's next step was `status run` to
+    get the job id, then the same command again -- two calls for a number they already had. The controller's own
+    timing history says which jobs a run has, so the reading is settled here, for no GitHub read."""
+    _, _, recs, _ = log_scan_setup(repo, "72h", controller)
+    of_run = [r for r in recs if r.get("run") and int(r["run"]) == number]
+    if not of_run:
+        return None
+    return sorted(of_run, key=lambda r: r.get("at") or "", reverse=True)
+
+
+def run_id_hint(repo: str, number: int, jobs: list[dict] | None) -> str:
+    """What to say about NUMBER when it is no job of REPO: which failed jobs its run has, or that it is no run
+    either. Named so both `log job` and `log errors` refuse the same way."""
+    if jobs is None:
+        return (f"; no run {number} of {repo} finished in the last 72 h either (a run of another repository, or one "
+                f"too old to have logs: `glaeda-gh status run {repo}/{number}` says which)")
+    failed = [r for r in jobs if (r.get("conclusion") or "") in LOG_FAILED]
+    if not failed:
+        return (f"; {number} is run {number} of {repo}, not a job, and none of its {len(jobs)} finished jobs failed "
+                f"(`glaeda-gh status run {repo}/{number} --jobs`)")
+    steps = " ".join(f"`glaeda-gh log errors {repo} {r['id']}`" for r in failed[:5])
+    return (f"; {number} is run {number} of {repo}, not a job: its failed job(s) are "
+            f"{', '.join(str(r['id']) for r in failed)} -- {steps}")
+
+
 def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
                    rest: Callable = rest_job_log) -> int:
-    """One job's error-level lines by step, not its whole log. Exit 0 with its log read (a log with no error line
-    prints a count of 0), 1 without a log."""
+    """One job's error-level lines by step, not its whole log. A run id here reads every failed job of that run,
+    because the two kinds of id are indistinguishable (run_jobs_typed_as_a_job). Exit 0 with a log read (a log
+    with no error line prints a count of 0), 1 with none."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
     text, source, why = job_log_read(repo, job, controller, rest)
-    if text is None:
-        print(f"glaeda-gh: no log for {repo} job {job}: {why}", file=sys.stderr)
+    if text is not None:
+        return log_errors_emit(repo, [(job, text, source)], limit, as_json, None)
+    try:
+        jobs = run_jobs_typed_as_a_job(repo, job, controller)
+    except (WatchError, OSError) as error:
+        print(f"glaeda-gh: no log for {repo} job {job}: {why}; whether {job} is a run id went unchecked: {error}",
+              file=sys.stderr)
         return EXIT_FAIL
-    found = log_errors(text, limit)
+    failed = [r for r in (jobs or []) if (r.get("conclusion") or "") in LOG_FAILED]
+    if not failed:
+        print(f"glaeda-gh: no log for {repo} job {job}: {why}{run_id_hint(repo, job, jobs)}", file=sys.stderr)
+        return EXIT_FAIL
+    say_waiting(f"glaeda-gh: {job} is run {job} of {repo}, not a job: reading its {len(failed)} failed job(s)")
+    read, unread = [], []
+    for r in failed:
+        one, src, reason = job_log_read(repo, int(r["id"]), controller, rest)
+        if one is None:
+            unread.append(f"{r['id']} ({reason})")
+        else:
+            read.append((int(r["id"]), one, src))
+    if unread:
+        say_waiting(f"glaeda-gh: no log for {', '.join(unread)}")
+    if not read:
+        return EXIT_FAIL
+    return log_errors_emit(repo, read, limit, as_json, job)
+
+
+def log_errors_emit(repo: str, logs: list[tuple[int, bytes, str]], limit: int, as_json: bool,
+                    run: int | None) -> int:
+    """Print the error lines of each (job, log, source). One job keeps the shape it always printed; a run prints
+    one block per job, and `--json` carries them under `run` and `jobs`, so a one-job reader never has to branch."""
+    found = [{"job": job, "source": source, **log_errors(text, limit)} for job, text, source in logs]
     if as_json:
-        print(json.dumps({"repo": repo, "job": job, "source": source, **found}, sort_keys=True))
+        one = {"repo": repo, **found[0]} if run is None else {"repo": repo, "run": run, "jobs": found}
+        print(json.dumps(one, sort_keys=True))
         return EXIT_OK
-    more = f", {found['total'] - found['shown']} more past --max" if found["total"] > found["shown"] else ""
-    print(f"{repo} job {job}: {found['total']} error lines in {len(found['steps'])} steps{more}")
-    for s in found["steps"]:
-        print(f"[{s['step']}]")
-        for line in s["lines"]:
-            print(f"  {line}")
+    for f in found:
+        more = f", {f['total'] - f['shown']} more past --max" if f["total"] > f["shown"] else ""
+        print(f"{repo} job {f['job']}: {f['total']} error lines in {len(f['steps'])} steps{more}")
+        for s in f["steps"]:
+            print(f"[{s['step']}]")
+            for line in s["lines"]:
+                print(f"  {line}")
     return EXIT_OK
 
 
@@ -26672,7 +26740,8 @@ def parser() -> argparse.ArgumentParser:
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
     lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
     lj.add_argument("repo", metavar="OWNER/REPO")
-    le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log")
+    le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log (a run id "
+                                       "reads every failed job of that run)")
     le.add_argument("repo", metavar="OWNER/REPO")
     for one in (lj, le):
         job = one.add_mutually_exclusive_group(required=True)
