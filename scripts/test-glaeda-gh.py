@@ -32,6 +32,7 @@ import urllib.parse
 from unittest import mock
 from pathlib import Path
 from typing import Any
+import http.server as _hs; _hs.HTTPServer.server_bind = lambda s: (_hs.socketserver.TCPServer.server_bind(s), setattr(s, "server_name", str(s.server_address[0])), setattr(s, "server_port", s.server_address[1])) and None  # no reverse DNS on bind (Local Network prompt): scripts/test-python-http-server-no-lookup.py
 
 ROOT = Path(__file__).resolve().parents[1]
 
