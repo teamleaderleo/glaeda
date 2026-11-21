@@ -13143,11 +13143,21 @@ class LandQueue:
             self.check(e)
             self.count("explain")
             e["head"] = head or e.get("head") or ""
+            # What this judgment was made on (judge: seenChecks), so the next one can say whether anything moved: a
+            # judgment at the same head on the same check fingerprint could only reach the verdict above it
+            # (explain_unmoved in `land status`): measured, never acted on. Counted here and nowhere else on purpose:
+            # the verdict's own wait is still honoured to the second, so this changes no step, wake or merge.
+            checks = str(e.get("seenChecks") or "")
+            prior = e.get("explain") or {}
+            unmoved = bool(checks) and prior.get("head") == head and prior.get("checks") == checks
+            if unmoved:
+                self.count("explain_unmoved")
             e["explain"] = {"at": self.now, "ok": bool(answer.get("ok")), "code": str(answer.get("code") or ""),
                             "reason": land_trim(answer.get("reason")), "next": land_trim(answer.get("next")),
-                            "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict)}
+                            "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict),
+                            "checks": checks}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
-                         head=head[:12], step=act.get("kind"))
+                         head=head[:12], step=act.get("kind"), unmoved=unmoved or None)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):

@@ -22683,6 +22683,9 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"], e["streak"], e["waitRefused"]["count"]),
                          ("waiting", "pr", None, len(judged)))
         self.assertEqual(self.w.sent(), [], "no stop, nobody asked to requeue")
+        # Every one of those judgments after the first was made at the same head on the same check set: the queued
+        # check never moved in these 3 h, so each could only reach the verdict above it (explain_unmoved).
+        self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
         # the checks start: progress, the wait goes on past the bound counted from the first refusal
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "IN_PROGRESS", None)])
         e = self.run_hour(self.queued_wait, seconds=gg.LAND_WAIT_STUCK - 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
@@ -22692,6 +22695,23 @@ class LandTest(Base):
         self.w.answers[:] = [ok_answer(LA)]
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_a_judgment_on_an_unmoved_check_set_is_counted(self):
+        # The instrumentation the keep was measured with: a judgment at the same head on the same check runs,
+        # statuses and conclusions could only reach the verdict above it (`land status`: explain_unmoved).
+        self.pr(LA)
+        self.land()
+        for _ in range(4):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 120},
+                                          reason="land-judge: refused: the classifier could not read the reds"))
+        e = self.run_hour(lambda: refusal("unreadable", LA, {"kind": "retry", "after_s": 120},
+                                          reason="land-judge: refused: the classifier could not read the reds"),
+                          seconds=400.0, step=60.0)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        self.assertGreaterEqual(len(judged), 2)
+        self.assertEqual(day.get("explain_unmoved"), len(judged) - 1)
+        self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
 
     def test_checks_that_never_start_stop_at_the_long_bound_naming_them(self):
         for code in ("checks_running", "checks_queued_no_runner"):
