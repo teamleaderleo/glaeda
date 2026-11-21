@@ -12481,7 +12481,7 @@ def _census_sudo_du(path: Path, timeout: float) -> int | None:
     """Disk usage of path in bytes as root (`sudo -n du -xs -B1`, bounded by TIMEOUT), or None: no sudo here, a
     timeout, or du still could not read all of it. Blocks, like df's used and the census's own du -k, not apparent
     sizes, so a measured row and the gap it closes are the same unit."""
-    if not sudo_reads():
+    if ROOT_CENSUS_MODE or not sudo_reads():  # the root census already reads as root: what it misses is protected
         return None
     t = max(5, int(timeout))
     argv = ["sudo", "-n", *([ionice, "-c", "3"] if (ionice := shutil.which("ionice")) else []),

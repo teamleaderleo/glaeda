@@ -44,6 +44,10 @@ spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+# Never the host's own sudo, nor a stale-scratch family that depends on it: a runner with passwordless sudo turned
+# every census test's unreadable fixture into a measured row. StaleTmpScratchTest and CensusSudoTest set both.
+gd._SUDO_READS = False
+gd._STALE_TMP_ENABLED = False
 
 
 # The ages before Leo's 1 h default (2026-11-18). Tests of rules other than the window's length (a git veto, a lease,
@@ -10077,7 +10081,7 @@ class LinuxLayoutTest(unittest.TestCase):
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
         self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build",
-                                       *gd.LANE_TMP_FAMILY_IDS})
+                                       gd.STALE_TMP_SCRATCH, *gd.LANE_TMP_FAMILY_IDS})
         self.assertEqual(next(f for f in fams if f.id == "tmp").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "user-cache").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "home-caches").platform, "linux")
