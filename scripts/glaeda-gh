@@ -14981,14 +14981,25 @@ def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[
             f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
 
 
+def check_land_pin_shape(pin: str | None) -> None:
+    """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
+    request this host can answer from its cache (land_draft_refusal) is answered after this and before
+    check_land_pin, so such an answer spends no git call either -- what that test asserts by banning every
+    subprocess."""
+    if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
+        raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+
+
 def check_land_pin(repo: str, number: int, pin: str | None,
                    git: Callable[[list[str]], str | None] | None = None) -> None:
     """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): its shape, and the one wrong source
     that is free to detect (land_pin_is_another_checkouts_head). No head read, so a land is queued whatever the quota;
     a head other than SHA stops it later (head_moved) and the pinned merge refuses it, so a land never takes a push
-    that came after the one the caller judged."""
-    if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
-        raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+    that came after the one the caller judged.
+
+    Two local git calls, so a caller that may still refuse from its cache runs check_land_pin_shape first and this
+    only for a request it is about to queue."""
+    check_land_pin_shape(pin)
     why = land_pin_is_another_checkouts_head(repo, pin, git) if pin else ""
     if why:
         raise WatchError(f"{why}\nnext: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
@@ -15034,7 +15045,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
-    check_land_pin(repo, number, pin)
+    check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
@@ -15049,6 +15060,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         else:
             say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
         return EXIT_FAIL
+    # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
+    # not to one this host already answered from its cache.
+    check_land_pin(repo, number, pin)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
