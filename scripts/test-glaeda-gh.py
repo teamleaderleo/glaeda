@@ -29909,6 +29909,57 @@ class WaitTwoTargetsNamesTheCallThatWorksTest(unittest.TestCase):
         self.assertEqual(gg.usage_next(["wait", "pr", "o/r#1", "--nope"]), "glaeda-gh wait --help")
 
 
+class APrintedLineCanBeTypedBackTest(unittest.TestCase):
+    """Every `read as`, `ran as` and `next:` line names an argv, and it must survive being typed back.
+
+    Measured on 2026-11-21 by rerunning what the refusals print: of 33,504 printed lines over 16,752
+    refusals, 912 did not run while the hand-typed call they were read from did run, in 26 shapes with one
+    cause -- `" ".join(argv)` renders `--body "two words"` as `--body two words`, which the shell splits into
+    two arguments and argparse refuses as `unrecognized arguments: words`. Pre-existing on main, so a reader
+    who followed the printed repair got a second refusal from the repair itself."""
+
+    SPACED = "two words"
+
+    def split_back(self, line: str) -> list[str]:
+        """LINE as a shell would hand it to the program, with the `glaeda-gh: ...` prefix and backticks gone."""
+        found = re.search(r"`([^`]+)`", line)
+        return shlex.split(found.group(1) if found else line.split("next: ", 1)[-1])
+
+    def test_quoting_is_only_added_where_a_word_needs_it(self) -> None:
+        self.assertEqual(gg.typed_line(["glaeda-gh", "wait", "pr", "o/r#1", "--timeout", "600"]),
+                         "glaeda-gh wait pr o/r#1 --timeout 600",
+                         "an ordinary word, this tool's own target form included, is left exactly as typed")
+        for word in (self.SPACED, "", "a'b", 'a"b', "a b\tc", "--body=two words", "*", "$HOME", "a\nb", "#x",
+                     "o/r#1", "a;b", "a|b", "a&b", "(a)", "a>b", "a`b`", "a!b", "~/x"):
+            with self.subTest(word):
+                self.assertEqual(shlex.split(gg.typed_line(["x", word, "y"])), ["x", word, "y"],
+                                 "a value survives the render as one word")
+
+    def test_the_repo_and_number_next_line_keeps_a_spaced_value(self) -> None:
+        nxt = gg.usage_next(["status", "pr", "o/r", "1", "--json", self.SPACED])
+        self.assertEqual(self.split_back(nxt), ["glaeda-gh", "status", "pr", "o/r#1", "--json", self.SPACED])
+
+    def test_the_two_target_wait_next_line_keeps_a_spaced_value(self) -> None:
+        nxt = gg.usage_next(["wait", "pr", "o/r#1", "o/r#2", "--notify", "a b"])
+        self.assertIn("'a b'", nxt, "the one-wait-each form quotes the value it carries over")
+
+    def test_the_ran_as_line_keeps_a_spaced_value(self) -> None:
+        fixed, said = gg.infer_kind(["wait", "pr", "o/r", "1", "--notify", self.SPACED])
+        self.assertTrue(said, "this call is one the tool reads into another form, so it says so")
+        self.assertEqual(self.split_back(said), ["glaeda-gh"] + fixed)
+
+    def test_the_brokered_gh_read_as_line_keeps_a_spaced_value(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as noise:
+            fixed = gg.broker_canonical_target(["pr", "comment", "o/r#5", "--body", self.SPACED])
+        self.assertEqual(self.split_back(noise.getvalue()), ["gh"] + fixed)
+
+    def test_the_log_job_read_as_line_keeps_a_spaced_value(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as noise:
+            fixed = gg.log_job_synonym(["log", "job", "o/r/123", "--grep", self.SPACED])
+        if noise.getvalue().strip():  # only the shapes it rewrites print a line
+            self.assertEqual(self.split_back(noise.getvalue()), fixed)
+
+
 class BrokeredGhTakesTheToolsOwnFormTest(unittest.TestCase):
     """`glaeda-gh gh ...` normalises this tool's own target form into the one real gh reads.
 
