@@ -44,6 +44,13 @@
     glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
                                                         deciding whether to hand its calls over
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
+    glaeda-gh search [issues|prs] QUERY [--repo OWNER/REPO]... [--state S] [--author LOGIN] [--limit N] [--json]
+                                                        find pull requests and issues over GraphQL search, kept
+                                                        for every session: `status pr`'s fields (number, title,
+                                                        url, state, head, headRefOid, merged, checks.state), and
+                                                        each row's OWNER/REPO#N to hand to status, wait or land.
+                                                        Instead of `gh search` / `gh api search/...`, which spend
+                                                        the shared REST quota (and its 30-a-minute search limit)
     glaeda-gh runners OWNER[/REPO] [--label L] [--json] busy and idle self-hosted runners, from one shared read
                                                         (instead of a jobs read per run: see GH_SWEEP_MAX)
     glaeda-gh on-event [--json]                         the commands the daemon runs once per finished run or job
@@ -11389,6 +11396,12 @@ class LandQueue:
         if self.refuse():
             return
         if self.queue_quota_parked():
+            # Nothing is judged, read or watched until the named reset, but a PR the cache shows ended still leaves
+            # the queue, and the pool line still says where the queue is (land-pool "queueParked").
+            self.retire_ended()
+            self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
+            self.pass_latched = self.pass_staggered = self.pass_capped = 0
+            self.log_pool()
             return
         latch = self.latch_held()
         ended = land_latch_spread(self.now) if latch is None else None
@@ -11437,6 +11450,9 @@ class LandQueue:
                 if self.queue_quota_parked():
                     break  # a worker parked the host while this pass was submitting judgments
                 e = self.entries[key]
+                with self.lock:
+                    if self.retire_from_cache(e):
+                        continue  # ended: no hold, park or worker needed to say so
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
                     with self.lock:
@@ -11721,6 +11737,30 @@ class LandQueue:
         self.save(e)
         return False
 
+    def retire_from_cache(self, e: dict) -> bool:
+        """Under the lock. End E when the daemon's copy of its PR reads MERGED (a merge never reverts: any copy), or
+        CLOSED in a copy read since E was queued (an older one may predate a reopen). A cache file read, no GitHub
+        call, so every look at an entry takes it -- a parked queue, a held latch, a parked entry or a full pool too.
+        gcp lane, 2026-11-21: hq#16308 merged and stayed listed for hours behind a host-wide quota park."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "")
+        if state == "CLOSED":
+            at = c.get("dataAt")
+            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
+                return False
+        return self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
+                          "the cache shows it")
+
+    def retire_ended(self) -> None:
+        """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
+        for key in [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]:
+            try:
+                with self.lock:
+                    self.retire_from_cache(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
     def queue_quota_parked(self) -> bool:
         """Whether a quota refusal has paused this host's whole land queue until its reset."""
         with self.lock:
@@ -11760,7 +11800,12 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        self.park_queue_quota(said if said is not None else wake, text)
+        if said is not None:
+            # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
+            # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
+            # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
+            # until 08:44Z though the limit it hit ended about 07:52Z -- 40 lands "every worker busy" for an hour.
+            self.park_queue_quota(said, text)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
@@ -12095,6 +12140,8 @@ class LandQueue:
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
              "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
+             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_trim(self.queue_quota_reason, 160)}
+             if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
@@ -12266,6 +12313,8 @@ class LandQueue:
     def consider(self, e: dict) -> None:
         """Whether this entry is judged now: only when something could have changed land_judge's answer."""
         c = self.cache_of(e["key"])
+        if self.retire_from_cache(e):
+            return  # before refresh_due: an ended PR never waits for a free worker to leave the queue
         if self.refresh_due(e, c):
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
@@ -13784,8 +13833,19 @@ def land_latch_held(e: dict) -> bool:
 LAND_LATCH_READ = object()  # land_line's default: read the login's latch now (land_latch)
 
 
-def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
-    """E's status line. LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
+def land_queue_parked(now: float) -> dict | None:
+    """The host-wide quota park (LandQueue.park_queue_quota: land/quota.json) while it holds, else None."""
+    doc = read_json(land_dir() / LAND_QUOTA_FILE)
+    until = (doc or {}).get("until") if isinstance(doc, dict) else None
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or until <= now:
+        return None
+    return {"until": float(until), "reason": str(doc.get("reason") or "")}
+
+
+def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | None = None) -> str:
+    """E's status line. QUEUE is the host-wide quota park (land_queue_parked) when one holds: a due entry names it,
+    never a stale "every worker busy" (gcp lane, 2026-11-21: 40 lines said every worker busy while the park, which
+    status never named, held the queue for an hour). LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
     latch held (latchHeld) says so only while a mark holds, and names the mark's until as read now, never the one it
     stored. gcp-agent-lane-1 2026-11-19 11:18Z: with no mark on disk, 12 entries printed "held by the login latch until
     11:43Z", each its own stored until."""
@@ -13816,6 +13876,8 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
             and float(e["windowCapped"].get("next") or 0) > now:
         bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
                     f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
+    elif queue and e["state"] in ("queued", "waiting") and not (w.get("kind") == "quota" and e["state"] == "waiting"):
+        bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
@@ -13849,7 +13911,7 @@ def land_status_doc(target: str | None) -> dict:
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
-            else None, "stale": stale if land_stale_fresh(stale, time.time()) else None,
+            else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries)}
 
 
@@ -13945,8 +14007,15 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if latch:
         print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
               f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
+    queue = doc.get("queueParked") if isinstance(doc.get("queueParked"), dict) else None
+    if queue and float(queue.get("until") or 0) <= now:
+        queue = None
+    if queue:
+        print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
+              f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
+              f"{land_trim(queue.get('reason'), 200)}")
     for e in entries:
-        print(land_line(e, now, latch))
+        print(land_line(e, now, latch, queue))
         if target:
             for h in e.get("history") or []:
                 extra = " ".join(f"{k}={v}" for k, v in h.items() if k not in ("at", "event"))
@@ -14053,9 +14122,41 @@ def land_queued_by() -> str:
     return reader if "/" in reader else f"{policy_host()}/{reader}"
 
 
-def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool, sha: str = "") -> int:
+def pr_head_sha(repo: str, number: int) -> str | None:
+    """The PR's head commit now (`gh api repos/R/pulls/N --jq .head.sha`, which the host's shim answers from the
+    daemon's cache), or None when it cannot be read."""
+    try:
+        done = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = done.stdout.strip()
+    return sha if done.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def check_land_pin(repo: str, number: int, pin: str | None) -> None:
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): refuse when the PR's head is not SHA
+    (a full or abbreviated one), so a land never takes a push that came after the one the caller judged."""
+    if not pin:
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
+        raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+    head = pr_head_sha(repo, number)
+    if head is None:
+        raise WatchError(f"cannot read {repo}#{number}'s head to check --match-head-commit {pin[:12]}; "
+                         f"next: glaeda-gh status pr {repo}#{number}")
+    if not head.startswith(pin.lower()):
+        raise WatchError(f"{repo}#{number}'s head moved: it is {head[:12]}, not {pin[:12]}; "
+                         f"next: glaeda-gh land {repo}#{number} --match-head-commit {head}")
+
+
+def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
+             pin: str | None = None) -> int:
+    """PIN (--sha or --match-head-commit) is checked against the head now and kept with the request, so the executor
+    stops (head_moved) if a later push moves the head before it merges."""
     key, repo, number = land_key(target)
-    sha = land_pin_sha(sha)
+    check_land_pin(repo, number, pin)
+    sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
@@ -16526,11 +16627,15 @@ def seconds(text: str) -> float:
     `type=float` took `inf` and `nan`. `inf` blocks forever, which is a process nobody is waiting
     for on purpose; `nan` is worse -- every comparison against it is false, so the loop never
     reaches its deadline and never exits (measured: killed from outside after 3 s). A formatter
-    printing "unknown" for those was treating the symptom one layer too late."""
+    printing "unknown" for those was treating the symptom one layer too late.
+
+    A duration with a unit (90s, 20m, 1h, 1d) is the same count: `wait until` already reads 45m,
+    and `--timeout 20m` refused as "not a number of seconds" was a wasted call that came back."""
+    unit = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*", text)
     try:
-        value = float(text)
+        value = float(unit.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit.group(2)] if unit else float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds or a duration (90s, 20m, 1h)") from None
     if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError(
             f"{text!r} is not a number of seconds this can wait for: a finite count, not negative")
@@ -21726,6 +21831,161 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- search (issues and pull requests)
+
+# An agent who needs to find a PR or issue had no subcommand here, so it reached for `gh search issues|prs` or
+# `gh api search/...`: 30 such calls from 20 session transcripts on this host in the week to 2026-11-21. Those
+# spend the shared REST quota this daemon exists to protect, and REST search carries its own 30-a-minute limit,
+# so one sweep of a few repositories blinds every PR wait on the host for a minute -- the fleet has run the
+# quota to zero this way. `search` asks GraphQL's search connection instead, through this broker (read_runners'
+# route), so a call costs 1 GraphQL point and no REST at all, and an identical search from the next session
+# within GLAEDA_GH_CACHE_TTL is served from the kept answer with no request at all. gh_cache_graphql_scope
+# already reads a `repo:o/r` search's scope, so a kept answer is made old by a write to that repository.
+SEARCH_LIMIT_MAX = 100  # GraphQL's `first:` ceiling; more would need paging, which no caller has asked for
+SEARCH_KINDS = {"issues": "is:issue", "prs": "is:pr", "both": ""}
+# What an agent types for each kind, `gh search` words included; `both` is a bare query with no kind word.
+SEARCH_KIND_WORDS = {"issues": "issues", "issue": "issues", "prs": "prs", "pr": "prs", "pulls": "prs",
+                     "pull-requests": "prs", "both": "both"}
+SEARCH_STATES = {"open": "state:open", "closed": "state:closed", "merged": "is:merged", "all": ""}
+SEARCH_SERVED = "glaeda-gh search issues|prs QUERY [--repo OWNER/REPO]"
+# `gh search code|commits|repos` have no GraphQL search type these fields come from: each names the form that works.
+SEARCH_UNSERVED = {
+    "code": f"code search is not served here (no cached route): grep a checkout instead "
+            f"(wt new REPO BRANCH --files), or for a pull request or issue `{SEARCH_SERVED}`",
+    "commits": f"commit search is not served here (no cached route): `git log` in a checkout, or for the pull "
+               f"request that carried it `{SEARCH_SERVED}`",
+    "repos": f"repository search is not served here (no cached route): for a pull request or issue `{SEARCH_SERVED}`"}
+SEARCH_QUALIFIER_RE = {
+    "kind": re.compile(r"(?:^|\s)(?:is:(?:pr|issue)|type:\S+)(?=\s|$)"),
+    "state": re.compile(r"(?:^|\s)(?:state:\S+|is:(?:open|closed|merged|unmerged))(?=\s|$)"),
+    "repo": re.compile(r"(?:^|\s)repo:\S+(?=\s|$)"),
+    "author": re.compile(r"(?:^|\s)author:\S+(?=\s|$)")}
+# The fields `status pr` prints, from the one search node: `head` is the head commit there too (status_view), so
+# `--field head,state,checks.state` reads the same values off a search row as off a status.
+SEARCH_NODE_FIELDS = (
+    "__typename "
+    "... on Issue { number title url state createdAt updatedAt author { login } repository { nameWithOwner } } "
+    "... on PullRequest { number title url state isDraft merged createdAt updatedAt author { login } "
+    "repository { nameWithOwner } headRefName headRefOid baseRefName "
+    "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }")
+SEARCH_GQL = ("query($q: String!, $n: Int!) { rateLimit { cost remaining } "
+              "search(type: ISSUE, query: $q, first: $n) { issueCount nodes { " + SEARCH_NODE_FIELDS + " } } }")
+
+
+def search_terms(kind: str, words: list[str], repos: list[str], state: str, author: str | None) -> str:
+    """The one GitHub search string a call sends: the words as typed, then a qualifier for each flag given. A
+    qualifier already in the words wins and the flag's is left out, so `search prs 'repo:o/r is:merged'` sends
+    exactly that; naming repositories both ways at once is refused rather than ANDed into no results."""
+    typed = " ".join(words).strip()
+    if repos and SEARCH_QUALIFIER_RE["repo"].search(typed):
+        raise WatchError("name the repositories one way, not both: --repo OWNER/REPO (repeatable) or repo:OWNER/REPO "
+                         f"in the query -- `{SEARCH_SERVED}`")
+    parts = [typed] if typed else []
+    for what, value in (("kind", SEARCH_KINDS[kind]), ("state", SEARCH_STATES[state]),
+                        ("repo", " ".join(f"repo:{r}" for r in repos)),
+                        ("author", f"author:{author}" if author else "")):
+        if value and not SEARCH_QUALIFIER_RE[what].search(typed):
+            parts.append(value)
+    terms = " ".join(p for p in parts if p).strip()
+    if not terms:
+        raise WatchError("search takes a query, --repo, --author or --state to look for: "
+                         f"`{SEARCH_SERVED}`")
+    return terms
+
+
+def search_read(terms: str, limit: int) -> dict:
+    """One GraphQL search, piped through this broker, so its answer is kept for every session on the host and
+    nothing touches REST (read_runners' route: the cache shares the read whether or not the shim is on PATH)."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
+            "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
+    try:
+        done = run_bounded(argv, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WatchError(f"gh api graphql (search): {describe(error)}") from None
+    if done.returncode != 0:
+        raise WatchError(f"gh api graphql (search): {(done.stderr or '').strip()[:300]}")
+    try:
+        doc = json.loads(done.stdout or "{}")
+    except ValueError as error:
+        raise WatchError(f"gh api graphql (search): unreadable answer: {error}") from None
+    found = ((doc.get("data") or {}).get("search")) if isinstance(doc, dict) else None
+    if not isinstance(found, dict) or not isinstance(found.get("nodes"), list):
+        said = (doc.get("errors") if isinstance(doc, dict) else None) or doc
+        raise WatchError(f"search was not answered: {json.dumps(said, sort_keys=True)[:300]}")
+    return found
+
+
+def search_row(node: dict) -> dict:
+    """One search node as this tool's row: the `status pr` names (head, headRefOid, state, checks.state, merged,
+    url, title, number) plus where it lives, so a row is a `status`, `wait` or `land` target as printed."""
+    repo = (node.get("repository") or {}).get("nameWithOwner")
+    number = node.get("number")
+    pr = node.get("__typename") == "PullRequest"
+    row: dict[str, Any] = {
+        "kind": "pr" if pr else "issue", "repo": repo, "number": number,
+        "target": f"{repo}#{number}" if repo and isinstance(number, int) else None,
+        "title": node.get("title"), "url": node.get("url"),
+        "state": (node.get("state") or "").lower() or None,
+        "author": (node.get("author") or {}).get("login"),
+        "createdAt": node.get("createdAt"), "updatedAt": node.get("updatedAt")}
+    if not pr:
+        return row
+    commit = ((node.get("commits") or {}).get("nodes") or [{}])[0] or {}
+    rollup = ((commit.get("commit") or {}).get("statusCheckRollup") or {}).get("state")
+    check_state = (rollup or "").lower() or None
+    row.update(head=node.get("headRefOid"), headRefOid=node.get("headRefOid"), headRef=node.get("headRefName"),
+               baseRef=node.get("baseRefName"), merged=bool(node.get("merged")), draft=bool(node.get("isDraft")),
+               checkState=check_state, checks={"state": check_state})
+    return row
+
+
+def search_line(row: dict) -> str:
+    """`OWNER/REPO#N state [checks] title (author, 2h ago)`: the target first, to paste into status, wait or land."""
+    marks = [row.get("state") or "?"]
+    if row.get("draft"):
+        marks.append("draft")
+    if row.get("checkState"):
+        marks.append(f"checks {row['checkState']}")
+    when = iso_epoch(row.get("updatedAt"))
+    who = ", ".join(x for x in (row.get("author"), age(when) if when else "") if x)
+    title = land_trim(row.get("title") or "", 100)
+    return f"{row.get('target') or '?'} {' '.join(marks)}  {title}" + (f"  ({who})" if who else "")
+
+
+def cmd_search(kind: str, words: list[str], repos: list[str], state: str, author: str | None, limit: int,
+               as_json: bool, fields: list[str] | None = None) -> int:
+    """Find pull requests and issues by query, over GraphQL search, through this host's one cached route.
+
+    The fields are `status pr`'s, so a row's `target` is what `status`, `wait` and `land` take next, and
+    `--field head,state,checks.state` reads the same names here as there."""
+    if not 1 <= limit <= SEARCH_LIMIT_MAX:
+        raise WatchError(f"--limit must be 1 to {SEARCH_LIMIT_MAX} (GraphQL search's page): "
+                         f"`{SEARCH_SERVED} --limit {SEARCH_LIMIT_MAX}`")
+    bad = [r for r in repos if not re.fullmatch(rf"{NAME}/{NAME}", r)]
+    if bad:
+        raise WatchError(f"--repo takes OWNER/REPO, not {bad[0]!r}: `{SEARCH_SERVED}`")
+    terms = search_terms(kind, words, repos, state, author)
+    found = search_read(terms, limit)
+    rows = [search_row(n) for n in found["nodes"] if isinstance(n, dict)]
+    if kind != "both":
+        rows = [r for r in rows if r["kind"] == ("pr" if kind == "prs" else "issue")]
+    total = found.get("issueCount")
+    if fields:
+        for row in rows:
+            print("\t".join(field_text(field_value(row, f)) for f in fields))
+        return EXIT_OK
+    if as_json:
+        print(json.dumps({"query": terms, "total": total, "shown": len(rows), "rows": rows}, sort_keys=True))
+        return EXIT_OK
+    more = f", {len(rows)} shown (--limit {limit})" if isinstance(total, int) and total > len(rows) else ""
+    print(f"{terms}: {total if isinstance(total, int) else len(rows)} found{more}")
+    for row in rows:
+        print(f"  {search_line(row)}")
+    if not rows:
+        print("  nothing matched (qualifiers are ANDed: drop one, or --state all)")
+    return EXIT_OK
+
+
 # A merge reaches GitHub only through the host's gh-quota guard (leo-workspace tools/gh-quota-shim, PACE_CLI; the
 # GLAEDA_MERGE_GUARD path overrides): land_judge's holds, BLOCKs, review and pin checks, the merge line, the landing
 # record and the transient-error retry all live there. broker_real_gh steps over every "gh guard" file, so a call
@@ -23621,6 +23881,26 @@ def cmd_on_event_replay(run_file: Path, jobs_file: Path | None, wait: float, as_
     return EXIT_OK
 
 
+REPO_ONLY_RE = re.compile(rf"({NAME})/({NAME})")
+
+
+def join_repo_and_number(raw: list[str]) -> list[str] | None:
+    """`wait run OWNER/REPO RUN_ID`, `wait pr OWNER/REPO N` (also status, and `land OWNER/REPO N`): the repository and
+    the number as two words, joined into the one target the command takes (coordinator, 2026-11-21: `glaeda-gh wait run
+    manaflow-ai/cmuxterm-hq 44884634507` failed "unrecognized arguments"). None when the words are not that shape."""
+    cmd, rest = raw[0], raw[1:]
+    kind = ""
+    if cmd != "land":
+        if len(rest) < 3 or rest[0] not in ("pr", "run"):
+            return None
+        kind, rest = rest[0], rest[1:]
+    if len(rest) < 2 or not REPO_ONLY_RE.fullmatch(rest[0]) or not re.fullmatch(r"#?\d+", rest[1]):
+        return None
+    number = rest[1].lstrip("#")
+    target = f"{rest[0]}/{number}" if kind == "run" else f"{rest[0]}#{number}"
+    return [cmd] + ([kind] if kind else []) + [target] + rest[2:]
+
+
 def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     """`wait|status|land` called without the kind run as the call meant (fewer-tool-calls).
 
@@ -23638,6 +23918,9 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
             raw = raw[:slot] + [f"{raw[slot]}#{raw[slot + 1].lstrip('#')}"] + raw[slot + 2:]
             joined = True
     cmd, first = raw[0], raw[1]
+    joined = join_repo_and_number(raw)
+    if joined:
+        return joined, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + joined)}`"
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
@@ -23803,6 +24086,24 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.add_argument("--by", choices=("caller",), default=None,
                    help="group the calls by caller (session:NAME or tool:NAME, as the gh-quota shim names them)")
+    sr = sub.add_parser("search", help="find pull requests and issues by query, over GraphQL search through this "
+                                       "host's one cached route (instead of gh search, which spends REST quota)")
+    sr.add_argument("kind", choices=tuple(SEARCH_KINDS), help="issues, prs, or both (a bare query); the word "
+                                                              "`issue`, `pr` or `pulls` is read as its kind")
+    sr.add_argument("words", nargs="*", metavar="QUERY",
+                    help="GitHub search terms as you would type them to `gh search`, qualifiers included "
+                         "(repo:OWNER/REPO, label:x, is:merged); a qualifier here wins over the flag for it")
+    sr.add_argument("--repo", action="append", default=[], metavar="OWNER/REPO",
+                    help="only this repository (repeatable: any of them)")
+    sr.add_argument("--state", choices=tuple(SEARCH_STATES), default="all",
+                    help="open, closed, merged (pull requests) or all (default all)")
+    sr.add_argument("--author", metavar="LOGIN", help="only this author")
+    sr.add_argument("--limit", type=int, default=20, metavar="N",
+                    help=f"rows at most (default 20, at most {SEARCH_LIMIT_MAX}: GraphQL search's page)")
+    sr.add_argument("--field", metavar="F,G",
+                    help="print just these values of each row, tab-separated, one line per row (the `status pr` "
+                         "names: target,head,state,checks.state,merged,url,title,number)")
+    sr.add_argument("--json", action="store_true")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
@@ -23827,11 +24128,13 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
                          "host/$ACPMUX_SESSION_NAME)")
+    ld.add_argument("--sha", "--match-head-commit", dest="sha", metavar="SHA",
+                    help="land only this head (7 to 40 hex): refused now if the PR's head is another, and the land "
+                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) is "
+                         "the same")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
                     help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
                          "--timeout is the same")
-    ld.add_argument("--sha", metavar="SHA",
-                    help="land only this head (7 to 40 hex): the land stops (head_moved) if the PR's head is another")
     ld.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
@@ -23871,6 +24174,41 @@ def log_job_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+def search_synonym(raw: list[str]) -> list[str]:
+    """The shapes an agent types for `search`, as the canonical form:
+
+    - a bare query (`search "cmux next"`) is `search both "cmux next"`: no kind word is both kinds;
+    - `gh search`'s own words (`issue`, `pr`, `pulls`, `pull-requests`) are their kind;
+    - `gh search`'s `--json FIELD,FIELD` is this tool's `--field FIELD,FIELD` (here `--json` is the whole object).
+
+    Said on stderr, as the other synonyms are, so the next call is typed the canonical way. A form with no
+    canonical shape here (`search code|commits|repos`) is refused by name in main, not rewritten."""
+    if not raw or raw[0] != "search" or "-h" in raw or "--help" in raw:
+        return raw  # help prints the canonical form itself; no line about the words asking for it
+    fixed, said = list(raw), []
+    for i, word in enumerate(fixed):
+        if word != "--json" or i + 1 >= len(fixed) or fixed[i + 1].startswith("-"):
+            continue
+        if re.fullmatch(r"[\w.]+(?:,[\w.]+)*", fixed[i + 1]):
+            fixed[i:i + 2] = ["--field", fixed[i + 1]]
+            said.append("--json FIELDS is --field FIELDS (--json alone is the whole object)")
+        break
+    word = fixed[1] if len(fixed) > 1 else ""
+    kind = SEARCH_KIND_WORDS.get(word.lower())
+    if kind and kind != word:
+        fixed[1] = kind
+        said.append(f"`{word}` is the kind `{kind}`")
+    elif not kind and word not in SEARCH_UNSERVED and not word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a query with no kind word searches both issues and pull requests")
+    elif not kind and word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a search with no kind word searches both issues and pull requests")
+    if said:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed
+
+
 def land_notify_synonym(raw: list[str]) -> list[str]:
     """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
     `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
@@ -23894,7 +24232,12 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    raw = land_notify_synonym(log_job_synonym(raw))
+    if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
+        # A form this subcommand cannot serve names the one that works, rather than reaching gh's REST search.
+        print(f"glaeda-gh: {SEARCH_UNSERVED[raw[1].lower()]}", file=sys.stderr)
+        print("next: glaeda-gh search --help", file=sys.stderr)
+        return 64
+    raw = land_notify_synonym(log_job_synonym(search_synonym(raw)))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
@@ -23951,6 +24294,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.kind == "flaky":
                 return cmd_log_flaky(args.repo, args.test, args.since, args.job, args.reads, args.limit, args.json)
             return cmd_log_job(args.repo, args.job)
+        if args.command == "search":
+            return cmd_search(args.kind, args.words, args.repo, args.state, args.author, args.limit, args.json,
+                              fields=parse_fields(args.field))
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":
@@ -23971,7 +24317,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha or "")
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:
