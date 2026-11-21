@@ -24524,9 +24524,10 @@ class Parser(argparse.ArgumentParser):
     argv: list[str] = []  # main() sets the raw arguments, for `next:` and --json
 
     def error(self, message: str) -> None:  # type: ignore[override]
-        nxt = usage_next(Parser.argv, self.prog)
+        hint, one_target = wait_extra_targets(message)
+        nxt = one_target or usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        spellings = kind_spellings(message)
+        spellings = kind_spellings(message) or hint
         say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
@@ -24535,6 +24536,32 @@ class Parser(argparse.ArgumentParser):
 
 
 KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
+EXTRA_ARGS = re.compile(r"unrecognized arguments: (.+)$")
+TARGET_WORD = re.compile(r"[/#]")  # every repository target carries OWNER/REPO or #N
+
+
+def wait_extra_targets(message: str) -> tuple[str, str]:
+    """What a `wait` given more than one target is told, and the single-target form to run: (hint, next).
+
+    `status` reads several targets in one gather and `wait` waits for one, and argparse's own line for the
+    second target ("unrecognized arguments: o/r#2326") names neither fact, so a lane that wrote
+    `wait pr A B` read a usage error with no form in it -- and a *background* wait that exits 64 at once
+    looks like a wait that waited for nothing (glaeda#2323). ("", "") when this is some other usage error."""
+    found = EXTRA_ARGS.search(message)
+    if not found or Parser.argv[:1] != ["wait"]:
+        return "", ""
+    extra = [w for w in found.group(1).replace(",", " ").split() if TARGET_WORD.search(w)]
+    if not extra or len(extra) != len(found.group(1).replace(",", " ").split()):
+        return "", ""  # an unrecognized flag, or a word that is no target: the usual usage error
+    kind = Parser.argv[1] if len(Parser.argv) > 1 and not Parser.argv[1].startswith("-") else "KIND"
+    kept = [w for w in Parser.argv if w not in extra]  # the call the lane meant, minus the targets past the first
+    form = ["glaeda-gh"] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
+    first = Parser.argv[2] if len(Parser.argv) > 2 and TARGET_WORD.search(Parser.argv[2]) else ""
+    both = ([first] if first else []) + extra
+    hint = (f"`wait` waits for one target, so {', '.join(extra)} "
+            f"{'is' if len(extra) == 1 else 'are'} beyond it: wait for one target per call, or read them all "
+            f"in one gather with `glaeda-gh status {kind} {' '.join(both)}`")
+    return hint, " ".join(form)
 
 
 def kind_spellings(message: str) -> str:

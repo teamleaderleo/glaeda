@@ -5008,6 +5008,32 @@ class ClientTest(Base):
         self.assertEqual(req.call_args.kwargs["sha"], "b" * 40)
         self.assertFalse([c for c in run.call_args_list if c.args and c.args[0][:1] == ["gh"]])
 
+    def test_wait_with_two_targets_names_the_single_target_form(self) -> None:
+        """Lane, 2026-11-21 (glaeda#2323): `status pr` takes several targets and `wait pr` takes one, and the
+        refusal was argparse's bare "unrecognized arguments", so a *background* wait exited 64 at once and
+        read as a wait that waited for nothing. The refusal now names the one-target form and `status`."""
+        out = io.StringIO()
+        said: list[str] = []
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting", said.append), \
+                self.assertRaises(SystemExit) as exit_:
+            gg.main(["wait", "pr", "o/r#1", "o/r#2", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        whole = "\n".join(said)
+        self.assertIn("`wait` waits for one target", whole)
+        self.assertIn("glaeda-gh status pr o/r#1 o/r#2", whole)  # several targets: the command that takes them
+        self.assertIn("next: glaeda-gh wait pr o/r#1 --json --timeout 1800", whole)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#1 --json --timeout 1800")
+        gg.Parser.argv = ["wait", "run", "o/r/11", "o/r/12", "o/r/13"]
+        hint, form = gg.wait_extra_targets("unrecognized arguments: o/r/12 o/r/13")
+        self.assertIn("o/r/12, o/r/13 are beyond it", hint)
+        self.assertEqual(form, "glaeda-gh wait run o/r/11 --timeout 1800")
+        for other in ("unrecognized arguments: --nope", "argument --timeout: expected one argument"):
+            self.assertEqual(gg.wait_extra_targets(other), ("", ""))  # the usual usage error, unchanged
+        gg.Parser.argv = ["status", "pr", "o/r#1", "o/r#2"]
+        self.assertEqual(gg.wait_extra_targets("unrecognized arguments: o/r#2"), ("", ""))  # status takes several
+
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
