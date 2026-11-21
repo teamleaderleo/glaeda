@@ -3297,11 +3297,23 @@ FEED_JUMP_S = 20 * 60.0
 STACK_BLOCKER_LABEL = "stack-blocker"
 STACK_BLOCKER_REPO = "manaflow-ai/cmux"
 STACK_BLOCKER_EVENTS = ("pull_request", "pull_request_target")
+# FFI_REPIN_FIRST: cmux's bot re-pin PR (head app-ffi-repin, base feat-cmux-next, a diff of only
+# Packages/macOS/CmuxNext/app-ffi-pin.json and Package.swift) takes the stack-blocker place without the label. A merged
+# app FFI change reaches the app only when that PR lands (Leo, 2026-11-08: "a merged change to the app's Rust FFI is in
+# the pinned CCmuxAppFFI release within 2 h"), and on 2026-11-20 cmux#48065's fast tier queued 96+ min on
+# glaeda-side-std-xcode-26.6 behind ordinary PR jobs with 9/9 runners busy; the last five re-pins took a median 139 min
+# from open to merge. cmux's placement sends such a PR's Mac jobs to the nightly slot (STACK_SLOT) only when its file
+# list is exactly the pin files; the payload carries no file names, so here the bound is the branch, the base, the same
+# repository and a changed_files count of 1 or 2: a PR on that branch with more files is an ordinary PR job. Like the
+# label, it only takes a place in line and trusts nothing a side runner does not.
+FFI_REPIN_HEAD = "app-ffi-repin"
+FFI_REPIN_BASE = "feat-cmux-next"
+FFI_REPIN_MAX_FILES = 2
 
 
 def stack_blocker_tier(event_name: str | None, repository: str | None, event: Any) -> str:
-    """TIER_STACK for a job of a same-repository manaflow-ai/cmux pull request labelled STACK_BLOCKER_LABEL, else "".
-    Pure. A fork's pull request never qualifies (its jobs never take an owned mini anyway)."""
+    """TIER_STACK for a job of a same-repository manaflow-ai/cmux pull request labelled STACK_BLOCKER_LABEL, or of the
+    app FFI re-pin pull request (FFI_REPIN_FIRST), else "". Pure. A fork's pull request never qualifies (its jobs never take an owned mini anyway)."""
     if event_name not in STACK_BLOCKER_EVENTS or not isinstance(event, dict):
         return ""
     pr = event.get("pull_request")
@@ -3315,7 +3327,13 @@ def stack_blocker_tier(event_name: str | None, repository: str | None, event: An
     # GitHub label names are case-insensitive (`Stack-Blocker` is the same label), so both sides are folded.
     names = {label["name"].casefold() for label in labels
              if isinstance(label, dict) and isinstance(label.get("name"), str)} if isinstance(labels, list) else set()
-    return TIER_STACK if STACK_BLOCKER_LABEL.casefold() in names else ""
+    if STACK_BLOCKER_LABEL.casefold() in names:
+        return TIER_STACK
+    files = pr.get("changed_files")
+    if head.get("ref") == FFI_REPIN_HEAD and base.get("ref") == FFI_REPIN_BASE and type(files) is int \
+            and 1 <= files <= FFI_REPIN_MAX_FILES:
+        return TIER_STACK  # FFI_REPIN_FIRST
+    return ""
 
 
 def gateway_jobs_note() -> str:

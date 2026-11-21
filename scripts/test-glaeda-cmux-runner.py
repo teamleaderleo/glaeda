@@ -5913,6 +5913,43 @@ time.sleep(60)
         self.assertLess(hook.admission_rank(stack, now - 5, 1, now),
                         hook.admission_rank("", now - hook.FEED_JUMP_S - 60, 2, now), "ahead of a PR job past the jump")
 
+    def test_ffi_repin_pull_request_ranks_as_stack_blocker(self) -> None:
+        # 2026-11-20: cmux#48065, the bot's re-pin PR (head app-ffi-repin, only the two pin files), queued its fast tier
+        # 96+ min on glaeda-side-std-xcode-26.6 behind ordinary PR jobs. Its Mac jobs now take the stack-blocker place:
+        # the nightly slot admits them and they wait right after nightly jobs; any other PR on that branch does not.
+        repo = {"full_name": "manaflow-ai/cmux"}
+
+        def event(head_ref: str = hook.FFI_REPIN_HEAD, files: object = 2, base_ref: str = hook.FFI_REPIN_BASE,
+                  head_repo: dict = repo) -> dict:
+            return {"pull_request": {"labels": [], "changed_files": files,
+                                     "head": {"ref": head_ref, "repo": head_repo},
+                                     "base": {"ref": base_ref, "repo": repo}}, "repository": repo}
+
+        tier = hook.stack_blocker_tier
+        repin, ordinary = event(), event(head_ref="feature-x")
+        self.assertEqual(tier("pull_request", "manaflow-ai/cmux", repin), hook.TIER_STACK)
+        self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event(files=1)), hook.TIER_STACK)
+        self.assertIsNone(hook.nightly_slot_refusal(tier("pull_request", "manaflow-ai/cmux", repin)))
+        self.assertIsNotNone(hook.nightly_slot_refusal(tier("pull_request", "manaflow-ai/cmux", ordinary)))
+        for name, ev in (("an ordinary PR", ordinary),
+                         ("a re-pin branch PR touching other files", event(files=3)),
+                         ("no file count", event(files=None)),
+                         ("a file count that is not a number", event(files="2")),
+                         ("a bool file count", event(files=True)),
+                         ("no files", event(files=0)),
+                         ("another base", event(base_ref="main")),
+                         ("a fork's branch of that name", event(head_repo={"full_name": "someone/cmux"}))):
+            with self.subTest(name):
+                self.assertEqual(tier("pull_request", "manaflow-ai/cmux", ev), "")
+        self.assertEqual(tier("push", "manaflow-ai/cmux", repin), "")
+        # queued together on one mini: the re-pin job is taken ahead of ordinary PR jobs that arrived before it
+        now = time.time()
+        rank = hook.admission_rank
+        repin_tier = tier("pull_request", "manaflow-ai/cmux", repin)
+        self.assertLess(rank(repin_tier, now - 5, 1, now), rank("", now - 3600, 2, now))
+        self.assertLess(rank(repin_tier, now - 5, 1, now),
+                        rank(tier("pull_request", "manaflow-ai/cmux", event(files=3)), now - 3600, 2, now))
+
     def test_stack_blocker_tier_reads_the_pull_request_label(self) -> None:
         repo = {"full_name": "manaflow-ai/cmux"}
         fork = {"full_name": "someone/cmux"}
