@@ -4073,7 +4073,7 @@ def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
 
 
 HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage endCursor} nodes{__typename
-... on CheckRun{databaseId name status conclusion startedAt completedAt checkSuite{databaseId app{slug}
+... on CheckRun{id databaseId name status conclusion startedAt completedAt checkSuite{databaseId app{slug}
 workflowRun{databaseId event workflow{name databaseId}}}}
 ... on StatusContext{context state description}}}}"""
 
@@ -4143,13 +4143,14 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
 
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
-                  order: dict | None = None) -> None:
+                  order: dict | None = None, failed: dict | None = None) -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
     (`status / context` -> (status, conclusion, state)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys
     another repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD).
     A status's `error` is folded into the conclusion `failure` (every reader of `found` counts it red), and its own
     state is kept beside it (head_data's statusStates): an `error` is a poster that gave no verdict, which a reader
-    such as a fallback dispatcher must tell apart from a red."""
+    such as a fallback dispatcher must tell apart from a red. `failed` (optional) gets each failure's databaseId ->
+    node id, for the step counts head_steps reads."""
     for item in nodes or []:
         if not item:
             continue
@@ -4172,6 +4173,8 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
                                               run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
+        if failed is not None and conclusion == "failure" and item.get("databaseId") and item.get("id"):
+            failed[item["databaseId"]] = item["id"]  # head_steps reads each one's step count
 
 
 def run_identity(item: dict, suite: dict) -> dict:
@@ -4189,6 +4192,16 @@ def run_identity(item: dict, suite: dict) -> dict:
     if app is None and "app" in suite:
         out["appNull"] = True  # GitHub's documented null app, not an unread one
     return {k: v for k, v in out.items() if v is not None}
+
+
+def attach_steps(data: dict, counts: dict) -> None:
+    """Add `steps` (the job's step count) to the identity of each failed row of data's `runs` that COUNTS (check run
+    databaseId -> count) knows. A failed job with 0 steps never ran: land-judge's runner_refused reads a stored red
+    as it reads a live one. A row without it is unknown, never zero; the key is an addition, older readers skip it."""
+    for rows in (data.get("runs") or {}).values():
+        for row in rows:
+            if len(row) > 5 and isinstance(row[5], dict) and row[2] == "failure" and row[0] in counts:
+                row[5]["steps"] = counts[row[0]]
 
 
 # A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
@@ -4566,6 +4579,7 @@ class Daemon:
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
+        self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
         self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
@@ -9032,10 +9046,11 @@ class Daemon:
         statuses: dict = {}
         ids: dict = {}
         order: dict = {}  # head_data's `runs`
+        failed: dict = {}  # failed check run databaseId -> node id (head_steps)
         for n, (owner, repo, contexts) in enumerate(sources):
             prefix = f"{owner}/{repo}: " if n else ""  # the head's own checks keep their names
             for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
-                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix, order)
+                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix, order, failed)
                 page = contexts.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
@@ -9053,8 +9068,51 @@ class Daemon:
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
         for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
-            fold_contexts(nodes, runs, statuses, ids, prefix, order)
-        return head_data(sha, runs, statuses, ids, order)
+            fold_contexts(nodes, runs, statuses, ids, prefix, order, failed)
+        data = head_data(sha, runs, statuses, ids, order)
+        self.head_steps(data, failed)
+        return data
+
+    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None) -> None:
+        """Store the step count of each failed check run of a head's `data` (attach_steps), so a reader of the store
+        judges a red as a live read does (a failed job that ran no step is the runner's refusal, not a red). A
+        completed job never changes: each is read once (self.job_steps), in GraphQL by node id (STEPS_QUERY) or, with
+        ROOT (`/repos/OWNER/REPO`, a head read over REST), one job at a time within REST_STEPS_MAX. A read that fails
+        or is out of time leaves its rows without `steps` (unknown), and the next read of the head tries again."""
+        if len(self.job_steps) > 20000:
+            self.job_steps.clear()
+        want = [i for i in failed if i not in self.job_steps]
+        if root is None:
+            want = want[:2 * STEPS_BATCH]
+            for n in range(0, len(want), STEPS_BATCH):
+                if self.mode("graphql") == "stop":
+                    break
+                chunk = {failed[i]: i for i in want[n:n + STEPS_BATCH]}
+                reason, self.gql_reason = self.gql_reason, "steps"
+                try:
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)})
+                except OutOfTime:
+                    break
+                finally:
+                    self.gql_reason = reason
+                if doc is None:
+                    self.errors.append(f"head steps: {error}")
+                    break
+                for node in (doc.get("data") or {}).get("nodes") or []:
+                    steps = (node.get("steps") or {}).get("nodes") if isinstance(node, dict) else None
+                    if isinstance(steps, list) and node.get("id") in chunk:  # null is unknown, never "no step ran"
+                        self.job_steps[chunk[node["id"]]] = len(steps)
+        else:
+            for job_id in want[:REST_STEPS_MAX]:
+                if self.mode("rest") == "stop" or not self.rest_room(1):
+                    break
+                try:
+                    state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
+                except OutOfTime:
+                    break
+                if state == "fresh" and isinstance(doc, dict) and isinstance(doc.get("steps"), list):
+                    self.job_steps[job_id] = len(doc["steps"])
+        attach_steps(data, self.job_steps)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -9556,9 +9614,12 @@ class Daemon:
         statuses_by: dict = {}
         ids: dict = {}
         order: dict = {}  # head_data's `runs`
-        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids, order=order)
-        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids, order),
-                   restParts=parts, via="rest")
+        failed: dict = {}
+        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids, order=order,
+                      failed=failed)
+        data = head_data(sha, found, statuses_by, ids, order)
+        self.head_steps(data, failed, f"/repos/{owner}/{repo}")
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=data, restParts=parts, via="rest")
         self.head_answered(e["key"])
 
     def fetch_comment_rest(self, e: dict) -> None:
@@ -10782,6 +10843,7 @@ LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
+LAND_HEAD_CONSUMER = "land-judge"  # the consumer a queued PR's head is registered for (land-judge's checks read)
 LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments it waits on this often
 # Only an entry that is due (queued, past its wake, or waiting on its own push's new head) holds a waited watch on its
 # PR (LandQueue.keep_watching). Every other open entry (a wait on its checks, a retry or a park whose wake is ahead,
@@ -11657,6 +11719,7 @@ class LandQueue:
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
+                 head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
         self.broker_client = broker_client
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
@@ -11674,6 +11737,12 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
+        # checks before land-judge's first judgment asks; a test's WATCH alone records neither.
+        self.head_watch = head_watch or ((lambda key: register(key, consumer=LAND_HEAD_CONSUMER,
+                                                                reader=f"tool:{LAND_TAG}"))
+                                         if watch is None else (lambda key: None))
+        self.head_touched: dict[str, float] = {}
         self.changed_entries: set[str] = set()
         self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
@@ -12878,6 +12947,7 @@ class LandQueue:
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
         waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
+        self.watch_head(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])
@@ -12894,6 +12964,22 @@ class LandQueue:
                 self.peeked[k] = self.now
                 with contextlib.suppress(OSError, WatchError):
                     self.peek(k)
+
+    def watch_head(self, e: dict) -> None:
+        """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
+        its head moves, then every LAND_TOUCH: HEAD_INTEREST outlasts a queued PR's wait, and a head that moved is a
+        new key, registered the same pass. Land-judge's first read of a head then finds the daemon's entry."""
+        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        if not SHA40.fullmatch(head):
+            return
+        key = f"head:{e['repo'].lower()}@{head}"
+        if self.now - self.head_touched.get(key, float("-inf")) < LAND_TOUCH:
+            return
+        self.head_touched[key] = self.now
+        if len(self.head_touched) > 2000:
+            self.head_touched = {k: t for k, t in self.head_touched.items() if self.now - t < LAND_TOUCH}
+        with contextlib.suppress(OSError, WatchError):
+            self.head_watch(key)
 
     def watch_now(self, key: str) -> None:
         self.touched[key] = self.now
@@ -19837,6 +19923,8 @@ def hhmm(epoch: Any) -> str:
 
 
 POOL_NAMES = {"rest": "REST", "graphql": "GraphQL"}
+# Where settle_counters keeps each bucket's live counters; rest_counters(budget, key) reads them.
+COUNTER_KEYS = {"rest": "restCounters", "graphql": "graphqlCounters"}
 
 
 def view_lines(view: dict) -> list[str]:
@@ -20073,9 +20161,17 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
-            counters = [c for c in rest_counters(budget) if c["reset"] > time.time()] if bucket == "rest" else []
+            # Both buckets answer from two counters with their own windows (settle_counters), and GET /rate_limit
+            # reports only one of them, so a reader who cross-checks this line against /rate_limit can see a rich
+            # counter while the one their reads actually spend is at zero -- 2026-11-21: `budget` said GraphQL 0 left
+            # resetting 11:38Z while /rate_limit said 4751 left resetting 12:02Z, and four parked waits were stopped
+            # as "stale" on the strength of it. Both were true. Name every live counter for GraphQL too, so the split
+            # is visible here instead of looking like a disagreement between two tools.
+            counters = [c for c in rest_counters(budget, COUNTER_KEYS[bucket]) if c["reset"] > time.time()]
             if len(counters) > 1:
-                print("         core counters (the poorest is the one above): " + "; ".join(
+                label = "core" if bucket == "rest" else POOL_NAMES[bucket]
+                print(f"         {label} counters (the poorest is the one above, and the one a read is refused "
+                      f"against): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
                     f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
