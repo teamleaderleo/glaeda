@@ -120,7 +120,12 @@ What `--apply` does:
      Under the lock no other fleet job runs, so the default holds for the whole job.
      `RUSTUP_TOOLCHAIN` is deliberately not used: it would override cmux's
      `rust-toolchain.toml` pins (DiffSidecar 1.88.0, cmux-tui 1.95.0, iroh-relay-minter
-     1.91.0). The DiffSidecar pin itself is checked with `rustup run`. A refusal after
+     1.91.0). The DiffSidecar pin itself is checked with `rustup run`; when its toolchain
+     (`diffRustToolchain`, a bare `1.88.0` resolved to rustup's host triple) is not in
+     `rustup toolchain list`, the refusal is `rust toolchain 1.88.0-<triple> is not
+     installed`, the same shape as a missing `rustcVersion` toolchain, so glaeda-mini-health's
+     `node_toolchain_missing` heal reinstalls it (pattern: "A class receipt's toolchain
+     went missing" in `docs/DEVBOX_DISK_AND_PROJECTS.md`). A refusal after
      the lock is taken releases it. The runner's PATH is exactly cmux's workload PATH
      (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), so a tool under
      the user's home never shadows the accepted one. The default is only changed when

@@ -7734,14 +7734,19 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
 def _toolchain_pins(projects: Path, budget: int = 2000) -> set[str]:
     """Toolchains a checkout pins (rust-toolchain.toml `channel`, or a legacy rust-toolchain file), in
     ~/Projects/* and one level into its worktree directories, reading at most `budget` entries."""
-    pins: set[str] = set()
     dirs: list[Path] = []
     for c in _children(projects)[:budget]:
         if c.is_dir() and not c.is_symlink():
             dirs.append(c)
             if c.name in WORKTREE_DIRS or c.name.endswith("-worktrees"):
                 dirs += [w for w in _children(c)[:budget] if w.is_dir() and not w.is_symlink()]
-    for d in dirs[:budget]:
+    return _pin_file_channels(dirs[:budget])
+
+
+def _pin_file_channels(dirs: list[Path]) -> set[str]:
+    """The toolchain each directory's rust-toolchain.toml `channel` (or legacy rust-toolchain file) names."""
+    pins: set[str] = set()
+    for d in dirs:
         for f in ("rust-toolchain.toml", "rust-toolchain"):
             text = _head(os.fspath(d / f), 4096).decode(errors="replace")
             if not text:
@@ -7755,11 +7760,84 @@ def _toolchain_pins(projects: Path, budget: int = 2000) -> set[str]:
     return pins
 
 
+RUNNER_PIN_DEPTH = 3  # <checkout>/Native/DiffSidecar: cmux pins its DiffSidecar two levels below the checkout root
+RUNNER_PIN_SKIP = {".git", "node_modules", "target", "DerivedData", ".build", "build", "zig-cache", ".zig-cache"}
+
+
+def _runner_checkout_pins(budget: int = 4000) -> set[str]:
+    """Toolchains the runners' checkouts (~/actions-runner*/_work/<repo>/<repo>) pin, in the checkout and up to
+    RUNNER_PIN_DEPTH levels below it (cmux pins 1.88.0 in Native/DiffSidecar), reading at most `budget` entries."""
+    dirs: list[Path] = []
+    left = budget
+    for work in sorted(HOME.glob("actions-runner*/_work")):
+        for repo in _children(work):
+            if repo.name.startswith("_") or not repo.is_dir() or repo.is_symlink():
+                continue
+            level = [c for c in _children(repo) if c.is_dir() and not c.is_symlink()]
+            for _ in range(RUNNER_PIN_DEPTH + 1):
+                dirs += level
+                nxt: list[Path] = []
+                for d in level:
+                    kids = _children(d)
+                    left -= len(kids)
+                    if left < 0:
+                        return _pin_file_channels(dirs)
+                    nxt += [k for k in kids if k.name not in RUNNER_PIN_SKIP and k.is_dir() and not k.is_symlink()]
+                level = nxt
+    return _pin_file_channels(dirs)
+
+
+# A fleet class receipt names the toolchains a build node must have: rustcVersion ('rustc 1.98.1 (...)') and the
+# DiffSidecar pin, diffRustToolchain ('1.88.0') with diffRustcVersion; job-started refuses every job when one is
+# missing. cmux19 2026-11-18: a cruft sweep removed ~/.rustup/toolchains/1.88.0-aarch64-apple-darwin and its six
+# listeners were held off 12+ hours ("diffRustcVersion '' != 'rustc 1.88.0 ...'"), cmux's only FFI release pool.
+RECEIPT_RUSTC = re.compile(r"rustc (\d+\.\d+\.\d+)(?: .*)?")
+
+
+def _receipt_toolchain_pins() -> set[str] | None:
+    """Toolchains any fleet class receipt on this host names (~/.config/glaeda/cmux-fleet/class-acceptance/*.json,
+    which glaeda-mini-enroll writes and glaeda-cmux-runner-hook reads), or None when a receipt is there that cannot
+    be read or names a toolchain in a shape this cannot parse: then every toolchain stays (fail closed)."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "glaeda" / "cmux-fleet" / "class-acceptance"
+    try:
+        names = sorted(n for n in os.listdir(config) if n.endswith(".json"))
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    pins: set[str] = set()
+    for name in names:
+        try:
+            receipt = json.loads((config / name).read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(receipt, dict):
+            return None
+        want = receipt.get("toolchain")
+        if want is None:
+            continue
+        if not isinstance(want, dict):
+            return None
+        for field in ("rustcVersion", "diffRustcVersion"):
+            if want.get(field):
+                m = RECEIPT_RUSTC.fullmatch(str(want[field]))
+                if not m:
+                    return None
+                pins.add(m.group(1))
+        diff = want.get("diffRustToolchain")
+        if diff:
+            if not isinstance(diff, str) or not diff.strip():
+                return None
+            pins.add(diff.strip())
+    return pins
+
+
 def rustup_verdict(path: Path) -> str:
     """Why a rustup toolchain stays whatever its age, or "". Only rustup puts one back, so a toolchain
     goes only from a rustup home (settings.toml beside toolchains/) whose rustup binary exists, and
-    never one that something names: the default, a directory override, $RUSTUP_TOOLCHAIN, or a
-    rust-toolchain file of a checkout under ~/Projects."""
+    never one that something names: the default, a directory override, $RUSTUP_TOOLCHAIN, a
+    rust-toolchain file of a checkout under ~/Projects or of a runner's checkout, or a fleet class
+    receipt (rustcVersion, diffRustToolchain); every one stays while a class receipt cannot be read."""
     home = path.parent.parent
     settings = home / "settings.toml"
     if path.parent.name != "toolchains" or not settings.is_file():
@@ -7771,6 +7849,11 @@ def rustup_verdict(path: Path) -> str:
         text = settings.read_text()
     except OSError:
         return "unreadable rustup settings"
+    receipt = _receipt_toolchain_pins()
+    if receipt is None:
+        return "a fleet class receipt cannot be read, so every toolchain it may name stays"
+    if any(path.name == tc or path.name.startswith(tc + "-") for tc in receipt):
+        return "a toolchain a fleet class receipt names (rustcVersion or diffRustToolchain)"
     pinned = set()
     for m in re.finditer(r'^\s*default_toolchain\s*=\s*"([^"]+)"', text, re.M):
         pinned.add(m.group(1))
@@ -7780,6 +7863,7 @@ def rustup_verdict(path: Path) -> str:
     if os.environ.get("RUSTUP_TOOLCHAIN"):
         pinned.add(os.environ["RUSTUP_TOOLCHAIN"])
     pinned |= _toolchain_pins(HOME / "Projects")
+    pinned |= _runner_checkout_pins()
     for tc in pinned:
         if path.name == tc or path.name.startswith(tc + "-"):
             return "a pinned toolchain (default, override, RUSTUP_TOOLCHAIN or rust-toolchain file)"

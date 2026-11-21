@@ -3937,6 +3937,15 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
     fields = list(REQUIRED_TOOLCHAIN)
     diff = str(want.get("diffRustToolchain") or "")
     if diff and want.get("diffRustcVersion"):  # the DiffSidecar pin, run the way cmux runs it
+        # A missing pin names the toolchain to install, the rustcVersion branch's shape, so glaeda-mini-health's
+        # node_toolchain_missing heal reinstalls it (cmux19 2026-11-18: a sweep removed 1.88.0 and the bare
+        # "diffRustcVersion '' != ..." drift, which nothing heals, held all six listeners off 12+ hours).
+        diff_name = receipt_toolchain_name({"rustcVersion": f"rustc {diff}"}, env, home, deadline) \
+            if re.fullmatch(r"\d+\.\d+\.\d+", diff) else diff
+        listed = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
+                  if line.strip()]
+        if diff_name and listed and diff_name not in listed:
+            return out_of_time(f"node not eligible (rust toolchain {diff_name} is not installed)", False), note
         have["diffRustcVersion"] = _probe(["rustup", "run", diff, "rustc", "--version"], env, home, deadline)
         fields.append("diffRustcVersion")
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields

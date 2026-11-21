@@ -1119,6 +1119,37 @@ class GlaedaDiskTest(unittest.TestCase):
             os.environ["RUSTUP_TOOLCHAIN"] = "nightly"
             self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
 
+    def test_rustup_toolchains_a_class_receipt_or_runner_checkout_names_stay(self) -> None:
+        # cmux19 2026-11-18: a sweep removed the m6-16 receipt's diffRustToolchain 1.88.0 and held six listeners off
+        home = self.root / "home"
+        rh = self.rustup_home(home)
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"")
+        receipts = home / ".config/glaeda/cmux-fleet/class-acceptance"
+        receipts.mkdir(parents=True)
+        (receipts / "m6-16.json").write_text(json.dumps({"toolchain": {
+            "rustcVersion": "rustc 1.98.1 (aaaaaaaaa 2026-09-01)", "diffRustToolchain": "1.88.0",
+            "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}}))
+        sidecar = home / "actions-runner-glaeda-1/_work/cmux/cmux/Native/DiffSidecar"
+        sidecar.mkdir(parents=True)
+        (sidecar / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.95.0"\n')
+        tcs = rh / "toolchains"
+        env = {"CARGO_HOME": str(home / ".cargo")}
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, env):
+            for var in ("RUSTUP_TOOLCHAIN", "XDG_CONFIG_HOME"):
+                os.environ.pop(var, None)
+            self.assertIn("class receipt", gd.rustup_verdict(tcs / "1.88.0-aarch64-apple-darwin"))
+            self.assertIn("class receipt", gd.rustup_verdict(tcs / "1.98.1-aarch64-apple-darwin"))
+            self.assertTrue(gd.rustup_verdict(tcs / "1.95.0-aarch64-apple-darwin"), "a runner checkout pins it")
+            self.assertEqual(gd.rustup_verdict(tcs / "1.80.0-aarch64-apple-darwin"), "")
+            (receipts / "m6-16.json").write_text("{not json")  # fail closed: every toolchain stays
+            self.assertIn("cannot be read", gd.rustup_verdict(tcs / "1.80.0-aarch64-apple-darwin"))
+            (receipts / "m6-16.json").write_text(json.dumps({"toolchain": {"rustcVersion": "1.98"}}))
+            self.assertIn("cannot be read", gd.rustup_verdict(tcs / "1.80.0-aarch64-apple-darwin"))
+            (receipts / "m6-16.json").unlink()
+            self.assertEqual(gd.rustup_verdict(tcs / "1.88.0-aarch64-apple-darwin"), "")
+
     def test_apply_rechecks_a_discovered_cache_for_a_new_clone(self) -> None:
         home = self.root / "home"
         cache = home / ".npm/_cacache"
