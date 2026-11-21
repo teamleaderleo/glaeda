@@ -10264,6 +10264,20 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A ci_never_ran refusal at a head this queue's own update-branch made is a "not yet", not a refusal to act on: the
+# repo's pull_request workflows start for the new head seconds later, and land_judge reads them a judgment later.
+# efficiency-standing-lane, 2026-11-21 08:39Z, `glaeda-gh land manaflow-ai/cmuxterm-hq#16382 --wait 2700`: the queue
+# sent the pinned update-branch at c46607e8da6f, GitHub's own update had already made the merge head 70420e0bfe85 (the
+# send was refused "expected head sha didn't match current head ref"), the entry judged that brand-new head, and
+# land_judge refused ci_never_ran because no pull_request run was behind it yet. The entry stopped with ~45 min of the
+# caller's wait budget unspent, and the caller had to notice, re-arm a wait and land again by hand: three calls for a
+# PR that was going to be green. Now such a refusal waits on the PR at that head for the run to appear (the run's
+# checks move the cache, and the judgment after it is the usual one) while the bound has time left, and stays terminal
+# where it should be: a head no update-branch of this queue made (nothing is starting the repo's CI for it on its own,
+# which is what hq#11655 was about) stops at the first refusal, as before, and a head whose run never showed up stops
+# at the bound. Either stop says which case it is and the call that takes the PR from there. The gate itself is
+# untouched: a head with no pull_request run is still never merged, here or in land_judge.
+LAND_CI_START = 600.0  # how long the repo's own pull_request run may take to appear at a head this queue's update made
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
@@ -10850,6 +10864,33 @@ def land_fetch_origin(url: str) -> str:
     """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
     m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
     return m.group(1) if m else ""
+
+
+def land_update_made_head(e: dict, head: str) -> float | None:
+    """When the update-branch this queue sent made HEAD: the time that step ended, else None. Both shapes count: the
+    head_change wait saw the new head (e["updatedHead"]), and the send was refused because GitHub's own update had
+    already made it ("expected head sha didn't match current head ref", hq#16382 at 70420e0bfe85), after which the
+    entry judges the new head from a retry wait with no head_change wait at all. A later step of another kind
+    (lastAction) leaves it None: then nothing here knows the head is this queue's."""
+    a = e.get("lastAction") or {}
+    at = a.get("endedAt")
+    before = str(a.get("before") or "").lower()
+    if a.get("kind") != "update_branch" or not isinstance(at, (int, float)) or isinstance(at, bool):
+        return None
+    return at if head and before and head.lower() != before else None
+
+
+def land_ci_start_left(e: dict, act: dict, answer: dict, head: str, now: float) -> float | None:
+    """Seconds left for the repo's own pull_request run to appear at HEAD when ANSWER is a ci_never_ran refusal of a
+    head this queue's update-branch made and the bound has time left, else None: the refusal is terminal
+    (LAND_CI_START's comment)."""
+    if str(answer.get("code") or "") != "ci_never_ran" or act.get("kind") != "command":
+        return None
+    at = land_update_made_head(e, head)
+    if at is None:
+        return None
+    left = at + LAND_CI_START - now
+    return left if left > 0 else None
 
 
 def land_fallback(answer: dict, head: str) -> dict:
@@ -12781,6 +12822,10 @@ class LandQueue:
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
                 pass
+            elif land_ci_start_left(e, act, answer, head, self.now) is not None:
+                # The repo's own CI has not started yet at a head this queue's update-branch made (LAND_CI_START's
+                # comment): a "not yet" is no strike, and the bound, not the streak, ends it (ci_never_ran_step).
+                e["streak"] = None
             elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
@@ -12860,6 +12905,29 @@ class LandQueue:
                   f"{land_trim(reason, 200)}", land_trim(nxt))
         return True
 
+    def ci_never_ran_step(self, e: dict, head: str, act: dict, answer: dict, why: Any, nxt: Any) -> None:
+        """land_judge refused HEAD ci_never_ran (LAND_CI_START's comment). Under the lock. While the update-branch this
+        queue sent made HEAD and the bound has time left, E waits on the PR at HEAD for the repo's own pull_request run
+        to appear: the run's checks move the cache, and the judgment after that is the usual one, merge included.
+        Otherwise E stops, as before, saying which terminal case it is and the exact call that takes the PR from
+        there."""
+        name = key_name(e["key"])
+        left = land_ci_start_left(e, act, answer, head, self.now)
+        if left is None:
+            at = land_update_made_head(e, head)
+            case = (f"the repo's own pull_request run never appeared at {head[:12]} in the {LAND_CI_START:.0f} s "
+                    f"after the update-branch this queue sent made that head" if at is not None else
+                    f"no update-branch of this queue made {head[:12] or '?'}, so no pull_request run of the repo's "
+                    "own CI is on its way for it")
+            self.stop(e, "ci_never_ran", f"{case}: {land_trim(why, 240)}",
+                      land_trim(f"{land_trim(nxt or answer.get('next'), 240)}, then glaeda-gh land {name} "
+                                f"--wait {LAND_WAIT_DEFAULT:.0f}"))
+            return
+        self.history(e, "ci_start_wait", head=head[:12], left=round(left))
+        self.wait(e, {"kind": "pr", "sha": head, "until": "done",
+                      "why": f"the repo's own pull_request run has not started yet at {head[:12]}, the head this "
+                             "queue's update-branch made"}, left)
+
     def claim(self, e: dict, kind: str, **args: Any) -> None:
         """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
         self.check(e)
@@ -12904,7 +12972,10 @@ class LandQueue:
             if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
                 return
             with self.lock:
-                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
+                if cls == "ci_never_ran":
+                    self.ci_never_ran_step(e, head, act, answer, why, nxt)
+                else:
+                    self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
