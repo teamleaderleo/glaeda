@@ -5108,7 +5108,15 @@ class ClientTest(Base):
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
         self.assertEqual((args.words, args.sha), (["manaflow-ai/cmux/48704"], "abc1234"))
         self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
-        with mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("a pin is never checked by a read")):
+        def only_local_git(argv, *a, **kw):
+            # A pin is never checked by a GitHub read (test_land_pin_queues_with_the_shared_quota_spent). The one
+            # thing it may run is the local checkout's own git: what repository this directory is, and its HEAD
+            # (land_pin_is_another_checkouts_head). Neither touches the shared quota; an answer it cannot get
+            # refuses nothing.
+            self.assertEqual(argv[0], "git", "a pin is never checked by a read")
+            self.assertIn(argv[-1], ("origin", "HEAD"), "a pin reads nothing but this checkout's repo and HEAD")
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        with mock.patch.object(gg.subprocess, "run", side_effect=only_local_git):
             gg.check_land_pin("o/r", 1, None)
             gg.check_land_pin("o/r", 1, "aaaaaaa")
             gg.check_land_pin("o/r", 1, "a" * 40)
@@ -9536,7 +9544,10 @@ class HeadChecksTest(Base):
         20 points (the daemon logged 1160 points over 58 PR queries on 2026-11-08). Without it the batch costs 10."""
         keys = [f"pr:o/r#{n}" for n in range(10)]
         query, _ = gg.pr_query(keys)
-        self.assertEqual(graphql_requests(gg.pr_query(keys[:1])[0]), 104)  # rules, commits, suites, latest x100, contexts
+        # rules, commits, the head commit's first parent, suites, latest x100, contexts. The first parent is the
+        # 105th request: it is what proves a new head is the merge the queue's own update-branch made (pr_head_parent,
+        # LandQueue.pin_follow), and at one request per PR a batch of ten still costs the same 10 points.
+        self.assertEqual(graphql_requests(gg.pr_query(keys[:1])[0]), 105)
         self.assertEqual(graphql_cost(query), 10)
         old = query.replace("latest: checkRuns(first: 1) { totalCount }", "latest: checkRuns(first: 1) { totalCount } "
                             "every: checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount }")
@@ -13132,6 +13143,127 @@ class BrokerLoopTest(BrokerBase):
         self.assertEqual(found, str(installed))
 
 
+class BrokerQuotaGuardTest(BrokerBase):
+    """Every call the host's gh-quota guard has not judged goes to the guard, not only a merge or a create.
+
+    `glaeda-gh gh ...` -- the route this tool's own next-step lines print -- reached the real gh with one route, no
+    fallback and no ledger entry. Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr
+    edit 2358 -R teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the identical
+    bare `gh pr edit` answered over REST at once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Named literally rather than through the module's constants, so the first test below is a detector of the
+        # behaviour and not of a missing symbol: on the old broker it fails by naming the gh it ran.
+        for name in ("GLAEDA_GH_QUOTA_HOP", "GLAEDA_GH_INTERNAL"):
+            os.environ.pop(name, None)
+            self.addCleanup(os.environ.pop, name, None)
+
+    def chain(self, comes_back: bool = True, guard: bool = True) -> Path:
+        """The host's designed chain on PATH: the gh-quota guard, then this broker's own shim, then gh. With
+        comes_back=False the next gh after the guard is the real gh, so the guard would run it behind this broker's
+        back. GH_QUOTA_CHECKED is dropped: this is a call that did not come through the guard."""
+        path = self.home / "quota" / "gh"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if guard:
+            path.write_text("#!/bin/sh\n# gh guard: gh-quota\nexit 9\n")
+            path.chmod(0o755)
+        self.patch_env({gg.MERGE_GUARD_ENV: str(path)})
+        after = self.home / "shim"
+        after.mkdir(exist_ok=True)
+        (after / "gh").write_text(f"#!/bin/sh\n# {gg.BROKER_MARK} shim\nexit 9\n" if comes_back
+                                  else "#!/bin/sh\nexit 0\n")
+        (after / "gh").chmod(0o755)
+        self.patch_env({"PATH": f"{path.parent}:{after}:{self.home / 'bin'}"})
+        os.environ.pop("GH_QUOTA_CHECKED", None)
+        self.addCleanup(os.environ.__setitem__, "GH_QUOTA_CHECKED", "1")
+        return path
+
+    def patch_env(self, values: dict) -> None:
+        patch = mock.patch.dict(os.environ, values)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def first_exec(self, args: list[str] | None = None) -> tuple[str | None, list[str] | None]:
+        """(the path cmd_gh exec'd, the argv it handed it), as a fresh process would see it."""
+        seen: list[tuple[str, list[str]]] = []
+
+        def execv(path: str, argv: list[str]) -> None:
+            seen.append((path, argv))
+            raise SystemExit(0)
+
+        for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
+            if name not in self.kept:
+                os.environ.pop(name, None)
+        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.suppress(SystemExit):
+                gg.cmd_gh(list(args if args is not None else self.READ))
+        return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
+
+    READ = ("pr", "view", "7", "-R", "o/r", "--json", "state")
+    kept: tuple[str, ...] = ()
+
+    def test_a_read_that_skipped_the_quota_guard_is_handed_back_to_it(self) -> None:
+        guard = self.chain()
+        path, passed = self.first_exec(["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"])
+        self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
+        self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
+                         "the line it is handed is the line that was typed")
+        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+                         "the pass back here knows it has been round")
+        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+                         "led by the guard's own directory, so it finds the gh after it as usual")
+
+    def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
+        """One hop, not a loop: the guard exports GH_QUOTA_CHECKED, and this hand-off's own mark carries the pid in
+        case a guard generation stops doing so. A `gh` the call's gh goes on to spawn is a new pid, and reaches the
+        guard as a plain `gh` would."""
+        self.chain()
+        real = os.environ["GLAEDA_GH_REAL"]
+        self.patch_env({"GH_QUOTA_CHECKED": "1"})
+        self.assertEqual(self.first_exec()[0], real, "exactly as before: the guard has judged it")
+        os.environ.pop("GH_QUOTA_CHECKED", None)
+        self.patch_env({"GLAEDA_GH_QUOTA_HOP": str(os.getpid())})
+        self.assertEqual(self.first_exec()[0], real, "its own mark, this pid")
+        self.patch_env({"GLAEDA_GH_QUOTA_HOP": str(os.getpid() + 1)})
+        self.assertEqual(self.first_exec()[0], str(self.home / "quota" / "gh"),
+                         "another process's mark is not this call's history")
+
+    def test_a_call_already_through_this_broker_keeps_its_route(self) -> None:
+        self.chain()
+        self.kept = (gg.BROKER_MARK,)
+        self.patch_env({gg.BROKER_MARK: f"1:{os.getpid()}"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+    def test_the_guard_is_left_out_when_it_would_not_hand_the_call_back(self) -> None:
+        """The guard execs the next `gh` on PATH. Where that is not this broker's shim, this route would hand the
+        read to the real gh behind this broker's back -- losing the answer cache, the source refusal and the repeat
+        hold, a worse trade than the one quota route it would gain. A create still goes (it has a pause only the
+        guard can ask) and a merge is refused without the guard: neither changes here."""
+        self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(self.first_exec(["pr", "comment", "7", "-R", "o/r", "--body", "x"])[0],
+                         str(self.home / "quota" / "gh"), "a create goes to the guard either way")
+
+    def test_a_host_with_no_guard_runs_the_read_as_before(self) -> None:
+        self.chain(guard=False)
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+    def test_this_daemons_own_reads_keep_the_route_they_have(self) -> None:
+        """They are piped through this broker on purpose (the answer cache shares them), and they run inside the
+        daemon's own tick, where the guard's checks and holds are not wanted."""
+        self.chain()
+        self.patch_env({"GLAEDA_GH_INTERNAL": "1"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(gg.internal_env()["GLAEDA_GH_INTERNAL"], "1", "which is how they say so")
+
+    def test_a_persons_switch_still_runs_the_real_gh(self) -> None:
+        self.chain()
+        self.patch_env({"CMUX_GH_BROKER_DISABLE": "1"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+
 class BrokerReviewTest(BrokerBase):
     """What a second independent review of the broker found by running it, 2026-10-21."""
 
@@ -14276,6 +14408,79 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/9/comments", "/repos/o/r/issues/8/comments",
                                                    "/repos/o/r/issues/1/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in notes], ["posted", "queued", "queued"])
+
+    def marker(self, thread: str, head: str, run: str, ago: float = 60, who: str = "router-review") -> dict:
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - ago))
+        body = f"<!-- review-running sha={head} at={at} run={run} by={who} -->\nreview running"
+        return self.queue("comment", thread, "--body", body, "--status-key", f"review-run={run}")
+
+    def test_a_marker_behind_its_own_runs_receipt_is_retired_as_superseded_not_sent(self) -> None:
+        head, run = "a" * 40, "run-" + "1" * 16
+        mark = self.marker("o/r#9", head, run)
+        other = self.marker("o/r#9", head, "run-" + "2" * 16)  # a second review of the same head (cmux#31529)
+        ship = self.queue("comment", "o/r#9", "--body",
+                          f"Review (opus via router-review): SHIP at {head[:12]}\n\n<!-- review-run={run} -->")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)  # the receipt sorts first and goes; its run's marker, behind it, is retired in the same tick
+        self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
+        self.assertIn(run, gg.post_state(mark["id"])["note"])
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 2)  # the receipt, then the second run's marker: its hold still stands
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (ship, other)], ["posted", "posted"])
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
+
+    def test_a_marker_whose_run_already_posted_its_verdict_is_retired(self) -> None:
+        run = "run-" + "3" * 16
+        verdict = self.queue("comment", "o/r#4", "--body", "Review (opus): BLOCK at " + "c" * 40,
+                             "--status-key", f"review-run={run}")
+        d, t = self.daemon((201, {}, {"html_url": "u"}), (201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(verdict["id"])["state"], "posted")
+        mark = self.marker("o/r#4", "d" * 40, run)  # queued late: its run already ended
+        elsewhere = self.marker("o/r#5", "d" * 40, run)  # another thread: the run's end there is not known
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
+        self.assertIn(run, gg.post_state(mark["id"])["note"])
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/4/comments", "/repos/o/r/issues/5/comments"])
+        self.assertEqual(gg.post_state(elsewhere["id"])["state"], "posted")  # the same tick: the retirement cost no turn
+
+    def test_an_old_marker_whose_run_never_ended_still_goes_out(self) -> None:
+        # once posted it starts review_running.slow()'s clock, which lets a SHIP at the head land
+        old = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16, ago=3 * 3600)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(old["id"])["state"], "posted")
+
+    def test_a_malformed_run_ends_record_retires_nothing_and_holds_no_write(self) -> None:
+        gg.write_json(gg.BASE / gg.RUN_ENDS, {"o/r#6": ["run-" + "4" * 16], "o/r#7": {"runs": "x"}})
+        mark = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "posted")
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 6, "body": "<!-- review-run=run-" + "8" * 16 + " -->"}, NOW)
+        self.assertEqual(gg.read_json(gg.BASE / gg.RUN_ENDS), {"o/r#6": {"runs": {"run-" + "8" * 16: NOW}}})
+
+    def test_a_marker_with_no_end_still_goes_out(self) -> None:
+        mark = self.marker("o/r#6", "e" * 40, "run-" + "7" * 16)
+        self.queue("comment", "o/r#6", "--body", "Review (opus): SHIP at " + "e" * 40)  # another run's receipt, same head
+        self.queue("comment", "o/r#7", "--body", "<!-- review-run=run-" + "7" * 16 + " -->")  # its end, another thread
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "posted")
+        self.assertEqual(len(t.calls), 3)
+
+    def test_superseded_reads_as_done_for_the_writer(self) -> None:
+        state = {"state": "superseded", "note": "a receipt for abc is queued (x)"}
+        self.assertEqual(gg.post_line(state), "superseded, not sent: a receipt for abc is queued (x)")
+
+    def test_run_ends_are_pruned_after_a_day(self) -> None:
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 1, "body": "<!-- review-run=run-" + "5" * 16 + " -->"}, NOW)
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 2, "body": "<!-- review-run=run-" + "6" * 16 + " -->"},
+                         NOW + gg.RUN_ENDS_KEEP + 1)
+        self.assertEqual(list(gg.read_json(gg.BASE / gg.RUN_ENDS)), ["o/r#2"])
 
     def test_a_gate_comment_is_never_joined_into_prose(self) -> None:
         self.assertFalse(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s", "gate": True}))
@@ -17881,6 +18086,28 @@ class BrokerAnswerCacheTest(CountingGhBase):
             gg.cmd_post(args)
         self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r heads", "o/r other"})
 
+    def test_a_post_on_a_host_with_no_login_is_refused_where_the_caller_is(self) -> None:
+        """gcp-agent-lane-2, 2026-11-21: three comments queued on a lane VM were all failed by the daemon with
+        "has no login to post with", an hour and a `post status` read later. A host that reads through an upstream
+        refuses the write at accept time and names the one that works here."""
+        no_guard(self)
+        config = self.home / "upstream.json"
+        config.write_text(json.dumps({"command": ["ssh", "huge-blue", "glaeda-gh", "upstream"]}), encoding="utf-8")
+        for kind, target, hand in (("comment", "O/R#7", "gh pr comment 7 --repo O/R --body-file F"),
+                                   ("review", "O/R#7", "gh pr review 7 --repo O/R --body-file F"),
+                                   ("pr", "O/R", "gh pr create --repo O/R --title T --body-file F")):
+            with self.subTest(kind=kind):
+                made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
+                    "head": None, "base": None, "title": None}
+                args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
+                                 reviewer=None, event="comment", **made)
+                err = io.StringIO()
+                with mock.patch.object(gg, "UPSTREAM_CONFIG", config), contextlib.redirect_stderr(err):
+                    self.assertEqual(gg.cmd_post(args), 3)
+                self.assertIn("has no login to post with", err.getvalue())
+                self.assertIn(hand, err.getvalue())  # whole, never cut
+                self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
         self.run_gh(args)
@@ -18413,6 +18640,9 @@ class RunnersTest(BrokerBase):
         argv = ran.call_args[0][0]
         self.assertIn("orgs/o/actions/runners?per_page=100", argv)
         self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        # The daemon's own reads carry the internal mark, so they keep this route instead of being handed to the
+        # host's quota guard; a fake answer that does not take env= is no longer this caller.
+        self.assertEqual(ran.call_args.kwargs["env"][gg.GLAEDA_INTERNAL], "1")
         bad = subprocess.CompletedProcess([], 0, "not json\n", "")
         with mock.patch.object(gg, "run_bounded", return_value=bad), self.assertRaises(gg.WatchError):
             gg.cmd_runners("o", None, True)
@@ -18425,7 +18655,8 @@ class RunnersTest(BrokerBase):
             gg.cmd_runners("not a scope", None, False)
 
     def test_repo_scope_reads_the_org_pool_too_and_says_so(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             path = next(a for a in argv if "actions/runners" in a)
             rows = ([{"name": "t", "status": "offline", "busy": False, "labels": ["side"]}] if "repos/" in path else
                     [{"name": "o1", "status": "online", "busy": True, "labels": ["side"]},
@@ -18443,7 +18674,8 @@ class RunnersTest(BrokerBase):
         self.assertIn("[read: 1 repo + 2 org]", out.getvalue())
 
     def test_repo_scope_names_an_org_listing_it_could_not_read(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("orgs/" in a for a in argv):
                 return subprocess.CompletedProcess([], 1, "", "HTTP 403")
             row = {"name": "t", "status": "online", "busy": False, "labels": ["side"]}
@@ -18468,7 +18700,8 @@ class RunnersTest(BrokerBase):
         repo_rows = [{"name": f"t{n}", "status": "online", "busy": False, "labels": ["self-hosted", "trusted"]}
                      for n in range(39)]
 
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("actions/variables/CI_RUNNER_STATE" in a for a in argv):
                 if state is None:
                     return subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")
@@ -20970,12 +21203,15 @@ class LogScanTest(Base):
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
-def land_pr(head: str, state: str = "OPEN", checks: list | None = None, draft: bool = False) -> dict:
-    """A PR cache entry's data, as parse_pr stores it."""
+def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
+            draft: bool = False) -> dict:
+    """A PR cache entry's data, as parse_pr stores it. PARENT is the head commit's first parent as the read gave it
+    (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
     return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
             "isDraft": draft,
+            **({"headParent": parent} if parent else {}),
             "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
 
 
@@ -22310,6 +22546,116 @@ class LandTest(Base):
         self.assertNotIn("pinSha", e)
         self.assert_merged_at(LB)
 
+    # -- the pin follows the merge commit the queue's own update-branch made
+
+    def update_branch_moved_the_head(self, pin: str = LA) -> dict:
+        """Judge PIN tip_merge, run update_branch at it, and leave the entry waiting for the new head."""
+        self.pr(pin)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=pin)
+        self.w.answers.append(self.tip_merge(pin))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("api")), 1)  # the update-branch was sent, pinned to the pin
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", pin))
+        return e
+
+    def test_the_pin_follows_the_merge_commit_its_own_update_branch_made(self):
+        # manaflow-ai/cmux#48445 (2026-11-21): judged tip_merge at ae9916f4e43f, `step exit=0 kind=update_branch`,
+        # then stopped "the head is 5ac37fd9debf, not the --sha ae9916f4e43f it was queued for" -- and 5ac37fd9debf
+        # was the merge commit that step made, first parent ae9916f4e43f. The daemon refused its own transition and a
+        # person had to read the new head and re-queue. The pin follows that commit now.
+        self.update_branch_moved_the_head()
+        self.pr(LB, parent=LA)  # the merge update-branch made: base merged into the pinned head
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        followed = [h for h in e["history"] if h["event"] == "pin_followed"]
+        self.assertEqual([(h["was"], h["head"], h["parent"], h["step"]) for h in followed],
+                         [(LA[:12], LB[:12], LA[:12], "update_branch")])
+        self.assert_merged_at(LB)  # the merge is still pinned, to the head that was judged
+
+    def test_the_pin_does_not_follow_a_head_whose_first_parent_is_another(self):
+        # The safety argument, and the whole of it: only a first parent that is the pin proves the pinned content is
+        # what is being merged. A push, a force-push or a merge made on top of anything else stops as it always did.
+        self.update_branch_moved_the_head()
+        self.pr(LB, parent=LC)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        # no new judgement and no merge at the new head: only the tip_merge judgement that ran the update-branch
+        self.assertEqual((len(self.w.explains()), self.w.gh_calls("pr", "merge")), (1, []))
+        self.assertEqual([h for h in e["history"] if h["event"] == "pin_followed"], [])
+
+    def test_a_head_whose_first_parent_no_read_says_waits_then_stops_as_before(self):
+        # "the first parent could not be read" is not "the head moved": a read that does not say the parent (a REST
+        # read, a commit list behind the head) is waited for, and past LAND_PIN_PARENT_WAIT the pin stops the row
+        # exactly as it did before this change.
+        self.update_branch_moved_the_head()
+        self.pr(LB)
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"], e["pinFollow"]["head"]),
+                         ("waiting", None, LA, LB))
+        self.assertIn("pin_parent_wait", [h["event"] for h in e["history"]])
+        self.assertEqual((len(self.w.explains()), self.w.gh_calls("pr", "merge")), (1, []))
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("pin_parent_unread", [h["event"] for h in e["history"]])
+
+    def test_a_first_parent_read_within_the_wait_is_followed(self):
+        self.update_branch_moved_the_head()
+        self.pr(LB)
+        self.assertEqual(self.tick()["state"], "waiting")
+        self.pr(LB, parent=LA)  # the next read says it
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
+        self.assertNotIn("pinFollow", e)
+
+    def test_a_pin_follow_needs_the_update_branch_to_have_been_sent_at_the_pin(self):
+        self.assertTrue(gg.land_pin_merged(LA, LA, LA))
+        self.assertTrue(gg.land_pin_merged(LA[:12], LA, LA))  # a prefix pin matches the full parent
+        self.assertFalse(gg.land_pin_merged(LA, LC, LA))  # the first parent is another commit
+        self.assertFalse(gg.land_pin_merged(LA, "", LA))  # no read said the first parent
+        self.assertFalse(gg.land_pin_merged(LA, LA, ""))  # no update-branch of ours was sent at the pin
+        self.assertFalse(gg.land_pin_merged(LA, LA, LC))  # ours was sent at another head
+        self.assertFalse(gg.land_pin_merged("", LA, LA))  # unpinned
+
+    def test_a_head_commit_names_its_first_parent_only_when_it_is_the_head(self):
+        def node(oid: str, parents: list[str]) -> dict:
+            return {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+                "oid": oid, "parents": {"nodes": [{"oid": p} for p in parents]}}}]}}
+        self.assertEqual(gg.pr_head_parent(node(LB, [LA, LC]), node(LB, [LA])["commits"]["nodes"]), LA)
+        # A commit list behind the head, no parents at all, or a REST read (no oid, no parents): nothing is claimed.
+        self.assertEqual(gg.pr_head_parent(node(LC, [LA]), node(LC, [LA])["commits"]["nodes"]), "")
+        self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
+        self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
+
+    def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
+        # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
+        # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read
+        # that gives the right sha.
+        def git(args: list[str]) -> str | None:
+            return LA if args == ["rev-parse", "HEAD"] else None
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/other"):
+            why = gg.land_pin_is_another_checkouts_head("o/r", LA, git)
+            self.assertIn("is the HEAD of", why)
+            self.assertIn("a checkout of o/other, not of o/r", why)
+            # a short pin (`git rev-parse --short HEAD`) is the same slip and reads the same
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA[:12], git), why)
+            # another sha entirely is somebody's honest pin, not this slip
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LB, git), "")
+            with self.assertRaises(gg.WatchError) as caught:
+                gg.check_land_pin("o/r", 1, LA, git)
+            self.assertIn("next: glaeda-gh gh api repos/o/r/pulls/1 --jq .head.sha", str(caught.exception))
+        # The target's own checkout, and a cwd that is no checkout at all, are left alone.
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, git), "")
+            gg.check_land_pin("o/r", 1, LA, git)
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: None):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, git), "")
+            gg.check_land_pin("o/r", 1, LA, git)
+        # A git that cannot answer refuses nothing: an unread HEAD is not a wrong one.
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/other"):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, lambda a: None), "")
     def test_sha_pin_follows_the_head_its_own_update_branch_made(self):
         # air-blue, 2026-11-21: hq#14568 pinned at eed0ffdf; land-judge named update_branch, the queue sent it, and
         # the base merge it made (d4fe4462) stopped the same land head_moved. The pin moves to the head this queue's
@@ -22318,7 +22664,7 @@ class LandTest(Base):
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
         self.tick()
-        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.pr(LB, parent=LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the merge it made
         self.w.answers.append(ok_answer(LB))
         e = self.tick()
         self.assertEqual((e.get("stop") or {}).get("code"), None)
@@ -22350,7 +22696,7 @@ class LandTest(Base):
         self.tick()
         self.w.gh_rc["update"] = 0
         self.pr(LB)
-        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)  # a real read carries both
         self.w.answers.append(ok_answer(LB))
         e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_RETRY_MAX + 60, step=30.0)
         self.assertEqual((e.get("stop") or {}).get("code"), None)
@@ -22364,7 +22710,7 @@ class LandTest(Base):
         self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
         self.tick()
         self.pr(LB)
-        self.w.cache[self.KEY]["data"]["headParents"] = [LC, "d" * 40]
+        self.w.cache[self.KEY]["data"].update(headParents=[LC, "d" * 40], headParent=LC)  # a real read carries both
         self.w.answers.append(ok_answer(LB))
         e = self.tick()
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")

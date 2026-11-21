@@ -875,6 +875,19 @@ JOIN_MENTION = re.compile(r"(?<![\w.`])@[A-Za-z0-9][\w-]*")  # an @mention: a bo
 # busiest threads in that hour.
 POST_STATUS_MAX = 6 * 3600
 STATUS_KEY = re.compile(r"[\w.:=@/-]{1,120}")
+# A review-running marker (leo-workspace tools/review_running.py) still queued once its own run has ended is retired as
+# superseded, never sent: its run's verdict or done line (`<!-- review-run=<run> -->`, or a comment keyed
+# `review-run=<run>`) is queued or was posted on the thread. Sent after that end, it would hold the head's merge for
+# nothing (review_running._runs counts only an end that comes after the marker). Receipts go out first (outbox_gate), so
+# on huge-blue 2026-11-21 15:4xZ about 206 markers sat behind them. Nothing else retires one: another run's receipt at
+# the same head leaves that run's own hold standing (cmux#31529's second review), and an old marker whose run never
+# ended still starts review_running.slow()'s SHIP clock once posted (review_model). A queued end counts even if its own
+# post later fails: the run has ended either way. RUN_ENDS records, per thread, the runs the outbox posted an end for
+# (kept RUN_ENDS_KEEP).
+REVIEW_MARK = re.compile(r"^<!-- review-running sha=([0-9a-f]{40}) at=(\S+) run=(run-[0-9a-f]{16}) by=([\w -]*) -->", re.I)
+RUN_END = re.compile(r"<!-- review-run=(run-[0-9a-f]{16}) -->")
+RUN_ENDS = "run-ends.json"
+RUN_ENDS_KEEP = 24 * 3600
 POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox posted there
 POST_SUBJECTS = "subjects.json"  # thread -> its GraphQL node id (an issue's or PR's id never changes)
 POST_EDITS = "edited.json"  # the comments the outbox edited in place: only their edits count as said again
@@ -907,6 +920,62 @@ def outbox_gate(item: Any) -> bool:
     body = str(item.get("body") or "")
     first = next((line for line in body.splitlines() if line.strip()), "").strip()
     return item.get("kind") == "comment" and bool(RISK_RECEIPT.match(first))
+
+
+def thread_of(item: Any) -> str:
+    return f"{str(item.get('repo') or '').lower()}#{item.get('number')}" if isinstance(item, dict) else ""
+
+
+def run_end_of(item: Any) -> str | None:
+    """The review run this queued or posted comment ends (superseded_by): its done line, or its run's status key."""
+    if not isinstance(item, dict) or item.get("kind") != "comment":
+        return None
+    body = str(item.get("body") or "")
+    if REVIEW_MARK.match(body):
+        return None  # a marker ends nothing, even with its run's status key
+    ended = RUN_END.search(body) or RUN_END.search(f"<!-- {item.get('status') or ''} -->")
+    return ended.group(1) if ended else None
+
+
+def superseded_by(item: Any, queue: list[tuple[Path, Any]], ended: dict) -> str | None:
+    """Why a queued review-running marker need not go out (REVIEW_MARK's notes), or None: it must."""
+    if not isinstance(item, dict) or item.get("kind") != "comment":
+        return None
+    mark = REVIEW_MARK.match(str(item.get("body") or ""))
+    if not mark:
+        return None
+    run, thread = mark.group(3), thread_of(item)
+    record = ended.get(thread)
+    runs = record.get("runs") if isinstance(record, dict) else None
+    if isinstance(runs, dict) and run in runs:
+        return f"its run {run} already posted its verdict or done line on {thread}"
+    for _, other in queue:
+        if other is not item and thread_of(other) == thread and run_end_of(other) == run:
+            return f"its run {run} has its verdict or done line queued ({other.get('id')})"
+    return None
+
+
+def note_run_ends(item: Any, at: float) -> None:
+    """Record the run a posted comment ends (run_end_of) for superseded_by, pruned past RUN_ENDS_KEEP."""
+    run = run_end_of(item)
+    if not run:
+        return
+    path = BASE / RUN_ENDS
+    doc = read_json(path)
+    doc = doc if isinstance(doc, dict) else {}
+    record = doc.get(thread_of(item))
+    runs = record.get("runs") if isinstance(record, dict) else None
+    doc[thread_of(item)] = {"runs": {**(runs if isinstance(runs, dict) else {}), run: at}}
+    cut = at - RUN_ENDS_KEEP
+    for thread in list(doc):
+        runs = doc[thread].get("runs") if isinstance(doc[thread], dict) else None
+        runs = {r: t for r, t in (runs if isinstance(runs, dict) else {}).items()
+                if isinstance(t, (int, float)) and t > cut}
+        if runs:
+            doc[thread] = {"runs": runs}
+        else:
+            doc.pop(thread)
+    write_json(path, doc)
 
 
 def outbox_queue() -> list[tuple[Path, Any]]:
@@ -1125,8 +1194,8 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
-  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid parents(first: 2) { nodes { oid } }
-SUITE_ATTEMPTS statusCheckRollup { state
+  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
+parents(first: 1) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
@@ -2640,6 +2709,13 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
+def internal_env() -> dict:
+    """This process's environment plus GLAEDA_GH_INTERNAL: for this daemon's own `glaeda-gh gh api` reads, which
+    are piped through the broker on purpose (the answer cache shares them) and keep the route they have today
+    rather than being handed to the host's quota guard as a person's call is (see broker_guard_comes_back)."""
+    return {**os.environ, GLAEDA_INTERNAL: "1"}
+
+
 def retry_after_seconds(value: Any) -> float | None:
     """A Retry-After header as seconds, at most PACE_HOLD_MAX, or None when it says no usable number. float() takes
     "inf", "nan" and "1e12": an infinite hold overflowed every int() after it (the queued write was dropped as a bad
@@ -3809,9 +3885,26 @@ def head_parents(node: dict) -> list[str] | None:
     return [str(p.get("oid") or "").lower() for p in nodes if isinstance(p, dict) and p.get("oid")]
 
 
+def pr_head_parent(node: dict, commits: list) -> str:
+    """The first parent of the PR's head commit as the read gave it (40 hex, lowercase), or "" when this read does not
+    say. Only the head commit's own parent is taken: commits(last: 1) is the head commit, and its oid is checked
+    against headRefOid, so a read whose commit list lags the head (or a REST read, which carries no parents) says
+    nothing rather than naming another commit's parent. A first parent is what proves a merge commit was made on top
+    of a known head: land's pin follows the merge its own update-branch made (LandQueue.pin_follow)."""
+    commit = ((commits[0] if commits else {}) or {}).get("commit") or {}
+    oid = str(commit.get("oid") or "").lower()
+    head = str(node.get("headRefOid") or "").lower()
+    if not oid or not head or oid != head:
+        return ""
+    parents = ((commit.get("parents") or {}).get("nodes") or [])
+    first = str(((parents[0] if parents else {}) or {}).get("oid") or "").lower()
+    return first if SHA40.fullmatch(first) else ""
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
+    head_parent = pr_head_parent(node, commits)
     contexts = rollup.get("contexts") or {}
     latest: dict[str, tuple[tuple, dict]] = {}
     superseded: list[dict] = []  # replaced by a newer attempt or run; GitHub's rollup still counts them
@@ -3895,6 +3988,7 @@ def parse_pr(node: dict) -> dict:
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeCommit": node.get("mergeCommit"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
+        **({"headParent": head_parent} if head_parent else {}),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         **({"headParents": parents} if (parents := head_parents(node)) is not None else {}),
@@ -5956,7 +6050,7 @@ class Daemon:
             return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
             return
-        for path, item in outbox_queue():
+        for path, item in self.retire_superseded(outbox_queue()):
             if not isinstance(item, dict) or item.get("id") != path.stem:
                 with contextlib.suppress(OSError):
                     if self.now - path.stat().st_mtime > POST_UNREADABLE:
@@ -5995,6 +6089,24 @@ class Daemon:
         if self.writing or clock - self.post_tried < POST_SPACING:
             return
         self.post_between()
+
+    def retire_superseded(self, queue: list[tuple[Path, Any]]) -> list[tuple[Path, Any]]:
+        """The queue less every review-running marker superseded_by retires, over the whole queue: receipts sort
+        first, so a send loop that stops at its one write would never reach the markers behind them. A retirement
+        is no request: it costs no turn."""
+        marks = [(p, i) for p, i in queue if isinstance(i, dict) and i.get("id") == p.stem
+                 and REVIEW_MARK.match(str(i.get("body") or ""))]
+        if not marks:
+            return queue
+        ended = read_json(BASE / RUN_ENDS)
+        ended = ended if isinstance(ended, dict) else {}
+        gone: set[Path] = set()
+        for path, item in marks:
+            why = superseded_by(item, queue, ended)
+            if why:
+                self.post_finish(path, item, superseded=why)
+                gone.add(path)
+        return [(p, i) for p, i in queue if p not in gone]
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""
@@ -6419,10 +6531,15 @@ class Daemon:
         write_json(path, item)
 
     def post_finish(self, path: Path, item: dict, url: str | None = None, number: Any = None,
-                    note: str | None = None, error: str | None = None) -> None:
+                    note: str | None = None, error: str | None = None, superseded: str | None = None) -> None:
+        """SUPERSEDED: the write was retired unsent, for that recorded reason (superseded_by); never deleted silently."""
         done = {k: v for k, v in item.items() if k not in {"body", "ownBody", "notBefore", "holdUntil"}}
-        done.update({"state": "failed" if error else "posted", "url": url, "number": number, "note": note,
-                     "error": error, "finishedAt": self.now})
+        state = "superseded" if superseded else "failed" if error else "posted"
+        done.update({"state": state, "url": url, "number": number if not superseded else item.get("number"),
+                     "note": superseded or note, "error": error, "finishedAt": self.now})
+        if state == "posted":
+            with contextlib.suppress(Exception):
+                note_run_ends(item, self.now)
         write_json(posted_dir() / path.name, done)
         path.unlink(missing_ok=True)
         for member in item.get("group") or []:  # one comment for all of them: each caller gets its URL
@@ -6432,9 +6549,11 @@ class Daemon:
                 self.post_finish(mpath, other, url=url, number=number, error=error,
                                  note=f"posted in one comment with {len(item['group'])} other queued comment"
                                       f"{'s' if len(item['group']) > 1 else ''} for this thread")
-        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write
-            gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
-        log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error})
+        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write (none: unsent)
+            if not superseded:
+                gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
+        log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error,
+             **({"why": superseded} if superseded else {})})
 
     # -- the outbox's comments: joined per thread, over the richer bucket, a writer's status edited in place
 
@@ -10541,6 +10660,9 @@ LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends 
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
+# parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
+LAND_PIN_PARENT_WAIT = 300.0
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -11954,6 +12076,7 @@ class LandQueue:
             e.pop("pinSince", None)
         e.pop("pinWait", None)
         e.pop("pinSeen", None)
+        e.pop("pinFollow", None)  # a re-request decides its own pin: no earlier head's parent wait
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -13072,7 +13195,8 @@ class LandQueue:
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
-                    self.follow_own_update(e, head)  # hq#14568: the pin follows its own base merge, not a push
+                    if self.pin_follow(e, head, data):
+                        return  # the new head's first parent is not read yet: not judged on it
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
@@ -13126,6 +13250,55 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def pin_follow(self, e: dict, head: str, data: dict) -> bool:
+        """E's pin follows HEAD when HEAD is the merge commit this queue's own update-branch just made on top of the
+        pinned head. True while the read does not yet say HEAD's first parent, so nothing is judged on a head whose
+        provenance is unread (LAND_PIN_PARENT_WAIT bounds that wait; past it the pin stops the row as it always did).
+
+        The daemon moved the head itself: judged tip_merge, ran update_branch at the pinned head, and GitHub made a
+        merge commit, so on the next tick the head is not the pin and judge stops the row head_moved -- a refusal built
+        from a state transition the refuser performed. manaflow-ai/cmux#48445, 2026-11-21: `step exit=0 kind=
+        update_branch` at 13:05:45Z, then "the head is 5ac37fd9debf, not the --sha ae9916f4e43f it was queued for";
+        5ac37fd9debf is "Merge branch 'feat-cmux-next' into lane/base-red-16" and its first parent is ae9916f4e43f,
+        the pin. The row sat stopped until a person read the trace, read the new head from GitHub and re-queued it.
+
+        Only that commit is followed, and land_pin_merged is the whole safety argument: the new head's first parent is
+        the pin, and the update-branch was sent pinned (expected_head_sha) to that same commit. Any other head -- a
+        push, a force-push, a merge made on top of something else -- still stops head_moved, unchanged. The pin the
+        merge is made with follows too, so the pinned merge still refuses a head nobody judged."""
+        pin = str(e.get("pinSha") or "")
+        if not pin or not land_head_moved(pin, head):
+            return False  # unpinned, or the head still is the pin: nothing to follow
+        parent = str((data or {}).get("headParent") or "").lower()
+        sent = str(((e.get("updateSent") or {}).get("head")) or "").lower() or str(e.get("preStepHead") or "").lower()
+        if land_pin_merged(pin, parent, sent):
+            e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
+            e.pop("pinFollow", None)
+            # The trace reads as its own safety argument: the old pin, the new head, and the first parent that matched.
+            self.history(e, "pin_followed", was=pin[:12], head=head[:12], parent=parent[:12], step="update_branch")
+            self.save(e)
+            return False
+        if parent or not SHA40.fullmatch(head):
+            e.pop("pinFollow", None)
+            return False  # a parent that is not the pin: judge's head_moved stops it, as it always did
+        # "the first parent could not be read" is not "the head moved": wait for a read that says it, then decide.
+        w = e.get("pinFollow")
+        if not isinstance(w, dict) or w.get("head") != head:
+            w = e["pinFollow"] = {"head": head, "since": self.now}
+            self.history(e, "pin_parent_wait", pin=pin[:12], head=head[:12])
+            self.nudge(e["key"])
+            self.save(e)
+            return True
+        if self.now - float(w.get("since") or 0) >= LAND_PIN_PARENT_WAIT:
+            e.pop("pinFollow", None)
+            self.history(e, "pin_parent_unread", head=head[:12])
+            return False  # no read said this head's parent in time: the pin stops the row as it always did
+        if self.now - float(w.get("nudgedAt") or 0) >= NUDGE_MIN:
+            w["nudgedAt"] = self.now
+            self.nudge(e["key"])
+            self.save(e)
+        return True
 
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
         """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
@@ -13346,6 +13519,11 @@ class LandQueue:
             return "no update_branch of this queue's was sent at the pinned head"
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
+        if parents is None and str(data.get("headRefOid") or "").lower() == head and data.get("headParent"):
+            parents = [data["headParent"]]  # pr_head_parent's first parent (pin_follow's read) says it as well
+        unread = [h for h in e.get("history") or [] if h.get("event") == "pin_parent_unread" and h.get("head") == head[:12]]
+        if not isinstance(parents, list) and unread:  # glaeda#2364: pin_follow waited for its parent and none came
+            return "no read of this head said its first parent within the wait, so it is not known to be this update"
         if isinstance(parents, list) and sent not in [str(p).lower() for p in parents]:
             return (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) do not include {sent[:12]}, "
                     "where this queue's update_branch was sent: a push, not that update's base merge")
@@ -14701,6 +14879,20 @@ def land_head_moved(pin: str, head: str) -> bool:
     return bool(pin and head) and not head.lower().startswith(pin)
 
 
+def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
+    """True when a new head is safe for E's pin to follow: PARENT, the new head's first parent, is the pinned PIN, and
+    SENT, the head the queue's own update-branch was pinned to (expected_head_sha), is that same commit. GitHub makes
+    update-branch a merge commit on the head branch whose first parent is the branch tip it was pinned to, so a first
+    parent that is the pin proves the pinned content is still exactly what is being merged, with only the base added.
+    Anything else -- a push, a force-push, an unrelated commit, a merge made on top of something else -- is False, and
+    the pin stops the row (head_moved) as it always did. An empty PARENT (a read that does not say) is False: a parent
+    that could not be read is not a parent that matched."""
+    # bool(parent) and bool(sent) are load-bearing: land_head_moved("pin", "") is False (an unread head has not
+    # moved), so without them a read that said no parent at all would read as a parent that matched.
+    return (bool(pin) and bool(parent) and not land_head_moved(pin, parent)
+            and bool(sent) and not land_head_moved(pin, sent))
+
+
 def land_request_lane(req: dict) -> tuple[str, str] | None:
     """A request's (lane, laneHost) as land_request takes it, or None when it records none (an older sender's)."""
     if "lane" not in req:
@@ -15044,13 +15236,55 @@ def land_queued_by() -> str:
 # "cannot read OWNER/REPO#N's head to check --match-head-commit" while the PR it pinned was green.
 
 
-def check_land_pin(repo: str, number: int, pin: str | None) -> None:
-    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): only its shape is checked here, so a
-    land is queued whatever the quota; a head other than SHA stops it later (head_moved) and the pinned merge refuses
-    it, so a land never takes a push that came after the one the caller judged. REPO and NUMBER are unused: no read."""
-    del repo, number
+def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[str]], str | None] | None = None) -> str:
+    """Why PIN cannot be REPO's head: it is the HEAD of the directory the caller ran in, and that directory is a
+    checkout of another repository. "" when it is not that, which is every other case. No GitHub read, two local git
+    calls, and only when a pin was passed.
+
+    The guidance for pinning is `--match-head-commit $(git rev-parse HEAD)`, and a lane working in one repository's
+    worktree while landing another's PR (a leo-workspace worktree landing a cmux PR) resolves it against the wrong
+    checkout: the land is pinned to a sha the target repository does not have, and stops later reading as head
+    movement. The right source when the cwd is not the target's checkout is a GitHub read, which this names."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    here = cwd_repo()
+    if not here or here.lower() == repo.lower():
+        return ""  # not a checkout, or the target's own checkout, where HEAD is a fair source
+    head = str(git(["rev-parse", "HEAD"]) or "").lower()
+    if not SHA40.fullmatch(head) or land_head_moved(pin.lower(), head):
+        return ""
+    return (f"--match-head-commit {pin[:12]} is the HEAD of {os.getcwd()}, a checkout of {here}, not of {repo}: "
+            f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
+
+
+def check_land_pin_shape(pin: str | None) -> None:
+    """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
+    request this host can answer from its cache (land_draft_refusal) is answered after this and before
+    check_land_pin, so such an answer spends no git call either -- what that test asserts by banning every
+    subprocess."""
     if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+
+
+def check_land_pin(repo: str, number: int, pin: str | None,
+                   git: Callable[[list[str]], str | None] | None = None) -> None:
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): its shape, and the one wrong source
+    that is free to detect (land_pin_is_another_checkouts_head). No head read, so a land is queued whatever the quota;
+    a head other than SHA stops it later (head_moved) and the pinned merge refuses it, so a land never takes a push
+    that came after the one the caller judged.
+
+    Two local git calls, so a caller that may still refuse from its cache runs check_land_pin_shape first and this
+    only for a request it is about to queue."""
+    check_land_pin_shape(pin)
+    why = land_pin_is_another_checkouts_head(repo, pin, git) if pin else ""
+    if why:
+        raise WatchError(f"{why}\nnext: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+                         f"then glaeda-gh land {repo}#{number} --match-head-commit THAT")
 
 
 # The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
@@ -15092,7 +15326,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
-    check_land_pin(repo, number, pin)
+    check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
@@ -15107,6 +15341,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         else:
             say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
         return EXIT_FAIL
+    # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
+    # not to one this host already answered from its cache.
+    check_land_pin(repo, number, pin)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
@@ -21585,6 +21822,49 @@ def lane_vm_gh() -> str | None:
     return None
 
 
+QUOTA_HOP = "GLAEDA_GH_QUOTA_HOP"  # a hand-off to the gh-quota guard that is neither a merge nor a create: this
+# broker's own mark for it, carrying the pid like BROKER_MARK, so a guard generation that stops exporting
+# GH_QUOTA_CHECKED costs one extra exec rather than an endless chain, while a `gh` the call's own gh goes on to
+# spawn is a new pid and reaches the guard as a plain `gh` would.
+GLAEDA_INTERNAL = "GLAEDA_GH_INTERNAL"  # this daemon's own `gh api` reads: left on the route they have today
+
+
+def file_head(path: Path) -> bytes:
+    """The first 4096 bytes of `path`, or b"" when it cannot be read (broker_is_wrapper's reason: a gh this account
+    may execute but not read is a binary, not a wrapper, and must not be judged by what it does not say)."""
+    try:
+        with path.open("rb") as stream:
+            return stream.read(4096)
+    except OSError:
+        return b""
+
+
+def path_gh_after(directory: Path) -> Path | None:
+    """The first executable `gh` on PATH in a directory after `directory`: what a guard in `directory` execs next,
+    resolved the way the guard resolves it (PATH order, first match after its own directory)."""
+    seen = False
+    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not entry:
+            continue
+        if not seen:
+            seen = Path(entry) == directory
+            continue
+        candidate = Path(entry) / "gh"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def broker_guard_comes_back(guard: Path) -> bool:
+    """Whether the gh-quota guard would hand the call back to this broker: the next `gh` after it on PATH is this
+    broker's own shim. A merge and a create go to the guard either way (one is refused without it, the other has a
+    pause only it can ask), but for every other call this is the condition that makes the hand-off free: without
+    it the guard runs the real gh behind this broker's back, and the call loses the answer cache, the source
+    refusal and the repeat hold -- a worse trade than the quota route it would gain."""
+    following = path_gh_after(guard.parent)
+    return following is not None and BROKER_MARK.encode() in file_head(following)
+
+
 def broker_real_gh() -> str:
     """The real gh: the binary a guard that delegated here named in GLAEDA_GH_REAL, else the next
     `gh` on PATH that is not a wrapper, else one of the usual install paths (a LaunchAgent's PATH
@@ -23313,7 +23593,8 @@ def read_runners(path: str) -> list[dict]:
     try:
         done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", "--paginate",
                             f"{path}?per_page=100", "--jq",
-                            ".runners[] | {name, status, busy, labels: [.labels[].name]}"], timeout=120)
+                            ".runners[] | {name, status, busy, labels: [.labels[].name]}"], timeout=120,
+                           env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WatchError(f"gh api {path}: {describe(error)}") from None
     if done.returncode != 0:
@@ -23341,7 +23622,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     where = f"{RUNNER_STATE_VARIABLE} on {repo}"
     try:
         done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", path, "--jq", ".value"],
-                           timeout=60)
+                           timeout=60, env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
     if done.returncode != 0:
@@ -23516,7 +23797,7 @@ def search_read(terms: str, limit: int) -> dict:
     argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
             "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
     try:
-        done = run_bounded(argv, timeout=120)
+        done = run_bounded(argv, timeout=120, env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WatchError(f"gh api graphql (search): {describe(error)}") from None
     if done.returncode != 0:
@@ -23618,6 +23899,11 @@ def cmd_search(kind: str, words: list[str], repos: list[str], state: str, author
 # reached gh unasked and could renew the pause for every writer on the login. The lists mirror the guard's own
 # (gh_quota.py CREATE_WORDS, CREATE_API, CREATE_MUTATIONS, plus its landing creates). Unlike a merge, a create on a
 # host with no guard runs as before: creates are routine everywhere, and such a host has no pause to ask.
+# Every other call goes the same way, for the same reason one step further on: the guard is where a call gets its
+# second route (a GraphQL read answered over REST once GraphQL is spent, and the reverse), and its ledger entry.
+# Only where the guard would hand the call back to this broker, so nothing is run behind the answer cache's back:
+# broker_guard_comes_back. Not for this daemon's own reads (GLAEDA_GH_INTERNAL) and not under a person's
+# CMUX_GH_BROKER_DISABLE, which a merge and a create override and an ordinary call does not.
 MERGE_GUARD_ENV = "GLAEDA_MERGE_GUARD"
 # (command, subcommand) -> None (always a create) or the flags without which it creates nothing (a close's comment)
 BROKER_CREATE_WORDS: dict[tuple[str, str], tuple[str, ...] | None] = {
@@ -23798,23 +24084,59 @@ def broker_canonical_target(args: list[str]) -> list[str]:
     return fixed
 
 
+def broker_answered_here(args: list[str]) -> bool:
+    """Whether this broker can answer the call without GitHub: broker_plan serves it from the daemon's own state,
+    or refuses it. Then the guard has nothing to add -- there is no protocol to fall back to and nothing to
+    charge -- and the hand-off would be pure latency on the commonest call there is. Measured 2026-11-21, one
+    served `pr view --json state`: 0.33 s this way, 0.84 s through the guard. broker_plan is pure (it registers no
+    watch and writes nothing), so asking it twice costs local reads only."""
+    try:
+        route, _payload, _key = broker_plan(args, time.time())
+    except Exception as error:  # noqa: BLE001  unknown is "not answered here": the hand-off is the safe side
+        broker_note({"route": "error", "error": describe(error), "site": "broker_answered_here"})
+        return False
+    return route in ("serve", "refuse")
+
+
 def broker_merge_handoff(args: list[str]) -> int | None:
     """Hand a merge or a create the gh-quota guard has not judged to the guard (exec, so this returns only on
     failure), or None when the call is neither, or is a create and no guard can be run here."""
     if os.environ.get("GH_QUOTA_CHECKED"):
         return None
     if not broker_merge_call(args):
-        if broker_create_call(args):
-            path = os.environ.get("PATH", "")
+        create = broker_create_call(args)
+        # And every other call the guard has not judged, for the same reason one step further on: the guard is
+        # where a call gets its second route. A GraphQL read it answers over REST once GraphQL is spent, and the
+        # reverse; a write whose refusal it reads and re-sends over the other protocol. Typed as `glaeda-gh gh`
+        # -- which is what this tool's own next-step lines print -- the call had one route and no ledger entry.
+        # Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr edit 2358 -R
+        # teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the
+        # identical bare `gh pr edit` answered over REST at once. Unlike a merge or a create, this hand-off is taken only when the guard would hand the
+        # call back here (broker_guard_comes_back) and not for this daemon's own reads, which keep their route.
+        # CMUX_GH_BROKER_DISABLE is honoured here, unlike for a merge or a create: a merge may never be sent
+        # past land_judge and a create may never skip the login's pause, but for an ordinary call that switch is
+        # a person asking for the real gh and the line they typed, and it is the escape hatch the loop message
+        # advertises -- it has to reach every route this broker adds.
+        other = not create and not os.environ.get(GLAEDA_INTERNAL) \
+            and os.environ.get("CMUX_GH_BROKER_DISABLE") != "1" \
+            and os.environ.get(QUOTA_HOP) != str(os.getpid()) and not os.environ.get(BROKER_MARK) \
+            and not broker_answered_here(args)
+        if create or other:
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-                if guard.is_file() and os.access(guard, os.X_OK):
-                    os.environ["PATH"] = os.pathsep.join([str(guard.parent), path])
-                    os.execv(str(guard), [str(guard), *args])
+                if guard.is_file() and os.access(guard, os.X_OK) \
+                        and (create or broker_guard_comes_back(guard)):
+                    # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
+                    # to the process being started. Mutating this process first leaves the guard's directory on
+                    # PATH and the hop mark set for every later call in the same process, which is wrong for
+                    # every in-process caller (a test, the daemon) whenever the exec does not happen.
+                    # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
+                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
-                os.environ["PATH"] = path
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
-        return None  # no guard to ask (or it cannot run): the create runs as before
+        return None  # no guard to ask (or it cannot run): the call runs as before
     # From here the call is a merge: anything that fails refuses it, never runs it unguarded (F2, second review).
     try:
         guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
@@ -24793,6 +25115,8 @@ def post_line(state: dict) -> str:
         return (state.get("url") or "posted") + (f" ({state['note']})" if state.get("note") else "")
     if state["state"] == "failed":
         return f"failed: {state.get('error')}"
+    if state["state"] == "superseded":
+        return f"superseded, not sent: {state.get('note')}"
     parts = [f"queued as {state['id']}", f"{state.get('ahead', 0)} ahead"]
     if state.get("holdUntil") and state["holdUntil"] > time.time():
         parts.append(f"GitHub holds writes for {span(state['holdUntil'] - time.time())}")
@@ -24859,8 +25183,32 @@ def body_guard_refusal(item: dict) -> str | None:
             os.unlink(name)
 
 
+# A host that reads GitHub through an upstream (UPSTREAM_CONFIG) has no login of its own, so the daemon fails
+# every queued write with "this host reads GitHub through its upstream and has no login to post with"
+# (upstream_refuse_posts). Accepting it first costs the caller a whole turn and a `post status` read to learn that
+# (gcp-agent-lane-2, 2026-11-21: three comments were believed queued for an hour, then all three had failed). The
+# refusal happens where the caller is: at accept time, naming the write that does work here.
+def no_login_refusal(item: dict) -> str | None:
+    if upstream_command() is None:
+        return None
+    repo = item.get("repo") or "OWNER/REPO"
+    if item.get("kind") == "pr":
+        hand = f"gh pr create --repo {repo} --title T --body-file F"
+    elif item.get("kind") == "review":
+        hand = f"gh pr review {item.get('number')} --repo {repo} --body-file F"
+    else:
+        hand = f"gh pr comment {item.get('number')} --repo {repo} --body-file F"
+    return (f"this host reads GitHub through its upstream ({UPSTREAM_CONFIG}) and has no login to post with; "
+            f"nothing was queued. Write it with gh, which routes through this host's broker: {hand} "
+            f"(--repo is not optional: without it gh reads the repository of the directory you stand in)")
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
+    why = no_login_refusal(item)
+    if why:
+        print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
+        return 3
     try:
         why = body_guard_refusal(item)
     except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
@@ -24906,11 +25254,13 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
         print(state.get("url") or "posted")
         if state.get("note"):
             print(f"glaeda-gh: {state['note']}", file=sys.stderr)
+    elif state["state"] == "superseded":
+        print(f"glaeda-gh: {post_line(state)}", file=sys.stderr)  # stdout stays a URL or nothing
     else:
         print(post_line(state))
     if state["state"] == "queued" and queued and wait <= 0:
         print(f"glaeda-gh: the daemon posts it and keeps the result: glaeda-gh post status {post_id}", file=sys.stderr)
-    return 0 if state["state"] == "posted" else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
+    return 0 if state["state"] in {"posted", "superseded"} else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
 
 
 # ---------------------------------------------------------------- log job: a finished job's log, read once per host
