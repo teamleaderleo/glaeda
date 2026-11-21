@@ -12582,7 +12582,8 @@ class LandQueue:
         if not data:
             since = e.setdefault("noDataSince", self.now)
             self.nudge(e["key"])
-            if self.now - since >= LAND_NO_DATA_AFTER and self.judge(e, "", fp):  # land_judge reads the head
+            # land_judge reads the head; a full pin (land_full_pin) is judged at once on the caller's own read
+            if (self.now - since >= LAND_NO_DATA_AFTER or land_full_pin(e)) and self.judge(e, "", fp):
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
@@ -12808,7 +12809,15 @@ class LandQueue:
         """SHA when a judgement may pin it, "" when land_judge must read the head itself, None while E waits (nudged)
         for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
         either held, the daemon read nothing for it. Only a head the cache gave is checked: a pin land_judge named (a
-        repin) is its own read. Past the wait with no worker FREE it stays None: unpinned on the next free one."""
+        repin) is its own read. Past the wait with no worker FREE it stays None: unpinned on the next free one.
+        A full pin the caller passed (land_full_pin) is trusted with no read: when the cache shows it, or shows no head
+        (SHA ""), the judgement is pinned to it at once. The merge's --match-head-commit refuses it if it moved; waiting
+        for a fresh read under a short quota (the latch, the reserve) never came, and unpinned land_judge read the head
+        over REST itself (cmuxterm-hq#16805)."""
+        full = land_full_pin(e)
+        if full and (not sha or sha == full):
+            e.pop("staleHead", None)
+            return full
         c = self.cache_of(e["key"]) or {}
         if not sha or str(((c.get("data") or {}).get("headRefOid")) or "").lower() != sha:
             e.pop("staleHead", None)
@@ -14076,6 +14085,12 @@ def land_pin_sha(text: Any) -> str:
     return sha
 
 
+def land_full_pin(e: dict) -> str:
+    """E's --sha when it names a whole commit (40 hex), which a judgement and a merge may pin as given, else ""."""
+    pin = str(e.get("pinSha") or "").lower()
+    return pin if re.fullmatch(r"[0-9a-f]{40}", pin) else ""
+
+
 def land_head_moved(pin: str, head: str) -> bool:
     """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
     return bool(pin and head) and not head.lower().startswith(pin)
@@ -14399,38 +14414,26 @@ def land_queued_by() -> str:
     return reader if "/" in reader else f"{policy_host()}/{reader}"
 
 
-def pr_head_sha(repo: str, number: int) -> str | None:
-    """The PR's head commit now (`gh api repos/R/pulls/N --jq .head.sha`, which the host's shim answers from the
-    daemon's cache), or None when it cannot be read."""
-    try:
-        done = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"],
-                              capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    sha = done.stdout.strip()
-    return sha if done.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+# A pin the caller passes is trusted as given, with no head read: the merge's own --match-head-commit (and land_judge's
+# --sha) refuse a head that moved, and the executor stops head_moved on a read that shows another one. Reading the head
+# here first (`gh api repos/R/pulls/N`) was what refused under a short quota: transcript-lessons (cmuxterm-hq#16805)
+# found a spent shared quota blocking push, PR create and land 9 times in 7 sessions, `land --sha` among them with
+# "cannot read OWNER/REPO#N's head to check --match-head-commit" while the PR it pinned was green.
 
 
 def check_land_pin(repo: str, number: int, pin: str | None) -> None:
-    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): refuse when the PR's head is not SHA
-    (a full or abbreviated one), so a land never takes a push that came after the one the caller judged."""
-    if not pin:
-        return
-    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): only its shape is checked here, so a
+    land is queued whatever the quota; a head other than SHA stops it later (head_moved) and the pinned merge refuses
+    it, so a land never takes a push that came after the one the caller judged. REPO and NUMBER are unused: no read."""
+    del repo, number
+    if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
-    head = pr_head_sha(repo, number)
-    if head is None:
-        raise WatchError(f"cannot read {repo}#{number}'s head to check --match-head-commit {pin[:12]}; "
-                         f"next: glaeda-gh status pr {repo}#{number}")
-    if not head.startswith(pin.lower()):
-        raise WatchError(f"{repo}#{number}'s head moved: it is {head[:12]}, not {pin[:12]}; "
-                         f"next: glaeda-gh land {repo}#{number} --match-head-commit {head}")
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
              pin: str | None = None, override: dict | None = None) -> int:
-    """PIN (--sha or --match-head-commit) is checked against the head now and kept with the request, so the executor
-    stops (head_moved) if a later push moves the head before it merges. OVERRIDE (land_override) rides every merge
+    """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
+    executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
     check_land_pin(repo, number, pin)

@@ -4980,19 +4980,33 @@ class ClientTest(Base):
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
         self.assertEqual((args.words, args.sha), (["manaflow-ai/cmux/48704"], "abc1234"))
         self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
-        head = "a" * 40
-        with mock.patch.object(gg, "pr_head_sha", lambda repo, n: head):
+        with mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("a pin is never checked by a read")):
             gg.check_land_pin("o/r", 1, None)
             gg.check_land_pin("o/r", 1, "aaaaaaa")
-            gg.check_land_pin("o/r", 1, head)
-            with self.assertRaises(gg.WatchError) as moved:
-                gg.check_land_pin("o/r", 1, "bbbbbbb")
-            self.assertIn("head moved", str(moved.exception))
+            gg.check_land_pin("o/r", 1, "a" * 40)
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
-        with mock.patch.object(gg, "pr_head_sha", lambda repo, n: None):
-            with self.assertRaises(gg.WatchError):
-                gg.check_land_pin("o/r", 1, "aaaaaaa")
+
+    def test_land_pin_queues_with_the_shared_quota_spent(self):
+        """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
+        --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
+        land is still queued, with its pin, and nothing was read."""
+        refused = subprocess.CompletedProcess([], 3, "", "gh-quota: refused: REST rate limit is spent for login")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ, {"GLAEDA_STATE_DIR": str(tmp), "GH_QUOTA_STATE": str(tmp / "q")}), \
+                mock.patch.object(gg.subprocess, "run", return_value=refused) as run, \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_judge", return_value=("/bin/true", [])), \
+                mock.patch.object(gg, "land_queue_lane", return_value=""), \
+                mock.patch.object(gg, "land_broker_client", return_value=False), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
+                mock.patch.object(gg, "land_request", return_value="rid-1") as req, \
+                mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            code = gg.cmd_land("o/r#1", [], "host/lane", 0, True, "b" * 40)
+        self.assertEqual(code, gg.EXIT_DOWN)  # queued for the daemon (down in this test), not refused
+        self.assertEqual(req.call_args.kwargs["sha"], "b" * 40)
+        self.assertFalse([c for c in run.call_args_list if c.args and c.args[0][:1] == ["gh"]])
 
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
@@ -24352,6 +24366,41 @@ class LandTest(Base):
         self.assertNotIn("--sha", self.w.explains()[0])
         self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
         self.assert_merged_at(LB)
+
+    def test_a_full_pin_is_judged_at_the_pin_with_no_fresh_read(self):
+        """transcript-lessons (cmuxterm-hq#16805): with the quota short no read since the latch cleared ever came, so a
+        pinned land waited LAND_FRESH_WAIT and then asked land_judge unpinned, which read the head over REST itself. A
+        full --sha the cache also shows is the caller's own read: judged at once, pinned, merged with
+        --match-head-commit, with no nudge answered and nothing unpinned."""
+        self.nudge_reads = False
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.latch("rest", self.t + 600)
+        self.tick(30)
+        self.clear_latch()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(self.w.explains()[0][-3:], ["--sha", LA, "--json"])
+        self.assertNotIn("head_unpinned", [h.get("event") for h in e["history"]])
+        self.assert_merged_at(LA)
+
+    def test_a_full_pin_with_no_cached_copy_is_judged_at_once(self):
+        """No read of the PR at all (the daemon's reads stopped under the reserve): a full pin is judged at once at the
+        pin, not after LAND_NO_DATA_AFTER with land_judge reading the head itself."""
+        self.nudge_reads = False
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assertEqual(self.w.explains()[0][-3:], ["--sha", LB, "--json"])
+
+    def test_a_full_pin_the_cache_contradicts_still_stops(self):
+        """The trust is in the pin, not over a read: a cached head that is not the pin still stops head_moved."""
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
+        e = self.tick(1)
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(e.get("state"), "stopped")
+        self.assertIn("head_moved", json.dumps(e))
 
     # -- due rows starved by the login's latch (huge-blue, 2026-11-18 17:18-19:53Z)
 
