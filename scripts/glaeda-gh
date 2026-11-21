@@ -25434,6 +25434,92 @@ class Parser(argparse.ArgumentParser):
             print_json_error("usage", message + (f" ({spellings})" if spellings else ""), nxt)
         raise SystemExit(64)
 
+    def _get_value(self, action, arg_string):  # type: ignore[override]
+        """Every choice argument here (`--until`, `--event`, `--state`, a kind) takes a synonym or a typo of
+        one choice as that choice, and says on stderr which it ran. Leo, 2026-11-20: "Like we need a bunch of
+        synonyms for code for you guys where it just goes \"eh close enough\" and works" -- `wait --until
+        checks-done` ended two background merge jobs at once. A value as close to two choices is refused."""
+        value = super()._get_value(action, arg_string)
+        choices = action.choices
+        if (not isinstance(value, str) or not isinstance(choices, (tuple, list))
+                or not all(isinstance(c, str) for c in choices) or value in choices):
+            return value
+        meant, near = close_choice(value, choices)
+        if meant:
+            name = action.option_strings[0] if action.option_strings else (action.metavar or action.dest)
+            say_waiting(f"glaeda-gh: {name} `{value}` ran as `{meant}` (choices: {', '.join(choices)})")
+            return meant
+        if len(near) > 1:
+            shown = ", ".join(map(repr, choices))
+            raise argparse.ArgumentError(action, f"invalid choice: {value!r} (choose from {shown}; "
+                                                 f"as close to {' as to '.join(near)}: say which)")
+        return value  # argparse's own refusal follows, with the choices
+
+
+# What agents type for a choice, by the choice it means. One table for every choice argument: a word here is
+# used only where its choice is one of the argument's choices (`merge` is `--until merged` and `--state merged`).
+CHOICE_SYNONYMS = {
+    "done": ("checks-done", "checks", "complete", "completed", "finished", "finish", "all-done", "settled",
+             "terminal", "ended", "end", "over", "checks-finished", "checks-complete", "ci-done"),
+    "green": ("pass", "passed", "passing", "passes", "success", "succeeded", "successful", "ok", "okay",
+              "all-green", "checks-green", "checks-pass", "checks-passed", "ci-green", "good"),
+    "required": ("req", "required-checks", "requires", "require", "must", "needed", "mandatory",
+                 "required-green"),
+    "merged": ("merge", "landed", "land", "merges"),
+    "request-changes": ("request_changes", "changes", "changes-requested", "reject", "rejected", "block"),
+    "approve": ("approved", "approval", "lgtm", "accept"),
+    "all": ("any", "every", "both"),
+    "closed": ("close", "shut"),
+    "open": ("opened", "active"),
+    "prs": ("pr", "pulls", "pull-requests", "pull"),
+    "issues": ("issue",),
+}
+CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
+
+
+def typo_distance(a: str, b: str) -> int:
+    """Edits between two words, a swap of two neighbours counting one (optimal string alignment)."""
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = a[i - 1] != b[j - 1]
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[len(b)]
+
+
+def close_choice(value: str, choices) -> tuple[str, list[str]]:
+    """(the one choice VALUE means, "") or ("", the choices it is equally close to). In order: the choice in
+    another case or with `_` for `-`; a synonym; the start of one word (3 letters at least); one typo (two in a
+    word of 6 letters or more) away from a choice or a synonym. A value as near to two choices means neither."""
+    word = value.strip().lower().replace("_", "-")
+    if not CHOICE_WORD.fullmatch(word):
+        return "", []  # a target (o/r#5, pr:o/r#5) in a choice's place is another mistake: argparse names it
+    spellings = [(c.lower(), c) for c in choices]
+    spellings += [(s, c) for c in choices for s in CHOICE_SYNONYMS.get(c, ())]
+    for test in (lambda s: s == word,
+                 lambda s: len(word) >= 3 and s.startswith(word)):
+        hit = sorted({c for s, c in spellings if test(s)}, key=list(choices).index)
+        if len(hit) == 1:
+            return hit[0], []
+        if hit:
+            return "", hit
+    allowed = 1 if len(word) <= 5 else 2
+    best: dict[str, int] = {}
+    for s, c in spellings:
+        d = typo_distance(word, s)
+        if d <= allowed:
+            best[c] = min(d, best.get(c, d))
+    if not best:
+        return "", []
+    least = min(best.values())
+    near = [c for c in choices if best.get(c) == least]
+    return (near[0], []) if len(near) == 1 else ("", near)
+
 
 KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
 EXTRA_ARGS = re.compile(r"unrecognized arguments: (.+)$")
@@ -25469,7 +25555,7 @@ def kind_spellings(message: str) -> str:
     that a separator was the problem. argparse's own line ("invalid choice: 'pr:o/r/7241'") lists the kinds
     and nothing else, which reads as "pr is not a kind" when the kind was there all along."""
     bad = KIND_CHOICE.search(message)
-    if not bad:
+    if not bad or ": say which)" in message:  # a plain word as close to two kinds (close_choice): no target shape
         return ""
     split = split_kind_prefix(bad.group(1))
     if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
@@ -25716,7 +25802,8 @@ def parser() -> argparse.ArgumentParser:
             until.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
-                                "all but merged exit 4 once the PR conflicts with its base")
+                                "all but merged exit 4 once the PR conflicts with its base. A synonym or a typo "
+                                "of one (checks-done, passed, merge) runs as it, said on stderr")
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
