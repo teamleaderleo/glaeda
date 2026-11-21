@@ -1262,11 +1262,13 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
         return [], None
     if not isinstance(rows, list):
         return [], None
-    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("rest"), int) and not isinstance(r["rest"], bool)
-            and r["rest"] > 0]
-    rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
+    rows = [r for r in rows if isinstance(r, dict) and any(
+        isinstance(r.get(pool), int) and not isinstance(r.get(pool), bool) and r[pool] > 0
+        for pool in ("rest", "graphql"))]
+    rows.sort(key=lambda r: (-max(int(r.get("rest", 0)), int(r.get("graphql", 0))),
+                           str(r.get("caller"))))
     return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source", "host") if k in r} for r in rows[:SPENDERS_TOP]],
-            sum(r["rest"] for r in rows))
+            sum(r.get("rest", 0) for r in rows if isinstance(r.get("rest"), int)))
 
 
 def consumer_share_alarm(rows: list[dict], policy: dict) -> tuple[str, str, dict] | None:
@@ -1352,10 +1354,11 @@ def unlogged_text(limit: int | None, remaining: int | None, reset: float | None,
 
 
 def spenders_text(rows: list[dict]) -> str:
-    if not rows:
+    rest_rows = [r for r in rows if isinstance(r.get("rest"), int) and r["rest"] > 0]
+    if not rest_rows:
         return f"Top REST callers on {policy_host()}: unknown ({Path(SPENDERS_CMD).name} usage gave none); glaeda-gh budget."
-    said = "; ".join(f"{r['caller']} {r['rest']}" + (f" ({r['source']})" if r.get("source") else "") for r in rows)
-    where = "on every login host" if any(r.get("host") for r in rows) else f"on {policy_host()}"
+    said = "; ".join(f"{r['caller']} {r['rest']}" + (f" ({r['source']})" if r.get("source") else "") for r in rest_rows)
+    where = "on every login host" if any(r.get("host") for r in rest_rows) else f"on {policy_host()}"
     return f"Top REST callers {where}, last hour: {said}."
 
 
@@ -3990,11 +3993,13 @@ def daemon_policy() -> dict:
         floors[bucket] = (f if f > raised else raised + (f - r), raised)
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
-    consumer = alarms.get("consumerShare") if isinstance(alarms.get("consumerShare"), dict) else {}
+    consumer_setting = alarms.get("consumerShare")
+    consumer = consumer_setting if isinstance(consumer_setting, dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
-                       "consumerShare": {"fraction": float(_bounded(consumer.get("fraction"), CONSUMER_SHARE_FRACTION, 0.01, 1.0)),
-                                         "minCalls": int(_bounded(consumer.get("minCalls"), CONSUMER_SHARE_MIN_CALLS, 1, 5000))},
+                       "consumerShare": False if consumer_setting is False else {
+                           "fraction": float(_bounded(consumer.get("fraction"), CONSUMER_SHARE_FRACTION, 0.01, 1.0)),
+                           "minCalls": int(_bounded(consumer.get("minCalls"), CONSUMER_SHARE_MIN_CALLS, 1, 5000))},
                        "stale": alarms.get("stale") is not False, "staleRestart": alarms.get("staleRestart") is not False,
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
                        "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
@@ -4133,6 +4138,7 @@ class Daemon:
         self.share_pace_at = float("-inf")  # the last share-pace log line (share_alarm)
         self.share_over_at = float("-inf")  # the last share-over log line (share_alarm: past the cap, the pool fine)
         self.consumer_share_at = float("-inf")  # last fleet consumer-share read, bounded to one alarm window
+        self.consumer_share_verdict: tuple[str, str, dict] | None = None
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -4873,13 +4879,16 @@ class Daemon:
             share = self.share_alarm(self.rest_cap(), rows)
             if share is not None:
                 firing["share"] = share
-        consumer_policy = policy.get("consumerShare") or {}
-        if isinstance(consumer_policy, dict) and self.now - self.consumer_share_at >= ALARM_EVERY:
-            self.consumer_share_at = self.now
-            spenders, _ = host_spenders()
-            consumer = consumer_share_alarm(spenders, consumer_policy)
-            if consumer is not None:
-                firing["consumer-share"] = consumer
+        consumer_policy = policy.get("consumerShare")
+        if isinstance(consumer_policy, dict):
+            if self.now - self.consumer_share_at >= ALARM_EVERY:
+                self.consumer_share_at = self.now
+                spenders, _ = host_spenders()
+                self.consumer_share_verdict = consumer_share_alarm(spenders, consumer_policy)
+            if self.consumer_share_verdict is not None:
+                firing["consumer-share"] = self.consumer_share_verdict
+        else:
+            self.consumer_share_verdict = None
         self.stale_now = self.stale_verdict()
         if policy.get("stale", True):
             stale = self.stale_valve(self.stale_now, policy)
@@ -17959,6 +17968,10 @@ def sweep_lines(doc: dict) -> list[str]:
     for pool, label in (("rest", "REST"), ("graphql", "GraphQL")):
         rows = []
         for host, report in (doc.get("hosts") or {}).items():
+            if not isinstance(report, dict) or not report.get("ok") or report.get("unread"):
+                continue
+            if report.get("brokerClient") and host in brokered:
+                continue
             for caller in (report.get("callers") or []) if isinstance(report, dict) else []:
                 if isinstance(caller, dict) and isinstance(caller.get(pool), int):
                     rows.append({"caller": f"{host}:{caller.get('caller', '?')}", pool: caller[pool]})

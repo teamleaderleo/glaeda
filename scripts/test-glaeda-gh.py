@@ -14981,6 +14981,18 @@ class SpendAlarmTest(AlarmBase):
         self.assertIn("huge-blue:session:nightly consumed 1300/5000 GraphQL", told[0])
         self.assertIn("20% consumer-share threshold", told[0])
 
+    def test_consumer_share_alarm_keeps_firing_until_the_next_observation_clears_it(self) -> None:
+        self.policy(pool=False, share=False, consumerShare={"fraction": 0.2, "minCalls": 100})
+        rows = [{"host": "huge-blue", "caller": "session:nightly", "rest": 0, "graphql": 1300}]
+        with mock.patch.object(gg, "host_spenders", side_effect=[(rows, 0), ([], 0)]):
+            self.daemon.check_alarms()
+            self.daemon.now += gg.ALARM_EVERY + 1
+            self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("1300/5000 GraphQL", told[0])
+        self.assertEqual(self.notice_lines()[-1]["kind"], "consumer-share")
+
     def test_the_pool_alarm_fires_on_a_drain_that_runs_dry_before_the_reset(self) -> None:
         self.policy(pool=True)
         reset = NOW + 3000
