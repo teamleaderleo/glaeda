@@ -209,6 +209,16 @@ HEAD on a branch, tag or remote ref of its repository, which survives, and no co
 own reflog holds. Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
 
+On Linux a top-level temp-dir entry no other class owns, untouched (mtime and ctime, anywhere in its tree)
+for stale_tmp_scratch_hours (12 by default), is the tmp-stale-scratch family's instead of "tmp": a
+bootstrap test's tree, a mktemp checkout, a clippy repo copy, each left by a process that is gone. Its
+checkouts are each judged (nothing unpushed), and it goes only once no process has its cwd, root or an
+open file inside it, read from every /proc entry (with `sudo -n` for other accounts' processes). A proof
+that cannot read every process keeps it, and the family exists only where the proof can be complete.
+Without it 21 GiB of 18-19 h old unheld /tmp trees sat on a full huge-blue (2026-11-21) while the pass freed
+nothing. Unreadable folders the census meets are measured with `sudo -n du` where sudo needs no password,
+so the accounting gap is only what nothing could measure.
+
 A mirror family's item (cmux-job-cache, the hq build cache: mirror_idle_hours) idle DEFAULT_AGE_HOURS goes
 whole, but first archive_mirror writes every commit no remote holds, and every branch or tag only this host
 has (what the servers confirm, never a local remote-tracking ref), into git bundles under ~/archive/glaeda-disk,
@@ -2425,6 +2435,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
+    "stale_tmp_scratch_hours": 12.0,
+    # Read what this account cannot (other users' /proc entries, root-only folders the census meets) with
+    # `sudo -n` where sudo needs no password; false: never
+    "sudo_reads": True,
     # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
     "build_caches_unwindowed": True,
     # Every build cache on a volume together (BUDGET_FAMILY_IDS and the fleet compilation cache) stays under this share of
@@ -5084,6 +5099,147 @@ PERSONAL_BUILD_FAMILY = "personal-build"
 PERSONAL_BUILDS = ("cmux-personal-build",)  # ~/Projects/<name>: someone's own build tree, kept and named
 
 
+# Top-level /tmp scratch no class owns (Leo, 2026-11-21: "evict stale scratch dirs: /tmp entries older than N h that no
+# live process holds open or has as its cwd"). huge-blue sat at 100% with ~21 GiB of 18-19 h old trees in /tmp
+# (hq-bootstrap-test-<pid> 7.6G, two mktemp tmp.* 3.6G, codex-windows-clippy-repo 1.4G) that no process held, while the
+# generic "tmp" family kept them for checkouts below their top level. An entry whose top is older than the window
+# (mtime and ctime) is this family's instead of "tmp"'s; it goes once its whole tree is that old and a read of every
+# /proc entry (cwd, root, open fds; other accounts' with `sudo -n`) shows no holder. An incomplete read holds it.
+STALE_TMP_SCRATCH = "tmp-stale-scratch"
+# Names other classes own, or the system's: dot entries (.X11-unix, .ICE-unix, worktree_reclaim's .wr-removing-*,
+# disk_hygiene's .hygiene-trash-*, .wt-mirrors), acpmux's per-user and peer scratch, disk_hygiene's acae-*, systemd and
+# snap private tmp, tmux and ssh sockets, the lane families' wt-* and bsz, canonical cmux-ci roots, the tmp hold.
+STALE_TMP_PROTECTED_PREFIXES = (".", "acpmux-", "acae-", "systemd-private-", "snap-private-tmp", "tmux-", "ssh-",
+                                "wt-", "bsz", "cmux-ci", "glaeda-tmp-hold-")
+STALE_TMP_PROC_TIMEOUT_S = 60
+STALE_TMP_CTIME = True  # ctime counts as a use too (a chmod, a rename, a hard link); tests that age by utime turn it off
+SUDO_PROBE_TIMEOUT_S = 5
+_SUDO_READS: bool | None = None
+_STALE_TMP_ENABLED: bool | None = None
+_STALE_HOLDERS: tuple[frozenset[str], int] | None = None
+
+# Run in this process and, for other accounts' processes, as `sudo -n python3 -I -c`: every /proc entry's cwd, root
+# and open fds, and the pids whose entries could not be read (a process that exits meanwhile is not one).
+_PROC_LINKS_SRC = r"""
+import os
+def proc_links(proc="/proc", only=None):
+    links, denied = [], []
+    for pid in os.listdir(proc):
+        if not pid.isdigit() or (only is not None and int(pid) not in only):
+            continue
+        base = proc + "/" + pid
+        try:
+            fds = [base + "/fd/" + fd for fd in os.listdir(base + "/fd")]
+        except FileNotFoundError:
+            continue
+        except OSError:
+            denied.append(pid)
+            continue
+        for link in (base + "/cwd", base + "/root", *fds):
+            try:
+                links.append(os.readlink(link))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                denied.append(pid)
+                break
+            except OSError:
+                continue
+    return links, denied
+"""
+_proc_ns: dict[str, Any] = {}
+exec(_PROC_LINKS_SRC, _proc_ns)
+proc_links = _proc_ns["proc_links"]
+
+
+def sudo_reads() -> bool:
+    """Whether `sudo -n` runs here without a password (Linux, not root, policy sudo_reads), probed once per run."""
+    global _SUDO_READS
+    if _SUDO_READS is None:
+        _SUDO_READS = False
+        if not DARWIN and os.geteuid() != 0 and POLICY.get("sudo_reads", True) and shutil.which("sudo"):
+            try:
+                _SUDO_READS = subprocess.run(["sudo", "-n", "true"], capture_output=True,
+                                             timeout=SUDO_PROBE_TIMEOUT_S).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                _SUDO_READS = False
+    return _SUDO_READS
+
+
+def sudo_proc_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str], int] | None:
+    """proc_links as root (`sudo -n`, bounded): every link and how many pids it still could not read; None: no sudo."""
+    if not sudo_reads():
+        return None
+    code = _PROC_LINKS_SRC + "\nimport json, sys\nl, d = proc_links()\nsys.stdout.write(json.dumps([l, len(d)]))\n"
+    python = sys.executable or "/usr/bin/python3"
+    try:
+        out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)), python, "-I", "-c", code],
+                             capture_output=True, text=True, timeout=timeout + 15)
+        links, denied = json.loads(out.stdout) if out.returncode == 0 else (None, None)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    if not isinstance(links, list) or not isinstance(denied, int):
+        return None
+    return [x for x in links if isinstance(x, str)], denied
+
+
+def stale_scratch_holders(fresh: bool = False) -> tuple[frozenset[str], int]:
+    """Every path a process has as its cwd or root or holds open (open_index), and how many processes' entries could
+    not be read: this account's /proc read first, and when it misses any, the whole read again as root."""
+    global _STALE_HOLDERS
+    if _STALE_HOLDERS is not None and not fresh:
+        return _STALE_HOLDERS
+    links, denied = proc_links()
+    unread = len(set(denied))
+    if unread and (rooted := sudo_proc_links()) is not None:
+        links, unread = rooted[0], rooted[1]
+    _STALE_HOLDERS = (open_index(links), unread)
+    return _STALE_HOLDERS
+
+
+def stale_scratch_held(path: Path, fresh: bool = False) -> str:
+    """Why a stale /tmp entry is held ("" when it is proven unheld): a process's cwd, root or open file inside it, or
+    a /proc read that missed a process (an incomplete proof holds it)."""
+    index, unread = stale_scratch_holders(fresh)
+    if unread:
+        return f"not proven unheld: {unread} processes' open files unreadable"
+    if in_cwd(os.fspath(path), index):
+        return "held by a process (its cwd, root or an open file is inside)"
+    return ""
+
+
+def stale_tmp_hours() -> float:
+    return float(POLICY.get("stale_tmp_scratch_hours", 12.0))
+
+
+def stale_tmp_enabled() -> bool:
+    """The family exists on Linux where its holder proof can be complete: sudo reads every process, or this account
+    already can (it is root, or no other account runs anything). Elsewhere "tmp" keeps every entry as before."""
+    global _STALE_TMP_ENABLED
+    if _STALE_TMP_ENABLED is None:
+        _STALE_TMP_ENABLED = (not DARWIN and stale_tmp_hours() > 0
+                              and (sudo_reads() or not proc_links()[1]))
+    return _STALE_TMP_ENABLED
+
+
+def stale_tmp_claims(path: Path, now: float | None = None) -> bool:
+    """Whether a top-level /tmp entry is the stale-scratch family's: not a protected name, no .wt-mirrors layout in
+    it, not a canonical root, and its own mtime and ctime both older than the window."""
+    name = path.name
+    if name.startswith(STALE_TMP_PROTECTED_PREFIXES) or name == f"claude-{os.getuid()}":
+        return False
+    if canonical_root_number(path) is not None:
+        return False
+    try:
+        st = path.lstat()
+        if stat.S_ISDIR(st.st_mode) and os.path.lexists(path / ".wt-mirrors"):
+            return False
+    except OSError:
+        return False
+    cutoff = (time.time() if now is None else now) - stale_tmp_hours() * 3600
+    return max(st.st_mtime, st.st_ctime if STALE_TMP_CTIME else 0.0) < cutoff
+
+
 def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -5109,6 +5265,11 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                skip_prefixes=() if DARWIN else ("wt-", "bsz"), files=True, max_idle_hours=1.0,
                min_bytes=1024**2 if tmpfs or role == "devbox" else None, git_disposable=True, owner="agents and tools",
                rebuild_minutes=0.5, platform=host_cache_platform()),
+        *([Family(STALE_TMP_SCRATCH, tmp, True, "nothing: a process that is gone left it",
+                  skip=(f"claude-{uid}",), skip_prefixes=STALE_TMP_PROTECTED_PREFIXES, files=True,
+                  min_bytes=1024**2, git_disposable=True, nested_git=True, deep_mtime=True,
+                  min_idle_hours=stale_tmp_hours(), owner="nothing: top-level /tmp scratch no class owns",
+                  rebuild_minutes=0.5, platform="linux")] if stale_tmp_enabled() else []),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
         # so a unit's DerivedData can go while the clones below cmux-base and work stay protected.
@@ -6109,7 +6270,7 @@ def item_mtime(fam: Family, path: Path) -> float:
     if fam.id in HOME_SCRATCH_FAMILIES and retired_owner(path):
         return 0.0
     if fam.deep_mtime:
-        return deep_newest_mtime(path)
+        return deep_newest_mtime(path, ctime=fam.id == STALE_TMP_SCRATCH and STALE_TMP_CTIME)
     # Git's index refresh rewrites metadata without using the build output. In
     # the enrolled-account profile that bookkeeping must not extend the cache's
     # reuse window. Active jobs are still protected by process evidence and the
@@ -6973,9 +7134,10 @@ ACPMUX_ROWS_ERROR = ""  # why the last acpmux_rows() read failed; "" when it did
 _SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
 
 
-def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET) -> float:
-    """The newest mtime of path and everything below it (lstat, never following a link). Now, so the item reads as
-    just used, when the walk cannot finish: past BUDGET entries, a directory it cannot list, another filesystem."""
+def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool = False) -> float:
+    """The newest mtime of path and everything below it (lstat, never following a link), and with CTIME the newest
+    ctime too. Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it
+    cannot list, another filesystem."""
     now = time.time()
     try:
         st = path.lstat()
@@ -6983,7 +7145,7 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET) -> float:
         return 0.0
     except OSError:
         return now
-    newest, dev = st.st_mtime, st.st_dev
+    newest, dev = max(st.st_mtime, st.st_ctime) if ctime else st.st_mtime, st.st_dev
     if not stat.S_ISDIR(st.st_mode):
         return newest
     stack = [os.fspath(path)]
@@ -7001,7 +7163,7 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET) -> float:
                         continue
                     except OSError:
                         return now
-                    newest = max(newest, est.st_mtime)
+                    newest = max(newest, est.st_mtime, est.st_ctime if ctime else 0.0)
                     if stat.S_ISDIR(est.st_mode):
                         if est.st_dev != dev:
                             return now  # a mount inside: not this tree's to judge
@@ -10847,6 +11009,10 @@ def candidates(fam: Family) -> list[Path]:
                           or (fam.files and e.is_file(follow_symlinks=False)))]
         if fam.include:
             level = [p for p in level if p.name.startswith(fam.include)]
+        if fam.id == STALE_TMP_SCRATCH:
+            level = [p for p in level if stale_tmp_claims(p)]
+        elif fam.id == "tmp" and not DARWIN and stale_tmp_enabled():
+            level = [p for p in level if not stale_tmp_claims(p)]  # the stale-scratch family's, not judged twice
         if fam.id == NIGHTLY_NEXT_FAMILY:  # kept by role: the dedicated builder's tree and anything unrecognized
             level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
@@ -11298,6 +11464,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(why)
         if in_cwd(sp, opened):
             reasons.append("open by a process")
+        if fam.id == STALE_TMP_SCRATCH and (why := stale_scratch_held(path)):
+            reasons.append(why)
         if named_by(sp, cmds):
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
@@ -12170,8 +12338,10 @@ def reconciled_known_coverage(coverage: list[dict[str, Any]]) -> int:
 # half the volume unexplained (Leo, 2026-10-27: "and how can <100gb be free on >256gb minis all the time").
 # It walks top-down: a directory that is sized is skipped, a directory that holds sized paths is opened and
 # its loose files counted, and any other directory gets one throttled `du` as "unclassified:<path>". A walk
-# that times out is opened one level instead, so the next slice resumes at a finer grain. It never deletes,
-# never uses sudo, and a root-only directory is reported as "unreadable:<path>" with du's lower bound.
+# that times out is opened one level instead, so the next slice resumes at a finer grain. It never deletes. A
+# directory it cannot fully read is measured with `sudo -n du` where sudo needs no password (sudo_reads), so it
+# counts as measured, not gap (Leo, 2026-11-21: "make it count the unreadable dirs with sudo, so its accounting gap is
+# real"); without sudo it is reported as "unreadable:<path>" with du's lower bound.
 CENSUS_STATE = HOME / ".cache/glaeda-disk/census.json"
 CENSUS_LOCK = HOME / ".cache/glaeda-disk/census.lock"
 CENSUS_EVERY_S = 24 * 3600  # a new census starts at most once a day
@@ -12307,6 +12477,76 @@ def _census_du(path: Path, timeout: float) -> tuple[int, bool] | None:
     return int(sized[-1][0]) * 1024, not any(line.startswith("du:") for line in lines)
 
 
+def _census_sudo_du(path: Path, timeout: float) -> int | None:
+    """Disk usage of path in bytes as root (`sudo -n du -xs -B1`, bounded by TIMEOUT), or None: no sudo here, a
+    timeout, or du still could not read all of it. Blocks, like df's used and the census's own du -k, not apparent
+    sizes, so a measured row and the gap it closes are the same unit."""
+    if not sudo_reads():
+        return None
+    t = max(5, int(timeout))
+    argv = ["sudo", "-n", *([ionice, "-c", "3"] if (ionice := shutil.which("ionice")) else []),
+            "timeout", "-k", "5", str(t), "du", "-xs", "-B1", "--", str(path)]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=t + 15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    fields = out.stdout.strip().splitlines()[-1].split(None, 1) if out.stdout.strip() else []
+    if out.returncode != 0 or len(fields) != 2 or not fields[0].isdigit():
+        return None
+    return int(fields[0])
+
+
+def _census_unreadable_row(state: dict[str, Any], key: str, lower: int, timeout: float) -> list[Any]:
+    """The row for a directory this account could not fully read: sudo's full measure when it has one (recorded in
+    the state's sudo_measured), else du's lower bound as "unreadable"."""
+    tried = state.setdefault("sudo_tried", [])
+    if key not in tried:
+        tried.append(key)
+    sized = _census_sudo_du(Path(key), timeout)
+    if sized is None:
+        return [lower, "unreadable", False]
+    measured = state.setdefault("sudo_measured", [])
+    if key not in measured:
+        measured.append(key)
+    return [sized, "unclassified", True]
+
+
+def census_sudo_remeasure(state: dict[str, Any], budget_s: float = CENSUS_BUDGET_S, clock=time.monotonic,
+                          path: Path | None = None) -> int:
+    """Measure, with sudo, each unreadable row of a census that was not tried yet (a census finished before sudo
+    reads, or on a day sudo was refused): the number of rows it measured. Saves the state when it changed."""
+    if not sudo_reads():
+        return 0
+    rows = state.get("rows")
+    if not isinstance(rows, dict):
+        return 0
+    deadline = clock() + budget_s
+    tried = state.setdefault("sudo_tried", [])
+    done = 0
+    for key, row in sorted(rows.items(), key=lambda kv: -(kv[1][0] if isinstance(kv[1], list) and kv[1]
+                                                          and isinstance(kv[1][0], int) else 0)):
+        if clock() >= deadline:
+            break
+        if not (isinstance(row, list) and len(row) > 1 and row[1] == "unreadable") or key in tried:
+            continue
+        if not os.path.lexists(key):
+            continue
+        new = _census_unreadable_row(state, key, int(row[0]) if isinstance(row[0], int) else 0,
+                                     max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
+        rows[key] = new
+        done += new[1] != "unreadable"
+    save_census(state, path)
+    return done
+
+
+def census_sudo_pending(state: dict[str, Any]) -> bool:
+    """Whether a census holds unreadable rows sudo has not tried yet (and sudo reads here)."""
+    rows = state.get("rows") if isinstance(state.get("rows"), dict) else {}
+    tried = set(state.get("sudo_tried") or [])
+    return any(isinstance(r, list) and len(r) > 1 and r[1] == "unreadable" and k not in tried
+               for k, r in rows.items()) and sudo_reads()
+
+
 def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | None = None, *,
                 budget_s: float = CENSUS_BUDGET_S, now: float | None = None, clock=time.monotonic,
                 path: Path | None = None, open_also: frozenset[str] = frozenset()) -> dict[str, Any]:
@@ -12356,7 +12596,8 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
             names = sorted(name for name in os.listdir(current) if name > after)
         except OSError:
             probe = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
-            rows[key] = [probe[0] if probe else 0, "unreadable", False]
+            rows[key] = _census_unreadable_row(state, key, probe[0] if probe else 0,
+                                               max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
             return True
         children: list[str] = []
         for name in names:
@@ -12422,7 +12663,9 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
                         break
                 else:
                     size, complete = result
-                    rows[key] = [size, "unclassified" if complete else "unreadable", complete]
+                    rows[key] = ([size, "unclassified", True] if complete else
+                                 _census_unreadable_row(state, key, size,
+                                                        max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock()))))
             if clock() - saved >= CENSUS_SAVE_EVERY_S:
                 save_census(state, path)
                 saved = clock()
@@ -12446,7 +12689,8 @@ def census_for(dev: int, state: dict[str, Any] | None = None) -> dict[str, Any] 
     """The newest complete census of this volume (or the one in progress before any completed)."""
     state = load_census() if state is None else state
     if state.get("complete") and state.get("dev") == dev:
-        return {"rows": state.get("rows", {}), "complete": True, "at": state.get("completed_at")}
+        return {"rows": state.get("rows", {}), "complete": True, "at": state.get("completed_at"),
+                "sudo_measured": list(state.get("sudo_measured") or [])}
     last = state.get("last")
     if isinstance(last, dict) and last.get("dev") == dev and last.get("rows"):
         return {"rows": last["rows"], "complete": True, "at": last.get("completed_at")}
@@ -12578,7 +12822,10 @@ def _background_argv(argv: list[str]) -> list[str]:
 
 def launch_background_census() -> bool:
     """Start one detached, throttled census slice when one is due, handing it the lock this process took."""
-    if not CENSUS_AUTOLAUNCH or not census_roots() or not census_due(load_census(), time.time()):
+    if not CENSUS_AUTOLAUNCH or not census_roots():
+        return False
+    state = load_census()
+    if not census_due(state, time.time()) and not (state.get("complete") and census_sudo_pending(state)):
         return False
     with contextlib.suppress(OSError):
         if root_census_for(DATA_VOLUME.stat().st_dev, time.time()) is not None:
@@ -12634,6 +12881,10 @@ def census_main(args: list[str]) -> int:
     signal.alarm(int(budget + 3 * CENSUS_DU_TIMEOUT_S))
     with handle:
         roots, state = census_roots(), load_census()
+        if roots and state.get("complete") and not census_due(state, time.time()) and census_sudo_pending(state):
+            done = census_sudo_remeasure(state, budget_s=budget)
+            print(f"census not due; measured {done} unreadable dirs with sudo")
+            return 0
         if not roots or not census_due(state, time.time()):
             print("census not due; skipped")
             return 0
@@ -13040,9 +13291,11 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
             gap = unclassified
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
+            sudo_measured = len(census.get("sudo_measured") or [])
             # an APFS volume (macOS, or its sibling volumes read) hides purgeable space; a Linux one only open-deleted files
             residual = (APFS_INVISIBLE if DARWIN or volumes else OPEN_DELETED) + (
                 f" and {unreadable} unreadable or skipped dirs (lower bounds)" if unreadable else "") \
+                + (f"; {sudo_measured} measured with sudo" if sudo_measured else "") \
                 + census_unreadable_named(census)
         else:
             gap = max(0, unclassified - known_coverage)
@@ -14098,6 +14351,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == LUME_BENCH_IMAGES and lume_vm_held(p, cmds))
                 or (fam.id in BUILD_STATE_FAMILY_IDS and build_state_held(fam, p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
+                or (fam.id == STALE_TMP_SCRATCH and stale_scratch_held(p, fresh=True))
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))

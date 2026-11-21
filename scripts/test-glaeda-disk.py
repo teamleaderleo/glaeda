@@ -15625,5 +15625,245 @@ class QueuedDiskWantTest(unittest.TestCase):
         self.assertEqual(gd.queued_disk_want(self.cap), 0)
         self.assertEqual(gd.queued_disk_want(self.cap / "missing"), 0)
 
+
+class StaleTmpScratchTest(unittest.TestCase):
+    """Top-level /tmp scratch no class owns (Leo, 2026-11-21: "evict stale scratch dirs: /tmp entries older than N h
+    that no live process holds open or has as its cwd"): a stale, unheld tree goes; a fresh one, one a process has
+    as its cwd or holds an open fd in, one whose holders cannot all be read, and a protected name stay."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        saved = (gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS,
+                 gd._SUDO_READS, gd.NESTED_KEEP)
+        gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME = self.home, False, "devbox", False
+        gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd._SUDO_READS = True, None, False
+        gd.NESTED_KEEP = self.home / ".nested-keep.json"
+        gd._DISCOVERED.clear()
+
+        def restore() -> None:
+            (gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS,
+             gd._SUDO_READS, gd.NESTED_KEEP) = saved
+            gd._DISCOVERED.clear()
+        self.addCleanup(restore)
+        self.addCleanup(self.tmp.cleanup)
+        # the holder proof reads only this test process's /proc entry: every other process is out of scope here
+        real = gd.proc_links
+        patcher = mock.patch.object(gd, "proc_links", side_effect=lambda proc="/proc", only=None:
+                                    real(proc, only={os.getpid()}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def age(tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def scratch(self, name: str, hours: float = 19.0) -> Path:
+        d = self.fake_tmp / name
+        (d / "deep/er").mkdir(parents=True)
+        (d / "deep/er/blob").write_bytes(b"x" * (2 * 1024 * 1024))
+        self.age(d, hours)
+        return d
+
+    def families(self) -> list[gd.Family]:
+        fams = [f for f in gd.default_families("devbox") if f.id in ("tmp", gd.STALE_TMP_SCRATCH)]
+        return [replace(f, root=self.fake_tmp) for f in fams]
+
+    def survey(self, fams: list[gd.Family]) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(["/nonexistent"], "ps")):
+            return {Path(i.path).name: i for i in gd.survey(fams, 0.5, 0)}
+
+    def apply(self, fams: list[gd.Family], items: list[gd.Item]) -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=(["/nonexistent"], "ps")), \
+                mock.patch.object(gd, "command_lines", return_value="ps"):
+            gd.apply(items, {f.id: f for f in fams}, receipt, None, 0.5, all_families=fams)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_a_stale_unheld_entry_goes_through_the_deletion_path_with_a_receipt(self) -> None:
+        stale = self.scratch("hq-bootstrap-test-2327741")
+        fams = self.families()
+        self.assertIn(gd.STALE_TMP_SCRATCH, [f.id for f in fams])
+        items = self.survey(fams)
+        item = items["hq-bootstrap-test-2327741"]
+        self.assertEqual((item.family, item.verdict), (gd.STALE_TMP_SCRATCH, "reclaimable"), item.reasons)
+        self.assertEqual(sum(1 for i in items.values() if i.path == str(stale)), 1)  # not judged by "tmp" too
+        receipt = self.apply(fams, list(items.values()))
+        self.assertFalse(stale.exists())
+        rec = [json.loads(line) for line in receipt.splitlines()]
+        self.assertTrue(any(r["family"] == gd.STALE_TMP_SCRATCH and r["path"] == str(stale) for r in rec), rec)
+
+    def test_a_fresh_entry_stays(self) -> None:
+        old_top = self.scratch("tmp.TIZHFrNfa4")
+        os.utime(old_top / "deep/er/blob", (time.time() - 3600,) * 2)  # its top is old, a file below is not
+        young = self.scratch("tmp.s2t7C9arjn", hours=3.0)
+        items = self.survey(self.families())
+        self.assertEqual(items["tmp.TIZHFrNfa4"].family, gd.STALE_TMP_SCRATCH)
+        self.assertEqual(items["tmp.TIZHFrNfa4"].verdict, "recent")
+        self.assertEqual(items["tmp.s2t7C9arjn"].family, "tmp")  # young at its top: the generic family's
+        self.assertTrue(old_top.exists() and young.exists())
+
+    def test_a_just_changed_ctime_keeps_it_whatever_its_mtime(self) -> None:
+        gd.STALE_TMP_CTIME = True
+        d = self.scratch("codex-windows-clippy-repo")  # mtime 19 h back, ctime now (utime itself sets it)
+        self.assertFalse(gd.stale_tmp_claims(d))
+        self.assertGreater(gd.deep_newest_mtime(d, ctime=True), time.time() - 60)
+
+    def test_an_entry_a_process_has_as_its_cwd_stays(self) -> None:
+        held = self.scratch("cwd-held")
+        here = os.getcwd()
+        os.chdir(held / "deep")
+        try:
+            items = self.survey(self.families())
+        finally:
+            os.chdir(here)
+        self.assertEqual(items["cwd-held"].verdict, "in-use")
+        self.assertIn("held by a process (its cwd, root or an open file is inside)", items["cwd-held"].reasons)
+
+    def test_an_entry_a_process_holds_an_open_fd_in_stays_even_when_it_opens_after_the_survey(self) -> None:
+        held = self.scratch("fd-held")
+        fams = self.families()
+        items = self.survey(fams)
+        self.assertEqual(items["fd-held"].verdict, "reclaimable")
+        with open(held / "deep/er/blob", "rb"):  # opened between the survey and the delete: apply re-reads /proc
+            gd._STALE_HOLDERS = None
+            receipt = self.apply(fams, list(items.values()))
+        self.assertTrue(held.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_an_incomplete_holder_proof_holds_it(self) -> None:
+        self.scratch("unprovable")
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])):
+            items = self.survey(self.families())
+        self.assertEqual(items["unprovable"].verdict, "in-use")
+        self.assertIn("not proven unheld: 1 processes' open files unreadable", items["unprovable"].reasons)
+
+    def test_without_a_complete_proof_there_is_no_stale_family(self) -> None:
+        gd._STALE_TMP_ENABLED = None
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])):
+            self.assertFalse(gd.stale_tmp_enabled())
+        gd._STALE_TMP_ENABLED = None
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])), \
+                mock.patch.object(gd, "sudo_reads", return_value=True):
+            self.assertTrue(gd.stale_tmp_enabled())
+
+    def test_protected_names_stay(self) -> None:
+        names = [".X11-unix", "acpmux-peer-scratch-1000-x", f"claude-{os.getuid()}", "systemd-private-abc",
+                 "tmux-1000", "ssh-XXXXabc", "acae-1", "wt-mirror"]
+        for name in names:
+            self.scratch(name)
+        mirrors = self.scratch("layout-root")
+        (mirrors / ".wt-mirrors").mkdir()
+        self.age(mirrors, 19.0)
+        fam = [f for f in self.families() if f.id == gd.STALE_TMP_SCRATCH][0]
+        self.assertEqual(gd.candidates(fam), [])
+        items = self.survey(self.families())
+        self.assertFalse(any(i.family == gd.STALE_TMP_SCRATCH for i in items.values()), items)
+
+    def test_a_nested_checkout_with_unpushed_work_stays(self) -> None:
+        d = self.scratch("mktemp-checkout")
+        repo = d / "deep/repo"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+        (repo / "f").write_text("work")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "unpushed"], check=True, env=env)
+        self.age(d, 19.0)
+        items = self.survey(self.families())
+        self.assertEqual(items["mktemp-checkout"].family, gd.STALE_TMP_SCRATCH)
+        self.assertNotEqual(items["mktemp-checkout"].verdict, "reclaimable", items["mktemp-checkout"].reasons)
+
+    def test_the_real_proc_read_sees_this_process_cwd_and_open_fd(self) -> None:
+        d = self.scratch("real-proc")
+        with open(d / "deep/er/blob", "rb"):
+            links, denied = gd._proc_ns["proc_links"](only={os.getpid()})
+        self.assertEqual(denied, [])
+        self.assertIn(str(d / "deep/er/blob"), links)
+        self.assertIn(os.getcwd(), links)
+
+
+class CensusSudoTest(unittest.TestCase):
+    """The census measures a directory it cannot read with `sudo -n du` where sudo needs no password, so the
+    accounting gap is real (Leo, 2026-11-21: "make it count the unreadable dirs with sudo"); without sudo it keeps
+    du's lower bound as "unreadable", as before."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name)) / "vol"
+        self.root.mkdir()
+        self.state = Path(self.tmp.name) / "census.json"
+        saved = (gd.DARWIN, gd.CENSUS_STATE, gd._SUDO_READS)
+        gd.DARWIN, gd.CENSUS_STATE = False, self.state
+        locked = self.root / "locked"
+        (locked / "inner").mkdir(parents=True)
+        (locked / "inner/blob").write_bytes(os.urandom(64 * 1024))
+        (self.root / "open").mkdir()
+        os.chmod(locked, 0)
+        self.locked = locked
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: os.chmod(locked, 0o755))
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "CENSUS_STATE", saved[1]),
+                                 setattr(gd, "_SUDO_READS", saved[2])))
+
+    def run_census(self) -> dict:
+        return gd.census_pass([self.root], set(), None, now=50.0, path=self.state)
+
+    def test_sudo_measures_an_unreadable_dir_as_measured_not_gap(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = True
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"123456\t{argv[-1]}\n", stderr="")
+        with mock.patch.object(gd.subprocess, "run", side_effect=fake_run):
+            state = self.run_census()
+        row = state["rows"][str(self.locked)]
+        self.assertEqual(row, [123456, "unclassified", True])
+        self.assertIn(str(self.locked), state["sudo_measured"])
+        argv = calls[-1]
+        self.assertEqual(argv[:2], ["sudo", "-n"])
+        self.assertIn("timeout", argv)
+        self.assertEqual(argv[-4:], ["-xs", "-B1", "--", str(self.locked)], argv)
+
+    def test_without_sudo_the_old_lower_bound_stays(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = False
+        state = self.run_census()
+        row = state["rows"][str(self.locked)]
+        self.assertEqual(row[1:], ["unreadable", False])
+        self.assertNotIn("sudo_measured", state)
+
+    def test_a_refused_sudo_keeps_the_lower_bound_and_a_later_remeasure_fills_it(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = False
+        state = self.run_census()
+        self.assertTrue(state["complete"])
+        gd._SUDO_READS = True
+        self.assertTrue(gd.census_sudo_pending({**state, "sudo_tried": []}))
+        state["sudo_tried"] = []
+        with mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 0, stdout=f"4096\t{argv[-1]}\n", stderr="")):
+            self.assertEqual(gd.census_sudo_remeasure(state, path=self.state), 1)
+        self.assertEqual(state["rows"][str(self.locked)], [4096, "unclassified", True])
+        self.assertFalse(gd.census_sudo_pending(state))
+        with mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="sudo: a password is required")):
+            self.assertIsNone(gd._census_sudo_du(self.locked, 5))
+
+
 if __name__ == "__main__":
     unittest.main()
