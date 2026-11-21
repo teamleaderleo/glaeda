@@ -10057,6 +10057,18 @@ class FileAndPidWaitTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             gg.cmd_wait_pid("abc", 1, False)
 
+    def test_log_job_takes_the_repo_and_id_in_one_word(self) -> None:
+        """`log job OWNER/REPO/ID` (called so 2026-11-21: argparse refused it) and a job URL read as `log job O/R ID`."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "job", "o/r/7"]), ["log", "job", "o/r", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "errors", "https://github.com/o/r/actions/runs/5/job/7",
+                                                 "--max", "9"]), ["log", "errors", "o/r", "7", "--max", "9"])
+            self.assertEqual(gg.parser().parse_args(gg.log_job_synonym(["log", "job", "o/r/7"])).job, 7)
+        self.assertEqual(err.getvalue().count("read as"), 3)
+        for same in (["log", "job", "o/r", "7"], ["log", "job", "o/r/7", "8"], ["log", "search", "o/r/7"]):
+            self.assertEqual(gg.log_job_synonym(same), same)
+
     def test_log_repo_job_flag_reads_as_log_job(self) -> None:
         """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
         err = io.StringIO()

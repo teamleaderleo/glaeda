@@ -23735,8 +23735,20 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+LOG_JOB_ONE_WORD = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)/(?:actions/runs/\d+/job/)?(\d+)/?")
+
+
 def log_job_synonym(raw: list[str]) -> list[str]:
-    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that."""
+    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that. So is
+    `log job|errors OWNER/REPO/ID` or a job's URL in one word (the shape `status run` and a failed check print;
+    2026-11-21 it cost a usage error)."""
+    given = [w for w in raw[3:4] if w.isdigit()] + [w for w in raw[3:] if w.startswith("--job")]  # an id already
+    one = LOG_JOB_ONE_WORD.fullmatch(raw[2]) if len(raw) >= 3 and raw[:2] in (["log", "job"], ["log", "errors"]) \
+        and not given else None
+    if one:
+        fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
+        print(f"glaeda-gh: read as `{' '.join(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw
     rest = raw[2:]
