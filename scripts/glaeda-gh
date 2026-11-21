@@ -50,10 +50,11 @@
                                                         (~/.config/glaeda/on-event.json), and what each one did
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
-    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--wait S] [--json]
-                                                        land a PR: the daemon asks land_judge, takes each step it
+    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
+                   [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
-                                                        pinned merge) and tells the requester on a merge or a stop
+                                                        pinned merge) and tells the requester on a merge or a stop;
+                                                        --sha lands only that head (another stops it: head_moved)
     glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day
     glaeda-gh land cancel OWNER/REPO#N                  stop landing it (a step already started finishes)
 
@@ -11303,6 +11304,16 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
+        # --sha pins the head this request lands; a request without one (a re-request too) lands whatever head is
+        # judged, as before.
+        try:
+            pin = land_pin_sha(req.get("sha"))
+        except WatchError:
+            pin = ""
+        if pin:
+            e["pinSha"] = pin
+        else:
+            e.pop("pinSha", None)
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -12524,6 +12535,10 @@ class LandQueue:
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
+        if land_head_moved(str(e.get("pinSha") or ""), sha):
+            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+            return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             if not free or self.snapshot(e["key"], sha)[1] == "wait":
@@ -13645,7 +13660,7 @@ def land_request_path(rid: str) -> Path:
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
-                 queued_by: str = "", lane: tuple[str, str] | None = None) -> str:
+                 queued_by: str = "", lane: tuple[str, str] | None = None, sha: str = "") -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
     request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
     steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
@@ -13659,8 +13674,25 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
     write_json(LandQueue.requests_dir() / f"{name}.json",
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
-                "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {}))
+                "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {})
+               | ({"sha": sha} if sha else {}))
     return rid
+
+
+LAND_PIN_SHA = re.compile(r"[0-9a-f]{7,40}")
+
+
+def land_pin_sha(text: Any) -> str:
+    """A --sha as the queue keeps it (lowercase hex, 7 to 40), or "" for none; anything else is an error."""
+    sha = str(text or "").strip().lower()
+    if sha and not LAND_PIN_SHA.fullmatch(sha):
+        raise WatchError(f"--sha is 7 to 40 hex characters: {str(text)[:60]!r}")
+    return sha
+
+
+def land_head_moved(pin: str, head: str) -> bool:
+    """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
+    return bool(pin and head) and not head.lower().startswith(pin)
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:
@@ -13900,7 +13932,7 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
-                       as_json: bool) -> int:
+                       as_json: bool, sha: str = "") -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -13910,12 +13942,12 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
-           "laneHost": policy_host() if lane else ""}
+           "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {})
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
-                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"])))
+                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]), sha=sha))
     if not why:
         try:
             out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
@@ -13949,14 +13981,15 @@ def land_queued_by() -> str:
     return reader if "/" in reader else f"{policy_host()}/{reader}"
 
 
-def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool) -> int:
+def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool, sha: str = "") -> int:
     key, repo, number = land_key(target)
+    sha = land_pin_sha(sha)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
-        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json)
+        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha)
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -13969,7 +14002,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         return EXIT_FAIL
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source, lane=(lane, policy_host() if lane else ""))
+                       source, lane=(lane, policy_host() if lane else ""), sha=sha)
     no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
                f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
                "lease") if not lane and land_broker_client() else ""
@@ -14049,13 +14082,18 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
             land_key(a)
     except (WatchError, TypeError):
         return None, f"not a pull request: {str(req.get('target'))[:80]!r}"
+    try:
+        land_pin_sha(req.get("sha"))
+    except WatchError as error:
+        return None, str(error)
     requester = str(req.get("requester") or "")
     if requester and not LAND_REQUESTER_SHAPE.fullmatch(requester):
         return None, f"not a requester (HOST/SESSION, no spaces, at most 200): {requester[:80]!r}"
     queued_by = str(req.get("queuedBy") or "")
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
-                       rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req))
+                       rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req),
+                       sha=land_pin_sha(req.get("sha")))
     return rid, ""
 
 
@@ -23659,8 +23697,11 @@ def parser() -> argparse.ArgumentParser:
                          "stops this one")
     ld.add_argument("--notify", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (default this host/$ACPMUX_SESSION_NAME)")
-    ld.add_argument("--wait", type=seconds, default=0, metavar="S",
-                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
+    ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
+                         "--timeout is the same")
+    ld.add_argument("--sha", metavar="SHA",
+                    help="land only this head (7 to 40 hex): the land stops (head_moved) if the PR's head is another")
     ld.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
@@ -23767,7 +23808,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json)
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha or "")
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:

@@ -21369,6 +21369,39 @@ class LandTest(Base):
         self.tick(30)
         self.assert_merged_at(LA)
 
+    def test_sha_pins_the_land_to_that_head(self):
+        # `glaeda-gh land o/r#1 --sha SHA` (an agent typed it, 2026-11-21, and argparse refused it): the head it names
+        # merges; another head stops the land (head_moved) before land_judge or a merge, naming the land again.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA[:12])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_sha_pin_stops_when_the_head_is_another(self):
+        self.pr(LB)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.explains(), self.w.gh_calls("pr", "merge")),
+                         ("stopped", "head_moved", [], []))
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        self.assertIn("stopped: head_moved", self.w.sent()[-1][-1])
+        # A land again without --sha drops the pin: it lands the head judged, as before.
+        self.land()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertNotIn("pinSha", e)
+        self.assert_merged_at(LB)
+
+    def test_land_takes_timeout_as_wait_and_a_sha(self):
+        args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
+        self.assertEqual((args.wait, args.sha), (1400, LA))
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--wait", "5"]).wait, 5)
+        self.assertEqual(gg.land_pin_sha(LA.upper()), LA)
+        with self.assertRaises(gg.WatchError):
+            gg.land_pin_sha("not-a-sha")
+        self.assertEqual(gg.land_serve_one({"op": "land", "target": "o/r#1", "sha": "zz"})[0], None)
+
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)
         self.pr(LC, key="pr:o/r#2")
