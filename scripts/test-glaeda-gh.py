@@ -6117,6 +6117,8 @@ class FleetBudgetTest(Base):
         self.assertRegex(text, r"top sessions and callers \(1 of 40\)")
         self.assertRegex(text, r"broker:gcp-agent-lane-4/ws-check +REST +778")
         self.assertRegex(text, r"session:glaeda-land +REST +583")
+        self.assertIn("ledger REST: 1361 observed; top consumers broker:gcp-agent-lane-4/ws-check=778, session:glaeda-land=583", text)
+        self.assertIn("ledger GraphQL: 360 observed; top consumers session:glaeda-land=360, broker:gcp-agent-lane-4/ws-check=0", text)
         self.assertIn("not seen: other-host: census has no gh_spend", text)
         self.assertIn("  quiet-host: no census reached the view; reports: its NOW census carries gh_spend", text)
         self.assertIn("hard reserve: 500 REST, 500 GraphQL", text)

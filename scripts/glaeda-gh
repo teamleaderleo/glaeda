@@ -17834,6 +17834,14 @@ def view_lines(view: dict) -> list[str]:
             out.append(f"  {h.get('host')}: {h.get('why')}; reports: {h.get('report')}")
     for gap in (view.get("gaps") or [])[:10]:
         out.append(f"not seen: {gap}")
+    for pool, label in (("rest", "REST"), ("graphql", "GraphQL")):
+        rows = []
+        for key in ("sessions", "lane_vm_sessions"):
+            rows.extend(r for r in (view.get(key) or []) if isinstance(r, dict) and isinstance(r.get(pool), int))
+        rows.sort(key=lambda r: (-r[pool], str(r.get("caller") or "?"), str(r.get("host") or "?")))
+        total = sum(r[pool] for r in rows)
+        top = ", ".join(f"{r.get('caller', '?')}={r[pool]}" for r in rows[:5]) or "none"
+        out.append(f"ledger {label}: {total} observed; top consumers {top}")
     return out
 
 
@@ -17911,6 +17919,15 @@ def sweep_lines(doc: dict) -> list[str]:
             parts.append(f"0 {POOL_NAMES[bucket]} (the read hosts' last hour holds {-g['unattributed']} more than "
                          f"GitHub's window to {hhmm(g.get('reset'))} counted, {g['used']}: the windows differ)")
     out.append("  unattributed: " + "; ".join(parts))
+    for pool, label in (("rest", "REST"), ("graphql", "GraphQL")):
+        rows = []
+        for host, report in (doc.get("hosts") or {}).items():
+            for caller in (report.get("callers") or []) if isinstance(report, dict) else []:
+                if isinstance(caller, dict) and isinstance(caller.get(pool), int):
+                    rows.append({"caller": f"{host}:{caller.get('caller', '?')}", pool: caller[pool]})
+        rows.sort(key=lambda r: (-r[pool], r["caller"]))
+        top = ", ".join(f"{r['caller']}={r[pool]}" for r in rows[:5]) or "none"
+        out.append(f"ledger {label}: {sum(r[pool] for r in rows)} observed; top consumers {top}")
     return out
 
 
