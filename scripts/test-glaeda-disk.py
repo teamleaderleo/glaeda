@@ -10344,6 +10344,29 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.remember_bundle_failure(path, mtime, "unreadable refs", 5)
         self.assertIsNotNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 3700))
 
+    def test_a_remembered_failure_is_retried_by_a_new_glaeda_disk_or_once_free_space_has_grown(self) -> None:
+        """cmux17, 2026-11-21: ~/m2l-viewer's bundle failed "no room" at 5.1G free and stayed kept at 16G free, and the
+        hot-verify mirror stayed kept on a judgement #2277 had fixed: 9.8G reclaimable, 0 reclaimed every pass."""
+        path, mtime = os.fspath(self.home / "tree"), 100.0
+        gd.remember_bundle_failure(path, mtime, "x: has linked worktrees outside it or missing; kept", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+        self.assertEqual(gd.load_bundle_failures()[path]["glaeda"], gd.glaeda_disk_sha256())
+        with mock.patch.object(gd, "_OWN_SHA256", "another"):
+            self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+        doc = gd.load_bundle_failures()
+        del doc[path]["glaeda"]  # recorded by a glaeda-disk before this field
+        gd.bundle_failures_path().write_text(json.dumps(doc))
+        self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+        free = 50 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", lambda p: (free, 100 * gd.GIB)):
+            gd.remember_bundle_failure(path, mtime, "bundle of x/.git: no room: its peak needs 5.6G free", 5)
+            self.assertEqual(gd.load_bundle_failures()[path]["free"], free)
+            self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+            free += gd.GIB // 2
+            self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+            free += gd.GIB
+            self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+
     def test_a_worktree_reflog_only_commit_of_an_outside_repository_goes_to_a_bundle(self) -> None:
         """cmux10s ~/cnx-macnext, cmux13s chiefinv/src, cmuxs-3 ~/cnx-hybrid: a worktree of ~/cmux whose detached
         commits only its reflog holds kept the tree forever, since git bundle had no ref to name."""
