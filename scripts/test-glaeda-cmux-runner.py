@@ -17382,6 +17382,60 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(register["previousLabels"],
                          ["ARM64", "glaeda-mini", "glaeda-side-std-xcode-26.6", "macOS", "self-hosted"])
 
+    def test_an_apply_records_the_labels_github_holds_so_a_receipt_stops_understating(self) -> None:
+        # hq#16433: registration.labels recorded what an install last *asked* GitHub for - the receipt says so
+        # itself, stamping "GitHub labels could not be read; re-registering with the supplied token" - and only a
+        # successful relabel rewrote it. Once GitHub held the newer set, every later pass read GitHub, found nothing
+        # to do (an "unchanged" register writes a registration only when there is none) and left the receipt
+        # understating the runner for good. The gate reads exactly these labels (glaeda-cmux-runner-hook's
+        # runner_labels -> cap_labels) and filters every controller-feed read with
+        # `set(job["labels"]) <= cap_labels`, so an understating receipt hid takeable jobs from a runner that could
+        # run them: on 2026-11-21 two minis' instance-1 and instance-2 read side-light while GitHub dispatched
+        # side-std jobs to both. Whenever a plan read GitHub's own labels, the receipt now records that reading.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            held = sorted(first["registration"]["labels"])
+            self.assertEqual(first["registration"]["labelsSource"], "registered",
+                             "a register of our own records what GitHub accepted")
+            doc = json.loads(receipt_path.read_text())
+            doc["registration"]["labels"] = ["glaeda-mini", "self-hosted"]  # the stale set an earlier apply asked for
+            doc["registration"].pop("labelsSource", None)
+            receipt_path.write_text(json.dumps(doc))
+            configs = len(self.config_argvs())
+            again = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(again)["register"]
+        self.assertEqual(register["state"], "unchanged", "GitHub already holds this version's labels")
+        self.assertEqual(register["receiptLabels"], held, "the pass that had nothing to do still corrects the receipt")
+        self.assertEqual(len(self.config_argvs()), configs, "and corrects it without re-registering the runner")
+        on_disk = json.loads(receipt_path.read_text())["registration"]
+        self.assertEqual(sorted(on_disk["labels"]), held, "what GitHub holds, not what some apply asked for")
+        self.assertEqual(on_disk["labelsSource"], "github")
+        self.assertTrue(on_disk["labelsObservedAt"], "stamped, so a reader can tell how fresh the reading is")
+
+    def test_a_runner_too_busy_to_relabel_still_has_its_github_labels_recorded(self) -> None:
+        # The drift sat on the low-index instances, the first GitHub picks for work: a runner mid-job cannot be
+        # relabelled, the register action is blocked, and apply_install stops at the first blocked action. The
+        # reading of GitHub's labels is therefore recorded before that loop runs, so the one pass that found the
+        # runner busy still leaves the gate a receipt that does not understate it.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            runners = json.loads((self.state / "runners.json").read_text())
+            runners["runners"][0]["labels"] = [{"name": name} for name in
+                                               ("self-hosted", "macOS", "ARM64", "glaeda-mini", "glaeda-extra")]
+            (self.state / "runners.json").write_text(json.dumps(runners))
+            doc = json.loads(receipt_path.read_text())
+            doc["registration"]["labels"] = ["glaeda-mini", "self-hosted"]
+            receipt_path.write_text(json.dumps(doc))
+            with mock.patch.object(cr, "runner_busy", return_value=True):
+                busy = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", expect=1)
+        self.assertEqual(self.by_kind(busy)["register"]["state"], "blocked")
+        on_disk = json.loads(receipt_path.read_text())["registration"]
+        self.assertEqual(on_disk["labels"], ["ARM64", "glaeda-extra", "glaeda-mini", "macOS", "self-hosted"],
+                         "a blocked relabel still records what GitHub holds today")
+        self.assertEqual(on_disk["labelsSource"], "github")
+
     def test_manifest_blocks_when_github_labels_cannot_be_read(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")

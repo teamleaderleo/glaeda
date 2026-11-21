@@ -720,6 +720,10 @@ def find_runner(ctx: Context) -> dict[str, Any] | None:
     return lookup_runner(ctx)[1]
 
 
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
 # ---------------------------------------------------------------- desired state
 
 
@@ -1320,6 +1324,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             reg.update(state="create", existing=existing)
     if own_name and reg["state"] == "create":
         reg.update(replace=True, note="re-registers this install's own name with --replace")
+    if github_listed and github_found is not None and github_found.get("labels"):
+        # hq#16433: the one authoritative reading of this runner's labels in the whole plan. apply_install records
+        # it in the receipt whatever it does about the rest of this action, so the gate stops reasoning from a
+        # receipt that only ever held what some earlier apply *asked* for.
+        reg["githubLabels"] = sorted(github_found["labels"])
     drifts = []
     if ours and configured and had is not None:
         drifts.append(label_drift("receipt", had, ctx.labels))
@@ -1491,7 +1500,7 @@ def cache_tarball(ctx: Context, act: dict[str, Any]) -> tuple[Path | None, str]:
     os.replace(stage, tarball)
     marker = {"schema": RUNNER_CACHE_SCHEMA, "version": act["version"], "asset": act["asset"],
               "sha256": act["sha256"], "shaSources": act.get("shaSources") or [], "url": act["url"],
-              "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+              "at": utc_now()}
     write_atomic(folder / RUNNER_CACHE_MARKER, (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode(), 0o644)
     prune_runner_cache(ctx, act["version"])
     return tarball, "downloaded"
@@ -1861,6 +1870,24 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             for act in actions:
                 if act["kind"] == "agent" and act["state"] in {"create", "update", "unchanged"}:
                     act["state"], act["note"] = "failed", f"headless supervisor install failed: {error}"[:400]
+    # hq#16433: `registration.labels` recorded the labels this install last *asked* GitHub for - the receipt says so
+    # itself, stamping "GitHub labels could not be read; re-registering with the supplied token" - and only a
+    # successful relabel rewrote it. So once GitHub held the new set, every later pass read GitHub, found nothing to
+    # do ("unchanged" writes a registration only when there is none) and left the receipt understating this runner
+    # for good. The gate reads exactly these labels (glaeda-cmux-runner-hook's runner_labels -> cap_labels) and
+    # filters every controller-feed read with `set(job["labels"]) <= cap_labels`, so an understating receipt hides
+    # takeable jobs from a runner that can run them: stranded capacity. Whenever this plan read GitHub's own labels,
+    # that reading is recorded - including when the relabel this run wanted is blocked (the runner is mid-job, which
+    # is why the drift sat on the low-index instances, the first picked for work) or fails. A successful register or
+    # relabel below then records what GitHub accepted.
+    for act in [a for a in actions if a["kind"] == "register" and a.get("githubLabels")]:
+        reg_doc = receipt_doc.get("registration")
+        if not isinstance(reg_doc, dict) or not reg_doc.get("owned"):
+            continue  # no registration of ours to correct; the create and adopt paths below write the whole one
+        observed = list(act["githubLabels"])
+        if reg_doc.get("labels") != observed or reg_doc.get("labelsSource") != "github":
+            reg_doc.update(labels=observed, labelsSource="github", labelsObservedAt=utc_now())
+            act["receiptLabels"] = observed
     for act in actions:
         act.setdefault("applied", False)
         if failed:
@@ -1885,6 +1912,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if act["state"] != "failed":
                 receipt_doc["registration"] = {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org),
                                                "name": ctx.name, "labels": ctx.labels,
+                                               "labelsSource": "registered", "labelsObservedAt": utc_now(),
                                                "runnerId": act.get("runnerId")}
         elif kind == "register" and state == "relabel":
             def write_hooks() -> None:
@@ -1899,6 +1927,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             relabel(ctx, act, write_hooks if dedicated_of(ctx) else None)
             if act["state"] != "failed":
                 receipt_doc["registration"] = {**(receipt_doc.get("registration") or {}), "labels": ctx.labels,
+                                               "labelsSource": "registered", "labelsObservedAt": utc_now(),
                                                "runnerId": act.get("runnerId"), "owned": True}
                 act["state"] = "updated"
         elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
