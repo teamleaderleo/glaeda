@@ -4801,6 +4801,25 @@ class ClientTest(Base):
         for same in (["wait", "pr", "o/r#5", "7"], ["wait", "run", "o/r"], ["wait", "run", "o", "5"]):
             self.assertEqual(gg.infer_kind(list(same))[0], same)
 
+    def test_land_takes_a_head_pin_and_slash_targets(self) -> None:
+        """Coordinator, 2026-11-21: `land manaflow-ai/cmux/48704 --match-head-commit SHA` was "unrecognized arguments"."""
+        args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
+        self.assertEqual((args.words, args.match_head), (["manaflow-ai/cmux/48704"], "abc1234"))
+        self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
+        head = "a" * 40
+        with mock.patch.object(gg, "pr_head_sha", lambda repo, n: head):
+            gg.check_land_pin("o/r", 1, None)
+            gg.check_land_pin("o/r", 1, "aaaaaaa")
+            gg.check_land_pin("o/r", 1, head)
+            with self.assertRaises(gg.WatchError) as moved:
+                gg.check_land_pin("o/r", 1, "bbbbbbb")
+            self.assertIn("head moved", str(moved.exception))
+            with self.assertRaises(gg.WatchError):
+                gg.check_land_pin("o/r", 1, "not-a-sha")
+        with mock.patch.object(gg, "pr_head_sha", lambda repo, n: None):
+            with self.assertRaises(gg.WatchError):
+                gg.check_land_pin("o/r", 1, "aaaaaaa")
+
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
