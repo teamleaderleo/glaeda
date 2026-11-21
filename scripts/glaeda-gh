@@ -410,6 +410,11 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
+# Falling back from the controller to REST is spend, not just a failure: on big-red, 2026-11-21, it ran a few
+# times every ten minutes for hours, and only refresh-errors.log knew, which nobody reads. The count is kept
+# here, by the hour it happened in, so `glaeda-gh budget` reports it beside the quota it costs.
+CONTROLLER_FALLBACK_FILE = "controller-fallback.json"
+CONTROLLER_FALLBACK_HOURS = 25  # hourly buckets kept: a day, plus the running one
 # The same counts by the hour (epoch // 3600 -> counted), folded in as minutes leave rest-spend.json's hour and kept
 # REST_HOURS_KEEP hours, so a cap is set from a day of real use (daemon.json restShare.hours). On 2026-11-18 the caps
 # had to be set from alarm lines, as no host kept more than the last hour.
@@ -642,14 +647,35 @@ UPSTREAM_OUTAGE = "upstream-outage"
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
-CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+# One deadline used to protect against two very different things, and the cheap one set it. A controller that is
+# not there (nothing listening, a dead tailnet route) must not stall a tick: that is what "3 s" was for, and a
+# connect deadline says it exactly. A controller that has accepted the connection has proved it is alive, and
+# giving up on it then is far more expensive than waiting: every run the fallback reads spends the shared REST
+# quota (5000/h for every lane on this account together), and the first failure also takes the controller out for
+# CONTROLLER_RETRY and more (controller_down), so one lost race sends a minute of run reads to REST. So the two
+# get their own deadlines, and the read one is derived from what the controller actually costs.
+# Measured on big-red 2026-11-21 10:05-10:35Z, over this host's socat forward to cmux-lawrence (client.json points
+# at http://127.0.0.1:18765, which socat forwards over `tailscale nc`, so "local" is a tailnet round trip):
+#   connect, to the local forward              0.3-4.7 ms (n=43)
+#   first byte                                 0.13-0.28 s, flat in body size
+#   whole answer, /v1/github/events            0.13-1.47 s (p50 0.44, p90 0.53), throughput-bound: the tunnel
+#                                              carries ~400 KB/s and the largest feed page seen was 321 KB
+# CONTROLLER_CONNECT_TIMEOUT is ~200x the worst connect seen, and fails faster than the old 3 s did.
+# CONTROLLER_READ_TIMEOUT is ~4x the worst whole answer seen, and still an order of magnitude under what losing
+# the race costs (CONTROLLER_RETRY's 60 s of REST): waiting can never cost more than falling back.
+CONTROLLER_CONNECT_TIMEOUT = 1.0  # a tick must not stall on an unreachable controller
+CONTROLLER_READ_TIMEOUT = 6.0  # an alive controller is worth waiting for: the fallback spends REST
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
-# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
-# what is left of it (Controller.budget_end); the first failure takes the controller out for CONTROLLER_RETRY and more
+# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. The budget bounds
+# what a tick *starts* (controller_room, Controller.budget_end cuts the connect), never a read already in flight:
+# that cut would read as the controller failing and take it out (#2201 review). An unreachable controller therefore
+# costs a tick this budget in CONTROLLER_CONNECT_TIMEOUT slices, less than the 3 s slices it cost before; one slow
+# read may overrun it by at most CONTROLLER_READ_TIMEOUT, against a TICK_BUDGET of 90 s, and it returns data
+# instead of taking the controller out. The first failure takes the controller out for CONTROLLER_RETRY and more
 # (controller_down), and REST, GitHub's own reads and the cache serve meanwhile.
 CONTROLLER_TICK_BUDGET = 4.0
-CONTROLLER_DEADLINE = 6  # one whole controller request
+CONTROLLER_DEADLINE = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
 # whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
@@ -2065,6 +2091,50 @@ class EdgeHTTPSHandler(urllib.request.HTTPSHandler):
 GITHUB_OPENER = urllib.request.build_opener(NoRedirect, EdgeHTTPSHandler)
 
 
+# The controller's own opener: urllib's one `timeout` is the socket timeout for the connect and for every read
+# alike, which is what conflated "the controller is not there" with "the controller is slow right now"
+# (CONTROLLER_CONNECT_TIMEOUT). Here the request carries the read deadline and the connect takes
+# CONTROLLER_CONNECT_DEADLINE's value instead, so an unreachable controller still fails fast while an answer
+# already coming in is waited for. The deadline travels in a thread-local because urllib has nowhere else to put
+# it: it is per request (a tick's budget cuts it), and http.client is per thread anyway.
+CONTROLLER_CONNECT_DEADLINE = threading.local()
+
+
+class ControllerConnect:
+    """A connect deadline of its own; the request's timeout then covers the reads."""
+
+    def connect(self) -> None:
+        read = self.timeout  # type: ignore[attr-defined]
+        self.timeout = getattr(CONTROLLER_CONNECT_DEADLINE, "seconds", None) or CONTROLLER_CONNECT_TIMEOUT
+        try:
+            super().connect()  # type: ignore[misc]
+        finally:
+            self.timeout = read
+        with contextlib.suppress(OSError, AttributeError):
+            self.sock.settimeout(read)  # type: ignore[attr-defined]
+
+
+class ControllerHTTPConnection(ControllerConnect, http_client.HTTPConnection):
+    pass
+
+
+class ControllerHTTPSConnection(ControllerConnect, http_client.HTTPSConnection):
+    pass
+
+
+class ControllerHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: ANN001
+        return self.do_open(ControllerHTTPConnection, req)
+
+
+class ControllerHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: ANN001
+        return self.do_open(ControllerHTTPSConnection, req, context=self._context)
+
+
+CONTROLLER_OPENER = urllib.request.build_opener(NoRedirect, ControllerHTTPHandler, ControllerHTTPSHandler)
+
+
 def error_site(error: BaseException) -> str:
     """Where `error` was raised: file, line and function only, never values, so a recurring error
     can be found without reproducing it."""
@@ -3088,6 +3158,17 @@ class NoReceiver(WatchError):
     """The controller answers but serves no run events (not deployed there, or not configured)."""
 
 
+class ControllerTimeout(WatchError):
+    """The controller missed a deadline (connect, read or the whole request). A WatchError, so every caller
+    treats it as before; named so the fallback it causes can be counted as REST spend (`glaeda-gh budget`)."""
+
+
+def timed_out(error: BaseException) -> bool:
+    """Whether `error` is a deadline, however urllib wrapped it: a socket timeout reaches us bare on a read and
+    inside URLError.reason on a connect, and hard_deadline's DeadlineTimeout is a TimeoutError too."""
+    return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
+
+
 class Controller:
     """The build controller's GitHub events (cmuxterm-hq#675) over the tailnet: no GitHub quota.
     Without a token it answers for public repositories only."""
@@ -3115,18 +3196,25 @@ class Controller:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         request = urllib.request.Request(self.base + path, headers=headers)
         try:
-            budget = CONTROLLER_TIMEOUT if timeout is None else timeout
+            read = CONTROLLER_READ_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
-            # the daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET)
+            # The daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET). It cuts
+            # the connect, never the read: a read cut short reads as the controller failing and takes it out
+            # (#2201 review), and the read is the part worth waiting for once the controller has answered at all.
             left = getattr(self, "budget_end", float("inf")) - time.monotonic()
-            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left) + deadline - budget)
-            with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
-                doc = json.loads(response.read(MAX_BODY))
+            CONTROLLER_CONNECT_DEADLINE.seconds = min(CONTROLLER_CONNECT_TIMEOUT, max(0.1, left))
+            try:
+                with hard_deadline(deadline), CONTROLLER_OPENER.open(request, timeout=read) as response:
+                    doc = json.loads(response.read(MAX_BODY))
+            finally:
+                CONTROLLER_CONNECT_DEADLINE.seconds = None
         except urllib.error.HTTPError as error:
             if error.code in {404, 503}:
                 raise NoReceiver(f"controller HTTP {error.code}") from None
             raise WatchError(f"controller HTTP {error.code}") from None
         except (OSError, HTTPException, ValueError) as error:
+            if timed_out(error):
+                raise ControllerTimeout(f"controller: {type(error).__name__}") from None
             raise WatchError(f"controller: {type(error).__name__}") from None
         if not isinstance(doc, dict):
             raise WatchError("controller: not a JSON object")
@@ -3136,7 +3224,7 @@ class Controller:
         """The controller's view of a run, optionally long-polling until it changes state."""
         if not isinstance(wait, int) or not 0 <= wait <= CONTROLLER_RUN_MAX_WAIT:
             raise WatchError(f"controller run wait must be 0..{CONTROLLER_RUN_MAX_WAIT} seconds")
-        timeout = CONTROLLER_TIMEOUT if wait == 0 else wait + CONTROLLER_TIMEOUT
+        timeout = CONTROLLER_READ_TIMEOUT if wait == 0 else wait + CONTROLLER_READ_TIMEOUT
         doc = self.get(f"/v1/github/runs/{int(run_id)}?wait={wait}", timeout=timeout)
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
@@ -4242,6 +4330,10 @@ class Daemon:
         doc = read_json(BASE / "budget.json")
         self.budget: dict[str, dict] = doc if isinstance(doc, dict) else {}
         self.saved_budget = json.loads(json.dumps(self.budget))
+        fell_back = read_json(BASE / CONTROLLER_FALLBACK_FILE)
+        self.controller_fallback: dict = fell_back if isinstance(fell_back, dict) else {}
+        self.saved_controller_fallback = json.loads(json.dumps(self.controller_fallback))
+        self.controller_missed_deadline = False  # the controller is out for a missed deadline, not another error
         self.backoff: dict[str, float] = {"rest": 0.0, "graphql": 0.0}
         self.secondary_until = 0.0  # a secondary 403 holds both buckets until then
         self.secondary_strikes = 0  # secondary 403s since the last clean answer: each doubles the hold
@@ -7345,6 +7437,9 @@ class Daemon:
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
             self.saved_budget = json.loads(json.dumps(self.budget))
+        if self.controller_fallback != self.saved_controller_fallback:
+            write_json(BASE / CONTROLLER_FALLBACK_FILE, self.controller_fallback)
+            self.saved_controller_fallback = json.loads(json.dumps(self.controller_fallback))
         self.save_spend()
         self.save_named_reads()
         try:
@@ -8844,6 +8939,8 @@ class Daemon:
         _, owner, repo, run_id = split_key(e["key"])
         prior = e["cache"] or {}
         self.reads.append((self.now, "run", "rest"))
+        if self.controller_missed_deadline and self.now < self.controller_down_until:
+            self.note_controller_fallback("restRuns")  # a read the controller would have served for free
         base = f"/repos/{owner}/{repo}/actions/runs/{run_id}"
         # a confirmation asks without the ETag: a 304 would prove only what the ETag's own read showed, which the
         # controller's newer record replaced (and a cache from before restRun has nothing to prove it with)
@@ -9405,10 +9502,34 @@ class Daemon:
                 return None, sent  # listed but not finished, or not in the run at all: read alone
         return None, sent
 
+    def note_controller_fallback(self, what: str, n: int = 1) -> None:
+        """Count what a fallback from the controller to REST cost, in the hour it happened in: `what` is
+        "deadline" for a deadline the controller missed, "restRuns" for a run this host then read over REST on
+        the shared quota. `glaeda-gh budget` reports both (controller_fallback_line)."""
+        doc = self.controller_fallback
+        hours = doc.get("hours")
+        if not isinstance(hours, dict):
+            hours = doc["hours"] = {}
+        hour = time.strftime("%Y-%m-%dT%HZ", time.gmtime(self.now))
+        bucket = hours.get(hour)
+        if not isinstance(bucket, dict):
+            bucket = hours[hour] = {}
+        bucket[what] = int(bucket.get(what) or 0) + n
+        for old in sorted(hours)[:-CONTROLLER_FALLBACK_HOURS]:
+            hours.pop(old, None)
+        if not isinstance(doc.get("since"), (int, float)):
+            doc["since"] = self.now  # the window the counts cover: when this host first counted one
+        if what == "deadline":
+            doc["lastAt"] = self.now
+
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
         feed catches up on what happened in between when it answers again."""
         what = describe(error) + (f" at {site}" if site else "")
+        self.controller_missed_deadline = isinstance(error, ControllerTimeout)
+        if self.controller_missed_deadline:
+            # the run reads this sends to REST are counted as they happen (fetch_run), not guessed at here
+            self.note_controller_fallback("deadline")
         if isinstance(error, NoReceiver):
             wait, state = CONTROLLER_ABSENT, "absent"  # not an error: that controller has no receiver
         else:
@@ -9472,6 +9593,7 @@ class Daemon:
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.controller_down_until, self.controller_failures = 0.0, 0
+        self.controller_missed_deadline = False
         self.controller_status = {"state": "off" if current is None else "starting"}
 
     def from_controller(self, entries: list[dict]) -> None:
@@ -9493,10 +9615,12 @@ class Daemon:
 
     def controller_room(self) -> bool:
         """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
-        CONTROLLER_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never started to be
-        cut short by the budget: that cut would read as the controller failing, and take it out (#2201 review)."""
+        CONTROLLER_CONNECT_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
+        started to be cut short by the budget: that cut would read as the controller failing, and take it out
+        (#2201 review). The budget bounds the connects a tick starts, not how long an answer already arriving is
+        waited for (CONTROLLER_READ_TIMEOUT): that wait is what keeps a run read off the shared REST quota."""
         return (self.controller is not None and self.now >= self.controller_down_until
-                and time.monotonic() + CONTROLLER_TIMEOUT <= self.controller_budget_end)
+                and time.monotonic() + CONTROLLER_CONNECT_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
@@ -9509,6 +9633,7 @@ class Daemon:
                 return self.controller_down(error)
             if getattr(self, "controller_feed_error", None) is None:
                 self.controller_failures = 0
+                self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
             self.controller_ok_at = self.now
             for page in pages:
                 for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
@@ -17842,6 +17967,29 @@ def controller_line(ctl: dict) -> str:
     return "controller: starting"
 
 
+def controller_fallback_line(doc: Any) -> str:
+    """`budget`'s line for the controller fallbacks that cost REST quota: how many deadlines the controller
+    missed, how many run reads went to REST because of them, and the window both cover (CONTROLLER_FALLBACK_FILE,
+    Daemon.note_controller_fallback). Empty when this host has never had one."""
+    hours = doc.get("hours") if isinstance(doc, dict) else None
+    if not isinstance(hours, dict):
+        return ""
+    kept = {h: b for h, b in hours.items() if isinstance(b, dict)}
+
+    def total(what: str, only: set[str] | None = None) -> int:
+        return sum(int(b.get(what) or 0) for h, b in kept.items() if only is None or h in only)
+
+    this_hour = {time.strftime("%Y-%m-%dT%HZ", time.gmtime(time.time()))}
+    missed, runs = total("deadline"), total("restRuns")
+    if not missed and not runs:
+        return ""
+    since = doc.get("since")
+    window = f"since {age(since)}" if isinstance(since, (int, float)) else f"over the {len(kept)} hours kept"
+    return (f"controller fallback: {missed} missed deadlines sent {runs} run reads to the shared REST quota "
+            f"that the controller would have served free, {window} ({total('deadline', this_hour)} and "
+            f"{total('restRuns', this_hour)} this hour); last missed deadline {age(doc.get('lastAt'))}")
+
+
 def spend_lines(spend: Any) -> list[str]:
     """`budget`'s spend tables from daemon.json spendBy (Daemon.spend_by)."""
     if not isinstance(spend, dict):
@@ -18537,6 +18685,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     if as_json:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
                "budget": budget, "watching": watching, "last": status,
+               "controllerFallback": read_json(BASE / CONTROLLER_FALLBACK_FILE) or {},
                "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict),
                # buckets whose reading's reset has passed: their "remaining" is unknown now, not what it says
                "resetPassed": [b for b in ("rest", "graphql") if isinstance(budget.get(b), dict)
@@ -18612,6 +18761,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
+        fell_back = controller_fallback_line(read_json(BASE / CONTROLLER_FALLBACK_FILE))
+        if fell_back:
+            print(fell_back)
         hour = status.get("lastHour")
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
