@@ -15965,6 +15965,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
+    # One plain pressure apply per host at a time (pressure_pass_lock), taken as soon as the run knows it is under
+    # pressure: before the floor and evict.lock queue waits, the cap's du and the hook-pass branch that narrows
+    # --family. The evict.lock queue serves one deletion at a time but lets its waiters pile up: on one mini
+    # (2026-11-21) nine pressure applies ran at once, a new one about every 40 s, each waiting its turn while the
+    # host sat at 2 GiB free; taken after those waits, as first shipped, the lock still let 8 to 14 pile up. The
+    # pass that holds it judges the same filesystems against the same floor, so a second one only waits.
+    if (a.pressure and a.apply and under and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
+            and not pressure_pass_lock()):
+        return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
@@ -16109,13 +16118,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return 0
-        # One plain pressure apply per host at a time (pressure_pass_lock). The evict.lock queue serves one
-        # deletion at a time but lets its waiters pile up: on one mini (2026-11-21) nine pressure applies ran at
-        # once, a new one about every 40 s, each waiting its turn while the host sat at 2 GiB free. The pass that
-        # holds this lock judges the same filesystems against the same floor, so a second one only waits.
-        if (a.pressure and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
-                and not pressure_pass_lock()):
-            return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
