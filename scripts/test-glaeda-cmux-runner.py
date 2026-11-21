@@ -9208,7 +9208,11 @@ class StarvedReserveTest(unittest.TestCase):
         self.assertTrue(all(0 <= turn < 1 for turn in turns))
         spread = hook.StarvedReserve(600.0, 1200.0, 1800.0)
         first = hosts[turns.index(min(turns))]
-        at = summary["jobs"][1]["created"] + 600 + min(turns) * 1200 + 1
+        # Past the first mini's turn and short of the second one's: the turns are a hash of the job key, which
+        # carries the job's created second, so the two can sit under a second apart (~1 run in 100 with these 12
+        # hosts, which is how this failed on glaeda#2288). Halfway between them is past one turn whatever they are.
+        soonest, next_up = sorted(turns)[:2]
+        at = summary["jobs"][1]["created"] + 600 + (soonest + next_up) / 2 * 1200
         summary = dict(summary, at=at, delivery=at)
         due = [host for host in hosts if hook.starved_job(summary, labels, host, at, spread)]
         self.assertEqual(due, [first], "only the first mini's turn has come")
