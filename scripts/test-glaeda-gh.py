@@ -14190,6 +14190,63 @@ class PostTest(unittest.TestCase):
                                                    "/repos/o/r/issues/1/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in notes], ["posted", "queued", "queued"])
 
+    def marker(self, thread: str, head: str, run: str) -> dict:
+        body = f"<!-- review-running sha={head} at=2026-11-21T15:40:00Z run={run} by=router-review -->\nreview running"
+        return self.queue("comment", thread, "--body", body, "--status-key", f"review-run={run}")
+
+    def test_a_marker_behind_its_heads_receipt_is_retired_as_superseded_not_sent(self) -> None:
+        head, run = "a" * 40, "run-" + "1" * 16
+        mark = self.marker("o/r#9", head, run)
+        other = self.marker("o/r#9", "b" * 40, "run-" + "2" * 16)  # another head: still goes out
+        ship = self.queue("comment", "o/r#9", "--body", f"Review (opus via router-review): SHIP at {head[:12]}")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)  # the receipt sorts first and goes; its marker, behind it, is retired in the same tick
+        self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 2)  # the receipt, then the other head's marker: the retirement cost no turn
+        state = gg.post_state(mark["id"])
+        self.assertEqual(state["state"], "superseded")
+        self.assertIn(head[:12], state["note"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (ship, other)], ["posted", "posted"])
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
+
+    def test_a_marker_whose_run_already_posted_its_verdict_is_retired(self) -> None:
+        run = "run-" + "3" * 16
+        verdict = self.queue("comment", "o/r#4", "--body", "Review (opus): BLOCK at " + "c" * 40,
+                             "--status-key", f"review-run={run}")
+        d, t = self.daemon((201, {}, {"html_url": "u"}), (201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(verdict["id"])["state"], "posted")
+        mark = self.marker("o/r#4", "d" * 40, run)  # queued late: its run already ended
+        done = self.marker("o/r#5", "d" * 40, run)  # another thread: the run's end there is not known
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
+        self.assertIn(run, gg.post_state(mark["id"])["note"])
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/4/comments", "/repos/o/r/issues/5/comments"])
+        self.assertEqual(gg.post_state(done["id"])["state"], "posted")  # the same tick: the retirement cost no turn
+
+    def test_a_marker_with_no_receipt_or_end_still_goes_out(self) -> None:
+        mark = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16)
+        self.queue("comment", "o/r#6", "--body", "Review (opus): SHIP at " + "f" * 40)  # another head
+        self.queue("comment", "o/r#7", "--body", "Review (opus): SHIP at " + "e" * 40)  # another thread
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "posted")
+        self.assertEqual(len(t.calls), 3)
+
+    def test_superseded_reads_as_done_for_the_writer(self) -> None:
+        state = {"state": "superseded", "note": "a receipt for abc is queued (x)"}
+        self.assertEqual(gg.post_line(state), "superseded, not sent: a receipt for abc is queued (x)")
+
+    def test_run_ends_are_pruned_after_a_day(self) -> None:
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 1, "body": "<!-- review-run=run-" + "5" * 16 + " -->"}, NOW)
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 2, "body": "<!-- review-run=run-" + "6" * 16 + " -->"},
+                         NOW + gg.RUN_ENDS_KEEP + 1)
+        self.assertEqual(list(gg.read_json(gg.BASE / gg.RUN_ENDS)), ["o/r#2"])
+
     def test_a_gate_comment_is_never_joined_into_prose(self) -> None:
         self.assertFalse(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s", "gate": True}))
         self.assertTrue(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s"}))
