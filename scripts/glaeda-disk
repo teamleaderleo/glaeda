@@ -184,8 +184,9 @@ Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "en
 --apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
 did, appends exactly one JSON line to the run log (macOS ~/Library/Logs/glaeda-disk-runs.jsonl, Linux
 ~/.local/state/glaeda/disk-runs.jsonl): free space before and after, target, floor, reclaimed, whether
-the target was reached, the biggest blocked families, and why a run skipped (off, no pressure, a
-lock held, a deferral).
+the target was reached, the biggest blocked families, why a run skipped (off, no pressure, a
+lock held, a deferral), and the release that ran: its sha256 and the OTA tag and source commit
+whose generation holds those exact bytes (`glaeda-disk --version` prints the same).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -1268,6 +1269,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "dafe3ca93911e8dd81a1aa23091d8ac5cdb7f933431c15b9233e30a6089c35a0",
     "659c8b25059548c744fd8ec729142e576abce68607b7657956c593ba06b544bb",
     "11be9214d14805b3108b60f92d6c3b38811c6366fc937a13b1723625a29e40ce",
+    "58f1fca2d4058e565c216ccce2a9b841776c8559866a82bd5fa05b147eb81d3c",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -6109,8 +6111,12 @@ def item_mtime(fam: Family, path: Path) -> float:
     # Git's index refresh rewrites metadata without using the build output. In
     # the enrolled-account profile that bookkeeping must not extend the cache's
     # reuse window. Active jobs are still protected by process evidence and the
-    # git-loss check before deletion.
-    skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
+    # git-loss check before deletion. A git-disposable family (the mirror rule: home-scratch, retired runners, the
+    # fleet cache) skips them too: its own archive step writes refs/glaeda-archive in a nested .git on every
+    # attempt, and that write restarted the 12 h clock each pass (cmux17's ~/m2l-viewer, idle 0.5 h for days,
+    # 2026-11-21). Unpushed commits are bundled before any delete, so .git activity alone keeps nothing.
+    skip_names = (frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE or fam.git_disposable)
+                  else frozenset())
     # Tart's access date first, and a walk that never lists a digest directory, which would move that date
     tart = (tart_vm_last_use(path) if fam.id in (TART_VMS, LIMA_VMS) else tart_last_use(path)
             if fam.id in TART_FAMILIES else 0.0)
@@ -6424,6 +6430,26 @@ def git_relief_peak(gitdir: Path, alternates: bool = False) -> int:
                         seen.add((st.st_dev, st.st_ino))
                         total += st.st_size
     return total
+
+
+BUNDLE_PEAK_SLACK = 64 * 1024**2  # loose objects compressed again, the pack's index and header
+
+
+def bundle_peak(gitdir: Path, revs: list[str]) -> int:
+    """A bundle's peak: twice the stored bytes of the objects it holds (`rev-list --objects --disk-usage` over the
+    same rev-list arguments: the bundle is a thin pack of only those, written with their stored deltas reused) plus
+    BUNDLE_PEAK_SLACK, never more than the whole store (git_relief_peak). The store alone sized a few unpushed
+    commits as the whole history: cmux17's ~/m2l-viewer (5.4 GB, idle 79 h) needed 5.6 GB free to bundle while the
+    disk held 4.1 GB, so the pass that most needed its room could never free it (2026-11-21). An older git without
+    --disk-usage, or an unreadable count, falls back to the whole store."""
+    whole = git_relief_peak(gitdir, alternates=True)
+    out = _git_dir_run(gitdir, "rev-list", "--objects", "--disk-usage", "--stdin",
+                       stdin="\n".join(revs) + "\n", timeout=600)
+    try:
+        used = int((out or "").strip())
+    except ValueError:
+        return whole
+    return min(whole, 2 * used + BUNDLE_PEAK_SLACK)
 
 
 def _ref_tree_state(root: Path) -> tuple[float, str] | None:
@@ -8113,6 +8139,27 @@ def has_git(path: Path) -> bool:
     return git_state(path) != "none"
 
 
+def hidden_from_status(flags: str, root: Path) -> bool:
+    """Whether `ls-files -v -z` (FLAGS) names a file whose edits status does not show: one flagged assume-unchanged
+    (a lowercase tag), or skip-worktree (S) and present in the work tree ROOT. A skip-worktree entry with no file is
+    a sparse checkout's path left out of the tree: HEAD holds its content and deleting the tree loses nothing.
+    cmux17's ~/m2l-viewer, a sparse checkout of the fleet mirror with 41,592 such entries, read as uncommitted work
+    and stayed (2026-11-21). An entry that cannot be checked counts as hidden."""
+    for entry in flags.split("\0"):
+        tag, rel = entry[:1], entry[2:]
+        if not tag:
+            continue
+        if tag.islower():
+            return True
+        if tag == "S":
+            try:
+                if not rel or os.path.lexists(root / rel):
+                    return True
+            except (OSError, ValueError):
+                return True
+    return False
+
+
 def git_loss(path: Path) -> str:
     """"" when deleting this checkout loses nothing git holds, else what it would lose.
 
@@ -8138,8 +8185,8 @@ def git_loss(path: Path) -> str:
     if status is None or status.strip():
         return "uncommitted or untracked changes"
     # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
-    flags = git("ls-files", "-v")
-    if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+    flags = git("ls-files", "-v", "-z")
+    if flags is None or hidden_from_status(flags, path):
         return "files hidden from status"
     own = git("rev-parse", "--path-format=absolute", "--git-dir")
     if own is None:
@@ -8176,8 +8223,9 @@ def git_loss(path: Path) -> str:
     return ""
 
 
-def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
-                 network: bool = False, stdin: str | None = None) -> str | None:
+def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60, network: bool = False, stdin: str | None = None,
+                 errors: list[str] | None = None) -> str | None:
+    """git's stdout, or None when it fails; ERRORS, when given, gets the last line of what it said on failure."""
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", **NO_LAZY_FETCH}
     if network and "GIT_SSH_COMMAND" not in env:
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
@@ -8190,8 +8238,13 @@ def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
             # command, so even for-each-ref fails. These commands never read a work tree; the git dir stands in.
             r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True, text=True,
                                timeout=timeout, env={**env, "GIT_WORK_TREE": str(gitdir)}, input=stdin)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if errors is not None:
+            errors.append(e.__class__.__name__)
         return None
+    if r.returncode != 0 and errors is not None:
+        said = [ln.strip() for ln in r.stderr.splitlines() if ln.strip()]
+        errors.append((said[-1] if said else f"exit {r.returncode}")[:300])
     return r.stdout if r.returncode == 0 else None
 
 
@@ -8741,14 +8794,14 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
     directory named in REPRODUCIBLE_DIRS or tagged with a CACHEDIR.TAG) as (path relative to root, path, sha256)).
     An untracked checkout is skipped only when it is one of trees (bundled and archived on its own)."""
     g = tree_git_dir(root)
-    flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v")
+    flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v", "-z")
     if _git_dir_run(g, "rev-parse", "-q", "--verify", "HEAD^{commit}") is None:  # unborn: no patch base
         status = _git_dir_run(g, "--work-tree", str(root), "status", "--porcelain", "--untracked-files=all")
         return ("" if status == "" else "no HEAD to hold its changes, or an unreadable work tree"), b"", []
     raw = _git_dir_run(g, "--work-tree", str(root), "diff", "HEAD", "--raw", "--ignore-submodules=none")
     if flags is None or raw is None:
         return "unreadable work tree", b"", []
-    if any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+    if hidden_from_status(flags, root):
         return "files hidden from status (assume-unchanged or skip-worktree)", b"", []
     if any(f[0] == ":160000" or (len(f) > 1 and f[1] == "160000")
            for f in (ln.split() for ln in raw.splitlines()) if f):
@@ -8889,11 +8942,14 @@ def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], wri
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     try:
         _private_archive_dir()
-        if (why := relief_room(mirror_archive(), git_relief_peak(gitdir, alternates=True), slow=False)):
+        if (why := relief_room(mirror_archive(), bundle_peak(gitdir, revs), slow=False)):
             return f"bundle of {gitdir}: {why}"
+        said: list[str] = []  # git's own words go into the receipt: a bare "failed" left cmux17's hot-verify unexplained
         if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
-                        timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:
-            return f"git bundle create or verify failed for {gitdir}"
+                        timeout=600, errors=said) is None:
+            return f"git bundle create failed for {gitdir}: {said[-1] if said else 'no output'}"
+        if _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600, errors=said) is None:
+            return f"git bundle verify failed for {gitdir}: {said[-1] if said else 'no output'}"
         listed = _git_dir_run(gitdir, "bundle", "list-heads", str(tmp))
         if listed is None or not heads <= {ln.split(" ", 1)[-1] for ln in listed.splitlines()}:
             return f"bundle of {gitdir} lacks a ref"
@@ -9435,8 +9491,12 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
 
 
 def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
-    """True when tree is gone and its linked worktree record under gitdir/worktrees holds no commit that a branch,
-    tag or remote-tracking ref of the repository does not already reach (so `git worktree prune` loses nothing)."""
+    """True when tree is gone and its linked worktree record under gitdir/worktrees is readable and unlocked: every
+    commit it holds is either reached by a branch, tag or remote-tracking ref, or one bundle_unpushed bundles before
+    the repository goes (it reads every record's HEAD and reflogs, local_tips worktree_only), so deleting the
+    repository loses nothing through it. A locked record (its tree may be on a volume not mounted now) keeps it.
+    cmux17, 2026-11-21: the 4.7G hot-verify mirror stayed kept for 1 gone record of an ended step that held a
+    commit of its own, though the bundle would have kept that commit."""
     try:  # gone only when the lookup says so: an unreadable parent could hide a live tree (lexists says False)
         os.lstat(moved_git_path(os.fspath(tree)))
         return False
@@ -9461,13 +9521,7 @@ def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
         tips = local_tips(rec, worktree_only=True)
         if tips is None:
             return False
-        tips = _present_commits(gitdir, tips) if tips else tips
-        if tips is None:
-            return False
-        if not tips:
-            return True
-        left = _git_dir_run(gitdir, "rev-list", *tips, "--not", "--branches", "--tags", "--remotes", timeout=600)
-        return left is not None and not left.strip()
+        return True  # its commits: reachable, or bundled by bundle_unpushed with the repository's own
     return False
 
 
@@ -9555,8 +9609,8 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         # absolute paths; after the rename aside, renamed_gitfiles reads them at the new path.
         outside = [w for w in linked if os.path.realpath(moved_git_path(os.fspath(w))) not in found]
         # A record whose tree is gone keeps nothing but its own HEAD and reflogs, and `git worktree prune` drops it.
-        # When every commit it holds is reachable from a branch, tag or remote-tracking ref, deleting the repository
-        # loses nothing through it: drop it from the judgement. 22 fleet minis kept the 3-7 GiB hot-verify mirror
+        # Its commits are reachable or go to the repository's bundle (bundle_unpushed reads every record): deleting
+        # the repository loses nothing through it, so an unlocked one is dropped from the judgement. 22 fleet minis kept the 3-7 GiB hot-verify mirror
         # (/Users/Shared/cmux-build-fleet/cache/hot-verify) as blocked:bundle-failed on every pass, cmux18 with 73
         # such records from ended steps, all reachable (2026-11-21 fleet audit).
         outside = [w for w in outside if not _gone_record_is_empty(g, w)]
@@ -9683,6 +9737,46 @@ def glaeda_disk_sha256() -> str:
         except OSError:
             _OWN_SHA256 = ""
     return _OWN_SHA256
+
+
+UPDATE_STATE_DIR = HOME / ".local/state/glaeda/update"  # glaeda-update's state.json and generations/<tag>
+_OWN_RELEASE: dict | None = None
+
+
+def glaeda_disk_release() -> dict:
+    """Which release this glaeda-disk is: its sha256, and the tag and source commit of the OTA generation whose
+    glaeda/scripts/glaeda-disk holds these exact bytes (current, then previous; both None for a hand install). A
+    deploy is proven by the bytes, not by an install time (2026-11-21: "very likely includes 14f096d1" was all a
+    fleet read could say)."""
+    global _OWN_RELEASE
+    if _OWN_RELEASE is None:
+        own = glaeda_disk_sha256()
+        _OWN_RELEASE = {"sha256": own or None, "tag": None, "source": None}
+        try:
+            state = json.loads((UPDATE_STATE_DIR / "state.json").read_text())
+        except (OSError, ValueError):
+            state = {}
+        tags = [state.get(k) for k in ("current", "previous")] if isinstance(state, dict) else []
+        for tag in tags:
+            if not own or not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+                continue
+            gen = UPDATE_STATE_DIR / "generations" / tag
+            try:
+                if hashlib.sha256((gen / "glaeda/scripts/glaeda-disk").read_bytes()).hexdigest() != own:
+                    continue
+                source = json.loads((gen / "release.json").read_text()).get("source")
+            except (OSError, ValueError, AttributeError):
+                continue
+            _OWN_RELEASE.update(tag=tag, source=source if isinstance(source, str) else None)
+            break
+    return _OWN_RELEASE
+
+
+def version_line() -> str:
+    r = glaeda_disk_release()
+    if r["tag"]:
+        return f"glaeda-disk {r['tag']} (source {r['source'] or 'unknown'}, sha256 {r['sha256']})"
+    return f"glaeda-disk unreleased (no OTA generation holds these bytes; sha256 {r['sha256'] or 'unreadable'})"
 
 
 def bundle_failure_stands(path: str, got: dict, now: float) -> bool:
@@ -11275,6 +11369,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("too deep or large to rule out a git checkout")
             elif fam.git_disposable and due:
                 reasons.append(loss)
+            elif fam.git_disposable:
+                # not due yet: say so, or the item reads as kept for no reason (cmux17's ~/m2l-viewer, 2026-11-21)
+                reasons.append(f"idle {idle:.1f} h of its {window:g} h window: a disposable checkout goes once due")
         elif not due:
             verdict = "recent"
             if media_tour_warm_slot(fam, path):
@@ -15779,6 +15876,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--runner-caches", action="store_true",
                     help="use the narrow enrolled-runner account profile (macOS only)")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--version", action="version", version=version_line(),
+                    help="print this glaeda-disk's release (OTA tag, source commit, sha256) and exit")
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dedupe", action="store_true",
@@ -16643,6 +16742,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "target_gib": RUN.get("target_gib"), "target_bytes": target, "targets": RUN.get("targets"),
            "default_targets": bool(RUN.get("default_targets")), "config_sha256": RUN.get("config_sha256"),
            "floor_gib": RUN.get("floor_gib"),
+           "release": glaeda_disk_release(),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),

@@ -861,6 +861,9 @@ class Supervisor:
                         held, note = False, "an earlier job's processes still run in a runner's _work"
                 if held:
                     break
+                if hook.LEDGER_FINAL_MARK in note:  # waiting until expires_at cannot clear it, and would hold the mini
+                    self.update(phase="failed", reason=note[:300])
+                    return False
                 if time.time() >= self.expires:
                     self.update(phase="expired", reason=f"no whole-mini claim before expires_at ({note[:200]})")
                     return False

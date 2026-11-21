@@ -5347,6 +5347,32 @@ class GlaedaDiskTest(unittest.TestCase):
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
+    def test_the_release_is_the_ota_generation_holding_these_exact_bytes(self) -> None:
+        state = self.root / "update"
+        own = Path(gd.__file__).read_bytes()
+
+        def generation(tag: str, body: bytes, source: str) -> None:
+            gen = state / "generations" / tag
+            (gen / "glaeda/scripts").mkdir(parents=True)
+            (gen / "glaeda/scripts/glaeda-disk").write_bytes(body)
+            (gen / "release.json").write_text(json.dumps({"source": source}))
+
+        generation("v-20261121-new", b"other bytes", "b" * 40)
+        generation("v-20261121-old", own, "a" * 40)
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": "v-20261121-old",
+                                                      "quarantined": []}))
+        sha = hashlib.sha256(own).hexdigest()
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # current holds other bytes (a setup that has not installed yet): the previous one is what runs
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": "v-20261121-old", "source": "a" * 40})
+            self.assertIn("v-20261121-old (source " + "a" * 40, gd.version_line())
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": None,
+                                                      "quarantined": []}))
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # a hand install: no generation holds these bytes, and the line says so instead of guessing
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": None, "source": None})
+            self.assertTrue(gd.version_line().startswith("glaeda-disk unreleased"))
+
     def test_every_applying_run_writes_one_run_line(self) -> None:
         blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
         status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
@@ -5361,6 +5387,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(row["target_bytes"], 170 * gd.GIB)
         self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
         self.assertEqual(row["config_sha256"], gd.config_sha256())
+        self.assertEqual(row["release"], gd.glaeda_disk_release())  # which bytes wrote the row: a deploy is provable
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
@@ -7951,6 +7978,54 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "eio")):  # unreadable: no room
             self.assertTrue(gd.relief_room(mirror, 0, slow=True).startswith("no room: cannot read"))
         self.assertEqual(gd.free_bytes, real)
+
+    def test_a_bundle_needs_room_for_its_unpushed_objects_not_the_whole_store(self) -> None:
+        # cmux17's ~/m2l-viewer: 13 unpushed commits (2 MB) in a 2.6 GB store needed 5.6 GB free to bundle
+        repo = self.root / "repo"
+        self._git("init", "-q", "-b", "main", os.fspath(repo))
+        (repo / "big.bin").write_bytes(os.urandom(4 * 1024**2))  # pushed history: incompressible, 4 MiB
+        self._git("-C", os.fspath(repo), "add", "big.bin")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "pushed")
+        self._git("-C", os.fspath(repo), "update-ref", "refs/remotes/origin/main", "HEAD")
+        (repo / "small.txt").write_text("unpushed\n")
+        self._git("-C", os.fspath(repo), "add", "small.txt")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "unpushed")
+        gitdir = repo / ".git"
+        whole = gd.git_relief_peak(gitdir, alternates=True)
+        self.assertGreater(whole, 4 * 1024**2)
+        with mock.patch.object(gd, "BUNDLE_PEAK_SLACK", 0):
+            unpushed = gd.bundle_peak(gitdir, ["refs/heads/main", "--not", "refs/remotes/origin/main"])
+            self.assertLess(unpushed, 64 * 1024)  # a commit, a tree and a blob, not the 4 MiB blob
+            self.assertGreater(unpushed, 0)
+            # everything unpushed: the bound is the whole history, never more than the store
+            self.assertLessEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+            self.assertGreater(gd.bundle_peak(gitdir, ["refs/heads/main"]), 4 * 1024**2)
+            # a git that cannot count (too old for --disk-usage, a broken store): the whole store
+            with mock.patch.object(gd, "_git_dir_run", return_value=None):
+                self.assertEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+
+    def test_a_sparse_checkouts_absent_paths_are_not_hidden_work(self) -> None:
+        root = self.root / "tree"
+        (root / "kept").mkdir(parents=True)
+        (root / "kept/here.txt").write_text("x")
+        # cmux17's ~/m2l-viewer: 41,592 skip-worktree entries for paths a sparse checkout left out
+        self.assertFalse(gd.hidden_from_status("H kept/here.txt\0S gone/a.txt\0S gone/dir/b.txt\0", root))
+        self.assertFalse(gd.hidden_from_status("", root))
+        # a skip-worktree file in the tree may hold edits status does not show
+        self.assertTrue(gd.hidden_from_status("S kept/here.txt\0", root))
+        # assume-unchanged (lowercase), with or without skip-worktree, always may
+        self.assertTrue(gd.hidden_from_status("h kept/here.txt\0", root))
+        self.assertTrue(gd.hidden_from_status("s gone/a.txt\0", root))
+        # a name with a newline or spaces is one entry under -z
+        (root / "kept/odd\nname x").write_text("y")
+        self.assertTrue(gd.hidden_from_status("S kept/odd\nname x\0", root))
+        self.assertFalse(gd.hidden_from_status("S kept/odd\nname y\0", root))
+
+    def test_a_failed_git_call_says_why_when_asked(self) -> None:
+        said: list[str] = []
+        self.assertIsNone(gd._git_dir_run(self.root / "no-such.git", "rev-parse", "HEAD", errors=said))
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0])
 
     def test_every_git_relief_waits_for_room_for_its_peak(self) -> None:
         # the class: home clone gc and runner checkout repack go through the same gate as the mirror compact
@@ -11141,18 +11216,25 @@ class LinuxLayoutTest(unittest.TestCase):
         shutil.rmtree(outside)  # a stale record whose HEAD a branch reaches: git worktree prune drops it, nothing lost
         self.assertEqual(gd.mirror_repos(unit)[0], "")
 
-    def test_a_gone_worktree_record_holding_its_own_commit_keeps_the_repository(self) -> None:
-        """Fleet audit 2026-11-21: hot-verify mirrors kept for 73 records of ended steps, all reachable, now go; a
-        gone record whose HEAD or reflog holds a commit no branch, tag or remote reaches still keeps the item."""
+    def test_a_gone_worktree_record_holding_its_own_commit_goes_with_that_commit_bundled(self) -> None:
+        """cmux17, 2026-11-21: the 4.7G hot-verify mirror stayed kept for 1 gone record of an ended step whose HEAD
+        held a commit no branch reached. bundle_unpushed bundles that commit with the repository, so the record no
+        longer keeps it; a locked record (its tree may be on an unmounted volume) still does."""
         unit, clone, env = self.mirror_unit()
         outside = self.home / "elsewhere-own"
         self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
         self.git(outside, "commit", "-q", "--allow-empty", "-m", "only in this worktree", env=env)
+        own = self.git(outside, "rev-parse", "HEAD", env=env).strip()
         shutil.rmtree(outside)
-        self.assertIn("1 whose tree is gone", gd.mirror_repos(unit)[0])
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
         record = next((clone / ".git/worktrees").iterdir())
         (record / "locked").write_text("")
         self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
+        (record / "locked").unlink()
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):
+            rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertIn(own, self.bundle_heads().values())
 
     def test_tree_git_dir_reads_a_moved_gitfile_only_while_renamed(self) -> None:
         old, doomed = self.home / "item", self.home / "aside"
@@ -13095,6 +13177,25 @@ class NightlyNextFallbackTest(unittest.TestCase):
             os.utime(written, (old, old))
         # other families' items keep their usual shallow look
         self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
+
+    def test_a_disposable_checkouts_git_writes_do_not_restart_its_idle_clock(self) -> None:
+        """cmux17, 2026-11-21: the mirror rule's archive step wrote refs/glaeda-archive in ~/m2l-viewer/src/.git on
+        every attempt, so the tree read idle 0.5 h for days and was never due."""
+        tree = self.root / "m2l-viewer"
+        gitdir = tree / "src/.git"
+        (gitdir / "refs/glaeda-archive").mkdir(parents=True)
+        work = tree / "src/main.c"
+        work.write_text("int main(void) { return 0; }\n")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        now = time.time() - 60
+        os.utime(gitdir, (now, now))
+        disposable = gd.Family("home-scratch", self.root, True, "x", git_disposable=True)
+        self.assertLess(gd.item_mtime(disposable, tree), old + 1)
+        self.assertGreaterEqual(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), now - 1)  # as before
+        os.utime(work, (now, now))  # a work tree write is use
+        self.assertGreaterEqual(gd.item_mtime(disposable, tree), now - 1)
 
     def test_runner_cache_profile(self) -> None:
         with mock.patch.object(gd, "POLICY", {**gd.POLICY, "nightly_next_dedicated_label": "off"}):

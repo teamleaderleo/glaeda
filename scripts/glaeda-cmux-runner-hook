@@ -6910,6 +6910,28 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
     return "; ".join(notes)
 
 
+# LEDGER_ERROR_IS_FINAL: an error opening or locking a ledger file that waiting cannot clear (permissions, a read-only
+# volume, a directory or symlink where a token belongs) is a refusal at once, naming the file, not a capacity wait.
+# Read as capacity ("capacity: ..."), job-started waited out its whole bound, and its admit.want marker held the
+# mini meanwhile: no other admission there, and the linux-vm supervisor stopped the mini's VM. a fleet Mac, 2026-11-21
+# 11:27-12:27Z: cmux nightly run 44898080726's generate-nightly-deltas (the exclusive class, SIGNING_DRAIN) logged
+# "cannot take the ledger (PermissionError)" for 3600 s and was refused, the mini idle meanwhile. The exclusive class
+# alone takes fast-0, fast-1, gateway-0, gateway-1 and gui, so a ledger file only it opens (or creates) can fail it on
+# a mini every other job admits on. Errors that can pass (descriptors or disk running out) stay capacity waits.
+LEDGER_FINAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ELOOP, errno.ENOTDIR, errno.EISDIR})
+LEDGER_FINAL_MARK = "(LEDGER_ERROR_IS_FINAL)"  # in the note, so a caller that waits on any note can stop on this one
+
+
+def ledger_error_note(error: OSError) -> str:
+    """The admission note for an OSError taking the ledger: a capacity wait only when waiting can clear it."""
+    where = f" on {error.filename}" if getattr(error, "filename", None) else ""
+    what = f"cannot take the ledger ({type(error).__name__}{where})"
+    if error.errno in LEDGER_FINAL_ERRNOS:
+        return (f"{what}: waiting cannot clear it, so this job is refused now {LEDGER_FINAL_MARK}; the ledger "
+                "files must be the runner user's to open and create")
+    return f"capacity: {what}"
+
+
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int | JobOwner,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
@@ -7257,7 +7279,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 roots_file(state_dir).write_text(root + "\n")
         return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
-        return refused(f"capacity: cannot take the ledger ({type(error).__name__})")
+        return refused(ledger_error_note(error))
     finally:
         close_all(fds)
         os.close(admission)
