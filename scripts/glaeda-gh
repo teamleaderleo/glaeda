@@ -4402,6 +4402,10 @@ class Daemon:
         self.land_dirty: set[str] = set()  # event/cache keys retained for LandQueue after due() consumes nudged
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
+        # "pr:owner/repo#N", "sha:owner/repo@SHA", "branch:owner/repo@B" -> when the feed last delivered an event
+        # for it (LAND_FEED_QUIET_MAX's comment), and since when the feed has answered without a gap (None: down)
+        self.feed_marks: dict[str, float] = {}
+        self.feed_live_since: float | None = None
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
@@ -10482,7 +10486,27 @@ LAND_REVIEW_WAIT = 3600.0
 # most 6 explains an hour from base churn, not two per base push. Twice LAND_SNAPSHOT_MAX_AGE and under land_judge's
 # RUNNING_WAIT_S (1800 s), so a wait land_judge names still times out on its own clock.
 LAND_VERDICT_KEEP = 600.0
-LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
+# The controller's webhook feed (the deliveries the daemon already follows: workflow runs, check suites and comments,
+# Daemon.read_controller) says when a PR's checks or head could have changed; GitHub is read only when it says they
+# did, or when it cannot say. Retro hq#17174 theme 3, gcp-codex-lane-5 2026-11-21: session:glaeda-land made 5,336
+# gh calls in 15.7 h (3,016 of them land_judge explain's own reads: `pr view` 1,270, check-runs 1,092, run jobs 868)
+# for 528 judgments, 411 of them answers that judged nothing (unreadable 286, quota 83, host_cap 42), and 189 judged
+# unpinned after a quota park because no read had shown the cached head since (head_unpinned). The feed is "quiet"
+# for a PR since T (Daemon.land_feed_quiet) when it has answered without a gap since before T, covers the repository
+# (Daemon.fed), and delivered no run, suite or comment for the PR, its head or its branch since T. While it is:
+# - a cached head read before the latch cleared or the park ended is still the head (fresh_head): a push shows up as
+#   runs for the new head, so no read is waited for and land_judge is pinned (no `pr view` of its own);
+# - an upstream host's copy is not re-read through the broker (refresh_due);
+# - a wait verdict at the head (feedVerdict: a wait_pr that judged something) is the answer a judgment would give
+#   again: neither a could-not-judge retry's wake nor a fingerprint change re-runs land_judge (feed_holds).
+# Each is bounded by LAND_FEED_QUIET_MAX from the read or verdict it trusts: what the feed carries no event for (the
+# base moving under a green head, mergeability, a PR merged or closed) is judged at most this late. A feed that is
+# down, reset, switched or not covering the repository holds nothing: every path reads as before.
+LAND_FEED_QUIET_MAX = 1800.0
+LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
+LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
+LAND_NOT_JUDGED = frozenset({"quota", "unreadable", "host_cap", "explain_failed"})  # answers that judged nothing
+LAND_STREAK_STOP = 3 # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
 # The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
 # failures step_refused counts on their own
@@ -11650,7 +11674,10 @@ class LandQueue:
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
-                 reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
+                 reading: Callable[[str], dict | None] | None = land_budget_reading,
+                 feed_quiet: Callable[[str, str, float], bool] | None = None) -> None:
+        # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
+        self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
