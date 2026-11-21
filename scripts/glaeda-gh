@@ -10867,11 +10867,11 @@ def land_fetch_origin(url: str) -> str:
 
 
 def land_update_made_head(e: dict, head: str) -> float | None:
-    """When the update-branch this queue sent made HEAD: the time that step ended, else None. Both shapes count: the
-    head_change wait saw the new head (e["updatedHead"]), and the send was refused because GitHub's own update had
-    already made it ("expected head sha didn't match current head ref", hq#16382 at 70420e0bfe85), after which the
-    entry judges the new head from a retry wait with no head_change wait at all. A later step of another kind
-    (lastAction) leaves it None: then nothing here knows the head is this queue's."""
+    """When the update-branch this queue sent made HEAD: the time that step ended, else None. The step itself says so,
+    so both shapes count: the send landed and the head_change wait saw the new head, and the send was refused because
+    GitHub's own update had already made it ("expected head sha didn't match current head ref", hq#16382 at
+    70420e0bfe85), after which the entry judges the new head from a retry wait with no head_change wait at all. Any
+    later step of another kind leaves it None: then nothing here knows the head is this queue's."""
     a = e.get("lastAction") or {}
     at = a.get("endedAt")
     before = str(a.get("before") or "").lower()
