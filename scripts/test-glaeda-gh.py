@@ -30055,7 +30055,9 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
             self.err.truncate(0), self.err.seek(0)
             self.assertEqual(gg.nesting_synonym(list(typed)), (canonical, []))
             said = self.err.getvalue()
-            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + canonical)}`", said)
+            # typed_line, not " ".join: two of these rows carry `some query`, and the line names an argv a
+            # reader runs, so the expectation is the form that survives being typed back.
+            self.assertIn(f"read as `{gg.typed_line(['glaeda-gh'] + canonical)}`", said)
             self.assertIn(f"`{typed[0]}` is a word of `{canonical[0]}`", said)
 
     def test_a_word_several_commands_take_is_refused_naming_every_one(self) -> None:
