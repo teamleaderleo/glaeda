@@ -22972,6 +22972,49 @@ class LandTest(Base):
         self.assertEqual(waits, [60, 120, 240, 480, 960])
         self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
 
+    def test_alternating_merge_refusals_at_one_head_do_not_reset_each_others_count(self):
+        """A non-transient refusal at a head that has not moved is no progress whatever its words, so the count is
+        per head. efficiency-standing-lane, 2026-11-21: teamleaderleo/glaeda#2320 took 13 merge calls, each after its
+        own full judgment, over 2h20m at 5f640aea6348 -- the designed bound is 6. "... add the `--auto` flag." (11)
+        alternated with "GraphQL: Pull Request has merge conflicts (mergePullRequest)" (2), and each conflict
+        refusal restarted the --auto count: n read 1,2, 1, 1,2,3, 1, 1,2,3,4,5,6."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        said = ("land-judge (pass): ok: may merge at " + LA + "\nTo have the pull request merged after all the "
+                "requirements have been met, add the `--auto` flag.",
+                "land-judge (pass): ok: may merge at " + LA + "\nGraphQL: Pull Request is not mergeable "
+                "(mergePullRequest)")
+        e = {}
+        for i in range(gg.LAND_STEP_STOP + 4):
+            self.w.gh_err["merge"] = said[0] if i % 3 else said[1]
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        self.assertEqual(merges, gg.LAND_STEP_STOP)  # not one per wording: the head never moved
+        self.assertEqual(len(self.w.explains()), gg.LAND_STEP_STOP)  # nor one judgment per wording
+
+    def test_a_streak_stop_that_names_no_step_still_names_one(self):
+        """A stop with an empty `next:` ends nobody's hold -- glaeda#2320's sat that way 95 min. The refusal names
+        no step this queue runs, so the stop names the step a person can take: read what GitHub still requires,
+        clear it, re-land pinned. Never --admin (routing around a refused merge is forbidden) and never --auto."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge (pass): ok: may merge at " + LA + "\nTo have the pull request merged "
+                                  "after all the requirements have been met, add the `--auto` flag.")
+        e = self.run_hour(lambda: ok_answer(LA))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        nxt = e["stop"].get("next") or ""
+        self.assertTrue(nxt.strip(), e["stop"])
+        self.assertIn("glaeda-gh land o/r#1 --match-head-commit", nxt)
+        self.assertIn("glaeda-gh status pr o/r#1", nxt)
+        for forbidden in ("--admin", "--auto"):
+            self.assertNotIn(forbidden, nxt.replace("never --admin", ""))
+
     def test_a_new_head_starts_the_count_again(self):
         self.pr(LA)
         self.land()
