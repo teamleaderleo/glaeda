@@ -23349,6 +23349,63 @@ class LandTest(Base):
         self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
 
+    CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
+                        'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
+                        'request-branch","status":"422"}')
+
+    def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
+        """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
+        else. big-red, 2026-11-21: four `land status` rows stopped update_branch_refused after 6 identical
+        "merge conflict between base and head" calls at one head, their stop's `next:` empty, one parked 3343 min."""
+        for said in (self.CONFLICT_REFUSAL, "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
+                     "its merge conflicts must be resolved"):
+            self.assertTrue(gg.LAND_STEP_CONFLICT.search(said), said)
+        for said in ("GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)",
+                     "GraphQL: Pull Request is not mergeable (mergePullRequest)"):
+            self.assertIsNone(gg.LAND_STEP_CONFLICT.search(said), said)
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)  # one call, not LAND_STEP_STOP of them
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("merge conflict between the base and the head", e["stop"]["reason"])
+        self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --match-head-commit", e["stop"]["next"])
+        self.assertFalse(e.get("stepFail"))  # no streak to count: nothing waits, nothing retries
+        self.assertFalse(e.get("stepTransient"))
+        self.assertFalse(gg.LAND_REARM_CODES.match("update_branch_conflict"))  # a person resolves it, not a timer
+        self.assertIn("stopped: update_branch_conflict", self.w.sent()[-1][-1])
+        # a new head is a new question: the entry takes the update again when it is landed at one
+        self.pr(LB)
+        self.land()
+        self.w.gh_rc["update"] = 0
+        self.w.answers.append(refusal("stale_green", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], len([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)])),
+                         ("waiting", 2), e.get("stop"))
+
+    def test_a_retryable_update_branch_refusal_still_backs_off_and_stops_at_the_streak(self):
+        # Unchanged by the conflict stop: a refusal GitHub can answer differently next time keeps its backoff and its
+        # LAND_STEP_STOP-th-refusal stop ("Base branch was modified" clears when the base settles).
+        said = "gh: GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest) (HTTP 405)"
+        self.assertIsNone(gg.LAND_STEP_CONFLICT.search(said))
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = said
+        answer = lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA})  # noqa: E731
+        self.w.answers.append(answer())
+        e = self.tick()
+        self.assertEqual((e["state"], e["stepFail"]["count"], e["stepFail"]["kind"]),
+                         ("waiting", 1, "update_branch"), e.get("stop"))
+        e = self.run_hour(answer, seconds=4 * 3600)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_refused"), e.get("stop"))
+        self.assertEqual(e["stepFail"]["count"], gg.LAND_STEP_STOP)
+
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
         self.broker = True
