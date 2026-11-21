@@ -4785,7 +4785,7 @@ class ClientTest(Base):
             gg.parser().parse_args(got)  # argparse takes what it was handed
         for same in (["wait", "pr", "o/r#5"], ["wait", "file", "/x"], ["wait", "--help"], ["wait", "bogus"],
                      ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"],
-                     ["status", "pr", "o/r#5", "6"], ["wait", "run", "o/r", "5"]):
+                     ["status", "pr", "o/r#5", "6"]):  # `wait run o/r 5` joins as o/r/5 (test_a_repo_and_a_number_are_joined)
             self.assertEqual(gg.infer_kind(list(same)), (same, ""))
 
     def test_a_repo_and_a_number_are_joined(self) -> None:
