@@ -23779,9 +23779,15 @@ def post_item(args: argparse.Namespace) -> dict:
         # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
         # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
         target = drop_kind_prefix(args.target, args.kind, also=("pr", "comment"))
-        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(target)
-        if not m:
-            raise WatchError(f"post {args.kind} takes OWNER/REPO#N, pr:OWNER/REPO#N or a GitHub URL")
+        # Through the one shared parser, as land_key is: until 2026-11-21 this matched the *strict* PR_RE /
+        # ISSUE_RE, so `post comment o/r/5`, a bare `5` and even `pr:o/r/5` -- a string status, wait and land
+        # all read, and one this tool prints -- refused here. The kind is named one word to the left, so the
+        # separator before the number is whichever the caller typed (see PR_KEY_RE). `post review` keeps the
+        # pr form: PR_KEY_RE has no `/issues/`, and an issue has no reviews.
+        kind = "pr" if args.kind == "review" else "comment"
+        m = KEY_RES[kind].fullmatch(target)
+        if not m and not BARE_NUMBER.fullmatch(target):
+            raise WatchError(f"post {args.kind} takes {KIND_FORMS[kind]}, not {args.target!r}")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
@@ -23793,7 +23799,10 @@ def post_item(args: argparse.Namespace) -> dict:
             if args.kind != "comment" or not STATUS_KEY.fullmatch(key):
                 raise WatchError("--status-key is for post comment: letters, digits and . : = @ / - (120 at most)")
             item["status"] = key
-        item.update(repo=f"{m.group(1)}/{m.group(2)}", number=int(m.group(3)))
+        # parse_key resolves a bare number against the repository the caller stands in (or raises, naming the
+        # form to type); a repository that was in the string keeps the case it was typed in, as land_key does.
+        _, owner, repo, number = split_key(parse_key(kind, target))
+        item.update(repo=f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", number=int(number))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
     item["id"] = f"{time.time_ns() // 1_000_000:013d}-{os.getpid()}-{os.urandom(3).hex()}"
