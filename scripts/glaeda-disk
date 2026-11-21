@@ -9430,7 +9430,12 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
 def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
     """True when tree is gone and its linked worktree record under gitdir/worktrees holds no commit that a branch,
     tag or remote-tracking ref of the repository does not already reach (so `git worktree prune` loses nothing)."""
-    if os.path.lexists(moved_git_path(os.fspath(tree))):
+    try:  # gone only when the lookup says so: an unreadable parent could hide a live tree (lexists says False)
+        os.lstat(moved_git_path(os.fspath(tree)))
+        return False
+    except FileNotFoundError:
+        pass
+    except OSError:
         return False
     wts = gitdir / "worktrees"
     try:
