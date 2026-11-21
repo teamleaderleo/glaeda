@@ -27587,5 +27587,116 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIsNotNone(gg.wait_starved(req, None, now), "past the old bound it is still said, just not read")
 
 
+class PrintedTargetNotationTest(unittest.TestCase):
+    """The notation this tool prints for a target is accepted back as one.
+
+    Measured on 2026-11-21: a lane's background `glaeda-gh wait pr:teamleaderleo/leo-workspace/7241 ...`
+    exited at once with "argument kind: invalid choice: 'pr:teamleaderleo/leo-workspace/7241'", having
+    waited on nothing, while every still-waiting line the tool prints names its target exactly that way
+    ("still waiting on pr:manaflow-ai/cmux#48834"). The most-copied string in the output was invalid as
+    input. Every spelling below resolves to the same key, and the old ones keep working."""
+
+    SPELLINGS = {
+        "pr:manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),          # as the tool prints it
+        "manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),             # as it always worked
+        "manaflow-ai/cmux/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "pr:manaflow-ai/cmux/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "PR:manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "https://github.com/manaflow-ai/cmux/pull/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "pr:https://github.com/manaflow-ai/cmux/pull/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "run:manaflow-ai/cmuxterm-hq/44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "manaflow-ai/cmuxterm-hq/44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "manaflow-ai/cmuxterm-hq#44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "https://github.com/manaflow-ai/cmuxterm-hq/actions/runs/44893458900":
+            ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "run:https://github.com/manaflow-ai/cmuxterm-hq/actions/runs/44893458900":
+            ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "comment:manaflow-ai/cmux#48834": ("comment", "comment:manaflow-ai/cmux#48834"),
+        "manaflow-ai/cmux#48834 ": ("comment", "comment:manaflow-ai/cmux#48834"),
+        "head:manaflow-ai/cmux@" + "a" * 40: ("head", "head:manaflow-ai/cmux@" + "a" * 40),
+        "manaflow-ai/cmux@" + "A" * 40: ("head", "head:manaflow-ai/cmux@" + "a" * 40),
+        # the exact string the measurement refused
+        "pr:teamleaderleo/leo-workspace/7241": ("pr", "pr:teamleaderleo/leo-workspace#7241"),
+    }
+
+    def test_every_spelling_of_a_target_resolves_to_the_same_key(self) -> None:
+        for text, (kind, key) in self.SPELLINGS.items():
+            with self.subTest(text):
+                self.assertEqual(gg.parse_key(kind, text), key)
+
+    def test_the_key_the_tool_prints_is_a_target_it_takes(self) -> None:
+        """The round trip, which is the whole class of bug: whatever parse_key prints, parse_key reads."""
+        for text, (kind, key) in self.SPELLINGS.items():
+            with self.subTest(text):
+                self.assertEqual(gg.parse_key(kind, gg.parse_key(kind, text)), key)
+
+    def test_a_printed_target_runs_as_itself_with_no_kind_word(self) -> None:
+        want = {
+            ("wait", "pr:teamleaderleo/leo-workspace/7241", "--timeout", "1500"):
+                ["wait", "pr", "teamleaderleo/leo-workspace/7241", "--timeout", "1500"],
+            ("wait", "run:manaflow-ai/cmuxterm-hq/44893458900", "--jobs"):
+                ["wait", "run", "manaflow-ai/cmuxterm-hq/44893458900", "--jobs"],
+            ("wait", "comment:o/r#5", "--match", "receipt"): ["wait", "comment", "o/r#5", "--match", "receipt"],
+            ("status", "pr:o/r#5", "--json"): ["status", "pr", "o/r#5", "--json"],
+            ("wait", "file:/tmp/x", "--exists"): ["wait", "file", "/tmp/x", "--exists"],
+            ("wait", "pid:1234"): ["wait", "pid", "1234"],
+            ("wait", "until:45m"): ["wait", "until", "45m"],
+        }
+        for given, fixed in want.items():
+            with self.subTest(given):
+                got, note = gg.infer_kind(list(given))
+                self.assertEqual(got, fixed)
+                self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
+                gg.parser().parse_args(got)  # argparse takes what it was handed
+        # A URL's `https:` is not a kind either: it keeps reading as the pr target it already was
+        self.assertEqual(gg.infer_kind(["wait", "https://github.com/o/r/pull/5"])[0],
+                         ["wait", "pr", "https://github.com/o/r/pull/5"])
+        # `wait until quota:rest`'s own colon is not a kind, a kind the command does not take is not
+        # promoted into its kind slot, and a command with no target is left alone
+        for same in (["wait", "until", "quota:rest"], ["status", "file:/x"], ["status", "pid:1"],
+                     ["budget", "pr:o/r#5"]):
+            self.assertEqual(gg.infer_kind(list(same))[0], same)
+
+    def test_the_kind_given_and_the_prefix_agree_or_it_refuses(self) -> None:
+        """Never a guess across kinds: a run id read as a pull request number would wait on the wrong thing."""
+        for kind, text, named in (("pr", "run:o/r/44893458900", "run"), ("run", "pr:o/r#5", "pr"),
+                                  ("comment", "run:o/r/44893458900", "run"), ("pr", "head:o/r@" + "a" * 40, "head")):
+            with self.subTest(text), self.assertRaises(gg.WatchError) as refused:
+                gg.parse_key(kind, text)
+            said = str(refused.exception)
+            self.assertIn(f"names a {named} target", said)
+            self.assertIn(gg.KIND_FORMS[kind], said, "a refusal names the spellings it does take")
+
+    def test_a_refused_kind_names_the_spellings_instead_of_the_kind_list_alone(self) -> None:
+        bad = "argument kind: invalid choice: 'pr/o/r#5' (choose from pr, run, comment, file, pid, until)"
+        self.assertIn("`pr:OWNER/REPO#N` as this tool prints it", gg.kind_spellings(bad))
+        self.assertIn("a file target is a path, or file:PATH",
+                      gg.kind_spellings("argument kind: invalid choice: 'file:/x' (choose from pr, run, comment)"))
+        self.assertEqual(gg.kind_spellings("argument --timeout: expected one argument"), "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), \
+                self.assertRaises(SystemExit) as exit_:
+            gg.main(["status", "file:/x", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertIn("a file target is a path, or file:PATH", doc["reason"])
+
+    def test_land_and_post_take_the_printed_notation_too(self) -> None:
+        """One normalisation at the boundary, so every subcommand that takes a target has it."""
+        self.assertEqual(gg.land_key("pr:manaflow-ai/cmux/48704"),
+                         ("pr:manaflow-ai/cmux#48704", "manaflow-ai/cmux", 48704))
+        self.assertEqual(gg.land_key("manaflow-ai/cmux#48704"),
+                         ("pr:manaflow-ai/cmux#48704", "manaflow-ai/cmux", 48704))
+        with self.assertRaises(gg.WatchError) as refused:
+            gg.land_key("run:manaflow-ai/cmux/44893458900")
+        self.assertIn("names a run target", str(refused.exception))
+        for target in ("pr:o/r#5", "comment:o/r#5", "o/r#5"):
+            with self.subTest(target):
+                args = gg.parser().parse_args(["post", "comment", target, "--body", "hi"])
+                item = gg.post_item(args)
+                self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
+
+
 if __name__ == "__main__":
     unittest.main()
