@@ -163,17 +163,28 @@ def side_label(pool: str) -> str:
 
 
 def side_classes(klass: str) -> tuple[str, ...]:
-    """The classes whose side label a `klass` runner carries: its own, then every narrower class.
+    """The classes whose side label a `klass` runner carries: its own first, then every other class.
 
-    RUNNER_CLASSES is widest first, and a wider mini runs whatever a narrower one runs (a std M4 Pro, 48 GB, runs a
-    light M4's side-lane job; never the reverse). So a std side runner also carries glaeda-side-light-xcode-<v>, and
-    GitHub's own queue hands a job asking for the light side label to whichever of those runners is idle: a starved
-    light pool spills onto idle std side runners for every workflow, picker or not. On 2026-10-20 at 22:22Z the light
-    side label had 133 jobs queued on 3 online runners while 51 std side runners sat idle. Only side labels widen:
-    root, gui, session and fast labels keep their own class (canonical roots, the gui token and the fast tokens are
-    per class), and the pool namespace and trust stay the member's own (pool_label's arguments), except the one root
-    spill root_classes() names.
+    A side runner takes every class's side lane (Leo, 2026-11-21, ask-4c7dba8681: "the light mac minis dont seem
+    to be doing much of anything and we're underutilizing the ultras", after "accept all labels"). Until then side
+    labels widened only downward (a std side runner carried glaeda-side-light-xcode-<v>, a light one never
+    glaeda-side-std-xcode-<v>): at 2026-11-21 01:09Z glaeda-side-std-xcode-26.6 had 151 jobs queued, the oldest
+    2h59m, while the light M6 minis cmux17 and cmux21 sat at 7% and 1% CPU (the controller's /v1/status headroom).
+    The hook still admits each job by its own measured need (HEAD_FIT, the capacity ledger and the listener gate),
+    so a 16 GB mini whose runner carries the std side label listens for a std side job only with room for it.
+    Earlier: on 2026-10-20 at 22:22Z the light side label had 133 jobs queued on 3 online runners while 51 std side
+    runners sat idle, which the downward spill fixed. Only side labels widen: root, gui, session and fast labels
+    keep their own class (canonical roots, the gui token and the fast tokens are per class), DEV slots keep
+    dev_classes(), and the pool namespace and trust stay the member's own (pool_label's arguments), except the one
+    root spill root_classes() names.
     """
+    if klass not in RUNNER_CLASSES:
+        return ()
+    return (klass, *(k for k in RUNNER_CLASSES if k != klass))
+
+
+def narrower_classes(klass: str) -> tuple[str, ...]:
+    """`klass` and every narrower class, widest first (RUNNER_CLASSES' order): what a `klass` mini can build."""
     return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
 
 
@@ -181,8 +192,9 @@ def dev_classes(klass: str) -> tuple[str, ...]:
     """The classes whose DEV freshness label a `klass` DEV slot carries: its own, then each narrower class down to std.
     As with side_classes(), a wider mini runs a narrower one's DEV compile (an M5 Ultra, 96 GB, builds what an M4 Pro
     builds), but never down to light: a 16 GB M4 cannot build the Release app, so no wider slot answers a light DEV
-    label, and a std slot's labels stay exactly what they were."""
-    return tuple(k for k in side_classes(klass) if k == klass or k != "light")
+    label, and a std slot's labels stay exactly what they were. It reads narrower_classes(), not side_classes(),
+    which since ask-4c7dba8681 spans every class."""
+    return tuple(k for k in narrower_classes(klass) if k == klass or k != "light")
 
 
 def nightly_classes(klass: str) -> tuple[str, ...]:
@@ -230,7 +242,7 @@ def widened_labels(labels: list[str]) -> list[str]:
     xl slot registered between #1819 and nightly_classes()'s narrowing carries glaeda-nightly-std-xcode-<v> too, the
     label cmux's signing jobs queue on, and the reconcile takes it off instead of keeping it until a reinstall.
 
-    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels (one
+    The registered labels of a runner installed before side_classes() lack the other classes' side labels (one
     installed before root_classes() its root spill).
     A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
     mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
