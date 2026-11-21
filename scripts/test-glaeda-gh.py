@@ -28337,6 +28337,69 @@ class ShorthandFlagTest(unittest.TestCase):
                 self.assertEqual((args.until, err), (word, ""))
         self.assertIn("invalid choice", self.refused(["wait", "pr", "o/r#1", "--until", "nope"]))
 
+    # Leo, 2026-11-20: "Like we need a bunch of synonyms for code for you guys where it just goes \"eh close
+    # enough\" and works". `--until checks-done` ended two background merge waits on 2026-11-21.
+    UNTIL_WORDS = {
+        "checks-done": "done", "checks": "done", "complete": "done", "completed": "done", "finished": "done",
+        "all-done": "done", "settled": "done", "checks_done": "done", "DONE": "done",
+        "pass": "green", "passed": "green", "passing": "green", "success": "green", "succeeded": "green",
+        "ok": "green", "all-green": "green", "Green": "green",
+        "req": "required", "required-checks": "required", "must": "required",
+        "merge": "merged", "landed": "merged", "land": "merged",
+        # typos: one edit (a swap counts one), two in a long word, a prefix of 3 letters or more
+        "dnoe": "done", "grren": "green", "mereged": "merged", "requird": "required", "chekcs-done": "done",
+        "finshed": "done", "sucess": "green", "fin": "done", "merg": "merged",
+    }
+
+    def test_each_until_synonym_runs_its_choice(self):
+        for word, meant in self.UNTIL_WORDS.items():
+            for argv in (["wait", "pr", "o/r#1", "--until", word, "--timeout", "60"],
+                         ["wait", "pr", "o/r#1", f"--until={word}"]):
+                with self.subTest(argv=argv):
+                    args, err = self.parse(argv)
+                    self.assertEqual(args.until, meant)
+                    self.assertEqual(err.count("\n"), 1, err)
+                    self.assertIn(f"glaeda-gh: --until `{word}` ran as `{meant}`", err)
+
+    def test_other_choice_arguments_take_synonyms(self):
+        for argv, field, meant in (
+                (["post", "review", "o/r#1", "--event", "lgtm"], "event", "approve"),
+                (["post", "review", "o/r#1", "--event", "request_changes"], "event", "request-changes"),
+                (["post", "review", "o/r#1", "--event", "aprove"], "event", "approve"),
+                (["post", "commnet", "o/r#1"], "kind", "comment"),
+                (["search", "prs", "x", "--state", "merge"], "state", "merged"),
+                (["search", "prs", "x", "--state", "any"], "state", "all"),
+                (["log", "search", "o/r", "pat", "--seg", "mian"], "seg", "main"),
+                (["on-event", "replya"], "action", "replay"),
+                (["status", "rn", "o/r/5"], "kind", "run")):
+            with self.subTest(argv=argv):
+                args, err = self.parse(argv)
+                self.assertEqual(getattr(args, field), meant)
+                self.assertIn(f"ran as `{meant}`", err)
+
+    def test_choice_as_close_to_two_is_refused_with_the_choices(self):
+        err = self.refused(["wait", "pi", "o/r#1"])  # one edit from pr and from pid
+        self.assertIn("invalid choice: 'pi'", err)
+        self.assertIn("as close to pr as to pid", err)
+        self.assertIn("'until'", err)  # the choices are listed
+        self.assertNotIn("ran as", err)
+
+    def test_far_or_target_shaped_choice_is_still_refused(self):
+        for argv in (["wait", "pr", "o/r#1", "--until", "nope"],
+                     ["wait", "pr", "o/r#1", "--until", "banana"],
+                     ["post", "review", "o/r#1", "--event", "maybe"]):
+            with self.subTest(argv=argv):
+                err = self.refused(argv)
+                self.assertIn("invalid choice", err)
+                self.assertNotIn("ran as", err)
+
+    def test_close_choice_unit(self):
+        self.assertEqual(gg.close_choice("checks-done", ("green", "done", "required", "merged")), ("done", []))
+        self.assertEqual(gg.close_choice("pi", gg.WAIT_KINDS), ("", ["pr", "pid"]))
+        self.assertEqual(gg.close_choice("o/r#5", gg.WAIT_KINDS), ("", []))
+        self.assertEqual(gg.typo_distance("dnoe", "done"), 1)
+        self.assertEqual(gg.typo_distance("nope", "done"), 2)
+
     def test_log_job_flag_is_the_job_id(self):
         for kind in ("errors", "job"):
             for argv in (["log", kind, "o/r", "--job", "136749709509"],
