@@ -30136,6 +30136,54 @@ class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
                       ["post", "comment", "o/r#1", "--body=pr", "--gate"]):
             self.assertEqual(gg.doubled_kind_synonym(list(typed)), (list(typed), []), typed)
 
+    def test_a_body_whose_text_is_a_flags_name_never_picks_the_reading(self) -> None:
+        """Review of #2381, F1: the narrowing read every word of the call, and `normalized_flag` drops
+        dashes, so a body of `event` answered for `--event` and `glaeda-gh post comment review o/r#1 --body
+        event` posted a *review* -- another write, to another place -- on the strength of its own body text.
+        Only a word typed as a flag is evidence; a body, a target or any other value is data."""
+        for typed in (["post", "comment", "review", "o/r#1", "--body", "event"],
+                      ["post", "pr", "comment", "o/r#1", "--body", "gate"],
+                      ["post", "comment", "review", "o/r#1", "--body-file", "title"]):
+            fixed, refusal = gg.doubled_kind_synonym(list(typed))
+            self.assertEqual(fixed, list(typed), typed)
+            self.assertTrue(refusal, typed)
+        with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
+            self.assertEqual(gg.main(["post", "comment", "review", "o/r#1", "--body", "event"]), 64)
+
+    def test_one_word_typed_twice_says_so_and_keeps_one(self) -> None:
+        """Review of #2381, F2: the two readings of `post comment comment o/r#1` are the same call, so the
+        duplicate is dropped -- but it went down the narrowing path with no evidence and said `and )`, an
+        empty clause. A doubled word is its own reading, named as one."""
+        fixed, refusal = gg.doubled_kind_synonym(["post", "comment", "comment", "o/r#1", "--json"])
+        self.assertEqual((fixed, refusal), (["post", "comment", "o/r#1", "--json"], []))
+        said = self.err.getvalue()
+        self.assertIn("read as `glaeda-gh post comment o/r#1 --json`", said)
+        self.assertIn("typed twice", said)
+        self.assertNotIn("and )", said)
+
+    def test_an_abbreviated_flags_value_is_still_its_value(self) -> None:
+        """Review of #2381, F3: argparse's `allow_abbrev` is on, so `--contain` is `--contains` and these
+        calls parse today. The value of an abbreviated flag was counted as a positional word, which pushed
+        the call past its capacity and refused a call that works."""
+        for typed in (["wait", "pr", "file", "--contain", "x"], ["wait", "pr", "run", "--time", "30"],
+                      ["post", "comment", "o/r#1", "--bod", "pr"]):
+            self.assertEqual(gg.doubled_kind_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_a_refusals_next_lines_are_calls_that_run(self) -> None:
+        """Review of #2381, F4: with `--title` (pr's) and `--status-key` (comment's) typed together the
+        readings scope to neither, and the old refusal printed `post comment o/r#1 --title t --status-key k`,
+        which `post_item` then refuses for `--title`. Each next line carries only the flags of its own kind,
+        and the refusal names the flags that disagree."""
+        fixed, refusal = gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--title", "t",
+                                                  "--status-key", "k"])
+        self.assertEqual(fixed, ["post", "pr", "comment", "o/r#1", "--title", "t", "--status-key", "k"])
+        self.assertIn("`--title` is pr's", refusal[0])
+        self.assertIn("`--status-key` is comment's", refusal[0])
+        self.assertEqual(sorted(line for line in refusal if line.startswith("next: ")),
+                         ["next: glaeda-gh post comment o/r#1 --status-key k",
+                          "next: glaeda-gh post pr o/r#1 --title t"])
+
     def test_the_whole_call_refuses_and_nothing_is_posted(self) -> None:
         """A write it cannot read is a usage error, with no request queued: the exit code argparse already
         has for one, and `post_item` never reached."""
