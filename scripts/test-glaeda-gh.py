@@ -22704,7 +22704,7 @@ class LandTest(Base):
         # moment a check moves the row is judged again on the new state, not on the kept answer.
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "QUEUED", None)])
         self.land()
-        e = self.run_hour(self.queued_wait, seconds=2 * gg.LAND_WAIT_IDLE_KEEP, step=60.0)
+        e = self.run_hour(self.queued_wait, seconds=gg.LAND_WAIT_DEFAULT + 2 * gg.LAND_WAIT_IDLE_KEEP, step=60.0)
         self.assertEqual((len(self.w.explains()), self.w.gh_calls("pr", "merge")), (1, []))
         self.assertTrue([h for h in e["history"] if h["event"] == "wait_kept"])
         # the check finishes green: judged at once on the new fingerprint, and that judgment's own "ok" merges
@@ -22726,7 +22726,7 @@ class LandTest(Base):
                                           reason="land-judge: refused: the classifier could not read the reds"),
                           seconds=400.0, step=60.0)
         judged = [h for h in e["history"] if h["event"] == "judged"]
-        day = (read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
         self.assertGreaterEqual(len(judged), 2)
         self.assertEqual(day.get("explain_unmoved"), len(judged) - 1)
         self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
