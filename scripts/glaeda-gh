@@ -10060,7 +10060,7 @@ def land_judge_missing(tried: list[Path]) -> tuple[str, str]:
 # Where router-review is, in order, after land.json's routerReview: ~/.local/bin (a host that links it there), the
 # ws-sync deploy's tools/, the leo-workspace checkout's tools/, then the daemon's PATH. The first that exists is run.
 # Before, only ~/.local/bin/router-review was tried, and on a host with no such link every review step stopped
-# review_failed with FileNotFoundError (cmux#45626, 2026-11-17).
+# review_cannot_start with FileNotFoundError (cmux#45626, 2026-11-17).
 LAND_ROUTER_REVIEW_PATHS = (Path.home() / ".local/bin/router-review", LAND_JUDGE.parent / "router-review",
                             Path.home() / "Projects/leo-workspace/tools/router-review")
 
@@ -10076,6 +10076,31 @@ def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
     found = next((p for p in tried if p.is_file() and os.access(p, os.X_OK)), None)
     on_path = None if found else shutil.which("router-review")
     return (Path(on_path) if on_path else found), tried + ([] if found else [Path("$PATH/router-review")])
+
+
+def land_review_start_failure(error: OSError, rr: Path) -> tuple[str, str]:
+    """(why, the step that fixes it) when router-review was resolved to RR but could not be started.
+
+    `describe` reduces anything that is not our own WatchError to its type name, so the stop read only
+    "router-review could not start: FileNotFoundError": it named no path, and nobody could tell what to repair.
+    cmux#45626 sat stopped on that line for 5,351 minutes (2026-11-17 18:40Z to 2026-11-21 11:52Z).
+    An OSError from Popen carries the path the kernel refused in .filename (the executable, or the cwd), which is a
+    path we passed, never a message from anywhere else. ENOENT on a file that is there is its `#!` interpreter, not
+    the tool, so the reason says which of the two it is and the next step repairs that one.
+    """
+    named = Path(error.filename) if error.filename else rr
+    what = error.strerror or str(error) or type(error).__name__
+    why = f"router-review at {named} could not start: {what}"
+    if error.errno is not None:
+        why += f" (errno {error.errno})"
+    if named.is_file():
+        why += "; that file is there, so what is missing is its `#!` interpreter"
+        nxt = f"head -1 {named}, then install the interpreter it names"
+    else:
+        why += "; no file is at that path"
+        nxt = (f"ln -s {LAND_ROUTER_REVIEW_PATHS[-1]} {LAND_ROUTER_REVIEW_PATHS[0]} "
+               "(or `reach enroll HOST --apply`, which links it)")
+    return why, nxt
 
 
 # The startup check's second half: land-judge found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
@@ -10400,12 +10425,17 @@ LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head (
 LAND_RERUN_CAP = 3
 # A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (land_judge could not judge:
 # an old land_judge checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
-# 5xx, LAND_STEP_TRANSIENT). It is queued again once land_judge's checkout was refreshed or turned current after the
+# 5xx, LAND_STEP_TRANSIENT) and review_cannot_start (router-review is not on this host, or would not exec: a link or
+# a deploy made since the stop clears it, and the entry must not read as a review that refused). It is queued again
+# once land_judge's checkout was refreshed or turned current after the
 # stop (retry_deadline), else LAND_REARM_AFTER after it, at most LAND_REARM_CAP times per entry per UTC day. Its wait
 # budget and transient count are kept, so a judgment that still reads the same stops it again at once (one probe, not
 # another 2 h); one that reads clean goes on. gcp-agent-lane-6, 2026-11-19: cmux#46208 and #46210 stayed stopped
-# retry_deadline behind a stale land_judge checkout, each landing only on a requeue by hand.
-LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|[a-z_]+_transient)$")
+# retry_deadline behind a stale land_judge checkout, each landing only on a requeue by hand. cmux#45626 stayed stopped
+# "review_failed" for 89 h because the reviewer could not start here and that reads the same as a review that refused:
+# a review verdict (a BLOCK, land_judge's stop class "block") is a judgment and is never re-armed, while
+# review_cannot_start is this host missing a tool and is.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
 # An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
@@ -13819,7 +13849,8 @@ class LandQueue:
             else:
                 rr, tried = land_router_review(self.config())
                 if rr is None:
-                    self.stop(e, "review_failed", "router-review is not at any of " + ", ".join(map(os.fspath, tried)),
+                    self.stop(e, "review_cannot_start",
+                              "router-review is not at any of " + ", ".join(map(os.fspath, tried)),
                               f'set "routerReview" in {LAND_CONFIG} to router-review\'s path, then '
                               f"router-review {repo} {number} --post")
                     return
@@ -13835,9 +13866,10 @@ class LandQueue:
                     self.finish(e, None, started=True)
                 except OSError as error:
                     e["reviewed"] = [h for h in e["reviewed"] if h != key]
-                    self.finish(e, None, error=describe(error))
-                    self.stop(e, "review_failed", f"router-review could not start: {describe(error)}",
-                              f"router-review {repo} {number} --post")
+                    why, nxt = land_review_start_failure(error, rr)
+                    self.finish(e, None, error=why)
+                    self.stop(e, "review_cannot_start", why,
+                              f"{nxt}; or run the review by hand: router-review {repo} {number} --post")
                     return
             key = parse_key("comment", f"{repo}#{number}")
             self.wait(e, {"kind": "comment", "key": key, "match": "SHIP|BLOCK", "since": self.now}, LAND_REVIEW_WAIT)

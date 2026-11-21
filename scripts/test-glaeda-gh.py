@@ -24698,7 +24698,52 @@ class LandTest(Base):
         self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
         with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
             e = self.tick()
-        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
+
+    def test_a_reviewer_that_cannot_start_names_the_missing_path_and_the_step_that_provides_it(self):
+        # cmux#45626 sat stopped 5,351 min on "router-review could not start: FileNotFoundError", naming no path.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        gone = "/nowhere/bin/router-review"
+        err = FileNotFoundError(2, "No such file or directory", gone)
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=err):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
+        self.assertIn(gone, e["stop"]["reason"], "the refusal must name the path that was not found")
+        self.assertIn("No such file or directory", e["stop"]["reason"])
+        self.assertIn("no file is at that path", e["stop"]["reason"])
+        self.assertIn("ln -s", e["stop"]["next"], "the next step must be the one command that provides it")
+        self.assertIn("router-review o/r 1 --post", e["stop"]["next"])
+        self.assertLessEqual(len(e["stop"]["next"]), gg.LAND_TEXT, "the next step must survive land_trim whole")
+        self.assertIn(gone, (e.get("lastAction") or {}).get("error") or "")
+        # a tool that is there but will not exec is its #! interpreter, and the next step reads it, not a link
+        here = Path(self.tmp.name) / "rr-here"
+        here.write_text("#!/usr/bin/nonesuch\n")
+        why, nxt = gg.land_review_start_failure(FileNotFoundError(2, "No such file or directory", str(here)), here)
+        self.assertIn(str(here), why)
+        self.assertIn("`#!` interpreter", why)
+        self.assertEqual(nxt, f"head -1 {here}, then install the interpreter it names")
+        # an OSError carrying no filename still names the path the daemon resolved
+        why, _ = gg.land_review_start_failure(OSError("no router-review"), Path("/opt/rr"))
+        self.assertIn("/opt/rr", why)
+
+    def test_a_reviewer_that_cannot_start_is_re_armed_while_a_review_verdict_is_not(self):
+        # "could not run the reviewer here" can clear by itself (a link, a deploy); a BLOCK verdict is a judgment.
+        self.assertTrue(gg.LAND_REARM_CODES.match("review_cannot_start"))
+        for verdict in ("block", "review_failed", "chat_hold", "own_red"):
+            self.assertIsNone(gg.LAND_REARM_CODES.match(verdict), verdict)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
+            e = self.tick()
+        self.assertEqual(e["stop"]["code"], "review_cannot_start")
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["stop"], e["rearms"]["n"]), ("queued", None, 1))
+        self.assertEqual(e["lastStop"]["code"], "review_cannot_start")
 
     def test_router_review_unset_is_found_in_the_workspace_tools_not_only_local_bin(self):
         # cmux#45626: a host with no ~/.local/bin/router-review link stopped every review with FileNotFoundError.
@@ -24731,7 +24776,7 @@ class LandTest(Base):
                 mock.patch.object(gg.shutil, "which", return_value=None), \
                 mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
             e = self.tick()
-        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
         self.assertIn("/nowhere/router-review", e["stop"]["reason"])
         self.assertIn("routerReview", e["stop"]["next"])
 
