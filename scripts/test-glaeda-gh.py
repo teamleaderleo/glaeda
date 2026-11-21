@@ -21405,6 +21405,55 @@ class LogScanTest(Base):
         self.run_cmd(gg.cmd_log_errors, "o/r", 31, rest=self.rest)
         self.assertEqual(self.rest_calls, 1)  # the finished log was kept
 
+    @staticmethod
+    def no_rest(repo: str, job: int) -> tuple[bool, bytes, str]:
+        return False, b"", "HTTP 404"
+
+    def test_errors_of_a_run_id_reads_that_run_s_failed_jobs(self) -> None:
+        """A run id and a job id are both bare integers, so neither the caller nor argparse can tell them apart:
+        `log errors OWNER/REPO 44950653493` said "no log for job 44950653493", which reads as a job whose log
+        expired, not as "that is a run". The controller's own history knows which jobs the run has, so the number
+        resolves here with no GitHub read and the caller gets the error lines asked for."""
+        self.rec(2, run=9, minutes_ago=30)
+        self.rec(3, run=9, conclusion="success", minutes_ago=29)
+        self.rec(4, run=9, name="unittest", minutes_ago=28)
+        self.ctl_logs[2] = (200, self.FAIL_LOG)
+        self.ctl_logs[4] = (200, self.QUIET_LOG)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, text = self.run_cmd(gg.cmd_log_errors, "o/r", 9, as_json=True, rest=self.no_rest)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["run"]), (0, 9))
+        self.assertEqual([j["job"] for j in doc["jobs"]], [2, 4])  # the green job is not a failure, so not read
+        self.assertEqual(doc["jobs"][0]["total"], 6)
+        self.assertIn("run 9", err.getvalue())
+
+    def test_errors_of_a_number_that_is_no_job_and_no_run_names_both_readings(self) -> None:
+        """The refusal has to say which of the two it looked for, or the reader retries the same number."""
+        self.rec(2, run=9, minutes_ago=30)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, _ = self.run_cmd(gg.cmd_log_errors, "o/r", 77, rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("no log for o/r job 77", said)
+        self.assertIn("no run 77", said)
+        self.assertIn("glaeda-gh status run o/r/77", said)  # a run of another repo, or one too old to have logs
+
+    def test_job_of_a_run_id_names_the_run_s_failed_jobs(self) -> None:
+        """`log job` prints exactly one log on stdout, so a run id cannot be served; it can be named, with the
+        command for each failed job of that run."""
+        self.rec(2, run=9, minutes_ago=30)
+        self.rec(3, run=9, conclusion="success", minutes_ago=29)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, out = self.run_cmd(gg.cmd_log_job, "o/r", 9, rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual((code, out), (1, ""))  # nothing on stdout: a caller pipes it
+        self.assertIn("run 9 of o/r, not a job", said)
+        self.assertIn("glaeda-gh log errors o/r 2", said)
+        self.assertNotIn("o/r 3", said)  # the green job of the same run is not offered
+
 
 # ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
 
