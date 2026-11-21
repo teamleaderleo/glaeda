@@ -21625,6 +21625,37 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def test_a_stop_on_a_pr_that_merged_since_ends_merged_never_rearmed(self):
+        # gcp-codex-swarm-06, 2026-11-20/21: hq#14618, merged long before, re-armed retry_deadline hour after hour.
+        self.stop_retry_deadline()
+        judged = len(self.w.explains())
+        self.pr(LA, state="MERGED")
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual(e["state"], "merged")
+        self.assertNotIn("rearms", e)
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], len(self.w.explains())), ("merged", judged))  # never judged again
+
+    def test_a_stop_on_a_pr_closed_since_stays_stopped_closed(self):
+        self.stop_retry_deadline()
+        self.pr(LA, state="CLOSED")
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "closed", None))
+
+    def test_land_cancel_on_a_stopped_entry_survives_the_rearm(self):
+        # hq#14618, 2026-11-21: `glaeda-gh land cancel` at ~01:00Z left the entry stopped, and it re-armed at 01:55Z.
+        self.stop_retry_deadline()
+        judged = len(self.w.explains())
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "host/lane")
+        e = self.tick(1)
+        self.assertEqual(e["state"], "cancelled")
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], len(self.w.explains())), ("cancelled", judged))
+        self.land()
+        self.assertNotEqual(self.tick()["state"], "cancelled")  # landing it again starts it over
+
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)
         self.land()

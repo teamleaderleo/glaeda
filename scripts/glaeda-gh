@@ -11156,7 +11156,10 @@ class LandQueue:
         if e and rid and rid in (e.get("requestId"), e.get("cancelId")):
             return  # applied before a crash took the request's deletion with it
         if req.get("op") == LAND_WITHDRAW:
-            if e and e["state"] not in LAND_DONE:
+            # A stopped entry is cancelled too: a stop that can clear by itself is re-armed (rearm), so leaving it
+            # stopped let the next pass queue it again (hq#14618, 2026-11-21: `land cancel` at ~01:00Z did not hold,
+            # and it re-armed at 01:55Z). Cancelled is never re-armed; a later `land` starts it over.
+            if e and (e["state"] not in LAND_DONE or e["state"] == "stopped"):
                 sent = e["state"] == "acting"
                 e["state"] = "cancelled"
                 e["wait"] = None
@@ -11655,6 +11658,17 @@ class LandQueue:
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
         if not LAND_REARM_CODES.match(code):
+            return False
+        # A PR that merged or closed since the stop is over: it ends its entry (merged, or stopped "closed"), never a
+        # re-arm. gcp-codex-swarm-06, 2026-11-20/21: hq#14618, merged long before, re-armed retry_deadline hour after
+        # hour, and every re-arm judged a merged PR. The cache is enough: MERGED and CLOSED are terminal, so a cached
+        # one is the truth however old.
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state in ("MERGED", "CLOSED"):
+            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "") \
+                if isinstance(data.get("mergeCommit"), dict) else ""
+            self.ended(e, state, merge_sha, "re-arm: the PR's cached state shows it")
             return False
         at = float(st.get("at") or 0)
         cleared = code == "retry_deadline" and self.mh_changed_at > at
