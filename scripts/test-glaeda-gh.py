@@ -30058,6 +30058,95 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
         self.assertEqual(self.err.getvalue(), "", "a canonical call says nothing on stderr")
 
 
+class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
+    """The mirror image of the class above: there a word was typed one level too shallow, here an extra one
+    is typed one level too deep. Measured 2026-11-21, `glaeda-gh post pr comment manaflow-ai/cmuxterm-hq#17050
+    --body-file /tmp/receipt.md --gate` answered `unrecognized arguments: manaflow-ai/cmuxterm-hq#17050`: it
+    named the one part of the call that was right, so the next try edited the target instead of dropping
+    `pr`, and a review receipt a merge was waiting on cost another round trip."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_the_refusal_names_the_extra_word_and_prints_both_readings(self) -> None:
+        raw = ["post", "pr", "comment", "manaflow-ai/cmuxterm-hq#17050", "--json"]
+        fixed, refusal = gg.doubled_kind_synonym(list(raw))
+        self.assertEqual(fixed, raw, "argv is never half-rewritten when it refuses")
+        self.assertIn("`pr comment` is two words of `post`", refusal[0])
+        self.assertEqual(sorted(refusal[1:]),
+                         ["next: glaeda-gh post comment manaflow-ai/cmuxterm-hq#17050 --json",
+                          "next: glaeda-gh post pr manaflow-ai/cmuxterm-hq#17050 --json"])
+
+    def test_the_flags_typed_pick_the_reading_when_only_one_of_them_takes_them(self) -> None:
+        """`post`'s words are one positional's `choices`, so all four share a parser and argparse knows no
+        difference between their options; the scope each option really has is in its help text, next to it.
+        `--status-key` says `comment:`, `--title` says `pr:`, `--gate` says `comment or review:`, and
+        `--json`, scoped to nothing, narrows nothing and still refuses."""
+        fixed, refusal = gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--status-key", "k"])
+        self.assertEqual((fixed, refusal), (["post", "comment", "o/r#1", "--status-key", "k"], []))
+        said = self.err.getvalue()
+        self.assertIn("read as `glaeda-gh post comment o/r#1 --status-key k`", said)
+        self.assertIn("`--status-key` is comment's", said)
+        self.assertEqual(gg.doubled_kind_synonym(["post", "comment", "pr", "o/r", "--title", "t"]),
+                         (["post", "pr", "o/r", "--title", "t"], []))
+        self.assertEqual(
+            gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--body-file", "/tmp/r.md", "--gate"]),
+            (["post", "comment", "o/r#1", "--body-file", "/tmp/r.md", "--gate"], []),
+            "the measured call: `--gate` is comment or review's, and only `comment` is also a reading")
+        self.assertTrue(gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--json"])[1])
+        self.assertTrue(gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--title", "t",
+                                                 "--status-key", "k"])[1],
+                        "flags that scope to neither reading together leave nothing, and it refuses")
+
+    def test_the_scope_is_read_off_each_options_own_help_text(self) -> None:
+        """Nothing hand-listed: a kind named in an option's help scopes it, and a help text that merely
+        happens to contain a colon does not. `--body`'s `the text (prefer --body-file: ...)` is every
+        kind's, as are `--wait`'s and `--json`'s."""
+        post = gg.child_parser(gg.parser(), "post")
+        scoped = gg.kind_scoped_options(post, gg.first_slot_words(post))
+        self.assertEqual(scoped.get("--title"), frozenset({"pr"}))
+        self.assertEqual(scoped.get("--status-key"), frozenset({"comment"}))
+        self.assertEqual(scoped.get("--gate"), frozenset({"comment", "review"}))
+        self.assertEqual(scoped.get("--event"), frozenset({"review"}))
+        for every in ("--body", "--body-file", "--wait", "--json"):
+            self.assertNotIn(every, scoped, f"{every} answers for every kind")
+
+    def test_a_word_that_is_this_callers_data_is_left_exactly_as_typed(self) -> None:
+        """`both` is a word of `search` and also a perfectly good thing to search for. Only a call with more
+        positional words than its command can hold is touched, and `search` holds a whole query, so this one
+        is not. The capacity is read off the parser, never listed by hand."""
+        for typed in (["search", "prs", "both"], ["search", "prs", "both", "issues", "--limit", "5"],
+                      ["log", "search", "o/r", "job"], ["post", "comment", "o/r#1", "--body", "pr comment"],
+                      ["status", "pr", "o/r#1"], ["post", "pr", "o/r", "--title", "t"],
+                      ["wait", "pr", "o/r#1", "--merged"], ["gh", "pr", "comment", "1"],
+                      ["post", "pr"], ["post"], [], ["--help"], ["nonsense", "pr", "comment", "x"]):
+            self.assertEqual(gg.doubled_kind_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a call it leaves alone says nothing on stderr")
+        self.assertEqual(gg.positional_capacity(gg.child_parser(gg.parser(), "post")), 2)
+        self.assertEqual(gg.positional_capacity(gg.child_parser(gg.parser(), "search")), math.inf)
+
+    def test_a_flags_value_is_never_read_as_a_positional_word(self) -> None:
+        """`--body comment` is a body, not a second word of `post`, so the call parses and is left alone;
+        the same text after a bare `--` is data too."""
+        for typed in (["post", "comment", "o/r#1", "--body", "comment"],
+                      ["post", "comment", "o/r#1", "--body-file", "pr"],
+                      ["post", "comment", "o/r#1", "--body=pr", "--gate"]):
+            self.assertEqual(gg.doubled_kind_synonym(list(typed)), (list(typed), []), typed)
+
+    def test_the_whole_call_refuses_and_nothing_is_posted(self) -> None:
+        """A write it cannot read is a usage error, with no request queued: the exit code argparse already
+        has for one, and `post_item` never reached."""
+        with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
+            self.assertEqual(gg.main(["post", "pr", "comment", "manaflow-ai/cmux#1", "--json"]), 64)
+        said = self.err.getvalue()
+        self.assertIn("is two words of `post`", said)
+        self.assertIn("next: glaeda-gh post comment manaflow-ai/cmux#1 --json", said)
+        self.assertNotIn("unrecognized arguments", said)
+
+
 class AFlagsCaseConventionTest(unittest.TestCase):
     """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
     spelling two real options would both answer to is refused rather than picked."""
