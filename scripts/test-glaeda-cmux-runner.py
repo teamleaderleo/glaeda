@@ -271,6 +271,24 @@ def wait_for_path(path: Path, seconds: float = 10) -> bool:
     return path.exists()
 
 
+def wait_for_lines(path: Path, count: int = 1, seconds: float = 10) -> list[str]:
+    """The whole lines a fake glaeda-disk appended, once there are count of them. Both phases trigger the one queued
+    pass detached after admitting (disk_pressure_detached), so a fake the hook also ran while waiting is run a second
+    time after the hook returned: the file grows under the reader, and a read can catch a line half-written (a shard
+    on a mini at load 123, 2026-11-21: `could not convert string to float: ''`). Only a newline-terminated line
+    counts, bounded, re-read rather than slept on; the first line is always the pass the hook waited for."""
+    deadline = time.monotonic() + seconds
+    while True:
+        text = path.read_text() if path.exists() else ""
+        lines = text.split("\n")[:-1]  # the last piece is unterminated: a line still being written
+        if len(lines) >= count:
+            return lines
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path.name}: {len(lines)} whole line(s), not {count}, after "
+                                 f"{seconds:g} s: {text!r}")
+        time.sleep(0.05)
+
+
 def event(tmp: Path, name: str, payload: dict) -> Path:
     path = tmp / f"{name}.json"
     path.write_text(json.dumps(payload))
@@ -1493,8 +1511,9 @@ class HookTest(unittest.TestCase):
 
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
-        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n"
                                "time.sleep(20)\n")
         broken = make_executable(self.dir / "glaeda-disk-broken", "import sys\nsys.exit(3)\n")
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1505,8 +1524,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertLess(time.monotonic() - start, 10)
         self.assertIn("glaeda-disk started in the background", result.stdout)  # the queued pass, never waited on
-        self.assertTrue(wait_for_path(marker))
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
         for phase in ("job-started", "job-completed"):
             result = self.run_hook(phase, "push", push, "--allowed-repo", "manaflow-ai/cmux",
                                    "--disk", os.fspath(broken), repo="manaflow-ai/cmux")
@@ -1795,8 +1813,9 @@ class HookTest(unittest.TestCase):
     def test_disk_floor_evicts_before_warning(self) -> None:
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n")
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
@@ -1804,7 +1823,7 @@ class HookTest(unittest.TestCase):
                                repo="manaflow-ai/cmux", env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0 --floor-gib 1e+09",
                          "told the floor, so it does not wait for the job that holds this runner")
         self.assertLess(result.stdout.index("disk floor"), result.stdout.index("warning:"), "evicted, then warned")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
@@ -1813,12 +1832,13 @@ class HookTest(unittest.TestCase):
         own = self.dir / "actions-runner" / hook.RUNNER_HOOK_SCRIPT
         own.parent.mkdir(parents=True)
         own.write_text("exec python3 /hook job-started --min-free-gib 999999999\n")
+        marker.unlink()  # this phase's own first line, not one the pass after the last phase appended
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
                                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
                                env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
 
     def test_a_nightly_job_short_of_disk_takes_idle_runners_work_then_is_admitted(self) -> None:
         """NIGHTLY_DISK_RESERVE, the 2026-10-28 00:04Z refusal: the dedicated nightly builder's job found 20 GiB free
@@ -1986,8 +2006,10 @@ class HookTest(unittest.TestCase):
         evict.lock; a pass of its own would skip as busy and the job be refused while space is being freed."""
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(str(time.time()))\n")
+        # one whole line appended per pass, never rewritten: the pass after admitting runs this same fake detached
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys, time\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(f'{time.time()}\\n')\nhandle.close()\n")
         self.hold_evict_lock(3)
         released = time.time() + 2  # the holder sleeps 3 s after it printed; allow a second of slack
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1998,7 +2020,8 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
                                         r"glaeda-disk exited 0, freed")
-        self.assertGreater(float(marker.read_text()), released, "its own pass ran only once the lock was free")
+        self.assertGreater(float(wait_for_lines(marker)[0]), released,
+                           "its own pass ran only once the lock was free")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
 
     def test_floor_eviction_skips_its_own_pass_when_the_running_one_freed_enough(self) -> None:
