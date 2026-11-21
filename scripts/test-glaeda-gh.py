@@ -17965,6 +17965,47 @@ class BrokerAnswerCacheTest(CountingGhBase):
             gg.cmd_post(args)
         self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r heads", "o/r other"})
 
+    def test_a_pr_on_an_upstream_host_is_made_through_the_broker(self) -> None:
+        """A host that reads GitHub through an upstream has no login to post with. Until 2026-11-21 `post` queued
+        the write and upstream_refuse_posts failed it a tick later, so the PR was never opened and `post pr` said
+        nothing was wrong. The broker writes it with a token minted for the call."""
+        no_guard(self)
+        args = mock.Mock(kind="pr", target="O/R", body="why", body_file=None, wait=0, json=False,
+                         head="lane/x", base="main", title="a title", reviewer=None, event="comment")
+        ran: list[list[str]] = []
+
+        def answer(argv, **_kw):
+            ran.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "data": {"url": "u/7"}}), "")
+
+        out = io.StringIO()
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "run_bounded", side_effect=answer), \
+                mock.patch("os.access", return_value=True), contextlib.redirect_stdout(out):
+            code = gg.cmd_post(args)
+        self.assertEqual((code, ran[0][1:4]), (0, ["call", "pr_create", "O/R"]))
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "O/R", "base": "main", "head": "lane/x",
+                                                 "title": "a title", "body": "why"})
+        self.assertIn("u/7", out.getvalue())
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
+    def test_a_write_the_broker_cannot_make_is_refused_with_its_body_and_the_command_for_it(self) -> None:
+        no_guard(self)
+        args = mock.Mock(kind="review", target="O/R#7", body="the review body", body_file=None, wait=0, json=False,
+                         head=None, base=None, title=None, reviewer=None, event="comment")
+        err = io.StringIO()
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no call for a review")), \
+                contextlib.redirect_stderr(err):
+            code = gg.cmd_post(args)
+        said = err.getvalue()
+        self.assertEqual(code, 3)
+        bodies = sorted(gg.unsent_dir().glob("*.md"))
+        self.assertEqual([p.read_text() for p in bodies], ["the review body"])
+        self.assertIn(str(bodies[0]), said)
+        self.assertIn("post review O/R#7 --event comment --body-file", said)
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
         self.run_gh(args)

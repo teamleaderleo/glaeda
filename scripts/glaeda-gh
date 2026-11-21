@@ -25042,6 +25042,95 @@ def body_guard_refusal(item: dict) -> str | None:
             os.unlink(name)
 
 
+# What the lane-gh broker writes for a host with no login of its own (cmuxterm-hq lane-gh-broker): the write runs
+# with a token minted for the call, so it needs no token here. Until 2026-11-21 `post` queued every write on such a
+# host and upstream_refuse_posts failed it one tick later, so `post pr` exited 0 and no PR was opened: a lane hit
+# that twice in one session and opened both PRs by hand with `gh pr create`. A write the broker has a tool for is
+# made here instead, and one it has no tool for is refused at accept, with its body written out and the command that
+# posts it named (cmuxterm-hq docs/handbook/printed-step-not-a-command.md).
+BROKER_POST_TOOLS = {"pr": "pr_create", "comment": "comment"}
+BROKER_POST_DEADLINE = 600.0  # a busy broker queues a write behind other lanes' (hq broker-caller-admission)
+
+
+def unsent_dir() -> Path:
+    return BASE / "unsent"  # a write this host cannot make: its body, kept for the command that can
+
+
+def broker_post_args(item: dict) -> tuple[str, dict] | None:
+    """The `lane-gh call` tool and arguments for a queued write, or None where the broker has no form for it: a
+    review, and the queue's own features (a status key, a merge gate, reviewers), which the broker does not carry."""
+    tool = BROKER_POST_TOOLS.get(str(item.get("kind")))
+    if not tool or item.get("status") or item.get("gate") or item.get("reviewers"):
+        return None
+    if tool == "pr_create":
+        return tool, {"repo": item["repo"], "base": item["base"], "head": item["head"],
+                      "title": item["title"], "body": item["body"]}
+    return tool, {"repo": item["repo"], "number": item["number"], "body": item["body"]}
+
+
+def broker_post_next(item: dict, body: Path) -> str:
+    """The command that makes a write this host cannot: a lane VM's `gh` reaches the broker's own tools only, so a
+    review is posted from the broker host, where this queue has a login."""
+    repo, number = item.get("repo"), item.get("number")
+    if item["kind"] == "review":
+        return (f"post it from the broker host: glaeda-gh post review {repo}#{number} "
+                f"--event {str(item.get('event') or 'comment').lower()} --body-file {body}")
+    if item["kind"] == "pr":
+        return (f"gh pr create --repo {repo} --base {item.get('base')} --head {item.get('head')} "
+                f"--title {shlex.quote(str(item.get('title') or ''))} --body-file {body}")
+    return f"gh pr comment {number} --repo {repo} --body-file {body}"
+
+
+def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
+    """Say that this write was not sent, where its body is, and what sends it. Exit 3: nothing was queued."""
+    path = unsent_dir() / f"{item['id']}.md"
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(item["body"])
+    lacks = "the lane-gh broker has no tool for this write" if chosen is not None else "no lane-gh runs here"
+    print(f"glaeda-gh: not queued: this host has no login to post with (it reads GitHub through its upstream) and "
+          f"{lacks}; its body is at {path}: {broker_post_next(item, path)}", file=sys.stderr)
+    return 3
+
+
+def broker_post(item: dict) -> int:
+    """Make a queued write through the lane-gh broker and say what it did. Exit 0 written, 1 the broker said no or
+    gave no answer, 3 not sent at all (its body and the command that sends it are named)."""
+    chosen = broker_post_args(item)
+    if chosen is None:
+        return broker_post_unsent(item, None)
+    if not os.access(LANE_GH_CMD, os.X_OK):
+        return broker_post_unsent(item, chosen)
+    tool, call_args = chosen
+    argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
+    try:
+        done = run_bounded(argv, timeout=BROKER_POST_DEADLINE)
+    except subprocess.TimeoutExpired:
+        print(f"glaeda-gh: the lane-gh broker gave no answer in {BROKER_POST_DEADLINE:g}s; the write may still have "
+              f"been made, so read {item['repo']} before sending it again", file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"glaeda-gh: lane-gh did not run ({type(error).__name__}: {error})", file=sys.stderr)
+        return 1
+    answer: Any = None
+    with contextlib.suppress(ValueError):
+        answer = json.loads(done.stdout)
+    if not isinstance(answer, dict) or not answer.get("ok"):
+        said = (answer.get("error") if isinstance(answer, dict) else None) or ""
+        if not said:
+            lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
+            said = lines[-1] if lines else "no answer"
+        print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {str(said)[:300]}", file=sys.stderr)
+        return 1
+    data = answer.get("data")
+    where = None
+    if isinstance(data, dict):
+        where = data.get("url") or data.get("html_url") or data.get("number")
+    print(f"{item['kind']} made through the lane-gh broker (this host holds no token)"
+          + (f": {where}" if where else ""))
+    return 0
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
     try:
@@ -25051,6 +25140,8 @@ def cmd_post(args: argparse.Namespace) -> int:
     if why:
         print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
         return 3
+    if upstream_command() is not None:
+        return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
     with contextlib.suppress(Exception):
         gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
     write_json(outbox_dir() / f"{item['id']}.json", item)
