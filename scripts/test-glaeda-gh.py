@@ -7533,6 +7533,34 @@ class TickBudgetTest(Base):
         self.assertEqual(set(order[:2]), {head["key"], errored["key"]})
         self.assertEqual(order[2:5], [e["key"] for e in prs])
 
+    def test_a_new_pr_watch_unread_for_a_minute_goes_ahead_of_the_deferred_backlog(self) -> None:
+        """huge-blue 2026-11-21 20:38Z: cmuxterm-hq#17119 and cmux#49236 had no cache file while every tick went to the
+        carried backlog of PRs already read, so each upstream `read` of them answered null. The PR or run never read
+        nor tried and watched longest, once past UNREAD_LEAD_AFTER, goes ahead of the deferred keys: one a tick, after
+        the waits and the confirmations; a younger one waits its turn; once tried it is ordinary."""
+        old_pr = {"key": "pr:o/r#9", "cache": None, "waitedAt": None, "consumers": {}}
+        older_run = {"key": "run:o/r/9", "cache": None, "waitedAt": None, "consumers": {}}
+        young = {"key": "pr:o/r#11", "cache": None, "waitedAt": None, "consumers": {}}
+        prs = [self.entry(f"pr:o/r#{n}", "rest", NOW - 1000, deferred=True) for n in range(1, 4)]
+        waited = self.entry("pr:o/r#5", "rest", NOW - 1000, waited=True, deferred=True)
+        self.daemon.deferred_before = {e["key"]: NOW - 500 + i for i, e in enumerate(prs + [waited])}
+        self.daemon.rest_tried = {}
+        self.daemon.since = {old_pr["key"]: NOW - gg.UNREAD_LEAD_AFTER - 5, older_run["key"]: NOW - 400,
+                             young["key"]: NOW - 5}
+        everything = prs + [waited, young, old_pr, older_run]
+        with mock.patch.object(self.daemon, "wait_confirms", side_effect=lambda e: e["key"] == "pr:o/r#2"):
+            order = self.order(everything)
+        self.assertEqual(order[:3], ["pr:o/r#2", waited["key"], older_run["key"]],
+                         "the confirmation, the waited key, then the longest-unread new key")
+        self.assertEqual(order[3:5], ["pr:o/r#1", "pr:o/r#3"], "then the deferred backlog, ahead of the other new keys")
+        self.daemon.rest_tried[older_run["key"]] = NOW - 1  # tried (and failed): the next one takes the floor
+        self.assertEqual(self.order(everything)[1], old_pr["key"])
+        self.daemon.rest_tried[old_pr["key"]] = NOW - 1
+        self.assertNotEqual(self.order(everything)[1], young["key"], "under a minute: no floor yet")
+        errored = {"key": "pr:o/r#10", "cache": {"error": "rest: HTTP 502", "data": None, "fetchedAt": NOW - 30},
+                   "waitedAt": None, "consumers": {}}
+        self.assertFalse(self.daemon.never_read(errored), "a stored try counts as read")
+
     def test_the_oldest_starved_waited_key_goes_ahead_of_asked_heads(self) -> None:
         """huge-blue 2026-11-20, GraphQL out for the hour: the fleet brokers' asked heads filled every tick and waited
         PRs sat up to 39,600 s unread. The one waited PR or run with the oldest data past STALE_DATA_AFTER goes first

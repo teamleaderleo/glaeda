@@ -736,6 +736,7 @@ IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EX
 # is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
 # alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
 STALE_DATA_AFTER = 600
+UNREAD_LEAD_AFTER = 60.0  # a PR or run never read, watched this long, gets the first-read floor (rest_order)
 # On an upstream host that reads one target itself through the broker (direct_command), a wait's data this old means
 # the broker host is behind: the wait reads its target itself (wait_starved). The broker host reads a waited key
 # within WAITED_FRESH even under its GraphQL reserve, and this host asks it every UPSTREAM_EVERY, so its copy is at
@@ -6968,7 +6969,9 @@ class Daemon:
         one read each, and then it is an ordinary key. Every key a wait is blocked on (an interactive wait, a due land)
         goes next, deferred or not: those the last tick ran out of time for first, oldest deferral first, then the
         longest unread (never read first). Then the plain watches: the deferred ones, oldest deferral first, so a newer
-        one (a new watch, never read) cannot overtake a key deferred tick after tick; then the longest unread. The
+        one (a new watch, never read) cannot overtake a key deferred tick after tick; then the longest unread. One
+        exception, a floor: the PR or run never read watched longest, past UNREAD_LEAD_AFTER, goes ahead of the
+        deferred plain keys (unread_lead), one key a tick. The
         blocked rank can starve plain keys while blocked ones fill the tick; tick() keeps them a floor
         (PLAIN_FLOOR_EVERY: the first plain key goes first once a minute)."""
         carried = self.deferred_before
@@ -6993,13 +6996,41 @@ class Daemon:
         # hour: every tick's ~90 s went to the fleet brokers' asked heads (each new SHA, newest first) and to plain
         # keys, waited PRs sat 3,800 to 39,600 s unread, and nothing above ever reached them. One key a tick bounds a
         # waited read at (starved waited keys x one tick) whatever else is asked.
+        # And a floor for a key nobody has read yet: the one PR or run with no copy at all, never tried, watched
+        # longest past UNREAD_LEAD_AFTER, goes next after the waits, ahead of the carried backlog. Until its first read
+        # every `read` of it answers null, where a deferred key has a copy to answer with. huge-blue 2026-11-21 20:38Z:
+        # cmuxterm-hq#17119 and cmux#49236 had no cache file at all while the carried PRs filled every tick, and each
+        # caller's glaeda-read fell back to 4 broker reads of 25-72 s. One key a tick, so new watches arriving every
+        # tick still leave the deferred keys the rest; once tried (answered or failed) the key is ordinary.
         lead = self.starved_lead(entries)
+        unread = self.unread_lead(entries)
         return sorted(entries, key=lambda e: (e is not lead, not self.head_unanswered(e), self.head_rank(e),
                                               not self.wait_confirms(e),
                                               not self.waited(e),
+                                              e is not unread,
                                               e["key"] not in carried,
                                               carried.get(e["key"], 0.0),
                                               self.last_read(e)))
+
+    def never_read(self, e: dict) -> bool:
+        """A PR or run watch with no copy at all, never read nor tried over REST: its readers get null until its first
+        read (unread_lead)."""
+        if not e["key"].startswith(("pr:", "run:")) or e["key"] in self.rest_tried:
+            return False
+        c = e.get("cache") or {}
+        return not c.get("data") and not isinstance(c.get("fetchedAt"), (int, float))
+
+    def unread_lead(self, entries: list[dict]) -> dict | None:
+        """The never_read PR or run among ENTRIES watched longest, when that is past UNREAD_LEAD_AFTER (rest_order's
+        floor for a first read), else None."""
+        since = getattr(self, "since", {}) or {}
+        best, best_age = None, float(UNREAD_LEAD_AFTER)
+        for e in entries:
+            if self.never_read(e):
+                age = self.now - since.get(e["key"], self.now)
+                if age >= best_age:
+                    best, best_age = e, age
+        return best
 
     def starved_lead(self, entries: list[dict]) -> dict | None:
         """The waited, unfinished PR or run among ENTRIES with the oldest data, when that is past STALE_DATA_AFTER
