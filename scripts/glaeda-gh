@@ -12915,8 +12915,9 @@ class LandQueue:
         left = land_ci_start_left(e, act, answer, head, self.now)
         if left is None:
             at = land_update_made_head(e, head)
+            spent = at is not None and self.now - at >= LAND_CI_START
             case = (f"the repo's own pull_request run never appeared at {head[:12]} in the {LAND_CI_START:.0f} s "
-                    f"after the update-branch this queue sent made that head" if at is not None else
+                    f"after the update-branch this queue sent made that head" if spent else
                     f"no update-branch of this queue made {head[:12] or '?'}, so no pull_request run of the repo's "
                     "own CI is on its way for it")
             self.stop(e, "ci_never_ran", f"{case}: {land_trim(why, 240)}",
