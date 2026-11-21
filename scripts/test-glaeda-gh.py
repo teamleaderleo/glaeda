@@ -5075,7 +5075,11 @@ class ClientTest(Base):
         self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("b", conclusion="FAILURE")])))
         code, text = self.status("pr", ["o/r#1", "2"], False, False)
         self.assertEqual(code, 0)
-        self.assertEqual(text, gg.render("pr:o/r#1", gg.read_cache("pr:o/r#1"), False)
+        # a sweep leads with its totals (status_sweep_header), then the blocks are exactly the per-target renders:
+        # unchanged below the first line, so anything reading a block still reads the same bytes
+        head, _, blocks = text.partition("\n")
+        self.assertEqual(head, "glaeda-gh status: 2 targets: 2 read (one block each below)")
+        self.assertEqual(blocks, gg.render("pr:o/r#1", gg.read_cache("pr:o/r#1"), False)
                          + gg.render("pr:o/r#2", gg.read_cache("pr:o/r#2"), False))
         code, text = self.status("pr", ["o/r#1", "o/r#2"], False, True)
         doc = json.loads(text)
