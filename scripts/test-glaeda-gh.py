@@ -14054,6 +14054,25 @@ class PostTest(unittest.TestCase):
         self.assertEqual(t.calls[1][2], {"body": "two", "event": "APPROVE"})
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
 
+    def test_a_review_receipt_goes_out_ahead_of_older_comments(self) -> None:
+        notes = [self.queue("comment", f"o/r#{n}", "--body", f"<!-- review-running sha={n} -->") for n in (1, 2, 3)]
+        ship = self.queue("comment", "o/r#9", "--body", "Review (opus via router-review): SHIP at " + "a" * 40)
+        check = self.queue("comment", "o/r#8", "--body", "ws-check passed", "--gate")
+        self.assertTrue(gg.read_json(gg.outbox_dir() / (check["id"] + ".json"))["gate"])
+        self.assertEqual([gg.post_state(i["id"])["ahead"] for i in (ship, check, notes[0])], [0, 1, 2])
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.step(d, NOW + 2 * gg.POST_SPACING)
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/9/comments", "/repos/o/r/issues/8/comments",
+                                                   "/repos/o/r/issues/1/comments"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in notes], ["posted", "queued", "queued"])
+
+    def test_a_gate_comment_is_never_joined_into_prose(self) -> None:
+        self.assertFalse(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s", "gate": True}))
+        self.assertTrue(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s"}))
+
     def pause_cmd(self, blocked_until: float, level: int = 1) -> Path:
         """A fake create-pause command, named in CONTENT_PAUSE_ENV: it logs its arguments and prints the pause."""
         root = Path(self.tmp.name) / "pause"

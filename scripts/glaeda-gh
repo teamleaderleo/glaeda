@@ -884,6 +884,30 @@ issueComment { id databaseId url authorAssociation author { __typename login } }
 # Match cmux's base-owned risk classifier. This only wakes that classifier; it never grants SHIP authority.
 RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*(ship|block|fix|not ship|hold)(?![\w-])",
                           re.I)
+
+
+def outbox_gate(item: Any) -> bool:
+    """A write a merge waits on: queued with --gate, a review's APPROVE or REQUEST_CHANGES, or a comment whose first
+    line is a review receipt (router-review's `Review (...): SHIP at SHA`). These go out ahead of every other queued
+    write, so a SHIP never waits behind a hundred awareness comments while the login's create pause spaces them."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("gate") is True or item.get("kind") == "review" and item.get("event") in {"APPROVE", "REQUEST_CHANGES"}:
+        return True
+    body = str(item.get("body") or "")
+    first = next((line for line in body.splitlines() if line.strip()), "").strip()
+    return item.get("kind") == "comment" and bool(RISK_RECEIPT.match(first))
+
+
+def outbox_queue() -> list[tuple[Path, Any]]:
+    """The outbox in send order: land-gating writes (outbox_gate) first, then the rest, each in queue order
+    (oldest first). An unreadable entry keeps its queue place among the rest."""
+    if not outbox_dir().is_dir():
+        return []
+    rows = [(path, read_json(path)) for path in sorted(outbox_dir().glob("*.json"))]
+    return sorted(rows, key=lambda row: not outbox_gate(row[1]))  # stable: queue order within each class
+
+
 VERDICTS = {"success", "neutral", "failure", "timed_out", "action_required", "startup_failure"}
 
 NAME = r"[A-Za-z0-9_.-]+"
@@ -5867,14 +5891,14 @@ class Daemon:
 
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
-        secondary limit holds the outbox. Oldest first; a write waiting out its own retry is skipped."""
+        secondary limit holds the outbox. Land-gating writes first (outbox_gate), then oldest first; a write waiting
+        out its own retry is skipped."""
         self.adopt_pace_hold()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
             return
-        for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
-            item = read_json(path)
+        for path, item in outbox_queue():
             if not isinstance(item, dict) or item.get("id") != path.stem:
                 with contextlib.suppress(OSError):
                     if self.now - path.stat().st_mtime > POST_UNREADABLE:
@@ -6352,7 +6376,7 @@ class Daemon:
         body = str(item.get("body") or "")
         first = next((line for line in body.splitlines() if line.strip()), "").strip()
         return (item.get("kind") == "comment" and not item.get("status") and not item.get("uncertain")
-                and not item.get("delivered") and not item.get("group") and not item.get("joinedInto")
+                and not item.get("delivered") and not item.get("group") and not item.get("joinedInto") and not item.get("gate")
                 and not int(item.get("attempts") or 0) and isinstance(item.get("by"), str) and bool(item["by"])
                 and not first.startswith(("<!--", "/")) and not RISK_RECEIPT.match(first)
                 and not JOIN_MENTION.search(body))
@@ -23793,6 +23817,8 @@ def post_item(args: argparse.Namespace) -> dict:
             if args.kind != "comment" or not STATUS_KEY.fullmatch(key):
                 raise WatchError("--status-key is for post comment: letters, digits and . : = @ / - (120 at most)")
             item["status"] = key
+        if getattr(args, "gate", False) is True:
+            item["gate"] = True  # a receipt a merge waits on: sent ahead of the rest (outbox_gate)
         item.update(repo=f"{m.group(1)}/{m.group(2)}", number=int(m.group(3)))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
@@ -23809,7 +23835,8 @@ def post_state(post_id: str) -> dict | None:
     queued = read_json(outbox_dir() / f"{post_id}.json")
     if not isinstance(queued, dict):
         return None
-    ahead = sum(1 for p in outbox_dir().glob("*.json") if p.stem < post_id)
+    order = [p.stem for p, _ in outbox_queue()]
+    ahead = order.index(post_id) if post_id in order else 0  # in send order: a receipt jumps the awareness comments
     outbox = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
     pause = outbox.get("pause") if isinstance(outbox.get("pause"), dict) else None
     return {k: v for k, v in queued.items() if k != "body"} | {"state": "queued", "ahead": ahead,
@@ -24820,6 +24847,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
+    po.add_argument("--gate", action="store_true",
+                    help="comment or review: a receipt a merge waits on (a verdict, a check, a land receipt); it goes "
+                         "out ahead of every other queued write (review receipts are recognized without it)")
     po.add_argument("--json", action="store_true")
     lg = sub.add_parser("log", help="a finished job's log, read once per host (cache, build controller, then REST)")
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
