@@ -4774,6 +4774,9 @@ class ClientTest(Base):
             ("wait", "o/r/123", "--timeout", "9"): ["wait", "run", "o/r/123", "--timeout", "9"],
             ("wait", "https://github.com/o/r/actions/runs/123"): ["wait", "run", "https://github.com/o/r/actions/runs/123"],
             ("land", "pr", "o/r#5"): ["land", "o/r#5"],
+            ("wait", "pr", "o/r", "5", "--timeout", "9"): ["wait", "pr", "o/r#5", "--timeout", "9"],
+            ("wait", "o/r", "#5"): ["wait", "pr", "o/r#5"],
+            ("wait", "comment", "o/r", "5"): ["wait", "comment", "o/r#5"],
         }
         for given, fixed in want.items():
             got, note = gg.infer_kind(list(given))
@@ -4781,7 +4784,8 @@ class ClientTest(Base):
             self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
             gg.parser().parse_args(got)  # argparse takes what it was handed
         for same in (["wait", "pr", "o/r#5"], ["wait", "file", "/x"], ["wait", "--help"], ["wait", "bogus"],
-                     ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"]):
+                     ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"],
+                     ["status", "pr", "o/r#5", "6"], ["wait", "run", "o/r", "5"]):
             self.assertEqual(gg.infer_kind(list(same)), (same, ""))
 
     def test_a_usage_error_names_the_right_form(self) -> None:
@@ -4791,11 +4795,11 @@ class ClientTest(Base):
         self.assertEqual(gg.usage_next(["wait", "bogus"]), "glaeda-gh wait --help")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), self.assertRaises(SystemExit) as exit_:
-            gg.main(["wait", "pr", "o/r", "3", "--json"])
+            gg.main(["wait", "bogus", "--json"])  # `wait pr o/r 3` now runs as `o/r#3` (infer_kind)
         self.assertEqual(exit_.exception.code, 64)
         doc = json.loads(out.getvalue())
         self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
-        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#3 --json --timeout 1800")
+        self.assertEqual(doc["next"], "glaeda-gh wait --help")
 
     def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
         old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}

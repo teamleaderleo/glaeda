@@ -23520,16 +23520,26 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     .../pull/N) means `pr`; OWNER/REPO/RUNID or .../actions/runs/ID means `run`. `land pr X` drops the `pr`. Returns the argv to parse and the note for stderr ("" when unchanged)."""
     if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
         return raw, ""
+    joined = False
+    if raw[0] == "wait":
+        # `wait [pr|comment] OWNER/REPO N` is `OWNER/REPO#N` (usage_next's form): one target, so a bare N can
+        # mean nothing else. `status` is multi-target (a bare N there is a number in the repo before it), and
+        # `wait run` keeps its own form.
+        slot = 2 if raw[1] in ("pr", "comment") else 1
+        if len(raw) > slot + 1 and re.fullmatch(rf"{NAME}/{NAME}", raw[slot]) and BARE_NUMBER.fullmatch(raw[slot + 1]):
+            raw = raw[:slot] + [f"{raw[slot]}#{raw[slot + 1].lstrip('#')}"] + raw[slot + 2:]
+            joined = True
     cmd, first = raw[0], raw[1]
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
+    ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if joined else ""
     if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
-        return raw, ""
+        return raw, ran_as
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
-        return raw, ""
+        return raw, ran_as
     fixed = [cmd, kind] + raw[1:]
     return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
 
