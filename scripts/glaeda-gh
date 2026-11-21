@@ -628,6 +628,15 @@ EXIT_INCONCLUSIVE = 7
 SETTLE_GRACE = 420
 EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": ("ws-check",)}
 EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
+# teamleaderleo/leo-workspace#7209, 2026-11-21: `wait pr ... --until done --timeout 1500` ran its whole 25 minutes on
+# `mergeable=MERGEABLE (CLEAN)`, `1 passed, 0 failed, 0 pending (of 1, 0 required)`, rollup SUCCESS. Its only hold was
+# `expected, not posted yet: ws-check` -- a status the lander already excuses: leo-workspace land-judge
+# [never-without-ci] skips "a ws-check unposted on a green head 20 min old". So the two components disagreed about
+# what `done` means, and every lane paid the difference: land-judge would have let that head through while the wait
+# sat on it. A done wait ends once every check that decides has ended, and names what it ended without
+# (docs/handbook/done-wait-held-by-stragglers.md). The bound is the lander's own 20 min, so that the wait cannot
+# outlast the hold it serves; `green` and `required` are unchanged, they mean every expected context reported.
+EXPECTED_UNPOSTED_AFTER = 20 * 60
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
@@ -15120,6 +15129,37 @@ def expected_missing(data: dict) -> list[str]:
     return [name for name in expected_contexts(pr_repo(data)) if name not in reported]
 
 
+def expected_unposted(data: dict, now: float, after: float = EXPECTED_UNPOSTED_AFTER) -> list[str]:
+    """The expected contexts a `--until done` wait no longer holds for: never posted, while every check that did
+    report finished at least AFTER ago (the lander's own bound for the same check). Empty while they still hold --
+    nothing is missing, something that reported has not finished, a time could not be read (a read that did not
+    happen is unknown: docs/handbook/missing-read-counted-as-a-value.md), or the head is too young."""
+    if data.get("state") != "OPEN":
+        return []
+    missing = expected_missing(data)
+    if not missing:
+        return []
+    ends = [iso_epoch(c.get("completedAt")) for c in data.get("checks") or []]
+    if any(end is None for end in ends):
+        return []  # something that reported has not ended (or gave no end time): it decides, so it still holds
+    stamps = [t for t in [*ends, pushed_by(data)] if isinstance(t, (int, float))]
+    return missing if stamps and now - max(stamps) >= after else []
+
+
+def unposted_lines(data: dict, now: float) -> list[str]:
+    """What a done wait ended without, when it ended without something: the contexts, how long the rest of the head
+    had been finished, and that the lander counts them the same way."""
+    missing = expected_unposted(data, now)
+    if not missing:
+        return []
+    ends = [t for t in [*(iso_epoch(c.get("completedAt")) for c in data.get("checks") or []), pushed_by(data)]
+            if isinstance(t, (int, float))]
+    for_ = span(now - max(ends)) if ends else "a while"
+    return [f"  done without: {', '.join(missing)}: expected here and never posted, while everything else on this "
+            f"head has been finished for {for_}; land-judge excuses the same context at "
+            f"{int(EXPECTED_UNPOSTED_AFTER // 60)} min, so a done wait holds no longer than it does"]
+
+
 def pushed_by(data: dict) -> float | None:
     """The latest the head can have been pushed: the PR's updatedAt (a push updates it) and the daemon's first
     sighting of the head, whichever is earlier; None when neither is known."""
@@ -15922,7 +15962,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     if bad:
         return EXIT_FAIL
     if data.get("state") == "OPEN" and expected_missing(data):
-        return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
+        # A status every head of this repo gets has not been posted yet: unfinished, like a required one -- until it
+        # is so late that the lander no longer holds the merge for it, at which point a `done` wait holding on is
+        # waiting past its own purpose (leo-workspace#7209). `green` and `required` still mean every expected
+        # context reported, so they wait (UnfinishedStatusTest, leo-workspace#3538).
+        return EXIT_OK if until == "done" and expected_unposted(data, now) else None
     return EXIT_OK
 
 
@@ -16164,6 +16208,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if until in ("done", "merged"):
             cut = straggler_cut(data, now)
             lines += straggler_lines(cut if cut is not None else data, now)
+            if until == "done":
+                lines += unposted_lines(data, now)
         # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
         own_failed, inherited_failed = split_inherited(data, groups["failed"], now)
         bad = sorted(own_failed, key=lambda c: (marked and not c.get("required"),
