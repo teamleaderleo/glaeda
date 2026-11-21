@@ -5132,6 +5132,27 @@ class ClientTest(Base):
             self.assertEqual(gg.main(["status", "pr", "o/r#1", "2", "--field", "checks.state"]), 0)
         self.assertEqual(out.getvalue(), "o/r#1\tSUCCESS\no/r#2\tSUCCESS\n")
 
+    def test_a_status_sweep_leads_with_the_totals_and_one_target_is_unchanged(self) -> None:
+        """A sweep prints one multi-line block per target, so a reader who kept the last N lines cannot even count
+        the blocks (big-red, 2026-11-21: `land status | tail -25` read a fragment as the whole answer). The first
+        line names how many follow, by outcome. One target still prints exactly what it always has: its block is
+        short, and cmd_status's contract is that a single read is byte-for-byte what it was."""
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="SUCCESS", checks=[check_run("a")])))
+        self.put("pr:o/r#3", None, missing=True)
+        code, text = self.status("pr", ["o/r#1", "2", "3", "9"], False, False)
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "glaeda-gh status: 4 targets: 2 read, 1 not-found, 1 no-data-yet "
+                                   "(one block each below)")
+        self.assertEqual(code, gg.EXIT_FAIL)  # unchanged: not-found is still the answer, and still exit 1
+        for want in ("o/r#1", "o/r#2", "o/r#3", "o/r#9"):
+            self.assertTrue([line for line in lines[1:] if line.startswith(want)], want)
+        one = self.status("pr", "o/r#1", False, False)
+        self.assertEqual(one[0], 0)
+        self.assertNotIn("glaeda-gh status:", one[1])
+        self.assertEqual(one[1], "\n".join(lines[1:lines.index(next(
+            line for line in lines[1:] if line.startswith("o/r#2")))]) + "\n")
+
     def test_the_daemon_waits_say_what_they_wait_for_before_they_block(self) -> None:
         """The pr, run and comment kinds, the three that go through the daemon; the file and pid
         kinds are covered in FileAndPidWaitTest. A line wired into some of the four call sites and
@@ -23084,6 +23105,57 @@ class LandTest(Base):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
         self.assertEqual(self.tick()["state"], "cancelled")
+
+    def write_entry(self, key: str, state: str, **more: Any) -> None:
+        """One queue entry on disk, as the daemon leaves it: what `land status` reads (land_entries)."""
+        d = gg.LandQueue.entries_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / gg.file_name(key)).write_text(json.dumps({"key": key, "state": state, "head": LA,
+                                                       "updated": self.t, **more}))
+
+    def land_status_text(self) -> list[str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.main(["land", "status"]), 0)
+        return out.getvalue().splitlines()
+
+    def test_land_status_leads_with_the_totals_so_a_truncated_read_is_visibly_partial(self):
+        """big-red, 2026-11-21: `glaeda-gh land status | tail -25` kept only merged history whose newest row was
+        81 h old, out of 141 lines whose top rows were the six PRs enqueued seconds earlier; the reader concluded
+        the view omits pending requests and nearly had that non-bug built. The totals are the *first* line, so a
+        `head`/`tail` that cuts the top drops the header too and says by its absence that this is a fragment.
+
+        The expected counts are read back from the rows this run printed, not from the plan alone, so the header
+        cannot drift from the body it summarises."""
+        plan = {"waiting": 3, "queued": 2, "merged": 5, "stopped": 1}
+        n = 0
+        for state, count in plan.items():
+            for _ in range(count):
+                n += 1
+                self.write_entry(f"pr:o/r#{100 + n}", state,
+                                 **({"stop": {"code": "own_red", "reason": "a red of its own"}}
+                                    if state == "stopped" else {}))
+        lines = self.land_status_text()
+        rows = collections.Counter(m.group(1) for m in
+                                   (re.match(r"^o/r#\d+ {2}(\S+)", line) for line in lines[1:]) if m)
+        self.assertEqual(dict(rows), plan)  # the renderer printed one row per entry, as the header counts them
+        self.assertEqual(lines[0], f"glaeda land: {sum(rows.values())} entries: "
+                                   + ", ".join(f"{rows[s]} {s}" for s in ("queued", "waiting", "merged", "stopped"))
+                                   + " (+ steps and stop causes below)")
+        # the live states come before the finished ones (LAND_STATES), so the top of the header is what is pending
+        self.assertLess(lines[0].index("waiting"), lines[0].index("merged"))
+        # tail -3, the read that caused the incident: no header, so a reader knows at once they hold a fragment
+        self.assertNotIn("glaeda land:", "\n".join(lines[-3:]))
+
+    def test_land_status_header_with_no_entries_does_not_read_as_an_empty_output(self):
+        """An empty queue still prints the steps taken and the stop causes, so the header says "no entries" and
+        names what follows: "0 rows" would be the same wrong read in the other direction."""
+        gg.land_dir().mkdir(parents=True, exist_ok=True)
+        (gg.land_dir() / "counts.json").write_text(json.dumps({"days": {gg.land_day(self.t): {"merge": 3}}}))
+        lines = self.land_status_text()
+        self.assertEqual(lines[0], "glaeda land: no entries (+ steps and stop causes below)")
+        self.assertNotIn("0 rows", lines[0])
+        self.assertIn("steps taken today: merge 3", "\n".join(lines))
+        self.assertFalse([line for line in lines if re.match(r"^o/r#\d+ {2}", line)])
 
     def test_cancel_during_a_step_wins(self):
         self.pr(LA)
