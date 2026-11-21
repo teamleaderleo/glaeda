@@ -4992,7 +4992,15 @@ class ClientTest(Base):
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
         self.assertEqual((args.words, args.sha), (["manaflow-ai/cmux/48704"], "abc1234"))
         self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
-        with mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("a pin is never checked by a read")):
+        def only_local_git(argv, *a, **kw):
+            # A pin is never checked by a GitHub read (test_land_pin_queues_with_the_shared_quota_spent). The one
+            # thing it may run is the local checkout's own git: what repository this directory is, and its HEAD
+            # (land_pin_is_another_checkouts_head). Neither touches the shared quota; an answer it cannot get
+            # refuses nothing.
+            self.assertEqual(argv[0], "git", "a pin is never checked by a read")
+            self.assertIn(argv[-1], ("origin", "HEAD"), "a pin reads nothing but this checkout's repo and HEAD")
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        with mock.patch.object(gg.subprocess, "run", side_effect=only_local_git):
             gg.check_land_pin("o/r", 1, None)
             gg.check_land_pin("o/r", 1, "aaaaaaa")
             gg.check_land_pin("o/r", 1, "a" * 40)
@@ -9366,7 +9374,10 @@ class HeadChecksTest(Base):
         20 points (the daemon logged 1160 points over 58 PR queries on 2026-11-08). Without it the batch costs 10."""
         keys = [f"pr:o/r#{n}" for n in range(10)]
         query, _ = gg.pr_query(keys)
-        self.assertEqual(graphql_requests(gg.pr_query(keys[:1])[0]), 104)  # rules, commits, suites, latest x100, contexts
+        # rules, commits, the head commit's first parent, suites, latest x100, contexts. The first parent is the
+        # 105th request: it is what proves a new head is the merge the queue's own update-branch made (pr_head_parent,
+        # LandQueue.pin_follow), and at one request per PR a batch of ten still costs the same 10 points.
+        self.assertEqual(graphql_requests(gg.pr_query(keys[:1])[0]), 105)
         self.assertEqual(graphql_cost(query), 10)
         old = query.replace("latest: checkRuns(first: 1) { totalCount }", "latest: checkRuns(first: 1) { totalCount } "
                             "every: checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount }")
@@ -22145,6 +22156,34 @@ class LandTest(Base):
         self.assertEqual(gg.pr_head_parent(node(LC, [LA]), node(LC, [LA])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
+
+    def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
+        # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
+        # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read
+        # that gives the right sha.
+        def git(args: list[str]) -> str | None:
+            return LA if args == ["rev-parse", "HEAD"] else None
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/other"):
+            why = gg.land_pin_is_another_checkouts_head("o/r", LA, git)
+            self.assertIn("is the HEAD of", why)
+            self.assertIn("a checkout of o/other, not of o/r", why)
+            # a short pin (`git rev-parse --short HEAD`) is the same slip and reads the same
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA[:12], git), why)
+            # another sha entirely is somebody's honest pin, not this slip
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LB, git), "")
+            with self.assertRaises(gg.WatchError) as caught:
+                gg.check_land_pin("o/r", 1, LA, git)
+            self.assertIn("next: glaeda-gh gh api repos/o/r/pulls/1 --jq .head.sha", str(caught.exception))
+        # The target's own checkout, and a cwd that is no checkout at all, are left alone.
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, git), "")
+            gg.check_land_pin("o/r", 1, LA, git)
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: None):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, git), "")
+            gg.check_land_pin("o/r", 1, LA, git)
+        # A git that cannot answer refuses nothing: an unread HEAD is not a wrong one.
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/other"):
+            self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, lambda a: None), "")
 
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
