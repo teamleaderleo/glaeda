@@ -672,6 +672,12 @@ class Base(unittest.TestCase):
         execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
         execv.start()
         self.addCleanup(execv.stop)
+        # The land pool is sized from the host (land_worker_ceiling, land_load_room): pinned to 8 idle cores here, so
+        # a suite on a busy runner judges as one on an idle one (4 workers); LandSizingTest moves both.
+        for name, value in (("land_cores", 8), ("land_load_per_core", None)):
+            pin = mock.patch.object(gg, name, return_value=value)
+            pin.start()
+            self.addCleanup(pin.stop)
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.UPSTREAM_DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
@@ -26634,10 +26640,35 @@ class LandTest(Base):
         self.w.config["workers"] = 1
         self.q.inline = False
         self.q.submit("pr:o/r#1", lambda: None)
-        self.assertEqual(self.q.pool._max_workers, gg.LAND_WORKERS_MAX)
+        self.assertEqual(self.q.pool._max_workers, 8)  # every core: a raised "workers" needs no new pool
         self.w.config["workers"] = 4
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
+
+    def test_the_pool_is_sized_from_the_hosts_cores_not_a_hand_set_four(self):
+        """gcp-agent-lane-1, 2026-11-21 20:05Z: 28 lands past due, p50 82 min, each "every worker busy" (4 of 4) on a
+        32-core VM; LAND_WORKERS 4 was set by hand. The ceiling is one worker per LAND_CORES_EACH cores, read at each
+        call; land.json "workers" stays an operator's override."""
+        for cores, want in ((1, 1), (2, 1), (8, 4), (16, 8), (32, 16)):
+            with mock.patch.object(gg, "land_cores", return_value=cores):
+                self.assertEqual(self.q.workers(), want, cores)
+        self.w.config["workers"] = 3
+        with mock.patch.object(gg, "land_cores", return_value=32):
+            self.assertEqual(self.q.workers(), 3)
+
+    def test_past_the_load_line_only_the_first_judgment_starts(self):
+        """Admission on the measured load (hand-set-concurrency-number.md): with no worker busy one judgment always
+        starts; past it, a worker is taken only while the 1-minute load per core is under LAND_LOAD_LINE."""
+        self.assertTrue(self.q.load_room())  # none busy: one always runs, whatever the load
+        self.q.jobs["pr:o/r#1"] = None
+        with mock.patch.object(gg, "land_load_per_core", return_value=gg.LAND_LOAD_LINE + 0.1):
+            self.assertFalse(self.q.load_room())
+            self.assertEqual(self.q.pass_load_gated, 1)
+        with mock.patch.object(gg, "land_load_per_core", return_value=gg.LAND_LOAD_LINE - 0.1):
+            self.assertTrue(self.q.load_room())
+        with mock.patch.object(gg, "land_load_per_core", return_value=None):
+            self.assertTrue(self.q.load_room())  # a host that does not say its load admits
+        self.q.jobs.clear()
 
     def test_login_workers_caps_only_lands_whose_reads_spend_the_login(self):
         # huge-blue, 2026-11-19: workers raised past 4 for the App-pool lands; the login's REST reserve, which landing

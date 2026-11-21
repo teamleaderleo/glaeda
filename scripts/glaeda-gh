@@ -10638,8 +10638,37 @@ LAND_ENV = ON_EVENT_ENV + ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_HOST", "SSH_A
 LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GLAEDA_GH_AGENT": LAND_TAG,
                  "GH_QUOTA_LANDING_READ": "land-judge"}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
-LAND_WORKERS = 4
-LAND_WORKERS_MAX = 16
+# The land pool is sized by the host it runs on, read at every pass, never a hand-set count (cmuxterm-hq
+# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): a ceiling
+# of one worker per LAND_CORES_EACH cores (land_worker_ceiling), and past the first worker a judgment starts only
+# while the 1-minute load per core is under LAND_LOAD_LINE (land_load_room). One judgment always runs. land.json
+# "workers" stays an operator's override of the ceiling. The 4 this replaced was set by hand; gcp-agent-lane-1,
+# 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
+LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
+LAND_LOAD_LINE = 0.8  # the handbook's 80% headroom line
+
+
+def land_cores() -> int:
+    """The cores this process may run on (its affinity, else the host's count), at least 1."""
+    with contextlib.suppress(AttributeError, OSError):
+        return max(1, len(os.sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
+
+
+def land_worker_ceiling(cores: int | None = None) -> int:
+    """One land worker per LAND_CORES_EACH cores, at least 1."""
+    return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
+
+
+def land_load_per_core(cores: int | None = None) -> float | None:
+    """The 1-minute load average per core, or None where the host does not say (an unknown load admits)."""
+    try:
+        one = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        return None
+    return one / (land_cores() if cores is None else max(1, int(cores)))
+
+
 LAND_EXPLAIN_DEADLINE = 1500.0  # land_judge's own CHECK_BUDGET_S is 1470 s
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
@@ -11895,6 +11924,7 @@ class LandQueue:
         self.jobs: dict[str, Any] = {}
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
+        self.pass_load_gated = 0  # ... of them, those the host's measured load held back (load_room)
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
@@ -12110,6 +12140,7 @@ class LandQueue:
             self.retire_ended()
             self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
+            self.pass_load_gated = 0
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.log_pool()
             return
@@ -12118,6 +12149,7 @@ class LandQueue:
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
         self.pass_gated, self.pass_first_gated = 0, None
+        self.pass_load_gated = 0
         self.pass_latch = latch
         self.pass_latched = 0
         self.pass_staggered = 0
@@ -12830,8 +12862,21 @@ class LandQueue:
         return [self.path("python", Path(sys.executable)).as_posix(), os.fspath(tool), "ready", "--owner", owner]
 
     def workers(self) -> int:
-        """land.json "workers", else LAND_WORKERS; nothing else sizes it (no load-based sizing)."""
-        return int(land_seconds(self.config().get("workers"), LAND_WORKERS, 1, LAND_WORKERS_MAX))
+        """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
+        this host's cores (land_worker_ceiling), read at each call. Past the first busy worker, load_room decides."""
+        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
+
+    def load_room(self) -> bool:
+        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs), else
+        only while the host's 1-minute load per core is under LAND_LOAD_LINE (an unknown load admits). Counted for the
+        pass's land-pool line ("loadGated")."""
+        if not self.jobs:
+            return True
+        load = land_load_per_core()
+        if load is None or load < LAND_LOAD_LINE:
+            return True
+        self.pass_load_gated += 1
+        return False
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -12841,7 +12886,7 @@ class LandQueue:
         given = self.config().get("loginWorkers")
         if given is None:
             return self.workers()
-        return min(self.workers(), int(land_seconds(given, LAND_WORKERS, 1, LAND_WORKERS_MAX)))
+        return min(self.workers(), int(land_seconds(given, self.workers(), 1, self.workers())))
 
     def login_room(self, e: dict) -> bool:
         """Whether E may start now under login_workers: an owner with an unlatched source always may."""
@@ -12855,7 +12900,7 @@ class LandQueue:
             on_login += 0 if seen and seen[1] else 1
         return on_login < cap
 
-    def gated(self, e: dict) -> None:
+    def gated(self, e: dict, why: str = "every worker busy") -> None:
         """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
         self.pass_gated += 1
         if self.pass_first_gated is None:
@@ -12863,8 +12908,8 @@ class LandQueue:
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
             e["dueLate"] = {"at": self.now, "since": self.due_since(e)}
-            self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why="every worker busy",
-                         workers=self.workers(), busy=len(self.jobs))
+            self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
+                         workers=self.workers(), busy=len(self.jobs), loadPerCore=land_load_per_core())
             self.save(e)
 
     def log_pool(self) -> None:
@@ -12898,7 +12943,8 @@ class LandQueue:
         oldest = min(due) if due else None
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
-             "workersFrom": "land.json" if "workers" in self.config() else "default", "busy": len(running),
+             "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
+             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated, "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
@@ -13043,7 +13089,8 @@ class LandQueue:
             import concurrent.futures
             # at the ceiling (threads start only as jobs need them): judge's cap is the live land.json "workers",
             # so changing it takes effect at once instead of at the next restart
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=LAND_WORKERS_MAX, thread_name_prefix="land")
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), self.workers()),
+                                                              thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
     def wake_near(self, e: dict) -> bool:
@@ -13566,6 +13613,9 @@ class LandQueue:
             return False
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
+            return False
+        if not self.load_room():
+            self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e):
             return False  # this window's share is spent: judged in a later one, its place kept
