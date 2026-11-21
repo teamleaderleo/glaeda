@@ -12970,6 +12970,13 @@ class LandQueue:
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
+                    pin = str(e.get("pinSha") or "")
+                    if pin and not land_head_moved(pin, str(w.get("before") or "")):
+                        # The pin named the head this update was sent at: the base merge it made is the pinned
+                        # change plus the base, so the pin follows it (hq#14568, 2026-11-21: stopped head_moved on
+                        # the head its own update made). Any other head still stops the land.
+                        e["pinSha"] = head
+                        self.history(e, "repin_own_update", pin=pin[:12], head=head[:12])
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
