@@ -1840,6 +1840,25 @@ class GraphqlDietTest(Base):
         self.daemon.tick(start + 2 * gg.NUDGE_MIN)
         self.assertEqual(self.pr_reads(), reads + 1)
 
+    def test_an_idle_pr_in_the_land_queue_takes_its_nudge(self) -> None:
+        """huge-blue, 2026-11-21 20:15Z: pinned lands sat 1.5-2 h in pin_wait because the idle backoff dropped the
+        queue's nudge for a PR nobody else read. A PR in the land queue is read on its nudge, idle or not."""
+        node = pr_node(1)
+        node["headRefName"] = "feat/x"
+        self.gh.prs[("o", "r", 1)] = node
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        start = NOW + gg.IDLE_BACKOFF_AFTER + gg.CYCLE
+        self.daemon.tick(start)
+        reads = self.pr_reads()
+        queue = types.SimpleNamespace(entries={"pr:o/r#1": {"key": "pr:o/r#1", "state": "queued"}}, lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.daemon.land_nudge("pr:o/r#1")
+            self.daemon.tick(start + gg.NUDGE_MIN)
+            self.daemon.land_queue = None
+        self.assertEqual(self.pr_reads(), reads + 1)
+
     def test_a_closed_or_merged_pr_is_dropped_after_its_last_reader(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1, state="MERGED")
         gg.register("pr:o/r#1")
@@ -25523,21 +25542,60 @@ class LandTest(Base):
         self.assert_merged_at(LB)
 
     def test_a_pinned_land_waits_for_a_read_with_no_judgment(self):
-        """No read answers the nudge yet: the entry waits (re-nudged every NUDGE_MIN), judging nothing; the read that
-        shows the pinned head is judged."""
+        """No read answers the nudge: after NUDGE_MIN the PR is read directly (not nudged again), judging nothing
+        meanwhile; the read that shows the pinned head is judged."""
         self.nudge_reads = False
         self.pr(LA)
         self.land_pinned(LB)
         e = self.tick(1)
-        for _ in range(int(gg.NUDGE_MIN * 2) + 1):
+        for _ in range(int(gg.NUDGE_MIN) - 2):
             e = self.tick(1)
-        self.assertEqual(self.w.explains(), [])
-        self.assertEqual(e["state"], "queued")
-        self.assertGreaterEqual(self.w.nudged.count(self.KEY), 3)
-        self.assertLessEqual(self.w.nudged.count(self.KEY), 4)
-        self.pr(LB)
+        self.assertEqual((self.w.explains(), self.w.refreshed, e["state"]), ([], [], "queued"))
+        self.assertEqual(self.w.nudged.count(self.KEY), 1)
+        self.fresh_head = LB
         self.w.answers.append(ok_answer(LB))
-        self.tick(1)
+        for _ in range(4):
+            self.tick(1)
+        self.assertEqual(self.w.nudged.count(self.KEY), 1)
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assert_merged_at(LB)
+
+    def test_a_pinned_land_whose_reads_all_fail_stops_naming_the_pin_and_the_error(self):
+        """huge-blue, 2026-11-21 20:15Z: hq#17124, hq#14715, cmux#48244 and hq#17344 waited in pin_wait with no bound
+        on a 1.5-2 h old cache. Now an unanswered nudge is followed by direct reads; LAND_PIN_READ_FAILS failed ones in
+        a row stop the entry (pin_unread) naming the pin, the cached head and the read's error, never head_moved."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        e = self.tick(1)
+        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+            e = self.tick(1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pin_unread"))
+        self.assertEqual(len(self.w.refreshed), gg.LAND_PIN_READ_FAILS)
+        self.assertIn(LB[:12], e["stop"]["reason"])
+        self.assertIn(LA[:12], e["stop"]["reason"])
+        self.assertIn("lane-gh call get: quota", e["stop"]["reason"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
+    def test_a_pinned_land_with_failed_direct_reads_short_of_the_stop_merges_on_the_read_that_works(self):
+        """Only failures in a row stop it: LAND_PIN_READ_FAILS - 1 failed reads, then one that shows the pin, and it
+        is judged and merged."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        e = self.tick(1)
+        while len(self.w.refreshed) < gg.LAND_PIN_READ_FAILS - 1:
+            e = self.tick(1)
+        self.assertEqual(e["pinWait"].get("directFails"), gg.LAND_PIN_READ_FAILS - 1)
+        self.assertIn("quota", e["pinWait"].get("directError"))
+        self.fresh_head = LB
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(int(gg.NUDGE_MIN) + 3):
+            self.tick(1)
+        self.assertEqual(len(self.w.refreshed), gg.LAND_PIN_READ_FAILS)
         self.assert_merged_at(LB)
 
     def test_a_pinned_land_stops_when_a_fresh_read_shows_another_head(self):
@@ -25555,19 +25613,19 @@ class LandTest(Base):
     def test_a_stale_cached_head_never_stops_a_newer_pin_as_head_moved(self):
         """The cache is stale and the pin is newer: judge()'s head_moved compares the pin with the cached head, so
         before pin_wait the land stopped head_moved on a head GitHub no longer has. No stop until a read since the
-        request; that read shows the pin, and it is judged and merged."""
+        request (each direct read fails here, short of LAND_PIN_READ_FAILS); the read that comes shows the pin, and it
+        is judged and merged."""
         self.nudge_reads = False
         self.pr(LA)
         self.land_pinned(LB)
-        for _ in range(int(gg.LAND_FRESH_WAIT)):  # long past every other wait: still no stop, no judgment
+        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS - 1) + 5):
             e = self.tick(1)
         self.assertEqual(self.w.explains(), [])
         self.assertNotEqual(e["state"], "stopped")
         self.assertNotIn("stopped", [h.get("event") for h in e["history"]])
-        self.nudge_reads = True
-        self.github_head[self.KEY] = LB
+        self.fresh_head = LB
         self.w.answers.append(ok_answer(LB))
-        self.tick(gg.NUDGE_MIN)  # the next nudge's read shows LB
+        self.tick(gg.NUDGE_MIN)  # the next direct read shows LB
         self.tick(1)
         self.assert_merged_at(LB)
 

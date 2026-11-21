@@ -7116,7 +7116,10 @@ class Daemon:
             if (kind == "pr" and c is not None and e["key"] in self.nudged
                     and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
-                if self.idle_interval(e, interval) <= interval:  # (an idle one keeps its slower cycle)
+                # (an idle one keeps its slower cycle, except a PR in the land queue: its nudge is a wait. huge-blue,
+                # 2026-11-21 20:15Z: pinned lands sat 1.5-2 h in pin_wait while the idle backoff dropped each nudge)
+                if (self.idle_interval(e, interval) <= interval
+                        or (self.land_queue is not None and e["key"] in self.land_queue.entries)):
                     out.append(e)
                     continue
             if kind == "run" and c is not None and e["key"] in self.controller_filled and c.get("source") == "controller":
@@ -10550,6 +10553,9 @@ def land_update_branch_args(repo: str, number: str, head: str, needs: list[str],
     return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
 
 
+LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
+
+
 def land_direct_read(key: str) -> str | None:
     """One read of KEY's PR from GitHub through the broker, stored in the cache; None, or why it could not."""
     return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time(), "land": True})
@@ -13307,7 +13313,11 @@ class LandQueue:
         of 0eb40dbac8fb and stopped on that head's conflict; the pin said a newer head existed. Until the cache shows
         the pinned head, or a read since the request shows another, no verdict on a cached head is taken (judge's own
         head_moved included): the PR is read again (nudged, or refreshed through the upstream), at most every
-        NUDGE_MIN. Once the cache shows the pin (pinSeen), judge's head_moved check holds as it always did."""
+        NUDGE_MIN. Once the cache shows the pin (pinSeen), judge's head_moved check holds as it always did.
+
+        Bounded: a nudge that brings no read within NUDGE_MIN is followed by a direct read of the PR (refresh_job), as
+        on a host that reads through its upstream; LAND_PIN_READ_FAILS failed direct reads in a row stop the entry
+        (pin_unread), naming the pin, the cached head and the read's error to its requester."""
         pin = str(e.get("pinSha") or "")
         if head and not land_head_moved(pin, head):
             e["pinSeen"] = True
@@ -13329,10 +13339,18 @@ class LandQueue:
             w = e["pinWait"] = {"since": self.now, "cached": head[:12]}
             self.history(e, "pin_wait", pin=pin[:12], cached=head[:12])
             self.save(e)
+        fails = int(w.get("directFails") or 0)
+        if fails >= LAND_PIN_READ_FAILS:
+            e.pop("pinWait", None)
+            self.stop(e, "pin_unread",
+                      f"waited for a read showing the --sha {pin[:12]} (cached head {head[:12] or 'none'}); "
+                      f"{fails} direct reads of the PR failed, the last: {w.get('directError') or 'no error text'}",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {pin}")
+            return True
         last = w.get("readAt")
         if not isinstance(last, (int, float)) or isinstance(last, bool) or self.now - last >= NUDGE_MIN:
-            if not self.reads_upstream():
-                w["readAt"] = self.now
+            if not self.reads_upstream() and not w.get("nudgedAt"):
+                w["readAt"] = w["nudgedAt"] = self.now
                 self.save(e)
                 before = (c.get("dataAt"), c.get("updatedAtAt"))
                 self.nudge(e["key"])
@@ -13343,7 +13361,8 @@ class LandQueue:
                     self.changed_entries.add(e["key"])
                     return True
             elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
-                w["readAt"] = self.now
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
+                w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
@@ -13420,6 +13439,10 @@ class LandQueue:
             if e is None:
                 return
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
+            w = e.get("pinWait")
+            if isinstance(w, dict) and w.get("directAt") is not None:  # a pinned land's direct read (pin_wait)
+                w["directFails"] = int(w.get("directFails") or 0) + 1 if error else 0
+                w["directError"] = land_trim(error, 160) if error else None
             log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error})
             self.save(e)
 
