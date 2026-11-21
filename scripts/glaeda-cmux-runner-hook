@@ -3033,9 +3033,35 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
-# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The one
-# exception is ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only (trusted_refusal).
+# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The
+# exceptions are ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only, and HQ_MAIN_DISPATCH (trusted_refusal).
 TRUSTED_EVENTS = ("push", "schedule")
+# HQ_MAIN_DISPATCH (2026-11-21, the coordinator on cmuxterm-hq#14636: "the fleet_route hook admits only main push and
+# schedule jobs. Let it admit workflow_dispatch on main too"): a runner trusted for manaflow-ai/cmuxterm-hq's main
+# (cmux24's hq-fleet-route, hq-census, hq-report and hq-runner-maker, cmux17's and cmux22's hq-two-mac) also takes a
+# workflow_dispatch of that repository at refs/heads/main, from a workflow file on main. Such a run executes main's own
+# workflow at main's head, and only a person or App with write access can start it: the same trust as a push to main.
+# The input-ref risk above is cmux's (app-host-test-rerun takes refs/pull/N/merge); HQ's workflows that route to these
+# runners take PR numbers and phases as inputs, never a ref to check out and run, and a new one is reviewed on main.
+# Only HQ, only main: a dispatch of another ref or repository, and pull_request, workflow_run and merge_group (payload
+# keys included), stay refused. HQ's runs-on lines send a dispatch here only while vars.HQ_OWNED_DISPATCH is 'live'.
+# And only HQ's workflow files that route to these runners (HQ_DISPATCH_WORKFLOWS, exact names or a "*" prefix): HQ main
+# also has workflows whose runs-on is a dispatch input (screenshare-bench-*-host.yml's `inputs.runner`), which would
+# let a dispatcher put main's code with their own inputs here; a new workflow for these runners is added here.
+HQ_DISPATCH_REPO = "manaflow-ai/cmuxterm-hq"
+HQ_DISPATCH_REF = "refs/heads/main"
+HQ_DISPATCH_WORKFLOWS = ("fleet-reconciler-*", "fleet-selfheal.yml", "freestyle-runners.yml", "next-dogfood.yml",
+                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml")
+
+
+def hq_dispatch_workflow(workflow_path: str) -> bool:
+    """Whether workflow_path (OWNER/REPO/.github/workflows/FILE, no @ref) is one of HQ_DISPATCH_WORKFLOWS. Pure."""
+    prefix = f"{HQ_DISPATCH_REPO}/.github/workflows/"
+    if not workflow_path.lower().startswith(prefix) or "/" in workflow_path[len(prefix):]:
+        return False
+    name = workflow_path[len(prefix):]
+    return any(name.startswith(w[:-1]) and name.endswith(".yml") if w.endswith("*") else name == w
+               for w in HQ_DISPATCH_WORKFLOWS)
 UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
 TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 # ONE_MINI_NIGHTLY: main's classic nightly.yml signing and publishing jobs, which cmux routes to the trusted signing
@@ -3139,7 +3165,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     """Why a job is not merged code of trusted_repo on trusted_ref, or None. Pure. For a push or schedule the
     workflow file and the default checkout come from that ref, so PR code runs only if a merged workflow
     fetches it (docs/CMUX_MINI_RUNNER.md 2e)."""
-    why = f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs"
+    hq_main = trusted_repo.lower() == HQ_DISPATCH_REPO and trusted_ref == HQ_DISPATCH_REF
+    why = (f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push, schedule and workflow_dispatch jobs"
+           if hq_main else f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs")
     if (trusted_next_nightly or trusted_next_signing) and (
             trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
@@ -3154,7 +3182,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return None
     # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
     dispatch = trusted_next_signing and event_name == "workflow_dispatch"
-    if event_name not in TRUSTED_EVENTS and not dispatch:
+    # HQ_MAIN_DISPATCH: checked below like a push: payload, repository, ref and workflow file from main
+    hq_dispatch = hq_main and event_name == "workflow_dispatch"
+    if event_name not in TRUSTED_EVENTS and not dispatch and not hq_dispatch:
         return f"{why}, not {event_name}"
     if not isinstance(event, dict):
         return f"{why}; the event payload is missing"
@@ -3179,6 +3209,14 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
                                             "signing job push or dispatch" if trusted_next_signing else ""))))
+    if hq_dispatch:
+        workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
+        if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
+                and hq_dispatch_workflow(workflow_path)):
+            return (f"{why}; a workflow_dispatch only of {trusted_ref} with one of its own workflow files that route "
+                    f"here ({', '.join(HQ_DISPATCH_WORKFLOWS)}) "
+                    f"(ref {ref or '(unset)'}, payload ref {event.get('ref')!r}, workflow {workflow_ref or '(unset)'})")
+        return None
     if dispatch:
         # ONE_MINI_NIGHTLY: main's classic nightly signing and publishing jobs, from main's exact nightly.yml
         if not (ref == trusted_ref and event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@{ref}"
@@ -6910,6 +6948,28 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
     return "; ".join(notes)
 
 
+# LEDGER_ERROR_IS_FINAL: an error opening or locking a ledger file that waiting cannot clear (permissions, a read-only
+# volume, a directory or symlink where a token belongs) is a refusal at once, naming the file, not a capacity wait.
+# Read as capacity ("capacity: ..."), job-started waited out its whole bound, and its admit.want marker held the
+# mini meanwhile: no other admission there, and the linux-vm supervisor stopped the mini's VM. a fleet Mac, 2026-11-21
+# 11:27-12:27Z: cmux nightly run 44898080726's generate-nightly-deltas (the exclusive class, SIGNING_DRAIN) logged
+# "cannot take the ledger (PermissionError)" for 3600 s and was refused, the mini idle meanwhile. The exclusive class
+# alone takes fast-0, fast-1, gateway-0, gateway-1 and gui, so a ledger file only it opens (or creates) can fail it on
+# a mini every other job admits on. Errors that can pass (descriptors or disk running out) stay capacity waits.
+LEDGER_FINAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ELOOP, errno.ENOTDIR, errno.EISDIR})
+LEDGER_FINAL_MARK = "(LEDGER_ERROR_IS_FINAL)"  # in the note, so a caller that waits on any note can stop on this one
+
+
+def ledger_error_note(error: OSError) -> str:
+    """The admission note for an OSError taking the ledger: a capacity wait only when waiting can clear it."""
+    where = f" on {error.filename}" if getattr(error, "filename", None) else ""
+    what = f"cannot take the ledger ({type(error).__name__}{where})"
+    if error.errno in LEDGER_FINAL_ERRNOS:
+        return (f"{what}: waiting cannot clear it, so this job is refused now {LEDGER_FINAL_MARK}; the ledger "
+                "files must be the runner user's to open and create")
+    return f"capacity: {what}"
+
+
 def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int | JobOwner,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
@@ -7257,7 +7317,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 roots_file(state_dir).write_text(root + "\n")
         return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
-        return refused(f"capacity: cannot take the ledger ({type(error).__name__})")
+        return refused(ledger_error_note(error))
     finally:
         close_all(fds)
         os.close(admission)

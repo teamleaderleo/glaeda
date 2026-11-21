@@ -4375,6 +4375,52 @@ class FallbackTest(Base):
         # the 200 statuses case says the same: the third page of runs was never read
         self.assertEqual(len([c for c in self.gh.rest_calls() if "actions/runs?" in c[1]]), gg.REST_RUN_PAGES)
 
+    def test_a_head_too_big_for_rest_is_not_paged_again_every_cycle(self) -> None:
+        """huge-blue 2026-11-21 07:58-11:21Z: manaflow-ai/cmux@df6c08f2 had more than 500 checks. A lane broker kept
+        asking for it, so as an asked head with no answer it went first in every REST tick and past the plain share,
+        paged ten REST requests every ~95 s tick, and failed the same way each time ("retry next cycle"), while waited PR
+        data went 5,896 s stale behind it. Those counts only grow: REST leaves it alone for HEAD_OVERSIZED_RETRY (no
+        request, no consumer charge, no direct-read slot), the PRs are still read, and GraphQL reads it when it can."""
+        sha = "d" * 40
+        many = [workflow_check("build", 1000 + i, workflow="CI", conclusion="SUCCESS") for i in range(250)]
+        for c in many:
+            c["checkSuite"]["app"] = {"slug": "github-actions"}
+        self.gh.heads[("o", "r", sha)] = many
+        self.force_low()
+        key = f"head:o/r@{sha}"
+        head_calls = lambda: [c for c in self.gh.rest_calls() if sha in c[1]]  # noqa: E731
+        per_tick = []
+        # the broker keeps asking and reading, tick after tick
+        with mock.patch.object(gg, "HEAD_INTEREST", 10 ** 6), mock.patch.object(gg, "IDLE_EXPIRY", 10 ** 6):
+            gg.register(key, consumer="lane-broker")
+            gg.register("pr:o/r#1", waited=True)
+            self.daemon.tick(NOW)
+            per_tick.append(len(head_calls()))
+            self.assertIn("workflow runs over REST", gg.read_cache(key)["error"])
+            self.assertEqual(gg.read_cache(key)["restOversizedAt"], NOW)
+            self.assertGreaterEqual(per_tick[0], gg.REST_RUN_PAGES + 2, "the first read pages every list")
+            for n in range(1, 4):  # each a whole cycle later, when an unanswered head is due again
+                self.daemon.tick(NOW + n * (gg.CYCLE + gg.TICK))
+                per_tick.append(len(head_calls()) - sum(per_tick))
+                self.assertEqual(gg.read_cache("pr:o/r#1")["fetchedAt"], NOW + n * (gg.CYCLE + gg.TICK),
+                                 "the waited PR is read on every one of those ticks")
+            self.assertEqual(per_tick[1:], [0, 0, 0], f"REST requests on the head per tick: {per_tick}")
+            self.assertEqual(self.daemon.head_direct_at, [], "nor does it take a direct-read slot")
+            # past HEAD_OVERSIZED_RETRY REST asks once more (it still cannot answer), and is held off again
+            later = NOW + gg.HEAD_OVERSIZED_RETRY + gg.CYCLE
+            self.daemon.tick(later)
+            self.assertGreater(len(head_calls()), sum(per_tick))
+            self.assertEqual(gg.read_cache(key)["restOversizedAt"], later)
+            # GraphQL back: it reads the head (up to HEAD_BATCH_MAX_CONTEXTS_PAGES pages), and the mark goes with the error
+            gg.DAEMON_CONFIG.unlink(missing_ok=True)
+            self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": later + 1800},
+                                  "graphql": {"limit": 5000, "remaining": 4500, "reset": later + 1800}}
+            self.daemon.paths = {**self.daemon.paths, "head": "graphql"}
+            self.daemon.tick(later + gg.CYCLE + gg.TICK)
+        head = gg.read_cache(key)
+        self.assertIsNotNone(head["data"], head.get("error"))
+        self.assertNotIn("restOversizedAt", head)
+
     def test_a_write_refused_by_the_secondary_limit_holds_the_reads_too(self) -> None:
         self.daemon.now = NOW
         self.gh.throttle["rest"] = self.SECONDARY
@@ -14103,6 +14149,25 @@ class PostTest(unittest.TestCase):
         self.assertEqual(t.calls[1][2], {"body": "two", "event": "APPROVE"})
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
 
+    def test_a_review_receipt_goes_out_ahead_of_older_comments(self) -> None:
+        notes = [self.queue("comment", f"o/r#{n}", "--body", f"<!-- review-running sha={n} -->") for n in (1, 2, 3)]
+        ship = self.queue("comment", "o/r#9", "--body", "Review (opus via router-review): SHIP at " + "a" * 40)
+        check = self.queue("comment", "o/r#8", "--body", "ws-check passed", "--gate")
+        self.assertTrue(gg.read_json(gg.outbox_dir() / (check["id"] + ".json"))["gate"])
+        self.assertEqual([gg.post_state(i["id"])["ahead"] for i in (ship, check, notes[0])], [0, 1, 2])
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.step(d, NOW + 2 * gg.POST_SPACING)
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/9/comments", "/repos/o/r/issues/8/comments",
+                                                   "/repos/o/r/issues/1/comments"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in notes], ["posted", "queued", "queued"])
+
+    def test_a_gate_comment_is_never_joined_into_prose(self) -> None:
+        self.assertFalse(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s", "gate": True}))
+        self.assertTrue(gg.Daemon.joinable({"kind": "comment", "body": "plain", "by": "s"}))
+
     def pause_cmd(self, blocked_until: float, level: int = 1) -> Path:
         """A fake create-pause command, named in CONTENT_PAUSE_ENV: it logs its arguments and prints the pause."""
         root = Path(self.tmp.name) / "pause"
@@ -15045,7 +15110,8 @@ class PostJoinTest(unittest.TestCase):
         d, t = self.daemon(ok, ok, ok, ok)
         for n in range(4):
             self.step(d, NOW + n * gg.POST_SPACING)
-        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "Review (codex): SHIP " + "a" * 40, "one", "two"])
+        # the receipt goes out first (outbox_gate); the prose it would have joined follows on its own
+        self.assertEqual([c[2]["body"] for c in t.calls], ["Review (codex): SHIP " + "a" * 40, "one", "one", "two"])
 
     def test_a_crash_mid_join_releases_the_members(self) -> None:
         a = self.queue("comment", "o/r#7", "--body", "one")
@@ -20760,12 +20826,14 @@ class LogScanTest(Base):
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
-def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "") -> dict:
+def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
+            draft: bool = False) -> dict:
     """A PR cache entry's data, as parse_pr stores it. PARENT is the head commit's first parent as the read gave it
     (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
     return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "isDraft": draft,
             **({"headParent": parent} if parent else {}),
             "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
 
@@ -20867,14 +20935,16 @@ class LandWorld:
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
-                merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"])
+                merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]
+                              or (c[1:4] == ["api", "-X", "PUT"] and c[4].endswith("/merge")))
                              and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 if self.view_err is not None:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
                 return subprocess.CompletedProcess(argv, 0, json.dumps(
                     {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
-            kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
+            kind = "merge" if words[:2] == ["pr", "merge"] or (words[:3] == ["api", "-X", "PUT"]
+                                                               and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
             return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
@@ -20978,6 +21048,11 @@ class LandTest(Base):
 
     def pr(self, head: str, key: str = KEY, **kw: Any) -> None:
         self.w.set_pr(key, land_pr(head, **kw), self.t)
+
+    def store_pr(self, data: dict, key: str = KEY, at: float | None = None) -> None:
+        """A PR in the daemon's cache *on disk* (cache_dir), which the `land` CLI reads with no fake in between."""
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "data": data, "dataAt": time.time() if at is None else at})
 
     def assert_merged_at(self, head: str) -> None:
         merges = self.w.gh_calls("pr", "merge")
@@ -22883,6 +22958,9 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"], e["streak"], e["waitRefused"]["count"]),
                          ("waiting", "pr", None, len(judged)))
         self.assertEqual(self.w.sent(), [], "no stop, nobody asked to requeue")
+        # Every one of those judgments after the first was made at the same head on the same check set: the queued
+        # check never moved in these 3 h, so each could only reach the verdict above it (explain_unmoved).
+        self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
         # the checks start: progress, the wait goes on past the bound counted from the first refusal
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("linux", "IN_PROGRESS", None)])
         e = self.run_hour(self.queued_wait, seconds=gg.LAND_WAIT_STUCK - 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
@@ -22892,6 +22970,23 @@ class LandTest(Base):
         self.w.answers[:] = [ok_answer(LA)]
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_a_judgment_on_an_unmoved_check_set_is_counted(self):
+        # The instrumentation the keep was measured with: a judgment at the same head on the same check runs,
+        # statuses and conclusions could only reach the verdict above it (`land status`: explain_unmoved).
+        self.pr(LA)
+        self.land()
+        for _ in range(4):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 120},
+                                          reason="land-judge: refused: the classifier could not read the reds"))
+        e = self.run_hour(lambda: refusal("unreadable", LA, {"kind": "retry", "after_s": 120},
+                                          reason="land-judge: refused: the classifier could not read the reds"),
+                          seconds=400.0, step=60.0)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        self.assertGreaterEqual(len(judged), 2)
+        self.assertEqual(day.get("explain_unmoved"), len(judged) - 1)
+        self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
 
     def test_checks_that_never_start_stop_at_the_long_bound_naming_them(self):
         for code in ("checks_running", "checks_queued_no_runner"):
@@ -23176,6 +23271,46 @@ class LandTest(Base):
         e = self.run_hour(answer, seconds=60)
         updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
         self.assertEqual((len(updates), e["state"]), (2, "waiting"))
+
+    def test_a_deliberate_fix_record_at_the_head_merges_by_rest_pinned_to_it(self):
+        """cmux#47721 (2026-11-21): a coordinator's deliberate fix merge record at the PR's exact head counts only for
+        REST's PUT pulls/N/merge pinned to it. land-judge explain finds the record (teammate_optin.deliberate_fix_record)
+        and names that merge (action via "rest"); the queue sends it through the shim, so land_judge judges it again."""
+        self.pr(LA)
+        self.land()
+        code, doc = ok_answer(LA)
+        doc["action"]["via"] = "rest"
+        doc["next"] = f"gh api -X PUT repos/o/r/pulls/1/merge -f sha={LA} -f merge_method=squash"
+        self.w.answers.append((code, doc))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"),
+                         [["api", "-X", "PUT", "repos/o/r/pulls/1/merge", "-f", f"sha={LA}", "-f", "merge_method=squash"]])
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
+    def test_a_stale_or_missing_deliberate_fix_record_stops_on_teammate(self):
+        """A record at another head, or none: land-judge explain judges the `gh pr merge` and stops it on teammate
+        with today's words; the queue sends no merge of either kind."""
+        why = "a teammate's PR lands on its author's opt-in: they add ready-to-land"
+        for _ in ("stale head", "no record"):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(refusal("teammate", LA, {"kind": "stop", "stop": "teammate", "why": why},
+                                          nxt=f"none ({why})"))
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "teammate"))
+            self.assertEqual(e["stop"]["reason"], why)
+            self.assertIn(f"stopped: teammate: {why}", self.w.sent()[-1][-1])
+            self.assertEqual((self.w.gh_calls("pr", "merge"), self.w.gh_calls("api", "-X", "PUT")), ([], []))
+
+    def test_land_merge_argv_is_rest_only_for_a_via_rest_merge(self):
+        sha = "a" * 40
+        gh_merge = ["pr", "merge", "1", "-R", "o/r", "--squash", "--match-head-commit", sha]
+        self.assertEqual(gg.land_merge_argv(ok_answer(sha)[1], "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"ok": True}, "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"action": {"kind": "merge", "via": "graphql"}}, "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"action": {"kind": "merge", "via": "rest"}}, "o/r", "1", sha),
+                         ["api", "-X", "PUT", "repos/o/r/pulls/1/merge", "-f", f"sha={sha}", "-f", "merge_method=squash"])
 
     def test_a_teammate_refusal_never_sends_an_update(self):
         self.pr(LA)
@@ -23552,6 +23687,11 @@ class LandTest(Base):
         for said in ("GraphQL: Pull Request is not mergeable (mergePullRequest)", "the PR is a draft review"):
             self.assertIsNone(gg.LAND_STEP_DRAFT.search(said), said)
         self.pr(LA)
+        # Converted to a draft *after* its request, which is why this check cannot be replaced by the request-time
+        # one: at the request this host's read said the PR was ready, so land_draft_refusal has nothing to answer.
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "data": land_pr(LA), "dataAt": time.time()})
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1))
         self.land()
         self.w.gh_rc["merge"] = 1
         self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
@@ -23562,6 +23702,66 @@ class LandTest(Base):
         self.assertIn("still a draft", e["stop"]["reason"])
         self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
+
+    def test_land_refuses_a_draft_pr_at_the_request_and_names_gh_pr_ready(self):
+        """The other half of the one above: *when* the answer comes. efficiency-standing-lane, 2026-11-21: one host's
+        queue stopped 7 rows merge_draft 139 min after their own land requests in total (median 13.6 min, worst
+        53.3 min: manaflow-ai/cmuxterm-hq#16729),
+        every refusal carrying "land-judge (pass): ok: ... may merge at <sha>" -- a full CI wait, a judgment and a
+        merge call spent on `isDraft`, which was already true when `land` was typed, and 65 more minutes sitting
+        stopped. A request this host can answer from its cache is answered at once, with the step that clears it."""
+        self.pr(LA, draft=True)
+        self.store_pr(land_pr(LA, draft=True))
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
+                mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("no read, no judge, no step")):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, "b" * 40)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        self.assertIn("o/r#1 is a draft", said[0])
+        self.assertIn("GitHub refuses every merge on a draft", said[0])
+        self.assertIn("stays yours", said[0])  # nothing here marks a PR ready: [hold-own-pr]
+        # The step, with the pin carried through, so the re-land is still pinned to the head the caller judged.
+        self.assertIn(f"next: gh pr ready 1 -R o/r, then glaeda-gh land o/r#1 --match-head-commit {'b' * 40}",
+                      said[0])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json"))
+                         if gg.LandQueue.requests_dir().is_dir() else [], [])
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
+        self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+
+    def test_a_draft_read_that_is_stale_or_shadowed_by_a_write_refuses_nothing(self):
+        """A refusal built from a read that may no longer hold is never final: it is queued as before, and the
+        merge-time check answers it. So the request-time check keeps inside the live-field bound, and drops a read a
+        write that could have marked the PR ready (the brokered `gh pr ready` itself) came after."""
+        self.assertEqual(gg.LAND_DRAFT_AGE, gg.BROKER_MAX_AGE)  # isDraft is in BROKER_LIVE_FIELDS
+        now = time.time()
+        draft = land_pr(LA, draft=True)
+        self.store_pr(draft, at=now)
+        self.assertIsNotNone(gg.land_draft_refusal(self.KEY, "o/r", 1))
+        for at, writes, why in ((now - gg.LAND_DRAFT_AGE - 1, {}, "older than the live-field bound"),
+                                (now + 600, {}, "stamped in the future"),
+                                (now, {"o/r pr 1": now + 1}, "a `gh pr ready` write after the read"),
+                                (now, {"*": now + 1}, "a write with no repository of its own")):
+            self.store_pr(draft, at=at)
+            gg.write_json(gg.gh_cache_dir() / "writes.json", writes)
+            self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), why)
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {})
+        for data, why in ((land_pr(LA), "not a draft"), (land_pr(LA, state="MERGED", draft=True), "not open"),
+                          ({"state": "OPEN"}, "no isDraft stored"),):
+            self.store_pr(data, at=now)
+            self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), why)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "data": draft, "dataAt": now, "error": "quota"})
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), "a failed read")
+        (gg.cache_dir() / gg.file_name(self.KEY)).unlink()
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), "no read at all")
 
     CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
@@ -24021,6 +24221,210 @@ class LandTest(Base):
         self.assertNotIn("every worker busy", line)
         self.assertIn("every worker busy", gg.land_line(e, self.t, latch=None))  # no park: as before
         self.assertIsNone(gg.land_queue_parked(self.t + 1801))
+
+    def test_status_names_the_queue_park_only_on_a_row_it_holds(self):
+        """One host, 2026-11-21 12:08Z: 18 rows said "held: the land queue is parked until 12:40:59Z (quota)", 3 of
+        them waiting on their own wake past the park's own end: the park was not why they had not moved."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        e.update(state="waiting", wait={"kind": "pr"}, wakeAt=self.t + 2400)
+        self.q.park_queue_quota(self.t + 1800, "quota: GraphQL spent until 09:00Z")
+        queue = gg.land_queue_parked(self.t)
+        self.assertNotIn("held: the land queue is parked", gg.land_line(e, self.t, latch=None, queue=queue))
+        e["wakeAt"] = self.t - 1  # past its wake: a judgment is owed, and the park is what holds it
+        self.assertIn(f"held: the land queue is parked until {gg.utc_clock(self.t + 1800)} (quota)",
+                      gg.land_line(e, self.t, latch=None, queue=queue))
+
+    def test_a_row_whose_own_park_ran_out_is_requeued_behind_a_host_park(self):
+        """A row's own park ending is this queue's own files, no GitHub call: the host-wide park held that step too,
+        so such a row read "waiting (quota)" past its own wake until the host park ended as well."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        e.update(state="waiting", wait={"kind": "quota", "until": self.t + 60, "said": True}, wakeAt=self.t + 60)
+        self.q.park_queue_quota(self.t + 1800, "quota: not judged, retry after 09:00Z (reset)")
+        self.give_reading("rest", 10, self.t + 900)  # under the reserve: the host park holds
+        reads = self.reads()
+        self.tick(61)
+        self.assertEqual((e["state"], e["wait"]), ("queued", None))
+        self.assertEqual(self.reads(), reads)  # re-queued by this queue's own files, nothing read or judged
+        self.assertGreater(self.q.queue_quota_until, self.t)
+
+    def test_a_fresh_reading_above_the_reserve_voids_the_whole_queue_park(self):
+        """One host, 2026-11-21 12:08Z: one row's classifier read (cmux#48940 at 93ecc731b278) was refused for the
+        GraphQL limit and parked the whole queue until 12:40:59Z, while /rate_limit at 12:07:37Z read 3873 REST and
+        4969 GraphQL left and 18 rows of 4 repos and 3 lanes waited behind it. Lands judge over REST: a park GitHub's
+        own count contradicts holds nothing, and the refused row keeps its own park and its own reason."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M:%S", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not be "
+            "read for base_red_excuse.py: RuntimeError: GraphQL: gh api graphql failed")))
+        self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual(self.q.queue_quota_until, said)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")  # before: the whole queue waits for the reset
+        self.tick(300)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.give_reading("rest", 3873, self.t + 900)  # GitHub's own count: the login is not spent
+        self.pr(LB, key=key2)  # a copy read since: the pass judges, never refreshes
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        self.tick(2)
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged, 28 min before the named reset
+        self.assertEqual(self.q.entries[key2]["state"], "merged")
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        over = [r for r in logs if r.get("event") == "land-queue-park-overridden"]
+        self.assertEqual(len(over), 1)
+        self.assertEqual(over[0]["why"], f"GitHub's count reads 3873 REST left, over the "
+                         f"{gg.hard_reserve_floor()['rest']} reserve")
+        e = self.q.entries[self.KEY]  # the row that was refused parks itself, with its own reason
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "quota", said))
+
+    def test_a_reading_at_or_under_the_reserve_keeps_the_whole_queue_parked(self):
+        """At or under the hard reserve GitHub's count agrees with the refusal: the park holds as written, and a
+        stale or missing reading never ends it either."""
+        key2 = "pr:o/r#2"
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        self.q.now = self.t
+        self.q.ingest()
+        self.q.park_queue_quota(self.t + 1800, "quota: not judged, retry after 09:00Z (reset)")
+        self.give_reading("rest", gg.hard_reserve_floor()["rest"], self.t + 900)
+        reads = self.reads()
+        self.tick(30)
+        self.assertEqual(self.reads(), reads)
+        self.give_reading("rest", 4000, self.t - 60, seen_ago=1200)  # stale: its reset passed, its count unknown
+        self.tick(30)
+        self.assertEqual(self.reads(), reads)
+        self.assertGreater(self.q.queue_quota_until, self.t)
+
+    def test_a_github_user_id_never_reaches_a_stored_reason(self):
+        """gh quotes the login's numeric account id in its own rate-limit error, and the daemon stored it verbatim in
+        queueParked.reason and in stopped rows' causes, which agents paste into PR and issue bodies (leo-workspace
+        tools/public_body_guard.py refuses it there). The id is dropped where the daemon captures the error; the
+        limit and the reset stay. The id below is a fake."""
+        self.pr(LA)
+        self.land()
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not be "
+            "read for base_red_excuse.py: RuntimeError: GraphQL: gh api graphql failed: gh: API rate limit already "
+            "exceeded for user ID 4242424242.")))
+        e = self.tick()
+        stored = json.dumps([gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE), e,
+                             gg.land_queue_parked(self.t), gg.land_line(e, self.t, latch=None)])
+        self.assertNotIn("4242424242", stored)
+        self.assertIn("user ID <redacted>", stored)
+        self.assertIn(f"retry after {at}Z", stored)  # the actionable words are kept
+        self.assertEqual(gg.land_redact("for user ID 4242424242."), "for user ID <redacted>.")
+        self.assertEqual(gg.land_redact('{"user": 4242424242}'), '{"user": 4242424242}')  # only gh's own sentence
+
+    def test_a_park_an_older_daemon_stored_is_redacted_on_the_way_out(self):
+        """The id is already on disk on every host that parked before this change: `land status` drops it on reading
+        the park file too, not only on writing it. The id below is a fake."""
+        gg.write_json(gg.land_dir() / gg.LAND_QUOTA_FILE, {
+            "until": self.t + 1800, "at": self.t,
+            "reason": "land-judge: refused: quota: gh: API rate limit already exceeded for user ID 4242424242."})
+        self.assertIn("user ID <redacted>", gg.land_queue_parked(self.t)["reason"])
+        self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
+        self.assertNotIn("4242424242", self.queue().queue_quota_reason)
+
+    def two_route_reason(self, at: str) -> str:
+        """A refusal of the shape land_judge's head_reds raises when both live reads failed: the prefix, then one
+        clause per route it tried, each up to 160 characters (leo-workspace tools/land_judge/engine.py). The
+        account id below is a fake."""
+        return (f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not "
+                "be read for base_red_excuse.py: RuntimeError: "
+                "GraphQL: gh api graphql failed: gh: API rate limit already exceeded for user ID 4242424242. "
+                "Run 'gh api rate_limit' to see the limits; "
+                f"REST: check-runs pages disagree on total_count for {LA[:12]} (page 2 of 3 says 61, page 1 said 58); "
+                f"the store: glaeda-gh holds no checks for {LA[:12]} (not read since 11:12Z)")
+
+    def test_a_two_route_refusal_keeps_every_route_s_verdict_in_the_park_reason(self):
+        """A read on the land path tries the store, GraphQL then REST, and the refusal names what each answered. The
+        park reason was trimmed flat to 300 characters, which landed inside the first clause: one lane host 2026-11-21
+        12:08Z stored "... GraphQL: gh api graphql failed: ...; REST:" and stopped there, so the one clause that said
+        whether REST could still serve the queue was destroyed, and no log on the host kept it. 26 of 27 rows waited
+        49 min behind that reason. Every route's verdict must survive the trim; detail inside a clause goes first."""
+        self.pr(LA)
+        self.land()
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        reason = self.two_route_reason(at)
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=reason))
+        e = self.tick()
+        stored = gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE)["reason"]
+        self.assertLessEqual(len(stored), 300)
+        # the defect: a flat head-cut of the same budget spends it all on the first clause, so the routes that
+        # decide whether this host could read around the failure are gone entirely
+        flat = gg.land_trim(gg.land_redact(reason), 300)
+        self.assertNotIn("check-runs pages disagree", flat)
+        self.assertNotIn("the store:", flat)
+        for route, said in (("GraphQL:", "gh api graphql failed"), ("REST:", "check-runs pages disagree"),
+                            ("the store:", "glaeda-gh holds no checks")):
+            self.assertIn(route, stored)
+            self.assertIn(said, stored)  # its label and the words that name the cause, not only the label
+        self.assertIn(f"retry after {at}Z", stored)  # the reset the park is held until still reads
+        # one construction, so every surface of that one stored reason shows the same routes (`land status`'s header
+        # at 200, the pool line at 160): a second cut must not throw away what the first kept
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        line = out.getvalue()
+        self.q.now = self.t
+        self.q.pool_logged = float("-inf")
+        with mock.patch.object(gg, "log") as logged:
+            self.q.log_pool()
+        pool = [c.args[0] for c in logged.call_args_list if c.args and c.args[0].get("event") == "land-pool"]
+        for shown in (line, pool[0]["queueParked"]["reason"]):
+            for route in ("GraphQL:", "REST:", "the store:"):
+                self.assertIn(route, shown, shown)
+        self.assertNotIn("4242424242", json.dumps([stored, line, pool[0]]))
+
+    def test_a_two_route_refusal_keeps_every_route_s_verdict_in_a_stopped_row(self):
+        """The same text is stored and said again when a row stops: the entry's cause (400), its history line (160)
+        and the message its requester gets (300) are all cut from one reason, so all three keep every route."""
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        reason = gg.land_redact(self.two_route_reason(at))
+        for limit in (400, 300, 200, 160):
+            got = gg.land_reason(reason, limit)
+            self.assertLessEqual(len(got), limit)
+            for route in ("GraphQL:", "REST:", "the store:"):
+                self.assertIn(route, got, f"{limit}: {got}")
+        # a surface trims what another already trimmed (the park is stored at 300 and shown at 160): the clauses
+        # must still be findable in the trimmed text, or the second cut throws away what the first kept
+        twice = gg.land_reason(gg.land_reason(reason, 300), 160)
+        self.assertEqual(twice, gg.land_reason(gg.land_reason(reason, 300), 160))
+        for route in ("GraphQL:", "REST:", "the store:"):
+            self.assertIn(route, twice, twice)
+
+    def test_a_reason_naming_one_route_is_trimmed_exactly_as_before(self):
+        """Only a reason reporting two or more routes is shared out: everything else keeps land_trim's answer, so no
+        existing message changes shape. A budget too small for every clause to keep its label falls back too."""
+        one = "graphql: HTTP 502: " + "the rollup read closed while reading page 2 of the check suites. " * 8
+        self.assertEqual(gg.land_reason(one, 160), gg.land_trim(one, 160))
+        self.assertEqual(gg.land_reason("", 160), "")
+        self.assertEqual(gg.land_reason(None, 160), "")
+        self.assertEqual(gg.land_reason("a short reason", 160), "a short reason")
+        both = gg.land_redact(self.two_route_reason("09:00:00"))
+        self.assertEqual(gg.land_reason(both, 40), gg.land_trim(both, 40))  # no room for four labels: flat
+        self.assertEqual(gg.land_reason(both, len(both) + 10), both)  # it fits: untouched
+        self.assertEqual(gg.land_reason(" a reason\n  on two lines ", 160), "a reason on two lines")
 
     def test_a_parked_queue_still_logs_its_pool_line(self):
         """While parked the tick returned before log_pool: 06:51Z to 08:44Z had two land-pool lines, none naming why."""
@@ -28373,18 +28777,26 @@ class WaitBlockedByQuotaTest(Base):
     RESET = 1200.0  # seconds from NOW: past a 600 s wait's deadline, inside a 1800 s one's
 
     def records(self, *, mode: str = "stop", remaining: int = 0, reset: float | None = None,
-                bucket: str = "graphql", upstream: bool = False) -> None:
-        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped."""
+                bucket: str = "graphql", upstream: bool = False, fed: bool | None = None,
+                capped: bool = False, hold: float | None = None, rest: dict | None = None) -> None:
+        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped. FED is the
+        controller's feed as Daemon.fed reads it: None publishes no feed at all (an older daemon), True a fresh feed
+        that delivered an event for o/r, False a fresh feed that has delivered nothing for it."""
         gg.BASE.mkdir(parents=True, exist_ok=True)
         status = {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
                   "modes": {"rest": "normal", "graphql": "normal", bucket: mode},
-                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": False}}
+                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": capped}}
         if upstream:
             status["upstream"] = {"ok": True}
+        if hold is not None:
+            status["secondaryHold"] = {"until": time.time() + hold, "strikes": 2}
+        if fed is not None:
+            status["controller"] = {"state": "ok", "okAt": time.time() - 1,
+                                    "fedRepos": {"o/r": time.time() - 5} if fed else {}}
         gg.write_json(gg.BASE / "daemon.json", status)
-        gg.write_json(gg.BASE / "budget.json",
-                      {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
-                                "reset": (time.time() + self.RESET) if reset is None else reset}})
+        budget = {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
+                           "reset": (time.time() + self.RESET) if reset is None else reset}}
+        gg.write_json(gg.BASE / "budget.json", {**budget, **(rest or {})})
 
     def request(self, timeout: float = 1800.0, began: float | None = None) -> dict:
         req = gg.wait_request("pr", "o/r#7208", "green", timeout, False, False, "7" * 40, True, gg.RESCUE_GRACE)
@@ -28508,12 +28920,71 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET + 600), time.time()),
                           "reads resume well inside this wait: it must carry on, not give up")
 
-    def test_a_blocked_run_wait_is_left_alone(self) -> None:
+    def run_request(self, timeout: float | None = None) -> dict:
+        req = gg.wait_request("run", "o/r/12345", "done", self.RESET - 600 if timeout is None else timeout,
+                              False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = time.time()
+        return req
+
+    def test_a_blocked_run_wait_the_feed_covers_is_left_alone(self) -> None:
         """A run's finish still arrives over the build controller's feed, which costs no quota, so a stopped bucket
-        is no reason to end a run wait early."""
+        is no reason to end a run wait early -- while the feed does cover its repository."""
+        self.records(bucket="rest", mode="stop", fed=True)
+        self.assertTrue(gg.feed_covers("run:o/r/12345"))
+        self.assertIsNone(gg.wait_step(self.run_request(), time.time()))
+        # and an older daemon, which publishes no feed at all, is read the same way: never give up on a guess
         self.records(bucket="rest", mode="stop")
-        req = gg.wait_request("run", "o/r/12345", "done", self.RESET - 600, False, False, None, True, gg.RESCUE_GRACE)
-        self.assertIsNone(gg.wait_step(req, time.time()))
+        self.assertTrue(gg.feed_covers("run:o/r/12345"))
+        self.assertIsNone(gg.wait_step(self.run_request(), time.time()))
+
+    def test_a_blocked_run_wait_the_feed_does_not_cover_ends_at_the_unreachable_reset(self) -> None:
+        """The pr path's comparison, on the run path: the exemption is the feed, so it holds only where the feed is.
+        Measured 2026-11-21 on this host: `wait run manaflow-ai/cmuxterm-hq/44907253327` sat out its timeout against
+        a stopped bucket and refused with a reset in the past."""
+        self.records(bucket="rest", mode="stop", fed=False)
+        self.assertFalse(gg.feed_covers("run:o/r/12345"))
+        req = self.run_request()
+        done = gg.wait_step(req, time.time())
+        self.assertIsNotNone(done, "no read before the deadline and no feed to carry the finish")
+        code, text = done
+        self.assertEqual(code, gg.EXIT_TIMEOUT, "the same exit code as any expired wait")
+        self.assertIn("past this wait's deadline", text)
+        self.assertIn("REST", text)
+        self.assertIn("glaeda-gh wait until " + gg.utc_clock(gg.read_blocked("run")["reset"]), text)
+        self.assertNotIn("\nnext: " + gg.wait_command(req) + "\n", text)
+        # a feed that went quiet (okAt older than CONTROLLER_FRESH) covers nothing either
+        self.records(bucket="rest", mode="stop", fed=True)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        status["controller"]["okAt"] = time.time() - gg.CONTROLLER_FRESH - 1
+        gg.write_json(gg.BASE / "daemon.json", status)
+        self.assertFalse(gg.feed_covers("run:o/r/12345"))
+
+    def test_a_reset_inside_the_deadline_keeps_an_uncovered_run_wait_going(self) -> None:
+        self.records(bucket="rest", mode="stop", fed=False)
+        self.assertIsNone(gg.wait_step(self.run_request(timeout=self.RESET + 600), time.time()),
+                          "reads resume well inside this wait: it must carry on, not give up")
+
+    # The bucket named is the one that has to come back, not the one the reads are routed over.
+
+    def test_a_spent_rest_share_names_graphqls_reset_and_not_rests(self) -> None:
+        """Measured on this host 2026-11-21 13:17Z: a `wait run` refusal said "this daemon has stopped its REST
+        reads ... still shows headroom (3573 of 5000 left, resets 13:27:38Z), so this is not the shared quota
+        running out", and then offered 13:27:38Z as the wait that ends. REST was not what held the reads: the
+        daemon's own REST share was spent (restShare cap 0, capped) and GraphQL was out, 0 of 5000, resetting
+        13:38:35Z -- eleven minutes later. Nothing changes at the time the refusal named."""
+        self.records(bucket="graphql", mode="stop", remaining=0, capped=True,
+                     rest={"rest": {"remaining": 3573, "limit": 5000, "seenAt": time.time(),
+                                    "reset": time.time() + 120}})
+        blocked = gg.read_blocked("run")
+        self.assertEqual((blocked["routed"], blocked["bucket"]), ("rest", "graphql"),
+                         "a run is read over REST, and GraphQL is what has to come back")
+        self.assertTrue(blocked["exhausted"])
+        self.assertEqual(blocked["reset"], gg.read_json(gg.BASE / "budget.json")["graphql"]["reset"])
+        self.assertIn("GraphQL quota for this login is spent (0 of 5000 left", blocked["text"])
+        self.assertIn("REST share", blocked["text"], "and why REST's own headroom is no answer")
+        self.assertNotIn("3573", blocked["text"], "REST's headroom was never what this wait was waiting for")
+        self.assertIn(gg.utc_clock(blocked["reset"]), gg.blocked_start_line("run:o/r/12345", "run"))
+        self.assertNotIn(gg.utc_clock(time.time() + 120), gg.blocked_next(self.run_request(), blocked))
 
     # (c): a stop the bucket's own reading does not back is said as itself, never as the quota running out.
 
@@ -28521,10 +28992,36 @@ class WaitBlockedByQuotaTest(Base):
         self.records(remaining=4800)
         blocked = gg.read_blocked("pr")
         self.assertFalse(blocked["exhausted"])
+        self.assertIsNone(blocked["reset"], "its quota reset frees nothing: it is not what stopped the reads")
+        nxt = gg.blocked_next(self.request(), blocked)
+        self.assertNotIn("wait until quota", nxt, "nothing ran out: that wait would wait for an end that never came")
+        self.assertTrue(nxt.startswith("glaeda-gh budget"), nxt)
+        self.assertIn("&& " + gg.wait_command(self.request()), nxt)
+        self.assertNotIn(gg.utc_clock(time.time() + self.RESET), gg.blocked_start_line("pr:o/r#7208", "pr") or "",
+                         "a reset that frees nothing is never offered as the deadline")
         self.assertIn("still shows headroom", blocked["text"])
         self.assertNotIn("spent", blocked["text"])
-        # and it never ends a wait early: that belongs to the lane fixing the refusal itself
+        # and it never ends a wait early: with no time at which these reads resume there is none to compare to a
+        # deadline, and the wait may yet be served the moment the daemon reads again.
         self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET - 600), time.time()))
+
+    def test_a_back_off_github_ordered_names_its_own_end_and_not_a_quota_reset(self) -> None:
+        """A secondary 403 holds both buckets until Daemon.secondary_until, with the quota untouched: the reason is
+        the hold and the deadline is its own `until`, never a quota reset that has nothing to do with it."""
+        self.records(remaining=4800, hold=300.0)
+        blocked = gg.read_blocked("pr")
+        self.assertFalse(blocked["exhausted"])
+        self.assertAlmostEqual(blocked["reset"], time.time() + 300, delta=5)
+        self.assertIn("GitHub told this daemon to back off", blocked["text"])
+        self.assertIn("the shared GraphQL quota is not what stopped it", blocked["text"])
+        self.assertIn("glaeda-gh wait until " + gg.utc_clock(blocked["reset"]),
+                      gg.blocked_next(self.request(), blocked))
+        # and a hold whose end a wait cannot reach ends that wait now, like any other unreachable reset
+        self.records(remaining=4800, hold=self.RESET)
+        code, text = gg.wait_step(self.request(timeout=self.RESET - 600), time.time())
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        self.assertIn("back off", text)
+        self.assertIn("past this wait's deadline", text)
 
     def test_a_host_reading_through_another_daemon_names_no_bucket_of_its_own(self) -> None:
         self.records(upstream=True)

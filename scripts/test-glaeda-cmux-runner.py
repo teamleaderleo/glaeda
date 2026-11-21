@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import copy
 import datetime
+import errno
 import fcntl
 import functools
 import hashlib
@@ -658,6 +659,78 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.run_hook("job-started", "pull_request", path, "--allowed-owner", "manaflow-ai",
                                        "--no-disk", repo="manaflow-ai/cmux").returncode, 0,
                          "without --trusted-ref a same-repo PR is admitted as before")
+
+    def test_hq_trusted_runner_admits_only_mains_own_dispatch(self) -> None:
+        # HQ_MAIN_DISPATCH: a runner trusted for cmuxterm-hq's main also takes a main workflow_dispatch of HQ
+        hq = {"full_name": "manaflow-ai/cmuxterm-hq", "fork": False, "default_branch": "main"}
+        main = "refs/heads/main"
+        wf = f"manaflow-ai/cmuxterm-hq/.github/workflows/synthetic-probes.yml@{main}"
+        payload = {"ref": main, "repository": hq, "inputs": {"job": "integrations-production"}}
+        args = {"event_name": "workflow_dispatch", "ref": main, "repository": "manaflow-ai/cmuxterm-hq",
+                "event": payload, "trusted_ref": main, "trusted_repo": "manaflow-ai/cmuxterm-hq", "workflow_ref": wf,
+                "job": "integrations-production", "run_attempt": "1"}
+        self.assertIsNone(hook.trusted_refusal(**args))
+        self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
+        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "workflow_ref": wf.replace("synthetic-probes.yml", name)}))
+        self.assertIsNone(hook.trusted_refusal(**{**args, "trusted_repo": "Manaflow-AI/cmuxterm-hq"}))
+        for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": event_payload}))
+        pr = {"number": 1, "head": {"repo": hq}, "base": {"repo": hq}}
+        refused = {
+            "dispatch of another branch": {"ref": "refs/heads/lane/x", "event": {**payload, "ref": "refs/heads/lane/x"},
+                                           "workflow_ref": wf.replace(main, "refs/heads/lane/x")},
+            "ref env and payload differ": {"event": {**payload, "ref": "refs/heads/lane/x"}},
+            "payload ref missing": {"event": {"repository": hq}},
+            "workflow file from another branch": {"workflow_ref": wf.replace(main, "refs/heads/lane/x")},
+            "workflow file of another repository": {
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{main}"},
+            "no workflow ref": {"workflow_ref": None},
+            "an HQ workflow that does not route here (runs-on from an input)": {
+                "workflow_ref": f"manaflow-ai/cmuxterm-hq/.github/workflows/screenshare-bench-linux-host.yml@{main}"},
+            "an @ smuggled into the workflow path": {"workflow_ref": f"{wf}@refs/heads/lane/x"},
+            "a tag": {"ref": "refs/tags/v1", "event": {**payload, "ref": "refs/tags/v1"},
+                      "workflow_ref": wf.replace(main, "refs/tags/v1")},
+            "a nested workflow path": {
+                "workflow_ref": f"manaflow-ai/cmuxterm-hq/.github/workflows/x/synthetic-probes.yml@{main}"},
+            "dispatch from another repository": {"repository": "manaflow-ai/cmux",
+                                                 "event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
+            "repo env and payload differ": {"event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
+            "payload carries a pull_request": {"event": {**payload, "pull_request": pr}},
+            "payload carries a workflow_run": {"event": {**payload, "workflow_run": {}}},
+            "payload carries a merge_group": {"event": {**payload, "merge_group": {}}},
+            "pull_request": {"event_name": "pull_request", "ref": "refs/pull/1/merge",
+                             "event": {"pull_request": pr, "repository": hq}},
+            "pull_request_target": {"event_name": "pull_request_target"},
+            "workflow_run": {"event_name": "workflow_run", "event": {"workflow_run": {}, "repository": hq}},
+            "merge_group": {"event_name": "merge_group", "ref": "refs/heads/gh-readonly-queue/main/pr-1"},
+            "runner trusted for another HQ branch": {"trusted_ref": "refs/heads/lane/x"},
+            "payload missing": {"event": None},
+        }
+        for name, overrides in refused.items():
+            with self.subTest(name):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+        # cmux's trusted runners keep refusing a main dispatch (its inputs can name refs/pull/N/merge)
+        cmux = {"event": {**payload, "repository": {**CMUX, "default_branch": "main"}}, "repository": "manaflow-ai/cmux",
+                "trusted_repo": "manaflow-ai/cmux", "workflow_ref": f"manaflow-ai/cmux/.github/workflows/x.yml@{main}"}
+        self.assertIn("not workflow_dispatch", hook.trusted_refusal(**{**args, **cmux}))
+        # end to end through the hook, as cmux24's runners call it
+        environ = {"GITHUB_REF": main, "GITHUB_WORKFLOW_REF": wf, "GITHUB_JOB": "integrations-production"}
+        for name, event_name, ref, body, workflow_ref, admitted in (
+                ("main dispatch", "workflow_dispatch", main, payload, wf, True),
+                ("branch dispatch", "workflow_dispatch", "refs/heads/lane/x", {**payload, "ref": "refs/heads/lane/x"},
+                 wf.replace(main, "refs/heads/lane/x"), False),
+                ("pull request", "pull_request", "refs/pull/1/merge", {"pull_request": pr, "repository": hq}, wf,
+                 False)):
+            with self.subTest(f"hook: {name}"):
+                path = event(self.dir, "hq-" + name.replace(" ", "-"), body)
+                result = self.run_hook("job-started", event_name, path, "--allowed-repo", "manaflow-ai/cmuxterm-hq",
+                                       "--trusted-ref", main, "--trusted-repo", "manaflow-ai/cmuxterm-hq", "--no-disk",
+                                       repo="manaflow-ai/cmuxterm-hq",
+                                       env={**environ, "GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref})
+                self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+                if not admitted:
+                    self.assertIn("refused: ", result.stdout)
 
     def test_trusted_next_nightly_is_an_exact_opt_in(self) -> None:
         ref = "refs/heads/nightly-next"
@@ -3424,6 +3497,46 @@ class HookTest(unittest.TestCase):
         killed.wait()
         self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "a killed waiter's marker goes with it")
         self.assertFalse(marker.exists())
+
+    def test_a_ledger_file_it_cannot_open_refuses_the_signing_job_at_once_naming_it(self) -> None:
+        """LEDGER_ERROR_IS_FINAL: a fleet Mac, 2026-11-21, cmux nightly run 44898080726's generate-nightly-deltas logged
+        "cannot take the ledger (PermissionError)" for SIGNING_DRAIN_WAIT_S, holding the whole mini, and was refused
+        anyway. An error waiting cannot clear refuses at once, names the file, and leaves no hold. Here gateway-0.token,
+        a token only the exclusive class takes, is a directory (EISDIR): a PermissionError a root test run cannot
+        make."""
+        self.fleet()
+        (self.dir / "capacity" / "gateway-0.token").mkdir(parents=True)
+        started = time.monotonic()
+        signer = self.nightly_signer("n0", "30", "--nightly-runner")
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{signer.pid}"
+        out, _ = signer.communicate(timeout=60)
+        self.assertEqual(signer.returncode, 1, out)
+        self.assertLess(time.monotonic() - started, 20, "refused at once, not after the drain's bound")
+        self.assertIn("refused: cannot take the ledger (IsADirectoryError on ", out)
+        self.assertIn("gateway-0.token", out)
+        self.assertIn(hook.LEDGER_FINAL_MARK, out)
+        self.assertNotIn("waiting (", out)
+        self.assertFalse(marker.exists(), "refused: no waiter marker holds the mini")
+        self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
+        self.assertTrue(self.lock_free(), "the refused job let go of everything it took")
+
+    def test_only_a_ledger_error_waiting_can_clear_is_a_capacity_wait(self) -> None:
+        """LEDGER_ERROR_IS_FINAL: permissions, a read-only volume or a wrong file type never pass by waiting; running
+        out of descriptors or disk can."""
+        for number, name in ((errno.EACCES, PermissionError), (errno.EPERM, PermissionError),
+                             (errno.EROFS, OSError), (errno.ELOOP, OSError), (errno.EISDIR, IsADirectoryError),
+                             (errno.ENOTDIR, NotADirectoryError)):
+            with self.subTest(errno=number):
+                note = hook.ledger_error_note(name(number, os.strerror(number), "/fleet/capacity/fast-0.token"))
+                self.assertFalse(note.startswith("capacity:"), note)
+                self.assertIn(hook.LEDGER_FINAL_MARK, note)
+                self.assertIn("on /fleet/capacity/fast-0.token", note)
+        for number in (errno.EMFILE, errno.ENFILE, errno.ENOSPC):
+            with self.subTest(errno=number):
+                note = hook.ledger_error_note(OSError(number, os.strerror(number), "/fleet/capacity/unit-3"))
+                self.assertTrue(note.startswith("capacity: cannot take the ledger (OSError on /fleet/capacity/unit-3)"),
+                                note)
+                self.assertNotIn(hook.LEDGER_FINAL_MARK, note)
 
     def test_a_draining_signing_job_keeps_draining_when_a_fleet_build_starts_waiting(self) -> None:
         """cmux13s, 2026-10-31 03:05Z: three sign-nightly-identity-legacy jobs in 30 s were refused at once with "a

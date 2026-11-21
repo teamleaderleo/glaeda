@@ -3661,6 +3661,21 @@ class GlaedaDiskTest(unittest.TestCase):
                              "b": ("git-checkout", ["commits no remote confirms"])})
         self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
 
+    def test_the_fleet_git_mirror_vouches_like_a_server(self) -> None:
+        root, origin = self._tmp_repos()
+        a = root / "a"
+        self._git("clone", "-q", str(origin), str(a))
+        gd.TRUSTED_LOCAL_REMOTES = ()
+        self.assertEqual(gd.network_remotes(a / ".git"), [])  # a plain local path is no copy
+        self.addCleanup(setattr, gd, "FLEET_MIRROR_REMOTES", gd.FLEET_MIRROR_REMOTES)
+        gd.FLEET_MIRROR_REMOTES = (str(origin.parent),)  # as cmux.git sits under the fleet's git/
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        head = self._git("-C", str(a), "rev-parse", "HEAD").strip()
+        pushed = self._git("-C", str(origin), "rev-parse", "HEAD").strip()
+        why, _, known = gd._server_known(a / ".git", ["origin"], {head, pushed})
+        self.assertEqual((why, known), ("", [pushed]))  # the bundle needs only the commit made here
+
     def test_network_remote_urls(self) -> None:
         for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
                     "big-red:Projects/x", "git://h/r"):
@@ -5347,6 +5362,32 @@ class GlaedaDiskTest(unittest.TestCase):
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
+    def test_the_release_is_the_ota_generation_holding_these_exact_bytes(self) -> None:
+        state = self.root / "update"
+        own = Path(gd.__file__).read_bytes()
+
+        def generation(tag: str, body: bytes, source: str) -> None:
+            gen = state / "generations" / tag
+            (gen / "glaeda/scripts").mkdir(parents=True)
+            (gen / "glaeda/scripts/glaeda-disk").write_bytes(body)
+            (gen / "release.json").write_text(json.dumps({"source": source}))
+
+        generation("v-20261121-new", b"other bytes", "b" * 40)
+        generation("v-20261121-old", own, "a" * 40)
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": "v-20261121-old",
+                                                      "quarantined": []}))
+        sha = hashlib.sha256(own).hexdigest()
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # current holds other bytes (a setup that has not installed yet): the previous one is what runs
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": "v-20261121-old", "source": "a" * 40})
+            self.assertIn("v-20261121-old (source " + "a" * 40, gd.version_line())
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": None,
+                                                      "quarantined": []}))
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # a hand install: no generation holds these bytes, and the line says so instead of guessing
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": None, "source": None})
+            self.assertTrue(gd.version_line().startswith("glaeda-disk unreleased"))
+
     def test_every_applying_run_writes_one_run_line(self) -> None:
         blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
         status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
@@ -5361,6 +5402,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(row["target_bytes"], 170 * gd.GIB)
         self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
         self.assertEqual(row["config_sha256"], gd.config_sha256())
+        self.assertEqual(row["release"], gd.glaeda_disk_release())  # which bytes wrote the row: a deploy is provable
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
@@ -7951,6 +7993,54 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "eio")):  # unreadable: no room
             self.assertTrue(gd.relief_room(mirror, 0, slow=True).startswith("no room: cannot read"))
         self.assertEqual(gd.free_bytes, real)
+
+    def test_a_bundle_needs_room_for_its_unpushed_objects_not_the_whole_store(self) -> None:
+        # cmux17's ~/m2l-viewer: 13 unpushed commits (2 MB) in a 2.6 GB store needed 5.6 GB free to bundle
+        repo = self.root / "repo"
+        self._git("init", "-q", "-b", "main", os.fspath(repo))
+        (repo / "big.bin").write_bytes(os.urandom(4 * 1024**2))  # pushed history: incompressible, 4 MiB
+        self._git("-C", os.fspath(repo), "add", "big.bin")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "pushed")
+        self._git("-C", os.fspath(repo), "update-ref", "refs/remotes/origin/main", "HEAD")
+        (repo / "small.txt").write_text("unpushed\n")
+        self._git("-C", os.fspath(repo), "add", "small.txt")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "unpushed")
+        gitdir = repo / ".git"
+        whole = gd.git_relief_peak(gitdir, alternates=True)
+        self.assertGreater(whole, 4 * 1024**2)
+        with mock.patch.object(gd, "BUNDLE_PEAK_SLACK", 0):
+            unpushed = gd.bundle_peak(gitdir, ["refs/heads/main", "--not", "refs/remotes/origin/main"])
+            self.assertLess(unpushed, 64 * 1024)  # a commit, a tree and a blob, not the 4 MiB blob
+            self.assertGreater(unpushed, 0)
+            # everything unpushed: the bound is the whole history, never more than the store
+            self.assertLessEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+            self.assertGreater(gd.bundle_peak(gitdir, ["refs/heads/main"]), 4 * 1024**2)
+            # a git that cannot count (too old for --disk-usage, a broken store): the whole store
+            with mock.patch.object(gd, "_git_dir_run", return_value=None):
+                self.assertEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+
+    def test_a_sparse_checkouts_absent_paths_are_not_hidden_work(self) -> None:
+        root = self.root / "tree"
+        (root / "kept").mkdir(parents=True)
+        (root / "kept/here.txt").write_text("x")
+        # cmux17's ~/m2l-viewer: 41,592 skip-worktree entries for paths a sparse checkout left out
+        self.assertFalse(gd.hidden_from_status("H kept/here.txt\0S gone/a.txt\0S gone/dir/b.txt\0", root))
+        self.assertFalse(gd.hidden_from_status("", root))
+        # a skip-worktree file in the tree may hold edits status does not show
+        self.assertTrue(gd.hidden_from_status("S kept/here.txt\0", root))
+        # assume-unchanged (lowercase), with or without skip-worktree, always may
+        self.assertTrue(gd.hidden_from_status("h kept/here.txt\0", root))
+        self.assertTrue(gd.hidden_from_status("s gone/a.txt\0", root))
+        # a name with a newline or spaces is one entry under -z
+        (root / "kept/odd\nname x").write_text("y")
+        self.assertTrue(gd.hidden_from_status("S kept/odd\nname x\0", root))
+        self.assertFalse(gd.hidden_from_status("S kept/odd\nname y\0", root))
+
+    def test_a_failed_git_call_says_why_when_asked(self) -> None:
+        said: list[str] = []
+        self.assertIsNone(gd._git_dir_run(self.root / "no-such.git", "rev-parse", "HEAD", errors=said))
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0])
 
     def test_every_git_relief_waits_for_room_for_its_peak(self) -> None:
         # the class: home clone gc and runner checkout repack go through the same gate as the mirror compact
