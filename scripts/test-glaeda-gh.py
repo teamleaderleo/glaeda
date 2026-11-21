@@ -21460,6 +21460,85 @@ class LogScanTest(Base):
         self.assertIn("glaeda-gh log errors o/r 2", said)
         self.assertNotIn("o/r 3", said)  # the green job of the same run is not offered
 
+    def test_errors_of_a_run_reads_at_most_its_cap_and_names_the_jobs_past_it(self) -> None:
+        """A run id fans out over every failed job of the run, and a wide matrix has dozens: unbounded, one command
+        read every one of them, each a download that can fall through to REST on the person's own quota. The
+        sibling scans (`log search`, `log flaky`) never spend that quota and still carry `--reads`; this path had
+        neither. It reads the newest LOG_ERRORS_RUN_READS of them and names the others as their own commands, so
+        the reader's next step is bounded and still theirs to take."""
+        for n, job in enumerate(range(2, 9)):  # seven failed jobs of run 9, job 8 newest
+            self.rec(job, run=9, minutes_ago=30 - n)
+            self.ctl_logs[job] = (200, self.FAIL_LOG)
+        said = io.StringIO()
+        with self.diagnostics_in(said):
+            code, text = self.run_cmd(gg.cmd_log_errors, "o/r", 9, as_json=True, rest=self.no_rest)
+        doc = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual([j["job"] for j in doc["jobs"]], [8, 7, 6, 5, 4], "read past the cap")
+        # The two it did not read are not silently dropped: each is named with the command that reads it.
+        self.assertIn("glaeda-gh log errors o/r 3", said.getvalue())
+        self.assertIn("glaeda-gh log errors o/r 2", said.getvalue())
+        # And the cap bounds the reads themselves, not just the printing.
+        self.assertEqual(sorted(j for j in self.ctl_reads if 2 <= j <= 8), [4, 5, 6, 7, 8])
+        self.assertEqual(self.rest_calls, 0)
+
+    def test_errors_of_a_run_cut_out_of_a_truncated_history_says_the_look_was_cut_short(self) -> None:
+        """A read that was cut short is unknown, not a value -- the same rule this command exists to serve. The
+        history scan drops the oldest records past LOG_SCAN_KEEP and reports that it did; that flag was discarded,
+        so a run that did finish inside the window, but fell outside the slice kept, was announced as "no run N
+        finished in the last 72 h" -- a confident claim about something never read."""
+        for n in range(8):  # more than 2 * LOG_SCAN_KEEP, so the oldest are dropped and the scan says so
+            self.rec(20 + n, run=5, minutes_ago=5 + n)
+        self.rec(2, run=9, minutes_ago=60)  # the oldest: cut out of the kept slice
+        err = io.StringIO()
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3), mock.patch("sys.stderr", err):
+            code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual((code, out), (1, ""))
+        self.assertNotIn("no run 9", said)  # it was never looked at: do not claim it is not one
+        self.assertIn("went unchecked", said)
+        self.assertIn("glaeda-gh status run o/r/9", said)  # a next step that can end the refusal
+
+    def test_errors_of_a_run_that_could_not_be_looked_up_does_not_claim_it_is_no_run(self) -> None:
+        """The unchecked-vs-absent distinction is the point of the change, and nothing pinned it: deleting the
+        branch whole left every test green. A controller that raises says so."""
+        class Dead:
+            def get(self, path: str, timeout: float | None = None) -> dict:
+                raise OSError("timed out reading the controller")
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code = gg.cmd_log_errors("o/r", 9, controller=Dead(), rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("went unchecked", said)
+        self.assertIn("timed out reading the controller", said)  # the failure's own words
+        self.assertNotIn("no run 9", said)
+
+    def test_errors_with_no_controller_names_the_command_that_wanted_one(self) -> None:
+        """The refusal named `log search` -- a command the reader did not type -- inside a `log errors` failure.
+        The sibling WatchError was fixed for this reason and this one was missed."""
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code = gg.cmd_log_errors("o/r", 9, controller=None, rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("no build controller configured", said)
+        self.assertIn("log errors", said)
+        self.assertNotIn("log search", said)
+
+    def test_errors_of_a_run_whose_logs_are_all_unread_exits_1_with_nothing_on_stdout(self) -> None:
+        """`log errors` exits 0 only with lines on stdout. Flipping the nothing-read return to EXIT_OK left every
+        test green, and a caller that branches on the exit code (scripts/ci/glaeda_log.py) would read an empty
+        read as a successful one."""
+        self.rec(2, run=9, minutes_ago=30)
+        self.rec(4, run=9, name="unittest", minutes_ago=28)  # recorded, but no log anywhere
+        said, err = io.StringIO(), io.StringIO()
+        with self.diagnostics_in(said), mock.patch("sys.stderr", err):
+            code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, rest=self.no_rest)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no log for", said.getvalue() + err.getvalue())
+
 
 # ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
 
