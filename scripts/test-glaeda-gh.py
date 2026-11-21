@@ -24969,6 +24969,25 @@ class LandTest(Base):
     def land_pinned(self, pin: str) -> None:
         gg.land_request("land", "o/r#1", [], "host/lane", sha=pin)
 
+    def test_a_pinned_land_follows_the_head_its_own_update_branch_made(self):
+        """air-blue, 2026-11-21: hq#15593 pinned at 7614e720, the queue's own update_branch merged main (53414d95),
+        and the next pass stopped head_moved on that head, twice in a row; each restart pinned by hand only for the
+        queue to update and stop again. The update is sent with --match-head-commit at the pin, so the head it makes
+        is the pin merged with its base: the pin moves to it, and only a head nobody in the queue made stops it."""
+        self.pr(LA)
+        self.land_pinned(LA)
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick(1)
+        self.tick(1)
+        self.assertEqual(len(self.w.gh_calls("api")), 1)
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertNotEqual(e.get("state"), "stopped", json.dumps(e.get("stop")))
+        self.assertEqual(e["pinSha"], LB)
+        self.assertIn("repin_own_update", [h["event"] for h in e["history"]])
+        self.assert_merged_at(LB)
+
     def test_a_pinned_land_never_judges_the_cached_head_before_the_pin(self):
         """leo-workspace#7221, 2026-11-21 10:56Z: 53fa5568 pushed, `land --match-head-commit 53fa5568` stopped within a
         minute on "conflict" at 0eb40dbac8fb, the cache's 5-minute-old head, which had a real conflict. A pinned land
