@@ -9978,6 +9978,17 @@ class FileAndPidWaitTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             gg.cmd_wait_pid("abc", 1, False)
 
+    def test_log_repo_job_flag_reads_as_log_job(self) -> None:
+        """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "o/r", "--job", "7"]), ["log", "job", "o/r", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "o/r", "--job=7"]), ["log", "job", "o/r", "7"])
+        self.assertEqual(err.getvalue().count("read as `log job o/r 7`"), 2)
+        for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
+                     ["log", "flaky", "o/r"]):
+            self.assertEqual(gg.log_job_synonym(same), same)
+
     def test_waits_until_a_time_or_the_quota_reset(self) -> None:
         """`wait until`: the wait for "go on at T" (a quota reset) that needs no head SHA (2026-11-18)."""
         now = 1_795_000_000.0  # 2026-11-18T11:06:40Z
@@ -9985,7 +9996,9 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(gg.until_epoch("2026-11-18T14:40:00Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("14:40Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("08:00Z", now), 1_795_075_200.0)  # passed today: tomorrow
-        for bad in ("soon", "2026-11-18T14:40:00", "-5m", "24:30Z", "14:61Z"):
+        self.assertEqual(gg.until_epoch("14:40:05Z", now), 1_795_012_805.0)
+        self.assertEqual(gg.until_epoch("5:20:05Z", now), 1_795_065_605.0)
+        for bad in ("soon", "2026-11-18T14:40:00", "-5m", "24:30Z", "14:61Z", "14:40:61Z"):
             with self.assertRaises(gg.WatchError):
                 gg.until_epoch(bad, now)
         state = self.dir / "gh-quota"

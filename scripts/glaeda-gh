@@ -13,7 +13,7 @@
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
     glaeda-gh wait file PATH [--exists|--gone] [--contains REGEX] [--timeout S]   a file, instead of a sleep loop
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
-    glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
+    glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 14:40:05Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
@@ -17144,15 +17144,16 @@ def until_epoch(target: str, now: float) -> float | None:
     match = re.fullmatch(r"(\d+)([smhd])", text)
     if match:
         return now + int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
-    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)Z", text)  # 24:30Z and 14:61Z fall through to the refusal
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?Z", text)  # 24:30Z and 14:61Z fall through to the refusal
     if match:
         day = dt.datetime.fromtimestamp(now, dt.timezone.utc)
-        at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0).timestamp()
+        at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=int(match.group(3) or 0),
+                         microsecond=0).timestamp()
         return at if at > now else at + 86400
     at = iso_epoch(text) if re.match(r"\d{4}-\d\d-\d\dT", text) and re.search(r"(Z|[+-]\d\d:\d\d)$", text) else None
     if at is None:
         raise WatchError(f"wait until takes quota, quota:rest, quota:graphql, an ISO time with a zone "
-                         f"(2026-11-18T14:40:00Z), a UTC time (14:40Z) or a duration (45m), not {target!r}")
+                         f"(2026-11-18T14:40:00Z), a UTC time (14:40Z or 14:40:05Z) or a duration (45m), not {target!r}")
     return at
 
 
@@ -23443,8 +23444,30 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def log_job_synonym(raw: list[str]) -> list[str]:
+    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that."""
+    if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
+        return raw
+    rest = raw[2:]
+    for i, word in enumerate(rest):
+        job = None
+        if word == "--job" and i + 1 < len(rest):
+            job, rest = rest[i + 1], rest[:i] + rest[i + 2:]
+        elif word.startswith("--job="):
+            job, rest = word[6:], rest[:i] + rest[i + 1:]
+        if job is not None:
+            if not job.isdigit():
+                return raw
+            fixed = ["log", "job", raw[1], job] + rest
+            print(f"glaeda-gh: read as `{' '.join(fixed)}` (log OWNER/REPO --job ID is `log job OWNER/REPO ID`)",
+                  file=sys.stderr)
+            return fixed
+    return raw
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    raw = log_job_synonym(raw)
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
