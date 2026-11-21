@@ -11311,7 +11311,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
             if artifact_referenced(path, references):
                 reasons.append("live lease or running job")
-        if LEASE and (why := lease_holds(fam, path, now - idle * 3600)):
+        if LEASE and (why := lease_holds(fam, path)):
             reasons.append(why)
         if fam.id in BUILD_STATE_FAMILY_IDS and not blind and (why := build_state_held(fam, path, cmds)):
             reasons.append(why)
@@ -11784,25 +11784,23 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
 # turn the budget off. Only the leased job's own paths are protected"). A lease used to make every pass floor-only
 # with no budget, no idle sweep and 24 h ages: a mini under a two-hour measurement lease kept 145 GiB "blocked" and
 # freed nothing. Now a readable, active lease (RESERVATION_SINCE) leaves every rule as on an unleased host, and holds
-# only what its job owns: an item used since the lease began (its job wrote it, or read it with a tool that moves
-# mtime), a path its lease or job markers name (live_artifact_references, as before) and anything its processes have
-# open or name (every family's own in-use checks). A list that cannot be read still fails closed to floor-only.
+# only what its job owns: a path its lease or job markers name (lease_holds, live_artifact_references) and anything
+# its processes have open or name (every family's own in-use checks). A list that cannot be read still fails closed
+# to floor-only. "Used since the lease began" no longer counts (2026-11-21): a lease drains a host, so runner jobs
+# admitted before it keep writing after it begins, and a drain lease on a mini at 17 GiB free kept the 26.5 GiB of
+# SwiftPM scratch those jobs had left, unheld by any lock, as "the leased job's own" while every pass freed nothing.
 LEASE: dict[str, Any] = {}  # {"why", "since"} when an active lease holds this host; set by main
 
 
-def lease_holds(fam: "Family", path: Path, used: float | None = None) -> str:
-    """Why the lease holding this host keeps PATH ("" when none does or it is no job's): used since it began. USED is
-    its last use when the caller already has it (the survey's), else item_mtime reads it now."""
-    since = LEASE.get("since")
-    if since is None:
+def lease_holds(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why the lease holding this host keeps PATH ("" when none does): its reservation or a job marker names it (at,
+    inside or above it; FRESH re-reads them, as apply does). What the leased job has open or names is every family's
+    own in-use check."""
+    if LEASE.get("since") is None:
         return ""
-    if used is None:
-        try:
-            used = item_mtime(fam, path)
-        except OSError:
-            return ""
-    if used >= since:
-        return f"used since the host's lease began ({LEASE.get('why', '?')}): the leased job's own"
+    names = fresh_artifact_references(FLEET_ROOT) if fresh else live_artifact_references(FLEET_ROOT)
+    if artifact_referenced(path, names):
+        return f"named by the host's lease ({LEASE.get('why', '?')}): the leased job's own"
     return ""
 
 
@@ -14113,7 +14111,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                and referenced_main_checkout(p, nested=families[i.family].nested_git))
               or (i.family in HOME_SCRATCH_FAMILIES and home_scratch_referenced(p))):
             outcome = "changed:referenced"
-        elif LEASE and lease_holds(fam, p):
+        elif LEASE and lease_holds(fam, p, fresh=True):
             outcome = "changed:leased"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:

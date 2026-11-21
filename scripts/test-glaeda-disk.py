@@ -14288,7 +14288,7 @@ class HeldReasonTest(unittest.TestCase):
 
 
 class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
-    """A fleet lease no longer turns the budget off: only what its job used since it began stays (Leo, 2026-11-18)."""
+    """A fleet lease no longer turns the budget off: only what its job names or has open stays (Leo, 2026-11-18)."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -14310,15 +14310,26 @@ class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
         self.assertIn("unreadable", gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json"))
         self.assertIsNone(gd.RESERVATION_SINCE, "fails closed: floor-only, as before")
 
-    def test_only_what_was_used_since_the_lease_began_is_held(self) -> None:
-        fam = gd.Family("xcode-derived-data", self.root, True, "")
-        old, new = make(self.root / "old", age_hours=48), make(self.root / "new", age_hours=0)
-        gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
-        self.assertEqual(gd.lease_holds(fam, old), "")
-        self.assertIn("the leased job's own", gd.lease_holds(fam, new))
-        self.assertEqual(gd.lease_holds(fam, new, used=time.time() - 7200), "", "the survey's own last use counts")
-        gd.LEASE.clear()
-        self.assertEqual(gd.lease_holds(fam, new), "", "no lease: nothing held by one")
+    def test_a_lease_holds_what_it_names_never_what_runner_jobs_left_after_it_began(self) -> None:
+        """2026-11-21: a drain lease on a mini at 17 GiB free kept 26.5 GiB of SwiftPM scratch, unheld by any lock,
+        because runner jobs admitted before the lease finished after it began; every pass freed nothing."""
+        fleet = self.root / "fleet"
+        fam = gd.Family(gd.SPM_SCRATCH, fleet / "ci/spm-scratch", True, "")
+        job, left = make(fleet / "cache/job-a", age_hours=0), make(fleet / "ci/spm-scratch/71c65b48", age_hours=0.05)
+        marker = fleet / "reservation.json"
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": int(time.time()) - 3600,
+                                      "until": int(time.time()) + 3600, "owner": "node:lane",
+                                      "paths": [os.fspath(job)]}))
+        with mock.patch.object(gd, "FLEET_ROOT", fleet):
+            gd._LIVE_REFERENCES.clear()
+            self.addCleanup(gd._LIVE_REFERENCES.clear)
+            gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
+            self.assertEqual(gd.lease_holds(fam, left), "", "used since the lease began, named by nothing")
+            self.assertEqual(gd.lease_holds(fam, left, fresh=True), "", "apply's re-check agrees")
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job))
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job, fresh=True))
+            gd.LEASE.clear()
+            self.assertEqual(gd.lease_holds(fam, job), "", "no lease: nothing held by one")
 
     def test_a_host_reservation_references_only_the_paths_it_names_never_the_fleet_root(self) -> None:
         fleet = self.root / "fleet"
