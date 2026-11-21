@@ -14700,13 +14700,44 @@ def land_queued_by() -> str:
 # "cannot read OWNER/REPO#N's head to check --match-head-commit" while the PR it pinned was green.
 
 
-def check_land_pin(repo: str, number: int, pin: str | None) -> None:
-    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): only its shape is checked here, so a
-    land is queued whatever the quota; a head other than SHA stops it later (head_moved) and the pinned merge refuses
-    it, so a land never takes a push that came after the one the caller judged. REPO and NUMBER are unused: no read."""
-    del repo, number
+def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[str]], str | None] | None = None) -> str:
+    """Why PIN cannot be REPO's head: it is the HEAD of the directory the caller ran in, and that directory is a
+    checkout of another repository. "" when it is not that, which is every other case. No GitHub read, two local git
+    calls, and only when a pin was passed.
+
+    The guidance for pinning is `--match-head-commit $(git rev-parse HEAD)`, and a lane working in one repository's
+    worktree while landing another's PR (a leo-workspace worktree landing a cmux PR) resolves it against the wrong
+    checkout: the land is pinned to a sha the target repository does not have, and stops later reading as head
+    movement. The right source when the cwd is not the target's checkout is a GitHub read, which this names."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    here = cwd_repo()
+    if not here or here.lower() == repo.lower():
+        return ""  # not a checkout, or the target's own checkout, where HEAD is a fair source
+    head = str(git(["rev-parse", "HEAD"]) or "").lower()
+    if not SHA40.fullmatch(head) or land_head_moved(pin.lower(), head):
+        return ""
+    return (f"--match-head-commit {pin[:12]} is the HEAD of {os.getcwd()}, a checkout of {here}, not of {repo}: "
+            f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
+
+
+def check_land_pin(repo: str, number: int, pin: str | None,
+                   git: Callable[[list[str]], str | None] | None = None) -> None:
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): its shape, and the one wrong source
+    that is free to detect (land_pin_is_another_checkouts_head). No head read, so a land is queued whatever the quota;
+    a head other than SHA stops it later (head_moved) and the pinned merge refuses it, so a land never takes a push
+    that came after the one the caller judged."""
     if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+    why = land_pin_is_another_checkouts_head(repo, pin, git) if pin else ""
+    if why:
+        raise WatchError(f"{why}\nnext: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+                         f"then glaeda-gh land {repo}#{number} --match-head-commit THAT")
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
