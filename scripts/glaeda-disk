@@ -6430,6 +6430,26 @@ def git_relief_peak(gitdir: Path, alternates: bool = False) -> int:
     return total
 
 
+BUNDLE_PEAK_SLACK = 64 * 1024**2  # loose objects compressed again, the pack's index and header
+
+
+def bundle_peak(gitdir: Path, revs: list[str]) -> int:
+    """A bundle's peak: twice the stored bytes of the objects it holds (`rev-list --objects --disk-usage` over the
+    same rev-list arguments: the bundle is a thin pack of only those, written with their stored deltas reused) plus
+    BUNDLE_PEAK_SLACK, never more than the whole store (git_relief_peak). The store alone sized a few unpushed
+    commits as the whole history: cmux17's ~/m2l-viewer (5.4 GB, idle 79 h) needed 5.6 GB free to bundle while the
+    disk held 4.1 GB, so the pass that most needed its room could never free it (2026-11-21). An older git without
+    --disk-usage, or an unreadable count, falls back to the whole store."""
+    whole = git_relief_peak(gitdir, alternates=True)
+    out = _git_dir_run(gitdir, "rev-list", "--objects", "--disk-usage", "--stdin",
+                       stdin="\n".join(revs) + "\n", timeout=600)
+    try:
+        used = int((out or "").strip())
+    except ValueError:
+        return whole
+    return min(whole, 2 * used + BUNDLE_PEAK_SLACK)
+
+
 def _ref_tree_state(root: Path) -> tuple[float, str] | None:
     """Newest mtime below a refs/ or logs/refs/ tree and the first *.lock in it; None past the budget."""
     newest, budget, stack = 0.0, HOME_CLONE_REF_BUDGET, [os.fspath(root)]
@@ -8117,6 +8137,27 @@ def has_git(path: Path) -> bool:
     return git_state(path) != "none"
 
 
+def hidden_from_status(flags: str, root: Path) -> bool:
+    """Whether `ls-files -v -z` (FLAGS) names a file whose edits status does not show: one flagged assume-unchanged
+    (a lowercase tag), or skip-worktree (S) and present in the work tree ROOT. A skip-worktree entry with no file is
+    a sparse checkout's path left out of the tree: HEAD holds its content and deleting the tree loses nothing.
+    cmux17's ~/m2l-viewer, a sparse checkout of the fleet mirror with 41,592 such entries, read as uncommitted work
+    and stayed (2026-11-21). An entry that cannot be checked counts as hidden."""
+    for entry in flags.split("\0"):
+        tag, rel = entry[:1], entry[2:]
+        if not tag:
+            continue
+        if tag.islower():
+            return True
+        if tag == "S":
+            try:
+                if not rel or os.path.lexists(root / rel):
+                    return True
+            except (OSError, ValueError):
+                return True
+    return False
+
+
 def git_loss(path: Path) -> str:
     """"" when deleting this checkout loses nothing git holds, else what it would lose.
 
@@ -8142,8 +8183,8 @@ def git_loss(path: Path) -> str:
     if status is None or status.strip():
         return "uncommitted or untracked changes"
     # status hides edits to files flagged assume-unchanged (lowercase tag) or skip-worktree (S)
-    flags = git("ls-files", "-v")
-    if flags is None or any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+    flags = git("ls-files", "-v", "-z")
+    if flags is None or hidden_from_status(flags, path):
         return "files hidden from status"
     own = git("rev-parse", "--path-format=absolute", "--git-dir")
     if own is None:
@@ -8180,8 +8221,9 @@ def git_loss(path: Path) -> str:
     return ""
 
 
-def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
-                 network: bool = False, stdin: str | None = None) -> str | None:
+def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60, network: bool = False, stdin: str | None = None,
+                 errors: list[str] | None = None) -> str | None:
+    """git's stdout, or None when it fails; ERRORS, when given, gets the last line of what it said on failure."""
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", **NO_LAZY_FETCH}
     if network and "GIT_SSH_COMMAND" not in env:
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
@@ -8194,8 +8236,13 @@ def _git_dir_run(gitdir: Path, *args: str, timeout: int = 60,
             # command, so even for-each-ref fails. These commands never read a work tree; the git dir stands in.
             r = subprocess.run(["git", "--git-dir", str(gitdir), *args], capture_output=True, text=True,
                                timeout=timeout, env={**env, "GIT_WORK_TREE": str(gitdir)}, input=stdin)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if errors is not None:
+            errors.append(e.__class__.__name__)
         return None
+    if r.returncode != 0 and errors is not None:
+        said = [ln.strip() for ln in r.stderr.splitlines() if ln.strip()]
+        errors.append((said[-1] if said else f"exit {r.returncode}")[:300])
     return r.stdout if r.returncode == 0 else None
 
 
@@ -8745,14 +8792,14 @@ def work_tree_changes(root: Path, trees: set[str]) -> tuple[str, bytes, list[tup
     directory named in REPRODUCIBLE_DIRS or tagged with a CACHEDIR.TAG) as (path relative to root, path, sha256)).
     An untracked checkout is skipped only when it is one of trees (bundled and archived on its own)."""
     g = tree_git_dir(root)
-    flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v")
+    flags = _git_dir_run(g, "--work-tree", str(root), "ls-files", "-v", "-z")
     if _git_dir_run(g, "rev-parse", "-q", "--verify", "HEAD^{commit}") is None:  # unborn: no patch base
         status = _git_dir_run(g, "--work-tree", str(root), "status", "--porcelain", "--untracked-files=all")
         return ("" if status == "" else "no HEAD to hold its changes, or an unreadable work tree"), b"", []
     raw = _git_dir_run(g, "--work-tree", str(root), "diff", "HEAD", "--raw", "--ignore-submodules=none")
     if flags is None or raw is None:
         return "unreadable work tree", b"", []
-    if any(ln[:1].islower() or ln[:1] == "S" for ln in flags.splitlines()):
+    if hidden_from_status(flags, root):
         return "files hidden from status (assume-unchanged or skip-worktree)", b"", []
     if any(f[0] == ":160000" or (len(f) > 1 and f[1] == "160000")
            for f in (ln.split() for ln in raw.splitlines()) if f):
@@ -8893,11 +8940,14 @@ def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], wri
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     try:
         _private_archive_dir()
-        if (why := relief_room(mirror_archive(), git_relief_peak(gitdir, alternates=True), slow=False)):
+        if (why := relief_room(mirror_archive(), bundle_peak(gitdir, revs), slow=False)):
             return f"bundle of {gitdir}: {why}"
+        said: list[str] = []  # git's own words go into the receipt: a bare "failed" left cmux17's hot-verify unexplained
         if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
-                        timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:
-            return f"git bundle create or verify failed for {gitdir}"
+                        timeout=600, errors=said) is None:
+            return f"git bundle create failed for {gitdir}: {said[-1] if said else 'no output'}"
+        if _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600, errors=said) is None:
+            return f"git bundle verify failed for {gitdir}: {said[-1] if said else 'no output'}"
         listed = _git_dir_run(gitdir, "bundle", "list-heads", str(tmp))
         if listed is None or not heads <= {ln.split(" ", 1)[-1] for ln in listed.splitlines()}:
             return f"bundle of {gitdir} lacks a ref"

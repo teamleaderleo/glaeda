@@ -7952,6 +7952,54 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertTrue(gd.relief_room(mirror, 0, slow=True).startswith("no room: cannot read"))
         self.assertEqual(gd.free_bytes, real)
 
+    def test_a_bundle_needs_room_for_its_unpushed_objects_not_the_whole_store(self) -> None:
+        # cmux17's ~/m2l-viewer: 13 unpushed commits (2 MB) in a 2.6 GB store needed 5.6 GB free to bundle
+        repo = self.root / "repo"
+        self._git("init", "-q", "-b", "main", os.fspath(repo))
+        (repo / "big.bin").write_bytes(os.urandom(4 * 1024**2))  # pushed history: incompressible, 4 MiB
+        self._git("-C", os.fspath(repo), "add", "big.bin")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "pushed")
+        self._git("-C", os.fspath(repo), "update-ref", "refs/remotes/origin/main", "HEAD")
+        (repo / "small.txt").write_text("unpushed\n")
+        self._git("-C", os.fspath(repo), "add", "small.txt")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "unpushed")
+        gitdir = repo / ".git"
+        whole = gd.git_relief_peak(gitdir, alternates=True)
+        self.assertGreater(whole, 4 * 1024**2)
+        with mock.patch.object(gd, "BUNDLE_PEAK_SLACK", 0):
+            unpushed = gd.bundle_peak(gitdir, ["refs/heads/main", "--not", "refs/remotes/origin/main"])
+            self.assertLess(unpushed, 64 * 1024)  # a commit, a tree and a blob, not the 4 MiB blob
+            self.assertGreater(unpushed, 0)
+            # everything unpushed: the bound is the whole history, never more than the store
+            self.assertLessEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+            self.assertGreater(gd.bundle_peak(gitdir, ["refs/heads/main"]), 4 * 1024**2)
+            # a git that cannot count (too old for --disk-usage, a broken store): the whole store
+            with mock.patch.object(gd, "_git_dir_run", return_value=None):
+                self.assertEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+
+    def test_a_sparse_checkouts_absent_paths_are_not_hidden_work(self) -> None:
+        root = self.root / "tree"
+        (root / "kept").mkdir(parents=True)
+        (root / "kept/here.txt").write_text("x")
+        # cmux17's ~/m2l-viewer: 41,592 skip-worktree entries for paths a sparse checkout left out
+        self.assertFalse(gd.hidden_from_status("H kept/here.txt\0S gone/a.txt\0S gone/dir/b.txt\0", root))
+        self.assertFalse(gd.hidden_from_status("", root))
+        # a skip-worktree file in the tree may hold edits status does not show
+        self.assertTrue(gd.hidden_from_status("S kept/here.txt\0", root))
+        # assume-unchanged (lowercase), with or without skip-worktree, always may
+        self.assertTrue(gd.hidden_from_status("h kept/here.txt\0", root))
+        self.assertTrue(gd.hidden_from_status("s gone/a.txt\0", root))
+        # a name with a newline or spaces is one entry under -z
+        (root / "kept/odd\nname x").write_text("y")
+        self.assertTrue(gd.hidden_from_status("S kept/odd\nname x\0", root))
+        self.assertFalse(gd.hidden_from_status("S kept/odd\nname y\0", root))
+
+    def test_a_failed_git_call_says_why_when_asked(self) -> None:
+        said: list[str] = []
+        self.assertIsNone(gd._git_dir_run(self.root / "no-such.git", "rev-parse", "HEAD", errors=said))
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0])
+
     def test_every_git_relief_waits_for_room_for_its_peak(self) -> None:
         # the class: home clone gc and runner checkout repack go through the same gate as the mirror compact
         room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
