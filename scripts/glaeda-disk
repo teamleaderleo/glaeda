@@ -6109,8 +6109,12 @@ def item_mtime(fam: Family, path: Path) -> float:
     # Git's index refresh rewrites metadata without using the build output. In
     # the enrolled-account profile that bookkeeping must not extend the cache's
     # reuse window. Active jobs are still protected by process evidence and the
-    # git-loss check before deletion.
-    skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
+    # git-loss check before deletion. A git-disposable family (the mirror rule: home-scratch, retired runners, the
+    # fleet cache) skips them too: its own archive step writes refs/glaeda-archive in a nested .git on every
+    # attempt, and that write restarted the 12 h clock each pass (cmux17's ~/m2l-viewer, idle 0.5 h for days,
+    # 2026-11-21). Unpushed commits are bundled before any delete, so .git activity alone keeps nothing.
+    skip_names = (frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE or fam.git_disposable)
+                  else frozenset())
     # Tart's access date first, and a walk that never lists a digest directory, which would move that date
     tart = (tart_vm_last_use(path) if fam.id in (TART_VMS, LIMA_VMS) else tart_last_use(path)
             if fam.id in TART_FAMILIES else 0.0)
@@ -11275,6 +11279,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("too deep or large to rule out a git checkout")
             elif fam.git_disposable and due:
                 reasons.append(loss)
+            elif fam.git_disposable:
+                # not due yet: say so, or the item reads as kept for no reason (cmux17's ~/m2l-viewer, 2026-11-21)
+                reasons.append(f"idle {idle:.1f} h of its {window:g} h window: a disposable checkout goes once due")
         elif not due:
             verdict = "recent"
             if media_tour_warm_slot(fam, path):

@@ -13096,6 +13096,25 @@ class NightlyNextFallbackTest(unittest.TestCase):
         # other families' items keep their usual shallow look
         self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
 
+    def test_a_disposable_checkouts_git_writes_do_not_restart_its_idle_clock(self) -> None:
+        """cmux17, 2026-11-21: the mirror rule's archive step wrote refs/glaeda-archive in ~/m2l-viewer/src/.git on
+        every attempt, so the tree read idle 0.5 h for days and was never due."""
+        tree = self.root / "m2l-viewer"
+        gitdir = tree / "src/.git"
+        (gitdir / "refs/glaeda-archive").mkdir(parents=True)
+        work = tree / "src/main.c"
+        work.write_text("int main(void) { return 0; }\n")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        now = time.time() - 60
+        os.utime(gitdir, (now, now))
+        disposable = gd.Family("home-scratch", self.root, True, "x", git_disposable=True)
+        self.assertLess(gd.item_mtime(disposable, tree), old + 1)
+        self.assertGreaterEqual(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), now - 1)  # as before
+        os.utime(work, (now, now))  # a work tree write is use
+        self.assertGreaterEqual(gd.item_mtime(disposable, tree), now - 1)
+
     def test_runner_cache_profile(self) -> None:
         with mock.patch.object(gd, "POLICY", {**gd.POLICY, "nightly_next_dedicated_label": "off"}):
             self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
