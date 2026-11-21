@@ -23119,6 +23119,27 @@ def cmd_on_event_replay(run_file: Path, jobs_file: Path | None, wait: float, as_
     return EXIT_OK
 
 
+def infer_kind(raw: list[str]) -> tuple[list[str], str]:
+    """`wait|status|land` called without the kind run as the call meant (fewer-tool-calls).
+
+    Agents write `wait OWNER/REPO#N --until done` and argparse refused it (11 tool results in 24 h on 2026-11-21). A first word that is not a kind but is a pull-request target (OWNER/REPO#N,
+    .../pull/N) means `pr`; OWNER/REPO/RUNID or .../actions/runs/ID means `run`. `land pr X` drops the `pr`. Returns the argv to parse and the note for stderr ("" when unchanged)."""
+    if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
+        return raw, ""
+    cmd, first = raw[0], raw[1]
+    if cmd == "land":
+        if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
+            return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
+        return raw, ""
+    if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
+        return raw, ""
+    kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
+    if not kind:
+        return raw, ""
+    fixed = [cmd, kind] + raw[1:]
+    return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
+
+
 def parser() -> argparse.ArgumentParser:
     p = Parser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
@@ -23298,8 +23319,11 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
+    raw, inferred = infer_kind(raw)
+    if inferred:
+        print(inferred, file=sys.stderr)
     Parser.argv = raw
-    args = parser().parse_args(argv)
+    args = parser().parse_args(raw)
     if getattr(args, "verbose", False):
         os.environ["AGENT_VERBOSE"] = "1"  # summary() and wait_request() read it, here and in the daemon's request
     try:

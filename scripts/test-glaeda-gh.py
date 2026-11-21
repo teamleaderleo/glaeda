@@ -4615,6 +4615,24 @@ class ClientTest(Base):
         self.assertEqual(due[0], "pr:o/r#999")
         self.assertEqual(due[1:], [e["key"] for e in old])
 
+    def test_a_call_without_its_kind_runs_as_the_call_meant(self) -> None:
+        want = {
+            ("wait", "o/r#5", "--until", "done"): ["wait", "pr", "o/r#5", "--until", "done"],
+            ("wait", "https://github.com/o/r/pull/5"): ["wait", "pr", "https://github.com/o/r/pull/5"],
+            ("status", "o/r#5", "o/r#6"): ["status", "pr", "o/r#5", "o/r#6"],
+            ("wait", "o/r/123", "--timeout", "9"): ["wait", "run", "o/r/123", "--timeout", "9"],
+            ("wait", "https://github.com/o/r/actions/runs/123"): ["wait", "run", "https://github.com/o/r/actions/runs/123"],
+            ("land", "pr", "o/r#5"): ["land", "o/r#5"],
+        }
+        for given, fixed in want.items():
+            got, note = gg.infer_kind(list(given))
+            self.assertEqual(got, fixed)
+            self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
+            gg.parser().parse_args(got)  # argparse takes what it was handed
+        for same in (["wait", "pr", "o/r#5"], ["wait", "file", "/x"], ["wait", "--help"], ["wait", "bogus"],
+                     ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"]):
+            self.assertEqual(gg.infer_kind(list(same)), (same, ""))
+
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
