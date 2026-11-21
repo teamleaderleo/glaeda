@@ -46,6 +46,14 @@ WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's la
 # stops a process in this machine's own /private/tmp/cmux-ci. test_taking_a_root_stops_its_leftovers sets its own.
 NO_ROOTS = "/nonexistent/glaeda-test-canonical-roots"
 
+sys.path.insert(0, os.fspath(ROOT / "scripts"))
+import glaeda_hook_pin  # noqa: E402
+
+# Pinning at import, as test-glaeda-disk.py does, so that any run of this file pins the hook - a `-k` selection
+# that did not happen to match DrainPinTest used to leave the pin out of the diff and only CI said so.
+if not glaeda_hook_pin.under_ci():
+    glaeda_hook_pin.ensure(check=False)
+
 
 def load(name: str, path: Path):
     loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
@@ -315,8 +323,6 @@ class DrainPinTest(unittest.TestCase):
         """A change to the hook must append its sha256 to glaeda-disk's CMUX_NEXT_DRAIN_HOOK_SHA256, or drain
         refuses every runner that installs it (#1550, #1561). Running this suite on a checkout pins it; under CI
         a missing pin fails here, next to the hook's own tests, with the command to run."""
-        sys.path.insert(0, os.fspath(ROOT / "scripts"))
-        import glaeda_hook_pin
         self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
 
 
@@ -9049,6 +9055,97 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIsNone(hook.head_fit_units(dict(summary, jobs=[]), side, now, need), "an empty queue too")
 
 
+    SIDE_LIGHT = "glaeda-side-light-xcode-26.6"
+
+    def receipt(self, labels: list[str]) -> None:
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": labels}}))
+
+    def test_a_label_github_dispatches_here_joins_a_set_its_receipt_understates(self) -> None:
+        # hq#16433: receipt.json records the labels the host asked GitHub for, not the ones GitHub kept, and stamps
+        # "GitHub labels could not be read; re-registering with the supplied token" when it could not confirm them.
+        # 2026-11-21: cmux-austin-mini-0-glaeda-1 and cmux-austin-mini-1-glaeda-1 listed only side-light while GitHub
+        # dispatched side-std jobs to both. Every read here filters the queue with set(job["labels"]) <= cap_labels,
+        # so neither gate could see one queued job of a label it demonstrably serves: no on-demand reserve, no urgent
+        # listen, no starved-job answer. A job GitHub handed it is proof it carries that job's labels.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertIn(self.LABEL, self.gate.cap_labels, "GitHub gave it this job, so it carries the label")
+        self.assertIn(self.SIDE_LIGHT, self.gate.cap_labels, "a union never drops a receipt label")
+        self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "the disagreement is published, not swallowed")
+
+    def test_with_no_job_of_its_own_the_label_set_stays_the_receipts(self) -> None:
+        # The other half of the rule: no observed dispatch changes nothing, so a runner the feed says nothing about
+        # keeps exactly today's behaviour. A job on a sibling runner of the same host is not this runner's evidence.
+        self.receipt(["glaeda-mini", self.LABEL])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-3", labels=["glaeda-gui-xcode-26.6"]),
+                     self.job("queued")]
+        self.poll()
+        self.assertEqual(self.gate.cap_labels, frozenset({"glaeda-mini", self.LABEL}))
+        self.assertEqual(self.gate.cap_label_drift, [])
+
+    def test_the_label_set_is_a_union_never_a_narrowing(self) -> None:
+        self.assertIsNone(hook.cap_label_set(None, frozenset()), "no receipt and no dispatch: the reads cannot say")
+        self.assertEqual(hook.cap_label_set(None, frozenset({"a"})), frozenset({"a"}), "dispatch alone still counts")
+        self.assertEqual(hook.cap_label_set(frozenset({"a"}), frozenset({"b"})), frozenset({"a", "b"}))
+        self.assertEqual(hook.cap_label_set(frozenset({"a"}), frozenset()), frozenset({"a"}),
+                         "a receipt label with no job keeps its place")
+        summary = {"jobs": [{"labels": ["x"], "runner": "cmux21-glaeda-2"}, {"labels": ["y"], "runner": None},
+                            {"labels": ["z"], "runner": "cmux21-glaeda-3"}]}
+        self.assertEqual(hook.observed_labels(summary, "cmux21-glaeda-2"), frozenset({"x"}),
+                         "a queued job has no runner, and a sibling's job is not this runner's evidence")
+        self.assertEqual(hook.observed_labels(summary, None), frozenset())
+
+    def test_the_union_makes_a_queued_job_of_that_label_visible_to_the_reserve(self) -> None:
+        # The point of hq#16433, at the level of a decision rather than a set: label_queued is what
+        # RESERVE_ON_DEMAND asks before it holds a reserve, and every reader filters the queue with
+        # set(job["labels"]) <= labels. With the receipt alone this queued job is invisible, so the mini holds no
+        # reserve and listens for nothing, while GitHub has already proved it can run the label.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued", ago=120)]
+        self.poll()
+        receipt_only = frozenset({"glaeda-mini", self.SIDE_LIGHT})
+        now = time.time()
+        self.assertFalse(hook.label_queued(self.gate.cap_summary, receipt_only, now),
+                         "the receipt's own set cannot see the job: this is the bug")
+        self.assertTrue(hook.label_queued(self.gate.cap_summary, self.gate.cap_labels, now),
+                        "the set the gate now reasons with sees it, so the reserve is asked for")
+
+    def test_an_observed_label_is_not_dropped_while_the_next_look_reads_the_feed(self) -> None:
+        # cap_labels is read by the main thread while the look runs in cap_thread. A look that narrowed it to the
+        # receipt before reading the feed would, once a minute, take an observed-only label away for the length of
+        # the read; starved_step would then see no want of that label, drop the reserve it holds and restart its
+        # max_hold_s clock. The label must stay put until the new set replaces it.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the union holds before the next look")
+        reading, seen = threading.Event(), []
+
+        def slow(now: float) -> dict | None:
+            seen.append(frozenset(self.gate.cap_labels or ()))
+            reading.set()
+            return self.fetch(now)
+
+        with mock.patch.object(hook, "load_cap_fetch", side_effect=slow):
+            self.gate.cap_feed_at = 0.0
+            self.gate.load_capped()
+            self.assertTrue(reading.wait(120), "the look never reached the feed read")
+            self.join()
+        self.assertEqual(seen, [frozenset({"glaeda-mini", self.SIDE_LIGHT, self.LABEL})],
+                         "the label GitHub dispatched is still there mid-read")
+
+    def test_a_receipt_it_cannot_read_is_not_published_as_a_disagreement(self) -> None:
+        # With no readable receipt there is nothing for the dispatches to disagree with. Reporting drift here would
+        # publish the runner's whole label set as "the receipt does not list this", which reads as a fleet-wide fault.
+        (self.state / "instance-2" / "receipt.json").write_text("{ not json")
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertEqual(self.gate.cap_labels, frozenset({self.LABEL}), "the dispatches still stand on their own")
+        self.assertEqual(self.gate.cap_label_drift, [], "an absent receipt is not a receipt that understates itself")
+
+
 class StarvedReserveTest(unittest.TestCase):
     """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
     units) queued 23 min with no std runner listening anywhere. Every std mini had 3 or 4 of 14 units free and the side
@@ -9208,7 +9305,12 @@ class StarvedReserveTest(unittest.TestCase):
         self.assertTrue(all(0 <= turn < 1 for turn in turns))
         spread = hook.StarvedReserve(600.0, 1200.0, 1800.0)
         first = hosts[turns.index(min(turns))]
-        at = summary["jobs"][1]["created"] + 600 + min(turns) * 1200 + 1
+        # Half way between the first turn and the second: exactly one mini is due whatever the key hashed to. A fixed
+        # "+ 1 second" was due two minis whenever the two smallest turns fell inside the same second of the 1200 s
+        # spread (a gap under 1/1200), which a key's hash does about one run in a hundred: glaeda#2288's shard 3 on
+        # 2026-11-21 read two mini names where one was due, and cost the PR a rerun of the shard.
+        low, second = sorted(turns)[:2]
+        at = summary["jobs"][1]["created"] + 600 + (low + second) / 2 * 1200
         summary = dict(summary, at=at, delivery=at)
         due = [host for host in hosts if hook.starved_job(summary, labels, host, at, spread)]
         self.assertEqual(due, [first], "only the first mini's turn has come")
@@ -14145,6 +14247,45 @@ class GateTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as again:
             gate.step()  # still held: the same reason is not logged again
         self.assertEqual(again.getvalue(), "")
+
+    def test_the_gate_state_carries_the_labels_github_dispatches_past_the_receipt(self) -> None:
+        # hq#16433: a reader of gate-<runner>.json must be able to see that the receipt and GitHub disagree about this
+        # runner's labels, rather than trusting the receipt the way a fleet-wide side-std count did on 2026-11-21.
+        gate, _ = self.gate(["held"] * 3)
+        gate.child = None
+        state = hook.gate_state_file(self.state, self.runner)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+            self.assertNotIn("label_drift", json.loads(state.read_text()), "no disagreement: no line")
+            gate.cap_label_drift = ["glaeda-side-std-xcode-26.6"]
+            gate.state_written -= hook.GATE_STATE_EVERY_S
+            gate.step()
+        self.assertEqual(json.loads(state.read_text())["label_drift"], ["glaeda-side-std-xcode-26.6"])
+    def test_the_gate_state_tells_a_busy_listener_from_an_idle_one(self) -> None:
+        # 2026-11-21, hq#16079: live_line() returned "starting the listener" for a live listener's whole life, so a
+        # busy runner and an idle one printed the same line with the same `since`. cmuxs-mac-mini-3-glaeda-5 read
+        # "starting the listener" since 2026-11-20 20:53:21Z while its Runner.Worker churned through job after job,
+        # and two readers in a row took that for a listener stuck in its start and proposed restarting it mid-job.
+        gate, _ = self.gate([None] * 4)
+        state = hook.gate_state_file(self.state, self.runner)
+        gate.listening_since = time.monotonic()
+        self.assertEqual(gate.live_line(), "starting the listener", "its first message poll is still open")
+        gate.listening_since -= hook.GATE_FIRST_POLL_S
+        self.assertEqual(gate.live_line(), "listening for jobs", "past its first poll with no job: idle")
+        gate.publish()
+        idle = json.loads(state.read_text())
+        self.assertEqual(idle["line"], "listening for jobs")
+        gate.busy_since = time.monotonic()  # poll() stamps this on the same pass, before publish()
+        self.assertEqual(gate.live_line(), "the listener has a job")
+        gate.publish()
+        busy = json.loads(state.read_text())
+        self.assertEqual(busy["line"], "the listener has a job")
+        self.assertGreaterEqual(busy["since"], idle["since"], "the job's start is its own since, not the listener's")
+        gate.busy_since = None  # its Worker exited
+        self.assertEqual(gate.live_line(), "listening for jobs")
+        gate.stop_deadline = time.monotonic() + 60  # a stop still outranks both
+        gate.held = "held"
+        self.assertEqual(gate.live_line(), "stopping the idle listener: held")
 
     def test_the_gate_state_is_rewritten_while_it_holds_and_keeps_its_since(self) -> None:
         gate, _ = self.gate(["held"] * 3)

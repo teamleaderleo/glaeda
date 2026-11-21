@@ -1562,6 +1562,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(summary["unchecked_bytes"], 3)
         self.assertEqual(json.loads(receipt.read_text())["before"]["filesystems"][0]["free"], 10)
 
+    def test_eviction_summary_of_a_pass_that_freed_nothing_is_slim_and_the_receipt_is_bounded(self) -> None:
+        receipt = self.root / "slim.jsonl"
+        fs = [{"dev": 1, "mount": "/data", "free": 10, "total": 20, "low": 12, "target": 15,
+               "under": True, "observed": True}]
+        accounting = [{"mount": "/data", "blocked": 7, "unchecked": 3, "accounting_gap": 4,
+                       "top_level": [{"path": "/x" * 200, "bytes": 1}] * 50}]
+        summary = gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(summary["before"]["accounting"], accounting)  # callers still get the whole record
+        line = json.loads(receipt.read_text())
+        self.assertTrue(line["slim"])
+        self.assertNotIn("accounting", line["before"])
+        self.assertEqual((line["blocked_bytes"], line["accounting_gap_bytes"]), (7, 4))
+        self.assertEqual(line["before"]["filesystems"][0]["free"], 10)
+        # a pass that freed something keeps the accounting
+        gd.write_eviction_summary(receipt, "pressure", 5, fs, fs, accounting, accounting)
+        self.assertEqual(json.loads(receipt.read_text().splitlines()[-1])["before"]["accounting"], accounting)
+        # past the limit the file moves aside once, and the next line starts a new one
+        with mock.patch.object(gd, "RECEIPT_MAX_BYTES", 10):
+            gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+        self.assertEqual(len(receipt.with_name("slim.jsonl.1").read_text().splitlines()), 2)
+
     def test_runner_profile_accounting_is_scoped_and_does_not_walk_roots_again(self) -> None:
         path = self.root / "cua-cache" / "frame.bin"
         path.parent.mkdir(parents=True)
@@ -3158,13 +3180,10 @@ class GlaedaDiskTest(unittest.TestCase):
                                       "--receipt", os.fspath(self.receipt())])
             return status, out.getvalue(), survey
 
-        # Under pressure but above the emergency floor (10% of 460 GiB): it still defers.
+        # Under pressure but above the emergency floor (10% of 460 GiB): a pressure apply goes on too.
         status, out, survey = run(100)
-        self.assertEqual(status, 3)
-        self.assertIn("measurement_busy", out)
-        survey.assert_not_called()
-        # A deferred run lets go of the eviction lock it took, not only at exit.
-        self.assertIsNone(gd._EVICT_HANDLE)
+        self.assertNotIn("measurement_busy", out)
+        survey.assert_called()
         # Nearly empty: it goes on.
         status, out, survey = run(0.9)
         self.assertNotIn("measurement_busy", out)
@@ -6003,10 +6022,25 @@ class GlaedaDiskTest(unittest.TestCase):
         lock = self.root / "measure.lock"
         with lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply", "--refresh"], free_gib=100.0)
         survey.assert_not_called()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["skipped"], "measurement_busy")
+
+    def test_a_second_pressure_apply_on_the_host_skips_at_once(self) -> None:
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        lock = self.root / "pressure-pass.lock"  # beside the EVICT_LOCK _main_run uses
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+        self.assertIsNone(gd._PRESSURE_PASS_HANDLE)
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_called()
+        self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
+        os.close(gd._PRESSURE_PASS_HANDLE)
 
     def test_the_kill_switch_deletes_nothing_and_says_so(self) -> None:
         off = self.root / "disk-off"
@@ -13742,6 +13776,43 @@ class DeadItemsTest(unittest.TestCase):
         self.assertEqual(gd.candidates(fam), [], "an instance that is a symlink is never followed")
         self.assertTrue((store / "slot-0").exists())
 
+    def test_an_idle_bench_lume_image_goes_unless_a_lume_vm_or_the_bench_runs(self) -> None:
+        """The computer-use bench's pinned Lume images (/Users/Shared/cu-driver-bench/.lume/<vm>): a pull brings one
+        back, so an idle one goes; the bench running, a lume run, or a lume command naming it keeps it."""
+        root = self.root / "cu-driver-bench/.lume"
+        image = root / "cu-bench-base-26-5-2"
+        (image / "disk.img").parent.mkdir(parents=True)
+        (image / "disk.img").write_bytes(b"x" * 4096)
+        (root / ".cache").mkdir()
+        self.age(root, 26)
+        self.assertTrue(gd.lume_root_safe(root))
+        fam = gd.lume_bench_family(root)
+        self.assertEqual([p.name for p in gd.candidates(fam)], ["cu-bench-base-26-5-2"], "dot entries are no items")
+        self.assertIn(fam.id, gd.REMOTE_COPY_FAMILIES)
+        for cmds, held in (("", False),
+                           ("/bin/bash scripts/measure/cu-driver-bench.sh --runs 3\n", True),
+                           ("/opt/homebrew/bin/lume run cu-bench-base-26-5-2 --no-display\n", True),
+                           ("/opt/homebrew/bin/lume run some-other-vm\n", True),
+                           ("/opt/homebrew/bin/lume pull ghcr.io/x/cu-bench-base-26-5-2:pinned\n", False),
+                           ("/opt/homebrew/bin/lume stop cu-bench-base-26-5-2\n", True),
+                           ("/usr/bin/vim notes-on-lume.txt\n", False)):
+            self.assertEqual(bool(gd.lume_vm_held(image, cmds)), held, cmds)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/lume run cu-bench-base-26-5-2\n")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "in-use", items["cu-bench-base-26-5-2"].reasons)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "reclaimable", items["cu-bench-base-26-5-2"].reasons)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["cu-bench-base-26-5-2"]], {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(image.exists())
+        link = self.root / "linked/.lume"
+        link.parent.mkdir()
+        link.symlink_to(root)
+        self.assertFalse(gd.lume_root_safe(link), "a symlinked root is never walked")
+
     def test_journey_cache_entries_unused_for_days_go(self) -> None:
         cache = self.home / gd.JOURNEY_CACHE
         old = cache / "builds/23ee510cbc3ac7c7a8eb22ad"
@@ -15320,6 +15391,37 @@ class OwnedElsewhereTest(unittest.TestCase):
             (tree / "x/locked").chmod(0o755)
         self.assertIn("cannot stat", gd.unreadable_why(str(self.home / "gone")))
 
+
+
+class QueuedDiskWantTest(unittest.TestCase):
+    """QUEUED_WANT: the fleet worker's live fleet-disk.want-<pid> markers set the pressure target."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cap = Path(self.tmp.name)
+
+    def write(self, pid: int, body: object, age: float = 0.0, name: str | None = None) -> Path:
+        marker = self.cap / (name or f"fleet-disk.want-{pid}")
+        marker.write_text(body if isinstance(body, str) else json.dumps(body))
+        if age:
+            at = time.time() - age
+            os.utime(marker, (at, at))
+        return marker
+
+    def test_largest_live_fresh_want(self) -> None:
+        self.write(os.getpid(), {"schema": "cmux-fleet-disk-want/v1", "since": 1, "want_bytes": 30 * gd.GIB})
+        self.write(os.getppid(), {"since": 1, "want_bytes": 50 * gd.GIB})
+        self.assertEqual(gd.queued_disk_want(self.cap), 50 * gd.GIB)
+
+    def test_stale_dead_and_malformed_markers_are_no_want(self) -> None:
+        self.write(os.getpid(), {"since": 1, "want_bytes": 90 * gd.GIB}, age=gd.QUEUED_WANT_FRESH_S + 5)
+        self.write(2 ** 31 - 2, {"since": 1, "want_bytes": 80 * gd.GIB})  # no such process
+        self.write(os.getppid(), {"since": 1, "want_bytes": True})
+        self.write(0, {"want_bytes": 70 * gd.GIB}, name=f"fleet-disk.want-{os.getpid()}.tmp")
+        self.write(0, "not json", name="fleet-disk.want-x")
+        self.assertEqual(gd.queued_disk_want(self.cap), 0)
+        self.assertEqual(gd.queued_disk_want(self.cap / "missing"), 0)
 
 if __name__ == "__main__":
     unittest.main()

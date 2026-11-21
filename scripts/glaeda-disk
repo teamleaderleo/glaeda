@@ -1264,6 +1264,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "81e78f7dc1354ce0330807f3a229eb471b953497d98a7c19a085b944a68326f3",
     "1500e5762d450b35833feea85e5672b6030403afe253ccd96b0f021a76ca8fe3",
     "2c0e7d650ed84016b3e4bb4a913382c44ab0ae073a0e7a68dd957f976b8bfa91",
+    "f24d15d44bcc942f969a4dd8c2d6a4c6641ba82941383a1e1ab9412bc959ebef",
+    "dafe3ca93911e8dd81a1aa23091d8ac5cdb7f933431c15b9233e30a6089c35a0",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5272,6 +5274,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                                mirror_exclude=FLEET_CACHE_MIRROR_KEEP,
                                platform="macos"))
+        if lume_root_safe(LUME_BENCH_ROOT):
+            fams.append(lume_bench_family(LUME_BENCH_ROOT))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
             fams.append(ci_ios_family(ci_ios))
@@ -7347,6 +7351,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "cmux-ghosttykit-cache",
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
     "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
+    "lume-bench-images",   # LUME_BENCH_IMAGES: a pulled bench image; a lume command or open disk.img still keeps it
     *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS),  # journey rounds are no CI job; a running app still keeps its build
     INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
 })
@@ -10149,7 +10154,7 @@ TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
 # Caches whose every item has a remote copy to pull back (a registry image, Apple's IPSW): under pressure they go
 # whatever their age (Leo, 2026-11-18, via the coordinator: a cache the controller SSD or R2 also holds is
 # reclaimable no matter how old). Seeds in the LAN archive already go at once (item_window's `archived`).
-REMOTE_COPY_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
+REMOTE_COPY_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, "lume-bench-images"})  # the last: LUME_BENCH_IMAGES
 # Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
 TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
@@ -10333,6 +10338,46 @@ LIMA_VMS = "lima-vms"
 LIMA_BASE_NAMES = frozenset({"cmux-linux-bake"})
 LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
 ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS, "hq-tip-loop-work"}  # walked only when tart_root_safe(root)
+
+
+# The computer-use driver bench's Lume VM images (cmux scripts/measure/cu-driver-bench.sh: LUME_HOME is
+# /Users/Shared/cu-driver-bench/.lume, one directory per VM, each a full macOS disk pulled from a pinned image tag).
+# No family listed them: one fleet mini held 26.7 GiB there at 0 GiB free (2026-11-21), and the gap read as
+# "unclassified". The bench pulls the pinned image again when it is missing, so an image nothing runs is a remote
+# copy (REMOTE_COPY_FAMILIES: under pressure it goes whatever its age). A running lume or bench command naming it,
+# an open file (the Virtualization framework holds disk.img open while a VM runs) or a .glaeda-keep.json claim
+# keeps it. A root that is a symlink, or under a symlinked parent, is never walked.
+LUME_BENCH_IMAGES = "lume-bench-images"
+LUME_BENCH_ROOT = Path("/Users/Shared/cu-driver-bench/.lume")
+LUME_VM_RUN = re.compile(r"(?:^|/)lume\s")
+LUME_BENCH_RUN = re.compile(r"(?:^|/)cu-driver-bench(?:\.sh)?(?:\s|$)")
+
+
+def lume_root_safe(root: Path) -> bool:
+    """Whether the bench's Lume root may be walked: it and its parent are real directories, not symlinks."""
+    try:
+        return (not root.is_symlink() and not root.parent.is_symlink() and root.is_dir()
+                and os.path.realpath(root) == os.path.abspath(root))
+    except OSError:
+        return False
+
+
+def lume_bench_family(root: Path) -> "Family":
+    return Family(LUME_BENCH_IMAGES, root, True, "the computer-use bench pulls its pinned Lume image again",
+                  depth=1, skip_prefixes=(".",), min_idle_hours=DEFAULT_AGE_HOURS,
+                  owner="cmux computer-use driver bench (scripts/measure/cu-driver-bench.sh)",
+                  rebuild_minutes=20, platform="macos")
+
+
+def lume_vm_held(path: Path, cmds: str) -> str:
+    """Why a bench Lume VM is in use, or "": the bench runs, a lume VM runs, or a lume command names it."""
+    name = re.compile(r"(?:^|[\s=/])" + re.escape(path.name) + r"(?:[\s/]|$)")
+    for line in cmds.splitlines():
+        if LUME_BENCH_RUN.search(line):
+            return f"the computer-use bench runs ({line.strip()[:120]})"
+        if LUME_VM_RUN.search(line) and (name.search(line) or re.search(r"\srun(?:\s|$)", line)):
+            return f"a running lume command holds it ({line.strip()[:120]})"
+    return ""
 
 
 def lima_vm_held(path: Path, cmds: str) -> str:
@@ -11133,6 +11178,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(why)
         if fam.id == LIMA_VMS and not blind and (why := lima_vm_held(path, cmds)):
             reasons.append(why)
+        if fam.id == LUME_BENCH_IMAGES and not blind and (why := lume_vm_held(path, cmds)):
+            reasons.append(why)
         if media_tour_dd(fam, path) and media_tour_tag_held(path):
             reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
@@ -11390,6 +11437,52 @@ def runner_floor_gib(home: Path = HOME) -> float:
         except (OSError, UnicodeDecodeError, ValueError):
             continue
     return floor
+
+
+# QUEUED_WANT (Leo, 2026-11-21: "man glaeda needs to be more aggressive... again!"; the ask: work "against a target
+# free figure derived from the queued jobs' min_free_bytes, not a hand-set floor"). The build-fleet worker, while it
+# is paused for disk with a job it could take but for disk, keeps capacity/fleet-disk.want-<pid> fresh with the
+# controller's disk_wanted_bytes for this host (cmux-fleet-disk-want/v1: since, want_bytes, free_bytes, who; the
+# runner hook's FLEET_DISK_WANT reads the same marker). A pressure pass raises every volume's low and target to that
+# want plus the policy margins, so it frees what the queued job needs instead of stopping at the hand-set policy
+# target. Markers are written by another account and read as untrusted: a stale one (QUEUED_WANT_FRESH_S) or one
+# whose worker is gone is no want.
+QUEUED_WANT_PREFIX = "fleet-disk.want-"
+QUEUED_WANT_FRESH_S = 180.0
+
+
+def queued_disk_want(capacity_dir: Path | None = None, now: float | None = None) -> int:
+    """The largest live queued-job disk want on this host (bytes), or 0."""
+    capacity_dir = FLEET_DIR / "capacity" if capacity_dir is None else capacity_dir
+    now = time.time() if now is None else now
+    best = 0
+    try:
+        markers = list(capacity_dir.glob(f"{QUEUED_WANT_PREFIX}*"))
+    except OSError:
+        return 0
+    for marker in markers:
+        if marker.name.endswith(".tmp"):
+            continue
+        try:
+            pid = int(marker.name[len(QUEUED_WANT_PREFIX):])
+            st = marker.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 64 * 1024 or now - st.st_mtime >= QUEUED_WANT_FRESH_S:
+                continue
+            if not 0 < pid < 2 ** 31:
+                continue
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # another account's live worker
+        except (OSError, ValueError):
+            continue
+        try:
+            want = json.loads(marker.read_text()).get("want_bytes")
+            if isinstance(want, bool) or not isinstance(want, int) or want <= 0 or want > 1 << 50:
+                continue
+        except (OSError, ValueError, AttributeError, RecursionError, UnicodeDecodeError):
+            continue
+        best = max(best, want)
+    return best
 
 
 # A fleet reservation hands a host to one person for a while. On a reserved fleet mini only floor-pressure eviction
@@ -13071,6 +13164,32 @@ def caller_floor_wait_s(now: float | None = None) -> float | None:
     return until - (time.time() if now is None else now)
 
 
+_PRESSURE_PASS_HANDLE = None  # kept open for the life of the run: the lock goes with the process
+
+
+def pressure_pass_lock() -> bool:
+    """Take this host's pressure-pass lock (pressure-pass.lock beside EVICT_LOCK) for the rest of the run, without
+    waiting. False when another live pass holds it. An unopenable lock file never blocks a pass."""
+    global _PRESSURE_PASS_HANDLE
+    if _PRESSURE_PASS_HANDLE is not None:
+        return True
+    try:
+        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(EVICT_LOCK.parent / "pressure-pass.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except OSError:
+        os.close(fd)
+        return True
+    _PRESSURE_PASS_HANDLE = fd
+    return True
+
+
 def floor_evict_wait_until(apply_: bool) -> float:
     """The monotonic time a run the floor needs may wait for evict.lock until, or 0.0 for no wait.
 
@@ -13463,6 +13582,21 @@ def gap_named(accounting: list[dict[str, Any]]) -> str:
     return f" ({'; '.join(parts)})" if parts else ""
 
 
+RECEIPT_MAX_BYTES = 64 * 1024 * 1024  # a receipt file past this moves to NAME.1 (the one before it goes)
+
+
+def rotate_receipt(receipt: Path, limit: int | None = None) -> bool:
+    """Bound an append-only receipt file: past LIMIT bytes it replaces NAME.1, so two files hold at most twice the
+    limit. Readers take the tail of NAME; the older half is for a person reading back. True when it rotated."""
+    try:
+        if receipt.stat().st_size <= (RECEIPT_MAX_BYTES if limit is None else limit):
+            return False
+        os.replace(receipt, receipt.with_name(receipt.name + ".1"))
+    except OSError:
+        return False
+    return True
+
+
 def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
                             before_fs: list[dict[str, Any]], after_fs: list[dict[str, Any]],
                             before_accounting: list[dict[str, Any]],
@@ -13491,10 +13625,18 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
         "after": {"filesystems": after_fs, "accounting": after_accounting},
         "findings": list(EVICTION_STUCK),
     }
+    written = record
+    if not logical_released and not physical["reclaimed_bytes"]:
+        # A pass that freed nothing (a host under its floor runs one every few minutes) keeps the filesystems and
+        # the totals above, not the full accounting of both sides: 36 KB a line was 160 MB a day on cmux16
+        # (2026-11-20), the receipt file at 568 MB.
+        written = {**record, "slim": True,
+                   "before": {"filesystems": before_fs}, "after": {"filesystems": after_fs}}
     try:
         receipt.parent.mkdir(parents=True, exist_ok=True)
+        rotate_receipt(receipt)
         with receipt.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
+            handle.write(json.dumps(written) + "\n")
     except OSError:
         # The stdout receipt remains useful even when its requested path is unavailable.
         pass
@@ -13806,6 +13948,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
                 or (fam.id == LIMA_VMS and lima_vm_held(p, cmds))
+                or (fam.id == LUME_BENCH_IMAGES and lume_vm_held(p, cmds))
                 or (fam.id in BUILD_STATE_FAMILY_IDS and build_state_held(fam, p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
@@ -15776,6 +15919,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 budget_base[dev] = (fs.low, fs.target)
                 fss[dev] = replace(fs, low=max(fs.low, fs.free + 1), target=max(fs.target, fs.free + row["over"]))
         BUDGET_WARM_DEVS = frozenset(budget_base)
+    # QUEUED_WANT: a queued job's disk want raises the volumes' low and target (never lowers them)
+    if (a.pressure and ROLE == "fleet-mini" and DARWIN and not RUNNER_CACHE_PROFILE and not reserved
+            and not a.family and a.need is None and not a.cmux_next_drain and not a.root_override):
+        want = queued_disk_want()
+        if want > 0:
+            RUN["queued_want_bytes"] = want
+            low_want = want + int(POLICY["low_margin_gib"] * GIB)
+            target_want = want + int(POLICY["target_margin_gib"] * GIB)
+            for dev, fs in list(fss.items()):
+                if fs.tmpfs:
+                    continue
+                cap = fs.total - GIB  # a want above the volume is met by nothing; aim at all of it
+                fss[dev] = replace(fs, low=max(fs.low, min(low_want, cap)), target=max(fs.target, min(target_want, cap)))
+            print(f"queued job wants {gib(want).strip()} free: target raised to it plus "
+                  f"{POLICY['target_margin_gib']:g} GiB")
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
@@ -15951,6 +16109,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return 0
+        # One plain pressure apply per host at a time (pressure_pass_lock). The evict.lock queue serves one
+        # deletion at a time but lets its waiters pile up: on one mini (2026-11-21) nine pressure applies ran at
+        # once, a new one about every 40 s, each waiting its turn while the host sat at 2 GiB free. The pass that
+        # holds this lock judges the same filesystems against the same floor, so a second one only waits.
+        if (a.pressure and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
+                and not pressure_pass_lock()):
+            return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
@@ -16021,11 +16186,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         measure_lock.close()
         measure_lock = None
         _ACTIVE_MEASURE_HANDLE = None
-        # Below the emergency floor a pressure apply goes on without the lock, as a report does: it
-        # re-measures its candidates itself (fresh_for_apply), and a background refresh can take up to
-        # its 600 s budget (cmux9s, 2026-10-21: every pressure run skipped at 0.9 GiB free while a
-        # refresh held the lock, with 32 GiB of finished steps' spm-scratch reclaimable).
-        if (a.pressure and not (a.apply and EMERGENCY_DEVS)) or a.refresh:
+        # A pressure apply under its low goes on without the lock: it re-measures its candidates itself
+        # (fresh_for_apply), the eviction lock already keeps two applies apart, and a background refresh
+        # can take up to its 600 s budget (2026-10-21: every pressure run skipped at 0.9 GiB free while a
+        # refresh held the lock; 2026-11-21: two minis at 11 and 0 GiB free skipped every 15-minute pass
+        # above the emergency floor). Only a report-only pressure run or a refresh still defers.
+        if (a.pressure and not a.apply) or a.refresh:
             if measure_lock is not None:
                 measure_lock.close()
                 measure_lock = None

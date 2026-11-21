@@ -2913,7 +2913,7 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "ios_runtime": ("licence", "launch"
              "cmux_clone": ("git",), "submodules": ("git",)}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
-READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
+READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check", "host_drain"}
 # Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
 # a drain waits out the job holding the lock, and restoring runners never builds anything.
 LOCK_GATE = {"runner_hold": "reservation", "ios_runtime": "reservation", "runner_release": "none", "runner_kick": "none"}
@@ -3303,11 +3303,39 @@ def host_check(manifest: dict[str, Any], name: str) -> str | None:
     return f"could not read its host lock and reservation (ssh exit {code})"
 
 
+def start_drain(manifest: dict[str, Any], name: str) -> Any:
+    """A host.lock.waiters entry on the host, so its build worker leases no new job while the running ones finish.
+
+    The entry lives while the returned ssh does: close_drains ends it. None when ssh cannot start."""
+    try:
+        return subprocess.Popen([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+                                 *host_ssh_options(manifest, name), "-l", host_ssh_user(manifest, name), name,
+                                 remote_command(library_command("host_drain", []))],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def close_drains(drains: dict[str, Any]) -> None:
+    """Remove every waiter entry gate_hosts registered: closing its stdin ends the remote holder."""
+    for proc in drains.values():
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+    drains.clear()
+
+
 def gate_hosts(manifest: dict[str, Any], names: list[str], wait: bool = False,
-               poll: float = HOLD_POLL_SECONDS, limit: float = HOLD_WAIT_SECONDS) -> dict[str, str]:
+               poll: float = HOLD_POLL_SECONDS, limit: float = HOLD_WAIT_SECONDS,
+               drains: dict[str, Any] | None = None) -> dict[str, str]:
     """The hosts a changing command must skip, and why: held by the fleet host lock or a reservation.
 
-    With wait, poll the held ones until they are free or `limit` seconds pass, then skip what is still held."""
+    With wait, poll the held ones until they are free or `limit` seconds pass, then skip what is still held.
+    With drains too (a dict the caller owns and ends with close_drains), a host the fleet host lock alone holds also
+    gets a host.lock.waiters entry, as the ios_runtime repair has, so no new job starts there and the lock frees
+    between jobs instead of never on a host that never goes idle."""
     def check(names: list[str]) -> dict[str, str]:
         if not names:
             return {}
@@ -3319,6 +3347,12 @@ def gate_hosts(manifest: dict[str, Any], names: list[str], wait: bool = False,
     deadline = time.monotonic() + limit
     while wait and held and time.monotonic() < deadline:
         say("waiting: " + "; ".join(f"{h} held: {why}" for h, why in sorted(held.items())))
+        for h, why in sorted(held.items()):
+            if drains is not None and h not in drains and why.startswith(BUSY_HOST_LOCK):
+                proc = start_drain(manifest, h)
+                if proc:
+                    drains[h] = proc
+                    say(f"{h}: holding new jobs off (host.lock.waiters entry) until the run ends")
         time.sleep(poll)
         held = check(sorted(held))
     for name, why in sorted(held.items()):
@@ -4493,6 +4527,16 @@ def runner_actions(result: dict[str, Any]) -> tuple[list[str], list[str]]:
 def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, sudo: str, acceptance: str,
                 seed: str | None, log_dir: Path | None, heartbeat: float = HEARTBEAT_SECONDS, mode: str = "onboard",
                 wait: bool = False) -> int:
+    drains: dict[str, Any] = {}
+    try:
+        return onboard_run(manifest, wanted, yes, sudo, acceptance, seed, log_dir, heartbeat, mode, wait, drains)
+    finally:
+        close_drains(drains)
+
+
+def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, sudo: str, acceptance: str,
+                seed: str | None, log_dir: Path | None, heartbeat: float, mode: str, wait: bool,
+                drains: dict[str, Any]) -> int:
     """onboard and repair: one pipeline. preflight, fix, sudo-plans, fix again, then the enrollment and runners.
 
     onboard enrolls a host that has no enrollment yet; repair leaves it (onboard's job). Both renew an
@@ -4503,7 +4547,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     targets, skipped = onboard_hosts(manifest, wanted)
     rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
     # A held host (another build's fleet host lock, or a reservation) is skipped, and the run exits 1.
-    held = gate_hosts(manifest, targets, wait and yes)
+    held = gate_hosts(manifest, targets, wait and yes, drains=drains)
     rows.update({h: new_row(manifest, h, f"held: {why}, skipped", step="gate") for h, why in held.items()})
     targets = [h for h in targets if h not in held]
     for name in targets:

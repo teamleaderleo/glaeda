@@ -223,7 +223,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
-4 when the PR conflicts with its base, 6 when no check or status ever reported on the PR's head
+4 when the PR conflicts with its base, 0 with "result: merged" (and the merge commit) as soon as the PR is MERGED,
+whatever --until says or head --sha names (a closed unmerged PR exits 1 at once), 6 when no check or status ever reported on the PR's head
 (--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass),
 7 (inconclusive) when --until done is left with only checks queued with no runner past 30 min, or the
 deadline passes on a read that never came back whole. Done and green never exit 0 while any check
@@ -1007,7 +1008,7 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
 # NUM is the alias's PR-number variable: isRequired needs it
-PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
+PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
@@ -3493,6 +3494,7 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
     mergeable = {True: "MERGEABLE", False: "CONFLICTING"}.get(pull.get("mergeable"), "UNKNOWN")
     return {"number": pull.get("number"), "url": pull.get("html_url"), "title": pull.get("title"), "state": state,
             "isDraft": bool(pull.get("draft")), "merged": bool(pull.get("merged")), "mergedAt": pull.get("merged_at"),
+            "mergeCommit": {"oid": pull.get("merge_commit_sha")} if pull.get("merged") else None,
             "mergeable": mergeable, "mergeStateStatus": upper(pull.get("mergeable_state")) or "UNKNOWN",
             "headRefOid": head.get("sha"), "headRefName": head.get("ref"),
             "baseRefName": (pull.get("base") or {}).get("ref"), "reviewDecision": review,
@@ -3681,7 +3683,7 @@ def parse_pr(node: dict) -> dict:
         "requiredNames": sorted(name for name in required if name),  # what the base requires (check_verdict)
         "number": node.get("number"), "url": node.get("url"), "title": node.get("title"),
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
-        "mergedAt": node.get("mergedAt"), "mergeable": node.get("mergeable"),
+        "mergedAt": node.get("mergedAt"), "mergeCommit": node.get("mergeCommit"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
@@ -4176,6 +4178,7 @@ class Daemon:
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
+        self.land_dirty: set[str] = set()  # event/cache keys retained for LandQueue after due() consumes nudged
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
@@ -4859,7 +4862,7 @@ class Daemon:
             # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
             # goes first instead (nudged), and the alarm stands.
             if data.get("key"):
-                self.nudged.add(str(data["key"]))
+                self.land_nudge(str(data["key"]))
             return level, text, {**data, "valve": "one_key", "freshest": int(fresh)}
         up = self.now - (self.started_tick if self.started_tick is not None else self.now)
         if up < STALE_DATA_AFTER:
@@ -7384,6 +7387,12 @@ class Daemon:
         q.reap()
         return bool(q.jobs)
 
+    def land_nudge(self, key: str) -> None:
+        """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
+        self.nudged.add(key)
+        if self.land_queue is not None and key in self.land_queue.entries:
+            self.land_dirty.add(key)
+
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
         an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
@@ -7393,8 +7402,16 @@ class Daemon:
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
-            self.land_queue = LandQueue(nudge=self.nudged.add, notice=self.write_notice, reading=self.land_reading)
-        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now)
+            self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading)
+        dirty, self.land_dirty = self.land_dirty, set()
+        # A direct reader can update the shared cache in another process. Consume its key before reading
+        # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
+        for marker in (land_dir() / "changed").glob("*.json"):
+            key = read_json(marker)
+            if isinstance(key, str) and key in self.land_queue.entries:
+                dirty.add(key)
+            marker.unlink(missing_ok=True)
+        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
 
@@ -8007,6 +8024,12 @@ class Daemon:
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
             write_json(cache, entry)
+        if key.startswith("pr:") and "data" in fields:
+            if self.land_queue is not None:
+                if key in self.land_queue.entries and land_fingerprint(base) != land_fingerprint(entry):
+                    self.land_dirty.add(key)
+            elif (LandQueue.entries_dir() / file_name(key)).is_file() and land_fingerprint(base) != land_fingerprint(entry):
+                write_json(land_dir() / "changed" / file_name(key), key)
         if fields.get("dataAt") is not None and not fields.get("error"):
             self.note_read(key)
 
@@ -9702,7 +9725,7 @@ class Daemon:
             if e["key"].startswith("head:"):
                 _, owner, repo, sha = split_key(e["key"])
                 if (f"{owner}/{repo}".lower(), "sha:" + sha) in touched:
-                    self.nudged.add(e["key"])  # a check event on this commit: its rollup changed
+                    self.land_nudge(e["key"])  # a check event on this commit: its rollup changed
                 continue
             data = (e["cache"] or {}).get("data") or {}
             if not e["key"].startswith("pr:") or not data:
@@ -9712,7 +9735,7 @@ class Daemon:
             if data.get("headRefName"):
                 marks.add("branch:" + str(data["headRefName"]))  # a push: runs for a head GitHub has not shown yet
             if any((f"{owner}/{repo}", m) in touched for m in marks):
-                self.nudged.add(e["key"])
+                self.land_nudge(e["key"])
 
     def merge_comments(self, entries: list[dict], page: dict) -> None:
         """Add new, edited and deleted comments on watched issues to their cached comment list. The
@@ -10282,6 +10305,15 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 #   LAND_STEP_BACKOFF_MAX), and stops only after LAND_RETRY_STREAK_STOP failed reads in a row.
 # A broker refusal "closed or its head is not a branch of" also fits a fork's open PR: a read that says OPEN at that
 # head lets the next such refusal count as before (stateOpen).
+# A draft PR is a permanent refusal, not a streak: GitHub answers every mergePullRequest on it "Pull Request is still
+# a draft", so the backoff spent LAND_STEP_STOP merge calls (~31 min) on an answer the first one already gave, and the
+# stop named no step. efficiency-standing-lane, 2026-11-21: leo-workspace#7087 was pushed as a draft by the
+# PreCompact checkpoint hook (tools/wip_checkpoint.py opens one), and `land` reported merge_refused after six identical
+# refusals with the GraphQL pool at its floor. Stopping at the first one names `gh pr ready`, the step that clears it.
+# Nothing here marks a PR ready: that is a state change on someone's PR (a teammate's included), so it stays the
+# requester's call.
+LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request is in draft state\b"
+                             r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
 LAND_STEP_CLOSED = re.compile(r"\bPR #?\d+ is closed\b|\bpull request (?:#?\d+ )?(?:is|was) (?:closed|already merged)\b"
                               r"|\bwas already merged\b|\bpull request is not open\b|\bPR is (?:closed|not open)\b",
                               re.I)
@@ -10334,6 +10366,9 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
+# deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
+LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
 # A due entry the login's latch skipped through this many latch windows (each a hold of the latch: LandQueue.hold)
 # tells its requester once, naming the latch and its end; from its second window it goes at the latch's clear without
 # the reset spread (land_latch_spread). huge-blue, 2026-11-18 17:18-19:53Z: 22 lands past their wake for 2-4 h
@@ -11122,6 +11157,8 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.changed_entries: set[str] = set()
+        self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
         self.nudge = nudge or (lambda key: None)
         self.notice = notice or (lambda kind, level, text, data: None)
@@ -11333,16 +11370,21 @@ class LandQueue:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
         self.entries[key] = e
         self.save(e)
+        self.changed_entries.add(key)
 
     # -- the tick
 
-    def tick(self, now: float | None = None) -> None:
+    def tick(self, now: float | None = None, dirty: set[str] | None = None) -> None:
         self.now = time.time() if now is None else now
+        recovery = self.now >= self.recovery_at
+        if recovery:
+            self.recovery_at = self.now + LAND_RECOVERY_SWEEP
         executor = land_executor(self.config())
         if executor is not None:
             self.forward_tick(executor)
             return
         self.ingest()
+        self.changed_entries.update(key for key in dirty or () if key in self.entries)
         self.reap()
         if self.refuse():
             return
@@ -11370,11 +11412,26 @@ class LandQueue:
                 if self.now - float(e.get("updated") or 0) > LAND_KEEP:
                     (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                     del self.entries[key]
+                    self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
                         self.rearm(e)  # judged from the next pass
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        if dirty is not None and not recovery and latch is None and ended is None:
+            # The daemon tells us when a PR cache write or webhook changes a waiting head. A quiet CI wait
+            # needs its watch renewed, but sorting it would reopen its cache on every daemon tick.
+            awake = []
+            for key in live:
+                e = self.entries[key]
+                w = e.get("wait") or {}
+                if (e["state"] == "waiting" and w.get("kind") == "pr" and not w.get("rerun")
+                        and key not in self.changed_entries and not self.due(e)
+                        and not (e.get("latchHeld") or e.get("snapshotWait") or e.get("after"))):
+                    self.keep_watching(e)
+                else:
+                    awake.append(key)
+            live = awake
         for key in sorted(live, key=self.judge_order):
             try:
                 if self.queue_quota_parked():
@@ -11400,6 +11457,7 @@ class LandQueue:
                         self.unhold(e)
                         self.save(e)
                     self.keep_watching(e)
+                    self.changed_entries.discard(key)
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
@@ -12209,6 +12267,7 @@ class LandQueue:
         """Whether this entry is judged now: only when something could have changed land_judge's answer."""
         c = self.cache_of(e["key"])
         if self.refresh_due(e, c):
+            self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
@@ -12523,6 +12582,9 @@ class LandQueue:
         again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
         most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
         snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
+        # Keep the event until we can submit the judgment. Workers, readiness and quota windows may
+        # recover before either another event arrives or the recovery sweep runs.
+        self.changed_entries.add(e["key"])
         if self.reset_staggered(e):
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
@@ -12574,6 +12636,7 @@ class LandQueue:
         e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
+        self.changed_entries.discard(e["key"])
         return True
 
     # -- a job: one judgment and the step it names (a worker thread)
@@ -13231,6 +13294,15 @@ class LandQueue:
             self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
             e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
             self.save(e)
+            return None
+        if LAND_STEP_DRAFT.search(out):
+            # Permanent until someone marks it ready (LAND_STEP_DRAFT's comment): one refusal, one named step.
+            self.history(e, "step_refused", kind=kind, head=head[:12], why="draft", n=1)
+            name = key_name(e["key"])
+            repo, _, number = name.partition("#")
+            self.stop(e, f"{kind}_draft", f"the {kind} at {head[:12]} was refused while the PR is a draft: "
+                      f"{land_trim(land_tail(out), 200)}",
+                      f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
             return None
         if LAND_STEP_CLOSED.search(out) and e.get("stateOpen") != head:
             # GitHub says the PR is closed: no refusal counted, its state read before anything else (state_first).
@@ -15829,7 +15901,13 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return EXIT_FAIL
     if until == "merged":
         return EXIT_OK if data.get("state") == "MERGED" else None
-    if until == "done" and data.get("state") == "MERGED":
+    if data.get("state") == "MERGED":
+        # A merged PR is final whatever --until says: it is never waited on (hq#16384, 2026-11-21: `--until required
+        # --sha 6ca0a8fd` kept waiting 2400 s on a PR that had merged at head cbad338ab7, which could never match).
+        if sha and not str(data.get("headRefOid") or "").startswith(sha):
+            return EXIT_OK  # it merged at another head: the commit waited for is not the one that landed, nothing to wait for
+        if until != "done":
+            return check_verdict(data, until, now, grace, settle)  # at the head waited for: a runner refusal in its grace still holds
         # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
         # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
         # still fails; a pending, missing or other-head check no longer holds the wait.
@@ -16171,6 +16249,11 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     data = (entry or {}).get("data") or {}
     if result == EXIT_OK:
         return ok_fields()
+    if result in (EXIT_TIMEOUT, EXIT_INCONCLUSIVE) and kind == "pr" and data.get("state") in ("MERGED", "CLOSED"):
+        # a PR that finished is never waited on again (a timeout cannot come from one, but the line must not say so)
+        return fail_fields("timeout" if result == EXIT_TIMEOUT else "inconclusive",
+                           f"waited {waited} s for {name}, which is {data.get('state')}",
+                           f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
         state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
         deadline = utc_clock(float(req["began"]) + float(req["timeout"]))
@@ -16646,7 +16729,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             if kind == "run":
                 raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never "
                                  "changes, and its run-name does not name that full commit as the one it tested")
-            if not exact:
+            if not exact and not final:
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
                                  f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
                                  "GitHub has not seen yet")
@@ -16676,7 +16759,8 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             req.pop("runsUnread", None)
             req.pop("runsUnfinished", None)
     if result is not None:
-        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
+        merged = kind == "pr" and data.get("state") == "MERGED" and result == EXIT_OK
+        outcome_name = {EXIT_OK: "merged" if merged else "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
                         EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
         if kind == "pr" and result == EXIT_NOTHING:
@@ -16689,8 +16773,14 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                              "merge or rebase onto the base and push")
         elif kind == "pr" and data.get("state") == "CLOSED":
             extra["note"] = "PR was closed without being merged"
-        elif kind == "pr" and until == "done" and data.get("state") == "MERGED":
-            extra["note"] = "PR was merged: done, whatever its checks still show"
+        elif kind == "pr" and data.get("state") == "MERGED":
+            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "")
+            extra["note"] = ("PR was merged" + (f" at {merge_sha[:10]}" if merge_sha else "") + (
+                f" (head {str(data.get('headRefOid') or '')[:10]}, not {sha[:10]})"
+                if sha and not str(data.get("headRefOid") or "").startswith(sha) else "")
+                + ": done, whatever its checks still show")
+            if merge_sha:
+                extra["merge_sha"] = merge_sha
         if unconfirmed and refused is not None:
             extra["note"] = f"finish not confirmed by a GitHub read: {refused}"
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
@@ -23538,18 +23628,50 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     .../pull/N) means `pr`; OWNER/REPO/RUNID or .../actions/runs/ID means `run`. `land pr X` drops the `pr`. Returns the argv to parse and the note for stderr ("" when unchanged)."""
     if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
         return raw, ""
+    joined = False
+    if raw[0] == "wait":
+        # `wait [pr|comment] OWNER/REPO N` is `OWNER/REPO#N` (usage_next's form): one target, so a bare N can
+        # mean nothing else. `status` is multi-target (a bare N there is a number in the repo before it), and
+        # `wait run` keeps its own form.
+        slot = 2 if raw[1] in ("pr", "comment") else 1
+        if len(raw) > slot + 1 and re.fullmatch(rf"{NAME}/{NAME}", raw[slot]) and BARE_NUMBER.fullmatch(raw[slot + 1]):
+            raw = raw[:slot] + [f"{raw[slot]}#{raw[slot + 1].lstrip('#')}"] + raw[slot + 2:]
+            joined = True
     cmd, first = raw[0], raw[1]
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
+    ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if joined else ""
     if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
-        return raw, ""
+        return raw, ran_as
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
-        return raw, ""
+        return raw, ran_as
     fixed = [cmd, kind] + raw[1:]
     return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
+
+
+class ShorthandFlag(argparse.Action):
+    """A flag agents type for a canonical form (`--merged` for `--until merged`, `--job ID` for the JOB_ID
+    argument): run it as that form, and say the canonical form on stderr once, so the next call uses it."""
+
+    def __init__(self, option_strings, dest, canonical: str = "", **kw):
+        self.canonical = canonical
+        super().__init__(option_strings, dest, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        value = self.const if self.nargs == 0 else values
+        setattr(namespace, self.dest, value)
+        say_waiting(f"glaeda-gh: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
+
+
+class OptionalJobId(argparse.Action):
+    """JOB_ID when `--job ID` may stand for it: an absent JOB_ID leaves what `--job` set, whichever came first."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is not None:
+            setattr(namespace, self.dest, values)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -23578,10 +23700,14 @@ def parser() -> argparse.ArgumentParser:
                        help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
         if name == "wait":
-            s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
+            until = s.add_mutually_exclusive_group()
+            until.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
                                 "all but merged exit 4 once the PR conflicts with its base")
+            for word in ("green", "done", "required", "merged"):
+                until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
+                                   canonical="`--until {}`", help=f"the same as --until {word}")
             s.add_argument("--timeout", type=seconds, default=3600,
                            help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
@@ -23631,10 +23757,13 @@ def parser() -> argparse.ArgumentParser:
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
     lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
     lj.add_argument("repo", metavar="OWNER/REPO")
-    lj.add_argument("job", type=int, metavar="JOB_ID")
     le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log")
     le.add_argument("repo", metavar="OWNER/REPO")
-    le.add_argument("job", type=int, metavar="JOB_ID")
+    for one in (lj, le):
+        job = one.add_mutually_exclusive_group(required=True)
+        job.add_argument("job", type=int, nargs="?", action=OptionalJobId, metavar="JOB_ID")
+        job.add_argument("--job", dest="job", type=int, action=ShorthandFlag, metavar="ID",
+                         canonical="`{prog} OWNER/REPO {}`", help="the same as JOB_ID")
     le.add_argument("--max", type=int, default=40, metavar="N", help="lines shown (default 40)")
     le.add_argument("--json", action="store_true")
     for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
@@ -23695,8 +23824,9 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
-    ld.add_argument("--notify", metavar="HOST/SESSION",
-                    help="who is told on a merge or a stop (default this host/$ACPMUX_SESSION_NAME)")
+    ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
+                    help="who is told on a merge or a stop (with no value, and by default, this "
+                         "host/$ACPMUX_SESSION_NAME)")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
                     help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
                          "--timeout is the same")
@@ -23708,8 +23838,20 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+LOG_JOB_ONE_WORD = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)/(?:actions/runs/\d+/job/)?(\d+)/?")
+
+
 def log_job_synonym(raw: list[str]) -> list[str]:
-    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that."""
+    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that. So is
+    `log job|errors OWNER/REPO/ID` or a job's URL in one word (the shape `status run` and a failed check print;
+    2026-11-21 it cost a usage error)."""
+    given = [w for w in raw[3:4] if w.isdigit()] + [w for w in raw[3:] if w.startswith("--job")]  # an id already
+    one = LOG_JOB_ONE_WORD.fullmatch(raw[2]) if len(raw) >= 3 and raw[:2] in (["log", "job"], ["log", "errors"]) \
+        and not given else None
+    if one:
+        fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
+        print(f"glaeda-gh: read as `{' '.join(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw
     rest = raw[2:]
@@ -23729,9 +23871,30 @@ def log_job_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+def land_notify_synonym(raw: list[str]) -> list[str]:
+    """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
+    `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
+    usage error, and with one allowed, the flag before the target would swallow it."""
+    if len(raw) < 3 or raw[0] != "land":
+        return raw
+    for i, word in enumerate(raw):
+        if word != "--notify" or i + 1 >= len(raw):
+            continue
+        after = raw[i + 1]
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", after):
+            return raw
+        if any(re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", w) for w in raw[1:i]):
+            return raw  # the target is already there: --notify names something else, odd as it looks
+        fixed = raw[:i] + [after] + ["--notify"] + raw[i + 2:]
+        print(f"glaeda-gh: read as `{' '.join(fixed)}` (--notify takes HOST/SESSION, not the PR; with no "
+              f"value it names this session)", file=sys.stderr)
+        return fixed
+    return raw
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    raw = log_job_synonym(raw)
+    raw = land_notify_synonym(log_job_synonym(raw))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:

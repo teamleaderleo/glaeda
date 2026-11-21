@@ -4537,6 +4537,25 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#4", until="done", fill=(mixed, {}), timeout=5)[0], 1,
                          "a finished red fails at once beside a running check")
 
+    def test_a_merged_pr_at_another_head_exits_merged_at_once_under_every_until(self) -> None:
+        """hq#16384, 2026-11-21: `--until required --sha 6ca0a8fd` kept waiting 2400 s on a PR merged at head cbad338ab7."""
+        node = pr_node(1, state="MERGED", checks=[check_run("a", "IN_PROGRESS", None)])
+        node["mergeCommit"] = {"oid": "f" * 40}
+        merged = gg.parse_pr(node)
+        for until in ("green", "done", "required", "merged"):
+            code, text = self.wait("pr", "o/r#1", until=until, fill=(merged, {}), sha="6" * 40, timeout=5)
+            self.assertEqual(code, 0, (until, text))
+            self.assertIn("result: merged", text)
+            self.assertIn("f" * 10, text)
+            self.assertNotIn("glaeda-gh wait pr", text)
+
+    def test_a_timeout_on_a_finished_pr_never_suggests_waiting_again(self) -> None:
+        for state in ("MERGED", "CLOSED"):
+            data = gg.parse_pr(pr_node(1, state=state))
+            req = {"key": "pr:o/r#1", "kind": "pr", "until": "green", "sha": "a" * 40, "timeout": 5, "began": time.time()}
+            out = gg.wait_outcome(req, gg.EXIT_TIMEOUT, {"data": data}, 5)
+            self.assertNotIn("glaeda-gh wait", out["next"])
+
     def test_wait_ignores_cache_from_before_it_began(self) -> None:
         old_green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
         self.put("pr:o/r#1", old_green, at=time.time() - 30)
@@ -4755,6 +4774,9 @@ class ClientTest(Base):
             ("wait", "o/r/123", "--timeout", "9"): ["wait", "run", "o/r/123", "--timeout", "9"],
             ("wait", "https://github.com/o/r/actions/runs/123"): ["wait", "run", "https://github.com/o/r/actions/runs/123"],
             ("land", "pr", "o/r#5"): ["land", "o/r#5"],
+            ("wait", "pr", "o/r", "5", "--timeout", "9"): ["wait", "pr", "o/r#5", "--timeout", "9"],
+            ("wait", "o/r", "#5"): ["wait", "pr", "o/r#5"],
+            ("wait", "comment", "o/r", "5"): ["wait", "comment", "o/r#5"],
         }
         for given, fixed in want.items():
             got, note = gg.infer_kind(list(given))
@@ -4762,7 +4784,8 @@ class ClientTest(Base):
             self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
             gg.parser().parse_args(got)  # argparse takes what it was handed
         for same in (["wait", "pr", "o/r#5"], ["wait", "file", "/x"], ["wait", "--help"], ["wait", "bogus"],
-                     ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"]):
+                     ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"],
+                     ["status", "pr", "o/r#5", "6"], ["wait", "run", "o/r", "5"]):
             self.assertEqual(gg.infer_kind(list(same)), (same, ""))
 
     def test_a_usage_error_names_the_right_form(self) -> None:
@@ -4772,11 +4795,11 @@ class ClientTest(Base):
         self.assertEqual(gg.usage_next(["wait", "bogus"]), "glaeda-gh wait --help")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), self.assertRaises(SystemExit) as exit_:
-            gg.main(["wait", "pr", "o/r", "3", "--json"])
+            gg.main(["wait", "bogus", "--json"])  # `wait pr o/r 3` now runs as `o/r#3` (infer_kind)
         self.assertEqual(exit_.exception.code, 64)
         doc = json.loads(out.getvalue())
         self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
-        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#3 --json --timeout 1800")
+        self.assertEqual(doc["next"], "glaeda-gh wait --help")
 
     def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
         old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
@@ -10038,6 +10061,18 @@ class FileAndPidWaitTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             gg.cmd_wait_pid("abc", 1, False)
 
+    def test_log_job_takes_the_repo_and_id_in_one_word(self) -> None:
+        """`log job OWNER/REPO/ID` (called so 2026-11-21: argparse refused it) and a job URL read as `log job O/R ID`."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "job", "o/r/7"]), ["log", "job", "o/r", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "errors", "https://github.com/o/r/actions/runs/5/job/7",
+                                                 "--max", "9"]), ["log", "errors", "o/r", "7", "--max", "9"])
+            self.assertEqual(gg.parser().parse_args(gg.log_job_synonym(["log", "job", "o/r/7"])).job, 7)
+        self.assertEqual(err.getvalue().count("read as"), 3)
+        for same in (["log", "job", "o/r", "7"], ["log", "job", "o/r/7", "8"], ["log", "search", "o/r/7"]):
+            self.assertEqual(gg.log_job_synonym(same), same)
+
     def test_log_repo_job_flag_reads_as_log_job(self) -> None:
         """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
         err = io.StringIO()
@@ -10048,6 +10083,24 @@ class FileAndPidWaitTest(unittest.TestCase):
         for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
+        """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
+        (both cost a usage error, 2026-11-21)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.land_notify_synonym(["land", "--notify", "o/r#1"]),
+                             ["land", "o/r#1", "--notify"])
+            self.assertEqual(gg.land_notify_synonym(["land", "--wait", "60", "--notify", "o/r#1"]),
+                             ["land", "--wait", "60", "o/r#1", "--notify"])
+        self.assertEqual(err.getvalue().count("read as `land"), 2)
+        for same in (["land", "o/r#1", "--notify"], ["land", "o/r#1", "--notify", "cosmic/coord"],
+                     ["land", "o/r#1", "--notify", "o/r#2"], ["land", "status"],
+                     ["wait", "--notify", "o/r#1"]):
+            self.assertEqual(gg.land_notify_synonym(same), same)
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--notify"]).notify, "")
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1"]).notify, None)
+        self.assertEqual(gg.land_requester_from(""), gg.land_requester_from(None))
 
     def test_waits_until_a_time_or_the_quota_reset(self) -> None:
         """`wait until`: the wait for "go on at T" (a quota reset) that needs no head SHA (2026-11-18)."""
@@ -18302,10 +18355,21 @@ class LandSnapshotTest(Base):
                                                                                                   "databaseId": 77}}}),
                 {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
-        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None: None,
+        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None, *, dirty=None: None,
                                           reap=lambda: None,
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
+
+    def test_changed_cached_check_wakes_a_waiting_land(self) -> None:
+        key = "pr:o/r#1"
+        head = {"headRefOid": "a" * 40, "state": "OPEN", "checks": []}
+        self.daemon.store(key, None, data=head)
+        self.assertIn(key, self.daemon.land_dirty)
+        self.daemon.land_dirty.clear()
+        self.daemon.store(key, None, data=dict(head))
+        self.assertNotIn(key, self.daemon.land_dirty)
+        self.daemon.store(key, None, data={**head, "checks": [{"name": "ci", "status": "COMPLETED"}]})
+        self.assertIn(key, self.daemon.land_dirty)
 
     def cycle(self, k: int) -> dict:
         at = NOW + gg.CYCLE * k
@@ -20890,6 +20954,77 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def test_an_unchanged_wait_skips_land_consider_until_recovery(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.t += 30
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [])
+        self.q.recovery_at = self.t
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_dirty_land_key_wakes_its_entry_before_the_recovery_sweep(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
+        self.assertEqual(calls, [])
+        dirty = {self.KEY}
+        self.q.tick(self.t + 1, dirty=dirty)
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_direct_readers_cache_write_wakes_a_quiet_land(self):
+        self.daemon.land_queue = self.q
+        self.daemon.clock_real = False
+        self.daemon.now = self.t
+        self.q.cache_of = gg.read_cache
+        self.land()
+        self.daemon.store(self.KEY, None, data=land_pr(LA), dataAt=self.t)
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+        writer = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)
+        writer.now = self.t + 1
+        writer.store(self.KEY, None, data=land_pr(LA, state="MERGED"), dataAt=writer.now)
+        self.daemon.now = self.t + 2
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_changed_wait_retries_when_the_quota_window_has_room(self):
+        self.pr(LA)
+        self.land()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(self.q, "window_room", return_value=False):
+            self.q.tick(self.t + 1, dirty={self.KEY})
+        self.assertEqual(len(self.w.explains()), 1)
+        self.q.tick(self.t + 2, dirty=set())
+        self.assert_merged_at(LA)
+
     def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
         # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
         # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.
@@ -22668,6 +22803,27 @@ class LandTest(Base):
         self.assertEqual(e["state"], "waiting", e.get("stop"))
         # each refusal is counted as itself: the last one (read Apps busy) is a first, not an eighth
         self.assertEqual((e["stepFail"]["class"], e["stepFail"]["count"]), (gg.land_step_class(said[1]), 1))
+
+    def test_a_draft_pr_stops_at_the_first_refusal_and_names_gh_pr_ready(self):
+        """A draft is permanent until someone marks it ready, so one refusal is the whole answer. 2026-11-21,
+        leo-workspace#7087 (opened as a draft by the PreCompact checkpoint hook): six identical "Pull Request is
+        still a draft" merge calls over ~31 min, with the GraphQL pool at its floor, and a stop naming no step."""
+        for said in ("GraphQL: Pull Request is still a draft (mergePullRequest)",
+                     "pull request is in draft state", "Draft pull requests cannot be merged"):
+            self.assertTrue(gg.LAND_STEP_DRAFT.search(said), said)
+        for said in ("GraphQL: Pull Request is not mergeable (mergePullRequest)", "the PR is a draft review"):
+            self.assertIsNone(gg.LAND_STEP_DRAFT.search(said), said)
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+        self.assertIn("still a draft", e["stop"]["reason"])
+        self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
+        self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
 
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
@@ -26822,6 +26978,75 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("POST", "/graphql", mutation))
         query = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
         self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
+
+
+class ShorthandFlagTest(unittest.TestCase):
+    """`wait --merged` is `wait --until merged` and `log errors|job OWNER/REPO --job ID` is the JOB_ID argument:
+    agents type them, so they run, with the canonical form on stderr; giving both forms is a usage error."""
+
+    def parse(self, argv: list[str]):
+        err = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=err)):
+            args = gg.parser().parse_args(argv)
+        return args, err.getvalue()
+
+    def refused(self, argv: list[str]) -> str:
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=err)), \
+                contextlib.redirect_stdout(out), mock.patch.object(gg.Parser, "argv", argv):
+            with self.assertRaises(SystemExit) as ctx:
+                gg.parser().parse_args(argv)
+        self.assertEqual(ctx.exception.code, 64)
+        return err.getvalue()
+
+    def test_each_wait_shorthand_is_its_until(self):
+        for word in ("green", "done", "required", "merged"):
+            with self.subTest(word=word):
+                args, err = self.parse(["wait", "pr", "o/r#1", f"--{word}", "--timeout", "60"])
+                self.assertEqual(args.until, word)
+                self.assertEqual(args.timeout, 60)
+                self.assertIn(f"--{word} ran as `--until {word}`", err)
+
+    def test_wait_shorthand_with_until_is_refused(self):
+        for argv in (["wait", "pr", "o/r#1", "--merged", "--until", "done"],
+                     ["wait", "pr", "o/r#1", "--until", "merged", "--merged"],
+                     ["wait", "pr", "o/r#1", "--merged", "--green"]):
+            with self.subTest(argv=argv):
+                self.assertIn("not allowed with argument", self.refused(argv))
+
+    def test_wait_until_forms_unchanged(self):
+        args, err = self.parse(["wait", "pr", "o/r#1"])
+        self.assertEqual((args.until, err), ("green", ""))
+        for word in ("green", "done", "required", "merged"):
+            with self.subTest(word=word):
+                args, err = self.parse(["wait", "pr", "o/r#1", "--until", word])
+                self.assertEqual((args.until, err), (word, ""))
+        self.assertIn("invalid choice", self.refused(["wait", "pr", "o/r#1", "--until", "nope"]))
+
+    def test_log_job_flag_is_the_job_id(self):
+        for kind in ("errors", "job"):
+            for argv in (["log", kind, "o/r", "--job", "136749709509"],
+                         ["log", kind, "--job", "136749709509", "o/r"],
+                         ["log", kind, "o/r", "--job=136749709509"]):
+                with self.subTest(argv=argv):
+                    args, err = self.parse(argv)
+                    self.assertEqual((args.kind, args.repo, args.job), (kind, "o/r", 136749709509))
+                    self.assertIn(f"--job ran as `glaeda-gh log {kind} OWNER/REPO 136749709509`", err)
+
+    def test_log_job_id_both_or_neither_is_refused(self):
+        for kind in ("errors", "job"):
+            with self.subTest(kind=kind):
+                self.assertIn("not allowed with argument",
+                              self.refused(["log", kind, "o/r", "5", "--job", "6"]))
+                self.assertIn("is required", self.refused(["log", kind, "o/r"]))
+
+    def test_log_positional_job_id_unchanged(self):
+        args, err = self.parse(["log", "errors", "o/r", "5", "--max", "3"])
+        self.assertEqual((args.repo, args.job, args.max, err), ("o/r", 5, 3, ""))
+        args, err = self.parse(["log", "job", "o/r", "5"])
+        self.assertEqual((args.repo, args.job, err), ("o/r", 5, ""))
+        args, _ = self.parse(["log", "search", "o/r", "boom", "--job", "build.*"])
+        self.assertEqual(args.job, "build.*")  # search and flaky keep --job as the job-name filter
 
 
 if __name__ == "__main__":
