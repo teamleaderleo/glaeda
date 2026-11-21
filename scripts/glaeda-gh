@@ -667,14 +667,15 @@ CONTROLLER_CONNECT_TIMEOUT = 1.0  # a tick must not stall on an unreachable cont
 CONTROLLER_READ_TIMEOUT = 6.0  # an alive controller is worth waiting for: the fallback spends REST
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
-# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. The budget bounds
-# what a tick *starts* (controller_room, Controller.budget_end cuts the connect), never a read already in flight:
-# that cut would read as the controller failing and take it out (#2201 review). An unreachable controller therefore
-# costs a tick this budget in CONTROLLER_CONNECT_TIMEOUT slices, less than the 3 s slices it cost before; one slow
-# read may overrun it by at most CONTROLLER_READ_TIMEOUT, against a TICK_BUDGET of 90 s, and it returns data
-# instead of taking the controller out. The first failure takes the controller out for CONTROLLER_RETRY and more
+# another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
+# what is left of it (Controller.budget_end); the first failure takes the controller out for CONTROLLER_RETRY and more
 # (controller_down), and REST, GitHub's own reads and the cache serve meanwhile.
-CONTROLLER_TICK_BUDGET = 4.0
+# The budget is one whole request (so controller_room can start one at all: #2201's invariant is that the budget
+# never cuts a request it allowed to start) plus room for a second when the first came back quickly. It is not a
+# number of its own: widen a deadline above and this widens with it. Against the old 3 s timeout an unreachable
+# controller cost a tick 3-4 s here; against the connect deadline it costs about 3 s in 1 s slices, and a
+# controller that accepts and then says nothing costs one read deadline before it is taken out for a minute.
+CONTROLLER_TICK_BUDGET = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1.0
 CONTROLLER_DEADLINE = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
@@ -3198,10 +3199,11 @@ class Controller:
         try:
             read = CONTROLLER_READ_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
-            # The daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET). It cuts
-            # the connect, never the read: a read cut short reads as the controller failing and takes it out
-            # (#2201 review), and the read is the part worth waiting for once the controller has answered at all.
+            # The daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET), and
+            # cuts each at what is left of it. controller_room starts none that the budget would cut short, so in
+            # the daemon this only ever shortens a request a caller made outside a tick (#2201 review).
             left = getattr(self, "budget_end", float("inf")) - time.monotonic()
+            read, deadline = min(read, max(0.1, left)), min(deadline, max(0.2, left) + deadline - read)
             CONTROLLER_CONNECT_DEADLINE.seconds = min(CONTROLLER_CONNECT_TIMEOUT, max(0.1, left))
             try:
                 with hard_deadline(deadline), CONTROLLER_OPENER.open(request, timeout=read) as response:
@@ -9615,12 +9617,13 @@ class Daemon:
 
     def controller_room(self) -> bool:
         """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
-        CONTROLLER_CONNECT_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
+        CONTROLLER_READ_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
         started to be cut short by the budget: that cut would read as the controller failing, and take it out
-        (#2201 review). The budget bounds the connects a tick starts, not how long an answer already arriving is
-        waited for (CONTROLLER_READ_TIMEOUT): that wait is what keeps a run read off the shared REST quota."""
+        (#2201 review). The allowance is the read deadline, not the connect one, because the read is the part a
+        slow answer spends: a request allowed to start can always wait out an answer that is on its way, which is
+        what keeps the run it carries off the shared REST quota."""
         return (self.controller is not None and self.now >= self.controller_down_until
-                and time.monotonic() + CONTROLLER_CONNECT_TIMEOUT <= self.controller_budget_end)
+                and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""

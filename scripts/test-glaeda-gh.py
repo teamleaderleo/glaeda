@@ -960,7 +960,7 @@ class ControllerTest(Base):
     def test_a_controller_request_ends_at_the_ticks_controller_budget(self) -> None:
         # air-blue 2026-11-18 22:4xZ: 17.1 of a 19.1 s tick went to a controller answering TimeoutError. A controller
         # that accepts the connection and never answers is cut at the budget the daemon gave this tick, not at
-        # CONTROLLER_TIMEOUT per request.
+        # CONTROLLER_READ_TIMEOUT per request.
         hole = socket.socket()
         hole.bind(("127.0.0.1", 0))
         hole.listen(8)
@@ -973,12 +973,129 @@ class ControllerTest(Base):
         self.assertLess(time.monotonic() - began, 1.5)
 
     def test_no_controller_request_starts_that_the_budget_would_cut(self) -> None:
-        # #2201 review: a request started with less than CONTROLLER_TIMEOUT left is cut by the daemon's own budget,
-        # and that cut reads as the controller failing. It waits for the next tick instead.
-        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_TIMEOUT - 0.5
+        # #2201 review: a request started with less than a whole request's deadline left is cut by the daemon's own
+        # budget, and that cut reads as the controller failing. It waits for the next tick instead. The allowance is
+        # the read deadline: the read is the part a slow answer spends, and waiting it out is what keeps the run it
+        # carries off the shared REST quota.
+        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_READ_TIMEOUT - 0.5
         self.assertFalse(self.daemon.controller_room())
-        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_TIMEOUT + 0.5
+        self.daemon.controller_budget_end = time.monotonic() + gg.CONTROLLER_READ_TIMEOUT + 0.5
         self.assertTrue(self.daemon.controller_room())
+        # and one whole request has to fit in the budget at all, or no tick would ever reach the controller
+        self.assertLessEqual(gg.CONTROLLER_READ_TIMEOUT, gg.CONTROLLER_TICK_BUDGET)
+
+    def slow_controller(self, delay: float, once: bool = True) -> Any:
+        """A controller that accepts at once and then takes `delay` seconds over its first answer (`once`) or
+        every one. Answers the two paths a tick reads: the change feed and a run's state."""
+        import http.server
+        state = {"delay": delay, "runs": {21: ctl_run(21, "in_progress")}}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                time.sleep(state["delay"])
+                if once:
+                    state["delay"] = 0.0
+                split = urllib.parse.urlsplit(self.path)
+                if split.path.startswith("/v1/github/runs/"):
+                    run = state["runs"].get(int(split.path.rsplit("/", 1)[1]))
+                    doc: dict = {"known": run is not None, "run": run}
+                else:
+                    since = urllib.parse.parse_qs(split.query).get("since")
+                    doc = {"cursor": 1, "more": False, "suites": [], "comments": [],
+                           "runs": [] if since is None else list(state["runs"].values()),
+                           "receiver_last_delivery": "2026-09-25T10:00:00Z"}
+                body = json.dumps(doc).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return gg.Controller(f"http://127.0.0.1:{server.server_address[1]}", None)
+
+    def test_an_unreachable_controller_fails_at_the_connect_deadline(self) -> None:
+        # The original point of one 3 s timeout: a tick must not stall on a controller that is not there. Splitting
+        # it kept that in CONTROLLER_CONNECT_TIMEOUT, and this holds the line: a connect that never completes costs
+        # the connect deadline, nowhere near the read deadline an answering controller is given.
+        wall = socket.socket()
+        wall.bind(("127.0.0.1", 0))
+        wall.listen(1)  # a full backlog: the kernel drops the handshake, so connect hangs rather than refusing
+        self.addCleanup(wall.close)
+        port = wall.getsockname()[1]
+        for _ in range(64):
+            held = socket.socket()
+            self.addCleanup(held.close)
+            held.setblocking(False)
+            held.connect_ex(("127.0.0.1", port))
+        ctl = gg.Controller(f"http://127.0.0.1:{port}", None)
+        began = time.monotonic()
+        with self.assertRaises(gg.WatchError):
+            ctl.events(None)
+        took = time.monotonic() - began
+        self.assertLess(took, gg.CONTROLLER_CONNECT_TIMEOUT + 0.5)
+        self.assertLess(took, gg.CONTROLLER_READ_TIMEOUT)  # the read deadline is not what an absent host costs
+
+    def test_a_slow_but_alive_controller_is_served_locally_and_spends_no_rest(self) -> None:
+        # The defect: an answer slower than the old 3 s timeout was given up on, and every run read it would have
+        # served went to the shared REST quota instead. It is now waited out, so no quota is spent.
+        slow = 3.4
+        self.assertGreater(slow, 3.0)  # slower than the timeout this replaced
+        self.assertLess(slow, gg.CONTROLLER_READ_TIMEOUT)  # inside the read deadline that replaced it
+        ctl = self.slow_controller(slow)
+        daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=ctl)
+        gg.register(gg.parse_key("run", "o/r/21"))
+        began = time.monotonic()
+        for i in range(3):
+            daemon.tick(NOW + i * gg.CYCLE)
+        self.assertGreater(time.monotonic() - began, slow)  # it waited the slow answer out
+        self.assertEqual(daemon.controller_cursor, 1)  # and was served: the feed's cursor is the controller's
+        self.assertEqual(self.gh.rest_calls(), [])  # the slow answer cost no REST
+        self.assertEqual(daemon.controller_fallback, {})  # and counted no fallback
+        self.assertEqual((daemon.controller_down_until, daemon.controller_failures), (0.0, 0))
+
+    def test_a_controller_slower_than_the_read_deadline_still_falls_back(self) -> None:
+        # The read deadline is a deadline, not a licence to wait: past it the fallback happens as before, and the
+        # error says it was a deadline so it can be counted.
+        read, gg.CONTROLLER_READ_TIMEOUT = gg.CONTROLLER_READ_TIMEOUT, 0.3
+        self.addCleanup(setattr, gg, "CONTROLLER_READ_TIMEOUT", read)
+        ctl = self.slow_controller(1.5, once=False)
+        began = time.monotonic()
+        with self.assertRaises(gg.ControllerTimeout):
+            ctl.events(None)
+        self.assertLess(time.monotonic() - began, 1.4)
+
+    def test_a_missed_controller_deadline_is_counted_as_rest_spend(self) -> None:
+        # The second half of the fix: a fallback used to be silent, so a controller that degraded looked like
+        # nothing at all while it spent the one quota the whole fleet shares. It is counted where it happens.
+        self.ctl.runs[21] = ctl_run(21, "in_progress")
+        self.gh.runs[21] = {"id": 21, "status": "in_progress", "conclusion": None, "run_attempt": 1,
+                            "updated_at": "2026-09-25T10:00:00Z"}
+        self.gh.jobs[21] = [job("build")]
+        gg.register(gg.parse_key("run", "o/r/21"))
+        self.ctl.down = gg.ControllerTimeout("controller: TimeoutError")
+        self.daemon.tick(NOW)
+        hours = self.daemon.controller_fallback.get("hours") or {}
+        counts = next(iter(hours.values()), {})
+        self.assertEqual(counts.get("deadline"), 1)  # the missed deadline
+        self.assertGreaterEqual(counts.get("restRuns") or 0, 1)  # and what it sent to the shared quota
+        self.assertEqual(self.daemon.controller_fallback.get("since"), NOW)
+        # an error that is not a deadline is a different failure, and adds nothing to these counts (which a new
+        # daemon on this host picks up where they were left: the window they report outlives one process)
+        other = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+        self.assertEqual(other.controller_fallback, self.daemon.controller_fallback)
+        before = json.dumps(other.controller_fallback, sort_keys=True)
+        self.ctl.down = gg.WatchError("controller: URLError")
+        other.tick(NOW)
+        self.assertEqual(json.dumps(other.controller_fallback, sort_keys=True), before)
 
     def test_tracked_run_costs_no_quota(self) -> None:
         self.ctl.runs[21] = ctl_run(21, "in_progress")
@@ -1007,7 +1124,8 @@ class ControllerTest(Base):
         payload = {"known": True, "run": ctl_run(41, "completed", "success")}
         with mock.patch.object(controller, "get", return_value=payload) as get:
             self.assertEqual(controller.run(41, wait=7)["id"], 41)
-        get.assert_called_once_with("/v1/github/runs/41?wait=7", timeout=10)
+        # the long poll waits out the wait it asked for, and then a read deadline on top of it
+        get.assert_called_once_with("/v1/github/runs/41?wait=7", timeout=7 + gg.CONTROLLER_READ_TIMEOUT)
 
     def test_controller_run_rejects_unbounded_wait(self) -> None:
         controller = gg.Controller("http://controller:18765", None)
@@ -25415,7 +25533,8 @@ class RefreshStallTest(AlarmBase):
 
     def test_every_network_call_in_the_refresh_loop_is_bounded(self) -> None:
         """GitHub: SOCKET_TIMEOUT per read and HTTP_DEADLINE per request (hard_deadline); the controller:
-        CONTROLLER_TIMEOUT and CONTROLLER_DEADLINE, and a down one is left alone with a bounded back-off."""
+        CONTROLLER_CONNECT_TIMEOUT per connect, CONTROLLER_READ_TIMEOUT per read and CONTROLLER_DEADLINE per
+        request (hard_deadline), and a down one is left alone with a bounded back-off."""
         self.assertLessEqual(gg.HTTP_DEADLINE, gg.TICK_BUDGET)
         self.assertLessEqual(gg.CONTROLLER_DEADLINE, gg.TICK * 5)
         self.assertLess(gg.TICK_BUDGET + gg.HTTP_DEADLINE, gg.WATCHDOG_AFTER)
