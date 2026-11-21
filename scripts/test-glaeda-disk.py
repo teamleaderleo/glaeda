@@ -6005,6 +6005,21 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["skipped"], "measurement_busy")
 
+    def test_a_second_pressure_apply_on_the_host_skips_at_once(self) -> None:
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        lock = self.root / "pressure-pass.lock"  # beside the EVICT_LOCK _main_run uses
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+        self.assertIsNone(gd._PRESSURE_PASS_HANDLE)
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_called()
+        self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
+        os.close(gd._PRESSURE_PASS_HANDLE)
+
     def test_the_kill_switch_deletes_nothing_and_says_so(self) -> None:
         off = self.root / "disk-off"
         off.write_text("")

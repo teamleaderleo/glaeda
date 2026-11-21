@@ -13121,6 +13121,32 @@ def caller_floor_wait_s(now: float | None = None) -> float | None:
     return until - (time.time() if now is None else now)
 
 
+_PRESSURE_PASS_HANDLE = None  # kept open for the life of the run: the lock goes with the process
+
+
+def pressure_pass_lock() -> bool:
+    """Take this host's pressure-pass lock (pressure-pass.lock beside EVICT_LOCK) for the rest of the run, without
+    waiting. False when another live pass holds it. An unopenable lock file never blocks a pass."""
+    global _PRESSURE_PASS_HANDLE
+    if _PRESSURE_PASS_HANDLE is not None:
+        return True
+    try:
+        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(EVICT_LOCK.parent / "pressure-pass.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except OSError:
+        os.close(fd)
+        return True
+    _PRESSURE_PASS_HANDLE = fd
+    return True
+
+
 def floor_evict_wait_until(apply_: bool) -> float:
     """The monotonic time a run the floor needs may wait for evict.lock until, or 0.0 for no wait.
 
@@ -16017,6 +16043,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return 0
+        # One plain pressure apply per host at a time (pressure_pass_lock). The evict.lock queue serves one
+        # deletion at a time but lets its waiters pile up: on one mini (2026-11-21) nine pressure applies ran at
+        # once, a new one about every 40 s, each waiting its turn while the host sat at 2 GiB free. The pass that
+        # holds this lock judges the same filesystems against the same floor, so a second one only waits.
+        if (a.pressure and not a.family and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE
+                and not pressure_pass_lock()):
+            return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
