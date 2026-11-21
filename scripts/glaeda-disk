@@ -184,8 +184,9 @@ Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "en
 --apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
 did, appends exactly one JSON line to the run log (macOS ~/Library/Logs/glaeda-disk-runs.jsonl, Linux
 ~/.local/state/glaeda/disk-runs.jsonl): free space before and after, target, floor, reclaimed, whether
-the target was reached, the biggest blocked families, and why a run skipped (off, no pressure, a
-lock held, a deferral).
+the target was reached, the biggest blocked families, why a run skipped (off, no pressure, a
+lock held, a deferral), and the release that ran: its sha256 and the OTA tag and source commit
+whose generation holds those exact bytes (`glaeda-disk --version` prints the same).
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -9687,6 +9688,46 @@ def glaeda_disk_sha256() -> str:
     return _OWN_SHA256
 
 
+UPDATE_STATE_DIR = HOME / ".local/state/glaeda/update"  # glaeda-update's state.json and generations/<tag>
+_OWN_RELEASE: dict | None = None
+
+
+def glaeda_disk_release() -> dict:
+    """Which release this glaeda-disk is: its sha256, and the tag and source commit of the OTA generation whose
+    glaeda/scripts/glaeda-disk holds these exact bytes (current, then previous; both None for a hand install). A
+    deploy is proven by the bytes, not by an install time (2026-11-21: "very likely includes 14f096d1" was all a
+    fleet read could say)."""
+    global _OWN_RELEASE
+    if _OWN_RELEASE is None:
+        own = glaeda_disk_sha256()
+        _OWN_RELEASE = {"sha256": own or None, "tag": None, "source": None}
+        try:
+            state = json.loads((UPDATE_STATE_DIR / "state.json").read_text())
+        except (OSError, ValueError):
+            state = {}
+        tags = [state.get(k) for k in ("current", "previous")] if isinstance(state, dict) else []
+        for tag in tags:
+            if not own or not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+                continue
+            gen = UPDATE_STATE_DIR / "generations" / tag
+            try:
+                if hashlib.sha256((gen / "glaeda/scripts/glaeda-disk").read_bytes()).hexdigest() != own:
+                    continue
+                source = json.loads((gen / "release.json").read_text()).get("source")
+            except (OSError, ValueError, AttributeError):
+                continue
+            _OWN_RELEASE.update(tag=tag, source=source if isinstance(source, str) else None)
+            break
+    return _OWN_RELEASE
+
+
+def version_line() -> str:
+    r = glaeda_disk_release()
+    if r["tag"]:
+        return f"glaeda-disk {r['tag']} (source {r['source'] or 'unknown'}, sha256 {r['sha256']})"
+    return f"glaeda-disk unreleased (no OTA generation holds these bytes; sha256 {r['sha256'] or 'unreadable'})"
+
+
 def bundle_failure_stands(path: str, got: dict, now: float) -> bool:
     """Whether a remembered failure (mtime already matched) still keeps the tree: under its retry age, recorded by
     this same glaeda-disk (a fix to the judgement must not wait out the age: cmux17's hot-verify mirror stayed
@@ -15784,6 +15825,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--runner-caches", action="store_true",
                     help="use the narrow enrolled-runner account profile (macOS only)")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--version", action="version", version=version_line(),
+                    help="print this glaeda-disk's release (OTA tag, source commit, sha256) and exit")
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dedupe", action="store_true",
@@ -16648,6 +16691,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "target_gib": RUN.get("target_gib"), "target_bytes": target, "targets": RUN.get("targets"),
            "default_targets": bool(RUN.get("default_targets")), "config_sha256": RUN.get("config_sha256"),
            "floor_gib": RUN.get("floor_gib"),
+           "release": glaeda_disk_release(),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),

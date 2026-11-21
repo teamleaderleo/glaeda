@@ -5347,6 +5347,32 @@ class GlaedaDiskTest(unittest.TestCase):
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
 
+    def test_the_release_is_the_ota_generation_holding_these_exact_bytes(self) -> None:
+        state = self.root / "update"
+        own = Path(gd.__file__).read_bytes()
+
+        def generation(tag: str, body: bytes, source: str) -> None:
+            gen = state / "generations" / tag
+            (gen / "glaeda/scripts").mkdir(parents=True)
+            (gen / "glaeda/scripts/glaeda-disk").write_bytes(body)
+            (gen / "release.json").write_text(json.dumps({"source": source}))
+
+        generation("v-20261121-new", b"other bytes", "b" * 40)
+        generation("v-20261121-old", own, "a" * 40)
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": "v-20261121-old",
+                                                      "quarantined": []}))
+        sha = hashlib.sha256(own).hexdigest()
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # current holds other bytes (a setup that has not installed yet): the previous one is what runs
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": "v-20261121-old", "source": "a" * 40})
+            self.assertIn("v-20261121-old (source " + "a" * 40, gd.version_line())
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": None,
+                                                      "quarantined": []}))
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # a hand install: no generation holds these bytes, and the line says so instead of guessing
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": None, "source": None})
+            self.assertTrue(gd.version_line().startswith("glaeda-disk unreleased"))
+
     def test_every_applying_run_writes_one_run_line(self) -> None:
         blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
         status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
@@ -5361,6 +5387,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(row["target_bytes"], 170 * gd.GIB)
         self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
         self.assertEqual(row["config_sha256"], gd.config_sha256())
+        self.assertEqual(row["release"], gd.glaeda_disk_release())  # which bytes wrote the row: a deploy is provable
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
