@@ -4853,7 +4853,7 @@ class ClientTest(Base):
     def test_land_takes_a_head_pin_and_slash_targets(self) -> None:
         """Coordinator, 2026-11-21: `land manaflow-ai/cmux/48704 --match-head-commit SHA` was "unrecognized arguments"."""
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
-        self.assertEqual((args.words, args.match_head), (["manaflow-ai/cmux/48704"], "abc1234"))
+        self.assertEqual((args.words, args.sha), (["manaflow-ai/cmux/48704"], "abc1234"))
         self.assertEqual(gg.land_key("manaflow-ai/cmux/48704")[1:], ("manaflow-ai/cmux", 48704))
         head = "a" * 40
         with mock.patch.object(gg, "pr_head_sha", lambda repo, n: head):
@@ -21775,6 +21775,39 @@ class LandTest(Base):
         self.tick(30)
         self.assert_merged_at(LA)
 
+    def test_sha_pins_the_land_to_that_head(self):
+        # `glaeda-gh land o/r#1 --sha SHA` (an agent typed it, 2026-11-21, and argparse refused it): the head it names
+        # merges; another head stops the land (head_moved) before land_judge or a merge, naming the land again.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA[:12])
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_sha_pin_stops_when_the_head_is_another(self):
+        self.pr(LB)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.explains(), self.w.gh_calls("pr", "merge")),
+                         ("stopped", "head_moved", [], []))
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        self.assertIn("stopped: head_moved", self.w.sent()[-1][-1])
+        # A land again without --sha drops the pin: it lands the head judged, as before.
+        self.land()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertNotIn("pinSha", e)
+        self.assert_merged_at(LB)
+
+    def test_land_takes_timeout_as_wait_and_a_sha(self):
+        args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
+        self.assertEqual((args.wait, args.sha), (1400, LA))
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--wait", "5"]).wait, 5)
+        self.assertEqual(gg.land_pin_sha(LA.upper()), LA)
+        with self.assertRaises(gg.WatchError):
+            gg.land_pin_sha("not-a-sha")
+        self.assertEqual(gg.land_serve_one({"op": "land", "target": "o/r#1", "sha": "zz"})[0], None)
+
     def test_dependency_chain_lands_after_the_first_merges(self):
         self.pr(LA)
         self.pr(LC, key="pr:o/r#2")
@@ -23011,6 +23044,87 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertEqual((e["state"], len(self.w.explains())), ("merged", 1))
 
+    OVERRIDE = {"reason": "base red: ci fails the same way on main", "receipt": "main run 123 job 456"}
+
+    def merge_envs(self) -> list[dict]:
+        return [env for c, env in zip(self.w.calls, self.w.envs)
+                if c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]]
+
+    def test_land_override_rides_every_merge_try_and_is_logged_with_the_entry(self):
+        # lw#7078 stopped in the queue on a base red, and cmux#48755 landed by hand: glaeda land carried no override.
+        # `land --override-reason R --override-receipt T`: every merge try runs with LAND_JUDGE_OVERRIDE(_RECEIPT).
+        want = {"LAND_JUDGE_OVERRIDE": self.OVERRIDE["reason"], "LAND_JUDGE_OVERRIDE_RECEIPT": self.OVERRIDE["receipt"]}
+        self.pr(LA)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane"}), \
+                mock.patch.object(gg, "policy_host", return_value="host"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--override-reason", self.OVERRIDE["reason"],
+                                      "--override-receipt", self.OVERRIDE["receipt"], "--json"]), 0)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "merge refused: something transient"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e.get("override"), self.OVERRIDE)
+        queued = [h for h in e["history"] if h["event"] == "queued"]
+        self.assertEqual((queued[-1].get("override"), queued[-1].get("receipt")),
+                         (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+        self.assertIn("override: " + self.OVERRIDE["reason"], gg.land_line(e, self.t))
+        self.w.gh_rc["merge"] = 0
+        for _ in range(20):
+            if e.get("state") == "merged":
+                break
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(600)
+        self.assertEqual(e.get("state"), "merged")
+        envs = self.merge_envs()
+        self.assertGreaterEqual(len(envs), 2)
+        for env in envs:
+            self.assertEqual({k: env.get(k) for k in want}, want)
+        # with none given, a merge carries none
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.assertEqual(self.tick()["state"], "merged")
+        [env] = self.merge_envs()
+        self.assertFalse(set(want) & set(env))
+
+    def test_land_override_goes_to_the_brokers_land_as_its_override(self):
+        self.broker = True
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        [call] = self.broker_lands()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "override": self.OVERRIDE})
+        [env] = self.merge_envs()
+        self.assertEqual((env.get("LAND_JUDGE_OVERRIDE"), env.get("LAND_JUDGE_OVERRIDE_RECEIPT")),
+                         (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+        self.assertEqual(e["state"], "merged")
+
+    def test_land_override_past_lane_gh_lands_limits_is_refused_at_enqueue(self):
+        bad = [["--override-reason", "r"], ["--override-receipt", "t"],
+               ["--override-reason", "r" * 201, "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", "t" * 241],
+               ["--override-reason", "two\nlines", "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", "two\nlines"]]
+        for extra in bad:
+            said: list[str] = []
+            with self.subTest(extra=[w[:12] for w in extra]), \
+                    mock.patch.object(gg, "daemon_running", return_value=True), \
+                    mock.patch.object(gg, "say_waiting", said.append), contextlib.redirect_stdout(io.StringIO()):
+                self.assertNotEqual(gg.main(["land", "o/r#1", *extra]), 0)
+                self.assertRegex(" ".join(said), r"override-re(ason|ceipt)")
+                d = gg.LandQueue.requests_dir()
+                self.assertEqual(list(d.glob("*.json")) if d.is_dir() else [], [], "nothing queued")
+        # the limits themselves are allowed
+        self.assertEqual(gg.land_override("r" * 200, "t" * 240), {"reason": "r" * 200, "receipt": "t" * 240})
+        # a forwarded request past them carries no override into the queue
+        self.assertIsNone(gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}}))
+
     def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
         self.broker = True
         self.pr(LA)
@@ -24051,7 +24165,7 @@ class LandTest(Base):
     # -- land --match-head-commit SHA against a cache that still shows the head before it (huge-blue, 2026-11-21)
 
     def land_pinned(self, pin: str) -> None:
-        gg.land_request("land", "o/r#1", [], "host/lane", pin=pin)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=pin)
 
     def test_a_pinned_land_never_judges_the_cached_head_before_the_pin(self):
         """leo-workspace#7221, 2026-11-21 10:56Z: 53fa5568 pushed, `land --match-head-commit 53fa5568` stopped within a
@@ -24060,7 +24174,7 @@ class LandTest(Base):
         self.pr(LA)
         self.github_head[self.KEY] = LB  # pushed: the cache still says LA
         self.land_pinned(LB[:8])
-        self.assertEqual(json.loads(next(gg.LandQueue.requests_dir().glob("*.json")).read_text())["pin"], LB[:8])
+        self.assertEqual(json.loads(next(gg.LandQueue.requests_dir().glob("*.json")).read_text())["sha"], LB[:8])
         e = self.tick(1)  # the nudge's read shows LB: nothing judged at LA (its conflict would have stopped it)
         self.assertEqual(self.w.explains(), [])
         self.assertIn(self.KEY, self.w.nudged)
@@ -24069,7 +24183,7 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LB))
         e = self.tick(1)
         self.assertIn("pin_seen", [h.get("event") for h in e["history"]])
-        self.assertNotIn("pin", e)
+        self.assertTrue(e.get("pinSeen"))
         self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
         self.assert_merged_at(LB)
 
@@ -24101,7 +24215,26 @@ class LandTest(Base):
         e = self.tick(1)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
-        self.assertIn(f"--match-head-commit {LC}", e["stop"]["next"])
+        self.assertIn(f"--sha {LC}", e["stop"]["next"])
+
+    def test_a_stale_cached_head_never_stops_a_newer_pin_as_head_moved(self):
+        """The cache is stale and the pin is newer: judge()'s head_moved compares the pin with the cached head, so
+        before pin_wait the land stopped head_moved on a head GitHub no longer has. No stop until a read since the
+        request; that read shows the pin, and it is judged and merged."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        for _ in range(int(gg.LAND_FRESH_WAIT)):  # long past every other wait: still no stop, no judgment
+            e = self.tick(1)
+        self.assertEqual(self.w.explains(), [])
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertNotIn("stopped", [h.get("event") for h in e["history"]])
+        self.nudge_reads = True
+        self.github_head[self.KEY] = LB
+        self.w.answers.append(ok_answer(LB))
+        self.tick(gg.NUDGE_MIN)  # the next nudge's read shows LB
+        self.tick(1)
+        self.assert_merged_at(LB)
 
     def test_a_pinned_land_on_an_upstream_host_refreshes_the_pr(self):
         """A host that reads PRs through an upstream: the read is a refresh through it (the broker's quota-aware path),
@@ -27835,6 +27968,117 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIsNone(gg.wait_starved(self.request(began=now - gg.WAIT_DIAGNOSE_AFTER - 5), None, now))
         req = self.request(began=now - gg.STALE_DATA_AFTER - 60)
         self.assertIsNotNone(gg.wait_starved(req, None, now), "past the old bound it is still said, just not read")
+
+
+class PrintedTargetNotationTest(unittest.TestCase):
+    """The notation this tool prints for a target is accepted back as one.
+
+    Measured on 2026-11-21: a lane's background `glaeda-gh wait pr:teamleaderleo/leo-workspace/7241 ...`
+    exited at once with "argument kind: invalid choice: 'pr:teamleaderleo/leo-workspace/7241'", having
+    waited on nothing, while every still-waiting line the tool prints names its target exactly that way
+    ("still waiting on pr:manaflow-ai/cmux#48834"). The most-copied string in the output was invalid as
+    input. Every spelling below resolves to the same key, and the old ones keep working."""
+
+    SPELLINGS = {
+        "pr:manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),          # as the tool prints it
+        "manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),             # as it always worked
+        "manaflow-ai/cmux/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "pr:manaflow-ai/cmux/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "PR:manaflow-ai/cmux#48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "https://github.com/manaflow-ai/cmux/pull/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "pr:https://github.com/manaflow-ai/cmux/pull/48834": ("pr", "pr:manaflow-ai/cmux#48834"),
+        "run:manaflow-ai/cmuxterm-hq/44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "manaflow-ai/cmuxterm-hq/44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "manaflow-ai/cmuxterm-hq#44893458900": ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "https://github.com/manaflow-ai/cmuxterm-hq/actions/runs/44893458900":
+            ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "run:https://github.com/manaflow-ai/cmuxterm-hq/actions/runs/44893458900":
+            ("run", "run:manaflow-ai/cmuxterm-hq/44893458900"),
+        "comment:manaflow-ai/cmux#48834": ("comment", "comment:manaflow-ai/cmux#48834"),
+        "manaflow-ai/cmux#48834 ": ("comment", "comment:manaflow-ai/cmux#48834"),
+        "head:manaflow-ai/cmux@" + "a" * 40: ("head", "head:manaflow-ai/cmux@" + "a" * 40),
+        "manaflow-ai/cmux@" + "A" * 40: ("head", "head:manaflow-ai/cmux@" + "a" * 40),
+        # the exact string the measurement refused
+        "pr:teamleaderleo/leo-workspace/7241": ("pr", "pr:teamleaderleo/leo-workspace#7241"),
+    }
+
+    def test_every_spelling_of_a_target_resolves_to_the_same_key(self) -> None:
+        for text, (kind, key) in self.SPELLINGS.items():
+            with self.subTest(text):
+                self.assertEqual(gg.parse_key(kind, text), key)
+
+    def test_the_key_the_tool_prints_is_a_target_it_takes(self) -> None:
+        """The round trip, which is the whole class of bug: whatever parse_key prints, parse_key reads."""
+        for text, (kind, key) in self.SPELLINGS.items():
+            with self.subTest(text):
+                self.assertEqual(gg.parse_key(kind, gg.parse_key(kind, text)), key)
+
+    def test_a_printed_target_runs_as_itself_with_no_kind_word(self) -> None:
+        want = {
+            ("wait", "pr:teamleaderleo/leo-workspace/7241", "--timeout", "1500"):
+                ["wait", "pr", "teamleaderleo/leo-workspace/7241", "--timeout", "1500"],
+            ("wait", "run:manaflow-ai/cmuxterm-hq/44893458900", "--jobs"):
+                ["wait", "run", "manaflow-ai/cmuxterm-hq/44893458900", "--jobs"],
+            ("wait", "comment:o/r#5", "--match", "receipt"): ["wait", "comment", "o/r#5", "--match", "receipt"],
+            ("status", "pr:o/r#5", "--json"): ["status", "pr", "o/r#5", "--json"],
+            ("wait", "file:/tmp/x", "--exists"): ["wait", "file", "/tmp/x", "--exists"],
+            ("wait", "pid:1234"): ["wait", "pid", "1234"],
+            ("wait", "until:45m"): ["wait", "until", "45m"],
+        }
+        for given, fixed in want.items():
+            with self.subTest(given):
+                got, note = gg.infer_kind(list(given))
+                self.assertEqual(got, fixed)
+                self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
+                gg.parser().parse_args(got)  # argparse takes what it was handed
+        # A URL's `https:` is not a kind either: it keeps reading as the pr target it already was
+        self.assertEqual(gg.infer_kind(["wait", "https://github.com/o/r/pull/5"])[0],
+                         ["wait", "pr", "https://github.com/o/r/pull/5"])
+        # `wait until quota:rest`'s own colon is not a kind, a kind the command does not take is not
+        # promoted into its kind slot, and a command with no target is left alone
+        for same in (["wait", "until", "quota:rest"], ["status", "file:/x"], ["status", "pid:1"],
+                     ["budget", "pr:o/r#5"]):
+            self.assertEqual(gg.infer_kind(list(same))[0], same)
+
+    def test_the_kind_given_and_the_prefix_agree_or_it_refuses(self) -> None:
+        """Never a guess across kinds: a run id read as a pull request number would wait on the wrong thing."""
+        for kind, text, named in (("pr", "run:o/r/44893458900", "run"), ("run", "pr:o/r#5", "pr"),
+                                  ("comment", "run:o/r/44893458900", "run"), ("pr", "head:o/r@" + "a" * 40, "head")):
+            with self.subTest(text), self.assertRaises(gg.WatchError) as refused:
+                gg.parse_key(kind, text)
+            said = str(refused.exception)
+            self.assertIn(f"names a {named} target", said)
+            self.assertIn(gg.KIND_FORMS[kind], said, "a refusal names the spellings it does take")
+
+    def test_a_refused_kind_names_the_spellings_instead_of_the_kind_list_alone(self) -> None:
+        bad = "argument kind: invalid choice: 'pr/o/r#5' (choose from pr, run, comment, file, pid, until)"
+        self.assertIn("`pr:OWNER/REPO#N` as this tool prints it", gg.kind_spellings(bad))
+        self.assertIn("a file target is a path, or file:PATH",
+                      gg.kind_spellings("argument kind: invalid choice: 'file:/x' (choose from pr, run, comment)"))
+        self.assertEqual(gg.kind_spellings("argument --timeout: expected one argument"), "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), \
+                self.assertRaises(SystemExit) as exit_:
+            gg.main(["status", "file:/x", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertIn("a file target is a path, or file:PATH", doc["reason"])
+
+    def test_land_and_post_take_the_printed_notation_too(self) -> None:
+        """One normalisation at the boundary, so every subcommand that takes a target has it."""
+        self.assertEqual(gg.land_key("pr:manaflow-ai/cmux/48704"),
+                         ("pr:manaflow-ai/cmux#48704", "manaflow-ai/cmux", 48704))
+        self.assertEqual(gg.land_key("manaflow-ai/cmux#48704"),
+                         ("pr:manaflow-ai/cmux#48704", "manaflow-ai/cmux", 48704))
+        with self.assertRaises(gg.WatchError) as refused:
+            gg.land_key("run:manaflow-ai/cmux/44893458900")
+        self.assertIn("names a run target", str(refused.exception))
+        for target in ("pr:o/r#5", "comment:o/r#5", "o/r#5"):
+            with self.subTest(target):
+                args = gg.parser().parse_args(["post", "comment", target, "--body", "hi"])
+                item = gg.post_item(args)
+                self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
 
 
 if __name__ == "__main__":

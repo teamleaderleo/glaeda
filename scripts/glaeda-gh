@@ -57,10 +57,11 @@
                                                         (~/.config/glaeda/on-event.json), and what each one did
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
-    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--wait S] [--json]
-                                                        land a PR: the daemon asks land_judge, takes each step it
+    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
+                   [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
-                                                        pinned merge) and tells the requester on a merge or a stop
+                                                        pinned merge) and tells the requester on a merge or a stop;
+                                                        --sha lands only that head (another stops it: head_moved)
     glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day
     glaeda-gh land cancel OWNER/REPO#N                  stop landing it (a step already started finishes)
 
@@ -872,6 +873,50 @@ ISSUE_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pul
 # `origin` as GitHub writes it, for a bare number's repository (cwd_repo)
 REMOTE_RE = re.compile(rf"(?:git@github\.com:|(?:https?://|ssh://git@)github\.com/)({NAME})/({NAME}?)(?:\.git)?/?")
 KEY_RES = {"pr": PR_KEY_RE, "run": RUN_KEY_RE, "comment": ISSUE_KEY_RE, "head": HEAD_RE}
+# `KIND:TARGET` -- the notation this tool *prints* for a target, and so the string an agent copies out of a
+# line and back into the next call. parse_key's output (`pr:owner/repo#5`, `run:owner/repo/123`) names the
+# target in every waiting, still-waiting and summary line, and until 2026-11-21 handing one back was an
+# argparse refusal ("argument kind: invalid choice: 'pr:teamleaderleo/leo-workspace/7241'") that cost a
+# whole background wait: the job printed a usage block and exited having waited on nothing. Accepted
+# everywhere a target is: the prefix carries the kind, so nothing here is a guess across kinds -- a prefix
+# naming a *different* kind than the command's refuses, and names the spellings (drop_kind_prefix).
+PREFIX_KINDS = ("pr", "run", "comment", "head", "file", "pid", "until")
+STATUS_KINDS = ("pr", "run", "comment")  # the kinds `status` takes; `head` is read for a PR, never asked for
+WAIT_KINDS = STATUS_KINDS + ("file", "pid", "until")
+KIND_PREFIX_RE = re.compile(rf"({'|'.join(PREFIX_KINDS)}):\s*(\S.*)", re.I | re.S)
+# The spellings of one target, for a refusal to name. `wait until`'s own targets (`quota:rest`) hold a
+# colon that is not a kind, and a URL's `https:` is not one either: both fall through unchanged.
+KIND_FORMS = {"pr": "OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N, a bare N in this checkout, or a pull request URL",
+              "run": "OWNER/REPO/RUN_ID, OWNER/REPO#RUN_ID, run:OWNER/REPO/RUN_ID, or a run URL",
+              "comment": "OWNER/REPO#N, OWNER/REPO/N, comment:OWNER/REPO#N, a bare N in this checkout, "
+                         "or an issue or pull request URL",
+              "head": "OWNER/REPO@SHA, head:OWNER/REPO@SHA, or a commit URL",
+              "file": "a path, or file:PATH", "pid": "a process id, or pid:PID",
+              "until": "quota, quota:rest, quota:graphql, an ISO time, a UTC time (14:40Z) or a duration (45m)"}
+
+
+def split_kind_prefix(text: str) -> tuple[str, str] | None:
+    """`("pr", "o/r#5")` for `pr:o/r#5`, the notation this tool prints; None when there is no kind prefix."""
+    match = KIND_PREFIX_RE.fullmatch(text.strip())
+    return (match.group(1).lower(), match.group(2).strip()) if match else None
+
+
+def drop_kind_prefix(text: str, kind: str, also: tuple[str, ...] = ()) -> str:
+    """TEXT without the `KIND:` prefix this tool prints for it, for a caller that already knows the kind.
+
+    A prefix naming another kind is never read as this one: `wait pr run:o/r/123` refuses, and says which
+    spellings a pr target has, rather than reading the run id as a pull request number. ALSO names the
+    other prefixes this caller accepts (`post comment pr:o/r#5` posts on that pull request's thread)."""
+    split = split_kind_prefix(text)
+    if split is None:
+        return text.strip()
+    named, rest = split
+    if named == kind or named in also:
+        return rest
+    forms = KIND_FORMS.get(kind, "")
+    raise WatchError(f"{text!r} names a {named} target, but this is a {kind} target: a {kind} is "
+                     f"{forms or 'named by its own form'}"
+                     + (f"; a {named} target goes to a {named} call" if named in PREFIX_KINDS else ""))
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
@@ -1154,8 +1199,9 @@ def cwd_repo(cwd: str | None = None) -> str | None:
 
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
-    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in."""
-    text = text.strip()
+    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
+    and a target already spelled the way this function prints it (`pr:o/r#5`) is taken as it stands."""
+    text = drop_kind_prefix(text, kind)
     bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
     if bare:
         repo = cwd_repo()
@@ -10739,11 +10785,11 @@ def land_config() -> dict:
 
 def land_key(target: str) -> tuple[str, str, int]:
     """(key, OWNER/REPO as typed, N) for OWNER/REPO#N, OWNER/REPO/N, a PR URL, or a bare N in the repository
-    the caller stands in (parse_key reads both of the loose forms)."""
-    text = target.strip()
+    the caller stands in (parse_key reads both of the loose forms), or `pr:OWNER/REPO#N` as this tool prints it."""
+    text = drop_kind_prefix(target, "pr")
     m = PR_KEY_RE.fullmatch(text)
     if not m and not BARE_NUMBER.fullmatch(text):
-        raise WatchError(f"land takes OWNER/REPO#N, OWNER/REPO/N or a pull request URL, not {target!r}")
+        raise WatchError(f"land takes {KIND_FORMS['pr']}, not {target!r}")
     key = parse_key("pr", text)  # a bare number names the repository the caller stands in, or raises
     _, owner, repo, number = split_key(key)
     return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
@@ -11376,13 +11422,19 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
-        # --match-head-commit SHA: the head this request was made for (pin_wait). A later request replaces it.
-        if land_pin(req.get("pin")):
-            e.update(pin=land_pin(req.get("pin")), pinSince=self.now)
+        # --sha pins the head this request lands; a request without one (a re-request too) lands whatever head is
+        # judged, as before.
+        try:
+            pin = land_pin_sha(req.get("sha"))
+        except WatchError:
+            pin = ""
+        if pin:
+            e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
         else:
-            e.pop("pin", None)
+            e.pop("pinSha", None)
             e.pop("pinSince", None)
         e.pop("pinWait", None)
+        e.pop("pinSeen", None)
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -11391,15 +11443,18 @@ class LandQueue:
         elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
             e.pop("lane", None)
             e.pop("laneHost", None)
+        if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
+            e["override"] = land_request_override(req)
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None)
-            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
+            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
+                         **land_override_history(e))
         else:
-            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
+            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e))
         self.entries[key] = e
         self.save(e)
         self.changed_entries.add(key)
@@ -11571,7 +11626,7 @@ class LandQueue:
                              # an entry from before the lane was recorded names none there: its requester's
                              # PARENT/CHILD would read as a session on the executor's host
                              | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                             | ({"pin": e["pin"]} if land_pin(e.get("pin")) else {}))
+                             | ({"override": e["override"]} if e.get("override") else {}))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -11587,7 +11642,7 @@ class LandQueue:
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy", "lane", "laneHost", "pin") if k in req}
+                                                      "queuedBy", "lane", "laneHost", "override") if k in req}
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
@@ -12398,7 +12453,7 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
-        if e.get("pin") and self.pin_wait(e, c or {}, head):
+        if e.get("pinSha") and not e.get("pinSeen") and self.pin_wait(e, c or {}, head):
             return
         running = land_checks_running(data, head)
         kind = w.get("kind")
@@ -12468,16 +12523,16 @@ class LandQueue:
             self.judge(e, head, fp, counts=woke)
 
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
-        """`land --match-head-commit SHA` (E's pin): True while E waits for the cache to show SHA, or when it stopped
-        because a read made since the request shows another head. huge-blue, 2026-11-21 10:56Z: leo-workspace#7221,
-        pinned at 53fa5568 just pushed, was judged within a minute on the cache's 5-minute-old copy of 0eb40dbac8fb
-        and stopped on that head's conflict; the pin said a newer head existed. Until a read shows the pinned head, no
-        verdict on a cached one is taken: the PR is read again (nudged, or refreshed through the upstream), at most
-        every NUDGE_MIN. Once the cache shows SHA the pin is spent: the queue's own pushes later move the head."""
-        pin = str(e.get("pin") or "")
-        if head and head.startswith(pin):
-            e.pop("pin", None)
-            e.pop("pinSince", None)
+        """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
+        the request, or when it stopped because that read shows another head. huge-blue, 2026-11-21 10:56Z:
+        leo-workspace#7221, pinned at 53fa5568 just pushed, was judged within a minute on the cache's 5-minute-old copy
+        of 0eb40dbac8fb and stopped on that head's conflict; the pin said a newer head existed. Until the cache shows
+        the pinned head, or a read since the request shows another, no verdict on a cached head is taken (judge's own
+        head_moved included): the PR is read again (nudged, or refreshed through the upstream), at most every
+        NUDGE_MIN. Once the cache shows the pin (pinSeen), judge's head_moved check holds as it always did."""
+        pin = str(e.get("pinSha") or "")
+        if head and not land_head_moved(pin, head):
+            e["pinSeen"] = True
             if e.pop("pinWait", None) is not None:
                 self.history(e, "pin_seen", head=head[:12])
             self.save(e)
@@ -12486,12 +12541,10 @@ class LandQueue:
         reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
                  and not isinstance(t, bool)]
         if head and reads and max(reads) >= since:
-            # GitHub, read since the request, says the head is not the pinned one: the pin refuses, as the CLI's does
-            # (check_land_pin)
+            # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
             e.pop("pinWait", None)
-            name = key_name(e["key"])
-            self.stop(e, "head_moved", f"{name}'s head moved: it is {head[:12]}, not {pin[:12]}",
-                      f"glaeda-gh land {name} --match-head-commit {head}")
+            self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
         w = e.get("pinWait")
         if not isinstance(w, dict):
@@ -12502,7 +12555,15 @@ class LandQueue:
         if not isinstance(last, (int, float)) or isinstance(last, bool) or self.now - last >= NUDGE_MIN:
             if not self.reads_upstream():
                 w["readAt"] = self.now
+                self.save(e)
+                before = (c.get("dataAt"), c.get("updatedAtAt"))
                 self.nudge(e["key"])
+                again = self.cache_of(e["key"]) or {}  # a read the nudge already answered (the daemon's own pass)
+                if (again.get("dataAt"), again.get("updatedAtAt")) != before:
+                    # judged from that read on the next pass (consider holds this pass's copy), or stopped now
+                    self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
+                    self.changed_entries.add(e["key"])
+                    return True
             elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
                 w["readAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
@@ -12718,6 +12779,10 @@ class LandQueue:
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
+        if land_head_moved(str(e.get("pinSha") or ""), sha):
+            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+            return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             if not free or self.snapshot(e["key"], sha)[1] == "wait":
@@ -13553,8 +13618,12 @@ class LandQueue:
         merge_hold pass again for 202 s before the broker's land answered 409 "REST rate limit is spent for login
         until 00:38Z": the window was gone inside its own merge step."""
         lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
-        got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"],
-                         json.dumps({"number": int(e["number"]), "sha": sha}, sort_keys=True)], LAND_MERGE_DEADLINE, e)
+        args: dict[str, Any] = {"number": int(e["number"]), "sha": sha}
+        extra = land_override_env(e)
+        if extra:  # lane-gh land's own override, which the broker's land_judge reads (and logs) on its host
+            args["override"] = {"reason": extra["LAND_JUDGE_OVERRIDE"], "receipt": extra["LAND_JUDGE_OVERRIDE_RECEIPT"]}
+        got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"], json.dumps(args, sort_keys=True)],
+                        LAND_MERGE_DEADLINE, e, extra)
         envelope: Any = None
         with contextlib.suppress(ValueError):
             envelope = json.loads(got.stdout or "")
@@ -13599,7 +13668,7 @@ class LandQueue:
             got = self.broker_land(e, sha)
         else:
             got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
-                            LAND_MERGE_DEADLINE, e)
+                            LAND_MERGE_DEADLINE, e, land_override_env(e))  # the shim's land_judge reads the override
         said = f"{got.stderr or ''} {got.stdout or ''}"
         if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
             with self.lock:  # the shim's land_judge judged it on a spent quota: parked, and no `pr view` after it
@@ -13848,8 +13917,54 @@ def land_request_path(rid: str) -> Path:
     return _land_written[rid]
 
 
+LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason and receipt, one line each
+LAND_OVERRIDE_RECEIPT_MAX = 240
+
+
+def land_override(reason: str | None, receipt: str | None) -> dict | None:
+    """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
+    neither. Refused (WatchError) as lane-gh land refuses it: one of the two alone, an empty one, a newline, or past
+    LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters. Each merge try then runs with
+    LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's "override")."""
+    if reason is None and receipt is None:
+        return None
+    if reason is None or receipt is None:
+        raise WatchError("--override-reason and --override-receipt go together: give both (the reason, and the "
+                         "receipt naming the base run and job ids), or neither")
+    for flag, text, most in (("--override-reason", reason, LAND_OVERRIDE_REASON_MAX),
+                             ("--override-receipt", receipt, LAND_OVERRIDE_RECEIPT_MAX)):
+        if "\n" in text or "\r" in text:
+            raise WatchError(f"{flag} is one line: it has a newline")
+        if not text.strip():
+            raise WatchError(f"{flag} is empty")
+        if len(text) > most:
+            raise WatchError(f"{flag} is {len(text)} characters; lane-gh land takes at most {most}")
+    return {"reason": reason, "receipt": receipt}
+
+
+def land_request_override(req: dict) -> dict | None:
+    """A request's override as land_override takes it, or None when it names none or a bad one (an older sender's,
+    or a forwarded one past the limits: never a merge override no queue checked)."""
+    o = req.get("override")
+    if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
+        return None
+    try:
+        return land_override(o["reason"], o["receipt"])
+    except WatchError:
+        return None
+
+
+def land_override_env(e: dict) -> dict[str, str]:
+    """The environment a merge try of E adds: its override, as land-judge and lane-gh read it."""
+    o = e.get("override")
+    if not isinstance(o, dict) or not o.get("reason") or not o.get("receipt"):
+        return {}
+    return {"LAND_JUDGE_OVERRIDE": str(o["reason"]), "LAND_JUDGE_OVERRIDE_RECEIPT": str(o["receipt"])}
+
+
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
-                 queued_by: str = "", lane: tuple[str, str] | None = None, pin: str = "") -> str:
+                 queued_by: str = "", lane: tuple[str, str] | None = None, sha: str = "",
+                 override: dict | None = None) -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
     request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
     steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
@@ -13864,17 +13979,24 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
                 "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {})
-               | ({"pin": land_pin(pin)} if land_pin(pin) else {}))
+               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {}))
     return rid
 
 
-LAND_PIN = re.compile(r"[0-9a-f]{7,40}")
+LAND_PIN_SHA = re.compile(r"[0-9a-f]{7,40}")
 
 
-def land_pin(pin: Any) -> str:
-    """A request's --match-head-commit SHA (full or abbreviated, lower case), or "" when it names none."""
-    pin = str(pin or "").strip().lower()
-    return pin if LAND_PIN.fullmatch(pin) else ""
+def land_pin_sha(text: Any) -> str:
+    """A --sha as the queue keeps it (lowercase hex, 7 to 40), or "" for none; anything else is an error."""
+    sha = str(text or "").strip().lower()
+    if sha and not LAND_PIN_SHA.fullmatch(sha):
+        raise WatchError(f"--sha is 7 to 40 hex characters: {str(text)[:60]!r}")
+    return sha
+
+
+def land_head_moved(pin: str, head: str) -> bool:
+    """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
+    return bool(pin and head) and not head.lower().startswith(pin)
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:
@@ -13960,7 +14082,17 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         bits.append(f"explain_failed: {land_trim(e['explain'].get('reason'), 160)}")
     if e.get("requester"):
         bits.append(f"for {e['requester']}")
+    o = e.get("override")
+    if isinstance(o, dict) and o.get("reason"):
+        bits.append(f"override: {land_trim(o.get('reason'), 120)} (receipt: {land_trim(o.get('receipt'), 120)})")
     return "  ".join(bits)
+
+
+def land_override_history(e: dict) -> dict:
+    """An entry's override as its queued/updated history line names it (reason and receipt, whole: each is one line
+    of at most 240 characters)."""
+    o = e.get("override")
+    return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
 
 
 def land_status_doc(target: str | None) -> dict:
@@ -14134,7 +14266,7 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
-                       as_json: bool, pin: str = "") -> int:
+                       as_json: bool, sha: str = "", override: dict | None = None) -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -14144,13 +14276,14 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
-           "laneHost": policy_host() if lane else ""} | ({"pin": land_pin(pin)} if land_pin(pin) else {})
+           "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
+        | ({"override": override} if override else {})
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
-                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]),
-                                            pin=pin))
+                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]), sha=sha,
+                                            override=override))
     if not why:
         try:
             out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
@@ -14213,15 +14346,19 @@ def check_land_pin(repo: str, number: int, pin: str | None) -> None:
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
-             pin: str | None = None) -> int:
+             pin: str | None = None, override: dict | None = None) -> int:
+    """PIN (--sha or --match-head-commit) is checked against the head now and kept with the request, so the executor
+    stops (head_moved) if a later push moves the head before it merges. OVERRIDE (land_override) rides every merge
+    try."""
     key, repo, number = land_key(target)
     check_land_pin(repo, number, pin)
+    sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
-        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, pin or "")
+        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override)
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -14234,7 +14371,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         return EXIT_FAIL
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source, lane=(lane, policy_host() if lane else ""), pin=pin or "")
+                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override)
     no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
                f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
                "lease") if not lane and land_broker_client() else ""
@@ -14314,6 +14451,10 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
             land_key(a)
     except (WatchError, TypeError):
         return None, f"not a pull request: {str(req.get('target'))[:80]!r}"
+    try:
+        land_pin_sha(req.get("sha"))
+    except WatchError as error:
+        return None, str(error)
     requester = str(req.get("requester") or "")
     if requester and not LAND_REQUESTER_SHAPE.fullmatch(requester):
         return None, f"not a requester (HOST/SESSION, no spaces, at most 200): {requester[:80]!r}"
@@ -14321,7 +14462,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
                        rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req),
-                       pin=land_pin(req.get("pin")))
+                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req))
     return rid, ""
 
 
@@ -23437,9 +23578,12 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("post pr needs --head, --base and --title")
         item.update(repo=args.target, head=args.head, base=args.base, title=args.title, reviewers=args.reviewer or [])
     else:
-        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(args.target)
+        # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
+        # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
+        target = drop_kind_prefix(args.target, args.kind, also=("pr", "comment"))
+        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(target)
         if not m:
-            raise WatchError(f"post {args.kind} takes OWNER/REPO#N or a GitHub URL")
+            raise WatchError(f"post {args.kind} takes OWNER/REPO#N, pr:OWNER/REPO#N or a GitHub URL")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
@@ -24184,11 +24328,29 @@ class Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         nxt = usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        say_waiting(f"{self.prog}: error: {message}")
+        spellings = kind_spellings(message)
+        say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
-            print_json_error("usage", message, nxt)
+            print_json_error("usage", message + (f" ({spellings})" if spellings else ""), nxt)
         raise SystemExit(64)
+
+
+KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
+
+
+def kind_spellings(message: str) -> str:
+    """What a refused *kind* is told about the spellings of a target, so the reader is not left to work out
+    that a separator was the problem. argparse's own line ("invalid choice: 'pr:o/r/7241'") lists the kinds
+    and nothing else, which reads as "pr is not a kind" when the kind was there all along."""
+    bad = KIND_CHOICE.search(message)
+    if not bad:
+        return ""
+    split = split_kind_prefix(bad.group(1))
+    if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
+        return f"a {split[0]} target is {KIND_FORMS.get(split[0], 'named by its own form')}"
+    return ("the kind comes first and the whole target is one word: `pr OWNER/REPO#N`, `run OWNER/REPO/RUN_ID`, "
+            "`pr:OWNER/REPO#N` as this tool prints it, or `OWNER/REPO#N` with no kind at all")
 
 
 def print_json_error(code: str, reason: str, nxt: str) -> None:
@@ -24341,8 +24503,15 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
     ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if wait_joined else ""
-    if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
+    if first.startswith("-") or first in WAIT_KINDS:
         return raw, ran_as
+    # `wait pr:o/r#5` -- this tool's own notation for a target, copied out of a line it printed -- is
+    # `wait pr o/r#5`: the prefix carries the kind, so the kind slot is where it goes.
+    prefixed = split_kind_prefix(first)
+    if prefixed and prefixed[0] in (WAIT_KINDS if cmd == "wait" else STATUS_KINDS):
+        kind, rest = prefixed
+        fixed = [cmd, kind, rest] + raw[2:]
+        return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
         return raw, ran_as
@@ -24380,10 +24549,11 @@ def parser() -> argparse.ArgumentParser:
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
     for name in ("status", "wait"):
         s = sub.add_parser(name)
-        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
+        s.add_argument("kind", choices=WAIT_KINDS if name == "wait" else STATUS_KINDS)
         if name == "status":
             s.add_argument("target", nargs="+",
-                           help="OWNER/REPO#N, OWNER/REPO/N or a GitHub URL; several are read in one gather, "
+                           help="OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, or a GitHub URL; "
+                                "several are read in one gather, "
                                 "and a bare #N or N is that number in the repository of the target before it, "
                                 "or of the directory you are in")
             s.add_argument("--field", metavar="F,G",
@@ -24391,7 +24561,9 @@ def parser() -> argparse.ArgumentParser:
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
                                 "lists print comma-joined")
         else:
-            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
+            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, a GitHub URL, or the KIND:TARGET "
+                                                 "form this tool prints (pr:OWNER/REPO#N, run:OWNER/REPO/RUN_ID), "
+                                                 "with or without the kind before it")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         s.add_argument("--verbose", action="store_true",
@@ -24543,10 +24715,18 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
                          "host/$ACPMUX_SESSION_NAME)")
-    ld.add_argument("--match-head-commit", dest="match_head", metavar="SHA",
-                    help="land only while the PR's head is SHA (a push after it refuses; gh pr merge's own flag)")
-    ld.add_argument("--wait", type=seconds, default=0, metavar="S",
-                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
+    ld.add_argument("--sha", "--match-head-commit", dest="sha", metavar="SHA",
+                    help="land only this head (7 to 40 hex): refused now if the PR's head is another, and the land "
+                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) is "
+                         "the same")
+    ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
+                    help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's "
+                         "override); one line, at most 200 characters; needs --override-receipt")
+    ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
+                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+    ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
+                         "--timeout is the same")
     ld.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
@@ -24729,7 +24909,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.match_head)
+            override = land_override(args.override_reason, args.override_receipt)
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:

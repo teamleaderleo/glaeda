@@ -92,6 +92,11 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
   (prefixed `OWNER/REPO#N` when there are several): `head`, `state`, `mergeable`, `url`, and
   `checks.state|failed|pending|passed|held|total`; lists print comma-joined names, instead of piping
   `--json` into python. A quoted `'#N'` works like a bare `N` (unquoted, the shell reads `#` as a comment).
+- A target takes whichever form you have, including **the one this tool prints**: the `pr:o/r#5` and
+  `run:o/r/123` keys in its own waiting and still-waiting lines are targets you can hand straight back
+  (`wait pr:o/r#5`, with or without the kind word before them), as are `o/r#5`, `o/r/5`, a GitHub URL
+  and a bare `N` in the checkout you are standing in. The kind is never guessed across kinds: a prefix
+  naming another kind (`wait pr run:o/r/123`) refuses and names the spellings that kind does take.
 
 ## Waiting on a file or a process: no sleep loops
 
