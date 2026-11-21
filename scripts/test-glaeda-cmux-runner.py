@@ -8988,6 +8988,24 @@ class HostLoadCapTest(unittest.TestCase):
                          "only 2 of 14 capacity units on this mini are free; its next job needs 3",
                          "it still needs room for its own job")
 
+    def test_a_remembered_label_never_shrinks_the_room_a_listener_keeps(self) -> None:
+        # hq#16544: memory widens cap_labels, which reveals takeable work and admits nothing - except that
+        # ios_sim_wanted reads a label to listen at this runner's own fit (3) instead of the side label's costliest
+        # job (5). A glaeda-ios-sim remembered past a real relabel would shrink the room this listener keeps for up
+        # to OBSERVED_LABEL_TTL_S, the very failure HEAD_FIT and IOS_SIM_OWN_FIT exist to prevent. So that one
+        # answer is read from the live feed window (cap_fit_labels), never from memory.
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-std-xcode-26.6"]
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"),
+                     self.job("queued", labels=self.IOS_SIM_JOB, ago=4 * 3600)]
+        gate = self.side_gate(10, side)
+        hook.save_observed_labels(hook.observed_label_file(self.state, self.runner), "cmux21-glaeda-2",
+                                  {hook.IOS_SIM_RUNNER_LABEL: time.time() - 60})
+        self.assertEqual(self.full(gate), "only 4 of 14 capacity units on this mini are free; its next job needs 5",
+                         "a remembered glaeda-ios-sim does not lower the fit this listener holds for")
+        self.assertIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_labels, "though it still makes that job visible")
+        self.assertNotIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_fit_labels,
+                         "the live window is what the lowering answer reads")
+
     def test_a_side_listener_never_takes_a_queue_head_it_cannot_start(self) -> None:
         # HEAD_FIT, 2026-11-17: cmux#44505's generated files (job 134087426027) reached cmux18-glaeda-8, which
         # listened at the side fit with 1 unit free; the job needed 8, waited 19 min for them in "Set up runner" and
