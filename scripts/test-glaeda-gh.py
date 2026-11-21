@@ -20802,14 +20802,16 @@ class LandWorld:
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
-                merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"])
+                merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]
+                              or (c[1:4] == ["api", "-X", "PUT"] and c[4].endswith("/merge")))
                              and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
                 if self.view_err is not None:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
                 return subprocess.CompletedProcess(argv, 0, json.dumps(
                     {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
-            kind = "merge" if words[:2] == ["pr", "merge"] else "update" if "update-branch" in " ".join(words) \
+            kind = "merge" if words[:2] == ["pr", "merge"] or (words[:3] == ["api", "-X", "PUT"]
+                                                               and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
             return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
@@ -22962,6 +22964,46 @@ class LandTest(Base):
         e = self.run_hour(answer, seconds=60)
         updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
         self.assertEqual((len(updates), e["state"]), (2, "waiting"))
+
+    def test_a_deliberate_fix_record_at_the_head_merges_by_rest_pinned_to_it(self):
+        """cmux#47721 (2026-11-21): a coordinator's deliberate fix merge record at the PR's exact head counts only for
+        REST's PUT pulls/N/merge pinned to it. land-judge explain finds the record (teammate_optin.deliberate_fix_record)
+        and names that merge (action via "rest"); the queue sends it through the shim, so land_judge judges it again."""
+        self.pr(LA)
+        self.land()
+        code, doc = ok_answer(LA)
+        doc["action"]["via"] = "rest"
+        doc["next"] = f"gh api -X PUT repos/o/r/pulls/1/merge -f sha={LA} -f merge_method=squash"
+        self.w.answers.append((code, doc))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"),
+                         [["api", "-X", "PUT", "repos/o/r/pulls/1/merge", "-f", f"sha={LA}", "-f", "merge_method=squash"]])
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
+    def test_a_stale_or_missing_deliberate_fix_record_stops_on_teammate(self):
+        """A record at another head, or none: land-judge explain judges the `gh pr merge` and stops it on teammate
+        with today's words; the queue sends no merge of either kind."""
+        why = "a teammate's PR lands on its author's opt-in: they add ready-to-land"
+        for _ in ("stale head", "no record"):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(refusal("teammate", LA, {"kind": "stop", "stop": "teammate", "why": why},
+                                          nxt=f"none ({why})"))
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "teammate"))
+            self.assertEqual(e["stop"]["reason"], why)
+            self.assertIn(f"stopped: teammate: {why}", self.w.sent()[-1][-1])
+            self.assertEqual((self.w.gh_calls("pr", "merge"), self.w.gh_calls("api", "-X", "PUT")), ([], []))
+
+    def test_land_merge_argv_is_rest_only_for_a_via_rest_merge(self):
+        sha = "a" * 40
+        gh_merge = ["pr", "merge", "1", "-R", "o/r", "--squash", "--match-head-commit", sha]
+        self.assertEqual(gg.land_merge_argv(ok_answer(sha)[1], "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"ok": True}, "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"action": {"kind": "merge", "via": "graphql"}}, "o/r", "1", sha), gh_merge)
+        self.assertEqual(gg.land_merge_argv({"action": {"kind": "merge", "via": "rest"}}, "o/r", "1", sha),
+                         ["api", "-X", "PUT", "repos/o/r/pulls/1/merge", "-f", f"sha={sha}", "-f", "merge_method=squash"])
 
     def test_a_teammate_refusal_never_sends_an_update(self):
         self.pr(LA)

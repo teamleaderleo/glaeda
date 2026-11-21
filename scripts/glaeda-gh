@@ -11117,6 +11117,20 @@ def land_fallback(answer: dict, head: str) -> dict:
     return {"v": 1, "kind": "command", "text": land_trim(answer.get("next"))}
 
 
+def land_merge_argv(answer: dict, repo: str, number: str, sha: str) -> list[str]:
+    """The gh arguments of the merge land_judge's ANSWER passed at SHA. A merge action `via: "rest"` is a teammate's PR
+    that a coordinator's deliberate fix merge record covers at exactly SHA (leo-workspace machines/deliberate-fix-merges.json,
+    read by teammate_optin.deliberate_fix_record in `land-judge explain`): the record covers only REST's PUT
+    pulls/N/merge pinned to SHA (land_judge.rest_fix_merge), never a `gh pr merge`, which can enqueue or auto-merge.
+    Either goes through the gh-quota shim, so land_judge judges it again (teammate_optin.fix_merge, holds, BLOCKs).
+    Before, the queue sent only `gh pr merge` and stopped every such PR on teammate (cmux#47721, 2026-11-21)."""
+    act = answer.get("action")
+    if isinstance(act, dict) and act.get("via") == "rest":
+        return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "-f", f"sha={sha}", "-f",
+                "merge_method=squash"]
+    return ["pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha]
+
+
 def land_action(answer: dict, head: str) -> dict:
     """The answer's "action" when it is one this queue knows, else the fallback table's."""
     act = answer.get("action")
@@ -13803,7 +13817,7 @@ class LandQueue:
         if self.broker_client():
             got = self.broker_land(e, sha)
         else:
-            got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
+            got = self.call([gh, *land_merge_argv(answer, repo, number, sha)],
                             LAND_MERGE_DEADLINE, e, land_override_env(e))  # the shim's land_judge reads the override
         said = f"{got.stderr or ''} {got.stdout or ''}"
         if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
