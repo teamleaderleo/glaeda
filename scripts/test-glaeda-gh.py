@@ -18618,6 +18618,9 @@ class RunnersTest(BrokerBase):
         argv = ran.call_args[0][0]
         self.assertIn("orgs/o/actions/runners?per_page=100", argv)
         self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        # The daemon's own reads carry the internal mark, so they keep this route instead of being handed to the
+        # host's quota guard; a fake answer that does not take env= is no longer this caller.
+        self.assertEqual(ran.call_args.kwargs["env"][gg.GLAEDA_INTERNAL], "1")
         bad = subprocess.CompletedProcess([], 0, "not json\n", "")
         with mock.patch.object(gg, "run_bounded", return_value=bad), self.assertRaises(gg.WatchError):
             gg.cmd_runners("o", None, True)
@@ -18630,7 +18633,8 @@ class RunnersTest(BrokerBase):
             gg.cmd_runners("not a scope", None, False)
 
     def test_repo_scope_reads_the_org_pool_too_and_says_so(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             path = next(a for a in argv if "actions/runners" in a)
             rows = ([{"name": "t", "status": "offline", "busy": False, "labels": ["side"]}] if "repos/" in path else
                     [{"name": "o1", "status": "online", "busy": True, "labels": ["side"]},
@@ -18648,7 +18652,8 @@ class RunnersTest(BrokerBase):
         self.assertIn("[read: 1 repo + 2 org]", out.getvalue())
 
     def test_repo_scope_names_an_org_listing_it_could_not_read(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("orgs/" in a for a in argv):
                 return subprocess.CompletedProcess([], 1, "", "HTTP 403")
             row = {"name": "t", "status": "online", "busy": False, "labels": ["side"]}
@@ -18673,7 +18678,8 @@ class RunnersTest(BrokerBase):
         repo_rows = [{"name": f"t{n}", "status": "online", "busy": False, "labels": ["self-hosted", "trusted"]}
                      for n in range(39)]
 
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("actions/variables/CI_RUNNER_STATE" in a for a in argv):
                 if state is None:
                     return subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")

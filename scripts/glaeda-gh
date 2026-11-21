@@ -24073,17 +24073,19 @@ def broker_merge_handoff(args: list[str]) -> int | None:
             and os.environ.get(QUOTA_HOP) != str(os.getpid()) and not os.environ.get(BROKER_MARK) \
             and not broker_answered_here(args)
         if create or other:
-            path = os.environ.get("PATH", "")
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
                 if guard.is_file() and os.access(guard, os.X_OK) \
                         and (create or broker_guard_comes_back(guard)):
-                    os.environ["PATH"] = os.pathsep.join([str(guard.parent), path])
-                    os.environ[QUOTA_HOP] = str(os.getpid())  # execv keeps the pid: the pass back here sees it
-                    os.execv(str(guard), [str(guard), *args])
+                    # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
+                    # to the process being started. Mutating this process first leaves the guard's directory on
+                    # PATH and the hop mark set for every later call in the same process, which is wrong for
+                    # every in-process caller (a test, the daemon) whenever the exec does not happen.
+                    # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
+                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
-                os.environ["PATH"] = path
-                os.environ.pop(QUOTA_HOP, None)
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
         return None  # no guard to ask (or it cannot run): the call runs as before
     # From here the call is a merge: anything that fails refuses it, never runs it unguarded (F2, second review).
