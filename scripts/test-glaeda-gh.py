@@ -28037,18 +28037,26 @@ class WaitBlockedByQuotaTest(Base):
     RESET = 1200.0  # seconds from NOW: past a 600 s wait's deadline, inside a 1800 s one's
 
     def records(self, *, mode: str = "stop", remaining: int = 0, reset: float | None = None,
-                bucket: str = "graphql", upstream: bool = False) -> None:
-        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped."""
+                bucket: str = "graphql", upstream: bool = False, fed: bool | None = None,
+                capped: bool = False, hold: float | None = None, rest: dict | None = None) -> None:
+        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped. FED is the
+        controller's feed as Daemon.fed reads it: None publishes no feed at all (an older daemon), True a fresh feed
+        that delivered an event for o/r, False a fresh feed that has delivered nothing for it."""
         gg.BASE.mkdir(parents=True, exist_ok=True)
         status = {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
                   "modes": {"rest": "normal", "graphql": "normal", bucket: mode},
-                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": False}}
+                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": capped}}
         if upstream:
             status["upstream"] = {"ok": True}
+        if hold is not None:
+            status["secondaryHold"] = {"until": time.time() + hold, "strikes": 2}
+        if fed is not None:
+            status["controller"] = {"state": "ok", "okAt": time.time() - 1,
+                                    "fedRepos": {"o/r": time.time() - 5} if fed else {}}
         gg.write_json(gg.BASE / "daemon.json", status)
-        gg.write_json(gg.BASE / "budget.json",
-                      {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
-                                "reset": (time.time() + self.RESET) if reset is None else reset}})
+        budget = {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
+                           "reset": (time.time() + self.RESET) if reset is None else reset}}
+        gg.write_json(gg.BASE / "budget.json", {**budget, **(rest or {})})
 
     def request(self, timeout: float = 1800.0, began: float | None = None) -> dict:
         req = gg.wait_request("pr", "o/r#7208", "green", timeout, False, False, "7" * 40, True, gg.RESCUE_GRACE)
