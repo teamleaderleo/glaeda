@@ -23383,6 +23383,63 @@ class LandTest(Base):
         self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
 
+    CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
+                        'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
+                        'request-branch","status":"422"}')
+
+    def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
+        """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
+        else. 2026-11-21, one host's queue: four `land status` rows stopped update_branch_refused after 6 identical
+        "merge conflict between base and head" calls at one head, their stop's `next:` empty, one parked 3343 min."""
+        for said in (self.CONFLICT_REFUSAL, "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
+                     "its merge conflicts must be resolved"):
+            self.assertTrue(gg.LAND_STEP_CONFLICT.search(said), said)
+        for said in ("GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)",
+                     "GraphQL: Pull Request is not mergeable (mergePullRequest)"):
+            self.assertIsNone(gg.LAND_STEP_CONFLICT.search(said), said)
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)  # one call, not LAND_STEP_STOP of them
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("merge conflict between the base and the head", e["stop"]["reason"])
+        self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --match-head-commit", e["stop"]["next"])
+        self.assertFalse(e.get("stepFail"))  # no streak to count: nothing waits, nothing retries
+        self.assertFalse(e.get("stepTransient"))
+        self.assertFalse(gg.LAND_REARM_CODES.match("update_branch_conflict"))  # a person resolves it, not a timer
+        self.assertIn("stopped: update_branch_conflict", self.w.sent()[-1][-1])
+        # a new head is a new question: the entry takes the update again when it is landed at one
+        self.pr(LB)
+        self.land()
+        self.w.gh_rc["update"] = 0
+        self.w.answers.append(refusal("stale_green", LB, {"kind": "update_branch", "expected_head_sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], len([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)])),
+                         ("waiting", 2), e.get("stop"))
+
+    def test_a_retryable_update_branch_refusal_still_backs_off_and_stops_at_the_streak(self):
+        # Unchanged by the conflict stop: a refusal GitHub can answer differently next time keeps its backoff and its
+        # LAND_STEP_STOP-th-refusal stop ("Base branch was modified" clears when the base settles).
+        said = "gh: GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest) (HTTP 405)"
+        self.assertIsNone(gg.LAND_STEP_CONFLICT.search(said))
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = said
+        answer = lambda: refusal("stale_green", LA, {"kind": "update_branch", "expected_head_sha": LA})  # noqa: E731
+        self.w.answers.append(answer())
+        e = self.tick()
+        self.assertEqual((e["state"], e["stepFail"]["count"], e["stepFail"]["kind"]),
+                         ("waiting", 1, "update_branch"), e.get("stop"))
+        e = self.run_hour(answer, seconds=4 * 3600)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_refused"), e.get("stop"))
+        self.assertEqual(e["stepFail"]["count"], gg.LAND_STEP_STOP)
+
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
         self.broker = True
@@ -24855,7 +24912,52 @@ class LandTest(Base):
         self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
         with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
             e = self.tick()
-        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
+
+    def test_a_reviewer_that_cannot_start_names_the_missing_path_and_the_step_that_provides_it(self):
+        # cmux#45626 sat stopped 5,351 min on "router-review could not start: FileNotFoundError", naming no path.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        gone = "/nowhere/bin/router-review"
+        err = FileNotFoundError(2, "No such file or directory", gone)
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=err):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
+        self.assertIn(gone, e["stop"]["reason"], "the refusal must name the path that was not found")
+        self.assertIn("No such file or directory", e["stop"]["reason"])
+        self.assertIn("no file is at that path", e["stop"]["reason"])
+        self.assertIn("ln -s", e["stop"]["next"], "the next step must be the one command that provides it")
+        self.assertIn("router-review o/r 1 --post", e["stop"]["next"])
+        self.assertLessEqual(len(e["stop"]["next"]), gg.LAND_TEXT, "the next step must survive land_trim whole")
+        self.assertIn(gone, (e.get("lastAction") or {}).get("error") or "")
+        # a tool that is there but will not exec is its #! interpreter, and the next step reads it, not a link
+        here = Path(self.tmp.name) / "rr-here"
+        here.write_text("#!/usr/bin/nonesuch\n")
+        why, nxt = gg.land_review_start_failure(FileNotFoundError(2, "No such file or directory", str(here)), here)
+        self.assertIn(str(here), why)
+        self.assertIn("`#!` interpreter", why)
+        self.assertEqual(nxt, f"head -1 {here}, then install the interpreter it names")
+        # an OSError carrying no filename still names the path the daemon resolved
+        why, _ = gg.land_review_start_failure(OSError("no router-review"), Path("/opt/rr"))
+        self.assertIn("/opt/rr", why)
+
+    def test_a_reviewer_that_cannot_start_is_re_armed_while_a_review_verdict_is_not(self):
+        # "could not run the reviewer here" can clear by itself (a link, a deploy); a BLOCK verdict is a judgment.
+        self.assertTrue(gg.LAND_REARM_CODES.match("review_cannot_start"))
+        for verdict in ("block", "review_failed", "chat_hold", "own_red"):
+            self.assertIsNone(gg.LAND_REARM_CODES.match(verdict), verdict)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=OSError("no router-review")):
+            e = self.tick()
+        self.assertEqual(e["stop"]["code"], "review_cannot_start")
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["stop"], e["rearms"]["n"]), ("queued", None, 1))
+        self.assertEqual(e["lastStop"]["code"], "review_cannot_start")
 
     def test_router_review_unset_is_found_in_the_workspace_tools_not_only_local_bin(self):
         # cmux#45626: a host with no ~/.local/bin/router-review link stopped every review with FileNotFoundError.
@@ -24888,7 +24990,7 @@ class LandTest(Base):
                 mock.patch.object(gg.shutil, "which", return_value=None), \
                 mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
             e = self.tick()
-        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_failed", []))
+        self.assertEqual((e["state"], e["stop"]["code"], e["reviewed"]), ("stopped", "review_cannot_start", []))
         self.assertIn("/nowhere/router-review", e["stop"]["reason"])
         self.assertIn("routerReview", e["stop"]["next"])
 
@@ -28253,6 +28355,272 @@ class WaitBlockedByQuotaTest(Base):
         req = self.request(began=now - gg.STALE_DATA_AFTER - 60)
         self.assertIsNotNone(gg.wait_starved(req, None, now), "past the old bound it is still said, just not read")
 
+
+class WaitStateNotMovingTest(Base):
+    """leo-workspace#7188, 2026-11-21 09:30-10:06Z, one `glaeda-gh wait pr ... --timeout 1800`: `no data yet` for its
+    first 841 s (glaeda#2316's case), then this, seven times, identically, 120 s apart, for the remaining ~840 s --
+
+        teamleaderleo/leo-workspace#7188 OPEN  mergeable=MERGEABLE (UNSTABLE)
+        checks PENDING: 1 passed, 0 failed, 1 pending (of 2, 0 required)
+
+    -- and then `result: timeout`. Half the wait's budget went to reprinting a state that had not moved, and the one
+    thing worth saying was in that data at every one of those prints and was never said: one check had been pending
+    alone for ~14 minutes while its only sibling had already passed. That is a stuck check and it is actionable.
+
+    So: say it, once, with the age (today "pending" reads the same at 20 s and at 14 min), and then be quiet. The
+    exits, the deadline, the final summary and the `result:` strings other tools parse are untouched; this adds
+    lines and removes repeats."""
+
+    BEGAN = 1764000000.0  # replaced per test in setUp; kept so the helpers read on their own
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The wait starts now, to the second: the in-process path takes the clock this test passes it, the daemon
+        # path takes time.time(), and an age in the words has to be the age the test computed on either.
+        self.BEGAN = float(int(time.time()))
+
+    def pending(self, name: str = "react-apps-base-check", started: float | None = None, run: int = 4242,
+                workflow: str | None = "Fast checks") -> dict:
+        """A check run still going, as GitHub's rollup gives it: with a start time and its workflow run."""
+        suite = {"workflowRun": {"databaseId": run, "workflow": {"name": workflow, "databaseId": 9}}} if run else {}
+        return {**check_run(name, "IN_PROGRESS", None), "databaseId": 77,
+                "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime(self.BEGAN - 480 if started is None else started)),
+                "checkSuite": suite}
+
+    def head(self, checks: list[dict]) -> dict:
+        return gg.parse_pr(pr_node(7188, rollup="PENDING", checks=checks))
+
+    def cached(self, data: dict) -> dict:
+        """The cache entry a wait reads, as the daemon leaves it: current data, read at BEGAN."""
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#7188"),
+                      {"key": "pr:o/r#7188", "fetchedAt": self.BEGAN, "dataAt": self.BEGAN,
+                       "data": data, "error": None})
+        return gg.read_cache("pr:o/r#7188")
+
+    def entry(self, checks: list[dict]) -> dict:
+        return self.cached(self.head(checks))
+
+    def request(self, timeout: float = 1800.0) -> dict:
+        req = gg.wait_request("pr", "o/r#7188", "green", timeout, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = self.BEGAN
+        return req
+
+    def polls(self, entry: dict | None, req: dict | None = None,
+              count: int = 15) -> list[tuple[int, str]]:
+        """What a wait says at each of COUNT progress intervals -- the shape of the measured run: the same data,
+        read again and again. (elapsed, line) for the intervals it said anything at all."""
+        req, seen, said = req or self.request(), {}, []
+        for i in range(1, count + 1):
+            now = self.BEGAN + i * gg.WAIT_PROGRESS_EVERY
+            line = gg.progress_update(seen, req, entry, now)
+            if line is not None:
+                said.append((int(now - self.BEGAN), line))
+        return said
+
+    def test_the_measured_shape_is_said_once_and_not_reprinted(self) -> None:
+        """The run above, interval by interval: 14 progress lines become 2, and the second one is the finding."""
+        entry = self.entry([check_run("fast-checks"), self.pending()])
+        said = self.polls(entry, count=14)  # 1800 s of a 120 s progress interval, as the measured wait had
+        self.assertEqual([at for at, _ in said], [120, 360],
+                         f"an unchanged state must be said once, then diagnosed once, then not at all: {said}")
+        state, diagnosis = said[0][1], said[1][1]
+        self.assertIn("checks PENDING: 1 passed, 0 failed, 1 pending", state)
+        self.assertNotIn("has not changed", state, "the first line is the state, exactly as before")
+        self.assertIn("o/r#7188 has not changed for 4m: 1 of 2 checks are still pending", diagnosis)
+        self.assertIn("Fast checks / react-apps-base-check pending 14m (since ", diagnosis)
+        self.assertIn("and its 1 sibling(s) have finished (1 passed, 0 failed)", diagnosis)
+        self.assertIn("A lone check pending beside siblings that all passed is usually stuck, not slow.", diagnosis)
+        self.assertEqual(diagnosis.splitlines()[-1], "next: gh run view 4242 -R o/r")
+        self.assertIn(state.splitlines()[0], diagnosis.splitlines()[0],
+                      "the diagnosis carries the state it diagnoses, so one line is enough to read")
+
+    def test_one_pending_of_seventeen_is_named_not_counted(self) -> None:
+        """teamleaderleo/glaeda#2314, 2026-11-21: 1500 s, twelve identical lines, each
+        `checks PENDING: 16 passed, 0 failed, 1 pending (of 17, 0 required)`. For 25 minutes the wait knew there was
+        exactly one pending check of seventeen and never said which, nor for how long. When the pending set is small
+        enough to enumerate, enumerate it."""
+        checks = [check_run(f"c{i}") for i in range(16)] + [self.pending("cmux-next generated files")]
+        said = self.polls(self.entry(checks), count=13)
+        self.assertEqual([at for at, _ in said], [120, 360], f"twelve repeats become one state and one finding: {said}")
+        note = said[1][1]
+        self.assertIn("1 of 17 checks are still pending", note)
+        self.assertIn("Fast checks / cmux-next generated files pending 14m (since ", note)
+        self.assertIn("16 sibling(s) have finished (16 passed, 0 failed)", note)
+        self.assertIn("usually stuck, not slow", note)
+        self.assertEqual(note.splitlines()[-1], "next: gh run view 4242 -R o/r")
+
+    def test_a_check_past_the_first_hundred_is_reported_unseen_never_absorbed(self) -> None:
+        """manaflow-ai/cmux#48834, 2026-11-21: 1501 s on
+        `45 passed, 0 failed, 0 pending, 1 more unfinished past the first 100 (of 45+, 0 required); GitHub's rollup
+        says FAILURE`. Read as one line that is three defects: `0 pending` beside `1 more unfinished`; the one check
+        that mattered unnameable because pagination, not the PR, decided what the read covered; and a rollup that had
+        said FAILURE for 25 minutes while the wait reported PENDING. The diagnosis says which part it cannot see, that
+        the rollup is a different test from the one this wait ends on, and a next step that reads the page it missed."""
+        shown = [check_run(f"c{i}") for i in range(45)]
+        data = {**gg.parse_pr(pr_node(48834, rollup="FAILURE", checks=shown)), "checksTruncated": True,
+                "checkState": "FAILURE",
+                "checkCounts": {"runs": {"SUCCESS": 45, "QUEUED": 1}, "statuses": {}}}
+        said = self.polls(self.cached(data), count=13)
+        self.assertEqual([at for at, _ in said], [120, 360], f"an unchanged state is said once: {said}")
+        note = said[1][1]
+        self.assertIn("every one of the 45 checks it can read has finished", note)
+        self.assertIn("cannot see: 1 unfinished context(s) past the first 45 this rollup returned", note)
+        self.assertIn("pagination, not this PR, decided", note)
+        self.assertIn("GitHub's rollup already says FAILURE", note)
+        self.assertIn("this wait ends on the checks it counts, not on the rollup", note)
+        self.assertNotIn("usually stuck, not slow", note)  # nothing visible is pending: that sentence would be false
+        last = note.splitlines()[-1]
+        self.assertIn("check-runs?per_page=100&page=2", last, f"the next step reads the page it could not see: {last}")
+        self.assertNotIn("glaeda-gh wait", last,
+                         "docs/handbook/wait-that-cannot-end.md: a next: never names this same wait again")
+
+    def test_the_age_is_the_load_bearing_part(self) -> None:
+        """"pending for 20 s" and "pending for 14 min" are the same word today. Both are said as themselves."""
+        young = self.polls(self.entry([check_run("fast-checks"), self.pending(started=self.BEGAN + 340)]))
+        self.assertIn("pending 20s (since ", young[1][1])
+        old = self.polls(self.entry([check_run("fast-checks"), self.pending(started=self.BEGAN - 3000)]))
+        self.assertIn("pending 56m (since ", old[1][1])
+
+    def test_nothing_is_said_before_the_state_has_been_still_long_enough(self) -> None:
+        self.assertEqual(gg.WAIT_STUCK_AFTER, 2 * gg.WAIT_PROGRESS_EVERY,
+                         "two intervals: the first line says the state, the second would be the first repeat")
+        entry = self.entry([check_run("fast-checks"), self.pending()])
+        self.assertIsNone(gg.stuck_note("pr:o/r#7188", entry, gg.WAIT_STUCK_AFTER - 1))
+        self.assertIsNotNone(gg.stuck_note("pr:o/r#7188", entry, gg.WAIT_STUCK_AFTER))
+
+    def test_a_state_that_moves_is_said_and_may_be_diagnosed_again(self) -> None:
+        """Quiet is only for an unchanged state: a new state prints at once, and if it then stops moving it is
+        diagnosed too."""
+        two = self.entry([check_run("fast-checks"), self.pending(), self.pending("webview-check", run=4343)])
+        seen, req = {}, self.request()
+        self.assertIsNotNone(gg.progress_update(seen, req, two, self.BEGAN + 120))
+        self.assertIsNotNone(gg.progress_update(seen, req, two, self.BEGAN + 360))  # the diagnosis
+        self.assertIsNone(gg.progress_update(seen, req, two, self.BEGAN + 480))
+        moved = self.entry([check_run("fast-checks"), check_run("webview-check"), self.pending()])
+        line = gg.progress_update(seen, req, moved, self.BEGAN + 600)
+        self.assertIsNotNone(line, "one check finishing is a new state: it prints at once")
+        self.assertIn("2 passed, 0 failed, 1 pending", line)
+        self.assertNotIn("has not changed", line, "a changed state is just the state")
+        self.assertIsNone(gg.progress_update(seen, req, moved, self.BEGAN + 720))
+        again = gg.progress_update(seen, req, moved, self.BEGAN + 840)
+        self.assertIn("react-apps-base-check pending", again or "",
+                      "a state that stops moving again is diagnosed again")
+
+    def test_a_next_step_is_about_the_check_never_the_same_wait_again(self) -> None:
+        entry = self.entry([check_run("fast-checks"), self.pending()])
+        note = gg.stuck_note("pr:o/r#7188", entry, 900)
+        nxt = note.splitlines()[-1]
+        self.assertEqual(nxt, "next: gh run view 4242 -R o/r")
+        self.assertNotIn(gg.wait_command(self.request()), nxt)
+        no_run = self.entry([check_run("fast-checks"), self.pending(run=0)])
+        self.assertEqual(gg.stuck_note("pr:o/r#7188", no_run, 900).splitlines()[-1],
+                         "next: glaeda-gh status pr o/r#7188 --verbose")
+
+    def test_a_wait_that_cannot_see_is_never_called_stuck(self) -> None:
+        """The distinction from glaeda#2316: there the read never happened ("no data yet", and which bucket and
+        reset), here the read works and nothing in it moves. A reader must be able to tell them apart."""
+        self.assertIsNone(gg.stuck_note("pr:o/r#7188", None, 1800))
+        self.assertIsNone(gg.stuck_note("pr:o/r#7188", {"key": "pr:o/r#7188", "data": None, "error": "x"}, 1800))
+        said = self.polls(None)
+        self.assertEqual([at for at, _ in said], [120], "no data yet is said once, and #2316's words own that case")
+        self.assertIn("no data yet", said[0][1])
+
+    def test_a_run_wait_and_a_finished_head_say_nothing_of_their_own(self) -> None:
+        gg.write_json(gg.cache_dir() / gg.file_name("run:o/r/5"),
+                      {"key": "run:o/r/5", "fetchedAt": self.BEGAN, "dataAt": self.BEGAN, "error": None,
+                       "data": {"id": 5, "name": "w", "status": "in_progress", "run_attempt": 1}})
+        self.assertIsNone(gg.stuck_note("run:o/r/5", gg.read_cache("run:o/r/5"), 1800))
+        green = self.entry([check_run("fast-checks"), check_run("webview-check")])
+        self.assertIsNone(gg.stuck_note("pr:o/r#7188", green, 1800), "nothing is pending: nothing is stuck")
+
+    def test_many_pending_checks_are_named_oldest_first_and_counted(self) -> None:
+        checks = [self.pending(name=f"shard-{i}", started=self.BEGAN - 60 * i, run=100 + i) for i in range(8)]
+        note = gg.stuck_note("pr:o/r#7188", self.entry(checks), 900)
+        self.assertIn("8 of 8 checks are still pending", note)
+        self.assertIn("+3 more pending", note)
+        named = sorted((n for n in range(8) if f"shard-{n} pending" in note),
+                       key=lambda n: note.index(f"shard-{n} pending"))
+        self.assertEqual(named, [7, 6, 5, 4, 3], f"the oldest {gg.STUCK_NAMED} first: {note}")
+        self.assertNotIn("sibling(s) have finished", note)
+        self.assertNotIn("usually stuck, not slow", note, "every check pending is a suite that has not started")
+
+    def test_a_pending_check_with_no_start_time_is_still_named(self) -> None:
+        blank = {**self.pending(name="queued-shard"), "startedAt": None}
+        note = gg.stuck_note("pr:o/r#7188", self.entry([check_run("fast-checks"), blank]), 900)
+        self.assertIn("queued-shard pending (GitHub reports no start time for it)", note)
+
+    def test_a_broken_entry_costs_the_note_and_never_the_wait(self) -> None:
+        for entry in ({"key": "pr:o/r#7188", "data": {"state": "OPEN"}}, {"data": {"checks": "not a list"}},
+                      {"data": {"checks": [{"status": None}]}}):
+            with self.subTest(entry=entry):
+                try:
+                    gg.stuck_note("pr:o/r#7188", entry, 900)
+                except Exception as error:  # noqa: BLE001  the point of the case
+                    self.fail(f"a malformed entry must not raise into the wait: {error!r}")
+
+    def test_the_daemon_path_writes_the_diagnosis_once_and_leaves_it_alone(self) -> None:
+        """A wait the daemon rules on: the state its blocker prints lives in <id>.out.state, so the diagnosis has to
+        reach that file once -- and the file must not then flip back to the plain state, which would read to the
+        blocker as a change and print a second time."""
+        entry = self.entry([check_run("fast-checks"), self.pending()])
+        req = gg.wait_request("pr", "o/r#7188", "green", 1800, False, False, None, True, gg.RESCUE_GRACE)
+        d = gg.waits_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "1-x.out.state"
+        with mock.patch.object(gg, "WAIT_PROGRESS_EVERY", 0.05), mock.patch.object(gg, "WAIT_STUCK_AFTER", 0.1):
+            gg.Daemon.note_wait_state(d, "1-x", req)
+            first = path.read_text()
+            time.sleep(0.15)
+            gg.Daemon.note_wait_state(d, "1-x", req)
+            diagnosis = path.read_text()
+            stamp = path.stat().st_mtime
+            time.sleep(0.15)
+            gg.Daemon.note_wait_state(d, "1-x", req)
+        self.assertNotIn("has not changed", first)
+        self.assertIn("has not changed for", diagnosis)
+        # the age is this path's own clock (time.time(), ~BEGAN), not the in-process tests' fake one
+        self.assertIn("not moving: Fast checks / react-apps-base-check pending 8m (since ", diagnosis)
+        self.assertIn("; next: gh run view 4242 -R o/r", diagnosis)
+        self.assertEqual(diagnosis.count("\n"), 1, f"the blocker reads one line: {diagnosis!r}")
+        self.assertEqual(path.read_text(), diagnosis, "nothing more to say: the file stays as it is")
+        self.assertEqual(path.stat().st_mtime, stamp)
+        self.assertIsInstance(req.get("progress"), dict)
+        self.assertTrue(req["progress"].get("stuck"), "the memory is on the request: each tick is a fresh daemon")
+
+    def test_the_blocker_prints_a_state_once_however_many_intervals_pass(self) -> None:
+        """End to end through the real bash blocker, which is what printed the seven paragraphs: one line per state,
+        not one per interval, and a state that changes is still said."""
+        rid = gg.write_wait_request("pr", "o/r#7188", "green", 60, False, False, None, True, gg.RESCUE_GRACE,
+                                    os.getpid())
+        d = gg.waits_dir()
+        (d / f"{rid}.out.state").write_text("o/r#7188 OPEN; checks PENDING: 1 passed, 0 failed, 1 pending\n")
+        stop = threading.Event()
+
+        def ticks() -> None:
+            moved = time.monotonic() + 2.5
+            while not stop.wait(0.1):
+                (d / ".served").touch()
+                if time.monotonic() >= moved:
+                    (d / f"{rid}.out.state").write_text("o/r#7188 OPEN; checks SUCCESS: 2 passed\n")
+        ticker = threading.Thread(target=ticks)
+        ticker.start()
+        env = dict(os.environ, GLAEDA_WAIT_PROGRESS="1", GLAEDA_WAIT_KEY="pr:o/r#7188", GLAEDA_WAIT_TIMEOUT="60",
+                   GLAEDA_WAIT_DEADLINE="00:00:00Z")
+        try:
+            done = subprocess.run([gg.BASH, "-c", gg.BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"),
+                                   os.fspath(d / f"{rid}.out"), "5", os.fspath(d / ".served"), "1",
+                                   sys.executable, "-c", "pass"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60, env=env)
+        finally:
+            stop.set()
+            ticker.join()
+        lines = [line for line in done.stderr.splitlines() if "still waiting on pr:o/r#7188" in line]
+        self.assertEqual([line.count("1 pending") for line in lines].count(1), 1,
+                         f"the first state, once, over five intervals: {done.stderr!r}")
+        self.assertEqual([line.count("2 passed") for line in lines].count(1), 1,
+                         f"and the state it moved to, once: {done.stderr!r}")
+        self.assertEqual(len(lines), 2, f"nothing else: {done.stderr!r}")
 
 class PrintedTargetNotationTest(unittest.TestCase):
     """The notation this tool prints for a target is accepted back as one.
