@@ -155,7 +155,9 @@ class Repository(unittest.TestCase):
         # The fork's Verify at a commit is its check of record in both repositories (scripts/glaeda-gh
         # CHECKS_OF_RECORD): a push to main runs Verify on Blacksmith there and runs no hosted copy here.
         text = (rl.workflow_files([])[0].parent / "ci.yml").read_text(encoding="utf-8")
-        gates = re.findall(r"^    if: \$\{\{(.*)\}\}$", text, re.M)
+        # A gate that wraps over several lines is the same gate: matching only `^    if: ...}}$` read a wrapped
+        # one as no gate at all, so a reformat of the two roots emptied `roots` instead of checking them.
+        gates = re.findall(r"^    if: \$\{\{(.*?)\}\}$", text, re.M | re.S)
         roots = [g for g in gates if "github.event_name == 'pull_request' ||" in g]
         self.assertEqual(len(roots), 2, gates)  # changes, and ci-status (always())
         for gate in roots:

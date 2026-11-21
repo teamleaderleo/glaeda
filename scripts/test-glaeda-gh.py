@@ -4707,6 +4707,18 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#4", until="done", fill=(mixed, {}), timeout=5)[0], 1,
                          "a finished red fails at once beside a running check")
 
+    def test_a_merged_pr_with_a_pending_non_required_check_exits_merged_at_once(self) -> None:
+        """leo-workspace#7310, 2026-11-21: `wait pr --timeout 1800` (no --until) saw MERGED at ~1398 s and ran to its
+        timeout because one non-required check (0 required) was still pending."""
+        node = pr_node(1, state="MERGED", checks=[check_run("a"), check_run("b", "IN_PROGRESS", None)])
+        node["mergeCommit"] = {"oid": "f" * 40}
+        merged = gg.parse_pr(node)
+        for until in ("green", "required"):
+            for sha in (None, "a" * 40):
+                code, text = self.wait("pr", "o/r#1", until=until, fill=(merged, {}), sha=sha, timeout=5)
+                self.assertEqual(code, 0, (until, sha, text))
+                self.assertIn("result: merged", text)
+
     def test_a_merged_pr_at_another_head_exits_merged_at_once_under_every_until(self) -> None:
         """hq#16384, 2026-11-21: `--until required --sha 6ca0a8fd` kept waiting 2400 s on a PR merged at head cbad338ab7."""
         node = pr_node(1, state="MERGED", checks=[check_run("a", "IN_PROGRESS", None)])
@@ -5007,6 +5019,32 @@ class ClientTest(Base):
         self.assertEqual(code, gg.EXIT_DOWN)  # queued for the daemon (down in this test), not refused
         self.assertEqual(req.call_args.kwargs["sha"], "b" * 40)
         self.assertFalse([c for c in run.call_args_list if c.args and c.args[0][:1] == ["gh"]])
+
+    def test_wait_with_two_targets_names_the_single_target_form(self) -> None:
+        """Lane, 2026-11-21 (glaeda#2323): `status pr` takes several targets and `wait pr` takes one, and the
+        refusal was argparse's bare "unrecognized arguments", so a *background* wait exited 64 at once and
+        read as a wait that waited for nothing. The refusal now names the one-target form and `status`."""
+        out = io.StringIO()
+        said: list[str] = []
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting", said.append), \
+                self.assertRaises(SystemExit) as exit_:
+            gg.main(["wait", "pr", "o/r#1", "o/r#2", "--json"])
+        self.assertEqual(exit_.exception.code, 64)
+        whole = "\n".join(said)
+        self.assertIn("`wait` waits for one target", whole)
+        self.assertIn("glaeda-gh status pr o/r#1 o/r#2", whole)  # several targets: the command that takes them
+        self.assertIn("next: glaeda-gh wait pr o/r#1 --json --timeout 1800", whole)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#1 --json --timeout 1800")
+        gg.Parser.argv = ["wait", "run", "o/r/11", "o/r/12", "o/r/13"]
+        hint, form = gg.wait_extra_targets("unrecognized arguments: o/r/12 o/r/13")
+        self.assertIn("o/r/12, o/r/13 are beyond it", hint)
+        self.assertEqual(form, "glaeda-gh wait run o/r/11 --timeout 1800")
+        for other in ("unrecognized arguments: --nope", "argument --timeout: expected one argument"):
+            self.assertEqual(gg.wait_extra_targets(other), ("", ""))  # the usual usage error, unchanged
+        gg.Parser.argv = ["status", "pr", "o/r#1", "o/r#2"]
+        self.assertEqual(gg.wait_extra_targets("unrecognized arguments: o/r#2"), ("", ""))  # status takes several
 
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
@@ -21184,6 +21222,44 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
 
+    def test_a_wait_parked_on_the_checks_is_read_at_full_pace_before_its_own_wake(self):
+        # Measured on this host's own land entries 2026-11-17..21: the snapshot share fell 94% -> 35% and 136 of 232
+        # snapshot waits ended snapshot_missing. Two constants decided it: a parked entry's unwaited read comes at most every
+        # LAND_PEEK_EVERY (600 s), looser than the LAND_SNAPSHOT_MAX_AGE (300 s) a snapshot must be inside, so a
+        # wait_pr verdict that slept 1800 s could not wake with a cache that qualified and paid for a live read. The
+        # last LAND_WAKE_PREFETCH before the wake is read at full pace instead.
+        self.assertLess(gg.LAND_WAKE_PREFETCH, gg.LAND_SNAPSHOT_MAX_AGE)  # the read must land inside the bound
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.snap_pr(LA, snap_head=LA)
+        self.land()
+        peeks: list[str] = []
+        self.q.peek = peeks.append  # the unwaited read a parked entry gets; self.w.watched is the full-pace one
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        # Parked with its wake far off: peeked, never read at full pace, so the daemon spends nothing on a PR it is
+        # not about to judge.
+        self.w.watched.clear()
+        self.tick(1800 - gg.LAND_WAKE_PREFETCH - 60)
+        self.assertNotIn(self.KEY, self.w.watched)
+        self.assertIn(self.KEY, peeks)
+        self.assertEqual(len(self.w.explains()), 1)  # and nothing judged early: its own wait still runs
+        # Inside the prefetch window: read at full pace, still not judged.
+        self.tick(90)
+        self.assertIn(self.KEY, self.w.watched)
+        self.assertEqual(len(self.w.explains()), 1)
+        # Its timeout: judged, and handed a snapshot rather than reading live.
+        self.snap_pr(LA, snap_head=LA)  # the read the prefetch asked for
+        day = gg.land_day(self.t)
+        live_before = gg.land_counts()[day].get("live") or 0
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_WAKE_PREFETCH)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
+        self.assertEqual(gg.land_counts()[day].get("live") or 0, live_before)
+        self.assertNotIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
+        self.assert_merged_at(LA)
+
     class FakePool:
         """A worker pool whose jobs run only when a test says so: what was handed to it, in order."""
 
@@ -27742,6 +27818,40 @@ class AppPoolTest(Base):
         self.assertEqual([e["key"] for e in due], [entry["key"]])
         self.assertEqual(self.minted, ["manaflow-ai"], "eligibility checks the App before spending login quota")
 
+    def test_a_mixed_owner_set_below_the_reserve_reads_the_app_owners_instead_of_nothing(self) -> None:
+        """One watch on an account with no App installed (teamleaderleo) made every App-servable watch beside it
+        ineligible too, because eligibility builds one query for the whole set and AppPool.owner_of refuses a
+        cross-owner query: under a login stop the daemon then read none of them. One dev host, 2026-11-21 11Z, watched 18
+        manaflow-ai and 14 teamleaderleo keys, so no PR set was ever eligible."""
+        self.daemon.budget = {
+            "rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][1] - 1, "reset": NOW + 900},
+            "graphql": {"limit": 5000, "remaining": gg.FLOORS["graphql"][1] - 1, "reset": NOW + 900},
+        }
+        mine = [{"key": "pr:manaflow-ai/cmux#1", "cache": None, "touched": NOW},
+                {"key": "pr:teamleaderleo/glaeda#2", "cache": None, "touched": NOW},
+                {"key": "pr:manaflow-ai/cmux#3", "cache": None, "touched": NOW}]
+        self.assertEqual(self.daemon.app_entries_eligible("pr", mine, "graphql"), [],
+                         "the mixed set names two owners, so no one installation can answer it")
+        self.daemon.last_cycle["pr"] = NOW - gg.CYCLE
+        due = self.daemon.due("pr", list(mine))
+        self.assertEqual([e["key"] for e in due], ["pr:manaflow-ai/cmux#1", "pr:manaflow-ai/cmux#3"],
+                         "the App's owner is read; the owner with one pool waits for its reset")
+
+    def test_a_graphql_batch_never_mixes_owners_so_the_app_can_take_it(self) -> None:
+        """A batch that mixes owners has no App and all of it goes on the login's 5,000 points an hour while the role
+        Apps hold 12,500 each: 108 of one dev host's 163 login GraphQL points in the 2026-11-21 11Z hour were spent by
+        cross-owner batches."""
+        keys = [f"pr:manaflow-ai/cmux#{i}" if i % 2 else f"pr:teamleaderleo/glaeda#{i}" for i in range(1, 13)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertTrue(sent, "the batch was sent")
+        for chunk in sent:
+            owners = {k.split(":", 1)[1].split("/")[0] for k in chunk}
+            self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
+        self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
+
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
         """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has
         its own limits, so the daemon's App reads go on while the login waits, and a login read is still held."""
@@ -28731,6 +28841,151 @@ class PrintedTargetNotationTest(unittest.TestCase):
                 args = gg.parser().parse_args(["post", "comment", target, "--body", "hi"])
                 item = gg.post_item(args)
                 self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
+
+
+class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
+    """The detector for the whole class: one table of the subcommands that take a PR or issue target, each
+    asserted against the *same* form set, so the next subcommand to parse targets its own way fails here
+    instead of in an agent's call.
+
+    Measured on 2026-11-21: `post comment teamleaderleo/glaeda#2323` was fine while `post comment
+    teamleaderleo/glaeda/2323`, a bare `2323` and `pr:teamleaderleo/glaeda/2323` -- a string this tool
+    prints, and one `status`, `wait` and `land` all read -- refused, because post_item matched the strict
+    PR_RE/ISSUE_RE instead of parse_key. #2282 and #2325 each fixed the sites they knew about; nothing
+    asserted that a *new* site joins them, and the per-subcommand tests above only ever handed `post` the
+    forms that already worked. This one is written as an enumeration on purpose: adding a target-taking
+    subcommand without adding it here leaves RESOLVERS incomplete, and the last test says so."""
+
+    # The shared form set for a pr/comment target, as KIND_FORMS names it, with the key each must reach.
+    FORMS = ("o/r#5", "o/r/5", "5", "#5", "https://github.com/o/r/pull/5")
+    # subcommand -> a callable taking one typed target and returning (repo, number), through the public
+    # boundary each caller actually uses. `cwd_repo` is mocked, so a bare number has a repository.
+    RESOLVERS = {
+        "status pr": lambda t: _from_key(gg.status_keys("pr", [t])[0]),
+        "status comment": lambda t: _from_key(gg.status_keys("comment", [t])[0]),
+        "wait pr": lambda t: _from_key(gg.parse_key("pr", t)),
+        "wait comment": lambda t: _from_key(gg.parse_key("comment", t)),
+        "land": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "land status": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "land cancel": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "post comment": lambda t: _post_target("comment", t),
+        "post review": lambda t: _post_target("review", t),
+    }
+
+    def test_every_subcommand_takes_every_shared_form(self) -> None:
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            for name, resolve in self.RESOLVERS.items():
+                for form in self.FORMS:
+                    with self.subTest(subcommand=name, form=form):
+                        self.assertEqual(tuple(str(p).lower() for p in resolve(form)), ("o/r", "5"),
+                                         f"`glaeda-gh {name} {form}` does not resolve to o/r#5: route it "
+                                         f"through parse_key, as the others do")
+
+    def test_a_refused_form_names_the_shared_set(self) -> None:
+        """A target no form reads is refused by naming the forms, never by blaming something else."""
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            for name, resolve in self.RESOLVERS.items():
+                with self.subTest(subcommand=name):
+                    with self.assertRaises(gg.WatchError) as refused:
+                        resolve("not a target at all")
+                    self.assertRegex(str(refused.exception), r"OWNER/REPO#N")
+
+    def test_the_table_covers_every_target_taking_subcommand(self) -> None:
+        """The enumeration itself, so the next subcommand cannot quietly skip the test above: every `pr` or
+        `comment` kind reachable from the parser is named in RESOLVERS."""
+        want = {f"status {k}" for k in ("pr", "comment")} | {f"wait {k}" for k in ("pr", "comment")} \
+            | {"land", "land status", "land cancel", "post comment", "post review"}
+        self.assertEqual(set(self.RESOLVERS), want,
+                         "a subcommand takes a PR or issue target and is not asserted here")
+
+
+def _from_key(key: str) -> tuple[str, Any]:
+    """(OWNER/REPO, N) out of a `kind:owner/repo#n` key, which is what every resolver compares."""
+    _, owner, repo, value = gg.split_key(key)
+    return f"{owner}/{repo}", value
+
+
+def _post_target(kind: str, target: str) -> tuple[str, int]:
+    args = gg.parser().parse_args(["post", kind, target, "--body", "hi"])
+    item = gg.post_item(args)
+    return item["repo"], item["number"]
+
+
+class WaitTwoTargetsNamesTheCallThatWorksTest(unittest.TestCase):
+    """`status pr A B` reads two targets and `wait pr A B` cannot, so the refusal names the calls that do.
+
+    Measured on 2026-11-21: the refusal was argparse's `unrecognized arguments: o/r#2`, which names neither
+    the one-target limit nor the way round it. A wait stays one key on purpose -- its exit code (0/1/2/4) is
+    that target's verdict, which every caller branches on -- so this is a better refusal, not a new rule."""
+
+    def test_the_refusal_names_status_and_one_wait_each(self) -> None:
+        nxt = gg.usage_next(["wait", "pr", "o/r#1", "o/r#2", "--timeout", "600"])
+        self.assertIn("glaeda-gh status pr o/r#1 o/r#2", nxt)
+        self.assertIn("glaeda-gh wait pr o/r#1 --timeout 600", nxt)
+        self.assertIn("one target", nxt)
+
+    def test_it_reads_every_shared_form_as_a_second_target(self) -> None:
+        for second in ("o/r#2", "o/r/2", "2", "#2", "pr:o/r#2", "https://github.com/o/r/pull/2"):
+            with self.subTest(second):
+                self.assertIn("one target", gg.usage_next(["wait", "pr", "o/r#1", second]))
+
+    def test_the_forms_that_already_had_a_next_line_keep_it(self) -> None:
+        """`wait pr OWNER/REPO N` is the repo-and-number join, not two targets, and keeps its own answer."""
+        self.assertEqual(gg.usage_next(["wait", "pr", "o/r", "6"]),
+                         "glaeda-gh wait pr o/r#6 --timeout 1800")
+        self.assertEqual(gg.usage_next(["wait", "--nope"]), "glaeda-gh wait --help")
+        self.assertEqual(gg.usage_next(["wait", "pr", "o/r#1", "--nope"]), "glaeda-gh wait --help")
+
+
+class BrokeredGhTakesTheToolsOwnFormTest(unittest.TestCase):
+    """`glaeda-gh gh ...` normalises this tool's own target form into the one real gh reads.
+
+    Measured on 2026-11-21: `gh pr comment teamleaderleo/glaeda#2323` is not a number and not a URL, so
+    gh's PR finder falls through to its branch case and the call died with `no pull requests found for
+    branch "teamleaderleo/glaeda#2323"`, exit 1, after a round trip -- on the canonical form every other
+    glaeda-gh subcommand prints and accepts. A `#` cannot appear in a git branch name, so the rewrite takes
+    nothing away from the branch form, which keeps working."""
+
+    def test_the_hash_form_becomes_the_number_and_repo_gh_reads(self) -> None:
+        want = {
+            ("pr", "comment", "o/r#5", "--body", "hi"): ["pr", "comment", "5", "--body", "hi", "--repo", "o/r"],
+            ("pr", "view", "o/r#5", "--json", "number"):
+                ["pr", "view", "5", "--json", "number", "--repo", "o/r"],
+            ("issue", "comment", "o/r#5", "--body", "hi"):
+                ["issue", "comment", "5", "--body", "hi", "--repo", "o/r"],
+            ("pr", "edit", "pr:o/r#5", "--add-label", "x"):
+                ["pr", "edit", "5", "--add-label", "x", "--repo", "o/r"],
+            ("pr", "comment", "--body", "hi", "o/r#5"): ["pr", "comment", "--body", "hi", "5", "--repo", "o/r"],
+            ("run", "rerun", "o/r/1234567"): ["run", "rerun", "1234567", "--repo", "o/r"],
+            ("pr", "comment", "o/r#5", "--repo", "o/r", "--body", "hi"):
+                ["pr", "comment", "5", "--repo", "o/r", "--body", "hi"],
+        }
+        for args, fixed in want.items():
+            with self.subTest(" ".join(args)):
+                with contextlib.redirect_stderr(io.StringIO()) as noise:
+                    self.assertEqual(gg.broker_canonical_target(list(args)), fixed)
+                self.assertIn("read as", noise.getvalue())
+
+    def test_a_form_gh_already_reads_is_left_exactly_as_typed(self) -> None:
+        """Nothing that works today is taken away -- the branch form above all, which some caller may rely
+        on, and which `o/r/5` can also be (`feature/v2/3` is a legal branch name)."""
+        same = [
+            ["pr", "view", "lane/fix-2323"],                      # a branch, gh's own fallthrough
+            ["pr", "view", "o/r/5"],                              # a shape a branch name can have
+            ["pr", "view", "5"],                                  # already the form gh reads
+            ["pr", "view", "https://github.com/o/r/pull/5"],      # a URL gh reads itself
+            ["pr", "comment", "o/r#5", "--repo", "x/y"],          # -R names another repo: gh decides
+            ["pr", "view", "run:o/r/123"],                        # a run prefix is not a pull request
+            ["issue", "create", "--title", "o/r#5"],              # a flag's value, not a target
+            ["pr", "list", "--search", "o/r#5"],                  # not a verb that takes one target
+        ]
+        for args in same:
+            with self.subTest(" ".join(args)):
+                with contextlib.redirect_stderr(io.StringIO()) as noise:
+                    self.assertEqual(gg.broker_canonical_target(list(args)), args)
+                self.assertEqual(noise.getvalue(), "")
 
 
 if __name__ == "__main__":
