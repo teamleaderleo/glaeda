@@ -410,9 +410,10 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
-# Falling back from the controller to REST is spend, not just a failure: on big-red, 2026-11-21, it ran a few
-# times every ten minutes for hours, and only refresh-errors.log knew, which nobody reads. The count is kept
-# here, by the hour it happened in, so `glaeda-gh budget` reports it beside the quota it costs.
+# Falling back from the controller to REST is spend, not just a failure: on one developer workstation on
+# 2026-11-21 it ran a few times every ten minutes for hours, and only refresh-errors.log knew, which nobody
+# reads. The count is kept here, by the hour it happened in, so `glaeda-gh budget` reports it beside the
+# quota it costs.
 CONTROLLER_FALLBACK_FILE = "controller-fallback.json"
 CONTROLLER_FALLBACK_HOURS = 25  # hourly buckets kept: a day, plus the running one
 # The same counts by the hour (epoch // 3600 -> counted), folded in as minutes leave rest-spend.json's hour and kept
@@ -654,8 +655,9 @@ CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 # quota (5000/h for every lane on this account together), and the first failure also takes the controller out for
 # CONTROLLER_RETRY and more (controller_down), so one lost race sends a minute of run reads to REST. So the two
 # get their own deadlines, and the read one is derived from what the controller actually costs.
-# Measured on big-red 2026-11-21 10:05-10:35Z, over this host's socat forward to cmux-lawrence (client.json points
-# at http://127.0.0.1:18765, which socat forwards over `tailscale nc`, so "local" is a tailnet round trip):
+# Measured 2026-11-21 10:05-10:35Z on a developer workstation, over its socat forward to cmux-lawrence
+# (client.json points at http://127.0.0.1:18765, which socat forwards over `tailscale nc`, so "local" is a
+# tailnet round trip):
 #   connect, to the local forward              0.3-4.7 ms (n=43)
 #   first byte                                 0.13-0.28 s, flat in body size
 #   whole answer, /v1/github/events            0.13-1.47 s (p50 0.44, p90 0.53), throughput-bound: the tunnel
