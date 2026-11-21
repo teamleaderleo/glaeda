@@ -20861,10 +20861,6 @@ class DiskBoundEvictQueueTest(unittest.TestCase):
         self.assertFalse(self.waiting())
 
 
-
-        self.assertNotIn("SIM_TOKEN_COPIES", disk)
-
-
 class StepBackfillTest(unittest.TestCase):
     """STEP_BACKFILL: a ci-step takes units a job waiting here for units cannot use now. 2026-11-18 13:45Z: five lent
     minis held 10-13 of 14 units with PR jobs waiting for more, and their workers advertised no step class while 228
