@@ -4707,6 +4707,21 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#4", until="done", fill=(mixed, {}), timeout=5)[0], 1,
                          "a finished red fails at once beside a running check")
 
+    def test_a_merged_pr_with_a_pending_non_required_check_exits_merged_at_once(self) -> None:
+        """leo-workspace#7310, 2026-11-21: `wait pr --timeout 1800` (no --until) saw MERGED at ~1398 s and ran to its
+        1800 s timeout with "result: timeout", because one check (0 required) was still pending."""
+        node = pr_node(1, state="MERGED", checks=[check_run("a"), check_run("b", "IN_PROGRESS", None)])
+        node["mergeCommit"] = {"oid": "f" * 40}
+        merged = gg.parse_pr(node)
+        for until in ("green", "done", "required", "merged"):
+            for sha in (None, "a" * 40):  # no --sha, and --sha at the head that merged
+                began = time.time()
+                code, text = self.wait("pr", "o/r#1", until=until, fill=(merged, {}), sha=sha, timeout=5)
+                self.assertEqual(code, 0, (until, sha, text))
+                self.assertIn("result: merged", text)
+                self.assertNotIn("timeout", text)
+                self.assertLess(time.time() - began, 4, (until, sha))
+
     def test_a_merged_pr_at_another_head_exits_merged_at_once_under_every_until(self) -> None:
         """hq#16384, 2026-11-21: `--until required --sha 6ca0a8fd` kept waiting 2400 s on a PR merged at head cbad338ab7."""
         node = pr_node(1, state="MERGED", checks=[check_run("a", "IN_PROGRESS", None)])

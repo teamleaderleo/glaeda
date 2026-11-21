@@ -16342,13 +16342,13 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         # --sha 6ca0a8fd` kept waiting 2400 s on a PR that had merged at head cbad338ab7, which could never match).
         if sha and not str(data.get("headRefOid") or "").startswith(sha):
             return EXIT_OK  # it merged at another head: the commit waited for is not the one that landed, nothing to wait for
-        if until != "done":
-            return check_verdict(data, until, now, grace, settle)  # at the head waited for: a runner refusal in its grace still holds
-        # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
-        # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
-        # still fails; a pending, missing or other-head check no longer holds the wait.
+        # Nothing more runs for it: a merged PR is done whatever its head still shows, under every --until
+        # (leo-workspace#4370, 2026-11-11: `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none
+        # reported yet"; leo-workspace#7310, 2026-11-21: `wait pr` with no --until saw MERGED at ~1398 s and ran to its
+        # 1800 s timeout on one non-required check still pending). A finished red that the --until counts still fails;
+        # a pending, held, missing or other-head check no longer holds the wait.
         # (judged as green would: under "done" a red waits for the running checks, and that None would read as OK)
-        decided = check_verdict(data, "green", now, grace, settle)
+        decided = check_verdict(data, "required" if until == "required" else "green", now, grace, settle)
         return EXIT_FAIL if decided == EXIT_FAIL else EXIT_OK
     if sha and not str(data.get("headRefOid") or "").startswith(sha):
         return None  # the push has not reached GitHub yet, or these are an older commit's checks
