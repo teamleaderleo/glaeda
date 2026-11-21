@@ -18325,6 +18325,17 @@ class LandSnapshotTest(Base):
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
 
+    def test_changed_cached_check_wakes_a_waiting_land(self) -> None:
+        key = "pr:o/r#1"
+        head = {"headRefOid": "a" * 40, "state": "OPEN", "checks": []}
+        self.daemon.store(key, None, data=head)
+        self.assertIn(key, self.daemon.land_dirty)
+        self.daemon.land_dirty.clear()
+        self.daemon.store(key, None, data=dict(head))
+        self.assertNotIn(key, self.daemon.land_dirty)
+        self.daemon.store(key, None, data={**head, "checks": [{"name": "ci", "status": "COMPLETED"}]})
+        self.assertIn(key, self.daemon.land_dirty)
+
     def cycle(self, k: int) -> dict:
         at = NOW + gg.CYCLE * k
         for n in range(1, self.N + 1):
@@ -20918,10 +20929,12 @@ class LandTest(Base):
         consider = self.q.consider
         self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
         self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
-        self.tick(30)
+        self.t += 30
+        self.q.tick(self.t, dirty=set())
         self.assertEqual(calls, [])
         self.q.recovery_at = self.t
-        self.tick(1)
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
         self.assertEqual(calls, [self.KEY])
         self.assertEqual(len(self.w.explains()), 1)
 
@@ -20935,7 +20948,8 @@ class LandTest(Base):
         consider = self.q.consider
         self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
         self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
-        self.tick(1)
+        self.t += 1
+        self.q.tick(self.t, dirty=set())
         self.assertEqual(calls, [])
         dirty = {self.KEY}
         self.q.tick(self.t + 1, dirty=dirty)

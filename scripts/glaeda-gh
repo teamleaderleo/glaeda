@@ -7387,7 +7387,8 @@ class Daemon:
     def land_nudge(self, key: str) -> None:
         """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
         self.nudged.add(key)
-        self.land_dirty.add(key)
+        if self.land_queue is not None and key in self.land_queue.entries:
+            self.land_dirty.add(key)
 
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
@@ -7399,7 +7400,8 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading)
-        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=self.land_dirty)
+        dirty, self.land_dirty = self.land_dirty, set()
+        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
 
@@ -8012,6 +8014,9 @@ class Daemon:
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
             write_json(cache, entry)
+        if (self.land_queue is not None and key in self.land_queue.entries and "data" in fields
+                and land_fingerprint(base) != land_fingerprint(entry)):
+            self.land_dirty.add(key)
         if fields.get("dataAt") is not None and not fields.get("error"):
             self.note_read(key)
 
@@ -11130,7 +11135,6 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
-        self.cache_seen: dict[str, str] = {}
         self.changed_entries: set[str] = set()
         self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
@@ -11340,9 +11344,6 @@ class LandQueue:
 
     def tick(self, now: float | None = None, dirty: set[str] | None = None) -> None:
         self.now = time.time() if now is None else now
-        dirty_keys = set(dirty or ())
-        if dirty is not None:
-            dirty.clear()
         recovery = self.now >= self.recovery_at
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
@@ -11350,10 +11351,8 @@ class LandQueue:
         if executor is not None:
             self.forward_tick(executor)
             return
-        prior_states = {key: entry.get("state") for key, entry in self.entries.items()}
         self.ingest()
-        dirty_keys |= self.changed_entries
-        self.changed_entries.clear()
+        self.changed_entries.update(key for key in dirty or () if key in self.entries)
         self.reap()
         if self.refuse():
             return
@@ -11381,11 +11380,26 @@ class LandQueue:
                 if self.now - float(e.get("updated") or 0) > LAND_KEEP:
                     (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                     del self.entries[key]
+                    self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
                         self.rearm(e)  # judged from the next pass
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        if dirty is not None and not recovery and latch is None and ended is None:
+            # The daemon tells us when a PR cache write or webhook changes a waiting head. A quiet CI wait
+            # needs its watch renewed, but sorting it would reopen its cache on every daemon tick.
+            awake = []
+            for key in live:
+                e = self.entries[key]
+                w = e.get("wait") or {}
+                if (e["state"] == "waiting" and w.get("kind") == "pr" and not w.get("rerun")
+                        and key not in self.changed_entries and not self.due(e)
+                        and not (e.get("latchHeld") or e.get("snapshotWait") or e.get("after"))):
+                    self.keep_watching(e)
+                else:
+                    awake.append(key)
+            live = awake
         for key in sorted(live, key=self.judge_order):
             try:
                 if self.queue_quota_parked():
@@ -11405,23 +11419,16 @@ class LandQueue:
                 with self.lock:
                     if self.parked(e):
                         continue
-                    cache_fp = land_fingerprint(self.cache_of(key))
-                    changed = cache_fp != self.cache_seen.get(key)
-                    self.cache_seen[key] = cache_fp
-                    wait_kind = (e.get("wait") or {}).get("kind")
-                    active = recovery or self.due(e) or key in dirty_keys \
-                        or (e.get("state") == "waiting_after" and prior_states.get(key) == "waiting_after") \
-                        or wait_kind in ("run", "comment", "repin") or (e.get("wait") or {}).get("rerun") or changed
-                    if not active:
-                        self.keep_watching(e)
-                        continue
                     if e.get("latchHeld"):
                         # no mark holds it this pass (re-read above, never the until it stored): due now, and its
                         # status names no latch, even if no worker takes it yet (gated)
                         self.unhold(e)
                         self.save(e)
                     self.keep_watching(e)
+                    gated = self.pass_gated
                     self.consider(e)
+                    if self.pass_gated == gated:
+                        self.changed_entries.discard(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
         self.log_pool()
