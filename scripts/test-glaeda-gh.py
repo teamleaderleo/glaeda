@@ -11066,6 +11066,19 @@ class BrokerBase(Base):
         # judged the call. BrokerMergeGuardTest takes it away: a merge typed as `glaeda-gh gh ...` goes to the guard.
         os.environ["GH_QUOTA_CHECKED"] = "1"
         os.environ.pop("GLAEDA_MERGE_GUARD", None)
+        # gh resolves a repository by walking up from the working directory, so every answer here
+        # depends on where the suite was launched: inside a checkout a bare `gh pr view` resolves
+        # that repo and is cacheable, outside one it is unknowable and passes through. Left to the
+        # ambient cwd, `test_uncacheable_reads_go_straight_to_gh` passed in /tmp and failed inside
+        # any git worktree -- which is where agents run the suite -- so the failure read as a diff's
+        # own and cost a bisection. Pinned here for the same reason as the git and gh config scopes
+        # above; a test that wants a repository chdirs into one it made itself. Its own directory,
+        # not one under self.tmp: tearDown removes self.tmp before the cleanups a subtest registers
+        # to chdir back, and those must land somewhere that still exists.
+        self.addCleanup(os.chdir, os.getcwd())
+        self.nowhere = tempfile.TemporaryDirectory(prefix="glaeda-gh-no-checkout-")
+        self.addCleanup(self.nowhere.cleanup)
+        os.chdir(self.nowhere.name)
 
     def fake_gh(self) -> Path:
         """A stand-in for the real gh that records the arguments it was handed."""
