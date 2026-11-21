@@ -23355,7 +23355,7 @@ class LandTest(Base):
 
     def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
         """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
-        else. big-red, 2026-11-21: four `land status` rows stopped update_branch_refused after 6 identical
+        else. 2026-11-21, one host's queue: four `land status` rows stopped update_branch_refused after 6 identical
         "merge conflict between base and head" calls at one head, their stop's `next:` empty, one parked 3343 min."""
         for said in (self.CONFLICT_REFUSAL, "GraphQL: Pull Request has merge conflicts (mergePullRequest)",
                      "its merge conflicts must be resolved"):

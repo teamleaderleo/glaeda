@@ -10533,7 +10533,7 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
-# push that resolves it can. efficiency-standing-lane, 2026-11-21: `land status` on big-red held four rows stopped
+# push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
 # update_branch_refused on {"message":"merge conflict between base and head"} (HTTP 422), each after 6 identical
 # update-branch calls at one head -- 48 of the host's 57 conflict refusals that day were the 2nd through 6th of a
 # streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
