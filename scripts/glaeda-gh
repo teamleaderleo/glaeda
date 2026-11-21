@@ -2709,6 +2709,13 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
+def internal_env() -> dict:
+    """This process's environment plus GLAEDA_GH_INTERNAL: for this daemon's own `glaeda-gh gh api` reads, which
+    are piped through the broker on purpose (the answer cache shares them) and keep the route they have today
+    rather than being handed to the host's quota guard as a person's call is (see broker_guard_comes_back)."""
+    return {**os.environ, GLAEDA_INTERNAL: "1"}
+
+
 def retry_after_seconds(value: Any) -> float | None:
     """A Retry-After header as seconds, at most PACE_HOLD_MAX, or None when it says no usable number. float() takes
     "inf", "nan" and "1e12": an infinite hold overflowed every int() after it (the queued write was dropped as a bad
@@ -21766,6 +21773,49 @@ def lane_vm_gh() -> str | None:
     return None
 
 
+QUOTA_HOP = "GLAEDA_GH_QUOTA_HOP"  # a hand-off to the gh-quota guard that is neither a merge nor a create: this
+# broker's own mark for it, carrying the pid like BROKER_MARK, so a guard generation that stops exporting
+# GH_QUOTA_CHECKED costs one extra exec rather than an endless chain, while a `gh` the call's own gh goes on to
+# spawn is a new pid and reaches the guard as a plain `gh` would.
+GLAEDA_INTERNAL = "GLAEDA_GH_INTERNAL"  # this daemon's own `gh api` reads: left on the route they have today
+
+
+def file_head(path: Path) -> bytes:
+    """The first 4096 bytes of `path`, or b"" when it cannot be read (broker_is_wrapper's reason: a gh this account
+    may execute but not read is a binary, not a wrapper, and must not be judged by what it does not say)."""
+    try:
+        with path.open("rb") as stream:
+            return stream.read(4096)
+    except OSError:
+        return b""
+
+
+def path_gh_after(directory: Path) -> Path | None:
+    """The first executable `gh` on PATH in a directory after `directory`: what a guard in `directory` execs next,
+    resolved the way the guard resolves it (PATH order, first match after its own directory)."""
+    seen = False
+    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not entry:
+            continue
+        if not seen:
+            seen = Path(entry) == directory
+            continue
+        candidate = Path(entry) / "gh"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def broker_guard_comes_back(guard: Path) -> bool:
+    """Whether the gh-quota guard would hand the call back to this broker: the next `gh` after it on PATH is this
+    broker's own shim. A merge and a create go to the guard either way (one is refused without it, the other has a
+    pause only it can ask), but for every other call this is the condition that makes the hand-off free: without
+    it the guard runs the real gh behind this broker's back, and the call loses the answer cache, the source
+    refusal and the repeat hold -- a worse trade than the quota route it would gain."""
+    following = path_gh_after(guard.parent)
+    return following is not None and BROKER_MARK.encode() in file_head(following)
+
+
 def broker_real_gh() -> str:
     """The real gh: the binary a guard that delegated here named in GLAEDA_GH_REAL, else the next
     `gh` on PATH that is not a wrapper, else one of the usual install paths (a LaunchAgent's PATH
@@ -23494,7 +23544,8 @@ def read_runners(path: str) -> list[dict]:
     try:
         done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", "--paginate",
                             f"{path}?per_page=100", "--jq",
-                            ".runners[] | {name, status, busy, labels: [.labels[].name]}"], timeout=120)
+                            ".runners[] | {name, status, busy, labels: [.labels[].name]}"], timeout=120,
+                           env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WatchError(f"gh api {path}: {describe(error)}") from None
     if done.returncode != 0:
@@ -23522,7 +23573,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     where = f"{RUNNER_STATE_VARIABLE} on {repo}"
     try:
         done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", path, "--jq", ".value"],
-                           timeout=60)
+                           timeout=60, env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
     if done.returncode != 0:
@@ -23697,7 +23748,7 @@ def search_read(terms: str, limit: int) -> dict:
     argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
             "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
     try:
-        done = run_bounded(argv, timeout=120)
+        done = run_bounded(argv, timeout=120, env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         raise WatchError(f"gh api graphql (search): {describe(error)}") from None
     if done.returncode != 0:
@@ -23799,6 +23850,11 @@ def cmd_search(kind: str, words: list[str], repos: list[str], state: str, author
 # reached gh unasked and could renew the pause for every writer on the login. The lists mirror the guard's own
 # (gh_quota.py CREATE_WORDS, CREATE_API, CREATE_MUTATIONS, plus its landing creates). Unlike a merge, a create on a
 # host with no guard runs as before: creates are routine everywhere, and such a host has no pause to ask.
+# Every other call goes the same way, for the same reason one step further on: the guard is where a call gets its
+# second route (a GraphQL read answered over REST once GraphQL is spent, and the reverse), and its ledger entry.
+# Only where the guard would hand the call back to this broker, so nothing is run behind the answer cache's back:
+# broker_guard_comes_back. Not for this daemon's own reads (GLAEDA_GH_INTERNAL) and not under a person's
+# CMUX_GH_BROKER_DISABLE, which a merge and a create override and an ordinary call does not.
 MERGE_GUARD_ENV = "GLAEDA_MERGE_GUARD"
 # (command, subcommand) -> None (always a create) or the flags without which it creates nothing (a close's comment)
 BROKER_CREATE_WORDS: dict[tuple[str, str], tuple[str, ...] | None] = {
@@ -23979,23 +24035,59 @@ def broker_canonical_target(args: list[str]) -> list[str]:
     return fixed
 
 
+def broker_answered_here(args: list[str]) -> bool:
+    """Whether this broker can answer the call without GitHub: broker_plan serves it from the daemon's own state,
+    or refuses it. Then the guard has nothing to add -- there is no protocol to fall back to and nothing to
+    charge -- and the hand-off would be pure latency on the commonest call there is. Measured 2026-11-21, one
+    served `pr view --json state`: 0.33 s this way, 0.84 s through the guard. broker_plan is pure (it registers no
+    watch and writes nothing), so asking it twice costs local reads only."""
+    try:
+        route, _payload, _key = broker_plan(args, time.time())
+    except Exception as error:  # noqa: BLE001  unknown is "not answered here": the hand-off is the safe side
+        broker_note({"route": "error", "error": describe(error), "site": "broker_answered_here"})
+        return False
+    return route in ("serve", "refuse")
+
+
 def broker_merge_handoff(args: list[str]) -> int | None:
     """Hand a merge or a create the gh-quota guard has not judged to the guard (exec, so this returns only on
     failure), or None when the call is neither, or is a create and no guard can be run here."""
     if os.environ.get("GH_QUOTA_CHECKED"):
         return None
     if not broker_merge_call(args):
-        if broker_create_call(args):
-            path = os.environ.get("PATH", "")
+        create = broker_create_call(args)
+        # And every other call the guard has not judged, for the same reason one step further on: the guard is
+        # where a call gets its second route. A GraphQL read it answers over REST once GraphQL is spent, and the
+        # reverse; a write whose refusal it reads and re-sends over the other protocol. Typed as `glaeda-gh gh`
+        # -- which is what this tool's own next-step lines print -- the call had one route and no ledger entry.
+        # Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr edit 2358 -R
+        # teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the
+        # identical bare `gh pr edit` answered over REST at once. Unlike a merge or a create, this hand-off is taken only when the guard would hand the
+        # call back here (broker_guard_comes_back) and not for this daemon's own reads, which keep their route.
+        # CMUX_GH_BROKER_DISABLE is honoured here, unlike for a merge or a create: a merge may never be sent
+        # past land_judge and a create may never skip the login's pause, but for an ordinary call that switch is
+        # a person asking for the real gh and the line they typed, and it is the escape hatch the loop message
+        # advertises -- it has to reach every route this broker adds.
+        other = not create and not os.environ.get(GLAEDA_INTERNAL) \
+            and os.environ.get("CMUX_GH_BROKER_DISABLE") != "1" \
+            and os.environ.get(QUOTA_HOP) != str(os.getpid()) and not os.environ.get(BROKER_MARK) \
+            and not broker_answered_here(args)
+        if create or other:
             try:
                 guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
-                if guard.is_file() and os.access(guard, os.X_OK):
-                    os.environ["PATH"] = os.pathsep.join([str(guard.parent), path])
-                    os.execv(str(guard), [str(guard), *args])
+                if guard.is_file() and os.access(guard, os.X_OK) \
+                        and (create or broker_guard_comes_back(guard)):
+                    # execve, not a mutated os.environ then execv: the hand-off's PATH and its hop mark belong
+                    # to the process being started. Mutating this process first leaves the guard's directory on
+                    # PATH and the hop mark set for every later call in the same process, which is wrong for
+                    # every in-process caller (a test, the daemon) whenever the exec does not happen.
+                    # execve keeps the pid, so the pass back here reads QUOTA_HOP as its own.
+                    env = {**os.environ, QUOTA_HOP: str(os.getpid()),
+                           "PATH": os.pathsep.join([str(guard.parent), os.environ.get("PATH", "")])}
+                    os.execve(str(guard), [str(guard), *args], env)
             except Exception as error:  # noqa: BLE001
-                os.environ["PATH"] = path
                 broker_note({"route": "error", "error": describe(error), "site": "broker_create_handoff"})
-        return None  # no guard to ask (or it cannot run): the create runs as before
+        return None  # no guard to ask (or it cannot run): the call runs as before
     # From here the call is a merge: anything that fails refuses it, never runs it unguarded (F2, second review).
     try:
         guard = Path(os.environ.get(MERGE_GUARD_ENV) or PACE_CLI)
@@ -25068,17 +25160,32 @@ def broker_post_args(item: dict) -> tuple[str, dict] | None:
     return tool, {"repo": item["repo"], "number": item["number"], "body": item["body"]}
 
 
-def broker_post_next(item: dict, body: Path) -> str:
-    """The command that makes a write this host cannot: a lane VM's `gh` reaches the broker's own tools only, so a
-    review is posted from the broker host, where this queue has a login."""
-    repo, number = item.get("repo"), item.get("number")
+def broker_post_next(item: dict, body: Path | None = None) -> str:
+    """The command that makes a write this host cannot, with every field this queue already knows filled in
+    (cmuxterm-hq docs/handbook/printed-step-not-a-command.md). A lane VM's `gh` reaches the broker's own tools, and
+    the broker has none for a review, so a review is posted from the broker host, where this queue has a login."""
+    repo, number = item.get("repo") or "OWNER/REPO", item.get("number")
+    body_file = str(body) if body is not None else "F"
     if item["kind"] == "review":
-        return (f"post it from the broker host: glaeda-gh post review {repo}#{number} "
-                f"--event {str(item.get('event') or 'comment').lower()} --body-file {body}")
+        return ("post it from the broker host, which has a login for this queue: "
+                f"glaeda-gh post review {repo}#{number} "
+                f"--event {str(item.get('event') or 'comment').lower()} --body-file {body_file}")
     if item["kind"] == "pr":
-        return (f"gh pr create --repo {repo} --base {item.get('base')} --head {item.get('head')} "
-                f"--title {shlex.quote(str(item.get('title') or ''))} --body-file {body}")
-    return f"gh pr comment {number} --repo {repo} --body-file {body}"
+        return (f"write it with gh, which routes through this host's broker: gh pr create --repo {repo} "
+                f"--base {item.get('base')} --head {item.get('head')} "
+                f"--title {shlex.quote(str(item.get('title') or ''))} --body-file {body_file}")
+    return ("write it with gh, which routes through this host's broker: "
+            f"gh pr comment {number} --repo {repo} --body-file {body_file}")
+
+
+def no_login_refusal(item: dict, body: Path | None = None) -> str | None:
+    """Why this host cannot make a write, and what makes it. None where this host has a login of its own.
+    (gcp-agent-lane-2, 2026-11-21: three comments were believed queued for an hour, then all three had failed in
+    the daemon with this reason -- upstream_refuse_posts. The caller hears it at accept time instead.)"""
+    if upstream_command() is None:
+        return None
+    return (f"this host reads GitHub through its upstream ({UPSTREAM_CONFIG}) and has no login to post with; "
+            f"nothing was queued. {broker_post_next(item, body)}")
 
 
 def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
@@ -25088,8 +25195,8 @@ def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(item["body"])
     lacks = "the lane-gh broker has no tool for this write" if chosen is not None else "no lane-gh runs here"
-    print(f"glaeda-gh: not queued: this host has no login to post with (it reads GitHub through its upstream) and "
-          f"{lacks}; its body is at {path}: {broker_post_next(item, path)}", file=sys.stderr)
+    why = no_login_refusal(item, path) or "this host has no login to post with"
+    print(f"glaeda-gh: not queued: {why} ({lacks}; its body is kept at {path})", file=sys.stderr)
     return 3
 
 

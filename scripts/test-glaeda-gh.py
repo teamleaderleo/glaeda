@@ -13143,6 +13143,127 @@ class BrokerLoopTest(BrokerBase):
         self.assertEqual(found, str(installed))
 
 
+class BrokerQuotaGuardTest(BrokerBase):
+    """Every call the host's gh-quota guard has not judged goes to the guard, not only a merge or a create.
+
+    `glaeda-gh gh ...` -- the route this tool's own next-step lines print -- reached the real gh with one route, no
+    fallback and no ledger entry. Measured 2026-11-21 on a workstation carrying both guards: `glaeda-gh gh pr
+    edit 2358 -R teamleaderleo/glaeda --body-file -` refused with "GraphQL: API rate limit already exceeded" while the identical
+    bare `gh pr edit` answered over REST at once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Named literally rather than through the module's constants, so the first test below is a detector of the
+        # behaviour and not of a missing symbol: on the old broker it fails by naming the gh it ran.
+        for name in ("GLAEDA_GH_QUOTA_HOP", "GLAEDA_GH_INTERNAL"):
+            os.environ.pop(name, None)
+            self.addCleanup(os.environ.pop, name, None)
+
+    def chain(self, comes_back: bool = True, guard: bool = True) -> Path:
+        """The host's designed chain on PATH: the gh-quota guard, then this broker's own shim, then gh. With
+        comes_back=False the next gh after the guard is the real gh, so the guard would run it behind this broker's
+        back. GH_QUOTA_CHECKED is dropped: this is a call that did not come through the guard."""
+        path = self.home / "quota" / "gh"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if guard:
+            path.write_text("#!/bin/sh\n# gh guard: gh-quota\nexit 9\n")
+            path.chmod(0o755)
+        self.patch_env({gg.MERGE_GUARD_ENV: str(path)})
+        after = self.home / "shim"
+        after.mkdir(exist_ok=True)
+        (after / "gh").write_text(f"#!/bin/sh\n# {gg.BROKER_MARK} shim\nexit 9\n" if comes_back
+                                  else "#!/bin/sh\nexit 0\n")
+        (after / "gh").chmod(0o755)
+        self.patch_env({"PATH": f"{path.parent}:{after}:{self.home / 'bin'}"})
+        os.environ.pop("GH_QUOTA_CHECKED", None)
+        self.addCleanup(os.environ.__setitem__, "GH_QUOTA_CHECKED", "1")
+        return path
+
+    def patch_env(self, values: dict) -> None:
+        patch = mock.patch.dict(os.environ, values)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def first_exec(self, args: list[str] | None = None) -> tuple[str | None, list[str] | None]:
+        """(the path cmd_gh exec'd, the argv it handed it), as a fresh process would see it."""
+        seen: list[tuple[str, list[str]]] = []
+
+        def execv(path: str, argv: list[str]) -> None:
+            seen.append((path, argv))
+            raise SystemExit(0)
+
+        for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
+            if name not in self.kept:
+                os.environ.pop(name, None)
+        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.suppress(SystemExit):
+                gg.cmd_gh(list(args if args is not None else self.READ))
+        return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
+
+    READ = ("pr", "view", "7", "-R", "o/r", "--json", "state")
+    kept: tuple[str, ...] = ()
+
+    def test_a_read_that_skipped_the_quota_guard_is_handed_back_to_it(self) -> None:
+        guard = self.chain()
+        path, passed = self.first_exec(["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"])
+        self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
+        self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
+                         "the line it is handed is the line that was typed")
+        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+                         "the pass back here knows it has been round")
+        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+                         "led by the guard's own directory, so it finds the gh after it as usual")
+
+    def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
+        """One hop, not a loop: the guard exports GH_QUOTA_CHECKED, and this hand-off's own mark carries the pid in
+        case a guard generation stops doing so. A `gh` the call's gh goes on to spawn is a new pid, and reaches the
+        guard as a plain `gh` would."""
+        self.chain()
+        real = os.environ["GLAEDA_GH_REAL"]
+        self.patch_env({"GH_QUOTA_CHECKED": "1"})
+        self.assertEqual(self.first_exec()[0], real, "exactly as before: the guard has judged it")
+        os.environ.pop("GH_QUOTA_CHECKED", None)
+        self.patch_env({"GLAEDA_GH_QUOTA_HOP": str(os.getpid())})
+        self.assertEqual(self.first_exec()[0], real, "its own mark, this pid")
+        self.patch_env({"GLAEDA_GH_QUOTA_HOP": str(os.getpid() + 1)})
+        self.assertEqual(self.first_exec()[0], str(self.home / "quota" / "gh"),
+                         "another process's mark is not this call's history")
+
+    def test_a_call_already_through_this_broker_keeps_its_route(self) -> None:
+        self.chain()
+        self.kept = (gg.BROKER_MARK,)
+        self.patch_env({gg.BROKER_MARK: f"1:{os.getpid()}"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+    def test_the_guard_is_left_out_when_it_would_not_hand_the_call_back(self) -> None:
+        """The guard execs the next `gh` on PATH. Where that is not this broker's shim, this route would hand the
+        read to the real gh behind this broker's back -- losing the answer cache, the source refusal and the repeat
+        hold, a worse trade than the one quota route it would gain. A create still goes (it has a pause only the
+        guard can ask) and a merge is refused without the guard: neither changes here."""
+        self.chain(comes_back=False)
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(self.first_exec(["pr", "comment", "7", "-R", "o/r", "--body", "x"])[0],
+                         str(self.home / "quota" / "gh"), "a create goes to the guard either way")
+
+    def test_a_host_with_no_guard_runs_the_read_as_before(self) -> None:
+        self.chain(guard=False)
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+    def test_this_daemons_own_reads_keep_the_route_they_have(self) -> None:
+        """They are piped through this broker on purpose (the answer cache shares them), and they run inside the
+        daemon's own tick, where the guard's checks and holds are not wanted."""
+        self.chain()
+        self.patch_env({"GLAEDA_GH_INTERNAL": "1"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+        self.assertEqual(gg.internal_env()["GLAEDA_GH_INTERNAL"], "1", "which is how they say so")
+
+    def test_a_persons_switch_still_runs_the_real_gh(self) -> None:
+        self.chain()
+        self.patch_env({"CMUX_GH_BROKER_DISABLE": "1"})
+        self.assertEqual(self.first_exec()[0], os.environ["GLAEDA_GH_REAL"])
+
+
 class BrokerReviewTest(BrokerBase):
     """What a second independent review of the broker found by running it, 2026-10-21."""
 
@@ -18003,8 +18124,37 @@ class BrokerAnswerCacheTest(CountingGhBase):
         bodies = sorted(gg.unsent_dir().glob("*.md"))
         self.assertEqual([p.read_text() for p in bodies], ["the review body"])
         self.assertIn(str(bodies[0]), said)
-        self.assertIn("post review O/R#7 --event comment --body-file", said)
+        self.assertIn("glaeda-gh post review O/R#7 --event comment --body-file", said)
         self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+    def test_a_post_on_a_host_with_no_login_is_refused_where_the_caller_is(self) -> None:
+        """gcp-agent-lane-2, 2026-11-21: three comments queued on a lane VM were all failed by the daemon with
+        "has no login to post with", an hour and a `post status` read later. A host that reads through an upstream
+        refuses the write where the caller is -- and, with no lane-gh to write it through, names the command that
+        posts the body it kept, with its fields filled in."""
+        no_guard(self)
+        config = self.home / "upstream.json"
+        config.write_text(json.dumps({"command": ["ssh", "huge-blue", "glaeda-gh", "upstream"]}), encoding="utf-8")
+        for kind, target, hand in (("comment", "O/R#7", "gh pr comment 7 --repo O/R --body-file {body}"),
+                                   ("review", "O/R#7",
+                                    "glaeda-gh post review O/R#7 --event comment --body-file {body}"),
+                                   ("pr", "O/R",
+                                    "gh pr create --repo O/R --base main --head lane/x --title t --body-file {body}")):
+            with self.subTest(kind=kind):
+                made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
+                    "head": None, "base": None, "title": None}
+                args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
+                                 reviewer=None, event="comment", **made)
+                err = io.StringIO()
+                with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
+                        contextlib.redirect_stderr(err):
+                    self.assertEqual(gg.cmd_post(args), 3)
+                said = err.getvalue()
+                # one id per write, random-suffixed: this subTest's body is the newest, not the last sorted
+                body = max(gg.unsent_dir().glob("*.md"), key=lambda f: f.stat().st_mtime_ns)
+                self.assertEqual(body.read_text(), "hi")
+                self.assertIn("has no login to post with", said)
+                self.assertIn(hand.format(body=body), said)  # whole, never cut
+                self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
 
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
@@ -18538,6 +18688,9 @@ class RunnersTest(BrokerBase):
         argv = ran.call_args[0][0]
         self.assertIn("orgs/o/actions/runners?per_page=100", argv)
         self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        # The daemon's own reads carry the internal mark, so they keep this route instead of being handed to the
+        # host's quota guard; a fake answer that does not take env= is no longer this caller.
+        self.assertEqual(ran.call_args.kwargs["env"][gg.GLAEDA_INTERNAL], "1")
         bad = subprocess.CompletedProcess([], 0, "not json\n", "")
         with mock.patch.object(gg, "run_bounded", return_value=bad), self.assertRaises(gg.WatchError):
             gg.cmd_runners("o", None, True)
@@ -18550,7 +18703,8 @@ class RunnersTest(BrokerBase):
             gg.cmd_runners("not a scope", None, False)
 
     def test_repo_scope_reads_the_org_pool_too_and_says_so(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             path = next(a for a in argv if "actions/runners" in a)
             rows = ([{"name": "t", "status": "offline", "busy": False, "labels": ["side"]}] if "repos/" in path else
                     [{"name": "o1", "status": "online", "busy": True, "labels": ["side"]},
@@ -18568,7 +18722,8 @@ class RunnersTest(BrokerBase):
         self.assertIn("[read: 1 repo + 2 org]", out.getvalue())
 
     def test_repo_scope_names_an_org_listing_it_could_not_read(self) -> None:
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("orgs/" in a for a in argv):
                 return subprocess.CompletedProcess([], 1, "", "HTTP 403")
             row = {"name": "t", "status": "online", "busy": False, "labels": ["side"]}
@@ -18593,7 +18748,8 @@ class RunnersTest(BrokerBase):
         repo_rows = [{"name": f"t{n}", "status": "online", "busy": False, "labels": ["self-hosted", "trusted"]}
                      for n in range(39)]
 
-        def answer(argv, timeout=None):
+        # env=: these reads carry internal_env(), so a fake that ignores it stops matching the caller.
+        def answer(argv, timeout=None, env=None):
             if any("actions/variables/CI_RUNNER_STATE" in a for a in argv):
                 if state is None:
                     return subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)")
