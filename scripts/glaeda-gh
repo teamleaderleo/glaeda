@@ -44,6 +44,13 @@
     glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
                                                         deciding whether to hand its calls over
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
+    glaeda-gh search [issues|prs] QUERY [--repo OWNER/REPO]... [--state S] [--author LOGIN] [--limit N] [--json]
+                                                        find pull requests and issues over GraphQL search, kept
+                                                        for every session: `status pr`'s fields (number, title,
+                                                        url, state, head, headRefOid, merged, checks.state), and
+                                                        each row's OWNER/REPO#N to hand to status, wait or land.
+                                                        Instead of `gh search` / `gh api search/...`, which spend
+                                                        the shared REST quota (and its 30-a-minute search limit)
     glaeda-gh runners OWNER[/REPO] [--label L] [--json] busy and idle self-hosted runners, from one shared read
                                                         (instead of a jobs read per run: see GH_SWEEP_MAX)
     glaeda-gh on-event [--json]                         the commands the daemon runs once per finished run or job
@@ -21636,6 +21643,161 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- search (issues and pull requests)
+
+# An agent who needs to find a PR or issue had no subcommand here, so it reached for `gh search issues|prs` or
+# `gh api search/...`: 30 such calls from 20 session transcripts on this host in the week to 2026-11-21. Those
+# spend the shared REST quota this daemon exists to protect, and REST search carries its own 30-a-minute limit,
+# so one sweep of a few repositories blinds every PR wait on the host for a minute -- the fleet has run the
+# quota to zero this way. `search` asks GraphQL's search connection instead, through this broker (read_runners'
+# route), so a call costs 1 GraphQL point and no REST at all, and an identical search from the next session
+# within GLAEDA_GH_CACHE_TTL is served from the kept answer with no request at all. gh_cache_graphql_scope
+# already reads a `repo:o/r` search's scope, so a kept answer is made old by a write to that repository.
+SEARCH_LIMIT_MAX = 100  # GraphQL's `first:` ceiling; more would need paging, which no caller has asked for
+SEARCH_KINDS = {"issues": "is:issue", "prs": "is:pr", "both": ""}
+# What an agent types for each kind, `gh search` words included; `both` is a bare query with no kind word.
+SEARCH_KIND_WORDS = {"issues": "issues", "issue": "issues", "prs": "prs", "pr": "prs", "pulls": "prs",
+                     "pull-requests": "prs", "both": "both"}
+SEARCH_STATES = {"open": "state:open", "closed": "state:closed", "merged": "is:merged", "all": ""}
+SEARCH_SERVED = "glaeda-gh search issues|prs QUERY [--repo OWNER/REPO]"
+# `gh search code|commits|repos` have no GraphQL search type these fields come from: each names the form that works.
+SEARCH_UNSERVED = {
+    "code": f"code search is not served here (no cached route): grep a checkout instead "
+            f"(wt new REPO BRANCH --files), or for a pull request or issue `{SEARCH_SERVED}`",
+    "commits": f"commit search is not served here (no cached route): `git log` in a checkout, or for the pull "
+               f"request that carried it `{SEARCH_SERVED}`",
+    "repos": f"repository search is not served here (no cached route): for a pull request or issue `{SEARCH_SERVED}`"}
+SEARCH_QUALIFIER_RE = {
+    "kind": re.compile(r"(?:^|\s)(?:is:(?:pr|issue)|type:\S+)(?=\s|$)"),
+    "state": re.compile(r"(?:^|\s)(?:state:\S+|is:(?:open|closed|merged|unmerged))(?=\s|$)"),
+    "repo": re.compile(r"(?:^|\s)repo:\S+(?=\s|$)"),
+    "author": re.compile(r"(?:^|\s)author:\S+(?=\s|$)")}
+# The fields `status pr` prints, from the one search node: `head` is the head commit there too (status_view), so
+# `--field head,state,checks.state` reads the same values off a search row as off a status.
+SEARCH_NODE_FIELDS = (
+    "__typename "
+    "... on Issue { number title url state createdAt updatedAt author { login } repository { nameWithOwner } } "
+    "... on PullRequest { number title url state isDraft merged createdAt updatedAt author { login } "
+    "repository { nameWithOwner } headRefName headRefOid baseRefName "
+    "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }")
+SEARCH_GQL = ("query($q: String!, $n: Int!) { rateLimit { cost remaining } "
+              "search(type: ISSUE, query: $q, first: $n) { issueCount nodes { " + SEARCH_NODE_FIELDS + " } } }")
+
+
+def search_terms(kind: str, words: list[str], repos: list[str], state: str, author: str | None) -> str:
+    """The one GitHub search string a call sends: the words as typed, then a qualifier for each flag given. A
+    qualifier already in the words wins and the flag's is left out, so `search prs 'repo:o/r is:merged'` sends
+    exactly that; naming repositories both ways at once is refused rather than ANDed into no results."""
+    typed = " ".join(words).strip()
+    if repos and SEARCH_QUALIFIER_RE["repo"].search(typed):
+        raise WatchError("name the repositories one way, not both: --repo OWNER/REPO (repeatable) or repo:OWNER/REPO "
+                         f"in the query -- `{SEARCH_SERVED}`")
+    parts = [typed] if typed else []
+    for what, value in (("kind", SEARCH_KINDS[kind]), ("state", SEARCH_STATES[state]),
+                        ("repo", " ".join(f"repo:{r}" for r in repos)),
+                        ("author", f"author:{author}" if author else "")):
+        if value and not SEARCH_QUALIFIER_RE[what].search(typed):
+            parts.append(value)
+    terms = " ".join(p for p in parts if p).strip()
+    if not terms:
+        raise WatchError("search takes a query, --repo, --author or --state to look for: "
+                         f"`{SEARCH_SERVED}`")
+    return terms
+
+
+def search_read(terms: str, limit: int) -> dict:
+    """One GraphQL search, piped through this broker, so its answer is kept for every session on the host and
+    nothing touches REST (read_runners' route: the cache shares the read whether or not the shim is on PATH)."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
+            "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
+    try:
+        done = run_bounded(argv, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WatchError(f"gh api graphql (search): {describe(error)}") from None
+    if done.returncode != 0:
+        raise WatchError(f"gh api graphql (search): {(done.stderr or '').strip()[:300]}")
+    try:
+        doc = json.loads(done.stdout or "{}")
+    except ValueError as error:
+        raise WatchError(f"gh api graphql (search): unreadable answer: {error}") from None
+    found = ((doc.get("data") or {}).get("search")) if isinstance(doc, dict) else None
+    if not isinstance(found, dict) or not isinstance(found.get("nodes"), list):
+        said = (doc.get("errors") if isinstance(doc, dict) else None) or doc
+        raise WatchError(f"search was not answered: {json.dumps(said, sort_keys=True)[:300]}")
+    return found
+
+
+def search_row(node: dict) -> dict:
+    """One search node as this tool's row: the `status pr` names (head, headRefOid, state, checks.state, merged,
+    url, title, number) plus where it lives, so a row is a `status`, `wait` or `land` target as printed."""
+    repo = (node.get("repository") or {}).get("nameWithOwner")
+    number = node.get("number")
+    pr = node.get("__typename") == "PullRequest"
+    row: dict[str, Any] = {
+        "kind": "pr" if pr else "issue", "repo": repo, "number": number,
+        "target": f"{repo}#{number}" if repo and isinstance(number, int) else None,
+        "title": node.get("title"), "url": node.get("url"),
+        "state": (node.get("state") or "").lower() or None,
+        "author": (node.get("author") or {}).get("login"),
+        "createdAt": node.get("createdAt"), "updatedAt": node.get("updatedAt")}
+    if not pr:
+        return row
+    commit = ((node.get("commits") or {}).get("nodes") or [{}])[0] or {}
+    rollup = ((commit.get("commit") or {}).get("statusCheckRollup") or {}).get("state")
+    check_state = (rollup or "").lower() or None
+    row.update(head=node.get("headRefOid"), headRefOid=node.get("headRefOid"), headRef=node.get("headRefName"),
+               baseRef=node.get("baseRefName"), merged=bool(node.get("merged")), draft=bool(node.get("isDraft")),
+               checkState=check_state, checks={"state": check_state})
+    return row
+
+
+def search_line(row: dict) -> str:
+    """`OWNER/REPO#N state [checks] title (author, 2h ago)`: the target first, to paste into status, wait or land."""
+    marks = [row.get("state") or "?"]
+    if row.get("draft"):
+        marks.append("draft")
+    if row.get("checkState"):
+        marks.append(f"checks {row['checkState']}")
+    when = iso_epoch(row.get("updatedAt"))
+    who = ", ".join(x for x in (row.get("author"), age(when) if when else "") if x)
+    title = land_trim(row.get("title") or "", 100)
+    return f"{row.get('target') or '?'} {' '.join(marks)}  {title}" + (f"  ({who})" if who else "")
+
+
+def cmd_search(kind: str, words: list[str], repos: list[str], state: str, author: str | None, limit: int,
+               as_json: bool, fields: list[str] | None = None) -> int:
+    """Find pull requests and issues by query, over GraphQL search, through this host's one cached route.
+
+    The fields are `status pr`'s, so a row's `target` is what `status`, `wait` and `land` take next, and
+    `--field head,state,checks.state` reads the same names here as there."""
+    if not 1 <= limit <= SEARCH_LIMIT_MAX:
+        raise WatchError(f"--limit must be 1 to {SEARCH_LIMIT_MAX} (GraphQL search's page): "
+                         f"`{SEARCH_SERVED} --limit {SEARCH_LIMIT_MAX}`")
+    bad = [r for r in repos if not re.fullmatch(rf"{NAME}/{NAME}", r)]
+    if bad:
+        raise WatchError(f"--repo takes OWNER/REPO, not {bad[0]!r}: `{SEARCH_SERVED}`")
+    terms = search_terms(kind, words, repos, state, author)
+    found = search_read(terms, limit)
+    rows = [search_row(n) for n in found["nodes"] if isinstance(n, dict)]
+    if kind != "both":
+        rows = [r for r in rows if r["kind"] == ("pr" if kind == "prs" else "issue")]
+    total = found.get("issueCount")
+    if fields:
+        for row in rows:
+            print("\t".join(field_text(field_value(row, f)) for f in fields))
+        return EXIT_OK
+    if as_json:
+        print(json.dumps({"query": terms, "total": total, "shown": len(rows), "rows": rows}, sort_keys=True))
+        return EXIT_OK
+    more = f", {len(rows)} shown (--limit {limit})" if isinstance(total, int) and total > len(rows) else ""
+    print(f"{terms}: {total if isinstance(total, int) else len(rows)} found{more}")
+    for row in rows:
+        print(f"  {search_line(row)}")
+    if not rows:
+        print("  nothing matched (qualifiers are ANDed: drop one, or --state all)")
+    return EXIT_OK
+
+
 # A merge reaches GitHub only through the host's gh-quota guard (leo-workspace tools/gh-quota-shim, PACE_CLI; the
 # GLAEDA_MERGE_GUARD path overrides): land_judge's holds, BLOCKs, review and pin checks, the merge line, the landing
 # record and the transient-error retry all live there. broker_real_gh steps over every "gh guard" file, so a call
@@ -23713,6 +23875,24 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.add_argument("--by", choices=("caller",), default=None,
                    help="group the calls by caller (session:NAME or tool:NAME, as the gh-quota shim names them)")
+    sr = sub.add_parser("search", help="find pull requests and issues by query, over GraphQL search through this "
+                                       "host's one cached route (instead of gh search, which spends REST quota)")
+    sr.add_argument("kind", choices=tuple(SEARCH_KINDS), help="issues, prs, or both (a bare query); the word "
+                                                              "`issue`, `pr` or `pulls` is read as its kind")
+    sr.add_argument("words", nargs="*", metavar="QUERY",
+                    help="GitHub search terms as you would type them to `gh search`, qualifiers included "
+                         "(repo:OWNER/REPO, label:x, is:merged); a qualifier here wins over the flag for it")
+    sr.add_argument("--repo", action="append", default=[], metavar="OWNER/REPO",
+                    help="only this repository (repeatable: any of them)")
+    sr.add_argument("--state", choices=tuple(SEARCH_STATES), default="all",
+                    help="open, closed, merged (pull requests) or all (default all)")
+    sr.add_argument("--author", metavar="LOGIN", help="only this author")
+    sr.add_argument("--limit", type=int, default=20, metavar="N",
+                    help=f"rows at most (default 20, at most {SEARCH_LIMIT_MAX}: GraphQL search's page)")
+    sr.add_argument("--field", metavar="F,G",
+                    help="print just these values of each row, tab-separated, one line per row (the `status pr` "
+                         "names: target,head,state,checks.state,merged,url,title,number)")
+    sr.add_argument("--json", action="store_true")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
@@ -23766,6 +23946,41 @@ def log_job_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+def search_synonym(raw: list[str]) -> list[str]:
+    """The shapes an agent types for `search`, as the canonical form:
+
+    - a bare query (`search "cmux next"`) is `search both "cmux next"`: no kind word is both kinds;
+    - `gh search`'s own words (`issue`, `pr`, `pulls`, `pull-requests`) are their kind;
+    - `gh search`'s `--json FIELD,FIELD` is this tool's `--field FIELD,FIELD` (here `--json` is the whole object).
+
+    Said on stderr, as the other synonyms are, so the next call is typed the canonical way. A form with no
+    canonical shape here (`search code|commits|repos`) is refused by name in main, not rewritten."""
+    if not raw or raw[0] != "search" or "-h" in raw or "--help" in raw:
+        return raw  # help prints the canonical form itself; no line about the words asking for it
+    fixed, said = list(raw), []
+    for i, word in enumerate(fixed):
+        if word != "--json" or i + 1 >= len(fixed) or fixed[i + 1].startswith("-"):
+            continue
+        if re.fullmatch(r"[\w.]+(?:,[\w.]+)*", fixed[i + 1]):
+            fixed[i:i + 2] = ["--field", fixed[i + 1]]
+            said.append("--json FIELDS is --field FIELDS (--json alone is the whole object)")
+        break
+    word = fixed[1] if len(fixed) > 1 else ""
+    kind = SEARCH_KIND_WORDS.get(word.lower())
+    if kind and kind != word:
+        fixed[1] = kind
+        said.append(f"`{word}` is the kind `{kind}`")
+    elif not kind and word not in SEARCH_UNSERVED and not word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a query with no kind word searches both issues and pull requests")
+    elif not kind and word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a search with no kind word searches both issues and pull requests")
+    if said:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed
+
+
 def land_notify_synonym(raw: list[str]) -> list[str]:
     """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
     `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
@@ -23789,7 +24004,12 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    raw = land_notify_synonym(log_job_synonym(raw))
+    if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
+        # A form this subcommand cannot serve names the one that works, rather than reaching gh's REST search.
+        print(f"glaeda-gh: {SEARCH_UNSERVED[raw[1].lower()]}", file=sys.stderr)
+        print("next: glaeda-gh search --help", file=sys.stderr)
+        return 64
+    raw = land_notify_synonym(log_job_synonym(search_synonym(raw)))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
@@ -23846,6 +24066,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.kind == "flaky":
                 return cmd_log_flaky(args.repo, args.test, args.since, args.job, args.reads, args.limit, args.json)
             return cmd_log_job(args.repo, args.job)
+        if args.command == "search":
+            return cmd_search(args.kind, args.words, args.repo, args.state, args.author, args.limit, args.json,
+                              fields=parse_fields(args.field))
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":
