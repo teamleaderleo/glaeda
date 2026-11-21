@@ -11885,7 +11885,17 @@ class Gate:
         if self.child is not None and self.child.poll() is None:
             if self.stop_deadline is not None:
                 return f"stopping the idle listener: {self.held}"
-            return "starting the listener"
+            # 2026-11-21, hq#16079: this returned "starting the listener" for a live listener's whole life, so a
+            # runner working flat out and one idle for ten hours printed the same line with the same `since`
+            # (publish() moves `since` only when the line changes). cmuxs-mac-mini-3-glaeda-5 read "starting the
+            # listener" since 20:53:21Z while it worked through job after job, and two readers in a row took that
+            # for a listener stuck in its start and proposed restarting it mid-job. busy_since is the job poll()
+            # already made on this path, and listening_since is start()'s, so neither look costs a ps here.
+            if self.busy_since is not None:
+                return "the listener has a job"
+            if self.listening_since is not None and time.monotonic() - self.listening_since < GATE_FIRST_POLL_S:
+                return "starting the listener"  # its first message poll is still open: not yet idle
+            return "listening for jobs"
         if self.child is None and self.registration and self.registration_held:
             # worded like its log line, with no hold prefix: a runner that needs re-registering reads as down
             return (f"{REGISTRATION_DELETED}: GitHub deleted this runner's registration; it needs re-registering, "

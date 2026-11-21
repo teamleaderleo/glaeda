@@ -14261,6 +14261,31 @@ class GateTest(unittest.TestCase):
             gate.state_written -= hook.GATE_STATE_EVERY_S
             gate.step()
         self.assertEqual(json.loads(state.read_text())["label_drift"], ["glaeda-side-std-xcode-26.6"])
+    def test_the_gate_state_tells_a_busy_listener_from_an_idle_one(self) -> None:
+        # 2026-11-21, hq#16079: live_line() returned "starting the listener" for a live listener's whole life, so a
+        # busy runner and an idle one printed the same line with the same `since`. cmuxs-mac-mini-3-glaeda-5 read
+        # "starting the listener" since 2026-11-20 20:53:21Z while its Runner.Worker churned through job after job,
+        # and two readers in a row took that for a listener stuck in its start and proposed restarting it mid-job.
+        gate, _ = self.gate([None] * 4)
+        state = hook.gate_state_file(self.state, self.runner)
+        gate.listening_since = time.monotonic()
+        self.assertEqual(gate.live_line(), "starting the listener", "its first message poll is still open")
+        gate.listening_since -= hook.GATE_FIRST_POLL_S
+        self.assertEqual(gate.live_line(), "listening for jobs", "past its first poll with no job: idle")
+        gate.publish()
+        idle = json.loads(state.read_text())
+        self.assertEqual(idle["line"], "listening for jobs")
+        gate.busy_since = time.monotonic()  # poll() stamps this on the same pass, before publish()
+        self.assertEqual(gate.live_line(), "the listener has a job")
+        gate.publish()
+        busy = json.loads(state.read_text())
+        self.assertEqual(busy["line"], "the listener has a job")
+        self.assertGreaterEqual(busy["since"], idle["since"], "the job's start is its own since, not the listener's")
+        gate.busy_since = None  # its Worker exited
+        self.assertEqual(gate.live_line(), "listening for jobs")
+        gate.stop_deadline = time.monotonic() + 60  # a stop still outranks both
+        gate.held = "held"
+        self.assertEqual(gate.live_line(), "stopping the idle listener: held")
 
     def test_the_gate_state_is_rewritten_while_it_holds_and_keeps_its_since(self) -> None:
         gate, _ = self.gate(["held"] * 3)
