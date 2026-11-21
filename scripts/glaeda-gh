@@ -10561,6 +10561,17 @@ LAND_LATCH_FREE_DEADLINE = 10.0  # the land-pool log line (LandQueue.log_pool)
 # nothing for 37 min; on resume glaeda#2140 waited on, then judged, its old head 401ccf880760 though bc1601b6 had been
 # its head since before 09:00Z. Past this wait for a fresh read (nudged), land_judge judges unpinned: it reads the head.
 LAND_FRESH_WAIT = 120.0
+# A head the cache gave that no read of this entry's has confirmed is settled by GitHub itself, with `git ls-remote`
+# on the PR's head ref (refs/pull/N/head, which every push moves, a force-push included): authoritative, and it spends
+# neither the REST nor the GraphQL quota the daemon's own reads need, so it answers while those are held under the
+# daemon's own land reserve. docs/handbook/read-with-one-quota-route.md: every read on the land path has two routes and
+# the first costs no quota when it can. 2026-11-21: leo-workspace#7208 was read at 09:20Z, rebased and
+# force-pushed to 48d8a885af67 at ~10:05Z (old head 75f789914eea), and its two land requests (10:17Z, 10:26Z) were each
+# parked "checks running" at 75f789914eea with a wake an hour out -- the cache had gone 45 min unread because the
+# GraphQL reserve "kept for lands" held every PR read -- while `git ls-remote` and `gh pr view` both had 48d8a885af67
+# the whole time. One ls-remote per entry per LAND_REMOTE_HEAD_EVERY settles it in a second.
+LAND_REMOTE_HEAD_DEADLINE = 20.0
+LAND_REMOTE_HEAD_EVERY = 60.0
 # A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: land_judge refused cmux#45404 (the
 # base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
 # manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
@@ -11094,6 +11105,41 @@ def land_fetch_origin(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def land_remote_head(repo: str, number: Any, deadline: float = LAND_REMOTE_HEAD_DEADLINE) -> str | None:
+    """The sha GitHub itself has at OWNER/REPO#N's head, from `git ls-remote` on refs/pull/N/head; None when it could
+    not be read (git missing, the remote refused, the deadline). Costs neither quota (LAND_REMOTE_HEAD_EVERY)."""
+    if not LAND_FETCH_REPO.fullmatch(str(repo or "")) or not str(number).isdigit():
+        return None
+    argv = ["git", "ls-remote", f"https://github.com/{repo}.git", f"refs/pull/{number}/head"]
+    try:
+        got = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=deadline)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if got.returncode != 0:
+        return None
+    for line in got.stdout.splitlines():
+        words = line.split()
+        if words and SHA40.fullmatch(words[0].strip().lower()):
+            return words[0].strip().lower()
+    return None
+
+
+def land_fresh_after(e: dict, latch_cleared: float, now: float) -> float:
+    """How recently GitHub must have shown a head for this entry to pin it on a read of ours alone: since the entry
+    was queued or unparked (freshAfter), since the login's latch last cleared, and at all events inside
+    STALE_DATA_AFTER -- the daemon's own bound on how long its copy of a PR stands for the PR. A `land` request sets
+    no freshAfter of its own, so without that bound an entry queued today would pin a head read yesterday."""
+    return max(float(e.get("freshAfter") or 0), latch_cleared, now - STALE_DATA_AFTER)
+
+
+def land_read_since(cache: dict | None, after: float) -> bool:
+    """Whether GitHub showed the PR this cache entry holds at or after AFTER: a read that changed its head (dataAt) or
+    one that confirmed it unchanged (updatedAtAt)."""
+    reads = [t for t in ((cache or {}).get("dataAt"), (cache or {}).get("updatedAtAt"))
+             if isinstance(t, (int, float)) and not isinstance(t, bool)]
+    return bool(reads) and max(reads) >= after
+
+
 def land_fallback(answer: dict, head: str) -> dict:
     """The step an older land_judge's answer (no "action") names, from its code alone (LAND_FALLBACK)."""
     if answer.get("ok"):
@@ -11357,7 +11403,10 @@ class LandQueue:
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
-                 reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
+                 reading: Callable[[str], dict | None] | None = land_budget_reading,
+                 remote_head: Callable[[str, Any], str | None] | None = None) -> None:
+        # GitHub's own word on a PR's head, for a cached head no read of ours confirms (settled_head)
+        self.remote_head = remote_head or (lambda repo, number: land_remote_head(repo, number))
         self.broker_client = broker_client
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
@@ -12795,9 +12844,29 @@ class LandQueue:
         return False
 
     def wait_running(self, e: dict, head: str, fp: str) -> None:
-        """Checks still run at the head: land_judge is not asked until they finish (the cache says when)."""
+        """Checks still run at the head: land_judge is not asked until they finish (the cache says when).
+
+        A head no read of this entry's own confirms is settled against GitHub first (settled_head): the whole
+        LAND_WAIT_DEFAULT belongs to a head GitHub still has, and a cache left behind by a force-push is repinned at
+        the live sha -- never parked for an hour on checks at a commit the PR has moved off, which can never finish
+        there. An unsettled head (no git, the remote refused, or one call was already made this
+        LAND_REMOTE_HEAD_EVERY) is looked at again in LAND_RETRY_DEFAULT instead."""
+        live = self.settled_head(e, head)
+        if live and live != head:
+            self.history(e, "head_repin", head=head[:12], live=live[:12],
+                         why="the cached head is not the PR's: repinned at the head GitHub has")
+            self.notify(e, e.get("requester") or "",
+                        f"glaeda land: {self.url(e)} was pinned at {head[:12]}, which is no longer its head -- "
+                        f"GitHub has {live[:12]} (git ls-remote refs/pull/{e['number']}/head). Repinned at "
+                        f"{live[:12]} and judged now; nothing merged at {head[:12]}.")
+            e.update(seen=fp, head=live)
+            e.pop("seenChecks", None)
+            self.unhold(e)
+            e.pop("dueLate", None)
+            self.wait(e, {"kind": "repin", "sha": live}, None)  # due at once: no wake to sit out
+            return
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
-                 wakeAt=self.now + LAND_WAIT_DEFAULT)
+                 wakeAt=self.now + (LAND_WAIT_DEFAULT if live == head else LAND_RETRY_DEFAULT))
         e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
         self.unhold(e)  # not due now: its wake is ahead (hold, LAND_DUE_LATE)
         e.pop("dueLate", None)
@@ -12858,26 +12927,58 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
+    def settled_head(self, e: dict, sha: str) -> str | None:
+        """What GitHub itself has at E's PR head, when SHA is the head its cache shows: SHA when a read of this
+        entry's own confirms it or `git ls-remote` agrees, the live sha when ls-remote disagrees, and None when
+        nothing settles it now (no git, the remote refused, or a call was already made this
+        LAND_REMOTE_HEAD_EVERY -- its answer is reused inside that window).
+
+        A cache entry is only ever corrected by the daemon's own reads, and a force-push from a worktree never goes
+        through this client, so a cached head outlives the commit by STALE_DATA_AFTER (10 min) -- and far longer when
+        PR reads are held under the daemon's own quota reserve, the one kept for lands. Nothing of the cache's is
+        trusted over GitHub's word here: the remote wins, and the entry is repinned at the sha it names."""
+        if not SHA40.fullmatch(sha or ""):
+            return None
+        c = self.cache_of(e["key"]) or {}
+        if str(((c.get("data") or {}).get("headRefOid")) or "").lower() != sha:
+            return sha  # not this cache's head: there is nothing of the cache's to settle
+        if land_read_since(c, land_fresh_after(e, self.latch_cleared, self.now)):
+            return sha  # GitHub showed us this head recently enough to stand for it (land_fresh_after)
+        asked = e.get("remoteHead") or {}
+        if asked.get("cached") == sha and self.now - float(asked.get("at") or 0) < LAND_REMOTE_HEAD_EVERY:
+            return str(asked.get("live") or "").lower() or None
+        live = self.remote_head(e["repo"], e["number"])
+        live = live.lower() if isinstance(live, str) and SHA40.fullmatch(live.lower()) else None
+        e["remoteHead"] = {"cached": sha, "live": live or "", "at": self.now}
+        if live and live != sha:
+            self.history(e, "head_moved", head=sha[:12], live=live[:12],
+                         why="git ls-remote: GitHub has a head the cache has not read yet")
+            self.nudge(e["key"])  # the cache entry is wrong: ask for a read of the PR that corrects it
+        return live
+
     def fresh_head(self, e: dict, sha: str, free: bool = True) -> str | None:
         """SHA when a judgement may pin it, "" when land_judge must read the head itself, None while E waits (nudged)
         for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
         either held, the daemon read nothing for it. Only a head the cache gave is checked: a pin land_judge named (a
-        repin) is its own read. Past the wait with no worker FREE it stays None: unpinned on the next free one."""
+        repin) is its own read, and GitHub's own word on the head (settled_head) is pinned ahead of any wait. Past the
+        wait with no worker FREE it stays None: unpinned on the next free one."""
         c = self.cache_of(e["key"]) or {}
         if not sha or str(((c.get("data") or {}).get("headRefOid")) or "").lower() != sha:
             e.pop("staleHead", None)
             return sha
-        after = max(float(e.get("freshAfter") or 0), self.latch_cleared)
-
-        def read_since(cache: dict) -> bool:
-            # When GitHub last showed this head: a read that changed it (dataAt) or confirmed it unchanged (updatedAtAt).
-            reads = [t for t in (cache.get("dataAt"), cache.get("updatedAtAt")) if isinstance(t, (int, float))
-                     and not isinstance(t, bool)]
-            return bool(reads) and max(reads) >= after
-
-        if read_since(c):
+        after = land_fresh_after(e, self.latch_cleared, self.now)
+        if land_read_since(c, after):
             e.pop("staleHead", None)
             return sha
+        # GitHub itself settles it, quota-free, before anything waits on a read of ours: its word is what gets pinned,
+        # whether it confirms this head or names the one a push put there (settled_head). Only an unsettled head waits.
+        live = self.settled_head(e, sha)
+        if live:
+            e.pop("staleHead", None)
+            if live != sha:
+                self.history(e, "head_repinned", head=sha[:12], live=live[:12],
+                             why="the cache's head is not the PR's: judged pinned at the head GitHub has")
+            return live
         w = e.get("staleHead") or {}
         if w.get("sha") != sha:
             w = e["staleHead"] = {"sha": sha, "since": self.now}
@@ -12886,7 +12987,7 @@ class LandQueue:
             self.save(e)
             c = self.cache_of(e["key"]) or {}  # a read the nudge already answered (the daemon's own, in its pass)
             head = str(((c.get("data") or {}).get("headRefOid")) or "").lower()
-            if read_since(c):
+            if land_read_since(c, after):
                 e.pop("staleHead", None)
                 return sha if head == sha else None  # a new head: consider() judges it on its next pass
         if self.now - float(w.get("since") or 0) < LAND_FRESH_WAIT or not free:  # (unpinned on a free worker)
