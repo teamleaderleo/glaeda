@@ -8549,6 +8549,105 @@ def cap_label_set(receipt: frozenset[str] | None, observed: frozenset[str]) -> f
     return receipt | observed
 
 
+# hq#16544: observed_labels only sees the controller feed's recent history (a fixed window of a few hours), so a
+# runner that has taken no job of a drifted label for a while would fall back to `receipt | nothing` - the
+# understating receipt - which is exactly the stranding hq#16433 is about. So what GitHub was seen to dispatch is
+# remembered per runner, with each label's last sighting, and expires only if GitHub stops dispatching it for
+# OBSERVED_LABEL_TTL_S. A runner's label set changes only by a deliberate --apply, so remembering it for days is
+# sound. It stays a widening of what the gate will *consider*: every consumer tests
+# `set(job["labels"]) <= cap_labels` and take_capacity's admission is untouched, so a remembered label can make a
+# takeable job visible but can never admit a job the runner may not run. The one cost of a label kept too long is
+# that the gate may listen for, or hold its starved reserve for, a job GitHub then declines to hand it: bounded by
+# starved_step's own max_hold_s each time, and ended by the TTL, since a runner relabelled away from a label stops
+# being dispatched it. That is the trade the TTL sets - an idle listen for at most a week against a mini that
+# strands itself for as long as its receipt is wrong.
+OBSERVED_LABEL_SCHEMA = 1
+OBSERVED_LABEL_TTL_S = float(os.environ.get("GLAEDA_RUNNER_OBSERVED_LABEL_TTL_S") or 7 * 86400.0)
+OBSERVED_LABEL_REFRESH_S = 3600.0  # a label already remembered restamps at most this often: one small write an hour
+OBSERVED_LABEL_MAX = 64  # AGENTS.md: a state file stays bounded, whatever a feed says
+OBSERVED_LABEL_MAX_BYTES = 16 * 1024
+
+
+def write_atomic(path: Path, body: str) -> None:
+    """Replace path with body, or leave it as it was. A tmp file names this writer (pid and thread), so two gates
+    never share one, and a failed write unlinks its own: a state dir that is full or read-only for a while must not
+    collect one leftover per look. Failure is silent by design at both call sites - a state file this gate writes
+    only speeds up the next look, so losing one costs nothing the gate decides."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def observed_label_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"observed-labels-{runner_dir.name}.json"
+
+
+def load_observed_labels(path: Path, name: str | None, now: float) -> dict[str, float]:
+    """What this runner was seen to be dispatched, label -> when last seen, as far as the file is still believable:
+    its own runner name (a runner dir re-registered under another name inherits nothing) and inside the TTL.
+    The receipt deliberately does not retire an entry. Any `glaeda-cmux-runner --apply` pass rewrites a receipt
+    (on 2026-11-21 one mini's higher-index instances were rewritten while instances 1 and 2 kept a stale one), so
+    retiring on that would hand the understating receipt back its authority on a routine pass - hq#16544 itself. A
+    real relabel away from a label also stops GitHub dispatching it, so the TTL is what retires it."""
+    if not name:
+        return {}
+    try:
+        raw = read_bounded(path, OBSERVED_LABEL_MAX_BYTES)
+        doc = json.loads(raw.decode("utf-8")) if raw is not None else None
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("schema") != OBSERVED_LABEL_SCHEMA or doc.get("name") != name:
+        return {}
+    seen = doc.get("labels")
+    if not isinstance(seen, dict):
+        return {}
+    floor = now - OBSERVED_LABEL_TTL_S
+    out: dict[str, float] = {}
+    for label, at in seen.items():
+        if isinstance(label, str) and label and isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and at > floor and at <= now + OBSERVED_LABEL_REFRESH_S:
+            out[label] = float(at)
+    return out
+
+
+def merge_observed_labels(remembered: dict[str, float], observed: frozenset[str],
+                          now: float) -> tuple[dict[str, float], bool]:
+    """(what to remember now, whether that is worth a write). A sighting of a label already remembered restamps it
+    at most every OBSERVED_LABEL_REFRESH_S, so a steady runner writes this file about once an hour, not once a
+    look."""
+    merged, write = dict(remembered), False
+    for label in observed:
+        prior = merged.get(label)
+        if prior is None or now - prior >= OBSERVED_LABEL_REFRESH_S:
+            write = True
+        merged[label] = now
+    if len(merged) > OBSERVED_LABEL_MAX:  # the most recently dispatched win; a label pushed out is simply forgotten
+        merged = dict(sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:OBSERVED_LABEL_MAX])
+        write = True
+    if set(merged) != set(remembered):
+        write = True
+    return merged, write
+
+
+def save_observed_labels(path: Path, name: str, labels: dict[str, float]) -> None:
+    """Atomic; a failed write only costs the next look the sighting, so nothing the gate decides changes."""
+    doc = {"schema": OBSERVED_LABEL_SCHEMA, "name": name, "at": gate_stamp(time.time()),
+           "labels": {label: round(at, 3) for label, at in sorted(labels.items())}}
+    body = json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n"
+    # A GitHub label may be long enough that OBSERVED_LABEL_MAX of them exceed the read bound, which would make every
+    # later look reject the file and write it again. The write is bounded by the same number the read is, so a file
+    # this gate wrote is always one it can read back; the labels dropped are the least recently dispatched.
+    while len(body.encode("utf-8")) > OBSERVED_LABEL_MAX_BYTES and doc["labels"]:
+        doc["labels"].pop(min(doc["labels"], key=lambda label: (doc["labels"][label], label)))
+        body = json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n"
+    write_atomic(path, body)
+
+
 def _feed_time(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -10225,6 +10324,13 @@ class Gate:
         self.cap_summary: dict[str, Any] | None = None
         self.cap_labels: frozenset[str] | None = None
         self.cap_label_drift: list[str] = []  # labels GitHub dispatched here that the receipt does not list
+        # hq#16544: cap_labels is widened by what GitHub was *remembered* to dispatch (OBSERVED_LABEL_TTL_S), which
+        # reveals takeable work and never admits anything (see cap_label_set). But one consumer reads a label to
+        # *lower* the room it keeps - ios_sim_wanted listens at this runner's own fit (3) instead of the side label's
+        # costliest job (5) - and there a label kept past a real relabel would shrink that room for up to the TTL,
+        # the very thing HEAD_FIT/IOS_SIM_OWN_FIT exist to prevent. So the live feed window alone (what main read)
+        # decides that: memory widens what the gate looks for, never the room it keeps.
+        self.cap_fit_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
         self.reserve_demand_at: float | None = None  # RESERVE_ON_DEMAND: when the feed last showed a job for it
@@ -10519,11 +10625,7 @@ class Gate:
                 if summary is None:
                     summary = load_cap_fetch(now)
                     if summary is not None:
-                        with contextlib.suppress(OSError):
-                            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
-                            tmp.write_text(json.dumps(summary, separators=(",", ":")))
-                            os.replace(tmp, path)
-                self.cap_summary = summary
+                        write_atomic(path, json.dumps(summary, separators=(",", ":")))
                 # hq#16433: the receipt holds the labels this host asked GitHub for, not the ones GitHub kept, and it
                 # stamps "GitHub labels could not be read; re-registering with the supplied token" when it could not
                 # confirm them. cmux-austin-mini-0-glaeda-1 and cmux-austin-mini-1-glaeda-1 read side-light while
@@ -10531,10 +10633,24 @@ class Gate:
                 # `set(job["labels"]) <= self.cap_labels`, so those two could not see a single queued job of a label
                 # they serve: no reserve, no urgent listen, no starved-job answer. What GitHub dispatched is proof.
                 observed = observed_labels(summary, name)
-                self.cap_labels = cap_label_set(receipt, observed)
+                # hq#16544: the feed only holds a few hours, so a runner that has taken no job of a drifted label
+                # for a while would fall back to `receipt | nothing` - the understating receipt - and strand itself
+                # again. So each sighting is remembered (load/merge/save_observed_labels) until the TTL or the next
+                # relabel's receipt retires it, and the gate reasons with the whole remembered set.
+                known = observed
+                if name:
+                    store = observed_label_file(self.state_dir, self.runner_dir)
+                    remembered = load_observed_labels(store, name, now)
+                    merged, write = merge_observed_labels(remembered, observed, now)
+                    if write:
+                        save_observed_labels(store, name, merged)
+                    known = frozenset(merged)
+                self.cap_summary = summary
+                self.cap_fit_labels = cap_label_set(receipt, observed)
+                self.cap_labels = cap_label_set(receipt, known)
                 # Drift is a receipt understating itself. With no readable receipt there is nothing to disagree with,
                 # so that is not published as drift: it would report the runner's whole label set as a disagreement.
-                drift = sorted(observed - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
+                drift = sorted(known - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
                 if drift != self.cap_label_drift:
                     self.cap_label_drift = drift
                     if drift:
@@ -10542,7 +10658,7 @@ class Gate:
             except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                 self.cap_summary = None
                 if receipt is not None:  # the feed could not say; reason with the receipt alone, as before
-                    self.cap_labels = receipt
+                    self.cap_labels = self.cap_fit_labels = receipt
                 gate_log(f"the host load cap's feed look failed ({type(error).__name__}); not holding for it")
 
         self.cap_thread = threading.Thread(target=look, name="load-cap", daemon=True)
@@ -10663,7 +10779,12 @@ class Gate:
         wanted = False
         if simulator_host(self.state_dir):
             self.cap_look()
-            wanted = ios_sim_queued(self.cap_summary, self.cap_labels, time.time())
+            # hq#16544: carrying the label is read from the live window (cap_fit_labels), because this answer
+            # *lowers* the room this listener keeps; whether the queued job is takeable is read from the whole
+            # remembered set, where a wider answer only reveals work.
+            carried = self.cap_fit_labels or frozenset()
+            wanted = IOS_SIM_RUNNER_LABEL in carried and ios_sim_queued(self.cap_summary, self.cap_labels,
+                                                                        time.time())
         if wanted != self.ios_sim_own:
             gate_log(f"a queued job needs {IOS_SIM_RUNNER_LABEL}: listening at this runner's own fit, not the side "
                      "label's costliest job" if wanted else
@@ -13665,6 +13786,199 @@ def command_table() -> dict[int, str]:
     return {pid: command for pid, (_ppid, command) in processes().items()}
 
 
+# JOB_SCRATCH (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 1; Leo, 2026-11-21: "man glaeda needs to be
+# more aggressive... again!", then on the design: "oh yeah that makes sense. i guess it's aboute seeing if we can
+# detect deletable before vs deciding after. this seems good."). A job's scratch lives on a disk that exists only for
+# that job: job-started attaches a sparse APFS image (hdiutil, no root; cmuxterm-hq build-fleet/internal/jobvolume's
+# shape) at JOB_SCRATCH_DIR/<runner>/job-<run id>-<attempt> and points the job's TMPDIR into it through $GITHUB_ENV;
+# job-completed detaches it and deletes the image, so nothing the job wrote there outlives it. The mount is never the
+# runner's _work: the runner writes _work/_actions and _work/_temp before the hook runs.
+#
+# Opt-in: GLAEDA_JOB_SCRATCH=1 in the runner's environment (LaunchAgent or the runner's .env); unset or anything else
+# is off, and the hook does nothing here. Everything is best effort: a failure is logged, never fails the job, and a
+# failed create leaves the job with no scratch, as before. Ownership is the runner's own directory: a runner runs one
+# job at a time, so every entry under JOB_SCRATCH_DIR/<this runner> is this runner's and none is live while its
+# job-started or job-completed hook runs. Another runner's directory is never read.
+JOB_SCRATCH_ENV = "GLAEDA_JOB_SCRATCH"
+JOB_SCRATCH_SIZE_ENV = "GLAEDA_JOB_SCRATCH_SIZE"
+JOB_SCRATCH_SIZE = "220g"  # the cap (sparse: allocation follows writes), jobvolume's default
+JOB_SCRATCH_DIR = Path(FLEET_DIR) / "job-scratch"
+JOB_SCRATCH_EXPORT = "CMUX_JOB_SCRATCH"
+HDIUTIL = "/usr/bin/hdiutil"
+HDIUTIL_TIMEOUT_S = 60
+HDIUTIL_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+JOB_SCRATCH_ENTRY = re.compile(r"job-[0-9]{1,20}-[0-9]{1,8}")
+JOB_SCRATCH_RUNNER = re.compile(r"[A-Za-z0-9._-]{1,64}")
+JOB_SCRATCH_SIZE_RE = re.compile(r"[1-9][0-9]{0,6}[mMgGtT]")
+
+
+def job_scratch_on(env: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if env is None else env).get(JOB_SCRATCH_ENV, "") == "1"
+
+
+def job_scratch_runner_dir(env: Mapping[str, str] | None = None, base: Path | None = None) -> Path | None:
+    """This runner's own scratch directory, or None when RUNNER_NAME is missing or not a plain name."""
+    name = (os.environ if env is None else env).get("RUNNER_NAME", "")
+    if not JOB_SCRATCH_RUNNER.fullmatch(name) or name in (".", ".."):
+        return None
+    return (JOB_SCRATCH_DIR if base is None else base) / name
+
+
+def job_scratch_id(env: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if env is None else env
+    entry = f"job-{env.get('GITHUB_RUN_ID', '')}-{env.get('GITHUB_RUN_ATTEMPT') or '1'}"
+    return entry if JOB_SCRATCH_ENTRY.fullmatch(entry) else None
+
+
+def hdiutil(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run([HDIUTIL, *argv], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=HDIUTIL_TIMEOUT_S, check=False, env=dict(HDIUTIL_ENV))
+
+
+def job_scratch_mounted(path: Path) -> bool:
+    return os.path.ismount(path)
+
+
+def job_scratch_drop(image: Path, mount: Path) -> str | None:
+    """Detach one entry's mount and delete its image; None when both are gone, else why not. Never walks or deletes
+    a tree: the mount directory is removed only empty (rmdir), the image only as a regular file."""
+    try:
+        mount_stat = os.lstat(mount)
+    except FileNotFoundError:
+        mount_stat = None
+    except OSError as error:
+        return f"{mount.name}: {error.strerror or error}"
+    if mount_stat is not None:
+        if not stat.S_ISDIR(mount_stat.st_mode):
+            return f"{mount.name}: not a directory, left alone"
+        if job_scratch_mounted(mount):
+            try:
+                out = hdiutil("detach", "-force", os.fspath(mount))
+            except (OSError, subprocess.SubprocessError) as error:
+                return f"{mount.name}: hdiutil detach failed: {error}"
+            if job_scratch_mounted(mount):
+                return (f"{mount.name}: still mounted after hdiutil detach (exit {out.returncode}: "
+                        f"{(out.stderr or out.stdout or '').strip()[:200]})")
+        try:
+            os.rmdir(mount)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            return f"{mount.name}: mount directory not removed: {error.strerror or error}"
+    try:
+        image_stat = os.lstat(image)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"{image.name}: {error.strerror or error}"
+    if not stat.S_ISREG(image_stat.st_mode):
+        return f"{image.name}: not a regular file, left alone"
+    try:
+        os.unlink(image)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"{image.name}: not deleted: {error.strerror or error}"
+    return None
+
+
+def job_scratch_reap(runner_dir: Path) -> tuple[list[str], list[str]]:
+    """Every scratch entry in this runner's own directory: (dropped, left with why). Names that are not ours
+    (job-<run>-<attempt>[.sparseimage]) are left alone and reported."""
+    try:
+        names = sorted(os.listdir(runner_dir))
+    except FileNotFoundError:
+        return [], []
+    except OSError as error:
+        return [], [f"{runner_dir}: {error.strerror or error}"]
+    entries: list[str] = []
+    left: list[str] = []
+    for name in names:
+        entry = name[:-len(".sparseimage")] if name.endswith(".sparseimage") else name
+        if not JOB_SCRATCH_ENTRY.fullmatch(entry):
+            left.append(f"{name}: not a job scratch entry, left alone")
+        elif entry not in entries:
+            entries.append(entry)
+    dropped = []
+    for entry in entries:
+        why = job_scratch_drop(runner_dir / f"{entry}.sparseimage", runner_dir / entry)
+        if why:
+            left.append(why)
+        else:
+            dropped.append(entry)
+    return dropped, left
+
+
+def job_scratch_reap_note(runner_dir: Path, dropped: list[str], left: list[str]) -> str | None:
+    parts = []
+    if dropped:
+        parts.append(f"job scratch: dropped {len(dropped)} volume(s) in {runner_dir}: {', '.join(dropped)[:300]}")
+    if left:
+        parts.append(f"job scratch: left {len(left)} in {runner_dir}: {'; '.join(left)[:600]}")
+    return "; ".join(parts) or None
+
+
+def job_scratch_start(env: Mapping[str, str] | None = None, base: Path | None = None,
+                      darwin: bool | None = None) -> list[str]:
+    """job-started, after admission: reap this runner's stale scratch, then attach this job's and export TMPDIR and
+    CMUX_JOB_SCRATCH to later steps. Off (no flag) does nothing and says nothing; any failure is a note, no scratch."""
+    env = os.environ if env is None else env
+    if not job_scratch_on(env):
+        return []
+    if not (sys.platform == "darwin" if darwin is None else darwin):
+        return ["job scratch: skipped: needs macOS hdiutil"]
+    runner_dir = job_scratch_runner_dir(env, base)
+    entry = job_scratch_id(env)
+    if runner_dir is None or entry is None:
+        return ["job scratch: skipped: no plain RUNNER_NAME, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT"]
+    size = env.get(JOB_SCRATCH_SIZE_ENV) or JOB_SCRATCH_SIZE
+    if not JOB_SCRATCH_SIZE_RE.fullmatch(size):
+        return [f"job scratch: skipped: {JOB_SCRATCH_SIZE_ENV}={size[:40]!r} is not a size like 220g"]
+    notes = []
+    dropped, left = job_scratch_reap(runner_dir)
+    if reaped := job_scratch_reap_note(runner_dir, dropped, left):
+        notes.append(reaped)
+    if left:  # at most one stale volume per runner: never stack a new one on one we could not drop
+        return notes + ["job scratch: skipped: this runner's stale scratch is still there"]
+    image, mount = runner_dir / f"{entry}.sparseimage", runner_dir / entry
+    try:
+        runner_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        out = hdiutil("create", "-quiet", "-type", "SPARSE", "-fs", "APFS", "-size", size,
+                      "-volname", f"cmux-job-{runner_dir.name}-{entry[4:]}"[:63], os.fspath(image))
+        if out.returncode != 0:
+            raise RuntimeError(f"hdiutil create exit {out.returncode}: "
+                               f"{(out.stderr or out.stdout or '').strip()[:300]}")
+        mount.mkdir(mode=0o700)
+        out = hdiutil("attach", "-nobrowse", "-owners", "on", "-plist", "-mountpoint", os.fspath(mount),
+                      os.fspath(image))
+        if out.returncode != 0 or not job_scratch_mounted(mount):
+            raise RuntimeError(f"hdiutil attach exit {out.returncode}, mounted {job_scratch_mounted(mount)}: "
+                               f"{(out.stderr or '').strip()[:300]}")
+        tmp = mount / "tmp"
+        tmp.mkdir(mode=0o700)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        why = job_scratch_drop(image, mount)
+        return notes + [f"job scratch: none for this job: {error}" + (f"; cleanup: {why}" if why else "")]
+    notes.append(f"job scratch: {mount} ({size} cap, sparse image {image.name}); "
+                 f"{export_job_env('TMPDIR', os.fspath(tmp), 'glaeda-job-tmpdir')}; "
+                 f"{export_job_env(JOB_SCRATCH_EXPORT, os.fspath(mount), 'glaeda-job-scratch')}")
+    return notes
+
+
+def job_scratch_end(env: Mapping[str, str] | None = None, base: Path | None = None,
+                    darwin: bool | None = None) -> list[str]:
+    """job-completed, after the job's leftover processes are ended: drop every scratch volume of this runner."""
+    env = os.environ if env is None else env
+    if not job_scratch_on(env) or not (sys.platform == "darwin" if darwin is None else darwin):
+        return []
+    runner_dir = job_scratch_runner_dir(env, base)
+    if runner_dir is None:
+        return []
+    dropped, left = job_scratch_reap(runner_dir)
+    note = job_scratch_reap_note(runner_dir, dropped, left)
+    return [note] if note else []
+
+
 def cleanup_job_leftovers(work: str | None = None) -> list[str]:
     """job-completed: end processes left running from this runner's _work. Each pid is signalled only while
     its command is unchanged, so a reused pid is never hit."""
@@ -14785,6 +15099,9 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(testmanagerd)
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        with contextlib.suppress(Exception):  # JOB_SCRATCH: best effort, never fails an admitted job
+            for scratch in job_scratch_start():
+                print(f"{PREFIX}: {scratch}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
@@ -14841,6 +15158,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)
+        with contextlib.suppress(Exception):  # JOB_SCRATCH: its processes are ended; drop its volume
+            for note in job_scratch_end():
+                print(f"{PREFIX}: {note}", flush=True)
         if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
             print(f"{PREFIX}: {borrowed}", flush=True)
         worker = args.watch_pid or current_worker

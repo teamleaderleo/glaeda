@@ -271,6 +271,24 @@ def wait_for_path(path: Path, seconds: float = 10) -> bool:
     return path.exists()
 
 
+def wait_for_lines(path: Path, count: int = 1, seconds: float = 10) -> list[str]:
+    """The whole lines a fake glaeda-disk appended, once there are count of them. Both phases trigger the one queued
+    pass detached after admitting (disk_pressure_detached), so a fake the hook also ran while waiting is run a second
+    time after the hook returned: the file grows under the reader, and a read can catch a line half-written (a shard
+    on a mini at load 123, 2026-11-21: `could not convert string to float: ''`). Only a newline-terminated line
+    counts, bounded, re-read rather than slept on; the first line is always the pass the hook waited for."""
+    deadline = time.monotonic() + seconds
+    while True:
+        text = path.read_text() if path.exists() else ""
+        lines = text.split("\n")[:-1]  # the last piece is unterminated: a line still being written
+        if len(lines) >= count:
+            return lines
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path.name}: {len(lines)} whole line(s), not {count}, after "
+                                 f"{seconds:g} s: {text!r}")
+        time.sleep(0.05)
+
+
 def event(tmp: Path, name: str, payload: dict) -> Path:
     path = tmp / f"{name}.json"
     path.write_text(json.dumps(payload))
@@ -363,6 +381,20 @@ class HookTest(unittest.TestCase):
                                        "--no-disk", repo=repo)
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
                 self.assertIn("admitted" if admitted else "refused", result.stdout)
+
+    def test_job_scratch_is_wired_into_job_started_and_off_by_default(self) -> None:
+        """JOB_SCRATCH: an admitted job tries its scratch only with GLAEDA_JOB_SCRATCH=1 (here on Linux, so it says
+        it needs macOS); without the flag the hook says nothing about it."""
+        path = event(self.dir, "push", {"repository": CMUX})
+        args = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk")
+        env = {"RUNNER_NAME": "actions-runner-glaeda-2", "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
+        off = self.run_hook(*args, repo="manaflow-ai/cmux", env=env)
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertNotIn("job scratch", off.stdout)
+        on = self.run_hook(*args, repo="manaflow-ai/cmux", env={**env, "GLAEDA_JOB_SCRATCH": "1"})
+        self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
+        if sys.platform != "darwin":
+            self.assertIn("job scratch: skipped: needs macOS hdiutil", on.stdout)
 
     def test_a_sparse_workspace_is_reset_before_the_checkout(self) -> None:
         """An earlier job's sparse checkout (sparse-checkout: scripts/ci) left the reused workspace sparse;
@@ -1493,8 +1525,9 @@ class HookTest(unittest.TestCase):
 
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
-        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n"
                                "time.sleep(20)\n")
         broken = make_executable(self.dir / "glaeda-disk-broken", "import sys\nsys.exit(3)\n")
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1505,8 +1538,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertLess(time.monotonic() - start, 10)
         self.assertIn("glaeda-disk started in the background", result.stdout)  # the queued pass, never waited on
-        self.assertTrue(wait_for_path(marker))
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
         for phase in ("job-started", "job-completed"):
             result = self.run_hook(phase, "push", push, "--allowed-repo", "manaflow-ai/cmux",
                                    "--disk", os.fspath(broken), repo="manaflow-ai/cmux")
@@ -1795,8 +1827,9 @@ class HookTest(unittest.TestCase):
     def test_disk_floor_evicts_before_warning(self) -> None:
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n")
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
@@ -1804,7 +1837,7 @@ class HookTest(unittest.TestCase):
                                repo="manaflow-ai/cmux", env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0 --floor-gib 1e+09",
                          "told the floor, so it does not wait for the job that holds this runner")
         self.assertLess(result.stdout.index("disk floor"), result.stdout.index("warning:"), "evicted, then warned")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
@@ -1813,12 +1846,13 @@ class HookTest(unittest.TestCase):
         own = self.dir / "actions-runner" / hook.RUNNER_HOOK_SCRIPT
         own.parent.mkdir(parents=True)
         own.write_text("exec python3 /hook job-started --min-free-gib 999999999\n")
+        marker.unlink()  # this phase's own first line, not one the pass after the last phase appended
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
                                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
                                env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
 
     def test_a_nightly_job_short_of_disk_takes_idle_runners_work_then_is_admitted(self) -> None:
         """NIGHTLY_DISK_RESERVE, the 2026-10-28 00:04Z refusal: the dedicated nightly builder's job found 20 GiB free
@@ -1986,8 +2020,10 @@ class HookTest(unittest.TestCase):
         evict.lock; a pass of its own would skip as busy and the job be refused while space is being freed."""
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(str(time.time()))\n")
+        # one whole line appended per pass, never rewritten: the pass after admitting runs this same fake detached
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys, time\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(f'{time.time()}\\n')\nhandle.close()\n")
         self.hold_evict_lock(3)
         released = time.time() + 2  # the holder sleeps 3 s after it printed; allow a second of slack
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1998,7 +2034,8 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
                                         r"glaeda-disk exited 0, freed")
-        self.assertGreater(float(marker.read_text()), released, "its own pass ran only once the lock was free")
+        self.assertGreater(float(wait_for_lines(marker)[0]), released,
+                           "its own pass ran only once the lock was free")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
 
     def test_floor_eviction_skips_its_own_pass_when_the_running_one_freed_enough(self) -> None:
@@ -8988,6 +9025,24 @@ class HostLoadCapTest(unittest.TestCase):
                          "only 2 of 14 capacity units on this mini are free; its next job needs 3",
                          "it still needs room for its own job")
 
+    def test_a_remembered_label_never_shrinks_the_room_a_listener_keeps(self) -> None:
+        # hq#16544: memory widens cap_labels, which reveals takeable work and admits nothing - except that
+        # ios_sim_wanted reads a label to listen at this runner's own fit (3) instead of the side label's costliest
+        # job (5). A glaeda-ios-sim remembered past a real relabel would shrink the room this listener keeps for up
+        # to OBSERVED_LABEL_TTL_S, the very failure HEAD_FIT and IOS_SIM_OWN_FIT exist to prevent. So that one
+        # answer is read from the live feed window (cap_fit_labels), never from memory.
+        side = ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-std-xcode-26.6"]
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"),
+                     self.job("queued", labels=self.IOS_SIM_JOB, ago=4 * 3600)]
+        gate = self.side_gate(10, side)
+        hook.save_observed_labels(hook.observed_label_file(self.state, self.runner), "cmux21-glaeda-2",
+                                  {hook.IOS_SIM_RUNNER_LABEL: time.time() - 60})
+        self.assertEqual(self.full(gate), "only 4 of 14 capacity units on this mini are free; its next job needs 5",
+                         "a remembered glaeda-ios-sim does not lower the fit this listener holds for")
+        self.assertIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_labels, "though it still makes that job visible")
+        self.assertNotIn(hook.IOS_SIM_RUNNER_LABEL, gate.cap_fit_labels,
+                         "the live window is what the lowering answer reads")
+
     def test_a_side_listener_never_takes_a_queue_head_it_cannot_start(self) -> None:
         # HEAD_FIT, 2026-11-17: cmux#44505's generated files (job 134087426027) reached cmux18-glaeda-8, which
         # listened at the side fit with 1 unit free; the job needed 8, waited 19 min for them in "Set up runner" and
@@ -9135,6 +9190,78 @@ class HostLoadCapTest(unittest.TestCase):
             self.join()
         self.assertEqual(seen, [frozenset({"glaeda-mini", self.SIDE_LIGHT, self.LABEL})],
                          "the label GitHub dispatched is still there mid-read")
+
+    def test_a_label_github_dispatched_is_remembered_past_the_feeds_window(self) -> None:
+        # hq#16544, the gap left by hq#16433's union: load_cap_fetch asks the controller for
+        # recent=HOST_LOAD_CAP_RECENT_S (600 s), so a job that finished more than 10 minutes ago is simply not in
+        # the answer and observed_labels is empty again. Union with nothing is the understating receipt, so the mini
+        # would strand itself the moment it went quiet on the drifted label - exactly the state the 2026-11-21
+        # austin minis were in. The sighting is remembered, so cap_labels keeps the label with no recent job at all.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.join()  # poll's last look is still reading; the next one would be skipped as one already runs
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the dispatch is seen while the feed still shows it")
+        store = hook.observed_label_file(self.state, self.runner)
+        self.assertTrue(store.exists(), "the sighting is written down, not only held in this process")
+
+        self.jobs = [self.job("queued")]  # 11 minutes on: the controller's window no longer carries that job
+        self.gate.cap_feed_at = 0.0
+        self.gate.load_capped()
+        self.join()
+        self.assertEqual(hook.observed_labels(self.gate.cap_summary, "cmux21-glaeda-2"), frozenset(),
+                         "the feed itself has forgotten the job, which is the whole premise")
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the gate has not: a remembered label outlives the window")
+        self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "and it is still published as a disagreement")
+        self.assertTrue(hook.label_queued(self.gate.cap_summary, self.gate.cap_labels, time.time()),
+                        "so the queued job of that label is still visible to the reserve")
+
+        self.assertIn(self.LABEL, hook.load_observed_labels(store, "cmux21-glaeda-2", time.time()),
+                      "the sighting is on disk, so it survives this gate's process")
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)  # the gate a restart (a hook rollout, a reboot) leaves behind
+        self.poll()
+        self.join()
+        self.assertIn(self.LABEL, self.gate.cap_labels,
+                      "a restarted gate reads the sighting back, so it never has to relearn it from a dispatch")
+
+    def test_a_remembered_label_is_dropped_only_by_its_ttl_or_a_new_runner_name(self) -> None:
+        now = self.NOW
+        store = self.tmp / "observed-labels-x.json"
+        hook.save_observed_labels(store, "cmux21-glaeda-2", {self.LABEL: now - 60, "glaeda-mini": now - 60})
+        self.assertEqual(sorted(hook.load_observed_labels(store, "cmux21-glaeda-2", now)),
+                         ["glaeda-mini", self.LABEL], "a round trip keeps what was seen")
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-3", now), {},
+                         "a runner dir registered under another name inherits nothing")
+        self.assertEqual(hook.load_observed_labels(store, None, now), {})
+        self.assertEqual(hook.load_observed_labels(self.tmp / "nothing.json", "cmux21-glaeda-2", now), {},
+                         "no file is no memory, not an error")
+        old = now + hook.OBSERVED_LABEL_TTL_S + 60
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-2", old), {},
+                         "a label GitHub has not dispatched for the whole TTL is forgotten: a real relabel away "
+                         "from a label also stops its dispatches")
+        store.write_text("{not json")
+        self.assertEqual(hook.load_observed_labels(store, "cmux21-glaeda-2", now), {}, "a broken file is no memory")
+
+    def test_remembering_a_steady_label_is_not_a_write_every_look(self) -> None:
+        # The look runs once a minute on every gate on the mini. Restamping on each one would be a pointless write a
+        # minute per runner; the TTL only needs the stamp to be fresher than OBSERVED_LABEL_TTL_S.
+        now = self.NOW
+        merged, write = hook.merge_observed_labels({}, frozenset({self.LABEL}), now)
+        self.assertEqual((merged, write), ({self.LABEL: now}, True), "a label never seen before is worth a write")
+        merged, write = hook.merge_observed_labels(merged, frozenset({self.LABEL}), now + 60)
+        self.assertEqual((merged, write), ({self.LABEL: now + 60}, False), "seen again a minute later: no write")
+        merged, write = hook.merge_observed_labels({self.LABEL: now}, frozenset({self.LABEL}),
+                                                   now + hook.OBSERVED_LABEL_REFRESH_S)
+        self.assertTrue(write, "past the refresh the stamp is written, so the TTL measures the last sighting")
+        kept, write = hook.merge_observed_labels({f"l{i}": now - i for i in range(hook.OBSERVED_LABEL_MAX + 4)},
+                                                 frozenset(), now)
+        self.assertEqual(len(kept), hook.OBSERVED_LABEL_MAX, "the file stays bounded whatever the feed says")
+        self.assertTrue(write)
+        self.assertNotIn(f"l{hook.OBSERVED_LABEL_MAX + 3}", kept, "the least recently dispatched goes first")
+        self.assertEqual(hook.merge_observed_labels({self.LABEL: now}, frozenset(), now)[1], False,
+                         "a look that saw nothing writes nothing")
 
     def test_a_receipt_it_cannot_read_is_not_published_as_a_disagreement(self) -> None:
         # With no readable receipt there is nothing for the dispatches to disagree with. Reporting drift here would
@@ -16507,6 +16634,26 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
         self.assertFalse(runner.exists())
 
+    def test_an_adopted_registration_records_github_labels_not_the_ones_this_run_would_ask_for(self) -> None:
+        # config.sh outlived our timeout, so the receipt holds no registration and the next pass adopts the one on
+        # disk. ctx.labels there is what this run *would* register - the manifest or hostname default - which can be
+        # a superset of what the interrupted config.sh actually got, so the adopted receipt would overstate the
+        # runner (hq#16433). This plan read GitHub for it; the adoption records that reading instead.
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out after 900 seconds"))[1]):
+            self.invoke("--apply", expect=1)
+        runners = json.loads((self.state / "runners.json").read_text())
+        held = sorted({label["name"] for label in runners["runners"][0]["labels"]} | {"glaeda-side-std"})
+        runners["runners"][0]["labels"] = [{"name": name} for name in held]  # not a set this run would ask for
+        (self.state / "runners.json").write_text(json.dumps(runners))
+        second = self.invoke("--apply")
+        self.assertIn("adopted", self.by_kind(second)["register"]["note"])
+        reg = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())["registration"]
+        self.assertEqual(reg["labels"], held, "what GitHub holds for it, not what this run would have asked for")
+        self.assertEqual(reg["labelsSource"], "github")
+        self.assertTrue(reg["labelsObservedAt"], "stamped, so a reader can tell how fresh the reading is")
+
     def test_uninstall_deregisters_an_unadopted_interrupted_registration(self) -> None:
         with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
                 subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
@@ -17381,6 +17528,101 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(register["state"], "relabel")
         self.assertEqual(register["previousLabels"],
                          ["ARM64", "glaeda-mini", "glaeda-side-std-xcode-26.6", "macOS", "self-hosted"])
+
+    def test_an_apply_records_the_labels_github_holds_so_a_receipt_stops_understating(self) -> None:
+        # hq#16433: registration.labels recorded what an install last *asked* GitHub for - the receipt says so
+        # itself, stamping "GitHub labels could not be read; re-registering with the supplied token" - and only a
+        # successful relabel rewrote it. Once GitHub held the newer set, every later pass read GitHub, found nothing
+        # to do (an "unchanged" register writes a registration only when there is none) and left the receipt
+        # understating the runner for good. The gate reads exactly these labels (glaeda-cmux-runner-hook's
+        # runner_labels -> cap_labels) and filters every controller-feed read with
+        # `set(job["labels"]) <= cap_labels`, so an understating receipt hid takeable jobs from a runner that could
+        # run them: on 2026-11-21 two minis' instance-1 and instance-2 read side-light while GitHub dispatched
+        # side-std jobs to both. Whenever a plan read GitHub's own labels, the receipt now records that reading.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            held = sorted(first["registration"]["labels"])
+            self.assertEqual(first["registration"]["labelsSource"], "registered",
+                             "a register of our own records what GitHub accepted")
+            doc = json.loads(receipt_path.read_text())
+            doc["registration"]["labels"] = ["glaeda-mini", "self-hosted"]  # the stale set an earlier apply asked for
+            doc["registration"].pop("labelsSource", None)
+            receipt_path.write_text(json.dumps(doc))
+            configs = len(self.config_argvs())
+            again = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(again)["register"]
+        self.assertEqual(register["state"], "unchanged", "GitHub already holds this version's labels")
+        self.assertEqual(register["receiptLabels"], held, "the pass that had nothing to do still corrects the receipt")
+        self.assertEqual(len(self.config_argvs()), configs, "and corrects it without re-registering the runner")
+        on_disk = json.loads(receipt_path.read_text())["registration"]
+        self.assertEqual(sorted(on_disk["labels"]), held, "what GitHub holds, not what some apply asked for")
+        self.assertEqual(on_disk["labelsSource"], "github")
+        self.assertTrue(on_disk["labelsObservedAt"], "stamped, so a reader can tell how fresh the reading is")
+
+    def test_a_runner_too_busy_to_relabel_still_has_its_github_labels_recorded(self) -> None:
+        # The drift sat on the low-index instances, the first GitHub picks for work: a runner mid-job cannot be
+        # relabelled, the register action is blocked, and apply_install stops at the first blocked action. The
+        # reading of GitHub's labels is therefore recorded before that loop runs, so the one pass that found the
+        # runner busy still leaves the gate a receipt that does not understate it.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            runners = json.loads((self.state / "runners.json").read_text())
+            runners["runners"][0]["labels"] = [{"name": name} for name in
+                                               ("self-hosted", "macOS", "ARM64", "glaeda-mini", "glaeda-extra")]
+            (self.state / "runners.json").write_text(json.dumps(runners))
+            doc = json.loads(receipt_path.read_text())
+            doc["registration"]["labels"] = ["glaeda-mini", "self-hosted"]
+            receipt_path.write_text(json.dumps(doc))
+            with mock.patch.object(cr, "runner_busy", return_value=True):
+                busy = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", expect=1)
+        self.assertEqual(self.by_kind(busy)["register"]["state"], "blocked")
+        on_disk = json.loads(receipt_path.read_text())["registration"]
+        self.assertEqual(on_disk["labels"], ["ARM64", "glaeda-extra", "glaeda-mini", "macOS", "self-hosted"],
+                         "a blocked relabel still records what GitHub holds today")
+        self.assertEqual(on_disk["labelsSource"], "github")
+
+    def test_a_name_that_now_points_at_another_registration_never_rewrites_our_labels(self) -> None:
+        # Overstating is the one direction a receipt must never drift: a receipt claiming a label GitHub does not
+        # hold has the gate keep room for work this runner can never be handed. lookup_runner finds a runner by
+        # name, and a name can move (another machine registered it, an operator re-registered it by hand), so the
+        # reading is recorded only when the registration behind it is the one this receipt made.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            ours = json.loads(receipt_path.read_text())["registration"]
+            held = sorted(ours["labels"])
+            runners = json.loads((self.state / "runners.json").read_text())
+            runners["runners"][0]["id"] = ours["runnerId"] + 1000  # a registration this install never made
+            runners["runners"][0]["labels"] = [{"name": name} for name in
+                                               ("self-hosted", "glaeda-mini", "glaeda-ios-sim")]
+            (self.state / "runners.json").write_text(json.dumps(runners))
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(plan)["register"]
+        self.assertNotIn("githubLabels", register, "another runner's labels are never recorded as ours")
+        self.assertEqual(register["githubLabelsIgnored"],
+                         {"id": ours["runnerId"] + 1000, "receiptRunnerId": ours["runnerId"]})
+        self.assertEqual(sorted(json.loads(receipt_path.read_text())["registration"]["labels"]), held,
+                         "the receipt keeps the labels of the registration it does own")
+
+    def test_a_name_that_is_not_this_installs_own_never_reaches_a_label_reading(self) -> None:
+        # --github-labels carries no name: it is the reading glaeda-cmux-runner-fleet took for the name it derived
+        # itself, so nothing in the flag proves it describes the runner this run is about. What pins it is this
+        # refusal - a run naming a runner other than the one installed here stops at the receipt, before any label
+        # is planned or recorded. Asserted here so the assumption the recording rests on cannot be loosened quietly.
+        real_which = cr.which
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            labels = ",".join(first["registration"]["labels"])
+            with mock.patch.object(cr, "which",
+                                   lambda name, extra=(): None if name == "gh" else real_which(name, extra)):
+                plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std",
+                                   "--name", "someone-elses-runner", "--github-labels", labels, gh=False)
+        kinds = self.by_kind(plan)
+        self.assertEqual(kinds["receipt"]["state"], "blocked")
+        self.assertIn("this Mac already has a runner install", kinds["receipt"]["note"])
+        self.assertNotIn("register", kinds, "no register action, so no reading of another name's labels")
 
     def test_manifest_blocks_when_github_labels_cannot_be_read(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -21102,6 +21344,195 @@ class StepBackfillTest(unittest.TestCase):
             with self.subTest(need=bad):
                 marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "need": bad}))
                 self.assertEqual([w["need"] for w in hook.admission_waiters(self.capacity)], [None])
+
+class JobScratchTest(unittest.TestCase):
+    """JOB_SCRATCH: a per-job sparse APFS image (hdiutil mocked), opt-in, best effort, scoped to this runner."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name) / "job-scratch"
+        self.github_env = Path(tmp.name) / "github_env"
+        self.github_env.write_text("")
+        self.runner_temp = Path(tmp.name) / "runner_temp"
+        self.runner_temp.mkdir()
+        self.env = {"GLAEDA_JOB_SCRATCH": "1", "RUNNER_NAME": "actions-runner-glaeda-3",
+                    "GITHUB_RUN_ID": "1234567", "GITHUB_RUN_ATTEMPT": "2"}
+        self.calls: list[list[str]] = []
+        self.mounted: set[str] = set()
+        self.fail: dict[str, int] = {}
+        patches = (mock.patch.object(hook, "hdiutil", self.fake_hdiutil),
+                   mock.patch.object(hook, "job_scratch_mounted", lambda path: os.fspath(path) in self.mounted),
+                   mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(self.github_env),
+                                                "RUNNER_TEMP": os.fspath(self.runner_temp)}))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def fake_hdiutil(self, *argv: str) -> subprocess.CompletedProcess:
+        self.calls.append(list(argv))
+        verb = argv[0]
+        if self.fail.get(verb):
+            return subprocess.CompletedProcess([hook.HDIUTIL, *argv], self.fail[verb], "", f"{verb} failed")
+        if verb == "create":
+            Path(argv[-1]).write_bytes(b"sparse")
+        elif verb == "attach":
+            self.mounted.add(argv[argv.index("-mountpoint") + 1])
+        elif verb == "detach":
+            self.mounted.discard(argv[-1])
+        return subprocess.CompletedProcess([hook.HDIUTIL, *argv], 0, "", "")
+
+    def start(self, **env: str) -> list[str]:
+        return hook.job_scratch_start({**self.env, **env}, self.base, darwin=True)
+
+    def end(self, **env: str) -> list[str]:
+        return hook.job_scratch_end({**self.env, **env}, self.base, darwin=True)
+
+    def test_flag_off_is_a_no_op(self) -> None:
+        for value in (None, "0", "", "true", "yes"):
+            with self.subTest(value=value):
+                env = {k: v for k, v in self.env.items() if k != "GLAEDA_JOB_SCRATCH"}
+                if value is not None:
+                    env["GLAEDA_JOB_SCRATCH"] = value
+                self.assertEqual(hook.job_scratch_start(env, self.base, darwin=True), [])
+                self.assertEqual(hook.job_scratch_end(env, self.base, darwin=True), [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.base.exists())
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_flag_off_by_default_in_the_hooks_environment(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GLAEDA_JOB_SCRATCH", None)
+            self.assertFalse(hook.job_scratch_on())
+            self.assertEqual(hook.job_scratch_start(), [])
+            self.assertEqual(hook.job_scratch_end(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_create_attach_export_then_detach_and_delete(self) -> None:
+        runner_dir = self.base / "actions-runner-glaeda-3"
+        image, mount = runner_dir / "job-1234567-2.sparseimage", runner_dir / "job-1234567-2"
+        notes = self.start()
+        self.assertEqual(self.calls, [
+            ["create", "-quiet", "-type", "SPARSE", "-fs", "APFS", "-size", "220g",
+             "-volname", "cmux-job-actions-runner-glaeda-3-1234567-2", os.fspath(image)],
+            ["attach", "-nobrowse", "-owners", "on", "-plist", "-mountpoint", os.fspath(mount), os.fspath(image)],
+        ])
+        self.assertIn(os.fspath(mount), self.mounted)
+        self.assertTrue((mount / "tmp").is_dir())
+        self.assertEqual(self.github_env.read_text().splitlines(),
+                         [f"TMPDIR={mount / 'tmp'}", f"CMUX_JOB_SCRATCH={mount}"])
+        self.assertTrue(any("job scratch: " + os.fspath(mount) in note for note in notes), notes)
+        (mount / "tmp").rmdir()  # the volume's contents vanish with the detach; the fake leaves the dir
+        self.calls.clear()
+        notes = self.end()
+        self.assertEqual(self.calls, [["detach", "-force", os.fspath(mount)]])
+        self.assertFalse(image.exists())
+        self.assertFalse(mount.exists())
+        self.assertIn("dropped 1 volume(s)", notes[0])
+
+    def test_size_override_and_bad_size(self) -> None:
+        self.start(GLAEDA_JOB_SCRATCH_SIZE="80g")
+        self.assertEqual(self.calls[0][self.calls[0].index("-size") + 1], "80g")
+        self.calls.clear()
+        for bad in ("80", "0g", "-1g", "80g; rm", "1e3g"):
+            with self.subTest(size=bad):
+                notes = self.start(GLAEDA_JOB_SCRATCH_SIZE=bad, GITHUB_RUN_ID="99")
+                self.assertIn("is not a size", notes[-1])
+        self.assertEqual(self.calls, [])
+
+    def test_reap_drops_only_this_runners_stale_entries(self) -> None:
+        mine, other = self.base / "actions-runner-glaeda-3", self.base / "actions-runner-glaeda-30"
+        for runner in (mine, other):
+            runner.mkdir(parents=True)
+            (runner / "job-1-1.sparseimage").write_bytes(b"old")
+            (runner / "job-1-1").mkdir()
+            self.mounted.add(os.fspath(runner / "job-1-1"))
+        (mine / "job-2-1.sparseimage").write_bytes(b"crashed before attach")
+        (mine / "notes.txt").write_text("not ours")
+        notes = self.start()
+        detached = [call for call in self.calls if call[0] == "detach"]
+        self.assertEqual(detached, [["detach", "-force", os.fspath(mine / "job-1-1")]])
+        self.assertFalse((mine / "job-1-1.sparseimage").exists())
+        self.assertFalse((mine / "job-2-1.sparseimage").exists())
+        self.assertTrue((mine / "notes.txt").exists(), "a name that is not a scratch entry is never deleted")
+        self.assertTrue((other / "job-1-1.sparseimage").exists(), "another runner's scratch is never touched")
+        self.assertIn(os.fspath(other / "job-1-1"), self.mounted)
+        self.assertIn("not a job scratch entry", " ".join(notes))
+        self.assertIn("still there", notes[-1], "an entry left in the runner's dir blocks a new volume")
+        self.assertFalse(any(call[0] == "create" for call in self.calls))
+
+    def test_reap_never_follows_a_symlink_or_walks_a_tree(self) -> None:
+        mine = self.base / "actions-runner-glaeda-3"
+        mine.mkdir(parents=True)
+        target = self.base / "precious"
+        target.mkdir()
+        (target / "file").write_text("keep")
+        (mine / "job-5-1").symlink_to(target)
+        full = mine / "job-6-1"
+        full.mkdir()
+        (full / "leftover").write_text("unmounted contents")
+        dropped, left = hook.job_scratch_reap(mine)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(left), 2, left)
+        self.assertTrue((target / "file").exists())
+        self.assertTrue((full / "leftover").exists(), "a nonempty mount directory is never walked")
+
+    def test_create_failure_is_no_scratch_and_a_note(self) -> None:
+        self.fail["create"] = 1
+        notes = self.start()
+        self.assertIn("job scratch: none for this job: hdiutil create exit 1", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+        self.assertEqual(list((self.base / "actions-runner-glaeda-3").iterdir()), [])
+
+    def test_attach_failure_drops_the_image(self) -> None:
+        self.fail["attach"] = 1
+        notes = self.start()
+        self.assertIn("hdiutil attach exit 1", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+        self.assertEqual(list((self.base / "actions-runner-glaeda-3").iterdir()), [])
+
+    def test_hdiutil_raising_never_escapes(self) -> None:
+        def boom(*argv: str) -> subprocess.CompletedProcess:
+            raise subprocess.TimeoutExpired([hook.HDIUTIL, *argv], hook.HDIUTIL_TIMEOUT_S)
+        with mock.patch.object(hook, "hdiutil", boom):
+            notes = self.start()
+        self.assertIn("job scratch: none for this job", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_detach_failure_keeps_the_image_and_says_so(self) -> None:
+        self.start()
+        (self.base / "actions-runner-glaeda-3" / "job-1234567-2" / "tmp").rmdir()
+        self.fail["detach"] = 16
+        notes = self.end()
+        self.assertIn("still mounted after hdiutil detach (exit 16", notes[0])
+        self.assertTrue((self.base / "actions-runner-glaeda-3" / "job-1234567-2.sparseimage").exists())
+
+    def test_names_that_are_not_plain_skip(self) -> None:
+        for env in ({"RUNNER_NAME": "../x"}, {"RUNNER_NAME": ".."}, {"RUNNER_NAME": ""}, {"GITHUB_RUN_ID": "1/2"},
+                    {"GITHUB_RUN_ID": ""}):
+            with self.subTest(env=env):
+                self.assertIn("skipped", self.start(**env)[0])
+        self.assertEqual(self.calls, [])
+
+    def test_not_darwin_skips(self) -> None:
+        self.assertEqual(hook.job_scratch_start(self.env, self.base, darwin=False),
+                         ["job scratch: skipped: needs macOS hdiutil"])
+        self.assertEqual(hook.job_scratch_end(self.env, self.base, darwin=False), [])
+        self.assertEqual(self.calls, [])
+
+    def test_hdiutil_runs_by_absolute_path_with_an_allowlisted_env(self) -> None:
+        mock.patch.stopall()  # the real hdiutil(), with subprocess.run faked
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(argv=argv, **kwargs)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(hook.subprocess, "run", fake_run):
+            hook.hdiutil("detach", "-force", "/x")
+        self.assertEqual(seen["argv"], ["/usr/bin/hdiutil", "detach", "-force", "/x"])
+        self.assertEqual(seen["env"], {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+        self.assertEqual(seen["timeout"], hook.HDIUTIL_TIMEOUT_S)
+
 
 if __name__ == "__main__":
     unittest.main()

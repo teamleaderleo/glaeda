@@ -57,10 +57,11 @@
                                                         (~/.config/glaeda/on-event.json), and what each one did
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
-    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--wait S] [--json]
-                                                        land a PR: the daemon asks land_judge, takes each step it
+    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
+                   [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
-                                                        pinned merge) and tells the requester on a merge or a stop
+                                                        pinned merge) and tells the requester on a merge or a stop;
+                                                        --sha lands only that head (another stops it: head_moved)
     glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day
     glaeda-gh land cancel OWNER/REPO#N                  stop landing it (a step already started finishes)
 
@@ -410,6 +411,12 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
+# Falling back from the controller to REST is spend, not just a failure: on one developer workstation on
+# 2026-11-21 it ran a few times every ten minutes for hours, and only refresh-errors.log knew, which nobody
+# reads. The count is kept here, by the hour it happened in, so `glaeda-gh budget` reports it beside the
+# quota it costs.
+CONTROLLER_FALLBACK_FILE = "controller-fallback.json"
+CONTROLLER_FALLBACK_HOURS = 25  # hourly buckets kept: a day, plus the running one
 # The same counts by the hour (epoch // 3600 -> counted), folded in as minutes leave rest-spend.json's hour and kept
 # REST_HOURS_KEEP hours, so a cap is set from a day of real use (daemon.json restShare.hours). On 2026-11-18 the caps
 # had to be set from alarm lines, as no host kept more than the last hour.
@@ -642,14 +649,37 @@ UPSTREAM_OUTAGE = "upstream-outage"
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
-CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+# One deadline used to protect against two very different things, and the cheap one set it. A controller that is
+# not there (nothing listening, a dead tailnet route) must not stall a tick: that is what "3 s" was for, and a
+# connect deadline says it exactly. A controller that has accepted the connection has proved it is alive, and
+# giving up on it then is far more expensive than waiting: every run the fallback reads spends the shared REST
+# quota (5000/h for every lane on this account together), and the first failure also takes the controller out for
+# CONTROLLER_RETRY and more (controller_down), so one lost race sends a minute of run reads to REST. So the two
+# get their own deadlines, and the read one is derived from what the controller actually costs.
+# Measured 2026-11-21 10:05-10:35Z on a developer workstation, over its socat forward to cmux-lawrence
+# (client.json points at http://127.0.0.1:18765, which socat forwards over `tailscale nc`, so "local" is a
+# tailnet round trip):
+#   connect, to the local forward              0.3-4.7 ms (n=43)
+#   first byte                                 0.13-0.28 s, flat in body size
+#   whole answer, /v1/github/events            0.13-1.47 s (p50 0.44, p90 0.53), throughput-bound: the tunnel
+#                                              carries ~400 KB/s and the largest feed page seen was 321 KB
+# CONTROLLER_CONNECT_TIMEOUT is ~200x the worst connect seen, and fails faster than the old 3 s did.
+# CONTROLLER_READ_TIMEOUT is ~4x the worst whole answer seen, and still an order of magnitude under what losing
+# the race costs (CONTROLLER_RETRY's 60 s of REST): waiting can never cost more than falling back.
+CONTROLLER_CONNECT_TIMEOUT = 1.0  # a tick must not stall on an unreachable controller
+CONTROLLER_READ_TIMEOUT = 6.0  # an alive controller is worth waiting for: the fallback spends REST
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
 # another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
 # what is left of it (Controller.budget_end); the first failure takes the controller out for CONTROLLER_RETRY and more
 # (controller_down), and REST, GitHub's own reads and the cache serve meanwhile.
-CONTROLLER_TICK_BUDGET = 4.0
-CONTROLLER_DEADLINE = 6  # one whole controller request
+# The budget is one whole request (so controller_room can start one at all: #2201's invariant is that the budget
+# never cuts a request it allowed to start) plus room for a second when the first came back quickly. It is not a
+# number of its own: widen a deadline above and this widens with it. Against the old 3 s timeout an unreachable
+# controller cost a tick 3-4 s here; against the connect deadline it costs about 3 s in 1 s slices, and a
+# controller that accepts and then says nothing costs one read deadline before it is taken out for a minute.
+CONTROLLER_TICK_BUDGET = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1.0
+CONTROLLER_DEADLINE = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
 # whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
@@ -872,6 +902,50 @@ ISSUE_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pul
 # `origin` as GitHub writes it, for a bare number's repository (cwd_repo)
 REMOTE_RE = re.compile(rf"(?:git@github\.com:|(?:https?://|ssh://git@)github\.com/)({NAME})/({NAME}?)(?:\.git)?/?")
 KEY_RES = {"pr": PR_KEY_RE, "run": RUN_KEY_RE, "comment": ISSUE_KEY_RE, "head": HEAD_RE}
+# `KIND:TARGET` -- the notation this tool *prints* for a target, and so the string an agent copies out of a
+# line and back into the next call. parse_key's output (`pr:owner/repo#5`, `run:owner/repo/123`) names the
+# target in every waiting, still-waiting and summary line, and until 2026-11-21 handing one back was an
+# argparse refusal ("argument kind: invalid choice: 'pr:teamleaderleo/leo-workspace/7241'") that cost a
+# whole background wait: the job printed a usage block and exited having waited on nothing. Accepted
+# everywhere a target is: the prefix carries the kind, so nothing here is a guess across kinds -- a prefix
+# naming a *different* kind than the command's refuses, and names the spellings (drop_kind_prefix).
+PREFIX_KINDS = ("pr", "run", "comment", "head", "file", "pid", "until")
+STATUS_KINDS = ("pr", "run", "comment")  # the kinds `status` takes; `head` is read for a PR, never asked for
+WAIT_KINDS = STATUS_KINDS + ("file", "pid", "until")
+KIND_PREFIX_RE = re.compile(rf"({'|'.join(PREFIX_KINDS)}):\s*(\S.*)", re.I | re.S)
+# The spellings of one target, for a refusal to name. `wait until`'s own targets (`quota:rest`) hold a
+# colon that is not a kind, and a URL's `https:` is not one either: both fall through unchanged.
+KIND_FORMS = {"pr": "OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N, a bare N in this checkout, or a pull request URL",
+              "run": "OWNER/REPO/RUN_ID, OWNER/REPO#RUN_ID, run:OWNER/REPO/RUN_ID, or a run URL",
+              "comment": "OWNER/REPO#N, OWNER/REPO/N, comment:OWNER/REPO#N, a bare N in this checkout, "
+                         "or an issue or pull request URL",
+              "head": "OWNER/REPO@SHA, head:OWNER/REPO@SHA, or a commit URL",
+              "file": "a path, or file:PATH", "pid": "a process id, or pid:PID",
+              "until": "quota, quota:rest, quota:graphql, an ISO time, a UTC time (14:40Z) or a duration (45m)"}
+
+
+def split_kind_prefix(text: str) -> tuple[str, str] | None:
+    """`("pr", "o/r#5")` for `pr:o/r#5`, the notation this tool prints; None when there is no kind prefix."""
+    match = KIND_PREFIX_RE.fullmatch(text.strip())
+    return (match.group(1).lower(), match.group(2).strip()) if match else None
+
+
+def drop_kind_prefix(text: str, kind: str, also: tuple[str, ...] = ()) -> str:
+    """TEXT without the `KIND:` prefix this tool prints for it, for a caller that already knows the kind.
+
+    A prefix naming another kind is never read as this one: `wait pr run:o/r/123` refuses, and says which
+    spellings a pr target has, rather than reading the run id as a pull request number. ALSO names the
+    other prefixes this caller accepts (`post comment pr:o/r#5` posts on that pull request's thread)."""
+    split = split_kind_prefix(text)
+    if split is None:
+        return text.strip()
+    named, rest = split
+    if named == kind or named in also:
+        return rest
+    forms = KIND_FORMS.get(kind, "")
+    raise WatchError(f"{text!r} names a {named} target, but this is a {kind} target: a {kind} is "
+                     f"{forms or 'named by its own form'}"
+                     + (f"; a {named} target goes to a {named} call" if named in PREFIX_KINDS else ""))
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
@@ -1154,8 +1228,9 @@ def cwd_repo(cwd: str | None = None) -> str | None:
 
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
-    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in."""
-    text = text.strip()
+    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
+    and a target already spelled the way this function prints it (`pr:o/r#5`) is taken as it stands."""
+    text = drop_kind_prefix(text, kind)
     bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
     if bare:
         repo = cwd_repo()
@@ -2063,6 +2138,50 @@ class EdgeHTTPSHandler(urllib.request.HTTPSHandler):
 
 
 GITHUB_OPENER = urllib.request.build_opener(NoRedirect, EdgeHTTPSHandler)
+
+
+# The controller's own opener: urllib's one `timeout` is the socket timeout for the connect and for every read
+# alike, which is what conflated "the controller is not there" with "the controller is slow right now"
+# (CONTROLLER_CONNECT_TIMEOUT). Here the request carries the read deadline and the connect takes
+# CONTROLLER_CONNECT_DEADLINE's value instead, so an unreachable controller still fails fast while an answer
+# already coming in is waited for. The deadline travels in a thread-local because urllib has nowhere else to put
+# it: it is per request (a tick's budget cuts it), and http.client is per thread anyway.
+CONTROLLER_CONNECT_DEADLINE = threading.local()
+
+
+class ControllerConnect:
+    """A connect deadline of its own; the request's timeout then covers the reads."""
+
+    def connect(self) -> None:
+        read = self.timeout  # type: ignore[attr-defined]
+        self.timeout = getattr(CONTROLLER_CONNECT_DEADLINE, "seconds", None) or CONTROLLER_CONNECT_TIMEOUT
+        try:
+            super().connect()  # type: ignore[misc]
+        finally:
+            self.timeout = read
+        with contextlib.suppress(OSError, AttributeError):
+            self.sock.settimeout(read)  # type: ignore[attr-defined]
+
+
+class ControllerHTTPConnection(ControllerConnect, http_client.HTTPConnection):
+    pass
+
+
+class ControllerHTTPSConnection(ControllerConnect, http_client.HTTPSConnection):
+    pass
+
+
+class ControllerHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: ANN001
+        return self.do_open(ControllerHTTPConnection, req)
+
+
+class ControllerHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: ANN001
+        return self.do_open(ControllerHTTPSConnection, req, context=self._context)
+
+
+CONTROLLER_OPENER = urllib.request.build_opener(NoRedirect, ControllerHTTPHandler, ControllerHTTPSHandler)
 
 
 def error_site(error: BaseException) -> str:
@@ -3088,6 +3207,17 @@ class NoReceiver(WatchError):
     """The controller answers but serves no run events (not deployed there, or not configured)."""
 
 
+class ControllerTimeout(WatchError):
+    """The controller missed a deadline (connect, read or the whole request). A WatchError, so every caller
+    treats it as before; named so the fallback it causes can be counted as REST spend (`glaeda-gh budget`)."""
+
+
+def timed_out(error: BaseException) -> bool:
+    """Whether `error` is a deadline, however urllib wrapped it: a socket timeout reaches us bare on a read and
+    inside URLError.reason on a connect, and hard_deadline's DeadlineTimeout is a TimeoutError too."""
+    return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
+
+
 class Controller:
     """The build controller's GitHub events (cmuxterm-hq#675) over the tailnet: no GitHub quota.
     Without a token it answers for public repositories only."""
@@ -3115,18 +3245,26 @@ class Controller:
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         request = urllib.request.Request(self.base + path, headers=headers)
         try:
-            budget = CONTROLLER_TIMEOUT if timeout is None else timeout
+            read = CONTROLLER_READ_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
-            # the daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET)
+            # The daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET), and
+            # cuts each at what is left of it. controller_room starts none that the budget would cut short, so in
+            # the daemon this only ever shortens a request a caller made outside a tick (#2201 review).
             left = getattr(self, "budget_end", float("inf")) - time.monotonic()
-            budget, deadline = min(budget, max(0.1, left)), min(deadline, max(0.2, left) + deadline - budget)
-            with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
-                doc = json.loads(response.read(MAX_BODY))
+            read, deadline = min(read, max(0.1, left)), min(deadline, max(0.2, left) + deadline - read)
+            CONTROLLER_CONNECT_DEADLINE.seconds = min(CONTROLLER_CONNECT_TIMEOUT, max(0.1, left))
+            try:
+                with hard_deadline(deadline), CONTROLLER_OPENER.open(request, timeout=read) as response:
+                    doc = json.loads(response.read(MAX_BODY))
+            finally:
+                CONTROLLER_CONNECT_DEADLINE.seconds = None
         except urllib.error.HTTPError as error:
             if error.code in {404, 503}:
                 raise NoReceiver(f"controller HTTP {error.code}") from None
             raise WatchError(f"controller HTTP {error.code}") from None
         except (OSError, HTTPException, ValueError) as error:
+            if timed_out(error):
+                raise ControllerTimeout(f"controller: {type(error).__name__}") from None
             raise WatchError(f"controller: {type(error).__name__}") from None
         if not isinstance(doc, dict):
             raise WatchError("controller: not a JSON object")
@@ -3136,7 +3274,7 @@ class Controller:
         """The controller's view of a run, optionally long-polling until it changes state."""
         if not isinstance(wait, int) or not 0 <= wait <= CONTROLLER_RUN_MAX_WAIT:
             raise WatchError(f"controller run wait must be 0..{CONTROLLER_RUN_MAX_WAIT} seconds")
-        timeout = CONTROLLER_TIMEOUT if wait == 0 else wait + CONTROLLER_TIMEOUT
+        timeout = CONTROLLER_READ_TIMEOUT if wait == 0 else wait + CONTROLLER_READ_TIMEOUT
         doc = self.get(f"/v1/github/runs/{int(run_id)}?wait={wait}", timeout=timeout)
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
@@ -3337,7 +3475,7 @@ def slim_check_runs(doc: dict) -> dict:
 
 
 def slim_statuses(doc: dict) -> list[dict]:
-    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at")}
+    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at", "description")}
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
 
 
@@ -3382,7 +3520,7 @@ def slim_head_runs_page(doc: dict) -> dict:
 
 
 def slim_head_runs(doc: dict) -> list[dict]:
-    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion")}
+    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion", "event")}
             for r in doc.get("workflow_runs") or [] if isinstance(r, dict)]
 
 
@@ -3466,14 +3604,17 @@ def rest_contexts(checks: dict, statuses: list[dict], runs: list[dict], required
                       "detailsUrl": c.get("details_url"), "databaseId": c.get("id"), "startedAt": c.get("started_at"),
                       "completedAt": c.get("completed_at"), "isRequired": c.get("name") in required,
                       "checkSuite": {"conclusion": upper(run.get("conclusion")), "app": {"slug": c.get("app")},
+                                     "databaseId": c.get("suite"),
                                      "workflowRun": {
-                          "databaseId": run.get("id"), "workflow": {
+                          "databaseId": run.get("id"), "event": run.get("event"), "workflow": {
                               "name": workflows.get(str(run.get("workflow_id"))) or run.get("name"),
                                                                     "databaseId": run.get("workflow_id")}}}
-                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "workflowRun": None}})
+                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "databaseId": c.get("suite"),
+                                   "workflowRun": None}})
     for c in statuses:
         nodes.append({"__typename": "StatusContext", "context": c.get("context"), "state": upper(c.get("state")),
                       "targetUrl": c.get("target_url"), "createdAt": c.get("created_at"),
+                      **({"description": c["description"]} if isinstance(c.get("description"), str) else {}),
                       "isRequired": c.get("context") in required})
     return nodes
 
@@ -3961,7 +4102,8 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
             state = (item.get("state") or "").lower()
             statuses[f"{prefix}status / {item['context']}"] = (
                 "in_progress" if state in ("pending", "expected") else "completed",
-                "failure" if state == "error" else state, state)
+                "failure" if state == "error" else state, state,
+                item.get("description") if isinstance(item.get("description"), str) else None)
             continue
         suite = item.get("checkSuite") or {}
         slug = (suite.get("app") or {}).get("slug")
@@ -3969,15 +4111,35 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
         runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
-        if order is not None:  # head_data's `runs`: each run's own id and times (head_data's `runs`)
+        if order is not None:  # head_data's `runs`: each run's own id and times, and its identity (run_identity)
             order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
-                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or ""])
+                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or "",
+                                              run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
 
 
+def run_identity(item: dict, suite: dict) -> dict:
+    """What tells one check run's run apart from another's (head_data's `runs`, a row's sixth field): its Actions run's
+    databaseId, event and workflow databaseId and name (the key's prefix, so a reader can split the job's own name off), its app's slug and its check suite's databaseId, each only when read,
+    and lastRealAttempt for a run of an older suite attempt
+    (last_real_contexts) that GitHub's rollup no longer lists."""
+    run = suite.get("workflowRun") or {}
+    workflow = run.get("workflow") or {}
+    app = suite.get("app")
+    out = {"run": run.get("databaseId"), "workflow": workflow.get("databaseId"), "workflowName": workflow.get("name"),
+           "event": run.get("event"),
+           "app": app.get("slug") if isinstance(app, dict) else None, "suite": suite.get("databaseId"),
+           "lastRealAttempt": True if item.get("lastRealAttempt") else None}
+    if app is None and "app" in suite:
+        out["appNull"] = True  # GitHub's documented null app, not an unread one
+    return {k: v for k, v in out.items() if v is not None}
+
+
 # A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
-# conclusion, startedAt, completedAt]. `found` keeps one verdict per name and no order, so a reader could not tell a
+# conclusion, startedAt, completedAt, identity] (run_identity: its Actions run, workflow, event, app and suite, so a
+# reader can collapse a rerun's attempts and drop a superseded cancel as a live rollup read does; leo-workspace
+# land-judge's head checks read it before going live). `found` keeps one verdict per name and no order, so a reader could not tell a
 # replay that ran after its shard's newest rerun from an older one: leo-workspace merge_hold's webview verdict could
 # only hold on the cache (Codex F1 on lw#4070), and while the shared login's GraphQL hour was spent its live read and
 # the head's own check reads all failed, so cmux#46128, #46236 and #46782 sat at glaeda land's 6 h retry deadline on
@@ -3991,6 +4153,11 @@ def head_data(sha: str, runs: dict, statuses: dict, ids: dict, order: dict | Non
     settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
     states = {key: value[2] for key, value in statuses.items() if len(value) > 2}
     data = {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
+    # each status's description where the read gave one (GraphQL's always; REST's combined status too): a reader
+    # judging from the cache (land-judge's fast-gates base, a ws-check standby post) reads what a live read would
+    said = {key: value[3] for key, value in statuses.items() if len(value) > 3 and value[3] is not None}
+    if said:
+        data["statusDescriptions"] = said
     if order is not None:
         data["runs"] = {key: sorted(rs, key=lambda r: int(r[0] or 0)) for key, rs in order.items()}
     return data
@@ -4213,6 +4380,10 @@ class Daemon:
         doc = read_json(BASE / "budget.json")
         self.budget: dict[str, dict] = doc if isinstance(doc, dict) else {}
         self.saved_budget = json.loads(json.dumps(self.budget))
+        fell_back = read_json(BASE / CONTROLLER_FALLBACK_FILE)
+        self.controller_fallback: dict = fell_back if isinstance(fell_back, dict) else {}
+        self.saved_controller_fallback = json.loads(json.dumps(self.controller_fallback))
+        self.controller_missed_deadline = False  # the controller is out for a missed deadline, not another error
         self.backoff: dict[str, float] = {"rest": 0.0, "graphql": 0.0}
         self.secondary_until = 0.0  # a secondary 403 holds both buckets until then
         self.secondary_strikes = 0  # secondary 403s since the last clean answer: each doubles the hold
@@ -7316,6 +7487,9 @@ class Daemon:
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
             self.saved_budget = json.loads(json.dumps(self.budget))
+        if self.controller_fallback != self.saved_controller_fallback:
+            write_json(BASE / CONTROLLER_FALLBACK_FILE, self.controller_fallback)
+            self.saved_controller_fallback = json.loads(json.dumps(self.controller_fallback))
         self.save_spend()
         self.save_named_reads()
         try:
@@ -8824,6 +8998,8 @@ class Daemon:
         _, owner, repo, run_id = split_key(e["key"])
         prior = e["cache"] or {}
         self.reads.append((self.now, "run", "rest"))
+        if self.controller_missed_deadline and self.now < self.controller_down_until:
+            self.note_controller_fallback("restRuns")  # a read the controller would have served for free
         base = f"/repos/{owner}/{repo}/actions/runs/{run_id}"
         # a confirmation asks without the ETag: a 304 would prove only what the ETag's own read showed, which the
         # controller's newer record replaced (and a cache from before restRun has nothing to prove it with)
@@ -9385,10 +9561,34 @@ class Daemon:
                 return None, sent  # listed but not finished, or not in the run at all: read alone
         return None, sent
 
+    def note_controller_fallback(self, what: str, n: int = 1) -> None:
+        """Count what a fallback from the controller to REST cost, in the hour it happened in: `what` is
+        "deadline" for a deadline the controller missed, "restRuns" for a run this host then read over REST on
+        the shared quota. `glaeda-gh budget` reports both (controller_fallback_line)."""
+        doc = self.controller_fallback
+        hours = doc.get("hours")
+        if not isinstance(hours, dict):
+            hours = doc["hours"] = {}
+        hour = time.strftime("%Y-%m-%dT%HZ", time.gmtime(self.now))
+        bucket = hours.get(hour)
+        if not isinstance(bucket, dict):
+            bucket = hours[hour] = {}
+        bucket[what] = int(bucket.get(what) or 0) + n
+        for old in sorted(hours)[:-CONTROLLER_FALLBACK_HOURS]:
+            hours.pop(old, None)
+        if not isinstance(doc.get("since"), (int, float)):
+            doc["since"] = self.now  # the window the counts cover: when this host first counted one
+        if what == "deadline":
+            doc["lastAt"] = self.now
+
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
         feed catches up on what happened in between when it answers again."""
         what = describe(error) + (f" at {site}" if site else "")
+        self.controller_missed_deadline = isinstance(error, ControllerTimeout)
+        if self.controller_missed_deadline:
+            # the run reads this sends to REST are counted as they happen (fetch_run), not guessed at here
+            self.note_controller_fallback("deadline")
         if isinstance(error, NoReceiver):
             wait, state = CONTROLLER_ABSENT, "absent"  # not an error: that controller has no receiver
         else:
@@ -9397,8 +9597,14 @@ class Daemon:
             self.errors.append(what)
         self.controller_down_until = self.now + wait
         if not isinstance(error, NoReceiver):
+            # The notice says what the fallback costs, not only that it happened: every run read this host makes until
+            # the controller answers again spends the shared REST quota (one account, 5000/h for every lane together)
+            # that the controller served for free. A reader told only "REST serves runs" has to know that to see the
+            # price, and a notice whose mechanism the reader has to re-derive gets re-derived wrong.
+            cost = ("REST serves runs, and each one spends the shared REST quota the controller served free"
+                    if self.controller_missed_deadline else "REST serves runs")
             self.refresh_note("controller", what, getattr(self.controller, "base", None) or "controller",
-                              f"REST serves runs; the controller is asked again at {utc_clock(self.now + wait)}")
+                              f"{cost}; the controller is asked again at {utc_clock(self.now + wait)}")
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
                                   "token": bool(getattr(self.controller, "token", None))}
 
@@ -9452,6 +9658,7 @@ class Daemon:
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.controller_down_until, self.controller_failures = 0.0, 0
+        self.controller_missed_deadline = False
         self.controller_status = {"state": "off" if current is None else "starting"}
 
     def from_controller(self, entries: list[dict]) -> None:
@@ -9473,10 +9680,13 @@ class Daemon:
 
     def controller_room(self) -> bool:
         """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
-        CONTROLLER_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never started to be
-        cut short by the budget: that cut would read as the controller failing, and take it out (#2201 review)."""
+        CONTROLLER_READ_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
+        started to be cut short by the budget: that cut would read as the controller failing, and take it out
+        (#2201 review). The allowance is the read deadline, not the connect one, because the read is the part a
+        slow answer spends: a request allowed to start can always wait out an answer that is on its way, which is
+        what keeps the run it carries off the shared REST quota."""
         return (self.controller is not None and self.now >= self.controller_down_until
-                and time.monotonic() + CONTROLLER_TIMEOUT <= self.controller_budget_end)
+                and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
@@ -9489,6 +9699,7 @@ class Daemon:
                 return self.controller_down(error)
             if getattr(self, "controller_feed_error", None) is None:
                 self.controller_failures = 0
+                self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
             self.controller_ok_at = self.now
             for page in pages:
                 for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
@@ -10719,11 +10930,11 @@ def land_config() -> dict:
 
 def land_key(target: str) -> tuple[str, str, int]:
     """(key, OWNER/REPO as typed, N) for OWNER/REPO#N, OWNER/REPO/N, a PR URL, or a bare N in the repository
-    the caller stands in (parse_key reads both of the loose forms)."""
-    text = target.strip()
+    the caller stands in (parse_key reads both of the loose forms), or `pr:OWNER/REPO#N` as this tool prints it."""
+    text = drop_kind_prefix(target, "pr")
     m = PR_KEY_RE.fullmatch(text)
     if not m and not BARE_NUMBER.fullmatch(text):
-        raise WatchError(f"land takes OWNER/REPO#N, OWNER/REPO/N or a pull request URL, not {target!r}")
+        raise WatchError(f"land takes {KIND_FORMS['pr']}, not {target!r}")
     key = parse_key("pr", text)  # a bare number names the repository the caller stands in, or raises
     _, owner, repo, number = split_key(key)
     return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
@@ -11356,6 +11567,19 @@ class LandQueue:
         e.update(after=[a for a in after if a != key], requester=str(req.get("requester") or ""),
                  requesterFrom=str(req.get("requesterFrom") or ""), queuedBy=str(req.get("queuedBy") or ""),
                  requestId=req.get("id"), gen=int(e.get("gen") or 0) + 1)
+        # --sha pins the head this request lands; a request without one (a re-request too) lands whatever head is
+        # judged, as before.
+        try:
+            pin = land_pin_sha(req.get("sha"))
+        except WatchError:
+            pin = ""
+        if pin:
+            e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
+        else:
+            e.pop("pinSha", None)
+            e.pop("pinSince", None)
+        e.pop("pinWait", None)
+        e.pop("pinSeen", None)
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -11364,15 +11588,18 @@ class LandQueue:
         elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
             e.pop("lane", None)
             e.pop("laneHost", None)
+        if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
+            e["override"] = land_request_override(req)
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None)
-            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]))
+            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
+                         **land_override_history(e))
         else:
-            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
+            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e))
         self.entries[key] = e
         self.save(e)
         self.changed_entries.add(key)
@@ -11543,7 +11770,8 @@ class LandQueue:
                               "queuedBy": e.get("queuedBy") or "", "handoff": True}
                              # an entry from before the lane was recorded names none there: its requester's
                              # PARENT/CHILD would read as a session on the executor's host
-                             | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""})
+                             | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
+                             | ({"override": e["override"]} if e.get("override") else {}))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -11559,7 +11787,8 @@ class LandQueue:
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy", "lane", "laneHost") if k in req} | {"id": rid})
+                                                      "queuedBy", "lane", "laneHost", "override") if k in req}
+                             | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
 
@@ -12369,6 +12598,8 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
+        if e.get("pinSha") and not e.get("pinSeen") and self.pin_wait(e, c or {}, head):
+            return
         running = land_checks_running(data, head)
         kind = w.get("kind")
         if e["state"] == "queued":
@@ -12435,6 +12666,55 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def pin_wait(self, e: dict, c: dict, head: str) -> bool:
+        """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
+        the request, or when it stopped because that read shows another head. huge-blue, 2026-11-21 10:56Z:
+        leo-workspace#7221, pinned at 53fa5568 just pushed, was judged within a minute on the cache's 5-minute-old copy
+        of 0eb40dbac8fb and stopped on that head's conflict; the pin said a newer head existed. Until the cache shows
+        the pinned head, or a read since the request shows another, no verdict on a cached head is taken (judge's own
+        head_moved included): the PR is read again (nudged, or refreshed through the upstream), at most every
+        NUDGE_MIN. Once the cache shows the pin (pinSeen), judge's head_moved check holds as it always did."""
+        pin = str(e.get("pinSha") or "")
+        if head and not land_head_moved(pin, head):
+            e["pinSeen"] = True
+            if e.pop("pinWait", None) is not None:
+                self.history(e, "pin_seen", head=head[:12])
+            self.save(e)
+            return False
+        since = float(e.get("pinSince") or 0)
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if head and reads and max(reads) >= since:
+            # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
+            e.pop("pinWait", None)
+            self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+            return True
+        w = e.get("pinWait")
+        if not isinstance(w, dict):
+            w = e["pinWait"] = {"since": self.now, "cached": head[:12]}
+            self.history(e, "pin_wait", pin=pin[:12], cached=head[:12])
+            self.save(e)
+        last = w.get("readAt")
+        if not isinstance(last, (int, float)) or isinstance(last, bool) or self.now - last >= NUDGE_MIN:
+            if not self.reads_upstream():
+                w["readAt"] = self.now
+                self.save(e)
+                before = (c.get("dataAt"), c.get("updatedAtAt"))
+                self.nudge(e["key"])
+                again = self.cache_of(e["key"]) or {}  # a read the nudge already answered (the daemon's own pass)
+                if (again.get("dataAt"), again.get("updatedAtAt")) != before:
+                    # judged from that read on the next pass (consider holds this pass's copy), or stopped now
+                    self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
+                    self.changed_entries.add(e["key"])
+                    return True
+            elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
+                w["readAt"] = self.now
+                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
+                self.submit(e["key"], self.refresh_job, e["key"])
+            self.save(e)
+        return True
 
     def after_stopped(self, e: dict, a: str, ae: dict) -> bool:
         """E lands after A, whose land stopped (LAND_AFTER_STOPPED_WAIT): E keeps waiting for A, telling its requester
@@ -12644,6 +12924,10 @@ class LandQueue:
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
+        if land_head_moved(str(e.get("pinSha") or ""), sha):
+            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+            return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             if not free or self.snapshot(e["key"], sha)[1] == "wait":
@@ -13479,8 +13763,12 @@ class LandQueue:
         merge_hold pass again for 202 s before the broker's land answered 409 "REST rate limit is spent for login
         until 00:38Z": the window was gone inside its own merge step."""
         lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
-        got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"],
-                         json.dumps({"number": int(e["number"]), "sha": sha}, sort_keys=True)], LAND_MERGE_DEADLINE, e)
+        args: dict[str, Any] = {"number": int(e["number"]), "sha": sha}
+        extra = land_override_env(e)
+        if extra:  # lane-gh land's own override, which the broker's land_judge reads (and logs) on its host
+            args["override"] = {"reason": extra["LAND_JUDGE_OVERRIDE"], "receipt": extra["LAND_JUDGE_OVERRIDE_RECEIPT"]}
+        got = self.call([lane_gh, "call", LAND_BROKER_MERGE_TOOL, e["repo"], json.dumps(args, sort_keys=True)],
+                        LAND_MERGE_DEADLINE, e, extra)
         envelope: Any = None
         with contextlib.suppress(ValueError):
             envelope = json.loads(got.stdout or "")
@@ -13525,7 +13813,7 @@ class LandQueue:
             got = self.broker_land(e, sha)
         else:
             got = self.call([gh, "pr", "merge", number, "-R", repo, "--squash", "--match-head-commit", sha],
-                            LAND_MERGE_DEADLINE, e)
+                            LAND_MERGE_DEADLINE, e, land_override_env(e))  # the shim's land_judge reads the override
         said = f"{got.stderr or ''} {got.stdout or ''}"
         if got.returncode != 0 and LAND_STEP_QUOTA.search(said):
             with self.lock:  # the shim's land_judge judged it on a spent quota: parked, and no `pr view` after it
@@ -13774,8 +14062,54 @@ def land_request_path(rid: str) -> Path:
     return _land_written[rid]
 
 
+LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason and receipt, one line each
+LAND_OVERRIDE_RECEIPT_MAX = 240
+
+
+def land_override(reason: str | None, receipt: str | None) -> dict | None:
+    """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
+    neither. Refused (WatchError) as lane-gh land refuses it: one of the two alone, an empty one, a newline, or past
+    LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters. Each merge try then runs with
+    LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's "override")."""
+    if reason is None and receipt is None:
+        return None
+    if reason is None or receipt is None:
+        raise WatchError("--override-reason and --override-receipt go together: give both (the reason, and the "
+                         "receipt naming the base run and job ids), or neither")
+    for flag, text, most in (("--override-reason", reason, LAND_OVERRIDE_REASON_MAX),
+                             ("--override-receipt", receipt, LAND_OVERRIDE_RECEIPT_MAX)):
+        if "\n" in text or "\r" in text:
+            raise WatchError(f"{flag} is one line: it has a newline")
+        if not text.strip():
+            raise WatchError(f"{flag} is empty")
+        if len(text) > most:
+            raise WatchError(f"{flag} is {len(text)} characters; lane-gh land takes at most {most}")
+    return {"reason": reason, "receipt": receipt}
+
+
+def land_request_override(req: dict) -> dict | None:
+    """A request's override as land_override takes it, or None when it names none or a bad one (an older sender's,
+    or a forwarded one past the limits: never a merge override no queue checked)."""
+    o = req.get("override")
+    if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
+        return None
+    try:
+        return land_override(o["reason"], o["receipt"])
+    except WatchError:
+        return None
+
+
+def land_override_env(e: dict) -> dict[str, str]:
+    """The environment a merge try of E adds: its override, as land-judge and lane-gh read it."""
+    o = e.get("override")
+    if not isinstance(o, dict) or not o.get("reason") or not o.get("receipt"):
+        return {}
+    return {"LAND_JUDGE_OVERRIDE": str(o["reason"]), "LAND_JUDGE_OVERRIDE_RECEIPT": str(o["receipt"])}
+
+
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
-                 queued_by: str = "", lane: tuple[str, str] | None = None) -> str:
+                 queued_by: str = "", lane: tuple[str, str] | None = None, sha: str = "",
+                 override: dict | None = None) -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
     request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
     steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
@@ -13789,8 +14123,25 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
     write_json(LandQueue.requests_dir() / f"{name}.json",
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
-                "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {}))
+                "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {})
+               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {}))
     return rid
+
+
+LAND_PIN_SHA = re.compile(r"[0-9a-f]{7,40}")
+
+
+def land_pin_sha(text: Any) -> str:
+    """A --sha as the queue keeps it (lowercase hex, 7 to 40), or "" for none; anything else is an error."""
+    sha = str(text or "").strip().lower()
+    if sha and not LAND_PIN_SHA.fullmatch(sha):
+        raise WatchError(f"--sha is 7 to 40 hex characters: {str(text)[:60]!r}")
+    return sha
+
+
+def land_head_moved(pin: str, head: str) -> bool:
+    """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
+    return bool(pin and head) and not head.lower().startswith(pin)
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:
@@ -13876,7 +14227,17 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         bits.append(f"explain_failed: {land_trim(e['explain'].get('reason'), 160)}")
     if e.get("requester"):
         bits.append(f"for {e['requester']}")
+    o = e.get("override")
+    if isinstance(o, dict) and o.get("reason"):
+        bits.append(f"override: {land_trim(o.get('reason'), 120)} (receipt: {land_trim(o.get('receipt'), 120)})")
     return "  ".join(bits)
+
+
+def land_override_history(e: dict) -> dict:
+    """An entry's override as its queued/updated history line names it (reason and receipt, whole: each is one line
+    of at most 240 characters)."""
+    o = e.get("override")
+    return {"override": o["reason"], "receipt": o["receipt"]} if isinstance(o, dict) and o.get("reason") else {}
 
 
 def land_status_doc(target: str | None) -> dict:
@@ -14050,7 +14411,7 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
-                       as_json: bool) -> int:
+                       as_json: bool, sha: str = "", override: dict | None = None) -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -14060,12 +14421,14 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
-           "laneHost": policy_host() if lane else ""}
+           "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
+        | ({"override": override} if override else {})
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
-                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"])))
+                                            queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]), sha=sha,
+                                            override=override))
     if not why:
         try:
             out = land_forward(executor, req, LAND_FORWARD_DEADLINE + wait)
@@ -14128,15 +14491,19 @@ def check_land_pin(repo: str, number: int, pin: str | None) -> None:
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
-             pin: str | None = None) -> int:
+             pin: str | None = None, override: dict | None = None) -> int:
+    """PIN (--sha or --match-head-commit) is checked against the head now and kept with the request, so the executor
+    stops (head_moved) if a later push moves the head before it merges. OVERRIDE (land_override) rides every merge
+    try."""
     key, repo, number = land_key(target)
     check_land_pin(repo, number, pin)
+    sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
-        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json)
+        return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override)
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -14149,7 +14516,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         return EXIT_FAIL
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source, lane=(lane, policy_host() if lane else ""))
+                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override)
     no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
                f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
                "lease") if not lane and land_broker_client() else ""
@@ -14229,13 +14596,18 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
             land_key(a)
     except (WatchError, TypeError):
         return None, f"not a pull request: {str(req.get('target'))[:80]!r}"
+    try:
+        land_pin_sha(req.get("sha"))
+    except WatchError as error:
+        return None, str(error)
     requester = str(req.get("requester") or "")
     if requester and not LAND_REQUESTER_SHAPE.fullmatch(requester):
         return None, f"not a requester (HOST/SESSION, no spaces, at most 200): {requester[:80]!r}"
     queued_by = str(req.get("queuedBy") or "")
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
-                       rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req))
+                       rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req),
+                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req))
     return rid, ""
 
 
@@ -16705,23 +17077,45 @@ def field_text(value: Any) -> str:
 
 
 def render_fields(keys: list[str], entries: dict[str, dict | None], fields: list[str]) -> str:
-    """One line per key, `fields` tab-separated, prefixed by OWNER/REPO#N when there are several keys. An
-    entry with no data yet prints empty values; a field an entry with data does not have is an error."""
-    lines = []
+    """One line per key, `fields` tab-separated, prefixed by OWNER/REPO#N when there are several keys. A
+    field an entry with data does not have is an error.
+
+    A row the daemon has no answer for prints its outcome code -- `no-data-yet`, or `not-found` for a
+    ref GitHub does not have -- in every column, and its reason and `next:` step go to fd 2 (the rest
+    of the answer is the table on fd 1).
+
+    It used to print empty columns, which made "the daemon has not looked yet" byte-identical to "this
+    field has no value": `status pr A B C D --field state,mergedAt,title` over four PRs, three unread,
+    printed three rows of blanks, and `mergedAt` is empty on every open PR anyway, so there was nothing
+    in the row to tell the two apart. A lander batching one `status` read -- the cheap, quota-correct
+    thing, and what we tell landers to do -- reads those blanks as facts about the PRs and acts on
+    them, while the exit code says only that *something* was unread, never which row. A sentinel is one
+    extra token a parser must learn; a blank is a wrong answer it cannot detect."""
+    lines, problems = [], []
     for key in keys:
-        has = bool((entries.get(key) or {}).get("data"))
-        view = status_view(key, entries.get(key))
+        entry = entries.get(key)
+        has = bool((entry or {}).get("data"))
+        view = status_view(key, entry)
         if not has and split_key(key)[0] == "pr":
             # no data yet: check the names against the shape every PR has, so a typo is refused now
             # rather than printing an empty column until the first read lands
             shape = status_view(key, {"data": parse_pr({"state": "OPEN"})})
             for f in fields:
                 field_value(shape, f)
-        values = [field_text(field_value(view, f)) if has else "" for f in fields]
+        if has:
+            values = [field_text(field_value(view, f)) for f in fields]
+        else:
+            outcome = status_outcome(key, entry)
+            values = [outcome["code"]] * len(fields)
+            problems.append(outcome)
         if len(keys) > 1:
             kind, owner, repo, number = split_key(key)
             values.insert(0, f"{owner}/{repo}{'/' if kind == 'run' else '#'}{number}")
         lines.append("\t".join(values))
+    for outcome in problems:
+        # the agent output contract: what is wrong, then `next:` as the last line (say_waiting's fd 2,
+        # so a caller reading the table off stdout still reads only the table)
+        say_waiting(f"glaeda-gh: {outcome['reason']}\nnext: {outcome['next'] or 'none'}")
     return "".join(f"{line}\n" for line in lines)
 
 
@@ -17125,12 +17519,22 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     # the one that just did not. Same exit code and the same "timeout" in --json as any other expired wait, so no
     # consumer has to learn a new one; only PRs, because a run's finish can still arrive over the build
     # controller's feed, which costs no quota at all.
-    blocked = blocked_now(kind, now) if result is None and not usable and kind == "pr" else None
+    deadline = began + float(req["timeout"])
+    # Cached data this wait can use is no reason to sit out the hold either (glaeda#2311, 2026-11-21: a wait holding
+    # one fresh read of "18 passed, 1 pending" spent its remaining 28 min on a bucket whose reset was 15 min past its
+    # deadline). What settles it is whether the data in hand can still rule with no further read: every transition
+    # time alone can make -- a head's settle window, a runner refusal's rescue grace, a done wait's straggler cut --
+    # turns on `now`, so the same verdict asked at the deadline is the one this wait would reach there. Still None
+    # there means only a read could decide it, and no read comes before the deadline.
+    stuck = result is None and kind == "pr" and (
+        not usable or verdict(kind, data, until, sha, (entry or {}).get("jobs"), deadline, grace,
+                              f"{owner}/{repo}", settle) is None)
+    blocked = blocked_now(kind, now) if stuck else None
     if blocked and blocked.get("exhausted") and blocked["reset"] is not None \
-            and blocked["reset"] >= began + float(req["timeout"]):
+            and blocked["reset"] >= deadline:
         extra = {"result": "timeout", "waited_s": waited,
                  "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
-                         f"deadline ({utc_clock(began + float(req['timeout']))}): waiting the rest of it reads "
+                         f"deadline ({utc_clock(deadline)}): waiting the rest of it reads "
                          "nothing"}
         extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
                                            f"{blocked['text']}", blocked_next(req, blocked)))
@@ -17976,7 +18380,9 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if sha in served:
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
-                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh}
+                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh,
+                          **({"statusDescriptions": data["statusDescriptions"]}
+                             if isinstance(data.get("statusDescriptions"), dict) else {})}
             if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
                 heads[sha]["runs"] = data["runs"]
         elif sha in missing:
@@ -18129,6 +18535,29 @@ def controller_line(ctl: dict) -> str:
     if state == "off":
         return "controller: none configured; polling GitHub"
     return "controller: starting"
+
+
+def controller_fallback_line(doc: Any) -> str:
+    """`budget`'s line for the controller fallbacks that cost REST quota: how many deadlines the controller
+    missed, how many run reads went to REST because of them, and the window both cover (CONTROLLER_FALLBACK_FILE,
+    Daemon.note_controller_fallback). Empty when this host has never had one."""
+    hours = doc.get("hours") if isinstance(doc, dict) else None
+    if not isinstance(hours, dict):
+        return ""
+    kept = {h: b for h, b in hours.items() if isinstance(b, dict)}
+
+    def total(what: str, only: set[str] | None = None) -> int:
+        return sum(int(b.get(what) or 0) for h, b in kept.items() if only is None or h in only)
+
+    this_hour = {time.strftime("%Y-%m-%dT%HZ", time.gmtime(time.time()))}
+    missed, runs = total("deadline"), total("restRuns")
+    if not missed and not runs:
+        return ""
+    since = doc.get("since")
+    window = f"since {age(since)}" if isinstance(since, (int, float)) else f"over the {len(kept)} hours kept"
+    return (f"controller fallback: {missed} missed deadlines sent {runs} run reads to the shared REST quota "
+            f"that the controller would have served free, {window} ({total('deadline', this_hour)} and "
+            f"{total('restRuns', this_hour)} this hour); last missed deadline {age(doc.get('lastAt'))}")
 
 
 def spend_lines(spend: Any) -> list[str]:
@@ -18392,12 +18821,44 @@ def summarize_host(report: dict, now: float) -> dict:
     return out
 
 
-def account_reading(hosts: dict, now: float) -> dict:
+# A bucket with no fresh reading on any host is still readable, for free: GET /rate_limit reports every resource
+# family at once and counts against no primary limit (the daemon's own counter calls those "rate_limit reads (free)",
+# and `GET /rate_limit` sits at "REST 0 of 30" in its spend table). So the account's answer has three routes, tried in
+# this order: this host's own daemon reading, then the freshest peer's, then one free read here.
+#
+# Measured on one host 2026-11-21, 25 minutes apart: `budget` printed "GraphQL unknown (no reachable host's daemon has
+# a fresh reading)" both times while REST answered to the call (4458/5000, then 4822/5000), with two of five hosts
+# "unreachable (no answer in 25s)". A daemon's GraphQL reading only refreshes when it sends a GraphQL query or
+# /rate_limit answers, while every REST answer carries its own headers -- so an idle or REST-leaning daemon has a
+# fresh REST reading and no GraphQL one, and the fleet's GraphQL answer went unknown while the number was free to
+# obtain. GraphQL is the bucket every PR state read spends (`reading: PRs over GraphQL, ... comments over GraphQL`),
+# so it is the one number a lander needs and the one `budget` was least likely to hold: in that same window three
+# `wait pr` calls each burned a full 1800 s timeout on "no data yet" with the shared login's GraphQL bucket at 0 and
+# ~3,300 REST calls left, and nothing an operator could run would have said so.
+#
+# docs/handbook/measurement-unknown-when-shared-quota-spent.md decides the shape: a measurement on a shared quota has
+# a second source that does not share it, and says which one answered and how old it is. Here the second source costs
+# no quota at all, so it is the last route rather than a carried reading, and a bucket that still cannot be read says
+# who was asked, what each answered and the one next step -- never a bare "unknown".
+FREE_READ_BUDGET = 10.0  # one free GET /rate_limit here must not hold `budget` longer than this
+ACCOUNT_ROUTES = ("local", "peer", "direct")  # in preference order; every reading carries the one that answered
+
+
+def account_reading(hosts: dict, now: float, me: str | None = None) -> dict:
     """The login's REST and GraphQL as the freshest live reading any host's daemon took (each host's "rest" is already
-    the poorest core counter it sees), with the host that read it."""
+    the poorest core counter it sees), with the host that read it and the route that answered -- "local" for this
+    host's own daemon, "peer" for another's. An unreachable host is skipped, so it can never by itself make a bucket
+    unknown; neither route reads GitHub, and the free direct read (free_account_reading) is the third route, taken by
+    host_sweep when this returns nothing for a bucket.
+
+    Freshest wins rather than local first, and a tie goes to local. Every host reads the same shared pool, so the
+    freshest reading is the truest one, and `budget` prints the host and the age either way. Preferring local would
+    report a 600 s-old reading here (4000 REST left) over a peer's 30 s-old one (12 left) -- and sweep_tally's
+    unattributed gap is "limit - remaining" of this very reading, so an old one understates the account's spend as
+    well as overstating what a lander may take."""
     out: dict[str, dict] = {}
     for bucket in ("rest", "graphql"):
-        best = None
+        live: list[dict] = []
         for name, h in hosts.items():
             r = (h.get("readings") or {}).get(bucket) if h.get("ok") else None
             try:
@@ -18407,10 +18868,66 @@ def account_reading(hosts: dict, now: float) -> dict:
                 continue
             if reset <= now or now - seen > FLEET_READING_MAX_AGE:
                 continue
-            if best is None or seen > best["seenAt"]:
-                best = {**r, "host": name}
+            live.append({**r, "host": name, "route": "local" if name == me else "peer"})
+        best = max(live, key=lambda r: (r["seenAt"], r["route"] == "local"), default=None)
         if best is not None:
             out[bucket] = best
+    return out
+
+
+def free_account_reading(now: float, make: Callable[[], Any] | None = None) -> dict:
+    """GitHub's own count of every bucket from one GET /rate_limit here. That read counts against no primary limit, so
+    it is the route that answers when no daemon on the fleet holds a fresh reading, and asking it costs a lander
+    nothing. The shared login's count only: Daemon.request offers a call to an App pool only when it is not free, so
+    an App pool's headroom can never be read back as the login's. {"readings": {bucket: reading}} or {"error": why};
+    this never raises, because reporting the budget must not fail on the read that would have filled it in."""
+    if upstream_command() is not None:
+        return {"error": "this host reads GitHub through its upstream (upstream.json) and has no login to ask"}
+    try:
+        daemon = (make or (lambda: Daemon(controller=None, upstream=None)))()
+    except Exception as failure:  # noqa: BLE001  a free reading is never the command failing
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    # A session's own free read, not the daemon's polling: it must never write rest-spend.json from the copy it read
+    # at construction, which would overwrite the minutes the daemon has counted since (review of glaeda#1942).
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]
+    daemon.now = now
+    daemon.tick_deadline = time.monotonic() + FREE_READ_BUDGET
+    try:
+        daemon.read_rate_limit()
+    except OutOfTime:
+        return {"error": f"no answer within {FREE_READ_BUDGET:g}s"}
+    except Exception as failure:  # noqa: BLE001
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    if daemon.rate_limit_at < now:  # read_rate_limit stamps this only when /rate_limit answered
+        why = next((e for e in reversed(daemon.errors) if e.startswith("rate_limit: ")), None)
+        return {"error": why[len("rate_limit: "):] if why else "/rate_limit gave no reading"}
+    # budget.json was loaded at construction, so only a bucket this answer refreshed is reported: its seenAt is NOW.
+    out = {b: {**r, "seenAt": now} for b in ("rest", "graphql")
+           if isinstance(r := daemon.budget.get(b), dict) and isinstance(r.get("remaining"), int)
+           and float(r.get("seenAt") or 0) >= now}
+    return {"readings": out} if out else {"error": "/rate_limit named no core or graphql resource"}
+
+
+def reading_gaps(hosts: dict, bucket: str, now: float) -> dict:
+    """Why each host holds no live BUCKET reading: its own error when it did not answer, else what its daemon's
+    reading was. A host that could not be reached and a host whose daemon has simply never taken a reading of that
+    bucket are different conditions, and `budget` must not print one of them for the other."""
+    out: dict[str, str] = {}
+    name_of = POOL_NAMES.get(bucket, bucket)
+    for host, h in hosts.items():
+        if not h.get("ok"):
+            out[host] = h.get("error") or "unreachable"
+            continue
+        r = (h.get("readings") or {}).get(bucket)
+        if not isinstance(r, dict) or not isinstance(r.get("remaining"), int):
+            out[host] = f"answered; its daemon has taken no {name_of} reading (it sends no {name_of} request)"
+        elif float(r.get("reset") or 0) <= now:
+            out[host] = f"answered; its {name_of} window reset {hhmm(r.get('reset'))} and nothing read it since"
+        elif now - float(r.get("seenAt") or 0) > FLEET_READING_MAX_AGE:
+            out[host] = (f"answered; its {name_of} reading is {int(now - float(r['seenAt']))}s old, over the "
+                         f"{FLEET_READING_MAX_AGE:g}s an account reading may be")
+        else:
+            out[host] = f"answered; live {name_of} reading"
     return out
 
 
@@ -18494,7 +19011,8 @@ def sweep_rows(names: list[str], me: str, clock: float, fetch: Callable[[str, bo
     return rows
 
 
-def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
+def host_sweep(clock: float, fetch: Callable[[str, bool], dict],
+               free: Callable[[float], dict] | None = None) -> dict:
     """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT. Then each lane VM
     no read host's broker:VM rows carry is read itself (its own gh-quota log names every call it sent through its
     broker), so a VM whose broker host is unread or idle is a row of its own, not "no broker:VM row". The coordinator,
@@ -18507,7 +19025,9 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     rows = sweep_rows(hosts, me, clock, fetch)
     if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
         rows[me]["brokerClient"] = True
-    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock, me),
+                           "exhausted": exhausted_marks(clock)}
+    fill_account(doc, rows, clock, me, free)
     vms = fleet_lane_vms()
     carried = set(sweep_tally(doc, [])["laneVms"]["brokered"]) | set(rows)
     missing = [vm for vm in vms if vm not in carried]
@@ -18518,6 +19038,60 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     doc["laneVmRows"] = vm_rows
     doc["total"] = sweep_tally(doc, vms)
     return doc
+
+
+def fill_account(doc: dict, rows: dict, clock: float, me: str, free: Callable[[float], dict] | None = None) -> None:
+    """The third route, and what to say when none of them answered. Any bucket account_reading left without a live
+    reading is read here for free (one GET /rate_limit answers both at once, so this costs one bounded read per sweep
+    at most, kept FLEET_BUDGET_TTL with the rest of the answer), and every bucket still unread records who was asked
+    and what each answered (accountGaps) so `budget` prints that instead of a bare "unknown". A gh-quota mark that a
+    bucket is spent is not an answer to what is left in it: a marked bucket is read too, and both are printed."""
+    missing = [b for b in ("rest", "graphql") if b not in doc["account"]]
+    if missing:
+        answer = (free or free_account_reading)(clock)
+        doc["freeRead"] = {"error": answer["error"]} if answer.get("error") else {"at": clock, "buckets": missing}
+        for bucket in missing:
+            r = (answer.get("readings") or {}).get(bucket)
+            if isinstance(r, dict) and float(r.get("reset") or 0) > clock:
+                doc["account"][bucket] = {**r, "host": me, "route": "direct"}
+    doc["accountGaps"] = {b: reading_gaps(rows, b, clock) for b in ("rest", "graphql") if b not in doc["account"]}
+
+
+def account_unknown(bucket: str, doc: dict) -> str:
+    """Why a bucket has no number, which hosts were asked, what each answered, and the one next step. Never a bare
+    "unknown": an operator who cannot see the GraphQL bucket cannot tell a lander's 1800 s of "no data yet" from a
+    slow run (docs/handbook/missing-read-counted-as-a-value.md: a thing whose read did not happen is unknown, and
+    says so)."""
+    gaps = (doc.get("accountGaps") or {}).get(bucket) or {}
+    free = (doc.get("freeRead") or {}).get("error")
+    answered = [h for h, why in gaps.items() if why.startswith("answered")]
+    if bucket in (doc.get("accountDropped") or ()):  # kept from a sweep whose window has since ended (budget_served)
+        return (f"unknown: the kept reading's window has reset since it was read; next: run `glaeda-gh budget` again, "
+                f"past the {FLEET_BUDGET_TTL:g}s an answer is kept for every session")
+    lead = (f"unknown: no host answered ({len(gaps)} asked)" if gaps and not answered
+            else f"unknown: {len(answered)} of {len(gaps)} hosts answered, none with a live reading" if gaps
+            else "unknown: no host reading was collected")
+    if free:
+        step = ("ask a host that holds the login (`glaeda-gh budget` there)"
+                if "upstream" in free else
+                f"fix that read -- it is the only route left: `glaeda-gh gh api /rate_limit --jq .resources.{bucket}` "
+                f"here, which spends nothing")
+    else:
+        step = f"`glaeda-gh gh api /rate_limit --jq .resources.{bucket}` here, which spends nothing"
+    where = "; ".join(f"{host}: {why}" for host, why in gaps.items())
+    route = f"the free GET /rate_limit here: {free}" if free else "the free GET /rate_limit here was not tried"
+    return f"{lead}" + (f" ({where})" if where else "") + f"; {route}; next: {step}"
+
+
+def account_line(bucket: str, reading: dict, marks: dict) -> str:
+    """One bucket's number with the route that answered it and how old it is, as `budget` has always shown REST."""
+    route = reading.get("route")
+    by = (f"read here by a free GET /rate_limit {age(reading.get('seenAt'))}" if route == "direct"
+          else f"read by {reading.get('host')} {age(reading.get('seenAt'))}")
+    mark = marks.get(bucket)
+    spent = f"; gh-quota's mark here says spent until {hhmm(mark.get('until'))}" if isinstance(mark, dict) else ""
+    return (f"{POOL_NAMES[bucket]} {reading.get('remaining')}/{reading.get('limit')} left, resets "
+            f"{hhmm(reading.get('reset'))} ({by}){spent}")
 
 
 def fleet_lane_vms() -> list[str]:
@@ -18601,7 +19175,7 @@ def sweep_tally(doc: dict, lane_vms: list[str]) -> dict:
 
 
 def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | None = None,
-                 view: Callable[[], dict] | None = None) -> dict:
+                 view: Callable[[], dict] | None = None, free: Callable[[float], dict] | None = None) -> dict:
     """Who spent the login's quota this hour, per host and session, with the account's reading and the hard reserve:
     the FLEET_BUDGET_FILE answer when it is under FLEET_BUDGET_TTL old, else spend_view, else one read per host (all
     at once). One reader at a time under a lock, so sessions asking together share one read."""
@@ -18623,7 +19197,7 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
         if seen.get("ok"):
             doc.update(source="spend_view", view=seen["data"])
         else:
-            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
+            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch, free))
         # when the read ended, by the wall clock read then (router review of glaeda#2252, F2: a start time plus a
         # monotonic length put it past the real end after a backward clock step)
         doc["keptFrom"] = FLEET_BUDGET_CLOCK()
@@ -18643,7 +19217,10 @@ def budget_served(doc: dict, clock: float) -> dict:
     if not reset and not ended:
         return doc
     out = {**doc, "account": {b: r for b, r in account.items() if b not in reset},
-           "exhausted": {b: m for b, m in marks.items() if b not in ended}}
+           "exhausted": {b: m for b, m in marks.items() if b not in ended},
+           # named, so `budget` says the kept answer's window has ended rather than reporting the sweep's host
+           # answers, which were about a window that is over (account_unknown)
+           "accountDropped": sorted(reset)}
     total = doc.get("total")
     if reset and isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
         out["total"] = {**total, "unattributed": {b: None if b in reset else g
@@ -18718,12 +19295,11 @@ def sweep_lines(doc: dict) -> list[str]:
     for bucket in ("rest", "graphql"):
         r = account.get(bucket)
         if r:
-            parts.append(f"{POOL_NAMES[bucket]} {r.get('remaining')}/{r.get('limit')} left, resets "
-                         f"{hhmm(r.get('reset'))} (read by {r.get('host')} {age(r.get('seenAt'))})")
+            parts.append(account_line(bucket, r, marks))
         elif marks.get(bucket):
             parts.append(f"{POOL_NAMES[bucket]} spent until {hhmm(marks[bucket].get('until'))} (gh-quota's mark here)")
         else:
-            parts.append(f"{POOL_NAMES[bucket]} unknown (no reachable host's daemon has a fresh reading)")
+            parts.append(f"{POOL_NAMES[bucket]} {account_unknown(bucket, doc)}")
     out = ["account (the shared login, every host): " + "; ".join(parts),
            f"{doc.get('spendView') or 'lane-gh spend_view unavailable'}; read each host instead",
            "who spent it, last hour, per host and caller (REST counted; 304s and cache, mirror or glaeda answers are "
@@ -18814,6 +19390,32 @@ def fleet_lines(doc: dict) -> list[str]:
     return out
 
 
+def account_bucket(bucket: str, now: float | None = None) -> dict:
+    """The shared login's reading for one bucket ("rest" or "graphql") as `budget` reports it, for any caller that
+    needs to name the bucket a read spends and when it resets. The wait side's stale trigger is the caller this is
+    for: it prints "the daemon has not refreshed <ref> for 1800s" and then names the identical failed invocation as
+    the next step, because it has no bucket reading to name. Answers from fleet_budget's kept sweep (one sweep per
+    FLEET_BUDGET_TTL shared by every session on the host, whose last route is a free GET /rate_limit), so a poll may
+    call it and it spends no quota in any case.
+
+    {"bucket", "remaining", "limit", "reset", "seenAt", "ageS", "host", "route", "spent", "hardReserve", "says"} when
+    the bucket could be read, else {"bucket", "unknown"} carrying the same sentence `budget` prints -- who was asked,
+    what each answered and the one next step. "mark" is gh-quota's own hold on this host when it has one."""
+    clock = time.time() if now is None else now
+    doc = fleet_budget(clock)
+    reserve = (doc.get("hardReserve") or {}).get(bucket)
+    out = {"bucket": bucket, "mark": (doc.get("exhausted") or {}).get(bucket), "hardReserve": reserve}
+    r = (doc.get("account") or {}).get(bucket)
+    if not isinstance(r, dict):
+        return {**out, "unknown": account_unknown(bucket, doc)}
+    seen = float(r.get("seenAt") or clock)
+    left = r.get("remaining")
+    return {**out, "remaining": left, "limit": r.get("limit"), "reset": r.get("reset"), "seenAt": seen,
+            "ageS": max(0.0, round(clock - seen, 1)), "host": r.get("host"), "route": r.get("route"),
+            "spent": isinstance(left, int) and left <= 0,
+            "says": account_line(bucket, r, doc.get("exhausted") or {})}
+
+
 def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     running = daemon_running(grace=DOWN_GRACE)
     budget = read_json(BASE / "budget.json") or {}
@@ -18826,6 +19428,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
     if as_json:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
                "budget": budget, "watching": watching, "last": status,
+               "controllerFallback": read_json(BASE / CONTROLLER_FALLBACK_FILE) or {},
                "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict),
                # buckets whose reading's reset has passed: their "remaining" is unknown now, not what it says
                "resetPassed": [b for b in ("rest", "graphql") if isinstance(budget.get(b), dict)
@@ -18901,6 +19504,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
+        fell_back = controller_fallback_line(read_json(BASE / CONTROLLER_FALLBACK_FILE))
+        if fell_back:
+            print(fell_back)
         hour = status.get("lastHour")
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "
@@ -23302,9 +23908,12 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("post pr needs --head, --base and --title")
         item.update(repo=args.target, head=args.head, base=args.base, title=args.title, reviewers=args.reviewer or [])
     else:
-        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(args.target)
+        # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
+        # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
+        target = drop_kind_prefix(args.target, args.kind, also=("pr", "comment"))
+        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(target)
         if not m:
-            raise WatchError(f"post {args.kind} takes OWNER/REPO#N or a GitHub URL")
+            raise WatchError(f"post {args.kind} takes OWNER/REPO#N, pr:OWNER/REPO#N or a GitHub URL")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
@@ -24049,11 +24658,29 @@ class Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         nxt = usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        say_waiting(f"{self.prog}: error: {message}")
+        spellings = kind_spellings(message)
+        say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
-            print_json_error("usage", message, nxt)
+            print_json_error("usage", message + (f" ({spellings})" if spellings else ""), nxt)
         raise SystemExit(64)
+
+
+KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
+
+
+def kind_spellings(message: str) -> str:
+    """What a refused *kind* is told about the spellings of a target, so the reader is not left to work out
+    that a separator was the problem. argparse's own line ("invalid choice: 'pr:o/r/7241'") lists the kinds
+    and nothing else, which reads as "pr is not a kind" when the kind was there all along."""
+    bad = KIND_CHOICE.search(message)
+    if not bad:
+        return ""
+    split = split_kind_prefix(bad.group(1))
+    if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
+        return f"a {split[0]} target is {KIND_FORMS.get(split[0], 'named by its own form')}"
+    return ("the kind comes first and the whole target is one word: `pr OWNER/REPO#N`, `run OWNER/REPO/RUN_ID`, "
+            "`pr:OWNER/REPO#N` as this tool prints it, or `OWNER/REPO#N` with no kind at all")
 
 
 def print_json_error(code: str, reason: str, nxt: str) -> None:
@@ -24206,8 +24833,15 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
     ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if wait_joined else ""
-    if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
+    if first.startswith("-") or first in WAIT_KINDS:
         return raw, ran_as
+    # `wait pr:o/r#5` -- this tool's own notation for a target, copied out of a line it printed -- is
+    # `wait pr o/r#5`: the prefix carries the kind, so the kind slot is where it goes.
+    prefixed = split_kind_prefix(first)
+    if prefixed and prefixed[0] in (WAIT_KINDS if cmd == "wait" else STATUS_KINDS):
+        kind, rest = prefixed
+        fixed = [cmd, kind, rest] + raw[2:]
+        return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
         return raw, ran_as
@@ -24245,10 +24879,11 @@ def parser() -> argparse.ArgumentParser:
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
     for name in ("status", "wait"):
         s = sub.add_parser(name)
-        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
+        s.add_argument("kind", choices=WAIT_KINDS if name == "wait" else STATUS_KINDS)
         if name == "status":
             s.add_argument("target", nargs="+",
-                           help="OWNER/REPO#N, OWNER/REPO/N or a GitHub URL; several are read in one gather, "
+                           help="OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, or a GitHub URL; "
+                                "several are read in one gather, "
                                 "and a bare #N or N is that number in the repository of the target before it, "
                                 "or of the directory you are in")
             s.add_argument("--field", metavar="F,G",
@@ -24256,7 +24891,9 @@ def parser() -> argparse.ArgumentParser:
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
                                 "lists print comma-joined")
         else:
-            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
+            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, a GitHub URL, or the KIND:TARGET "
+                                                 "form this tool prints (pr:OWNER/REPO#N, run:OWNER/REPO/RUN_ID), "
+                                                 "with or without the kind before it")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         s.add_argument("--verbose", action="store_true",
@@ -24408,10 +25045,18 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
                          "host/$ACPMUX_SESSION_NAME)")
-    ld.add_argument("--match-head-commit", dest="match_head", metavar="SHA",
-                    help="land only while the PR's head is SHA (a push after it refuses; gh pr merge's own flag)")
-    ld.add_argument("--wait", type=seconds, default=0, metavar="S",
-                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
+    ld.add_argument("--sha", "--match-head-commit", dest="sha", metavar="SHA",
+                    help="land only this head (7 to 40 hex): refused now if the PR's head is another, and the land "
+                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) is "
+                         "the same")
+    ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
+                    help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's "
+                         "override); one line, at most 200 characters; needs --override-receipt")
+    ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
+                    help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+    ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going); "
+                         "--timeout is the same")
     ld.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
@@ -24594,7 +25239,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.match_head)
+            override = land_override(args.override_reason, args.override_receipt)
+            return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:

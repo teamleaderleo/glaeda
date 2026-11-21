@@ -40,16 +40,44 @@ class VerifyPlanTests(unittest.TestCase):
         self.assertEqual(plan["authority"], "developer_feedback_only")
         self.assertEqual(
             [phase["name"] for phase in plan["phases"]],
-            ["compile-all-targets", "format", "repo-query-integration"],
+            [
+                "fleet-rule-lints",
+                "gh-auth-token-lint",
+                "compile-all-targets",
+                "format",
+                "repo-query-integration",
+            ],
         )
         self.assertEqual(
             plan["phases"][0]["argv"],
-            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+            ["python3", "-I", "scripts/test-fleet-rule-lints.py"],
+        )
+        self.assertEqual(
+            plan["phases"][1]["argv"],
+            ["python3", "-I", "scripts/gh_auth_token_lint.py"],
         )
         self.assertEqual(
             plan["phases"][2]["argv"],
+            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+        )
+        self.assertEqual(
+            plan["phases"][4]["argv"],
             ["cargo", "test", "--locked", "--test", "repo_query_cli"],
         )
+
+    def test_the_script_lints_run_before_any_cargo_phase_of_the_focused_plan(self) -> None:
+        """`run` breaks at the first failing phase, so the sub-second lints must not sit behind a
+        cargo check. Both lints also exist in CI's `scripts` job; this profile is where a change
+        under `scripts/` learns their verdict without a CI cycle."""
+        names = [phase["name"] for phase in read_plan("focused")["phases"]]
+        argvs = {phase["name"]: phase["argv"] for phase in read_plan("focused")["phases"]}
+        lints = ["fleet-rule-lints", "gh-auth-token-lint"]
+        first_cargo = min(i for i, n in enumerate(names) if argvs[n][0] == "cargo")
+        for lint in lints:
+            self.assertLess(names.index(lint), first_cargo, names)
+        for lint in lints:
+            # -I so a planted module beside the script cannot be imported by it.
+            self.assertEqual(argvs[lint][:2], ["python3", "-I"], argvs[lint])
 
     def test_required_profile_is_the_exact_eight_step_agents_sequence(self) -> None:
         plan = read_plan("required")

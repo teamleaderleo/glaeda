@@ -329,6 +329,14 @@ What `--apply` does:
      When its schema and run identity match, the completed line embeds a bounded `compile`
      object with cacheable tasks, hits, misses, hit rate, seed distance, compile, fetch and
      link seconds. Malformed or stale sidecars are ignored and removed by the job.
+   - Per-job scratch (opt-in, off by default): with `GLAEDA_JOB_SCRATCH=1` in the runner's
+     environment, an admitted job gets a sparse APFS image (`hdiutil`, no root, cap
+     `GLAEDA_JOB_SCRATCH_SIZE`, default `220g`) mounted at
+     `/Users/Shared/cmux-build-fleet/job-scratch/<runner>/job-<run id>-<attempt>`, and later
+     steps get `TMPDIR=<mount>/tmp` and `CMUX_JOB_SCRATCH=<mount>` through `$GITHUB_ENV`.
+     job-completed (after the job's leftover processes end) detaches it and deletes the image;
+     job-started first drops any stale entry in this runner's own directory and, if one cannot
+     be dropped, runs the job without scratch. Every failure is a hook line, never a failed job.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
      (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
      under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, ends this runner's
@@ -482,6 +490,25 @@ What `--apply` does:
        `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
        default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
        and `off` or 0 turns it off.
+     - **Which labels a gate reasons with** (`cap_labels`; hq#16433, hq#16544). Every feed read
+       above filters the queue with `set(job["labels"]) <= cap_labels`, so a gate that understates
+       its runner's labels sees none of the work it could take: on 2026-11-21 two austin minis'
+       `-glaeda-1` receipts read side-light while GitHub dispatched side-std jobs to both, and
+       neither reserved, listened urgently or answered a starved job of that label. `receipt.json`
+       records the labels an install last *asked* GitHub for (it stamps "GitHub labels could not be
+       read; re-registering with the supplied token" when it could not confirm them), so the gate
+       unions in what GitHub was *seen* to dispatch here: GitHub hands a job only to a runner whose
+       labels cover every `runs-on` label, so a dispatch in the feed is proof of a label, never a
+       claim to one. The feed's window is minutes, so each sighting is also written down per runner
+       in `observed-labels-<runner-dir>.json` in the state dir (label to last sighting, bounded at
+       64 entries and 16 KiB) and kept until GitHub stops dispatching it for 7 days
+       (`GLAEDA_RUNNER_OBSERVED_LABEL_TTL_S` in the runner LaunchAgent's environment, seconds); a
+       real relabel away from a label stops its dispatches, so the TTL is what retires it. This
+       only ever widens what a gate *considers*: admission (`take_capacity`) reads no labels, and
+       GitHub alone decides what reaches a runner. The one answer that reads a label to keep
+       *less* room - a simulator runner listening at its own fit instead of the side label's
+       costliest job (`IOS_SIM_OWN_FIT` above) - reads the live feed window only, never the
+       remembered set. The gate's state file publishes the disagreement as `label_drift`.
      - **Memory cap** (`MEMORY_CAP`, cmuxterm-hq#12838). The 16 GiB minis (cmux17, 18, 21, 22)
        showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z
        cmux17's JetsamEvent killed a dozen daemons for low swap while eight `swift-frontend`
@@ -971,6 +998,27 @@ it refuses first if that name now belongs to a different runner id. A re-run tha
 passes neither `--labels` nor `--manifest` keeps the labels and name it registered
 and never relabels. If `--replace` itself was interrupted after GitHub assigned the
 new id, the id check blocks; pass `--replace` to take the name back.
+
+**What `registration.labels` means** (hq#16433). It used to hold what some earlier
+apply *asked* GitHub for, which only a successful relabel rewrote: once GitHub held a
+newer set, every later pass read GitHub, found nothing to do (an `unchanged` register
+writes a registration only when there is none) and left the receipt understating the
+runner for good. The gate reads exactly these labels (`cap_labels`) and drops every
+feed job whose labels they do not cover, so an understating receipt hides takeable
+jobs. Now, whenever a plan read GitHub's own labels for this runner, `--apply` records
+that reading - including when the relabel it wanted is blocked (the runner is mid-job)
+or fails - and two fields say what the set is:
+
+- `labelsSource`: `github` (read from GitHub for this runner), `registered` (what a
+  register or relabel of ours just got), or `requested` (an adopted registration no
+  reading covered: the manifest or hostname default, which can overstate it).
+- `labelsObservedAt`: when that reading was taken, stamped on every confirming pass.
+
+A reading is recorded only when the registration behind it is the one this receipt
+made: `lookup_runner` finds a runner by name, so a name that now carries a different
+id leaves the receipt alone and the plan says `githubLabelsIgnored`. Overstating is the
+one direction a receipt must never drift - claiming a label GitHub does not hold has
+the gate keep room for work this runner can never be handed.
 
 The plan names every label drift on the register step: `label drift (receipt)` or
 `label drift (GitHub)`, "registered labels differ from what this version would

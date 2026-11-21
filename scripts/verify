@@ -275,8 +275,33 @@ def fast_phases() -> tuple[Phase, ...]:
 
 
 def focused_phases() -> tuple[Phase, ...]:
-    """Credentialless workstation feedback with no host-administration assumptions."""
+    """Credentialless workstation feedback with no host-administration assumptions.
+
+    The two script lints lead because they are the cheapest phases and `run` breaks at the first
+    failing one: together they take under 4 s, they read only the tree and `git ls-files`, and they
+    reach no network and no credential. Before 2026-11-21 this profile was cargo only while both
+    lints existed solely in CI's `scripts` job, so a change under `scripts/` -- "most current work
+    is the fleet track in `scripts/`" (AGENTS.md) -- could not learn their verdict without a full
+    CI cycle. Measured twice on 2026-11-21, in two separate lanes, each for one word in a new
+    comment: 13 minutes from job start to verdict, against 0.54 s here.
+
+    `scripts/test-fleet-rule-lints.py` compares the allowlist against a base only when
+    FLEET_RULE_BASE is set (CI sets HEAD^1). Unset, as here, it checks the tree alone, which is the
+    half that catches a new violation; the ratchet against the base stays CI's.
+    """
     return (
+        Phase(
+            "fleet-rule-lints",
+            "capability",
+            "python3",
+            ("-I", "scripts/test-fleet-rule-lints.py"),
+        ),
+        Phase(
+            "gh-auth-token-lint",
+            "capability",
+            "python3",
+            ("-I", "scripts/gh_auth_token_lint.py"),
+        ),
         Phase(
             "compile-all-targets",
             "capability",

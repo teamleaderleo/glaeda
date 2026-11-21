@@ -215,7 +215,7 @@ each checked with `git bundle verify`, never written over another, and listed wi
 only listed bundles at that hash are pruned, MIRROR_ARCHIVE_DAYS later. A bundle that fails keeps the tree:
 the receipt says blocked:bundle-failed, the run line lists it, and stderr alerts. That failure is remembered
 (~/.cache/glaeda-disk/bundle-failures.json, by path and item_mtime) for BUNDLE_FAILURE_RETRY_S: while the tree
-is unchanged, later passes neither bundle it again nor walk it with du (its remembered size stands). A linked
+is unchanged, glaeda-disk is the one that recorded it and, for a "no room" failure, free space has not grown, later passes neither bundle it again nor walk it with du (its remembered size stands). A linked
 worktree whose repository is outside the item and whose commits only its own HEAD or reflogs hold has those
 commits bundled through refs named for them in that repository (bundle_worktree_reflog). A repository git
 cannot read whole (an alternate object store that is gone, objects fsck finds missing) goes to a compressed tar
@@ -1266,6 +1266,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "2c0e7d650ed84016b3e4bb4a913382c44ab0ae073a0e7a68dd957f976b8bfa91",
     "f24d15d44bcc942f969a4dd8c2d6a4c6641ba82941383a1e1ab9412bc959ebef",
     "dafe3ca93911e8dd81a1aa23091d8ac5cdb7f933431c15b9233e30a6089c35a0",
+    "659c8b25059548c744fd8ec729142e576abce68607b7657956c593ba06b544bb",
+    "11be9214d14805b3108b60f92d6c3b38811c6366fc937a13b1723625a29e40ce",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -9666,14 +9668,50 @@ def load_bundle_failures() -> dict[str, dict]:
     return {k: v for k, v in doc.items() if isinstance(v, dict)} if isinstance(doc, dict) else {}
 
 
+NO_ROOM_RETRY_GAIN = GIB  # a "no room" failure is tried again once free space has grown this much since
+
+
+_OWN_SHA256: str | None = None
+
+
+def glaeda_disk_sha256() -> str:
+    """This glaeda-disk's own sha256 ("" when unreadable): a remembered failure is judged again by a new one."""
+    global _OWN_SHA256
+    if _OWN_SHA256 is None:
+        try:
+            _OWN_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        except OSError:
+            _OWN_SHA256 = ""
+    return _OWN_SHA256
+
+
+def bundle_failure_stands(path: str, got: dict, now: float) -> bool:
+    """Whether a remembered failure (mtime already matched) still keeps the tree: under its retry age, recorded by
+    this same glaeda-disk (a fix to the judgement must not wait out the age: cmux17's hot-verify mirror stayed
+    blocked by 153 gone worktree records #2277 no longer counts, 2026-11-21), and for a "no room" failure only while
+    free space has not grown by NO_ROOM_RETRY_GAIN since (cmux17's ~/m2l-viewer failed at 5.1G free and was still
+    kept at 16G free)."""
+    if not 0 <= now - float(got["at"]) < bundle_failure_retry_s(str(got.get("why", ""))):
+        return False
+    if got.get("glaeda") != glaeda_disk_sha256():
+        return False
+    if "no room:" in str(got.get("why", "")):
+        try:
+            free, _ = free_bytes(Path(path) if os.path.lexists(path) else Path(path).parent)
+        except OSError:
+            return True
+        if not isinstance(got.get("free"), int) or free >= got["free"] + NO_ROOM_RETRY_GAIN:
+            return False
+    return True
+
+
 def recent_bundle_failure(path: str, mtime: float, now: float | None = None) -> dict | None:
-    """The failure remembered for this tree when it is under BUNDLE_FAILURE_RETRY_S old and the tree's newest
-    mtime (item_mtime) is the one it failed at; else None, and the tree is bundled again."""
+    """The failure remembered for this tree while it stands (bundle_failure_stands) and the tree's newest mtime
+    (item_mtime) is the one it failed at; else None, and the tree is bundled again."""
     now = time.time() if now is None else now
     got = load_bundle_failures().get(path)
     try:
-        if got and float(got["mtime"]) == mtime and \
-                0 <= now - float(got["at"]) < bundle_failure_retry_s(str(got.get("why", ""))):
+        if got and float(got["mtime"]) == mtime and bundle_failure_stands(path, got, now):
             return got
     except (KeyError, TypeError, ValueError):
         pass
@@ -9686,7 +9724,12 @@ def remember_bundle_failure(path: str, mtime: float, why: str, size: int | None 
     now = time.time()
     doc = {k: v for k, v in load_bundle_failures().items()
            if isinstance(v.get("at"), (int, float)) and now - v["at"] < BUNDLE_FAILURE_RETRY_S}
-    doc[path] = {"mtime": mtime, "at": now, "why": why[:500], **({"size": size} if size is not None else {})}
+    free: int | None = None
+    if "no room:" in why:
+        with contextlib.suppress(OSError):
+            free = free_bytes(Path(path) if os.path.lexists(path) else Path(path).parent)[0]
+    doc[path] = {"mtime": mtime, "at": now, "why": why[:500], "glaeda": glaeda_disk_sha256(),
+                 **({"size": size} if size is not None else {}), **({"free": free} if free is not None else {})}
     target = bundle_failures_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -9709,8 +9752,7 @@ def remembered_failure_sizes(work: list[tuple[Family, Path]]) -> dict[str, int]:
         if not got or not isinstance(got.get("size"), int):
             continue
         try:
-            if now - float(got["at"]) >= bundle_failure_retry_s(str(got.get("why", ""))) \
-                    or item_mtime(fam, p) != float(got["mtime"]):
+            if not bundle_failure_stands(os.fspath(p), got, now) or item_mtime(fam, p) != float(got["mtime"]):
                 continue
         except (KeyError, TypeError, ValueError, OSError):
             continue
