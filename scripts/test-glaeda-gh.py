@@ -15966,7 +15966,7 @@ class AWriteGithubRefusedNamesWhatItRefusedTest(unittest.TestCase):
                                 {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
         self.assertNotIn("known here as", line)
 
-    def test_a_422_names_the_repository_it_was_writing_too(self) -> None:
+    def test_a_422_names_the_repository_it_was_writing_to(self) -> None:
         # The incident this started from. `post pr manaflow-ai/glaeda` recorded a 422 whose every word was about the
         # head branch, so the owner -- the word that was wrong -- was never in question. Naming the target only on
         # 404 would leave that read in place, and it is the read that cost the five calls.
