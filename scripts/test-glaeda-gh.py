@@ -4709,6 +4709,14 @@ class ClientTest(Base):
                      ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"]):
             self.assertEqual(gg.infer_kind(list(same)), (same, ""))
 
+    def test_a_split_repo_and_number_runs_as_the_joined_form(self):
+        self.assertEqual(gg.join_repo_number(["wait", "pr", "manaflow-ai/cmux", "48582", "--timeout", "60"]),
+                         (["wait", "pr", "manaflow-ai/cmux#48582", "--timeout", "60"],
+                          "glaeda-gh: running `wait pr manaflow-ai/cmux#48582`"))
+        self.assertEqual(gg.join_repo_number(["status", "pr", "o/r", "#7"])[0], ["status", "pr", "o/r#7"])
+        self.assertEqual(gg.join_repo_number(["wait", "pr", "o/r#7"]), (["wait", "pr", "o/r#7"], ""))
+        self.assertEqual(gg.join_repo_number(["wait", "run", "o/r", "7"])[1], "")
+
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")

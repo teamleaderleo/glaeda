@@ -23272,6 +23272,18 @@ def print_json_error(code: str, reason: str, nxt: str) -> None:
         sys.stdout.flush()
 
 
+def join_repo_number(argv: list[str]) -> tuple[list[str], str]:
+    """`wait|status pr|comment OWNER/REPO N` runs as `... OWNER/REPO#N`, the one form it can mean, and says so
+    (2026-11-21: `glaeda-gh wait pr manaflow-ai/cmux 48582 --timeout 3600` came back an argparse error whose own
+    next line was the joined form, and was rerun by hand)."""
+    words = list(argv)
+    if len(words) >= 4 and words[0] in ("wait", "status") and words[1] in ("pr", "comment") \
+            and re.fullmatch(rf"{NAME}/{NAME}", words[2]) and BARE_NUMBER.fullmatch(words[3]):
+        joined = f"{words[2]}#{words[3].lstrip('#')}"
+        return words[:2] + [joined] + words[4:], f"glaeda-gh: running `{words[0]} {words[1]} {joined}`"
+    return words, ""
+
+
 def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
     """The right form of a mistyped call: `wait pr OWNER/REPO N` is `wait pr OWNER/REPO#N`; else the --help."""
     words = list(argv)
@@ -23573,6 +23585,9 @@ def main(argv: list[str] | None = None) -> int:
     raw, inferred = infer_kind(raw)
     if inferred:
         print(inferred, file=sys.stderr)
+    raw, joined = join_repo_number(raw)
+    if joined:
+        print(joined, file=sys.stderr)
     Parser.argv = raw
     args = parser().parse_args(raw)
     if getattr(args, "verbose", False):
