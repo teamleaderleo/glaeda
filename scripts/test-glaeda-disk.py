@@ -10194,7 +10194,7 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("held by 2 that still exist", why)
         for w in live:
             self.assertIn(str(w), why)
-        self.assertIn("1 whose tree is gone", why)
+        self.assertNotIn("whose tree is gone", why)  # its HEAD a branch reaches: nothing to lose through it
         self.assertNotIn(str(gone), why)
         held = self.survey_mirror(unit)  # kept by the plan itself, before any bundle (git_used_from_outside)
         self.assertEqual(held.verdict, "in-use")
