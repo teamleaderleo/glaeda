@@ -271,6 +271,24 @@ def wait_for_path(path: Path, seconds: float = 10) -> bool:
     return path.exists()
 
 
+def wait_for_lines(path: Path, count: int = 1, seconds: float = 10) -> list[str]:
+    """The whole lines a fake glaeda-disk appended, once there are count of them. Both phases trigger the one queued
+    pass detached after admitting (disk_pressure_detached), so a fake the hook also ran while waiting is run a second
+    time after the hook returned: the file grows under the reader, and a read can catch a line half-written (a shard
+    on a mini at load 123, 2026-11-21: `could not convert string to float: ''`). Only a newline-terminated line
+    counts, bounded, re-read rather than slept on; the first line is always the pass the hook waited for."""
+    deadline = time.monotonic() + seconds
+    while True:
+        text = path.read_text() if path.exists() else ""
+        lines = text.split("\n")[:-1]  # the last piece is unterminated: a line still being written
+        if len(lines) >= count:
+            return lines
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{path.name}: {len(lines)} whole line(s), not {count}, after "
+                                 f"{seconds:g} s: {text!r}")
+        time.sleep(0.05)
+
+
 def event(tmp: Path, name: str, payload: dict) -> Path:
     path = tmp / f"{name}.json"
     path.write_text(json.dumps(payload))
@@ -363,6 +381,20 @@ class HookTest(unittest.TestCase):
                                        "--no-disk", repo=repo)
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
                 self.assertIn("admitted" if admitted else "refused", result.stdout)
+
+    def test_job_scratch_is_wired_into_job_started_and_off_by_default(self) -> None:
+        """JOB_SCRATCH: an admitted job tries its scratch only with GLAEDA_JOB_SCRATCH=1 (here on Linux, so it says
+        it needs macOS); without the flag the hook says nothing about it."""
+        path = event(self.dir, "push", {"repository": CMUX})
+        args = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk")
+        env = {"RUNNER_NAME": "actions-runner-glaeda-2", "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
+        off = self.run_hook(*args, repo="manaflow-ai/cmux", env=env)
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertNotIn("job scratch", off.stdout)
+        on = self.run_hook(*args, repo="manaflow-ai/cmux", env={**env, "GLAEDA_JOB_SCRATCH": "1"})
+        self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
+        if sys.platform != "darwin":
+            self.assertIn("job scratch: skipped: needs macOS hdiutil", on.stdout)
 
     def test_a_sparse_workspace_is_reset_before_the_checkout(self) -> None:
         """An earlier job's sparse checkout (sparse-checkout: scripts/ci) left the reused workspace sparse;
@@ -1493,8 +1525,9 @@ class HookTest(unittest.TestCase):
 
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
-        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n"
+        slow = make_executable(self.dir / "glaeda-disk-slow", "import time, sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n"
                                "time.sleep(20)\n")
         broken = make_executable(self.dir / "glaeda-disk-broken", "import sys\nsys.exit(3)\n")
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1505,8 +1538,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertLess(time.monotonic() - start, 10)
         self.assertIn("glaeda-disk started in the background", result.stdout)  # the queued pass, never waited on
-        self.assertTrue(wait_for_path(marker))
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
         for phase in ("job-started", "job-completed"):
             result = self.run_hook(phase, "push", push, "--allowed-repo", "manaflow-ai/cmux",
                                    "--disk", os.fspath(broken), repo="manaflow-ai/cmux")
@@ -1795,8 +1827,9 @@ class HookTest(unittest.TestCase):
     def test_disk_floor_evicts_before_warning(self) -> None:
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(' '.join(sys.argv[1:]) + '\\n')\nhandle.close()\n")
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
@@ -1804,7 +1837,7 @@ class HookTest(unittest.TestCase):
                                repo="manaflow-ai/cmux", env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0 --floor-gib 1e+09",
                          "told the floor, so it does not wait for the job that holds this runner")
         self.assertLess(result.stdout.index("disk floor"), result.stdout.index("warning:"), "evicted, then warned")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
@@ -1813,12 +1846,13 @@ class HookTest(unittest.TestCase):
         own = self.dir / "actions-runner" / hook.RUNNER_HOOK_SCRIPT
         own.parent.mkdir(parents=True)
         own.write_text("exec python3 /hook job-started --min-free-gib 999999999\n")
+        marker.unlink()  # this phase's own first line, not one the pass after the last phase appended
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
                                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
                                env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+        self.assertEqual(wait_for_lines(marker)[0], "--pressure --apply --top 0")
 
     def test_a_nightly_job_short_of_disk_takes_idle_runners_work_then_is_admitted(self) -> None:
         """NIGHTLY_DISK_RESERVE, the 2026-10-28 00:04Z refusal: the dedicated nightly builder's job found 20 GiB free
@@ -1986,8 +2020,10 @@ class HookTest(unittest.TestCase):
         evict.lock; a pass of its own would skip as busy and the job be refused while space is being freed."""
         self.fleet()
         marker = self.dir / "disk-ran"
-        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
-                               f"pathlib.Path({os.fspath(marker)!r}).write_text(str(time.time()))\n")
+        # one whole line appended per pass, never rewritten: the pass after admitting runs this same fake detached
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import sys, time\n"
+                               f"handle = open({os.fspath(marker)!r}, 'a')\n"
+                               "handle.write(f'{time.time()}\\n')\nhandle.close()\n")
         self.hold_evict_lock(3)
         released = time.time() + 2  # the holder sleeps 3 s after it printed; allow a second of slack
         push = event(self.dir, "push", {"repository": CMUX})
@@ -1998,7 +2034,8 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
                                         r"glaeda-disk exited 0, freed")
-        self.assertGreater(float(marker.read_text()), released, "its own pass ran only once the lock was free")
+        self.assertGreater(float(wait_for_lines(marker)[0]), released,
+                           "its own pass ran only once the lock was free")
         self.assertIn("GiB required: admitted under the admission floor", result.stdout)
 
     def test_floor_eviction_skips_its_own_pass_when_the_running_one_freed_enough(self) -> None:
@@ -21102,6 +21139,195 @@ class StepBackfillTest(unittest.TestCase):
             with self.subTest(need=bad):
                 marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "need": bad}))
                 self.assertEqual([w["need"] for w in hook.admission_waiters(self.capacity)], [None])
+
+class JobScratchTest(unittest.TestCase):
+    """JOB_SCRATCH: a per-job sparse APFS image (hdiutil mocked), opt-in, best effort, scoped to this runner."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name) / "job-scratch"
+        self.github_env = Path(tmp.name) / "github_env"
+        self.github_env.write_text("")
+        self.runner_temp = Path(tmp.name) / "runner_temp"
+        self.runner_temp.mkdir()
+        self.env = {"GLAEDA_JOB_SCRATCH": "1", "RUNNER_NAME": "actions-runner-glaeda-3",
+                    "GITHUB_RUN_ID": "1234567", "GITHUB_RUN_ATTEMPT": "2"}
+        self.calls: list[list[str]] = []
+        self.mounted: set[str] = set()
+        self.fail: dict[str, int] = {}
+        patches = (mock.patch.object(hook, "hdiutil", self.fake_hdiutil),
+                   mock.patch.object(hook, "job_scratch_mounted", lambda path: os.fspath(path) in self.mounted),
+                   mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(self.github_env),
+                                                "RUNNER_TEMP": os.fspath(self.runner_temp)}))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def fake_hdiutil(self, *argv: str) -> subprocess.CompletedProcess:
+        self.calls.append(list(argv))
+        verb = argv[0]
+        if self.fail.get(verb):
+            return subprocess.CompletedProcess([hook.HDIUTIL, *argv], self.fail[verb], "", f"{verb} failed")
+        if verb == "create":
+            Path(argv[-1]).write_bytes(b"sparse")
+        elif verb == "attach":
+            self.mounted.add(argv[argv.index("-mountpoint") + 1])
+        elif verb == "detach":
+            self.mounted.discard(argv[-1])
+        return subprocess.CompletedProcess([hook.HDIUTIL, *argv], 0, "", "")
+
+    def start(self, **env: str) -> list[str]:
+        return hook.job_scratch_start({**self.env, **env}, self.base, darwin=True)
+
+    def end(self, **env: str) -> list[str]:
+        return hook.job_scratch_end({**self.env, **env}, self.base, darwin=True)
+
+    def test_flag_off_is_a_no_op(self) -> None:
+        for value in (None, "0", "", "true", "yes"):
+            with self.subTest(value=value):
+                env = {k: v for k, v in self.env.items() if k != "GLAEDA_JOB_SCRATCH"}
+                if value is not None:
+                    env["GLAEDA_JOB_SCRATCH"] = value
+                self.assertEqual(hook.job_scratch_start(env, self.base, darwin=True), [])
+                self.assertEqual(hook.job_scratch_end(env, self.base, darwin=True), [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.base.exists())
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_flag_off_by_default_in_the_hooks_environment(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GLAEDA_JOB_SCRATCH", None)
+            self.assertFalse(hook.job_scratch_on())
+            self.assertEqual(hook.job_scratch_start(), [])
+            self.assertEqual(hook.job_scratch_end(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_create_attach_export_then_detach_and_delete(self) -> None:
+        runner_dir = self.base / "actions-runner-glaeda-3"
+        image, mount = runner_dir / "job-1234567-2.sparseimage", runner_dir / "job-1234567-2"
+        notes = self.start()
+        self.assertEqual(self.calls, [
+            ["create", "-quiet", "-type", "SPARSE", "-fs", "APFS", "-size", "220g",
+             "-volname", "cmux-job-actions-runner-glaeda-3-1234567-2", os.fspath(image)],
+            ["attach", "-nobrowse", "-owners", "on", "-plist", "-mountpoint", os.fspath(mount), os.fspath(image)],
+        ])
+        self.assertIn(os.fspath(mount), self.mounted)
+        self.assertTrue((mount / "tmp").is_dir())
+        self.assertEqual(self.github_env.read_text().splitlines(),
+                         [f"TMPDIR={mount / 'tmp'}", f"CMUX_JOB_SCRATCH={mount}"])
+        self.assertTrue(any("job scratch: " + os.fspath(mount) in note for note in notes), notes)
+        (mount / "tmp").rmdir()  # the volume's contents vanish with the detach; the fake leaves the dir
+        self.calls.clear()
+        notes = self.end()
+        self.assertEqual(self.calls, [["detach", "-force", os.fspath(mount)]])
+        self.assertFalse(image.exists())
+        self.assertFalse(mount.exists())
+        self.assertIn("dropped 1 volume(s)", notes[0])
+
+    def test_size_override_and_bad_size(self) -> None:
+        self.start(GLAEDA_JOB_SCRATCH_SIZE="80g")
+        self.assertEqual(self.calls[0][self.calls[0].index("-size") + 1], "80g")
+        self.calls.clear()
+        for bad in ("80", "0g", "-1g", "80g; rm", "1e3g"):
+            with self.subTest(size=bad):
+                notes = self.start(GLAEDA_JOB_SCRATCH_SIZE=bad, GITHUB_RUN_ID="99")
+                self.assertIn("is not a size", notes[-1])
+        self.assertEqual(self.calls, [])
+
+    def test_reap_drops_only_this_runners_stale_entries(self) -> None:
+        mine, other = self.base / "actions-runner-glaeda-3", self.base / "actions-runner-glaeda-30"
+        for runner in (mine, other):
+            runner.mkdir(parents=True)
+            (runner / "job-1-1.sparseimage").write_bytes(b"old")
+            (runner / "job-1-1").mkdir()
+            self.mounted.add(os.fspath(runner / "job-1-1"))
+        (mine / "job-2-1.sparseimage").write_bytes(b"crashed before attach")
+        (mine / "notes.txt").write_text("not ours")
+        notes = self.start()
+        detached = [call for call in self.calls if call[0] == "detach"]
+        self.assertEqual(detached, [["detach", "-force", os.fspath(mine / "job-1-1")]])
+        self.assertFalse((mine / "job-1-1.sparseimage").exists())
+        self.assertFalse((mine / "job-2-1.sparseimage").exists())
+        self.assertTrue((mine / "notes.txt").exists(), "a name that is not a scratch entry is never deleted")
+        self.assertTrue((other / "job-1-1.sparseimage").exists(), "another runner's scratch is never touched")
+        self.assertIn(os.fspath(other / "job-1-1"), self.mounted)
+        self.assertIn("not a job scratch entry", " ".join(notes))
+        self.assertIn("still there", notes[-1], "an entry left in the runner's dir blocks a new volume")
+        self.assertFalse(any(call[0] == "create" for call in self.calls))
+
+    def test_reap_never_follows_a_symlink_or_walks_a_tree(self) -> None:
+        mine = self.base / "actions-runner-glaeda-3"
+        mine.mkdir(parents=True)
+        target = self.base / "precious"
+        target.mkdir()
+        (target / "file").write_text("keep")
+        (mine / "job-5-1").symlink_to(target)
+        full = mine / "job-6-1"
+        full.mkdir()
+        (full / "leftover").write_text("unmounted contents")
+        dropped, left = hook.job_scratch_reap(mine)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(left), 2, left)
+        self.assertTrue((target / "file").exists())
+        self.assertTrue((full / "leftover").exists(), "a nonempty mount directory is never walked")
+
+    def test_create_failure_is_no_scratch_and_a_note(self) -> None:
+        self.fail["create"] = 1
+        notes = self.start()
+        self.assertIn("job scratch: none for this job: hdiutil create exit 1", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+        self.assertEqual(list((self.base / "actions-runner-glaeda-3").iterdir()), [])
+
+    def test_attach_failure_drops_the_image(self) -> None:
+        self.fail["attach"] = 1
+        notes = self.start()
+        self.assertIn("hdiutil attach exit 1", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+        self.assertEqual(list((self.base / "actions-runner-glaeda-3").iterdir()), [])
+
+    def test_hdiutil_raising_never_escapes(self) -> None:
+        def boom(*argv: str) -> subprocess.CompletedProcess:
+            raise subprocess.TimeoutExpired([hook.HDIUTIL, *argv], hook.HDIUTIL_TIMEOUT_S)
+        with mock.patch.object(hook, "hdiutil", boom):
+            notes = self.start()
+        self.assertIn("job scratch: none for this job", notes[-1])
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_detach_failure_keeps_the_image_and_says_so(self) -> None:
+        self.start()
+        (self.base / "actions-runner-glaeda-3" / "job-1234567-2" / "tmp").rmdir()
+        self.fail["detach"] = 16
+        notes = self.end()
+        self.assertIn("still mounted after hdiutil detach (exit 16", notes[0])
+        self.assertTrue((self.base / "actions-runner-glaeda-3" / "job-1234567-2.sparseimage").exists())
+
+    def test_names_that_are_not_plain_skip(self) -> None:
+        for env in ({"RUNNER_NAME": "../x"}, {"RUNNER_NAME": ".."}, {"RUNNER_NAME": ""}, {"GITHUB_RUN_ID": "1/2"},
+                    {"GITHUB_RUN_ID": ""}):
+            with self.subTest(env=env):
+                self.assertIn("skipped", self.start(**env)[0])
+        self.assertEqual(self.calls, [])
+
+    def test_not_darwin_skips(self) -> None:
+        self.assertEqual(hook.job_scratch_start(self.env, self.base, darwin=False),
+                         ["job scratch: skipped: needs macOS hdiutil"])
+        self.assertEqual(hook.job_scratch_end(self.env, self.base, darwin=False), [])
+        self.assertEqual(self.calls, [])
+
+    def test_hdiutil_runs_by_absolute_path_with_an_allowlisted_env(self) -> None:
+        mock.patch.stopall()  # the real hdiutil(), with subprocess.run faked
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(argv=argv, **kwargs)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(hook.subprocess, "run", fake_run):
+            hook.hdiutil("detach", "-force", "/x")
+        self.assertEqual(seen["argv"], ["/usr/bin/hdiutil", "detach", "-force", "/x"])
+        self.assertEqual(seen["env"], {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+        self.assertEqual(seen["timeout"], hook.HDIUTIL_TIMEOUT_S)
+
 
 if __name__ == "__main__":
     unittest.main()

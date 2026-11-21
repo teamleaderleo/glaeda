@@ -44,6 +44,13 @@
     glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
                                                         deciding whether to hand its calls over
     glaeda-gh audit [--log PATH] [--last N] [--json]    this host's gh traffic, and what a cache would answer
+    glaeda-gh search [issues|prs] QUERY [--repo OWNER/REPO]... [--state S] [--author LOGIN] [--limit N] [--json]
+                                                        find pull requests and issues over GraphQL search, kept
+                                                        for every session: `status pr`'s fields (number, title,
+                                                        url, state, head, headRefOid, merged, checks.state), and
+                                                        each row's OWNER/REPO#N to hand to status, wait or land.
+                                                        Instead of `gh search` / `gh api search/...`, which spend
+                                                        the shared REST quota (and its 30-a-minute search limit)
     glaeda-gh runners OWNER[/REPO] [--label L] [--json] busy and idle self-hosted runners, from one shared read
                                                         (instead of a jobs read per run: see GH_SWEEP_MAX)
     glaeda-gh on-event [--json]                         the commands the daemon runs once per finished run or job
@@ -3330,7 +3337,7 @@ def slim_check_runs(doc: dict) -> dict:
 
 
 def slim_statuses(doc: dict) -> list[dict]:
-    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at")}
+    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at", "description")}
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
 
 
@@ -3375,7 +3382,7 @@ def slim_head_runs_page(doc: dict) -> dict:
 
 
 def slim_head_runs(doc: dict) -> list[dict]:
-    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion")}
+    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion", "event")}
             for r in doc.get("workflow_runs") or [] if isinstance(r, dict)]
 
 
@@ -3459,14 +3466,17 @@ def rest_contexts(checks: dict, statuses: list[dict], runs: list[dict], required
                       "detailsUrl": c.get("details_url"), "databaseId": c.get("id"), "startedAt": c.get("started_at"),
                       "completedAt": c.get("completed_at"), "isRequired": c.get("name") in required,
                       "checkSuite": {"conclusion": upper(run.get("conclusion")), "app": {"slug": c.get("app")},
+                                     "databaseId": c.get("suite"),
                                      "workflowRun": {
-                          "databaseId": run.get("id"), "workflow": {
+                          "databaseId": run.get("id"), "event": run.get("event"), "workflow": {
                               "name": workflows.get(str(run.get("workflow_id"))) or run.get("name"),
                                                                     "databaseId": run.get("workflow_id")}}}
-                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "workflowRun": None}})
+                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "databaseId": c.get("suite"),
+                                   "workflowRun": None}})
     for c in statuses:
         nodes.append({"__typename": "StatusContext", "context": c.get("context"), "state": upper(c.get("state")),
                       "targetUrl": c.get("target_url"), "createdAt": c.get("created_at"),
+                      **({"description": c["description"]} if isinstance(c.get("description"), str) else {}),
                       "isRequired": c.get("context") in required})
     return nodes
 
@@ -3954,7 +3964,8 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
             state = (item.get("state") or "").lower()
             statuses[f"{prefix}status / {item['context']}"] = (
                 "in_progress" if state in ("pending", "expected") else "completed",
-                "failure" if state == "error" else state, state)
+                "failure" if state == "error" else state, state,
+                item.get("description") if isinstance(item.get("description"), str) else None)
             continue
         suite = item.get("checkSuite") or {}
         slug = (suite.get("app") or {}).get("slug")
@@ -3962,15 +3973,35 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
         runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
-        if order is not None:  # head_data's `runs`: each run's own id and times (head_data's `runs`)
+        if order is not None:  # head_data's `runs`: each run's own id and times, and its identity (run_identity)
             order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
-                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or ""])
+                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or "",
+                                              run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
 
 
+def run_identity(item: dict, suite: dict) -> dict:
+    """What tells one check run's run apart from another's (head_data's `runs`, a row's sixth field): its Actions run's
+    databaseId, event and workflow databaseId and name (the key's prefix, so a reader can split the job's own name off), its app's slug and its check suite's databaseId, each only when read,
+    and lastRealAttempt for a run of an older suite attempt
+    (last_real_contexts) that GitHub's rollup no longer lists."""
+    run = suite.get("workflowRun") or {}
+    workflow = run.get("workflow") or {}
+    app = suite.get("app")
+    out = {"run": run.get("databaseId"), "workflow": workflow.get("databaseId"), "workflowName": workflow.get("name"),
+           "event": run.get("event"),
+           "app": app.get("slug") if isinstance(app, dict) else None, "suite": suite.get("databaseId"),
+           "lastRealAttempt": True if item.get("lastRealAttempt") else None}
+    if app is None and "app" in suite:
+        out["appNull"] = True  # GitHub's documented null app, not an unread one
+    return {k: v for k, v in out.items() if v is not None}
+
+
 # A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
-# conclusion, startedAt, completedAt]. `found` keeps one verdict per name and no order, so a reader could not tell a
+# conclusion, startedAt, completedAt, identity] (run_identity: its Actions run, workflow, event, app and suite, so a
+# reader can collapse a rerun's attempts and drop a superseded cancel as a live rollup read does; leo-workspace
+# land-judge's head checks read it before going live). `found` keeps one verdict per name and no order, so a reader could not tell a
 # replay that ran after its shard's newest rerun from an older one: leo-workspace merge_hold's webview verdict could
 # only hold on the cache (Codex F1 on lw#4070), and while the shared login's GraphQL hour was spent its live read and
 # the head's own check reads all failed, so cmux#46128, #46236 and #46782 sat at glaeda land's 6 h retry deadline on
@@ -3984,6 +4015,11 @@ def head_data(sha: str, runs: dict, statuses: dict, ids: dict, order: dict | Non
     settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
     states = {key: value[2] for key, value in statuses.items() if len(value) > 2}
     data = {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
+    # each status's description where the read gave one (GraphQL's always; REST's combined status too): a reader
+    # judging from the cache (land-judge's fast-gates base, a ws-check standby post) reads what a live read would
+    said = {key: value[3] for key, value in statuses.items() if len(value) > 3 and value[3] is not None}
+    if said:
+        data["statusDescriptions"] = said
     if order is not None:
         data["runs"] = {key: sorted(rs, key=lambda r: int(r[0] or 0)) for key, rs in order.items()}
     return data
@@ -11378,6 +11414,12 @@ class LandQueue:
         if self.refuse():
             return
         if self.queue_quota_parked():
+            # Nothing is judged, read or watched until the named reset, but a PR the cache shows ended still leaves
+            # the queue, and the pool line still says where the queue is (land-pool "queueParked").
+            self.retire_ended()
+            self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
+            self.pass_latched = self.pass_staggered = self.pass_capped = 0
+            self.log_pool()
             return
         latch = self.latch_held()
         ended = land_latch_spread(self.now) if latch is None else None
@@ -11426,6 +11468,9 @@ class LandQueue:
                 if self.queue_quota_parked():
                     break  # a worker parked the host while this pass was submitting judgments
                 e = self.entries[key]
+                with self.lock:
+                    if self.retire_from_cache(e):
+                        continue  # ended: no hold, park or worker needed to say so
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
                     with self.lock:
@@ -11710,6 +11755,30 @@ class LandQueue:
         self.save(e)
         return False
 
+    def retire_from_cache(self, e: dict) -> bool:
+        """Under the lock. End E when the daemon's copy of its PR reads MERGED (a merge never reverts: any copy), or
+        CLOSED in a copy read since E was queued (an older one may predate a reopen). A cache file read, no GitHub
+        call, so every look at an entry takes it -- a parked queue, a held latch, a parked entry or a full pool too.
+        gcp lane, 2026-11-21: hq#16308 merged and stayed listed for hours behind a host-wide quota park."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "")
+        if state == "CLOSED":
+            at = c.get("dataAt")
+            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
+                return False
+        return self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
+                          "the cache shows it")
+
+    def retire_ended(self) -> None:
+        """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
+        for key in [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]:
+            try:
+                with self.lock:
+                    self.retire_from_cache(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
     def queue_quota_parked(self) -> bool:
         """Whether a quota refusal has paused this host's whole land queue until its reset."""
         with self.lock:
@@ -11749,7 +11818,12 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        self.park_queue_quota(said if said is not None else wake, text)
+        if said is not None:
+            # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
+            # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
+            # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
+            # until 08:44Z though the limit it hit ended about 07:52Z -- 40 lands "every worker busy" for an hour.
+            self.park_queue_quota(said, text)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
@@ -12084,6 +12158,8 @@ class LandQueue:
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
              "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
+             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_trim(self.queue_quota_reason, 160)}
+             if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
@@ -12255,6 +12331,8 @@ class LandQueue:
     def consider(self, e: dict) -> None:
         """Whether this entry is judged now: only when something could have changed land_judge's answer."""
         c = self.cache_of(e["key"])
+        if self.retire_from_cache(e):
+            return  # before refresh_due: an ended PR never waits for a free worker to leave the queue
         if self.refresh_due(e, c):
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
@@ -13752,8 +13830,19 @@ def land_latch_held(e: dict) -> bool:
 LAND_LATCH_READ = object()  # land_line's default: read the login's latch now (land_latch)
 
 
-def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
-    """E's status line. LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
+def land_queue_parked(now: float) -> dict | None:
+    """The host-wide quota park (LandQueue.park_queue_quota: land/quota.json) while it holds, else None."""
+    doc = read_json(land_dir() / LAND_QUOTA_FILE)
+    until = (doc or {}).get("until") if isinstance(doc, dict) else None
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or until <= now:
+        return None
+    return {"until": float(until), "reason": str(doc.get("reason") or "")}
+
+
+def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | None = None) -> str:
+    """E's status line. QUEUE is the host-wide quota park (land_queue_parked) when one holds: a due entry names it,
+    never a stale "every worker busy" (gcp lane, 2026-11-21: 40 lines said every worker busy while the park, which
+    status never named, held the queue for an hour). LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
     latch held (latchHeld) says so only while a mark holds, and names the mark's until as read now, never the one it
     stored. gcp-agent-lane-1 2026-11-19 11:18Z: with no mark on disk, 12 entries printed "held by the login latch until
     11:43Z", each its own stored until."""
@@ -13784,6 +13873,8 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
             and float(e["windowCapped"].get("next") or 0) > now:
         bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
                     f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
+    elif queue and e["state"] in ("queued", "waiting") and not (w.get("kind") == "quota" and e["state"] == "waiting"):
+        bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
@@ -13817,7 +13908,7 @@ def land_status_doc(target: str | None) -> dict:
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
-            else None, "stale": stale if land_stale_fresh(stale, time.time()) else None,
+            else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries)}
 
 
@@ -13913,8 +14004,15 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if latch:
         print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
               f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
+    queue = doc.get("queueParked") if isinstance(doc.get("queueParked"), dict) else None
+    if queue and float(queue.get("until") or 0) <= now:
+        queue = None
+    if queue:
+        print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
+              f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
+              f"{land_trim(queue.get('reason'), 200)}")
     for e in entries:
-        print(land_line(e, now, latch))
+        print(land_line(e, now, latch, queue))
         if target:
             for h in e.get("history") or []:
                 extra = " ".join(f"{k}={v}" for k, v in h.items() if k not in ("at", "event"))
@@ -16218,11 +16316,148 @@ def wait_command(req: dict) -> str:
     return " ".join(parts + ["--timeout", f"{float(req['timeout']):g}"])
 
 
+# A wait that cannot read its target must say so, name the bucket and the reset, and name a next step that can end
+# the hold (docs/handbook/refusal-next-step-cannot-end-the-hold.md). Three states read as the same "no data yet"
+# today and are not:
+#   (a) the daemon has not got around to reading it yet: transient, and retrying is right;
+#   (b) the daemon cannot read it, because the bucket its reads go over has stopped: it reads nothing for that kind
+#       until a known reset, so the same wait again reads nothing either;
+#   (c) a bucket whose own reading shows headroom is refused anyway: a fault of its own, with its own fix, and
+#       never to be dressed up here as the shared quota running out.
+# (b) is already on this host's disk from the first second, free: daemon.json's `paths` says which bucket each kind
+# is read over now, `modes` what the quota lets that bucket do, `restShare.capped` whether this daemon's own REST
+# share is spent, and budget.json carries that bucket's last reading with its reset. The wait path read none of it.
+# Measured 2026-11-21, one GraphQL exhaustion window: three lanes ran `glaeda-gh wait pr ... --sha ... --timeout
+# 1800` (leo-workspace#7208, leo-workspace#7188, cmuxterm-hq#16555). All three printed `...: no data yet` at every
+# one of their fourteen progress lines for the full 1800 s, then `result: timeout`, `last seen: no data yet` and a
+# `next:` that was the identical command -- which an agent takes. 90 minutes of blocked lane time in one window for
+# a fact three file reads away, and `glaeda-gh budget` on the same host printed the bucket and the reset throughout.
+BUCKET_NAME = {"rest": "REST", "graphql": "GraphQL"}
+WAIT_UNTIL_SLACK = 30  # the `wait until RESET` a blocked wait names gets this much past the reset to be sure of it
+
+
+def read_blocked(kind: str, now: float | None = None) -> dict | None:
+    """Why nothing is being read for KIND's targets now, from the files the daemon already writes every heartbeat:
+    no GitHub call, no quota spent. None when a route is open (state (a) above), or when there is no daemon record
+    to read, or on a host whose reads go through another host's daemon (it has no bucket of its own to name).
+
+    Else {"bucket", "label", "reset", "remaining", "limit", "exhausted", "text"}: `reset` is when reads can resume
+    (None when the reading names none) and `exhausted` is whether the bucket's own reading backs the stop. False
+    there is state (c): the stop is real and worth saying, its cause is not the shared quota running out, and the
+    text must not claim it is."""
+    now = time.time() if now is None else now
+    status = read_json(BASE / "daemon.json")
+    if not isinstance(status, dict) or not isinstance(status.get("modes"), dict):
+        return None
+    if isinstance(status.get("upstream"), dict):
+        return None
+    modes = status["modes"]
+    paths = status.get("paths") if isinstance(status.get("paths"), dict) else {}
+    share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
+    bucket = paths.get(kind) if paths.get(kind) in BUCKET_NAME else BUCKETS.get(kind)
+    if bucket is None:
+        return None
+    # The bucket KIND is routed over has stopped. Daemon.route() already moves a kind off a stopped bucket when the
+    # other one can take its reads, so a kind still routed over a stopped bucket has no second route this tick.
+    if modes.get(bucket) != "stop" and not (bucket == "rest" and share.get("capped") is True
+                                            and modes.get("graphql") == "stop"):
+        return None
+    seen = read_json(BASE / "budget.json") or {}
+    seen = seen.get(bucket) if isinstance(seen.get(bucket), dict) else {}
+    whole = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None  # noqa: E731
+    remaining, limit = whole(seen.get("remaining")), whole(seen.get("limit"))
+    reset = seen.get("reset")
+    reset = float(reset) if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > now else None
+    label = BUCKET_NAME[bucket]
+    reserve = daemon_policy()["floors"][bucket][1]
+    exhausted = remaining is not None and remaining < reserve
+    left = (f"{remaining} of {limit} left" if remaining is not None and limit is not None else
+            f"{remaining} left" if remaining is not None else "its last reading is unknown")
+    when = f", resets {utc_clock(reset)}" if reset is not None else " (its reading names no reset)"
+    if exhausted:
+        text = (f"the shared {label} quota for this login is spent ({left}, under the {reserve} this daemon keeps "
+                f"back for lands{when}): nothing is read for a {kind} until then, so the same wait again reads "
+                "nothing either")
+    else:
+        text = (f"this daemon has stopped its {label} reads, so nothing is read for a {kind} now; its own last "
+                f"{label} reading still shows headroom ({left}{when}), so this is not the shared quota running out")
+    return {"bucket": bucket, "label": label, "reset": reset, "remaining": remaining, "limit": limit,
+            "exhausted": exhausted, "text": text}
+
+
+_blocked_memo: dict[tuple, dict | None] = {}
+
+
+def _blocked_stamp() -> tuple:
+    """What the answer depends on: the two records' mtimes. A memo on this and not on a clock cannot answer from a
+    file that has since changed (the daemon rewrites both every tick)."""
+    out = []
+    for name in ("daemon.json", "budget.json"):
+        try:
+            out.append((BASE / name).stat().st_mtime_ns)
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def blocked_now(kind: str, now: float | None = None) -> dict | None:
+    """read_blocked, but never the reason a wait fails: a bad record or an unreadable config costs the note, not
+    the wait. Memoized on the records' mtimes, so the daemon serving many waits in one tick reads them once."""
+    at = time.time() if now is None else now
+    try:
+        key = (kind, str(BASE), int(at // 1), _blocked_stamp())
+    except Exception:  # noqa: BLE001
+        key = None
+    if key is not None and key in _blocked_memo:
+        return _blocked_memo[key]
+    try:
+        answer = read_blocked(kind, at)
+    except Exception:  # noqa: BLE001  a diagnostic never stops a wait
+        answer = None
+    if key is not None:
+        if len(_blocked_memo) > 64:
+            _blocked_memo.clear()
+        _blocked_memo[key] = answer
+    return answer
+
+
+def blocked_next(req: dict, blocked: dict) -> str:
+    """The `next:` of a wait a stopped bucket blocked: a wait that ends, then the same wait -- never the
+    invocation that just returned nothing, which is worse than no next step because an agent takes it.
+    `wait until HH:MM:SSZ` is the reset this host read itself; `wait until quota` is the fallback when the reading
+    names no reset (it waits out this host's gh-quota marks and is read again on every pass)."""
+    again = wait_command(req)
+    reset = blocked.get("reset")
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool):
+        return (f"glaeda-gh wait until {utc_clock(reset)} "
+                f"--timeout {max(1, int(reset - time.time()) + WAIT_UNTIL_SLACK)} && {again}")
+    return f"glaeda-gh wait until quota --timeout {float(req['timeout']):g} && {again}"
+
+
+def blocked_start_line(key: str, kind: str) -> str | None:
+    """What a wait says before it blocks when nothing can be read for it now: said immediately, because the whole
+    loss this fixes was learning it at the deadline instead."""
+    blocked = blocked_now(kind)
+    if blocked is None:
+        return None
+    resumes = (f" This wait reads nothing before {utc_clock(blocked['reset'])}: "
+               f"`glaeda-gh wait until {utc_clock(blocked['reset'])}` is the wait that ends."
+               if blocked.get("reset") is not None else "")
+    return f"glaeda-gh: {key_name(key)} cannot be read right now: {blocked['text']}.{resumes}"
+
+
 def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
-    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line)."""
+    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line). When nothing
+    is being read for its kind (read_blocked) and the data is not fresh, the line names the bucket and the reset
+    as well: "no data yet" alone reads as "its CI has not started", which is the one thing it does not mean."""
     lines = [line.strip() for line in summary(key, entry, until, grace, False).splitlines()]
     keep = lines[:2] if split_key(key)[0] == "pr" else lines[:1]
-    return "; ".join(line for line in keep if line and not line.startswith("http"))
+    state = "; ".join(line for line in keep if line and not line.startswith("http"))
+    at = (entry or {}).get("dataAt")
+    fresh = (entry or {}).get("data") and isinstance(at, (int, float)) and not isinstance(at, bool) \
+        and time.time() - at < WAIT_PROGRESS_EVERY
+    blocked = None if fresh else blocked_now(split_key(key)[0])
+    return f"{state}; {blocked['text']}" if blocked is not None else state
 
 
 def progress_line(req: dict, state: str, now: float | None = None) -> str:
@@ -16249,15 +16484,18 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     if result == EXIT_TIMEOUT:
         state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
         deadline = utc_clock(float(req["began"]) + float(req["timeout"]))
+        blocked = blocked_now(kind)
         return fail_fields("timeout", f"waited {waited} s for {name} (deadline {deadline}); last seen: {state}",
-                           wait_command(req))
+                           blocked_next(req, blocked) if blocked else wait_command(req))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
     if result == EXIT_INCONCLUSIVE:
         if data.get("checksPageError") or req.get("runsUnread"):
             why = data.get("checksPageError") or "its Actions runs could not be read"
-            return fail_fields("inconclusive", f"{name}: the last read was partial ({why})", wait_command(req))
+            blocked = blocked_now(kind)
+            return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
+                               blocked_next(req, blocked) if blocked else wait_command(req))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; land_judge counts them "
                            "running)")
@@ -16540,11 +16778,15 @@ def seconds(text: str) -> float:
     `type=float` took `inf` and `nan`. `inf` blocks forever, which is a process nobody is waiting
     for on purpose; `nan` is worse -- every comparison against it is false, so the loop never
     reaches its deadline and never exits (measured: killed from outside after 3 s). A formatter
-    printing "unknown" for those was treating the symptom one layer too late."""
+    printing "unknown" for those was treating the symptom one layer too late.
+
+    A duration with a unit (90s, 20m, 1h, 1d) is the same count: `wait until` already reads 45m,
+    and `--timeout 20m` refused as "not a number of seconds" was a wasted call that came back."""
+    unit = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*", text)
     try:
-        value = float(text)
+        value = float(unit.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit.group(2)] if unit else float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds or a duration (90s, 20m, 1h)") from None
     if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError(
             f"{text!r} is not a number of seconds this can wait for: a finite count, not negative")
@@ -16801,6 +17043,21 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
+    # Nothing can be read for this kind until a reset that is past this wait's own deadline, so every second left
+    # would be spent the way the first ones were: on nothing. Return now and name the wait that ends instead of
+    # the one that just did not. Same exit code and the same "timeout" in --json as any other expired wait, so no
+    # consumer has to learn a new one; only PRs, because a run's finish can still arrive over the build
+    # controller's feed, which costs no quota at all.
+    blocked = blocked_now(kind, now) if result is None and not usable and kind == "pr" else None
+    if blocked and blocked.get("exhausted") and blocked["reset"] is not None \
+            and blocked["reset"] >= began + float(req["timeout"]):
+        extra = {"result": "timeout", "waited_s": waited,
+                 "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
+                         f"deadline ({utc_clock(began + float(req['timeout']))}): waiting the rest of it reads "
+                         "nothing"}
+        extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
+                                           f"{blocked['text']}", blocked_next(req, blocked)))
+        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     unread = (data or {}).get("checksPageError") or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
     if now - began >= req["timeout"] and kind == "pr" and until in ("done", "green") and data and unread:
@@ -16894,8 +17151,20 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    say_waiting(waiting_line(key, until, sha, exact, timeout))
+    # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
+    # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
+    blocked_note = blocked_start_line(key, kind)
+    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
     return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle))
+
+
+# A wait whose target was never read once learns why at WAIT_DIAGNOSE_AFTER instead of STALE_DATA_AFTER (600 s, and
+# in practice the wait's whole timeout: Daemon.serve_wait hands a wait back only when nothing already explains the
+# silence, so a quota stop deferred the probe to the deadline). Three 1800 s waits in the 2026-11-21 window learned
+# the cause in their last second. Once per wait, and only when read_blocked() sees no stop on disk: during a real
+# quota stop the answer is free from the files, so this spends no call to be told what is already known -- which is
+# what keeps the hard reserve (the calls kept back for lands) out of it however many waits block at once.
+WAIT_DIAGNOSE_AFTER = 120
 
 
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
@@ -16907,6 +17176,11 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     # waited keys fresher than that), else STALE_DATA_AFTER.
     bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
         else STALE_DATA_AFTER
+    seen_at = (entry or {}).get("dataAt")
+    never_read = not isinstance(seen_at, (int, float)) or isinstance(seen_at, bool)
+    if never_read and not req.get("diagnosed") and bound > WAIT_DIAGNOSE_AFTER \
+            and blocked_now(req.get("kind"), now) is None:
+        bound = WAIT_DIAGNOSE_AFTER
     if now - began < bound:
         return None
     if now - float(req.get("directAt") or float("-inf")) < bound:
@@ -17078,12 +17352,22 @@ def poll_wait(req: dict) -> int:
                 # The daemon heartbeats but has not refreshed this target: say so, loudly, and read it once here
                 # instead of waiting out the timeout on data that old.
                 req["directAt"] = time.time()
-                say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
-                            f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub directly once.")
-                error = direct_read(req)
-                say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
-                            + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
-                               else "\nnext: glaeda-gh restart"))
+                req["diagnosed"] = True
+                blocked = blocked_now(req["kind"])
+                if blocked is not None and blocked.get("exhausted"):
+                    # The files already say why, and a direct read over that bucket is refused before it is sent:
+                    # say the bucket and the reset rather than spend a call to be told the same thing.
+                    say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
+                                f"{int(starved)}s (its heartbeat is fresh, its data is not), because "
+                                f"{blocked['text']}.")
+                else:
+                    say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
+                                f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub "
+                                "directly once.")
+                    error = direct_read(req)
+                    say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
+                                + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
+                                   else "\nnext: glaeda-gh restart"))
                 done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
@@ -17287,7 +17571,10 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    say_waiting(waiting_line(key, until, sha, exact, timeout))
+    # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
+    # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
+    blocked_note = blocked_start_line(key, kind)
+    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
@@ -17605,7 +17892,9 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if sha in served:
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
-                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh}
+                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh,
+                          **({"statusDescriptions": data["statusDescriptions"]}
+                             if isinstance(data.get("statusDescriptions"), dict) else {})}
             if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
                 heads[sha]["runs"] = data["runs"]
         elif sha in missing:
@@ -18021,12 +18310,44 @@ def summarize_host(report: dict, now: float) -> dict:
     return out
 
 
-def account_reading(hosts: dict, now: float) -> dict:
+# A bucket with no fresh reading on any host is still readable, for free: GET /rate_limit reports every resource
+# family at once and counts against no primary limit (the daemon's own counter calls those "rate_limit reads (free)",
+# and `GET /rate_limit` sits at "REST 0 of 30" in its spend table). So the account's answer has three routes, tried in
+# this order: this host's own daemon reading, then the freshest peer's, then one free read here.
+#
+# Measured on one host 2026-11-21, 25 minutes apart: `budget` printed "GraphQL unknown (no reachable host's daemon has
+# a fresh reading)" both times while REST answered to the call (4458/5000, then 4822/5000), with two of five hosts
+# "unreachable (no answer in 25s)". A daemon's GraphQL reading only refreshes when it sends a GraphQL query or
+# /rate_limit answers, while every REST answer carries its own headers -- so an idle or REST-leaning daemon has a
+# fresh REST reading and no GraphQL one, and the fleet's GraphQL answer went unknown while the number was free to
+# obtain. GraphQL is the bucket every PR state read spends (`reading: PRs over GraphQL, ... comments over GraphQL`),
+# so it is the one number a lander needs and the one `budget` was least likely to hold: in that same window three
+# `wait pr` calls each burned a full 1800 s timeout on "no data yet" with the shared login's GraphQL bucket at 0 and
+# ~3,300 REST calls left, and nothing an operator could run would have said so.
+#
+# docs/handbook/measurement-unknown-when-shared-quota-spent.md decides the shape: a measurement on a shared quota has
+# a second source that does not share it, and says which one answered and how old it is. Here the second source costs
+# no quota at all, so it is the last route rather than a carried reading, and a bucket that still cannot be read says
+# who was asked, what each answered and the one next step -- never a bare "unknown".
+FREE_READ_BUDGET = 10.0  # one free GET /rate_limit here must not hold `budget` longer than this
+ACCOUNT_ROUTES = ("local", "peer", "direct")  # in preference order; every reading carries the one that answered
+
+
+def account_reading(hosts: dict, now: float, me: str | None = None) -> dict:
     """The login's REST and GraphQL as the freshest live reading any host's daemon took (each host's "rest" is already
-    the poorest core counter it sees), with the host that read it."""
+    the poorest core counter it sees), with the host that read it and the route that answered -- "local" for this
+    host's own daemon, "peer" for another's. An unreachable host is skipped, so it can never by itself make a bucket
+    unknown; neither route reads GitHub, and the free direct read (free_account_reading) is the third route, taken by
+    host_sweep when this returns nothing for a bucket.
+
+    Freshest wins rather than local first, and a tie goes to local. Every host reads the same shared pool, so the
+    freshest reading is the truest one, and `budget` prints the host and the age either way. Preferring local would
+    report a 600 s-old reading here (4000 REST left) over a peer's 30 s-old one (12 left) -- and sweep_tally's
+    unattributed gap is "limit - remaining" of this very reading, so an old one understates the account's spend as
+    well as overstating what a lander may take."""
     out: dict[str, dict] = {}
     for bucket in ("rest", "graphql"):
-        best = None
+        live: list[dict] = []
         for name, h in hosts.items():
             r = (h.get("readings") or {}).get(bucket) if h.get("ok") else None
             try:
@@ -18036,10 +18357,66 @@ def account_reading(hosts: dict, now: float) -> dict:
                 continue
             if reset <= now or now - seen > FLEET_READING_MAX_AGE:
                 continue
-            if best is None or seen > best["seenAt"]:
-                best = {**r, "host": name}
+            live.append({**r, "host": name, "route": "local" if name == me else "peer"})
+        best = max(live, key=lambda r: (r["seenAt"], r["route"] == "local"), default=None)
         if best is not None:
             out[bucket] = best
+    return out
+
+
+def free_account_reading(now: float, make: Callable[[], Any] | None = None) -> dict:
+    """GitHub's own count of every bucket from one GET /rate_limit here. That read counts against no primary limit, so
+    it is the route that answers when no daemon on the fleet holds a fresh reading, and asking it costs a lander
+    nothing. The shared login's count only: Daemon.request offers a call to an App pool only when it is not free, so
+    an App pool's headroom can never be read back as the login's. {"readings": {bucket: reading}} or {"error": why};
+    this never raises, because reporting the budget must not fail on the read that would have filled it in."""
+    if upstream_command() is not None:
+        return {"error": "this host reads GitHub through its upstream (upstream.json) and has no login to ask"}
+    try:
+        daemon = (make or (lambda: Daemon(controller=None, upstream=None)))()
+    except Exception as failure:  # noqa: BLE001  a free reading is never the command failing
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    # A session's own free read, not the daemon's polling: it must never write rest-spend.json from the copy it read
+    # at construction, which would overwrite the minutes the daemon has counted since (review of glaeda#1942).
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]
+    daemon.now = now
+    daemon.tick_deadline = time.monotonic() + FREE_READ_BUDGET
+    try:
+        daemon.read_rate_limit()
+    except OutOfTime:
+        return {"error": f"no answer within {FREE_READ_BUDGET:g}s"}
+    except Exception as failure:  # noqa: BLE001
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    if daemon.rate_limit_at < now:  # read_rate_limit stamps this only when /rate_limit answered
+        why = next((e for e in reversed(daemon.errors) if e.startswith("rate_limit: ")), None)
+        return {"error": why[len("rate_limit: "):] if why else "/rate_limit gave no reading"}
+    # budget.json was loaded at construction, so only a bucket this answer refreshed is reported: its seenAt is NOW.
+    out = {b: {**r, "seenAt": now} for b in ("rest", "graphql")
+           if isinstance(r := daemon.budget.get(b), dict) and isinstance(r.get("remaining"), int)
+           and float(r.get("seenAt") or 0) >= now}
+    return {"readings": out} if out else {"error": "/rate_limit named no core or graphql resource"}
+
+
+def reading_gaps(hosts: dict, bucket: str, now: float) -> dict:
+    """Why each host holds no live BUCKET reading: its own error when it did not answer, else what its daemon's
+    reading was. A host that could not be reached and a host whose daemon has simply never taken a reading of that
+    bucket are different conditions, and `budget` must not print one of them for the other."""
+    out: dict[str, str] = {}
+    name_of = POOL_NAMES.get(bucket, bucket)
+    for host, h in hosts.items():
+        if not h.get("ok"):
+            out[host] = h.get("error") or "unreachable"
+            continue
+        r = (h.get("readings") or {}).get(bucket)
+        if not isinstance(r, dict) or not isinstance(r.get("remaining"), int):
+            out[host] = f"answered; its daemon has taken no {name_of} reading (it sends no {name_of} request)"
+        elif float(r.get("reset") or 0) <= now:
+            out[host] = f"answered; its {name_of} window reset {hhmm(r.get('reset'))} and nothing read it since"
+        elif now - float(r.get("seenAt") or 0) > FLEET_READING_MAX_AGE:
+            out[host] = (f"answered; its {name_of} reading is {int(now - float(r['seenAt']))}s old, over the "
+                         f"{FLEET_READING_MAX_AGE:g}s an account reading may be")
+        else:
+            out[host] = f"answered; live {name_of} reading"
     return out
 
 
@@ -18123,7 +18500,8 @@ def sweep_rows(names: list[str], me: str, clock: float, fetch: Callable[[str, bo
     return rows
 
 
-def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
+def host_sweep(clock: float, fetch: Callable[[str, bool], dict],
+               free: Callable[[float], dict] | None = None) -> dict:
     """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT. Then each lane VM
     no read host's broker:VM rows carry is read itself (its own gh-quota log names every call it sent through its
     broker), so a VM whose broker host is unread or idle is a row of its own, not "no broker:VM row". The coordinator,
@@ -18136,7 +18514,9 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     rows = sweep_rows(hosts, me, clock, fetch)
     if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
         rows[me]["brokerClient"] = True
-    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock, me),
+                           "exhausted": exhausted_marks(clock)}
+    fill_account(doc, rows, clock, me, free)
     vms = fleet_lane_vms()
     carried = set(sweep_tally(doc, [])["laneVms"]["brokered"]) | set(rows)
     missing = [vm for vm in vms if vm not in carried]
@@ -18147,6 +18527,60 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     doc["laneVmRows"] = vm_rows
     doc["total"] = sweep_tally(doc, vms)
     return doc
+
+
+def fill_account(doc: dict, rows: dict, clock: float, me: str, free: Callable[[float], dict] | None = None) -> None:
+    """The third route, and what to say when none of them answered. Any bucket account_reading left without a live
+    reading is read here for free (one GET /rate_limit answers both at once, so this costs one bounded read per sweep
+    at most, kept FLEET_BUDGET_TTL with the rest of the answer), and every bucket still unread records who was asked
+    and what each answered (accountGaps) so `budget` prints that instead of a bare "unknown". A gh-quota mark that a
+    bucket is spent is not an answer to what is left in it: a marked bucket is read too, and both are printed."""
+    missing = [b for b in ("rest", "graphql") if b not in doc["account"]]
+    if missing:
+        answer = (free or free_account_reading)(clock)
+        doc["freeRead"] = {"error": answer["error"]} if answer.get("error") else {"at": clock, "buckets": missing}
+        for bucket in missing:
+            r = (answer.get("readings") or {}).get(bucket)
+            if isinstance(r, dict) and float(r.get("reset") or 0) > clock:
+                doc["account"][bucket] = {**r, "host": me, "route": "direct"}
+    doc["accountGaps"] = {b: reading_gaps(rows, b, clock) for b in ("rest", "graphql") if b not in doc["account"]}
+
+
+def account_unknown(bucket: str, doc: dict) -> str:
+    """Why a bucket has no number, which hosts were asked, what each answered, and the one next step. Never a bare
+    "unknown": an operator who cannot see the GraphQL bucket cannot tell a lander's 1800 s of "no data yet" from a
+    slow run (docs/handbook/missing-read-counted-as-a-value.md: a thing whose read did not happen is unknown, and
+    says so)."""
+    gaps = (doc.get("accountGaps") or {}).get(bucket) or {}
+    free = (doc.get("freeRead") or {}).get("error")
+    answered = [h for h, why in gaps.items() if why.startswith("answered")]
+    if bucket in (doc.get("accountDropped") or ()):  # kept from a sweep whose window has since ended (budget_served)
+        return (f"unknown: the kept reading's window has reset since it was read; next: run `glaeda-gh budget` again, "
+                f"past the {FLEET_BUDGET_TTL:g}s an answer is kept for every session")
+    lead = (f"unknown: no host answered ({len(gaps)} asked)" if gaps and not answered
+            else f"unknown: {len(answered)} of {len(gaps)} hosts answered, none with a live reading" if gaps
+            else "unknown: no host reading was collected")
+    if free:
+        step = ("ask a host that holds the login (`glaeda-gh budget` there)"
+                if "upstream" in free else
+                f"fix that read -- it is the only route left: `glaeda-gh gh api /rate_limit --jq .resources.{bucket}` "
+                f"here, which spends nothing")
+    else:
+        step = f"`glaeda-gh gh api /rate_limit --jq .resources.{bucket}` here, which spends nothing"
+    where = "; ".join(f"{host}: {why}" for host, why in gaps.items())
+    route = f"the free GET /rate_limit here: {free}" if free else "the free GET /rate_limit here was not tried"
+    return f"{lead}" + (f" ({where})" if where else "") + f"; {route}; next: {step}"
+
+
+def account_line(bucket: str, reading: dict, marks: dict) -> str:
+    """One bucket's number with the route that answered it and how old it is, as `budget` has always shown REST."""
+    route = reading.get("route")
+    by = (f"read here by a free GET /rate_limit {age(reading.get('seenAt'))}" if route == "direct"
+          else f"read by {reading.get('host')} {age(reading.get('seenAt'))}")
+    mark = marks.get(bucket)
+    spent = f"; gh-quota's mark here says spent until {hhmm(mark.get('until'))}" if isinstance(mark, dict) else ""
+    return (f"{POOL_NAMES[bucket]} {reading.get('remaining')}/{reading.get('limit')} left, resets "
+            f"{hhmm(reading.get('reset'))} ({by}){spent}")
 
 
 def fleet_lane_vms() -> list[str]:
@@ -18230,7 +18664,7 @@ def sweep_tally(doc: dict, lane_vms: list[str]) -> dict:
 
 
 def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | None = None,
-                 view: Callable[[], dict] | None = None) -> dict:
+                 view: Callable[[], dict] | None = None, free: Callable[[float], dict] | None = None) -> dict:
     """Who spent the login's quota this hour, per host and session, with the account's reading and the hard reserve:
     the FLEET_BUDGET_FILE answer when it is under FLEET_BUDGET_TTL old, else spend_view, else one read per host (all
     at once). One reader at a time under a lock, so sessions asking together share one read."""
@@ -18252,7 +18686,7 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
         if seen.get("ok"):
             doc.update(source="spend_view", view=seen["data"])
         else:
-            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
+            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch, free))
         # when the read ended, by the wall clock read then (router review of glaeda#2252, F2: a start time plus a
         # monotonic length put it past the real end after a backward clock step)
         doc["keptFrom"] = FLEET_BUDGET_CLOCK()
@@ -18272,7 +18706,10 @@ def budget_served(doc: dict, clock: float) -> dict:
     if not reset and not ended:
         return doc
     out = {**doc, "account": {b: r for b, r in account.items() if b not in reset},
-           "exhausted": {b: m for b, m in marks.items() if b not in ended}}
+           "exhausted": {b: m for b, m in marks.items() if b not in ended},
+           # named, so `budget` says the kept answer's window has ended rather than reporting the sweep's host
+           # answers, which were about a window that is over (account_unknown)
+           "accountDropped": sorted(reset)}
     total = doc.get("total")
     if reset and isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
         out["total"] = {**total, "unattributed": {b: None if b in reset else g
@@ -18347,12 +18784,11 @@ def sweep_lines(doc: dict) -> list[str]:
     for bucket in ("rest", "graphql"):
         r = account.get(bucket)
         if r:
-            parts.append(f"{POOL_NAMES[bucket]} {r.get('remaining')}/{r.get('limit')} left, resets "
-                         f"{hhmm(r.get('reset'))} (read by {r.get('host')} {age(r.get('seenAt'))})")
+            parts.append(account_line(bucket, r, marks))
         elif marks.get(bucket):
             parts.append(f"{POOL_NAMES[bucket]} spent until {hhmm(marks[bucket].get('until'))} (gh-quota's mark here)")
         else:
-            parts.append(f"{POOL_NAMES[bucket]} unknown (no reachable host's daemon has a fresh reading)")
+            parts.append(f"{POOL_NAMES[bucket]} {account_unknown(bucket, doc)}")
     out = ["account (the shared login, every host): " + "; ".join(parts),
            f"{doc.get('spendView') or 'lane-gh spend_view unavailable'}; read each host instead",
            "who spent it, last hour, per host and caller (REST counted; 304s and cache, mirror or glaeda answers are "
@@ -18441,6 +18877,32 @@ def fleet_lines(doc: dict) -> list[str]:
     out.append(f"(read {age(doc.get('at'))}; kept {FLEET_BUDGET_TTL:g} s for every session; --local for this host's "
                f"daemon only)")
     return out
+
+
+def account_bucket(bucket: str, now: float | None = None) -> dict:
+    """The shared login's reading for one bucket ("rest" or "graphql") as `budget` reports it, for any caller that
+    needs to name the bucket a read spends and when it resets. The wait side's stale trigger is the caller this is
+    for: it prints "the daemon has not refreshed <ref> for 1800s" and then names the identical failed invocation as
+    the next step, because it has no bucket reading to name. Answers from fleet_budget's kept sweep (one sweep per
+    FLEET_BUDGET_TTL shared by every session on the host, whose last route is a free GET /rate_limit), so a poll may
+    call it and it spends no quota in any case.
+
+    {"bucket", "remaining", "limit", "reset", "seenAt", "ageS", "host", "route", "spent", "hardReserve", "says"} when
+    the bucket could be read, else {"bucket", "unknown"} carrying the same sentence `budget` prints -- who was asked,
+    what each answered and the one next step. "mark" is gh-quota's own hold on this host when it has one."""
+    clock = time.time() if now is None else now
+    doc = fleet_budget(clock)
+    reserve = (doc.get("hardReserve") or {}).get(bucket)
+    out = {"bucket": bucket, "mark": (doc.get("exhausted") or {}).get(bucket), "hardReserve": reserve}
+    r = (doc.get("account") or {}).get(bucket)
+    if not isinstance(r, dict):
+        return {**out, "unknown": account_unknown(bucket, doc)}
+    seen = float(r.get("seenAt") or clock)
+    left = r.get("remaining")
+    return {**out, "remaining": left, "limit": r.get("limit"), "reset": r.get("reset"), "seenAt": seen,
+            "ageS": max(0.0, round(clock - seen, 1)), "host": r.get("host"), "route": r.get("route"),
+            "spent": isinstance(left, int) and left <= 0,
+            "says": account_line(bucket, r, doc.get("exhausted") or {})}
 
 
 def cmd_budget(as_json: bool, fleet: bool = False) -> int:
@@ -21740,6 +22202,161 @@ def cmd_runners(scope: str, label: str | None, as_json: bool) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- search (issues and pull requests)
+
+# An agent who needs to find a PR or issue had no subcommand here, so it reached for `gh search issues|prs` or
+# `gh api search/...`: 30 such calls from 20 session transcripts on this host in the week to 2026-11-21. Those
+# spend the shared REST quota this daemon exists to protect, and REST search carries its own 30-a-minute limit,
+# so one sweep of a few repositories blinds every PR wait on the host for a minute -- the fleet has run the
+# quota to zero this way. `search` asks GraphQL's search connection instead, through this broker (read_runners'
+# route), so a call costs 1 GraphQL point and no REST at all, and an identical search from the next session
+# within GLAEDA_GH_CACHE_TTL is served from the kept answer with no request at all. gh_cache_graphql_scope
+# already reads a `repo:o/r` search's scope, so a kept answer is made old by a write to that repository.
+SEARCH_LIMIT_MAX = 100  # GraphQL's `first:` ceiling; more would need paging, which no caller has asked for
+SEARCH_KINDS = {"issues": "is:issue", "prs": "is:pr", "both": ""}
+# What an agent types for each kind, `gh search` words included; `both` is a bare query with no kind word.
+SEARCH_KIND_WORDS = {"issues": "issues", "issue": "issues", "prs": "prs", "pr": "prs", "pulls": "prs",
+                     "pull-requests": "prs", "both": "both"}
+SEARCH_STATES = {"open": "state:open", "closed": "state:closed", "merged": "is:merged", "all": ""}
+SEARCH_SERVED = "glaeda-gh search issues|prs QUERY [--repo OWNER/REPO]"
+# `gh search code|commits|repos` have no GraphQL search type these fields come from: each names the form that works.
+SEARCH_UNSERVED = {
+    "code": f"code search is not served here (no cached route): grep a checkout instead "
+            f"(wt new REPO BRANCH --files), or for a pull request or issue `{SEARCH_SERVED}`",
+    "commits": f"commit search is not served here (no cached route): `git log` in a checkout, or for the pull "
+               f"request that carried it `{SEARCH_SERVED}`",
+    "repos": f"repository search is not served here (no cached route): for a pull request or issue `{SEARCH_SERVED}`"}
+SEARCH_QUALIFIER_RE = {
+    "kind": re.compile(r"(?:^|\s)(?:is:(?:pr|issue)|type:\S+)(?=\s|$)"),
+    "state": re.compile(r"(?:^|\s)(?:state:\S+|is:(?:open|closed|merged|unmerged))(?=\s|$)"),
+    "repo": re.compile(r"(?:^|\s)repo:\S+(?=\s|$)"),
+    "author": re.compile(r"(?:^|\s)author:\S+(?=\s|$)")}
+# The fields `status pr` prints, from the one search node: `head` is the head commit there too (status_view), so
+# `--field head,state,checks.state` reads the same values off a search row as off a status.
+SEARCH_NODE_FIELDS = (
+    "__typename "
+    "... on Issue { number title url state createdAt updatedAt author { login } repository { nameWithOwner } } "
+    "... on PullRequest { number title url state isDraft merged createdAt updatedAt author { login } "
+    "repository { nameWithOwner } headRefName headRefOid baseRefName "
+    "commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }")
+SEARCH_GQL = ("query($q: String!, $n: Int!) { rateLimit { cost remaining } "
+              "search(type: ISSUE, query: $q, first: $n) { issueCount nodes { " + SEARCH_NODE_FIELDS + " } } }")
+
+
+def search_terms(kind: str, words: list[str], repos: list[str], state: str, author: str | None) -> str:
+    """The one GitHub search string a call sends: the words as typed, then a qualifier for each flag given. A
+    qualifier already in the words wins and the flag's is left out, so `search prs 'repo:o/r is:merged'` sends
+    exactly that; naming repositories both ways at once is refused rather than ANDed into no results."""
+    typed = " ".join(words).strip()
+    if repos and SEARCH_QUALIFIER_RE["repo"].search(typed):
+        raise WatchError("name the repositories one way, not both: --repo OWNER/REPO (repeatable) or repo:OWNER/REPO "
+                         f"in the query -- `{SEARCH_SERVED}`")
+    parts = [typed] if typed else []
+    for what, value in (("kind", SEARCH_KINDS[kind]), ("state", SEARCH_STATES[state]),
+                        ("repo", " ".join(f"repo:{r}" for r in repos)),
+                        ("author", f"author:{author}" if author else "")):
+        if value and not SEARCH_QUALIFIER_RE[what].search(typed):
+            parts.append(value)
+    terms = " ".join(p for p in parts if p).strip()
+    if not terms:
+        raise WatchError("search takes a query, --repo, --author or --state to look for: "
+                         f"`{SEARCH_SERVED}`")
+    return terms
+
+
+def search_read(terms: str, limit: int) -> dict:
+    """One GraphQL search, piped through this broker, so its answer is kept for every session on the host and
+    nothing touches REST (read_runners' route: the cache shares the read whether or not the shim is on PATH)."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
+            "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
+    try:
+        done = run_bounded(argv, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise WatchError(f"gh api graphql (search): {describe(error)}") from None
+    if done.returncode != 0:
+        raise WatchError(f"gh api graphql (search): {(done.stderr or '').strip()[:300]}")
+    try:
+        doc = json.loads(done.stdout or "{}")
+    except ValueError as error:
+        raise WatchError(f"gh api graphql (search): unreadable answer: {error}") from None
+    found = ((doc.get("data") or {}).get("search")) if isinstance(doc, dict) else None
+    if not isinstance(found, dict) or not isinstance(found.get("nodes"), list):
+        said = (doc.get("errors") if isinstance(doc, dict) else None) or doc
+        raise WatchError(f"search was not answered: {json.dumps(said, sort_keys=True)[:300]}")
+    return found
+
+
+def search_row(node: dict) -> dict:
+    """One search node as this tool's row: the `status pr` names (head, headRefOid, state, checks.state, merged,
+    url, title, number) plus where it lives, so a row is a `status`, `wait` or `land` target as printed."""
+    repo = (node.get("repository") or {}).get("nameWithOwner")
+    number = node.get("number")
+    pr = node.get("__typename") == "PullRequest"
+    row: dict[str, Any] = {
+        "kind": "pr" if pr else "issue", "repo": repo, "number": number,
+        "target": f"{repo}#{number}" if repo and isinstance(number, int) else None,
+        "title": node.get("title"), "url": node.get("url"),
+        "state": (node.get("state") or "").lower() or None,
+        "author": (node.get("author") or {}).get("login"),
+        "createdAt": node.get("createdAt"), "updatedAt": node.get("updatedAt")}
+    if not pr:
+        return row
+    commit = ((node.get("commits") or {}).get("nodes") or [{}])[0] or {}
+    rollup = ((commit.get("commit") or {}).get("statusCheckRollup") or {}).get("state")
+    check_state = (rollup or "").lower() or None
+    row.update(head=node.get("headRefOid"), headRefOid=node.get("headRefOid"), headRef=node.get("headRefName"),
+               baseRef=node.get("baseRefName"), merged=bool(node.get("merged")), draft=bool(node.get("isDraft")),
+               checkState=check_state, checks={"state": check_state})
+    return row
+
+
+def search_line(row: dict) -> str:
+    """`OWNER/REPO#N state [checks] title (author, 2h ago)`: the target first, to paste into status, wait or land."""
+    marks = [row.get("state") or "?"]
+    if row.get("draft"):
+        marks.append("draft")
+    if row.get("checkState"):
+        marks.append(f"checks {row['checkState']}")
+    when = iso_epoch(row.get("updatedAt"))
+    who = ", ".join(x for x in (row.get("author"), age(when) if when else "") if x)
+    title = land_trim(row.get("title") or "", 100)
+    return f"{row.get('target') or '?'} {' '.join(marks)}  {title}" + (f"  ({who})" if who else "")
+
+
+def cmd_search(kind: str, words: list[str], repos: list[str], state: str, author: str | None, limit: int,
+               as_json: bool, fields: list[str] | None = None) -> int:
+    """Find pull requests and issues by query, over GraphQL search, through this host's one cached route.
+
+    The fields are `status pr`'s, so a row's `target` is what `status`, `wait` and `land` take next, and
+    `--field head,state,checks.state` reads the same names here as there."""
+    if not 1 <= limit <= SEARCH_LIMIT_MAX:
+        raise WatchError(f"--limit must be 1 to {SEARCH_LIMIT_MAX} (GraphQL search's page): "
+                         f"`{SEARCH_SERVED} --limit {SEARCH_LIMIT_MAX}`")
+    bad = [r for r in repos if not re.fullmatch(rf"{NAME}/{NAME}", r)]
+    if bad:
+        raise WatchError(f"--repo takes OWNER/REPO, not {bad[0]!r}: `{SEARCH_SERVED}`")
+    terms = search_terms(kind, words, repos, state, author)
+    found = search_read(terms, limit)
+    rows = [search_row(n) for n in found["nodes"] if isinstance(n, dict)]
+    if kind != "both":
+        rows = [r for r in rows if r["kind"] == ("pr" if kind == "prs" else "issue")]
+    total = found.get("issueCount")
+    if fields:
+        for row in rows:
+            print("\t".join(field_text(field_value(row, f)) for f in fields))
+        return EXIT_OK
+    if as_json:
+        print(json.dumps({"query": terms, "total": total, "shown": len(rows), "rows": rows}, sort_keys=True))
+        return EXIT_OK
+    more = f", {len(rows)} shown (--limit {limit})" if isinstance(total, int) and total > len(rows) else ""
+    print(f"{terms}: {total if isinstance(total, int) else len(rows)} found{more}")
+    for row in rows:
+        print(f"  {search_line(row)}")
+    if not rows:
+        print("  nothing matched (qualifiers are ANDed: drop one, or --state all)")
+    return EXIT_OK
+
+
 # A merge reaches GitHub only through the host's gh-quota guard (leo-workspace tools/gh-quota-shim, PACE_CLI; the
 # GLAEDA_MERGE_GUARD path overrides): land_judge's holds, BLOCKs, review and pin checks, the merge line, the landing
 # record and the transient-error retry all live there. broker_real_gh steps over every "gh guard" file, so a call
@@ -23662,7 +24279,7 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     .../pull/N) means `pr`; OWNER/REPO/RUNID or .../actions/runs/ID means `run`. `land pr X` drops the `pr`. Returns the argv to parse and the note for stderr ("" when unchanged)."""
     if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
         return raw, ""
-    joined = False
+    wait_joined = False
     if raw[0] == "wait":
         # `wait [pr|comment] OWNER/REPO N` is `OWNER/REPO#N` (usage_next's form): one target, so a bare N can
         # mean nothing else. `status` is multi-target (a bare N there is a number in the repo before it), and
@@ -23670,7 +24287,7 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
         slot = 2 if raw[1] in ("pr", "comment") else 1
         if len(raw) > slot + 1 and re.fullmatch(rf"{NAME}/{NAME}", raw[slot]) and BARE_NUMBER.fullmatch(raw[slot + 1]):
             raw = raw[:slot] + [f"{raw[slot]}#{raw[slot + 1].lstrip('#')}"] + raw[slot + 2:]
-            joined = True
+            wait_joined = True
     cmd, first = raw[0], raw[1]
     joined = join_repo_and_number(raw)
     if joined:
@@ -23679,7 +24296,7 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
-    ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if joined else ""
+    ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if wait_joined else ""
     if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
         return raw, ran_as
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
@@ -23840,6 +24457,24 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.add_argument("--by", choices=("caller",), default=None,
                    help="group the calls by caller (session:NAME or tool:NAME, as the gh-quota shim names them)")
+    sr = sub.add_parser("search", help="find pull requests and issues by query, over GraphQL search through this "
+                                       "host's one cached route (instead of gh search, which spends REST quota)")
+    sr.add_argument("kind", choices=tuple(SEARCH_KINDS), help="issues, prs, or both (a bare query); the word "
+                                                              "`issue`, `pr` or `pulls` is read as its kind")
+    sr.add_argument("words", nargs="*", metavar="QUERY",
+                    help="GitHub search terms as you would type them to `gh search`, qualifiers included "
+                         "(repo:OWNER/REPO, label:x, is:merged); a qualifier here wins over the flag for it")
+    sr.add_argument("--repo", action="append", default=[], metavar="OWNER/REPO",
+                    help="only this repository (repeatable: any of them)")
+    sr.add_argument("--state", choices=tuple(SEARCH_STATES), default="all",
+                    help="open, closed, merged (pull requests) or all (default all)")
+    sr.add_argument("--author", metavar="LOGIN", help="only this author")
+    sr.add_argument("--limit", type=int, default=20, metavar="N",
+                    help=f"rows at most (default 20, at most {SEARCH_LIMIT_MAX}: GraphQL search's page)")
+    sr.add_argument("--field", metavar="F,G",
+                    help="print just these values of each row, tab-separated, one line per row (the `status pr` "
+                         "names: target,head,state,checks.state,merged,url,title,number)")
+    sr.add_argument("--json", action="store_true")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")
     rn.add_argument("--label", default=None, help="only runners carrying this label")
@@ -23907,6 +24542,41 @@ def log_job_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+def search_synonym(raw: list[str]) -> list[str]:
+    """The shapes an agent types for `search`, as the canonical form:
+
+    - a bare query (`search "cmux next"`) is `search both "cmux next"`: no kind word is both kinds;
+    - `gh search`'s own words (`issue`, `pr`, `pulls`, `pull-requests`) are their kind;
+    - `gh search`'s `--json FIELD,FIELD` is this tool's `--field FIELD,FIELD` (here `--json` is the whole object).
+
+    Said on stderr, as the other synonyms are, so the next call is typed the canonical way. A form with no
+    canonical shape here (`search code|commits|repos`) is refused by name in main, not rewritten."""
+    if not raw or raw[0] != "search" or "-h" in raw or "--help" in raw:
+        return raw  # help prints the canonical form itself; no line about the words asking for it
+    fixed, said = list(raw), []
+    for i, word in enumerate(fixed):
+        if word != "--json" or i + 1 >= len(fixed) or fixed[i + 1].startswith("-"):
+            continue
+        if re.fullmatch(r"[\w.]+(?:,[\w.]+)*", fixed[i + 1]):
+            fixed[i:i + 2] = ["--field", fixed[i + 1]]
+            said.append("--json FIELDS is --field FIELDS (--json alone is the whole object)")
+        break
+    word = fixed[1] if len(fixed) > 1 else ""
+    kind = SEARCH_KIND_WORDS.get(word.lower())
+    if kind and kind != word:
+        fixed[1] = kind
+        said.append(f"`{word}` is the kind `{kind}`")
+    elif not kind and word not in SEARCH_UNSERVED and not word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a query with no kind word searches both issues and pull requests")
+    elif not kind and word.startswith("-"):
+        fixed.insert(1, "both")
+        said.append("a search with no kind word searches both issues and pull requests")
+    if said:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed
+
+
 def land_notify_synonym(raw: list[str]) -> list[str]:
     """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
     `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
@@ -23930,7 +24600,12 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    raw = land_notify_synonym(log_job_synonym(raw))
+    if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
+        # A form this subcommand cannot serve names the one that works, rather than reaching gh's REST search.
+        print(f"glaeda-gh: {SEARCH_UNSERVED[raw[1].lower()]}", file=sys.stderr)
+        print("next: glaeda-gh search --help", file=sys.stderr)
+        return 64
+    raw = land_notify_synonym(log_job_synonym(search_synonym(raw)))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
@@ -23987,6 +24662,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.kind == "flaky":
                 return cmd_log_flaky(args.repo, args.test, args.since, args.job, args.reads, args.limit, args.json)
             return cmd_log_job(args.repo, args.job)
+        if args.command == "search":
+            return cmd_search(args.kind, args.words, args.repo, args.state, args.author, args.limit, args.json,
+                              fields=parse_fields(args.field))
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
         if args.command == "restart":
