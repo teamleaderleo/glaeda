@@ -830,7 +830,9 @@ class HeadRunOrderTest(unittest.TestCase):
     def node(name: str, ident: int, started: str, done: str, conclusion: str = "SUCCESS") -> dict:
         return {"__typename": "CheckRun", "databaseId": ident, "name": name, "status": "COMPLETED",
                 "conclusion": conclusion, "startedAt": started, "completedAt": done,
-                "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": "CI"}}}}
+                "checkSuite": {"app": {"slug": "github-actions"}, "databaseId": 5,
+                               "workflowRun": {"databaseId": 900 + ident, "event": "pull_request",
+                                               "workflow": {"name": "CI", "databaseId": 77}}}}
 
     def test_graphql_nodes_keep_every_run_with_its_id_and_times(self) -> None:
         runs: dict = {}
@@ -842,22 +844,64 @@ class HeadRunOrderTest(unittest.TestCase):
         data = gg.head_data("a" * 40, runs, statuses, {}, order)
         self.assertEqual(data["found"]["CI / web / react-apps-check (1)"], ["completed", "success"])
         self.assertEqual(data["runs"]["CI / web / react-apps-check (1)"],
-                         [[10, "completed", "failure", "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z"],
-                          [20, "completed", "success", "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z"]])
+                         [[10, "completed", "failure", "2026-11-20T01:00:00Z", "2026-11-20T01:10:00Z",
+                           {"run": 910, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}],
+                          [20, "completed", "success", "2026-11-20T02:00:00Z", "2026-11-20T02:10:00Z",
+                           {"run": 920, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}]])
         self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
 
     def test_rest_nodes_keep_them_too_and_no_order_writes_none(self) -> None:
         nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "web / react-apps-base-check", "status": "completed",
                                                   "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
-                                                  "completed_at": "2026-11-20T03:05:00Z", "app": "github-actions"}]},
+                                                  "completed_at": "2026-11-20T03:05:00Z", "app": "github-actions",
+                                                  "suite": 3}]},
                                  [], [], set())
         runs: dict = {}
         order: dict = {}
         gg.fold_contexts(nodes, runs, {}, {}, order=order)
         self.assertEqual(gg.head_data("b" * 40, runs, {}, {}, order)["runs"],
                          {"github-actions / web / react-apps-base-check":
-                          [[7, "completed", "success", "2026-11-20T03:00:00Z", "2026-11-20T03:05:00Z"]]})
+                          [[7, "completed", "success", "2026-11-20T03:00:00Z", "2026-11-20T03:05:00Z",
+                            {"app": "github-actions", "suite": 3}]]})
         self.assertNotIn("runs", gg.head_data("b" * 40, runs, {}, {}))
+
+    def test_each_row_keeps_its_run_identity_over_rest_and_graphql(self) -> None:
+        """land-judge's head checks read the cache first and collapse attempts by run as a live rollup read does:
+        each row names its Actions run, workflow, event, app and suite; a lastRealAttempt row and a null app say so."""
+        doc = {"workflow_runs": [{"id": 41, "name": "CI", "workflow_id": 77, "check_suite_id": 3,
+                                  "conclusion": "success", "event": "pull_request", "status": "completed"}]}
+        runs_kept = gg.slim_head_runs(doc)
+        self.assertEqual(runs_kept[0]["event"], "pull_request")
+        nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "build", "status": "completed",
+                                                  "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
+                                                  "completed_at": "2026-11-20T03:05:00Z", "app": "github-actions",
+                                                  "suite": 3}]}, [], runs_kept, set(), {"77": "CI"})
+        order: dict = {}
+        gg.fold_contexts(nodes, {}, {}, {}, order=order)
+        self.assertEqual(order["CI / build"][0][5], {"run": 41, "workflow": 77, "workflowName": "CI", "event": "pull_request",
+                                                     "app": "github-actions", "suite": 3})
+        late = {**self.node("build", 30, "2026-11-20T04:00:00Z", "2026-11-20T04:01:00Z"), "lastRealAttempt": True,
+                "isRequired": True}
+        bare = {"__typename": "CheckRun", "databaseId": 31, "name": "lint", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "startedAt": "2026-11-20T04:00:00Z", "completedAt": "2026-11-20T04:01:00Z",
+                "checkSuite": {"app": None, "databaseId": 8, "workflowRun": None}}
+        order = {}
+        gg.fold_contexts([late, bare], {}, {}, {}, order=order)
+        self.assertEqual(order["CI / build"][0][5], {"run": 930, "workflow": 77, "workflowName": "CI", "event": "pull_request",
+                                                     "app": "github-actions", "suite": 5, "lastRealAttempt": True})
+        self.assertEqual(order["check / lint"][0][5], {"suite": 8, "appNull": True})
+
+    def test_a_status_keeps_its_description_over_rest_and_graphql(self) -> None:
+        statuses: dict = {}
+        gg.fold_contexts([{"__typename": "StatusContext", "context": "cmux-next/fast-gates", "state": "SUCCESS",
+                           "description": "passed at base 1234567"}], {}, statuses, {})
+        nodes = gg.rest_contexts({"check_runs": []}, gg.slim_statuses(
+            {"statuses": [{"context": "ws-check", "state": "pending", "description": "in line"}]}), [], set())
+        gg.fold_contexts(nodes, {}, statuses, {})
+        data = gg.head_data("c" * 40, {}, statuses, {})
+        self.assertEqual(data["statusDescriptions"], {"status / cmux-next/fast-gates": "passed at base 1234567",
+                                                      "status / ws-check": "in line"})
+        self.assertEqual(data["statusStates"]["status / ws-check"], "pending")
 
 
 class FakeController:

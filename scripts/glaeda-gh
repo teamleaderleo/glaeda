@@ -3273,7 +3273,7 @@ def slim_check_runs(doc: dict) -> dict:
 
 
 def slim_statuses(doc: dict) -> list[dict]:
-    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at")}
+    return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at", "description")}
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
 
 
@@ -3318,7 +3318,7 @@ def slim_head_runs_page(doc: dict) -> dict:
 
 
 def slim_head_runs(doc: dict) -> list[dict]:
-    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion")}
+    return [{k: r.get(k) for k in ("id", "name", "workflow_id", "check_suite_id", "conclusion", "event")}
             for r in doc.get("workflow_runs") or [] if isinstance(r, dict)]
 
 
@@ -3402,14 +3402,17 @@ def rest_contexts(checks: dict, statuses: list[dict], runs: list[dict], required
                       "detailsUrl": c.get("details_url"), "databaseId": c.get("id"), "startedAt": c.get("started_at"),
                       "completedAt": c.get("completed_at"), "isRequired": c.get("name") in required,
                       "checkSuite": {"conclusion": upper(run.get("conclusion")), "app": {"slug": c.get("app")},
+                                     "databaseId": c.get("suite"),
                                      "workflowRun": {
-                          "databaseId": run.get("id"), "workflow": {
+                          "databaseId": run.get("id"), "event": run.get("event"), "workflow": {
                               "name": workflows.get(str(run.get("workflow_id"))) or run.get("name"),
                                                                     "databaseId": run.get("workflow_id")}}}
-                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "workflowRun": None}})
+                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "databaseId": c.get("suite"),
+                                   "workflowRun": None}})
     for c in statuses:
         nodes.append({"__typename": "StatusContext", "context": c.get("context"), "state": upper(c.get("state")),
                       "targetUrl": c.get("target_url"), "createdAt": c.get("created_at"),
+                      **({"description": c["description"]} if isinstance(c.get("description"), str) else {}),
                       "isRequired": c.get("context") in required})
     return nodes
 
@@ -3896,7 +3899,8 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
             state = (item.get("state") or "").lower()
             statuses[f"{prefix}status / {item['context']}"] = (
                 "in_progress" if state in ("pending", "expected") else "completed",
-                "failure" if state == "error" else state, state)
+                "failure" if state == "error" else state, state,
+                item.get("description") if isinstance(item.get("description"), str) else None)
             continue
         suite = item.get("checkSuite") or {}
         slug = (suite.get("app") or {}).get("slug")
@@ -3904,15 +3908,35 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
         key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
         runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
-        if order is not None:  # head_data's `runs`: each run's own id and times (head_data's `runs`)
+        if order is not None:  # head_data's `runs`: each run's own id and times, and its identity (run_identity)
             order.setdefault(key, []).append([item.get("databaseId") or 0, (item.get("status") or "").lower(),
-                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or ""])
+                                              conclusion, item.get("startedAt") or "", item.get("completedAt") or "",
+                                              run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
 
 
+def run_identity(item: dict, suite: dict) -> dict:
+    """What tells one check run's run apart from another's (head_data's `runs`, a row's sixth field): its Actions run's
+    databaseId, event and workflow databaseId and name (the key's prefix, so a reader can split the job's own name off), its app's slug and its check suite's databaseId, each only when read,
+    and lastRealAttempt for a run of an older suite attempt
+    (last_real_contexts) that GitHub's rollup no longer lists."""
+    run = suite.get("workflowRun") or {}
+    workflow = run.get("workflow") or {}
+    app = suite.get("app")
+    out = {"run": run.get("databaseId"), "workflow": workflow.get("databaseId"), "workflowName": workflow.get("name"),
+           "event": run.get("event"),
+           "app": app.get("slug") if isinstance(app, dict) else None, "suite": suite.get("databaseId"),
+           "lastRealAttempt": True if item.get("lastRealAttempt") else None}
+    if app is None and "app" in suite:
+        out["appNull"] = True  # GitHub's documented null app, not an unread one
+    return {k: v for k, v in out.items() if v is not None}
+
+
 # A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
-# conclusion, startedAt, completedAt]. `found` keeps one verdict per name and no order, so a reader could not tell a
+# conclusion, startedAt, completedAt, identity] (run_identity: its Actions run, workflow, event, app and suite, so a
+# reader can collapse a rerun's attempts and drop a superseded cancel as a live rollup read does; leo-workspace
+# land-judge's head checks read it before going live). `found` keeps one verdict per name and no order, so a reader could not tell a
 # replay that ran after its shard's newest rerun from an older one: leo-workspace merge_hold's webview verdict could
 # only hold on the cache (Codex F1 on lw#4070), and while the shared login's GraphQL hour was spent its live read and
 # the head's own check reads all failed, so cmux#46128, #46236 and #46782 sat at glaeda land's 6 h retry deadline on
@@ -3926,6 +3950,11 @@ def head_data(sha: str, runs: dict, statuses: dict, ids: dict, order: dict | Non
     settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
     states = {key: value[2] for key, value in statuses.items() if len(value) > 2}
     data = {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
+    # each status's description where the read gave one (GraphQL's always; REST's combined status too): a reader
+    # judging from the cache (land-judge's fast-gates base, a ws-check standby post) reads what a live read would
+    said = {key: value[3] for key, value in statuses.items() if len(value) > 3 and value[3] is not None}
+    if said:
+        data["statusDescriptions"] = said
     if order is not None:
         data["runs"] = {key: sorted(rs, key=lambda r: int(r[0] or 0)) for key, rs in order.items()}
     return data
@@ -17340,7 +17369,9 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if sha in served:
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
-                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh}
+                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh,
+                          **({"statusDescriptions": data["statusDescriptions"]}
+                             if isinstance(data.get("statusDescriptions"), dict) else {})}
             if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
                 heads[sha]["runs"] = data["runs"]
         elif sha in missing:
