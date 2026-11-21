@@ -826,6 +826,12 @@ CHECKS_OF_RECORD = {("teamleaderleo", "glaeda"): ("manaflow-ai", "glaeda")}
 GQL_BLIND_TTL = 3600  # a run GraphQL answered null for is read over REST this long before GraphQL is tried again
 RUN_MISSING_RETRY = 600  # a run no read ever showed (GraphQL and REST both say none) is asked about this rarely
 HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
+# A head with more checks, statuses or workflow runs than one REST read pages through (REST_CHECK_PAGES and the rest) is
+# asked over REST again only this rarely: those counts only grow, so a retry cannot answer, and GraphQL (up to
+# HEAD_BATCH_MAX_CONTEXTS_PAGES pages) still reads it on every cycle it routes there. huge-blue 2026-11-21 07:58-11:21Z:
+# manaflow-ai/cmux@df6c08f2 (asked by a lane broker, so first in every REST tick and past the plain share) paged ten
+# REST requests every ~95 s tick and failed each time, while waited PR data went 5,896 s stale behind it.
+HEAD_OVERSIZED_RETRY = 1800
 CONSUMER_WINDOW = 3600
 # An asked head with no answer (`glaeda-gh checks` on a new SHA) is read over REST even when this daemon's REST share is
 # spent and GraphQL is stopped, while the login's REST is above its floor: at most this many such reads an hour, each
@@ -6826,7 +6832,7 @@ class Daemon:
         asked = sorted((e for e in mine if self.head_unanswered(e)), key=self.head_rank)
         if not asked or not self.head_direct_room():
             return []
-        due = self.due_heads(asked, "normal")
+        due = self.due_heads(asked, "normal", rest=True)
         out = due[:HEAD_DIRECT_MAX - len(self.head_direct_at)]
         for e in due[len(out):]:
             self.refund(e["key"])  # past the hourly bound: not read, so not charged
@@ -6886,7 +6892,7 @@ class Daemon:
             # REST lean only because the daemon is past its own share (the yield): consumers are admitted as when
             # normal, and every head, a reserved consumer's too, is read at most once per lean cycle (review F1, F2)
             yielding = path == "rest" and mode == "lean" and self.rest_above_floor()
-            return self.due_heads(mine, "normal" if yielding else mode, paced=yielding)
+            return self.due_heads(mine, "normal" if yielding else mode, paced=yielding, rest=path == "rest")
         interval = self.policy["cycles"][kind] * (LEAN_FACTOR if mode == "lean" else 1)
         # GraphQL scarce (lean): what a session waits on keeps its cycle and goes first, oldest data first; the
         # unwaited rest takes the lean pace (huge-blue 2026-11-11: at the fleet's 1000 floor a waited PR was 2509 s old)
@@ -7073,10 +7079,11 @@ class Daemon:
             self.head_spend.setdefault(self.refunded[key], []).append(self.now)
         self.refunded.pop(key, None)
 
-    def due_heads(self, mine: list[dict], mode: str, paced: bool = False) -> list[dict]:
+    def due_heads(self, mine: list[dict], mode: str, paced: bool = False, rest: bool = False) -> list[dict]:
         """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
         every consumer of the head; it is charged to the first consumer (reserved ones first) that may pay.
-        A head nobody may pay for is left to the cache, and the refused consumers are marked denied."""
+        A head nobody may pay for is left to the cache, and the refused consumers are marked denied. REST: the heads
+        are read over REST, which leaves out a head too big for it (rest_oversized) until HEAD_OVERSIZED_RETRY."""
         policy = consumer_policy()
         self.head_spend = {k: [t for t in v if self.now - t < CONSUMER_WINDOW] for k, v in self.head_spend.items()}
         for key, (_, at) in list(self.payer.items()):
@@ -7103,6 +7110,9 @@ class Daemon:
             retry = HEAD_MISSING_RETRY if c.get("missing") else self.policy["cycles"]["head"]
             if paced:
                 retry = max(retry, self.policy["cycles"]["head"] * LEAN_FACTOR)
+            if rest and self.rest_oversized(e):
+                self.deferred.discard(e["key"])
+                continue  # REST cannot answer it (HEAD_OVERSIZED_RETRY): no read, no charge, no tick spent on it
             if e["key"] in self.deferred:
                 self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
             elif self.now - self.attempted.get(e["key"], float("-inf")) < retry:
@@ -7120,6 +7130,12 @@ class Daemon:
             self.nudged.discard(e["key"])  # (kept until it is read: a check event inside the retry gate still counts)
             out.append(e)
         return out
+
+    def rest_oversized(self, e: dict) -> bool:
+        """Whether this head's last REST read, within HEAD_OVERSIZED_RETRY, found more than one REST read pages through
+        (fetch_head_rest): asking REST again before then would page the same requests and fail the same way."""
+        at = (e.get("cache") or {}).get("restOversizedAt")
+        return isinstance(at, (int, float)) and not isinstance(at, bool) and self.now - at < HEAD_OVERSIZED_RETRY
 
     def head_ttl(self, e: dict) -> float:
         """How long a head's answer stands: a settled one HEAD_SETTLED_TTL; a running one HEAD_PENDING_TTL, or
@@ -7310,7 +7326,9 @@ class Daemon:
                 else:
                     stored = read_cache(e["key"]) or {}
                     if stored.get("error") and stored.get("fetchedAt") == self.now:
-                        self.refresh_note("rest", stored["error"], key_name(e["key"]), "retry next cycle")
+                        self.refresh_note("rest", stored["error"], key_name(e["key"]),
+                                          f"REST asks again in {HEAD_OVERSIZED_RETRY}s, GraphQL whenever heads route there"
+                                          if stored.get("restOversizedAt") == self.now else "retry next cycle")
                 if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
                     # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
                     self.to_graphql(over_rest[i:], spilled)
@@ -9408,6 +9426,10 @@ class Daemon:
         """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
         _, owner, repo, sha = split_key(e["key"])
         prior = e["cache"] or {}
+        if self.rest_oversized(e):
+            # (a GraphQL read that spilled here this tick: due_heads leaves these out of REST's own turn)
+            self.refund(e["key"])
+            return None
         self.reads.append((self.now, "head", "rest"))
         old, parts = prior.get("restParts") or {}, {}
         try:
@@ -9420,8 +9442,9 @@ class Daemon:
                               missing=missing)
         if (checks.get("total_count") or 0) > len(checks["check_runs"]):
             self.refund(e["key"])  # a partial list would read as a smaller, greener head
+            # Those counts only grow: REST is not asked again before HEAD_OVERSIZED_RETRY (rest_oversized; GraphQL is)
             return self.store(e["key"], e["cache"], error=f"more than {REST_CHECK_PAGES * 100} checks, {REST_STATUS_PAGES * 100} statuses or "
-                              f"{REST_RUN_PAGES * 100} workflow runs over REST")
+                              f"{REST_RUN_PAGES * 100} workflow runs over REST", restOversizedAt=self.now)
         found: dict = {}
         statuses_by: dict = {}
         ids: dict = {}

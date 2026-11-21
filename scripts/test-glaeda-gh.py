@@ -4375,6 +4375,52 @@ class FallbackTest(Base):
         # the 200 statuses case says the same: the third page of runs was never read
         self.assertEqual(len([c for c in self.gh.rest_calls() if "actions/runs?" in c[1]]), gg.REST_RUN_PAGES)
 
+    def test_a_head_too_big_for_rest_is_not_paged_again_every_cycle(self) -> None:
+        """huge-blue 2026-11-21 07:58-11:21Z: manaflow-ai/cmux@df6c08f2 had more than 500 checks. A lane broker kept
+        asking for it, so as an asked head with no answer it went first in every REST tick and past the plain share,
+        paged ten REST requests every ~95 s tick, and failed the same way each time ("retry next cycle"), while waited PR
+        data went 5,896 s stale behind it. Those counts only grow: REST leaves it alone for HEAD_OVERSIZED_RETRY (no
+        request, no consumer charge, no direct-read slot), the PRs are still read, and GraphQL reads it when it can."""
+        sha = "d" * 40
+        many = [workflow_check("build", 1000 + i, workflow="CI", conclusion="SUCCESS") for i in range(250)]
+        for c in many:
+            c["checkSuite"]["app"] = {"slug": "github-actions"}
+        self.gh.heads[("o", "r", sha)] = many
+        self.force_low()
+        key = f"head:o/r@{sha}"
+        head_calls = lambda: [c for c in self.gh.rest_calls() if sha in c[1]]  # noqa: E731
+        per_tick = []
+        # the broker keeps asking and reading, tick after tick
+        with mock.patch.object(gg, "HEAD_INTEREST", 10 ** 6), mock.patch.object(gg, "IDLE_EXPIRY", 10 ** 6):
+            gg.register(key, consumer="lane-broker")
+            gg.register("pr:o/r#1", waited=True)
+            self.daemon.tick(NOW)
+            per_tick.append(len(head_calls()))
+            self.assertIn("workflow runs over REST", gg.read_cache(key)["error"])
+            self.assertEqual(gg.read_cache(key)["restOversizedAt"], NOW)
+            self.assertGreaterEqual(per_tick[0], gg.REST_RUN_PAGES + 2, "the first read pages every list")
+            for n in range(1, 4):  # each a whole cycle later, when an unanswered head is due again
+                self.daemon.tick(NOW + n * (gg.CYCLE + gg.TICK))
+                per_tick.append(len(head_calls()) - sum(per_tick))
+                self.assertEqual(gg.read_cache("pr:o/r#1")["fetchedAt"], NOW + n * (gg.CYCLE + gg.TICK),
+                                 "the waited PR is read on every one of those ticks")
+            self.assertEqual(per_tick[1:], [0, 0, 0], f"REST requests on the head per tick: {per_tick}")
+            self.assertEqual(self.daemon.head_direct_at, [], "nor does it take a direct-read slot")
+            # past HEAD_OVERSIZED_RETRY REST asks once more (it still cannot answer), and is held off again
+            later = NOW + gg.HEAD_OVERSIZED_RETRY + gg.CYCLE
+            self.daemon.tick(later)
+            self.assertGreater(len(head_calls()), sum(per_tick))
+            self.assertEqual(gg.read_cache(key)["restOversizedAt"], later)
+            # GraphQL back: it reads the head (up to HEAD_BATCH_MAX_CONTEXTS_PAGES pages), and the mark goes with the error
+            gg.DAEMON_CONFIG.unlink(missing_ok=True)
+            self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": later + 1800},
+                                  "graphql": {"limit": 5000, "remaining": 4500, "reset": later + 1800}}
+            self.daemon.paths = {**self.daemon.paths, "head": "graphql"}
+            self.daemon.tick(later + gg.CYCLE + gg.TICK)
+        head = gg.read_cache(key)
+        self.assertIsNotNone(head["data"], head.get("error"))
+        self.assertNotIn("restOversizedAt", head)
+
     def test_a_write_refused_by_the_secondary_limit_holds_the_reads_too(self) -> None:
         self.daemon.now = NOW
         self.gh.throttle["rest"] = self.SECONDARY
