@@ -14190,24 +14190,24 @@ class PostTest(unittest.TestCase):
                                                    "/repos/o/r/issues/1/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in notes], ["posted", "queued", "queued"])
 
-    def marker(self, thread: str, head: str, run: str) -> dict:
-        body = f"<!-- review-running sha={head} at=2026-11-21T15:40:00Z run={run} by=router-review -->\nreview running"
+    def marker(self, thread: str, head: str, run: str, ago: float = 60, who: str = "router-review") -> dict:
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - ago))
+        body = f"<!-- review-running sha={head} at={at} run={run} by={who} -->\nreview running"
         return self.queue("comment", thread, "--body", body, "--status-key", f"review-run={run}")
 
-    def test_a_marker_behind_its_heads_receipt_is_retired_as_superseded_not_sent(self) -> None:
+    def test_a_marker_behind_its_own_runs_receipt_is_retired_as_superseded_not_sent(self) -> None:
         head, run = "a" * 40, "run-" + "1" * 16
         mark = self.marker("o/r#9", head, run)
-        other = self.marker("o/r#9", "b" * 40, "run-" + "2" * 16)  # another head: still goes out
-        ship = self.queue("comment", "o/r#9", "--body", f"Review (opus via router-review): SHIP at {head[:12]}")
+        other = self.marker("o/r#9", head, "run-" + "2" * 16)  # a second review of the same head (cmux#31529)
+        ship = self.queue("comment", "o/r#9", "--body",
+                          f"Review (opus via router-review): SHIP at {head[:12]}\n\n<!-- review-run={run} -->")
         ok = (201, {}, {"html_url": "u"})
         d, t = self.daemon(ok, ok)
-        self.step(d, NOW)  # the receipt sorts first and goes; its marker, behind it, is retired in the same tick
+        self.step(d, NOW)  # the receipt sorts first and goes; its run's marker, behind it, is retired in the same tick
         self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
+        self.assertIn(run, gg.post_state(mark["id"])["note"])
         self.step(d, NOW + gg.POST_SPACING)
-        self.assertEqual(len(t.calls), 2)  # the receipt, then the other head's marker: the retirement cost no turn
-        state = gg.post_state(mark["id"])
-        self.assertEqual(state["state"], "superseded")
-        self.assertIn(head[:12], state["note"])
+        self.assertEqual(len(t.calls), 2)  # the receipt, then the second run's marker: its hold still stands
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (ship, other)], ["posted", "posted"])
         self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
 
@@ -14219,17 +14219,28 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual(gg.post_state(verdict["id"])["state"], "posted")
         mark = self.marker("o/r#4", "d" * 40, run)  # queued late: its run already ended
-        done = self.marker("o/r#5", "d" * 40, run)  # another thread: the run's end there is not known
+        elsewhere = self.marker("o/r#5", "d" * 40, run)  # another thread: the run's end there is not known
         self.step(d, NOW + gg.POST_SPACING)
         self.assertEqual(gg.post_state(mark["id"])["state"], "superseded")
         self.assertIn(run, gg.post_state(mark["id"])["note"])
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/4/comments", "/repos/o/r/issues/5/comments"])
-        self.assertEqual(gg.post_state(done["id"])["state"], "posted")  # the same tick: the retirement cost no turn
+        self.assertEqual(gg.post_state(elsewhere["id"])["state"], "posted")  # the same tick: the retirement cost no turn
 
-    def test_a_marker_with_no_receipt_or_end_still_goes_out(self) -> None:
-        mark = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16)
-        self.queue("comment", "o/r#6", "--body", "Review (opus): SHIP at " + "f" * 40)  # another head
-        self.queue("comment", "o/r#7", "--body", "Review (opus): SHIP at " + "e" * 40)  # another thread
+    def test_a_marker_past_the_hold_is_retired_but_a_review_service_one_is_not(self) -> None:
+        old = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16, ago=gg.MARK_HOLD)
+        young = self.marker("o/r#6", "e" * 40, "run-" + "5" * 16, ago=gg.MARK_HOLD - 60)
+        asked = self.marker("o/r#6", "e" * 40, "run-" + "6" * 16, ago=2 * gg.MARK_HOLD, who="review service")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (old, young, asked)], ["superseded", "posted", "posted"])
+        self.assertIn("would hold no merge", gg.post_state(old["id"])["note"])
+
+    def test_a_marker_with_no_end_still_goes_out(self) -> None:
+        mark = self.marker("o/r#6", "e" * 40, "run-" + "7" * 16)
+        self.queue("comment", "o/r#6", "--body", "Review (opus): SHIP at " + "e" * 40)  # another run's receipt, same head
+        self.queue("comment", "o/r#7", "--body", "<!-- review-run=run-" + "7" * 16 + " -->")  # its end, another thread
         ok = (201, {}, {"html_url": "u"})
         d, t = self.daemon(ok, ok, ok)
         for n in range(3):
