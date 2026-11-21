@@ -16436,11 +16436,15 @@ def seconds(text: str) -> float:
     `type=float` took `inf` and `nan`. `inf` blocks forever, which is a process nobody is waiting
     for on purpose; `nan` is worse -- every comparison against it is false, so the loop never
     reaches its deadline and never exits (measured: killed from outside after 3 s). A formatter
-    printing "unknown" for those was treating the symptom one layer too late."""
+    printing "unknown" for those was treating the symptom one layer too late.
+
+    A duration with a unit (90s, 20m, 1h, 1d) is the same count: `wait until` already reads 45m,
+    and `--timeout 20m` refused as "not a number of seconds" was a wasted call that came back."""
+    unit = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*", text)
     try:
-        value = float(text)
+        value = float(unit.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit.group(2)] if unit else float(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds") from None
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds or a duration (90s, 20m, 1h)") from None
     if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError(
             f"{text!r} is not a number of seconds this can wait for: a finite count, not negative")

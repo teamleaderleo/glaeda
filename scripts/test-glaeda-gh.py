@@ -9737,6 +9737,15 @@ class WaitSubscriptionTest(Base):
             with self.subTest(good):
                 self.assertTrue(0 <= gg.seconds(good) <= gg.WAITS_MAX_TIMEOUT)
 
+    def test_a_timeout_with_a_unit_is_its_seconds(self) -> None:
+        """`--timeout 20m` is 1200 s, as `wait until 45m` already reads a unit; a bad unit still refuses."""
+        for text, want in (("90s", 90.0), ("20m", 1200.0), ("1h", 3600.0), ("1.5m", 90.0), ("1d", 86400.0)):
+            with self.subTest(text):
+                self.assertEqual(gg.seconds(text), want)
+        for bad in ("20x", "m", "-5m"):
+            with self.subTest(bad), self.assertRaises(gg.argparse.ArgumentTypeError):
+                gg.seconds(bad)
+
 
 class FileAndPidWaitTest(unittest.TestCase):
     def setUp(self) -> None:
