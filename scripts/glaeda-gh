@@ -10988,6 +10988,72 @@ def land_tail(text: Any, limit: int = LAND_TEXT) -> str:
     return text if len(text) <= limit else "…" + text[-(limit - 1):]
 
 
+# Every read on the land path has more than one route (docs/handbook/read-with-one-quota-route.md), and a refusal
+# reports each route's outcome as its own labelled clause: head_reds tries the store, GraphQL, then REST, and raises
+# "GraphQL: <160 chars>; REST: <160 chars>; the store: <160 chars>" when the live reads both failed (leo-workspace
+# tools/land_judge/engine.py). Which route failed, and whether another could still answer, is the whole difference
+# between a GraphQL-only outage this host can read around and a GitHub-wide one it cannot -- and that verdict sits in
+# the clauses a head-cut drops first. big-red, 2026-11-21 12:08Z: a queue park's stored reason ended "... GraphQL: gh
+# api graphql failed: ...; REST:" and stopped there, because land_trim(text, 300) landed exactly at the start of the
+# REST clause; /rate_limit read 3873 REST left for the same login at 12:07:37Z, so the park that held 26 of 27 rows
+# (4 repos, 3 lanes) for 49 min may have been a GraphQL-only failure, and no log on the host kept what REST said
+# (50,508 lines of glaeda-gh.jsonl searched, no match). So a trimmed reason spends its budget *within* the clauses:
+# every route's verdict survives, the first route's verbose stack trace is what goes.
+LAND_ROUTE_CLAUSE = re.compile(r"(?:^|(?<=; )|(?<=: )|(?<=, ))((?:the )?"
+                               r"(?:graphql|rest|store|cache|direct|upstream|broker)\s*:\s)", re.I)
+LAND_CLAUSE_MIN = 24  # a clause keeps its label and the first words of its verdict, or the budget is spent flat
+
+
+def land_route_clauses(text: str) -> list[str]:
+    """TEXT as the clauses it reports: what precedes the first route label, then one piece per route label
+    (LAND_ROUTE_CLAUSE), each without the boundary punctuation it ended on (land_reason joins them back with "; ",
+    the separator this same split reads, so trimming an already-trimmed reason keeps finding the clauses). One route
+    named, or none: [TEXT], so land_reason trims exactly as land_trim does."""
+    starts = [m.start(1) for m in LAND_ROUTE_CLAUSE.finditer(text)]
+    if len(starts) < 2:
+        return [text]
+    cuts = ([0] if starts[0] else []) + starts + [len(text)]
+    pieces = [text[a:b].rstrip(" ;,:") for a, b in zip(cuts, cuts[1:])]
+    return [p for p in pieces if p]
+
+
+def land_shares(lengths: list[int], budget: int) -> list[int]:
+    """BUDGET split over LENGTHS so that no piece is dropped whole while another keeps detail: an equal share each,
+    and a piece shorter than its share gives what it does not need back to the longer ones (one word of a route's
+    answer is worth more than another 100 characters of the first route's stack trace)."""
+    shares = [0] * len(lengths)
+    left, pending = budget, list(range(len(lengths)))
+    while pending:
+        share = left // len(pending)
+        fits = [i for i in pending if lengths[i] <= share]
+        if not fits:  # every piece still wants more than its share: split what is left, the remainder to the first
+            for n, i in enumerate(pending):
+                shares[i] = share + (1 if n < left - share * len(pending) else 0)
+            break
+        for i in fits:
+            shares[i], left = lengths[i], left - lengths[i]
+            pending.remove(i)
+    return shares
+
+
+def land_reason(text: Any, limit: int = LAND_TEXT) -> str:
+    """TEXT on one line within LIMIT characters, every route's verdict kept (LAND_ROUTE_CLAUSE's comment).
+
+    A refusal naming two or more routes is trimmed clause by clause, each with its share of the budget
+    (land_shares), so "GraphQL: ...; REST: ...; the store: ..." always shows what all three answered and detail goes
+    before a verdict does. Anything else -- one route, no route, a budget too small for every clause to keep its
+    label -- is land_trim, unchanged."""
+    one = " ".join(str(text or "").split())
+    if len(one) <= limit:
+        return one
+    pieces = land_route_clauses(one)
+    joiners = 2 * (len(pieces) - 1)  # the "; " each clause after the first is joined back on
+    if len(pieces) < 2 or limit - joiners < len(pieces) * LAND_CLAUSE_MIN:
+        return land_trim(one, limit)
+    shares = land_shares([len(p) for p in pieces], limit - joiners)
+    return "; ".join(land_trim(p, s) for p, s in zip(pieces, shares))
+
+
 def land_checks_running(data: dict, head: str) -> bool:
     """Whether the cache shows checks still running at HEAD (a pending status counts, and so does an unfinished context
     a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
@@ -11114,7 +11180,7 @@ def land_fallback(answer: dict, head: str) -> dict:
     code = str(answer.get("code") or "other")
     kind = LAND_FALLBACK.get(code)
     if code in LAND_STOP_CLASSES:
-        return {"v": 1, "kind": "stop", "stop": LAND_STOP_CLASSES[code], "why": land_trim(answer.get("reason"))}
+        return {"v": 1, "kind": "stop", "stop": LAND_STOP_CLASSES[code], "why": land_reason(answer.get("reason"))}
     if kind == "update_branch":
         return {"v": 1, "kind": kind, "expected_head_sha": head}
     if kind == "wait_pr":
@@ -12056,7 +12122,7 @@ class LandQueue:
                     self.queue_park_voided = (self.queue_quota_until, why)
                     log({"event": "land-queue-park-overridden", "until": utc_clock(self.queue_quota_until),
                          "why": why, "parkedAt": utc_clock(self.queue_quota_at),
-                         "reason": land_trim(self.queue_quota_reason, 160)})
+                         "reason": land_reason(self.queue_quota_reason, 160)})
                 self.clear_queue_park()
                 return False
             if self.queue_quota_until:
@@ -12074,7 +12140,7 @@ class LandQueue:
             if self.queue_quota_until >= until and self.queue_quota_until > self.now:
                 return  # a later refusal must never shorten the host-wide hold
             self.queue_quota_until = max(self.queue_quota_until, until)
-            self.queue_quota_reason = land_trim(land_redact(text), 300)
+            self.queue_quota_reason = land_reason(land_redact(text), 300)
             self.queue_quota_at = self.now
             self.queue_park_voided = None
             write_json(land_dir() / LAND_QUOTA_FILE,
@@ -12433,7 +12499,7 @@ class LandQueue:
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
              "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
-             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_trim(self.queue_quota_reason, 160)}
+             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_reason(self.queue_quota_reason, 160)}
              if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
@@ -12803,7 +12869,7 @@ class LandQueue:
             return False
         self.stop(e, "after_stopped",
                   f"{key_name(a)}, which it lands after, stayed stopped ({st.get('code') or 'stopped'}: "
-                  f"{land_trim(st.get('reason'), 160)}) for {LAND_AFTER_STOPPED_WAIT:.0f} s",
+                  f"{land_reason(st.get('reason'), 160)}) for {LAND_AFTER_STOPPED_WAIT:.0f} s",
                   f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
         return True
 
@@ -13134,7 +13200,7 @@ class LandQueue:
                     answer = doc
                     break
         if answer is None or got.returncode not in (0, 1, 3):
-            why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}")
+            why = land_reason(got.stderr or got.stdout or f"exit {got.returncode}")
             return {"ok": False, "code": "explain_failed", "reason": f"land_judge explain exit {got.returncode}: {why}",
                     "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
         if got.returncode != 0:
@@ -13151,7 +13217,7 @@ class LandQueue:
                 self.history(e, "window_capped", pool="graphql", cacheOnly="miss", next=utc_clock(nxt))
             return {"ok": False, "code": "host_cap", "head": sha, "cacheMiss": True,
                     "reason": f"not judged this window: host cap (graphql), and this host's caches could not judge it "
-                              f"({land_trim(answer.get('reason'), 200)})",
+                              f"({land_reason(answer.get('reason'), 200)})",
                     "next": f"none (judged again once the next window opens at {utc_clock(nxt)})",
                     "action": {"v": 1, "kind": "retry", "after_s": max(LAND_RETRY_DEFAULT, nxt - self.now)}}
         return answer
@@ -13214,7 +13280,7 @@ class LandQueue:
             self.count("explain")
             e["head"] = head or e.get("head") or ""
             e["explain"] = {"at": self.now, "ok": bool(answer.get("ok")), "code": str(answer.get("code") or ""),
-                            "reason": land_trim(answer.get("reason")), "next": land_trim(answer.get("next")),
+                            "reason": land_reason(answer.get("reason")), "next": land_trim(answer.get("next")),
                             "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict)}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"))
@@ -13249,7 +13315,7 @@ class LandQueue:
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
                           f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
-                          f"refusals in a row: {land_trim(answer.get('reason'))}", land_trim(answer.get("next")))
+                          f"refusals in a row: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
                 return
             self.save(e)
         self.take(e, act, answer)
@@ -13294,7 +13360,7 @@ class LandQueue:
         self.stop(e, f"{kind}_deadline",
                   f"waited {waited:.0f} s (deadline {b['deadline']:.0f} s, {b['n']} judgments{idle}) at "
                   f"{head[:12] or '?'} "
-                  f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_trim(answer.get('reason'))}",
+                  f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_reason(answer.get('reason'))}",
                   land_trim(answer.get("next")))
         return True
 
@@ -13321,7 +13387,7 @@ class LandQueue:
         left = land_unfinished(data, self.now) if fp else ""
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
                   f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
-                  f"{land_trim(reason, 200)}", land_trim(nxt))
+                  f"{land_reason(reason, 200)}", land_trim(nxt))
         return True
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
@@ -13368,7 +13434,7 @@ class LandQueue:
             if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
                 return
             with self.lock:
-                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
+                self.stop(e, cls, land_reason(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
@@ -13416,7 +13482,7 @@ class LandQueue:
                 if capped:
                     self.stop(e, "rerun_failed_cap",
                               f"run {', '.join(map(str, capped))} was rerun {LAND_RERUN_CAP} times at {head[:12]} and "
-                              f"is still cancelled: {land_trim(answer.get('reason'))}",
+                              f"is still cancelled: {land_reason(answer.get('reason'))}",
                               f"gh run view {capped[0]} -R {repo}")
                     return
                 for r in runs:  # counted before the send: a restart mid-send counts it
@@ -14069,12 +14135,12 @@ class LandQueue:
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
-                 stop={"code": code, "reason": land_trim(reason), "next": land_trim(nxt), "at": self.now})
+                 stop={"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now})
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing
             e.pop(held, None)
-        self.history(e, "stopped", code=code, reason=land_trim(reason, 160))
+        self.history(e, "stopped", code=code, reason=land_reason(reason, 160))
         self.save(e)
-        msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_trim(reason, 300)}"
+        msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
         if nxt:
             msg += f" next: {land_trim(nxt, 300)}"
         self.notify(e, e.get("requester") or "", msg)
@@ -14303,10 +14369,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         bits.append(f"merge {e['mergeSha'][:12]}")
     if e["state"] == "stopped":
         st = e.get("stop") or {}
-        bits.append(f"{st.get('code')}: {land_trim(st.get('reason'), 160)}")
+        bits.append(f"{st.get('code')}: {land_reason(st.get('reason'), 160)}")
     elif (e.get("explain") or {}).get("code") == "explain_failed":
         # land_judge itself failed (a crash, a bad python): its words, or the line reads like a quota wait.
-        bits.append(f"explain_failed: {land_trim(e['explain'].get('reason'), 160)}")
+        bits.append(f"explain_failed: {land_reason(e['explain'].get('reason'), 160)}")
     if e.get("requester"):
         bits.append(f"for {e['requester']}")
     o = e.get("override")
@@ -14433,7 +14499,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if queue:
         print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
               f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
-              f"{land_trim(queue.get('reason'), 200)}")
+              f"{land_reason(queue.get('reason'), 200)}")
     for e in entries:
         print(land_line(e, now, latch, queue))
         if target:
@@ -14520,7 +14586,7 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
             if out.get("ok") or out.get("code") == "land_judge_missing":
                 staged.unlink(missing_ok=True)  # taken (or refused for good, and said so below)
             else:
-                why = f"{name}: {land_trim(out.get('reason') or out.get('code'), 200)}"
+                why = f"{name}: {land_reason(out.get('reason') or out.get('code'), 200)}"
         if not why:
             land_print_answer(out, as_json, key, name)
             if out.get("code") == "land_judge_missing" and not as_json:
