@@ -4517,15 +4517,21 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
             continue
         where = ".".join(str(e[k]) for k in ("resource", "field") if e.get(k))
         code = str(e.get("code") or "")
-        parts.append(f"{where}: {code}" if where and code else where or code)
-    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip()
+        part = f"{where}: {code}" if where and code else where or code
+        if part:  # an error dict with none of the three says nothing; empty parens say less than no parens
+            parts.append(part)
+    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip().rstrip(":")  # a body with no message: no bare colon
     if parts:
-        line += f" ({'; '.join(p for p in parts if p)})"
-    if status == 404 and repo:
+        line += f" ({'; '.join(parts)})"
+    if repo:
         number = item.get("number")
         reached = f"{repo}#{number}" if number else repo
-        line += (f": no {reached} this login can write to -- the repository (wrong owner, renamed, or no access)"
-                 + (f" or the number {number}" if number else ""))
+        # Every status, not only 404: the 422 that started this (`post pr manaflow-ai/glaeda`) read as a bad head
+        # branch precisely because the line never said which repository the head was being pushed into.
+        line += f": writing {reached}"
+        if status in (403, 404):
+            line += (" -- no such target this login can write to: the repository (wrong owner, renamed, or no"
+                     " access)" + (f" or the number {number}" if number else ""))
         name = repo.split("/")[-1]
         elsewhere = sorted(s for s in (known or {}) if s != repo and s.split("/")[-1] == name)
         if elsewhere:

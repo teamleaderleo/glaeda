@@ -15966,13 +15966,36 @@ class AWriteGithubRefusedNamesWhatItRefusedTest(unittest.TestCase):
                                 {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
         self.assertNotIn("known here as", line)
 
+    def test_a_422_names_the_repository_it_was_writing_too(self) -> None:
+        # The incident this started from. `post pr manaflow-ai/glaeda` recorded a 422 whose every word was about the
+        # head branch, so the owner -- the word that was wrong -- was never in question. Naming the target only on
+        # 404 would leave that read in place, and it is the read that cost the five calls.
+        line = gg.write_failure({"kind": "pr", "repo": "manaflow-ai/glaeda", "head": "b", "base": "main"}, 422,
+                                self.PR_422, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertIn("manaflow-ai/glaeda", line)
+        self.assertIn("teamleaderleo/glaeda", line, "the hint does not belong to the 404 branch")
+        self.assertNotIn("no such target", line, "422 is not a reachability verdict; only 403/404 say that")
+
+    def test_a_body_with_nothing_to_add_adds_no_empty_punctuation(self) -> None:
+        # Two shapes a real GitHub body does not have, and a reader of a damaged one should not have to parse:
+        # "HTTP 404::" from an empty message, and "HTTP 404: M ()" from an error dict with no resource, field or code.
+        self.assertNotIn("::", gg.write_failure({"kind": "comment", "repo": "o/r"}, 404, {"message": ""}))
+        line = gg.write_failure({"kind": "comment", "repo": "o/r"}, 404, {"message": "M", "errors": [{}]})
+        self.assertNotIn("()", line, line)
+
     def test_every_line_is_one_line(self) -> None:
         # post_finish records it as the item's "error" and `post status` prints it as the last word on the write; a
-        # newline in it breaks every reader that takes the last line.
-        for status, doc in ((422, self.PR_422), (404, {"message": "Not Found"}), (403, {"message": "Forbidden"})):
+        # newline in it breaks every reader that takes the last line. The docs that carry one are the point: without
+        # them this test passes with the collapse deleted, because no fixture below has a newline of its own.
+        newlines = {"message": "Validation Failed\nsee the docs",
+                    "errors": [{"resource": "PullRequest", "field": "head", "message": "no commits\r\nbetween\tthem"}]}
+        for status, doc in ((422, self.PR_422), (404, {"message": "Not Found"}), (403, {"message": "Forbidden"}),
+                            (422, newlines), (404, {"message": "Not\nFound"})):
             line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 1}, status, doc,
                                     known={"teamleaderleo/glaeda": "/x"})
             self.assertNotIn("\n", line, line)
+            self.assertNotIn("\r", line, line)
+            self.assertNotIn("\t", line, line)
             self.assertTrue(line.startswith(f"HTTP {status}"), line)
 
 
