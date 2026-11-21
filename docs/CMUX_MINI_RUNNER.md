@@ -490,6 +490,25 @@ What `--apply` does:
        `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
        default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
        and `off` or 0 turns it off.
+     - **Which labels a gate reasons with** (`cap_labels`; hq#16433, hq#16544). Every feed read
+       above filters the queue with `set(job["labels"]) <= cap_labels`, so a gate that understates
+       its runner's labels sees none of the work it could take: on 2026-11-21 two austin minis'
+       `-glaeda-1` receipts read side-light while GitHub dispatched side-std jobs to both, and
+       neither reserved, listened urgently or answered a starved job of that label. `receipt.json`
+       records the labels an install last *asked* GitHub for (it stamps "GitHub labels could not be
+       read; re-registering with the supplied token" when it could not confirm them), so the gate
+       unions in what GitHub was *seen* to dispatch here: GitHub hands a job only to a runner whose
+       labels cover every `runs-on` label, so a dispatch in the feed is proof of a label, never a
+       claim to one. The feed's window is minutes, so each sighting is also written down per runner
+       in `observed-labels-<runner-dir>.json` in the state dir (label to last sighting, bounded at
+       64 entries and 16 KiB) and kept until GitHub stops dispatching it for 7 days
+       (`GLAEDA_RUNNER_OBSERVED_LABEL_TTL_S` in the runner LaunchAgent's environment, seconds); a
+       real relabel away from a label stops its dispatches, so the TTL is what retires it. This
+       only ever widens what a gate *considers*: admission (`take_capacity`) reads no labels, and
+       GitHub alone decides what reaches a runner. The one answer that reads a label to keep
+       *less* room - a simulator runner listening at its own fit instead of the side label's
+       costliest job (`IOS_SIM_OWN_FIT` above) - reads the live feed window only, never the
+       remembered set. The gate's state file publishes the disagreement as `label_drift`.
      - **Memory cap** (`MEMORY_CAP`, cmuxterm-hq#12838). The 16 GiB minis (cmux17, 18, 21, 22)
        showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z
        cmux17's JetsamEvent killed a dozen daemons for low swap while eight `swift-frontend`
