@@ -30184,6 +30184,29 @@ class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
                          ["next: glaeda-gh post comment o/r#1 --status-key k",
                           "next: glaeda-gh post pr o/r#1 --title t"])
 
+    def test_a_flag_typed_in_another_case_still_takes_its_value(self) -> None:
+        """Re-review of #2381: `positional_words` read a flag's name exactly or by abbreviation only, so a
+        flag typed in one of the case conventions `flag_spelling_synonym` accepts (`--statusKey`,
+        `--Author`) looked to take no value. Its value then counted as a positional word, the call went
+        over capacity, and the rewriter fired on a call that parses -- the one thing it must never do.
+        A value is a value in every spelling of its flag."""
+        for raw in (["post", "comment", "--statusKey", "review", "o/r#1", "--body-file", "f"],
+                    ["wait", "comment", "--Author", "pr", "o/r#1"],
+                    ["post", "pr", "--Title", "comment", "o/r", "--head", "h", "--base", "b"],
+                    ["post", "comment", "--status_key", "comment", "o/r#1", "--body", "hi"]):
+            self.assertEqual(gg.doubled_kind_synonym(list(raw)), (list(raw), []), raw)
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_a_refusals_next_lines_drop_a_case_typed_flag_with_its_value(self) -> None:
+        """The same root cause in `own_kinds_flags`: it dropped a variant-spelled flag scoped away from the
+        reading but left its value behind as a stray word, so the `next:` line it printed exited 64 with
+        `unrecognized arguments`. A next line is printed to be run."""
+        _, refusal = gg.doubled_kind_synonym(["post", "pr", "comment", "o/r#1", "--Title", "t",
+                                              "--statusKey", "k"])
+        self.assertEqual(sorted(line for line in refusal if line.startswith("next: ")),
+                         ["next: glaeda-gh post comment o/r#1 --statusKey k",
+                          "next: glaeda-gh post pr o/r#1 --Title t"])
+
     def test_a_help_text_naming_its_kind_in_the_plural_scopes_the_same(self) -> None:
         """Review of #2381, F5: `wait`'s own help says `comments:`, `runs:` and `PRs:`, so a scope read as
         the exact word missed every one of them and only `--exists`, `--gone` and `--contains` (`file:`)
