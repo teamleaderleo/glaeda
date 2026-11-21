@@ -14391,6 +14391,13 @@ class LandQueue:
             cls = str(act.get("stop") or answer.get("code") or kind)
             if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
                 return
+            if land_override_takes(e, act, head):
+                # LAND_OVERRIDE_TAKES' comment: the requester's override answers this refusal at the head judged now,
+                # the queue's own update-branch's head included, as a pinned merge carrying it
+                with self.lock:
+                    self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
+                self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                return
             with self.lock:
                 self.stop(e, cls, land_reason(why), land_trim(nxt or answer.get("next")))
             return
@@ -15245,6 +15252,25 @@ def land_override_env(e: dict) -> dict[str, str]:
     if not isinstance(o, dict) or not o.get("reason") or not o.get("receipt"):
         return {}
     return {"LAND_JUDGE_OVERRIDE": str(o["reason"]), "LAND_JUDGE_OVERRIDE_RECEIPT": str(o["receipt"])}
+
+
+# An entry queued with an override (`land --override-reason R --override-receipt T`) carried it only on the merge
+# step, and land_judge explain, which runs without it, decides whether there is a merge step at all. So a refusal that
+# names no step the queue runs stopped it, the override unused: cmux#47821 lost its override once the queue's own
+# update-branch moved the head and the new head was refused, and hq#17374 (docs alone, head f4a442a5) was refused
+# ci_never_ran three times on 2026-11-21 with --override-reason given, until its owner pushed an empty commit. Now
+# such a refusal (a "command" step, or a stop outside LAND_STOP_CLASSES: own_red, ci_never_ran, a stuck check) at the
+# head judged now -- whichever head that is, the queue's own update-branch's included -- is a pinned merge at that
+# head carrying the override, which the shim's or the broker's land_judge logs. A hold, BLOCK, teammate, conflict or
+# other LAND_STOP_CLASSES stop still stops: those are the PR's, not a check's. Waits and update-branch steps are
+# taken as before, so an override never skips a check still running.
+def land_override_takes(e: dict, act: dict, head: str) -> bool:
+    """True when E's override answers ACT, a refusal's stop or command step at HEAD (the comment above)."""
+    if not land_override_env(e) or not SHA40.fullmatch(head or ""):
+        return False
+    if act.get("kind") == "command":
+        return True
+    return act.get("kind") == "stop" and str(act.get("stop") or "") not in set(LAND_STOP_CLASSES.values())
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",

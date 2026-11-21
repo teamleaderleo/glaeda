@@ -24340,6 +24340,46 @@ class LandTest(Base):
                          (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
         self.assertEqual(e["state"], "merged")
 
+    def test_land_override_survives_the_queues_own_update_branch_and_merges_past_ci_never_ran(self):
+        # cmux#47821 lost its override when the queue updated the branch itself; hq#17374 (docs alone) was refused
+        # ci_never_ran three times with --override-reason given. The override answers the refusal at the new head.
+        never = f"git commit --allow-empty -m 'ci: start CI' && git push && glaeda-gh wait pr o/r#1 --until done"
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA},
+                                      nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={LA}"))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.assertEqual(self.merge_envs(), [])  # an update_branch step is taken as named, never skipped
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(refusal("ci_never_ran", LB, {"kind": "command", "text": never}, nxt=never))
+        e = self.tick()
+        self.assertEqual(e.get("override"), self.OVERRIDE)
+        self.assert_merged_at(LB)
+        [env] = self.merge_envs()
+        self.assertEqual((env.get("LAND_JUDGE_OVERRIDE"), env.get("LAND_JUDGE_OVERRIDE_RECEIPT")),
+                         (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+        took = [h for h in e["history"] if h["event"] == "override_merge"]
+        self.assertEqual((took[-1]["code"], took[-1]["head"], took[-1]["override"]),
+                         ("ci_never_ran", LB[:12], self.OVERRIDE["reason"]))
+
+    def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
+        never = "git commit --allow-empty -m x && git push"
+        for override, answer, stopped in (
+                (dict(self.OVERRIDE), refusal("held", LA, {"kind": "stop", "stop": "hold", "why": "HOLD"}), "hold"),
+                (dict(self.OVERRIDE), refusal("teammate", LA, {"kind": "stop", "stop": "teammate"}), "teammate"),
+                (None, refusal("ci_never_ran", LA, {"kind": "command", "text": never}, nxt=never), "ci_never_ran")):
+            with self.subTest(stopped=stopped):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA)
+                gg.land_request("land", "o/r#1", [], "host/lane", override=override)
+                self.w.answers.append(answer)
+                e = self.tick()
+                self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", stopped))
+                self.assertEqual(self.merge_envs(), [])
+
     def test_land_override_past_lane_gh_lands_limits_is_refused_at_enqueue(self):
         bad = [["--override-reason", "r"], ["--override-receipt", "t"],
                ["--override-reason", "r" * 201, "--override-receipt", "t"],
