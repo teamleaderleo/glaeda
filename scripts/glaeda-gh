@@ -11203,6 +11203,15 @@ LAND_RESET_STAGGER_S = 3600.0
 # The coordinator, 2026-11-20: right after the GraphQL reset glaeda land held PRs "not judged this window: host cap
 # (graphql)" while their verdict was a cache read away (cmux#46128, #46236, #46782 had sat 6 h on unreadable reads).
 LAND_CACHE_ONLY_MAX_AGE = 900  # merge_hold's own --cache-only bound (its CACHE_ONLY_MAX_S)
+# LAND_REST_ROUTE: when GraphQL's live count is spent to its hard reserve (so no pace slot opens before its reset) and
+# REST's live count has paced room, a judgment the caches miss is judged live, and charged to REST alone. land_judge
+# judges in full over REST when GraphQL refuses: its GraphQL reads (`gh pr view`, main's required checks) fall to
+# `gh api repos/O/R/...`, and a GraphQL-only fact it cannot read it notes and judges without ("main's required checks
+# could not be read ... judged in full"). huge-blue, 2026-11-21: GraphQL 0/5000 from 21:38Z to 22:38Z with REST at
+# 3900/5000; glaeda#2394 (20/20 green) and cmux#49140, #49147, #49227, #49241, #49339 sat "host cap ... cacheOnly=miss"
+# 80+ min, and nightly-30min lagged 168 min; `land-judge explain teamleaderleo/glaeda 2394` at 22:28Z, GraphQL at 0,
+# answered ok over REST in 141 s. The pace still holds: a REST judgment waits for REST's own slot, and a pool with no
+# fresh reading opens no REST route.
 LAND_JUDGE_COST = {"rest": 5.0, "graphql": 3.0}
 LAND_WINDOW_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
@@ -13208,6 +13217,16 @@ class LandQueue:
         w.setdefault("graphql", 0.0)
         return w
 
+    def rest_route_room(self, nexts: dict, seen: dict | None) -> bool:
+        """Whether a judgment GraphQL's pace leaves out may go over REST now (LAND_REST_ROUTE): GraphQL's fresh reading
+        is spent to its hard reserve (no slot opens before its reset), and REST has a fresh reading with paced room
+        now. An unread REST pool is no room: this route spends only what GitHub's count shows."""
+        if not isinstance(seen, dict) or float(seen["remaining"]) - hard_reserve_floor()["graphql"] \
+                >= LAND_JUDGE_COST["graphql"]:
+            return False  # GraphQL has points over its reserve: its next slot comes, as before
+        rest = nexts.get("rest")
+        return rest is not None and rest[0] <= self.now
+
     def window_room(self, e: dict) -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
@@ -13227,6 +13246,11 @@ class LandQueue:
         pool = over[0]
         slot = float(w.get("graphqlAt", float("-inf")))
         nxt, seen = nexts[pool]
+        if over == ["graphql"] and self.rest_route_room(nexts, seen):
+            # GraphQL is spent to its reserve and REST has paced room: the caches first, then a live judgment over
+            # REST, charged to REST alone (LAND_REST_ROUTE's comment).
+            e["cacheOnlyJudge"] = "rest"
+            return True
         if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == slot:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
             # One that missed already in this slot waits for the next, as any capped entry does.
@@ -13252,8 +13276,10 @@ class LandQueue:
         (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
         if not isinstance(e.get("cacheOnlyJudge"), float):  # a pace slot's cache-only judgment sends nothing
-            for pool, cost in LAND_JUDGE_COST.items():
-                w[pool] += cost
+            # a REST-route judgment (LAND_REST_ROUTE) sends no GraphQL the pace could give: charged to REST alone
+            pools = ("rest",) if e.get("cacheOnlyJudge") == "rest" else LAND_JUDGE_COST
+            for pool in pools:
+                w[pool] += LAND_JUDGE_COST[pool]
                 w[f"{pool}At"] = self.now
         e.pop("windowCapped", None)
         write_json(land_dir() / "window.json", w)
@@ -14042,8 +14068,11 @@ class LandQueue:
         cached = argv + ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]
         # After an unreadable answer: the caches first, live only on a miss (LAND_UNREAD_SAME_STOP's comment); paced out
         # of GraphQL: the caches alone (the comment above LAND_JUDGE_COST)
-        tries = [cached, argv] if cache_only == "unread" else [cached] if cache_only is not None else [argv]
-        if cache_only == "unread":
+        tries = [cached, argv] if cache_only in ("unread", "rest") else [cached] if cache_only is not None else [argv]
+        if cache_only in ("unread", "rest"):
+            if cache_only == "rest":
+                with self.lock:
+                    self.count("rest_route")  # GraphQL spent to its reserve: judged over REST (LAND_REST_ROUTE)
             cache_only = None
         snap, _ = self.snapshot(e["key"], sha)
         extra = {}

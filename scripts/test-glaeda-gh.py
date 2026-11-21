@@ -25636,6 +25636,67 @@ class LandTest(Base):
             self.assertEqual(sum(1 for n, only in seen if only and f"pr:o/r#{n}" == e["key"]), 1)  # once a slot
         self.assertLessEqual(gg.read_json(gg.land_dir() / "window.json")["graphql"], gg.LAND_JUDGE_COST["graphql"])
 
+    def test_graphql_spent_to_its_reserve_judges_over_rest_and_charges_rest_alone(self):
+        """huge-blue, 2026-11-21 21:18-22:38Z: GraphQL 0/5000 with REST at 3900/5000. glaeda#2394 (20/20 green) sat
+        "judged code=host_cap ... window_capped cacheOnly=miss pool=graphql" 80+ min, though land_judge judged it ok
+        over REST in 141 s with GraphQL at 0 (LAND_REST_ROUTE). With GraphQL's live count at its hard reserve and REST
+        read with room, a cache miss is judged live, charged to REST alone, and merges; with REST unread, it waits for
+        GraphQL's reset as before."""
+        head = format(0xF1, "040x")
+        reserve = gg.hard_reserve_floor()
+
+        reset = self.t + 1200
+        self.q.reading = lambda pool: {"limit": 5000, "remaining": 0 if pool == "graphql" else 3900, "reset": reset,
+                                       "seenAt": self.t}
+        self.w.set_pr("pr:o/r#1", land_pr(head), self.t)
+        self.land("o/r#1")
+        seen: list[bool] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                seen.append("--cache-only" in argv)
+                if "--cache-only" not in argv:
+                    rc, doc = ok_answer(head)
+                    doc["action"]["number"] = 1
+                    self.w.answers.append((rc, doc))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(4):
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(30)
+        self.assertIn(False, seen, seen)  # judged live after the caches missed
+        self.assertEqual(seen[:2], [True, False], seen)  # the caches first, then REST
+        self.assertEqual(self.q.entries["pr:o/r#1"]["state"], "merged")
+        w = gg.read_json(gg.land_dir() / "window.json")
+        self.assertEqual(w["graphql"], 0.0)  # no GraphQL charged: the pace keeps its count
+        self.assertGreaterEqual(w["rest"], gg.LAND_JUDGE_COST["rest"])
+        self.assertGreater(3900 - reserve["rest"], gg.LAND_JUDGE_COST["rest"])
+
+    def test_graphql_spent_with_rest_unread_still_waits_for_the_graphql_reset(self):
+        """The REST route spends only what GitHub's count shows: with no fresh REST reading, a cache miss under a
+        spent GraphQL pool keeps its place (host_cap) and sends no live judgment."""
+        head = format(0xF2, "040x")
+        self.q.reading = lambda pool: {"limit": 5000, "remaining": 0, "reset": self.t + 1200, "seenAt": self.t} \
+            if pool == "graphql" else None
+        self.w.set_pr("pr:o/r#1", land_pr(head), self.t)
+        self.land("o/r#1")
+        live: list[list] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"] and "--cache-only" not in argv:
+                live.append(argv)
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(4):
+            self.tick(30)
+        self.assertEqual(live, [])
+        e = self.q.entries["pr:o/r#1"]
+        self.assertNotEqual(e["state"], "merged")
+        self.assertIn("not judged this window: host cap (graphql", gg.land_line(e, self.t, latch=None))
+
     def test_the_same_raised_unreadable_three_times_stops_naming_it_to_its_requester(self):
         """gcp-agent-lane-1, 2026-11-21: 26 of 38 judgments in 2 h ended "unreadable" and were retried, each holding a
         worker to learn nothing new (cmux#49035: the same KeyError on every pass). The same raised error text at one
