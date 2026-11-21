@@ -19705,10 +19705,65 @@ def head_served(entry: dict | None, now: float, max_age: float) -> tuple[dict | 
     return data, age < HEAD_SETTLED_TTL + 2 * daemon_policy()["cycles"]["head"]
 
 
-def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool) -> int:
+PR_ROLLUP_ROUTE = "pr-rollup"
+PR_ROLLUP_GREEN = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
+
+
+def pr_rollup_head(repo: str, number: int, sha: str, now: float) -> tuple[dict | None, str]:
+    """The second route for a head `checks` holds no entry for (hq docs/handbook/read-with-one-quota-route.md): PR
+    NUMBER's own cached read, when its headRefOid is SHA and its rollup is whole and green. Returns (the head as
+    `checks` serves it, "") or (None, why not). A read of the head can fail (the upstream's 60 s timeout on lane hosts,
+    glaeda#2396 2026-11-21) while the PR's read beside it already holds every check of that head.
+
+    Green only: every check finished success, skipped or neutral, no required check missing, the list not cut short
+    (checksTruncated, checksPageError). Anything else, a red or one still running, stays unread, so the caller's live
+    read decides: the rollup keeps no check-run ids, suites or step counts, which judging a red needs. The answer is
+    marked route=pr-rollup, with `at` the PR read's own time and `stale` by head_served's settled rule. It holds the
+    head's own repository's checks only (never a CHECKS_OF_RECORD repository's), as land-judge judges them."""
+    entry = read_cache(parse_key("pr", f"{repo}#{number}")) or {}
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    at = entry.get("dataAt")
+    if not data or not isinstance(at, (int, float)) or isinstance(at, bool):
+        return None, f"no cached read of #{number}"
+    if str(data.get("headRefOid") or "").lower() != sha:
+        return None, f"#{number}'s cached head is {str(data.get('headRefOid') or 'unknown')[:12]}"
+    checks = data.get("checks")
+    if not isinstance(checks, list) or not checks or not all(isinstance(c, dict) for c in checks):
+        return None, f"#{number}'s cached read lists no checks"
+    if data.get("checksTruncated") or data.get("checksPageError"):
+        return None, f"#{number}'s cached rollup is cut short"
+    if data.get("requiredMissing"):
+        return None, f"#{number} has required checks not reported: {', '.join(map(str, data['requiredMissing']))[:120]}"
+    not_green = sorted(str(c.get("name")) for c in checks
+                       if c.get("status") != "COMPLETED" or str(c.get("conclusion") or "").upper() not in PR_ROLLUP_GREEN)
+    if not_green:
+        return None, f"#{number}'s cached rollup is not all green ({', '.join(not_green)[:120]}): the live read decides"
+    found: dict[str, list] = {}
+    states: dict[str, str] = {}
+    rollup = []
+    for c in checks:
+        conclusion = str(c.get("conclusion") or "").lower()
+        status_context = "id" not in c and not c.get("workflow")  # parse_pr writes no id for a StatusContext
+        key = f"status / {c.get('name')}" if status_context else f"{c.get('workflow') or 'check'} / {c.get('name')}"
+        found[key] = ["completed", conclusion]
+        if status_context:
+            states[key] = conclusion
+        rollup.append({"name": c.get("name"), "workflow": c.get("workflow"), "status": "COMPLETED",
+                       "conclusion": conclusion.upper(), "required": bool(c.get("required")),
+                       "runId": c.get("runId"), "statusContext": status_context})
+    settled_age = HEAD_SETTLED_TTL + 2 * daemon_policy()["cycles"]["head"]
+    return {"found": found, "ids": {}, "settled": True, "statusStates": states, "at": at,
+            "stale": now - at >= settled_age, "route": PR_ROLLUP_ROUTE, "pr": number,
+            "age": round(max(0.0, now - at), 1), "rollup": rollup}, ""
+
+
+def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool,
+               pr: int | None = None) -> int:
     """Every check of each commit, from the daemon's cache. The daemon reads each head once for all
     sessions, within the consumer's hourly budget; a head it may not read is served stale or reported
-    unread, and this command never reads GitHub itself."""
+    unread, and this command never reads GitHub itself. With PR, a head the store has no entry for is
+    served from that PR's cached rollup when it is of this head and all green (pr_rollup_head); each
+    head names its route (head or pr-rollup)."""
     if not CONSUMER_RE.fullmatch(consumer or ""):
         raise WatchError("--consumer must be a short name (letters, digits, . _ -), e.g. autoland")
     keys = {}
@@ -19754,7 +19809,7 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if sha in served:
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
-                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh,
+                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh, "route": "head",
                           **({"statusDescriptions": data["statusDescriptions"]}
                              if isinstance(data.get("statusDescriptions"), dict) else {})}
             if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
@@ -19762,7 +19817,12 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         elif sha in missing:
             unread[sha] = "no such commit"
         else:
-            unread[sha] = "budget spent" if spent else "not read yet"
+            why = "budget spent" if spent else "not read yet"
+            second, why_not = pr_rollup_head(repo, pr, sha, time.time()) if pr is not None else (None, "")
+            if second is not None:
+                heads[sha] = second
+            else:
+                unread[sha] = f"{why}; {why_not}" if why_not else why
     partial = bool(unread) or any(h["stale"] for h in heads.values())
     out = {"consumer": consumer, "heads": heads, "unread": unread,
            "budget": {"spent": ledger.get("spent"), "limit": ledger.get("limit"), "denied": spent}}
@@ -26647,6 +26707,9 @@ def parser() -> argparse.ArgumentParser:
                         "finished heads are good for 12 minutes")
     c.add_argument("--wait", type=float, default=30, metavar="S",
                    help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
+    c.add_argument("--pr", type=int, metavar="N",
+                   help="the PR whose head this is: a head with no entry is served from that PR's cached rollup "
+                        "when it is of this head and all green (route pr-rollup)")
     c.add_argument("--json", action="store_true")
     po = sub.add_parser("post", help="queue a comment, PR or review; the daemon posts it, paced for every session")
     po.add_argument("kind", choices=("comment", "pr", "review", "status"))
@@ -27327,7 +27390,9 @@ def main(argv: list[str] | None = None) -> int:
             bad = [x for x in args.shas if not re.fullmatch(r"[0-9a-fA-F]{40}", x)]
             if bad or not re.fullmatch(rf"{NAME}/{NAME}", args.repo):
                 raise WatchError("checks takes OWNER/REPO and full 40-hex commit ids (git rev-parse HEAD)")
-            return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json)
+            if args.pr is not None and (args.pr <= 0 or len(args.shas) != 1):
+                raise WatchError("--pr takes the PR number (1 or more) of the one head asked for")
+            return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json, pr=args.pr)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json, fields=parse_fields(args.field))
         if args.rescue_grace < 0:

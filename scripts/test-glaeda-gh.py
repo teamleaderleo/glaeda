@@ -9815,6 +9815,77 @@ class HeadChecksTest(Base):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(gg.cmd_checks("o/r", [SHA_A], "autoland", 120, 0, True), gg.EXIT_OK)
 
+    def pr_rollup_fixture(self, head: str, checks: list[dict], age: float = 30.0, **extra) -> None:
+        """A running daemon with no entry for any head, and PR o/r#7's cached read at HEAD."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        if getattr(self, "_daemon_lock", None) is None:  # one lock per test: a second flock would wait on the first
+            self._daemon_lock = open(gg.BASE / "daemon.lock", "a+")
+            fcntl.flock(self._daemon_lock, fcntl.LOCK_EX)
+            self.addCleanup(self._daemon_lock.close)
+        at = time.time() - age
+        key = gg.parse_key("pr", "o/r#7")
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {
+            "key": key, "dataAt": at, "fetchedAt": at,
+            "data": {"headRefOid": head, "checks": checks, "checksTruncated": False,
+                     "requiredMissing": [], **extra}})
+
+    def run_checks(self, *args, **kwargs) -> tuple[int, dict]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_checks(*args, **kwargs)
+        return code, json.loads(out.getvalue())
+
+    GREEN_ROLLUP = [
+        {"name": "build", "workflow": "CI", "status": "COMPLETED", "conclusion": "SUCCESS", "id": "CR_1",
+         "runId": 11, "required": True},
+        {"name": "docs", "workflow": "CI", "status": "COMPLETED", "conclusion": "SKIPPED", "id": "CR_2", "runId": 11},
+        {"name": "ci/legacy", "workflow": None, "status": "COMPLETED", "conclusion": "SUCCESS"},
+    ]
+
+    def test_pr_rollup_serves_an_unread_head_whose_pr_entry_is_that_head_and_green(self) -> None:
+        self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP)
+        code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertEqual(code, gg.EXIT_OK)
+        self.assertEqual(doc["unread"], {})
+        head = doc["heads"][SHA_A]
+        self.assertEqual((head["route"], head["pr"], head["settled"], head["stale"]), ("pr-rollup", 7, True, False))
+        self.assertGreaterEqual(head["age"], 29)
+        self.assertEqual(head["found"], {"CI / build": ["completed", "success"], "CI / docs": ["completed", "skipped"],
+                                         "status / ci/legacy": ["completed", "success"]})
+        self.assertEqual(head["statusStates"], {"status / ci/legacy": "success"})
+        self.assertNotIn("runs", head)  # no run ids: a caller judging reds must read live
+        self.assertEqual([r["statusContext"] for r in head["rollup"]], [False, False, True])
+        # without --pr the same head stays unread: the route is opt-in
+        code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True)
+        self.assertEqual((code, doc["unread"]), (gg.EXIT_PARTIAL, {SHA_A: "not read yet"}))
+        # an old rollup is served marked stale, never as fresh
+        self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP, age=gg.HEAD_SETTLED_TTL + 3600)
+        code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertEqual(code, gg.EXIT_PARTIAL)
+        self.assertTrue(doc["heads"][SHA_A]["stale"])
+
+    def test_pr_rollup_of_another_head_falls_through_to_unread(self) -> None:
+        self.pr_rollup_fixture(SHA_B, self.GREEN_ROLLUP)
+        code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertEqual(code, gg.EXIT_PARTIAL)
+        self.assertEqual(doc["heads"], {})
+        self.assertTrue(doc["unread"][SHA_A].startswith("not read yet; #7's cached head is " + SHA_B[:12]))
+
+    def test_pr_rollup_with_a_red_or_running_check_keeps_the_live_path(self) -> None:
+        for bad in ({"status": "COMPLETED", "conclusion": "FAILURE"}, {"status": "IN_PROGRESS", "conclusion": None}):
+            red = [*self.GREEN_ROLLUP, {"name": "test", "workflow": "CI", "id": "CR_3", "runId": 11, **bad}]
+            self.pr_rollup_fixture(SHA_A, red)
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+            self.assertEqual(code, gg.EXIT_PARTIAL)
+            self.assertEqual(doc["heads"], {})
+            self.assertIn("not all green (test)", doc["unread"][SHA_A])
+        for extra, why in (({"requiredMissing": ["e2e"]}, "required checks not reported: e2e"),
+                           ({"checksTruncated": True}, "cut short"), ({"checksPageError": "502"}, "cut short")):
+            self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP, **extra)
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+            self.assertEqual((code, doc["heads"]), (gg.EXIT_PARTIAL, {}))
+            self.assertIn(why, doc["unread"][SHA_A])
+
 
 def cli_run(ghdir: Path, *args, stderr=None, shell_prefix=()) -> tuple[subprocess.CompletedProcess, float]:
     """The real CLI in a subprocess, because fd 2 is the thing under test here.
