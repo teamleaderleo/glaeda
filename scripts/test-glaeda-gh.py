@@ -30143,5 +30143,53 @@ class AFlagsCaseConventionTest(unittest.TestCase):
         past = ["log", "search", "o/r", "pat", "--", "--maxAge"]
         self.assertEqual(gg.flag_spelling_synonym(list(past)), (past, []))
 
+
+class CachedStartTest(unittest.TestCase):
+    """glaeda-gh run as a command starts from cached bytecode (2026-11-21: 330 to 110 ms a call; huge-blue ran up to
+    18 at once). Its head is a sh/Python polyglot: /bin/sh execs `python3 -c LOADER "$0" "$@"`, Python sees only the
+    docstring. Every way to run or load it must look the same as before."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.bin = Path(self.dir.name) / "bin"
+        self.bin.mkdir()
+        self.exe = self.bin / "glaeda-gh"
+        shutil.copy(ROOT / "scripts" / "glaeda-gh", self.exe)
+        self.exe.chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if k not in ("PYTHONDONTWRITEBYTECODE", "GLAEDA_GH_PLAIN_RUN")}
+        self.env["HOME"] = self.dir.name
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def run_it(self, argv, **env):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                              env={**self.env, **env})
+
+    def test_the_module_docstring_is_the_help_without_the_start_lines(self):
+        self.assertTrue(gg.__doc__.startswith("glaeda-gh: one shared GitHub CI watcher"), gg.__doc__[:120])
+        self.assertNotIn("exec python3", gg.__doc__)
+
+    def test_a_command_run_matches_a_run_by_path_and_caches_its_bytecode(self):
+        for args in (["--help"], ["status", "no-such-kind"]):
+            want = self.run_it([sys.executable, os.fspath(self.exe), *args])
+            got = self.run_it([os.fspath(self.exe), *args])
+            plain = self.run_it([os.fspath(self.exe), *args], GLAEDA_GH_PLAIN_RUN="1")
+            for other in (got, plain):
+                self.assertEqual((other.returncode, other.stdout, other.stderr),
+                                 (want.returncode, want.stdout, want.stderr), args)
+        self.assertEqual(len(list((self.bin / "__pycache__").glob("glaeda-gh*.pyc"))), 1)
+
+    def test_the_script_sees_a_run_by_path(self):
+        probe = self.bin / "probe"
+        head = self.exe.read_text().split("\nglaeda-gh: one shared", 1)[0]
+        probe.write_text(head + '\n"""\nimport json, os, sys\n'
+                         'print(json.dumps([__name__, __file__, sys.argv, sys.path[0]]))\n')
+        probe.chmod(0o755)
+        got = self.run_it([os.fspath(probe), "a", "b c"])
+        self.assertEqual(json.loads(got.stdout), ["__main__", os.fspath(probe), [os.fspath(probe), "a", "b c"],
+                                                  os.fspath(self.bin.resolve())], got.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

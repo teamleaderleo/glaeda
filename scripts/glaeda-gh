@@ -1,5 +1,19 @@
-#!/usr/bin/env python3
-"""glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
+#!/bin/sh
+""":"; [ "${GLAEDA_GH_PLAIN_RUN:-}" = 1 ] && exec python3 "$0" "$@"; exec python3 -c '
+import os, sys
+p = sys.argv[1]
+try:
+    import importlib.util as u, importlib.machinery as m
+    l = m.SourceFileLoader("__main__", p)
+    g = u.module_from_spec(u.spec_from_loader("__main__", l))
+except Exception:
+    os.execv(sys.executable, [sys.executable, p, *sys.argv[2:]])
+sys.argv = sys.argv[1:]
+sys.path[0] = os.path.dirname(os.path.realpath(p))
+sys.modules["__main__"] = g
+l.exec_module(g)
+' "$0" "$@"
+glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
 
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
@@ -312,6 +326,16 @@ when this file changes, so an update takes effect without a restart.
 """
 
 from __future__ import annotations
+
+# Started from cached bytecode (2026-11-21). Python compiles the script it runs by path from source on every start and
+# never caches it: for this 1.6 MB file that was 290 of a call's 340 ms, and huge-blue ran up to 18 of these at once
+# (18:42Z, 3145% CPU, the host's largest per-call cost). So the file is a sh/Python polyglot: run as a command, /bin/sh
+# reads the docstring's first lines as `exec python3 -c LOADER "$0" "$@"`, which runs this same file as its own __main__
+# through importlib, so its bytecode is cached in __pycache__ beside it, with argv, __file__ and sys.path[0] as a run by
+# path has them. To Python those lines are only the docstring's head, cut off here. A loader that cannot set the file
+# up runs it by path; GLAEDA_GH_PLAIN_RUN=1 always does. `python3 glaeda-gh ...` and loading it as a module (land_judge,
+# tests) are as before.
+__doc__ = __doc__.partition("\n' \"$0\" \"$@\"\n")[2] or __doc__
 
 import argparse
 import base64

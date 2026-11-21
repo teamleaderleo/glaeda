@@ -82,6 +82,13 @@ def shell_hits(path: Path, text: str) -> list[tuple[int, str]]:
     return hits
 
 
+def polyglot(text: str) -> bool:
+    # A `#!/bin/sh` file whose second line opens a Python docstring with three quotes and ":" is a Python script
+    # that sh starts (scripts/glaeda-gh runs itself from cached bytecode that way). Judge it as Python.
+    lines = text.split("\n", 2)
+    return len(lines) > 1 and lines[1].startswith('""' '":"')
+
+
 def tracked(root: Path) -> list[Path]:
     result = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True)
     return [root / item for item in result.stdout.decode().split("\0") if item]
@@ -98,7 +105,8 @@ def scan(root: Path) -> list[str]:
             continue
         if not all(word in text for word in ("gh", "auth", "token")):
             continue
-        is_python = path.suffix == ".py" or text.startswith("#!") and "python" in text.partition("\n")[0]
+        is_python = path.suffix == ".py" or text.startswith("#!") and (
+            "python" in text.partition("\n")[0] or polyglot(text))
         rel = path.relative_to(root)
         hits = python_hits(rel, text) if is_python else shell_hits(rel, text)
         findings.extend(f"{path.relative_to(root)}:{line}: {why}" for line, why in hits)
