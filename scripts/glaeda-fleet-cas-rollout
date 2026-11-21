@@ -34,6 +34,9 @@
 # Local Network privacy lets through). The store's only allowed writer is then the writer's
 # LAN source address toward IP, read from the writer's route table. No tailnet ACL grant is
 # needed; it is the path for a store whose tailnet port no grant opens (cmux-lawrence).
+# The store (and its gc) install as system LaunchDaemons on the store host, so the installer there
+# needs passwordless `sudo -n` (or run the root commands it prints with `fleet-sudo HOST ...`);
+# it migrates the old LaunchAgent. Node, writer and relay stay agents on the CI minis.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450

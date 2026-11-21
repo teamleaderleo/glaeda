@@ -11,8 +11,22 @@
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
 # a service only when its arguments or binary changed. Everything is owned by the current
 # user: binaries and stores under /Users/Shared/cmux-build-fleet/xcode, launchd services
-# com.teamleaderleo.glaeda.fleet-cas-{node,store} (LaunchAgents, which need the user's
-# GUI session, or LaunchDaemons run as this user where root installed the plist). No sudo.
+# com.teamleaderleo.glaeda.fleet-cas-{node,store}.
+#
+# Headless roles are system LaunchDaemons, never agents. The store role (fleet-cas-store) and
+# its gc (fleet-cas-store-gc) serve the whole fleet from a host (cmux-lawrence) that must not
+# depend on anyone being logged in: a LaunchAgent stops with the login session, which is what
+# took the store down at the 2026-11-20 reboot (hit rate 0.7% against 75.7%). They install as
+# /Library/LaunchDaemons/LABEL.plist with UserName=this user (the user keeps owning the data),
+# `launchctl bootstrap system`, through `sudo -n` (FLEET_CAS_SUDO overrides the prefix; root
+# needs none). Install migrates: the old gui/UID agent is booted out and its plist removed
+# first. Without passwordless sudo the install stops and prints the root commands (a controller
+# runs them with `fleet-sudo HOST ...`); it never falls back to an agent. A daemon already
+# loaded from hand (same label) is adopted: if the plist differs and sudo is missing it is kept,
+# with a warning, instead of duplicated. `uninstall` removes both the agent and the daemon.
+# The node, writer, relay and prewarm roles stay LaunchAgents: they run on CI minis whose
+# builds already need the logged-in GUI session (see the relay note below).
+# scripts/test-glaeda-headless-services.py fails if a store/server role is written as an agent.
 #
 # node:   Xcode talks to /Users/Shared/cmux-build-fleet/xcode/fleet-cas.sock. The node is
 #         read-only (--read-only-kv). With --trusted-keys it uses only index entries signed
@@ -38,11 +52,16 @@
 #         env file and the scripts then use 127.0.0.1:7451 as the store. A dead relay or store is a
 #         refused or closed connection, which the node turns into its 30 s upstream backoff (local
 #         misses), the same as a dead store; fleet-cas-settings.sh still answers only when the node
-#         does. Without --relay the role removes the relay.
+#         does. Without --relay the role removes the relay. The relay stays an agent on purpose:
+#         it is a node-side service on the CI minis (never on a store host), where Local Network
+#         privacy is decided per responsible app in the GUI session and /usr/bin/nc passes there
+#         (measured, 2026-10-30 on cmux14). A system daemon is outside that session, and nobody
+#         has measured what the privacy check does to a daemon's nc, so it is not moved blind.
 #         A store with a custom root (--store-root on the rollout) also gets
 #         com.teamleaderleo.glaeda.fleet-cas-store-gc: hourly `glaeda-fleet-cas-prune --apply
 #         --store-gc-only`, the daily fleet-cas gc of that store and nothing else (its own label,
-#         so it never replaces a mini's fleet-cas-prune agent from glaeda-mini-setup).
+#         so it never replaces a mini's fleet-cas-prune agent from glaeda-mini-setup). Both the
+#         store and this gc are LaunchDaemons (see the top).
 # The node and writer roles write xcode/fleet-cas.env (store address, trusted keys, signing
 # key path) for the scripts above.
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
@@ -56,6 +75,7 @@ FLEET_STORE=$ROOT/fleet-store
 AGENTS=$HOME/Library/LaunchAgents
 LOGS=$HOME/Library/Logs
 LAUNCH_DAEMONS=${FLEET_CAS_LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}
+SUDO=${FLEET_CAS_SUDO:-/usr/bin/sudo -n}
 custom_store_image=${FLEET_CAS_IMAGE:-}
 # This path is deliberately fixed to the user's boot-volume cache. Do not make
 # the launch wrapper location another configurable path that could be on ROOT.
@@ -174,6 +194,60 @@ bootstrap() {  # domain, label, plist: bootout then bootstrap, retrying the know
   launchctl bootstrap "$1" "$3"
 }
 
+# Root, for the system domain: as root directly, else through $SUDO (passwordless only).
+root_run() { if [ "$(id -u)" = 0 ]; then "$@"; else $SUDO "$@"; fi; }
+have_root() { [ "$(id -u)" = 0 ] || $SUDO true >/dev/null 2>&1; }
+retire_agent() {  # label: the old gui/UID LaunchAgent of a headless role, which would fight the daemon
+  local agent=$AGENTS/$1.plist
+  if [ -e "$agent" ] || launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true
+    rm -f "$agent"
+  fi
+}
+# Install (or adopt) the system LaunchDaemon LABEL from the rendered plist SRC. Returns 0 with
+# the daemon loaded from the current plist ("current"), adopted as is ("adopted"), or freshly
+# installed ("installed"); 1 with the root commands printed when it needs root and has none.
+install_daemon() {  # label, rendered plist
+  local label=$1 src=$2 daemon=$LAUNCH_DAEMONS/$1.plist
+  if cmp -s "$src" "$daemon" && launchctl print "system/$label" >/dev/null 2>&1; then
+    retire_agent "$label"; DAEMON_STATE=current; return 0
+  fi
+  if ! have_root; then
+    if launchctl print "system/$label" >/dev/null 2>&1; then
+      echo "warning: the LaunchDaemon $label is loaded from a different plist and there is no passwordless sudo to replace it; adopting it as is" >&2
+      retire_agent "$label"; DAEMON_STATE=adopted; return 0
+    fi
+    echo "$label needs a system LaunchDaemon and there is no passwordless sudo; as root:" >&2
+    echo "  install -m 644 $src $daemon && chown root:wheel $daemon && launchctl bootstrap system $daemon" >&2
+    echo "  (from a controller: fleet-sudo HOST sh -c '...' with those commands), then re-run this installer" >&2
+    return 1
+  fi
+  retire_agent "$label"
+  root_run launchctl bootout "system/$label" 2>/dev/null || true
+  root_run install -m 0644 "$src" "$daemon"
+  root_run chown root:wheel "$daemon"
+  local i
+  for i in 1 2 3 4 5; do
+    root_run launchctl bootstrap system "$daemon" 2>/dev/null && { DAEMON_STATE=installed; return 0; }
+    sleep 1
+  done
+  root_run launchctl bootstrap system "$daemon"
+  DAEMON_STATE=installed
+}
+# Remove the agent and the daemon of LABEL; the daemon needs root (else a root step is printed).
+remove_service() {  # label
+  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true
+  rm -f "$AGENTS/$1.plist"
+  [ -e "$LAUNCH_DAEMONS/$1.plist" ] || return 0
+  if have_root; then
+    root_run launchctl bootout "system/$1" 2>/dev/null || true
+    root_run rm -f "$LAUNCH_DAEMONS/$1.plist"
+  else
+    echo "ROOT STEP NEEDED: sudo launchctl bootout system/$1; sudo rm $LAUNCH_DAEMONS/$1.plist"
+    ROOT_STEP_NEEDED=1
+  fi
+}
+
 health_failed() {  # role
   echo "fleet-cas $1 is not healthy; last log lines:" >&2
   tail -5 "$LOGS/glaeda-fleet-cas-$1.log" >&2 2>/dev/null || true
@@ -215,14 +289,14 @@ check_upstream() {  # HOST:PORT
 # (agents and daemons alike) from other LAN hosts on these headless minis: the node on
 # cmux8s got "No route to host" for the store on cmux7s's LAN address, while tailnet
 # addresses work. So the store listens on its tailnet address (the tailnet grants the port,
-# cmuxterm-hq#591) and every node, and the writer, connect to that. A role runs as a
-# LaunchAgent, or as a LaunchDaemon (run as this user) if root installed the plist below.
+# cmuxterm-hq#591) and every node, and the writer, connect to that. The store runs as a
+# LaunchDaemon (UserName this user); node and writer as LaunchAgents.
 #
 # ProcessType Interactive: builds wait on these daemons. Adaptive, with no XPC activity, ran
 # them in the background band (priority 4), and a full-app fill on cmux7s (Xcode 26.6) then
 # timed out 187 store calls under compile load and published no marker. Standard gave
 # priority 20; Interactive matches a process started from a shell (31).
-plist_for() {  # role, label, daemon (1 or empty)
+plist_for() {  # role, label, daemon (sys: a headless role's, with HOME; 1: a root-installed node's; or empty: an agent)
   local log=$LOGS/glaeda-fleet-cas-$1.log runner state
   runner=$(runner_for "$1")
   state=$(state_for "$1")
@@ -233,14 +307,21 @@ plist_for() {  # role, label, daemon (1 or empty)
   [ -z "${3:-}" ] || printf '%s\n' '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>"
   printf '%s\n' '    <key>ProgramArguments</key>' '    <array>' \
     "        <string>$(xml "$runner")</string>" "        <string>$1</string>" '    </array>'
+  if [ "${3:-}" = sys ] || { [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; }; then
+    printf '%s\n' '    <key>EnvironmentVariables</key>' '    <dict>'
+    # A daemon has no login session to take HOME from.
+    [ "${3:-}" != sys ] || printf '%s\n' '        <key>HOME</key>' "        <string>$(xml "$HOME")</string>"
+  fi
   if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; then
-    printf '%s\n' '    <key>EnvironmentVariables</key>' '    <dict>' \
+    printf '%s\n' \
       '        <key>FLEET_CAS_ROOT</key>' "        <string>$(xml "$FLEET_CAS_ROOT")</string>" \
       '        <key>FLEET_CAS_VOLUME_UUID</key>' "        <string>$(xml "$custom_store_volume_uuid")</string>" \
       '        <key>FLEET_CAS_IMAGE</key>' "        <string>$(xml "$custom_store_image")</string>" \
       '        <key>FLEET_CAS_STATE_DIR</key>' "        <string>$(xml "$state")</string>" \
-      '        <key>FLEET_CAS_MOUNT_HELPER</key>' "        <string>$(xml "$launch_root/fleet-cas-mount")</string>" \
-      '    </dict>'
+      '        <key>FLEET_CAS_MOUNT_HELPER</key>' "        <string>$(xml "$launch_root/fleet-cas-mount")</string>"
+  fi
+  if [ "${3:-}" = sys ] || { [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; }; then
+    printf '%s\n' '    </dict>'
   fi
   printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'
   printf '%s\n' '    <key>ThrottleInterval</key>' '    <integer>10</integer>' \
@@ -357,11 +438,13 @@ prune_plist() {
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
     '<plist version="1.0">' '<dict>' \
     '    <key>Label</key>' "    <string>$PRUNE_LABEL</string>" \
+    '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>" \
     '    <key>ProgramArguments</key>' '    <array>' \
     '        <string>/usr/bin/python3</string>' '        <string>-I</string>' \
     "        <string>$(xml "$launch_root/glaeda-fleet-cas-prune")</string>" \
     '        <string>--apply</string>' '        <string>--store-gc-only</string>' '    </array>' \
     '    <key>EnvironmentVariables</key>' '    <dict>' \
+    '        <key>HOME</key>' "        <string>$(xml "$HOME")</string>" \
     '        <key>GLAEDA_FLEET_CAS_ROOT</key>' "        <string>$(xml "$ROOT")</string>" '    </dict>' \
     '    <key>StartInterval</key>' '    <integer>3600</integer>' \
     '    <key>ProcessType</key>' '    <string>Background</string>' \
@@ -371,21 +454,16 @@ prune_plist() {
 }
 write_store_prune() {
   [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
-  local agent=$AGENTS/$PRUNE_LABEL.plist src=$here/scripts/glaeda-fleet-cas-prune
-  say "prune $PRUNE_LABEL: hourly $launch_root/glaeda-fleet-cas-prune --apply --store-gc-only (GLAEDA_FLEET_CAS_ROOT=$ROOT)"
+  local src=$here/scripts/glaeda-fleet-cas-prune plist=$launch_root/launchd/$PRUNE_LABEL.plist
+  say "prune $PRUNE_LABEL: hourly $launch_root/glaeda-fleet-cas-prune --apply --store-gc-only (GLAEDA_FLEET_CAS_ROOT=$ROOT), system LaunchDaemon"
   [ -n "$apply" ] || return 0
   [ -f "$src" ] && [ ! -L "$src" ] || { echo "missing $src" >&2; exit 1; }
-  mkdir -p "$AGENTS" "$LOGS" "$launch_root"
+  mkdir -p "$LOGS" "$launch_root/launchd"
   install -m 0755 "$src" "$launch_root/glaeda-fleet-cas-prune.new"
   mv "$launch_root/glaeda-fleet-cas-prune.new" "$launch_root/glaeda-fleet-cas-prune"
-  prune_plist >"$agent.tmp"
-  plutil -lint -s "$agent.tmp"
-  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$PRUNE_LABEL" >/dev/null 2>&1; then
-    rm -f "$agent.tmp"
-  else
-    mv "$agent.tmp" "$agent"
-    bootstrap "gui/$(id -u)" "$PRUNE_LABEL" "$agent"
-  fi
+  prune_plist >"$plist"
+  plutil -lint -s "$plist"
+  install_daemon "$PRUNE_LABEL" "$plist" || exit 1
 }
 
 # Stop the role's process so launchd starts it again with the current args and binary. The
@@ -429,6 +507,16 @@ write_service() {  # role, args...
     mv "$state/$r.args.tmp" "$state/$r.args"; changed=1
   else
     rm -f "$state/$r.args.tmp"
+  fi
+  if [ "$r" = store ]; then
+    # Headless role: always a system LaunchDaemon, never an agent.
+    plist_for "$r" "$label" sys >"$ROOT/launchd/$label.plist"
+    plutil -lint -s "$ROOT/launchd/$label.plist"
+    install_daemon "$label" "$ROOT/launchd/$label.plist" || exit 1
+    # A fresh bootstrap starts on the current arguments; a loaded daemon is restarted for new ones.
+    if [ "$DAEMON_STATE" != installed ] && [ -n "$changed" ]; then restart_role "$r" "$old_first"; fi
+    echo "daemon $label ($DAEMON_STATE)"
+    return 0
   fi
   plist_for "$r" "$label" 1 >"$ROOT/launchd/$label.plist"
   plutil -lint -s "$ROOT/launchd/$label.plist"
@@ -604,25 +692,24 @@ case $role in
       write_prewarm ""
       write_relay ""
     fi
+    ROOT_STEP_NEEDED=
     if [ "$uninstall_scope" = store ] || [ "$uninstall_scope" = all ]; then
-      if [ -e "$AGENTS/$PRUNE_LABEL.plist" ]; then
-        say "stop and remove $PRUNE_LABEL (the store host's gc)"
-        [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$PRUNE_LABEL" 2>/dev/null || true; rm -f "$AGENTS/$PRUNE_LABEL.plist"; }
+      if [ -e "$AGENTS/$PRUNE_LABEL.plist" ] || [ -e "$LAUNCH_DAEMONS/$PRUNE_LABEL.plist" ]; then
+        say "stop and remove $PRUNE_LABEL (the store host's gc: agent and daemon)"
+        [ -z "$apply" ] || remove_service "$PRUNE_LABEL"
       fi
     fi
     for r in node store; do
       [ "$uninstall_scope" = all ] || [ "$uninstall_scope" = "$r" ] || continue
       label=$(label_for "$r")
       state=$(state_for "$r")
-      say "stop and remove $label (stores kept)"
-      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$state/$r.args"; }
-      if [ -e "$LAUNCH_DAEMONS/$label.plist" ]; then
-        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm $LAUNCH_DAEMONS/$label.plist"
-      fi
+      say "stop and remove $label (agent and daemon; stores kept)"
+      [ -z "$apply" ] || { remove_service "$label"; rm -f "$state/$r.args"; }
     done
     if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
       do_ rm -f "$ROOT/fleet-cas.env"
     fi
+    [ -z "$ROOT_STEP_NEEDED" ] || exit 1
     ;;
   *) sed -n '2,10p' "$0" >&2; exit 2 ;;
 esac
