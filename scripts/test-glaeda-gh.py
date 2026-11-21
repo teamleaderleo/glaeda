@@ -28345,5 +28345,150 @@ class PrintedTargetNotationTest(unittest.TestCase):
                 self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
 
 
+class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
+    """The detector for the whole class: one table of the subcommands that take a PR or issue target, each
+    asserted against the *same* form set, so the next subcommand to parse targets its own way fails here
+    instead of in an agent's call.
+
+    Measured on 2026-11-21: `post comment teamleaderleo/glaeda#2323` was fine while `post comment
+    teamleaderleo/glaeda/2323`, a bare `2323` and `pr:teamleaderleo/glaeda/2323` -- a string this tool
+    prints, and one `status`, `wait` and `land` all read -- refused, because post_item matched the strict
+    PR_RE/ISSUE_RE instead of parse_key. #2282 and #2325 each fixed the sites they knew about; nothing
+    asserted that a *new* site joins them, and the per-subcommand tests above only ever handed `post` the
+    forms that already worked. This one is written as an enumeration on purpose: adding a target-taking
+    subcommand without adding it here leaves RESOLVERS incomplete, and the last test says so."""
+
+    # The shared form set for a pr/comment target, as KIND_FORMS names it, with the key each must reach.
+    FORMS = ("o/r#5", "o/r/5", "5", "#5", "https://github.com/o/r/pull/5")
+    # subcommand -> a callable taking one typed target and returning (repo, number), through the public
+    # boundary each caller actually uses. `cwd_repo` is mocked, so a bare number has a repository.
+    RESOLVERS = {
+        "status pr": lambda t: _from_key(gg.status_keys("pr", [t])[0]),
+        "status comment": lambda t: _from_key(gg.status_keys("comment", [t])[0]),
+        "wait pr": lambda t: _from_key(gg.parse_key("pr", t)),
+        "wait comment": lambda t: _from_key(gg.parse_key("comment", t)),
+        "land": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "land status": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "land cancel": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
+        "post comment": lambda t: _post_target("comment", t),
+        "post review": lambda t: _post_target("review", t),
+    }
+
+    def test_every_subcommand_takes_every_shared_form(self) -> None:
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            for name, resolve in self.RESOLVERS.items():
+                for form in self.FORMS:
+                    with self.subTest(subcommand=name, form=form):
+                        self.assertEqual(tuple(str(p).lower() for p in resolve(form)), ("o/r", "5"),
+                                         f"`glaeda-gh {name} {form}` does not resolve to o/r#5: route it "
+                                         f"through parse_key, as the others do")
+
+    def test_a_refused_form_names_the_shared_set(self) -> None:
+        """A target no form reads is refused by naming the forms, never by blaming something else."""
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            for name, resolve in self.RESOLVERS.items():
+                with self.subTest(subcommand=name):
+                    with self.assertRaises(gg.WatchError) as refused:
+                        resolve("not a target at all")
+                    self.assertRegex(str(refused.exception), r"OWNER/REPO#N")
+
+    def test_the_table_covers_every_target_taking_subcommand(self) -> None:
+        """The enumeration itself, so the next subcommand cannot quietly skip the test above: every `pr` or
+        `comment` kind reachable from the parser is named in RESOLVERS."""
+        want = {f"status {k}" for k in ("pr", "comment")} | {f"wait {k}" for k in ("pr", "comment")} \
+            | {"land", "land status", "land cancel", "post comment", "post review"}
+        self.assertEqual(set(self.RESOLVERS), want,
+                         "a subcommand takes a PR or issue target and is not asserted here")
+
+
+def _from_key(key: str) -> tuple[str, Any]:
+    """(OWNER/REPO, N) out of a `kind:owner/repo#n` key, which is what every resolver compares."""
+    _, owner, repo, value = gg.split_key(key)
+    return f"{owner}/{repo}", value
+
+
+def _post_target(kind: str, target: str) -> tuple[str, int]:
+    args = gg.parser().parse_args(["post", kind, target, "--body", "hi"])
+    item = gg.post_item(args)
+    return item["repo"], item["number"]
+
+
+class WaitTwoTargetsNamesTheCallThatWorksTest(unittest.TestCase):
+    """`status pr A B` reads two targets and `wait pr A B` cannot, so the refusal names the calls that do.
+
+    Measured on 2026-11-21: the refusal was argparse's `unrecognized arguments: o/r#2`, which names neither
+    the one-target limit nor the way round it. A wait stays one key on purpose -- its exit code (0/1/2/4) is
+    that target's verdict, which every caller branches on -- so this is a better refusal, not a new rule."""
+
+    def test_the_refusal_names_status_and_one_wait_each(self) -> None:
+        nxt = gg.usage_next(["wait", "pr", "o/r#1", "o/r#2", "--timeout", "600"])
+        self.assertIn("glaeda-gh status pr o/r#1 o/r#2", nxt)
+        self.assertIn("glaeda-gh wait pr o/r#1 --timeout 600", nxt)
+        self.assertIn("one target", nxt)
+
+    def test_it_reads_every_shared_form_as_a_second_target(self) -> None:
+        for second in ("o/r#2", "o/r/2", "2", "#2", "pr:o/r#2", "https://github.com/o/r/pull/2"):
+            with self.subTest(second):
+                self.assertIn("one target", gg.usage_next(["wait", "pr", "o/r#1", second]))
+
+    def test_the_forms_that_already_had_a_next_line_keep_it(self) -> None:
+        """`wait pr OWNER/REPO N` is the repo-and-number join, not two targets, and keeps its own answer."""
+        self.assertEqual(gg.usage_next(["wait", "pr", "o/r", "6"]),
+                         "glaeda-gh wait pr o/r#6 --timeout 1800")
+        self.assertEqual(gg.usage_next(["wait", "--nope"]), "glaeda-gh wait --help")
+        self.assertEqual(gg.usage_next(["wait", "pr", "o/r#1", "--nope"]), "glaeda-gh wait --help")
+
+
+class BrokeredGhTakesTheToolsOwnFormTest(unittest.TestCase):
+    """`glaeda-gh gh ...` normalises this tool's own target form into the one real gh reads.
+
+    Measured on 2026-11-21: `gh pr comment teamleaderleo/glaeda#2323` is not a number and not a URL, so
+    gh's PR finder falls through to its branch case and the call died with `no pull requests found for
+    branch "teamleaderleo/glaeda#2323"`, exit 1, after a round trip -- on the canonical form every other
+    glaeda-gh subcommand prints and accepts. A `#` cannot appear in a git branch name, so the rewrite takes
+    nothing away from the branch form, which keeps working."""
+
+    def test_the_hash_form_becomes_the_number_and_repo_gh_reads(self) -> None:
+        want = {
+            ("pr", "comment", "o/r#5", "--body", "hi"): ["pr", "comment", "5", "--body", "hi", "--repo", "o/r"],
+            ("pr", "view", "o/r#5", "--json", "number"):
+                ["pr", "view", "5", "--json", "number", "--repo", "o/r"],
+            ("issue", "comment", "o/r#5", "--body", "hi"):
+                ["issue", "comment", "5", "--body", "hi", "--repo", "o/r"],
+            ("pr", "edit", "pr:o/r#5", "--add-label", "x"):
+                ["pr", "edit", "5", "--add-label", "x", "--repo", "o/r"],
+            ("pr", "comment", "--body", "hi", "o/r#5"): ["pr", "comment", "--body", "hi", "5", "--repo", "o/r"],
+            ("run", "rerun", "o/r/1234567"): ["run", "rerun", "1234567", "--repo", "o/r"],
+            ("pr", "comment", "o/r#5", "--repo", "o/r", "--body", "hi"):
+                ["pr", "comment", "5", "--repo", "o/r", "--body", "hi"],
+        }
+        for args, fixed in want.items():
+            with self.subTest(" ".join(args)):
+                with contextlib.redirect_stderr(io.StringIO()) as noise:
+                    self.assertEqual(gg.broker_canonical_target(list(args)), fixed)
+                self.assertIn("read as", noise.getvalue())
+
+    def test_a_form_gh_already_reads_is_left_exactly_as_typed(self) -> None:
+        """Nothing that works today is taken away -- the branch form above all, which some caller may rely
+        on, and which `o/r/5` can also be (`feature/v2/3` is a legal branch name)."""
+        same = [
+            ["pr", "view", "lane/fix-2323"],                      # a branch, gh's own fallthrough
+            ["pr", "view", "o/r/5"],                              # a shape a branch name can have
+            ["pr", "view", "5"],                                  # already the form gh reads
+            ["pr", "view", "https://github.com/o/r/pull/5"],      # a URL gh reads itself
+            ["pr", "comment", "o/r#5", "--repo", "x/y"],          # -R names another repo: gh decides
+            ["pr", "view", "run:o/r/123"],                        # a run prefix is not a pull request
+            ["issue", "create", "--title", "o/r#5"],              # a flag's value, not a target
+            ["pr", "list", "--search", "o/r#5"],                  # not a verb that takes one target
+        ]
+        for args in same:
+            with self.subTest(" ".join(args)):
+                with contextlib.redirect_stderr(io.StringIO()) as noise:
+                    self.assertEqual(gg.broker_canonical_target(list(args)), args)
+                self.assertEqual(noise.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
