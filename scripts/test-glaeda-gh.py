@@ -17794,6 +17794,28 @@ class BrokerAnswerCacheTest(CountingGhBase):
             gg.cmd_post(args)
         self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r heads", "o/r other"})
 
+    def test_a_post_on_a_host_with_no_login_is_refused_where_the_caller_is(self) -> None:
+        """gcp-agent-lane-2, 2026-11-21: three comments queued on a lane VM were all failed by the daemon with
+        "has no login to post with", an hour and a `post status` read later. A host that reads through an upstream
+        refuses the write at accept time and names the one that works here."""
+        no_guard(self)
+        config = self.home / "upstream.json"
+        config.write_text(json.dumps({"command": ["ssh", "huge-blue", "glaeda-gh", "upstream"]}), encoding="utf-8")
+        for kind, target, hand in (("comment", "O/R#7", "gh pr comment 7 --repo O/R --body-file F"),
+                                   ("review", "O/R#7", "gh pr review 7 --repo O/R --body-file F"),
+                                   ("pr", "O/R", "gh pr create --repo O/R --title T --body-file F")):
+            with self.subTest(kind=kind):
+                made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
+                    "head": None, "base": None, "title": None}
+                args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
+                                 reviewer=None, event="comment", **made)
+                err = io.StringIO()
+                with mock.patch.object(gg, "UPSTREAM_CONFIG", config), contextlib.redirect_stderr(err):
+                    self.assertEqual(gg.cmd_post(args), 3)
+                self.assertIn("has no login to post with", err.getvalue())
+                self.assertIn(hand, err.getvalue())  # whole, never cut
+                self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
         self.run_gh(args)
