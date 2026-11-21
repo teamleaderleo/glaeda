@@ -4722,13 +4722,20 @@ class ClientTest(Base):
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
         self.assertEqual(gg.usage_next(["status", "pr", "o/r", "#7", "--json"]), "glaeda-gh status pr o/r#7 --json")
         self.assertEqual(gg.usage_next(["wait", "bogus"]), "glaeda-gh wait --help")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(gg, "say_waiting"), self.assertRaises(SystemExit) as exit_:
+        # main() no longer refuses the split form: it hands argparse the joined one (join_repo_number)
+        seen: list[list[str]] = []
+
+        class Stop(Exception):
+            pass
+
+        def parse(argv):
+            seen.append(list(argv))
+            raise Stop
+
+        with mock.patch.object(gg, "parser", return_value=mock.Mock(parse_args=parse)), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(Stop):
             gg.main(["wait", "pr", "o/r", "3", "--json"])
-        self.assertEqual(exit_.exception.code, 64)
-        doc = json.loads(out.getvalue())
-        self.assertEqual((doc["ok"], doc["code"]), (False, "usage"))
-        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#3 --json --timeout 1800")
+        self.assertEqual(seen, [["wait", "pr", "o/r#3", "--json"]])
 
     def test_rerun_after_cancel_counts_the_latest_attempt(self) -> None:
         old = {**check_run("Web complexity", conclusion="CANCELLED"), "databaseId": 1, "startedAt": "2026-09-25T10:00:00Z"}
