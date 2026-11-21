@@ -8521,6 +8521,16 @@ HOST_LOAD_CAP_CONTROLLER_CONFIG = ".local/share/cmux-fleet-client/client.json"  
 HOST_LOAD_CAP_URGENT = re.compile(r"(?i)nightly|promot")  # in a workflow or branch name: the urgent class
 LOAD_CAPPED = "the host is over its load cap"
 
+# SIGNER_FIRST (Leo: "Nightlies come first on the fleet."): the trusted signing runner (--trusted-next-signing, the
+# listener of glaeda-trusted-next-signing) is never held off by host load, neither the load cap above nor the CPU and
+# overload holds in Gate.saturated. On 2026-11-21 21:00Z ultra1 (30 cores, the fastest signer) stopped its idle signing
+# listener again and again ("the host is over its load cap ... while another host's listener takes
+# glaeda-trusted-next-signing jobs", "the mini is saturated") because the ultra1-guest PR worker and the xl runners kept
+# the load at 45-73. cmux15 alone signed, 3 min slower, and the nightly feed stood 168 min behind the newest landing.
+# Load on a signing host is lower-priority work (PR CI) by definition: a nightly signing job drains the mini
+# (SIGNING_DRAIN) and the work beside it yields at its own admission; the signer never stands down for it. Memory
+# pressure, disk, the fleet's reservations and a drain still hold it: those are the host's limits, not other work's.
+
 
 def host_load_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> float:
     """The cap in load1 per core, 0 for off: CMUX_CI_HOST_LOAD_CAP when set ("off" or 0 is off; an invalid value
@@ -10773,7 +10783,8 @@ class Gate:
         another host's listener keeps up with its label, or None. Only defers: the moment no other listener keeps
         up (a job waits HOST_LOAD_CAP_GRACE_S, an urgent or pinned job queues, or the feed cannot say) it listens."""
         scope = runner_scope(self.runner_dir)
-        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or scope.dedicated
+        exempt = (scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or scope.dedicated
+                  or scope.trusted_signing)  # SIGNER_FIRST
         if exempt:
             return self.cap_release(None)
         self.cpu_holds()  # refreshes self.cap with the other settings, at most every GATE_SETTINGS_EVERY_S
@@ -11068,7 +11079,8 @@ class Gate:
         about no CPU, and the build they submit runs wherever the controller has room."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway
+        exempt = (scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway
+                  or scope.trusted_signing)  # SIGNER_FIRST
         cpu_hold = not exempt and self.cpu_holds()
         overload = None if exempt else self.overload  # cpu_holds() above refreshed it
         if not cpu_hold and overload is None:

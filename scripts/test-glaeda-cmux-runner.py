@@ -9136,6 +9136,30 @@ class HostLoadCapTest(unittest.TestCase):
         with mock.patch.object(hook, "load_cap_fetch", return_value=None):
             self.assertIsNone(self.poll(), "an unreachable controller holds nothing")
 
+    def test_the_signing_listener_is_never_held_off_by_load(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-21 20:50-21:07Z gate log: load 1.5 to 3 per core from the
+        ultra1-guest PR worker while another host (cmux15) takes the label's jobs. The signing listener
+        (--trusted-next-signing) logged "the host is over its load cap ... while another host's listener takes
+        glaeda-trusted-next-signing jobs" and "the mini is saturated" and stopped, again and again. It must listen; a
+        side runner beside it is still held (the PR work yields, not the signer); memory pressure still holds it."""
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        scope = hook.RunnerScope(trusted_signing=True)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1):
+            self.assertIsNotNone(self.poll(), "a side runner is held for another host's listener")
+            self.assertIsNotNone(self.gate.saturated(), "and for the overloaded mini")
+            self.gate.cap_samples.clear()
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.poll(), "the signing listener keeps listening over the load cap")
+                self.assertIsNone(self.gate.saturated(), "and through CPU saturation and overload")
+            with mock.patch.object(hook, "runner_scope", return_value=scope), \
+                    mock.patch.object(hook, "memory_pressure_level", return_value=2):
+                self.assertIsNotNone(self.gate.saturated(), "memory pressure is the host's own limit: it holds")
+
     def test_exempt_runners_and_the_off_switch(self) -> None:
         self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
         self.assertIsNotNone(self.poll())
