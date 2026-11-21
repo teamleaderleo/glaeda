@@ -10352,6 +10352,18 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # a check that will never start.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 LAND_WAIT_STUCK = 4 * 3600.0
+# Such a wait, woken with nothing it was judged on moved, re-arms for this long with no land_judge explain
+# (LandQueue.wait_idle_keeps). The wait's bound is already a clock on the checks, not a count of judgments
+# (wait_refused's movedAt, LAND_WAIT_STUCK), so a wait that explains again at every wake only re-decides a row whose
+# head, check runs, statuses, conclusions and CONFLICTING-ness are the ones it last read (land_check_fingerprint): the
+# answer is the same wait. Measured on huge-blue's own entries, 2026-11-18..21 (the `idle` of each wait_refused):
+# 186 of 359 judgments naming such a wait (52%) were made at an unmoved head, median 3655 s and p90 14129 s after the
+# last movement -- one PR re-decided the same stalled check set for 4.9 h. The kept verdict is always a refusal, so
+# nothing merges on it: a check that moves still wakes the row at once (the fingerprint path above), the merge keeps
+# its own fresh read, and checks_stuck still stops the row on its own idle clock, which this never extends (a wake is
+# never set past it). 1800 s is the wait land_judge itself asks for (RUNNING_WAIT_S), so what the fingerprint cannot
+# see (the base moving under the wait) is held back no longer than one of its own waits.
+LAND_WAIT_IDLE_KEEP = 1800.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
 # (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
 # (rerun_failed; its checks' wait after it is a wait_pr above). interim-coord, 2026-11-18: "A refusal whose next step
@@ -12756,6 +12768,34 @@ class LandQueue:
             self.save(e)
         return True
 
+    def wait_idle_keeps(self, e: dict, c: dict | None, head: str, fp: str) -> bool:
+        """True when E's last verdict, a wait on the checks at HEAD (LAND_WAIT_KINDS), is kept and its wait re-armed
+        with no land_judge explain: nothing that verdict was judged on has moved since (land_check_fingerprint, the
+        wait's own movedAt), so explain can only name the same wait. Never past the idle clock checks_stuck stops on
+        (LAND_WAIT_STUCK): the judgment that stops the row keeps its fresh reason. A kept verdict is a refusal, never
+        an "ok": no step runs on it and nothing is merged."""
+        x = e.get("explain") or {}
+        w = e.get("waitRefused") or {}
+        if not head or x.get("ok") or x.get("head") != head or (x.get("action") or {}).get("kind") not in LAND_WAIT_KINDS:
+            return False
+        if w.get("head") != head or not w.get("fp") or w["fp"] != land_check_fingerprint(c):
+            return False
+        moved = w.get("movedAt")
+        if not isinstance(moved, (int, float)) or isinstance(moved, bool):
+            return False
+        stuck = float(moved) + LAND_WAIT_STUCK
+        if self.now + LAND_WAIT_IDLE_KEEP > stuck:
+            return False  # its stop is due within the keep: judged, so checks_stuck names what land_judge sees now
+        e["seen"] = fp  # a mergeability turn alone (UNKNOWN <-> MERGEABLE on every base push) is not a change
+        e["wakeAt"] = self.now + LAND_WAIT_IDLE_KEEP
+        e.pop("dueLate", None)
+        e.pop("dueAt", None)
+        self.count("kept_wait")
+        self.history(e, "wait_kept", head=head[:12], code=x.get("code"),
+                     idle=round(self.now - float(moved)), until=utc_clock(e["wakeAt"]))
+        self.save(e)
+        return True
+
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
         LAND_REFRESH_AFTER (see there), started on a worker: True when one was started."""
@@ -13146,11 +13186,20 @@ class LandQueue:
             self.check(e)
             self.count("explain")
             e["head"] = head or e.get("head") or ""
+            # What this judgment was made on (judge: seenChecks), so the next one can say whether anything moved: a
+            # judgment at the same head on the same check fingerprint could only reach the verdict above it
+            # (explain_unmoved in `land status`, LAND_WAIT_IDLE_KEEP's comment). Counted, never acted on.
+            checks = str(e.get("seenChecks") or "")
+            prior = e.get("explain") or {}
+            unmoved = bool(checks) and prior.get("head") == head and prior.get("checks") == checks
+            if unmoved:
+                self.count("explain_unmoved")
             e["explain"] = {"at": self.now, "ok": bool(answer.get("ok")), "code": str(answer.get("code") or ""),
                             "reason": land_trim(answer.get("reason")), "next": land_trim(answer.get("next")),
-                            "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict)}
+                            "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict),
+                            "checks": checks}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
-                         head=head[:12], step=act.get("kind"))
+                         head=head[:12], step=act.get("kind"), unmoved=unmoved or None)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
