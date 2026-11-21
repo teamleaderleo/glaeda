@@ -22325,6 +22325,51 @@ class LandTest(Base):
         self.assertEqual(e["pinSha"], LB)
         self.assert_merged_at(LB)
 
+    def test_sha_pin_follows_its_own_update_when_the_head_wait_expired_and_land_judge_names_repin(self):
+        # cmux16, 2026-11-21 17:05Z: hq#15931 pinned at 6a6234d0; the queue sent update_branch there, the cache never
+        # showed the head it made (head_timeout), land_judge (pinned at 6a6234d0) read 4c8e0840 and named a repin,
+        # and the land stopped head_moved on its own base merge.
+        self.nudge_reads = False
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.w.answers += [refusal("pin", LA, {"kind": "repin", "sha": LB}), ok_answer(LB)]
+        self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assert_merged_at(LB)
+
+    def test_sha_pin_follows_an_update_that_timed_out_but_made_its_merge(self):
+        # A timeout (124) may have reached GitHub: the head it made has the pin as a parent, so the pin follows it.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["update"] = 124
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.w.gh_rc["update"] = 0
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_RETRY_MAX + 60, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assert_merged_at(LB)
+
+    def test_sha_pin_still_stops_on_a_head_whose_parents_are_not_its_own_update(self):
+        # After the queue's update at the pin, a head whose parents do not include the pin is someone's push.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LC, "d" * 40]
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
         self.assertEqual((args.wait, args.sha), (1400, LA))

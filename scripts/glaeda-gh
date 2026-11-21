@@ -1125,7 +1125,8 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
-  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
+  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid parents(first: 2) { nodes { oid } }
+SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
@@ -3794,6 +3795,20 @@ def null_contexts_error(count: int) -> str:
     return f"graphql: {count} check context{'s' if count != 1 else ''} came back null (a partial rollup)"
 
 
+def head_parents(node: dict) -> list[str] | None:
+    """The PR head commit's parent oids, lowercased, or None when the read did not carry them (a probe, REST, an older
+    query) or its commit is not the head. The land queue reads them to tell its own update_branch's base merge (the
+    pinned head plus the base) from someone's push (LandQueue.follow_own_update)."""
+    commits = (node.get("commits") or {}).get("nodes") if isinstance(node.get("commits"), dict) else None
+    commit = ((commits or [{}])[0] or {}).get("commit") if isinstance(commits, list) else None
+    parents = commit.get("parents") if isinstance(commit, dict) else None
+    nodes = parents.get("nodes") if isinstance(parents, dict) else None
+    head = str(node.get("headRefOid") or "").lower()
+    if not isinstance(nodes, list) or not head or str(commit.get("oid") or "").lower() != head:
+        return None
+    return [str(p.get("oid") or "").lower() for p in nodes if isinstance(p, dict) and p.get("oid")]
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
@@ -3882,6 +3897,7 @@ def parse_pr(node: dict) -> dict:
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
+        **({"headParents": parents} if (parents := head_parents(node)) is not None else {}),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
         "checksTotal": contexts.get("totalCount", len(checks)),
@@ -13056,13 +13072,7 @@ class LandQueue:
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
-                    pin = str(e.get("pinSha") or "")
-                    if pin and not land_head_moved(pin, str(w.get("before") or "")):
-                        # The pin named the head this update was sent at: the base merge it made is the pinned
-                        # change plus the base, so the pin follows it (hq#14568, 2026-11-21: stopped head_moved on
-                        # the head its own update made). Any other head still stops the land.
-                        e["pinSha"] = head
-                        self.history(e, "repin_own_update", pin=pin[:12], head=head[:12])
+                    self.follow_own_update(e, head)  # hq#14568: the pin follows its own base merge, not a push
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
@@ -13317,6 +13327,35 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
+    def follow_own_update(self, e: dict, head: str) -> str | None:
+        """Move E's pin to HEAD when HEAD is the base merge this queue's own update_branch made at the pinned head;
+        None when it moved (or nothing was pinned elsewhere), else why HEAD still stops the land (head_moved).
+        hq#14568 (glaeda#2377) followed it only when the cache showed the new head right after an update that returned
+        0. cmux16, 2026-11-21 17:05Z: hq#15931's update at its pin 6a6234d0 made 4c8e0840, the cache never showed it
+        (head_timeout), land_judge read it and named a repin, and the land stopped head_moved on its own base merge.
+        An update that timed out (124) may have reached GitHub the same way. So every head check asks here: the update
+        was sent at the pinned head (updateSent), and HEAD's parents, when the read carried them (headParents), include
+        that head. A head whose parents do not is someone's push and still stops the land; land_judge still judges
+        whatever head the pin follows to, in full, before any merge."""
+        pin = str(e.get("pinSha") or "")
+        head = str(head or "").lower()
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head):
+            return None
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        if not sent or land_head_moved(pin, sent) or sent == head:
+            return "no update_branch of this queue's was sent at the pinned head"
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
+        if isinstance(parents, list) and sent not in [str(p).lower() for p in parents]:
+            return (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) do not include {sent[:12]}, "
+                    "where this queue's update_branch was sent: a push, not that update's base merge")
+        e["pinSha"] = head
+        e["updatedHead"] = head
+        self.history(e, "repin_own_update", pin=pin[:12], head=head[:12],
+                     parents="checked" if isinstance(parents, list) else "unread")
+        self.save(e)
+        return None
+
     def fresh_head(self, e: dict, sha: str, free: bool = True) -> str | None:
         """SHA when a judgement may pin it, "" when land_judge must read the head itself, None while E waits (nudged)
         for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
@@ -13382,9 +13421,9 @@ class LandQueue:
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
-        if land_head_moved(str(e.get("pinSha") or ""), sha):
-            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for",
-                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+        if land_head_moved(str(e.get("pinSha") or ""), sha) and (why := self.follow_own_update(e, sha)):
+            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for "
+                      f"({why})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
