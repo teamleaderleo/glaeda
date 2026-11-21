@@ -118,7 +118,7 @@ crashed session) have driven the owner's Mac past load 150.
 Locally, run only what the change touches:
 
 ```bash
-./scripts/verify focused                  # compile, format, repo-query test
+./scripts/verify focused                  # script lints, compile, format, repo-query test
 python3 scripts/test-<file>.py -k <name>  # only the cases you changed or added
 ```
 
