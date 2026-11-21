@@ -9359,7 +9359,7 @@ class HostLoadCapTest(unittest.TestCase):
         self.receipt(["glaeda-mini", self.SIDE_LIGHT])
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
-        self.join()  # poll's last look may still be reading; load_capped below would skip as one already runs
+        self.join()  # poll's last look is still reading; the next one would be skipped as one already runs
         self.assertIn(self.LABEL, self.gate.cap_labels, "the union holds before the next look")
         reading, seen = threading.Event(), []
 
@@ -9454,6 +9454,7 @@ class HostLoadCapTest(unittest.TestCase):
         (self.state / "instance-2" / "receipt.json").write_text("{ not json")
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
+        self.join()  # the same lingering look: read what the last one published, not what the one before it did
         self.assertEqual(self.gate.cap_labels, frozenset({self.LABEL}), "the dispatches still stand on their own")
         self.assertEqual(self.gate.cap_label_drift, [], "an absent receipt is not a receipt that understates itself")
 
