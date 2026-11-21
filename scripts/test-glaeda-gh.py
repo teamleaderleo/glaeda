@@ -672,6 +672,12 @@ class Base(unittest.TestCase):
         execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
         execv.start()
         self.addCleanup(execv.stop)
+        # settled_head reads GitHub with `git ls-remote`: never the network from a test process. A LandQueue that
+        # wants an answer injects its own (LandTest.remote_head).
+        ls_remote = mock.patch.object(gg, "land_remote_head",
+                                      side_effect=AssertionError("git ls-remote in a test process"))
+        ls_remote.start()
+        self.addCleanup(ls_remote.stop)
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.UPSTREAM_DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
@@ -20693,6 +20699,7 @@ class LandTest(Base):
         self.addCleanup(machines.stop)
         self.t = NOW
         self.github_head = {}
+        self.remote_reads: list[str] = []
         self.q = self.queue()
 
     def queue(self) -> Any:
@@ -20700,7 +20707,7 @@ class LandTest(Base):
                             nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
                             config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
                             behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
-                            snapshot_of=self.snaps.get)
+                            snapshot_of=self.snaps.get, remote_head=self.remote_head)
 
     # GitHub's own head per PR when a test moves it behind the daemon's back (the cache not told); a nudge reads it.
     github_head: dict[str, str] = {}
@@ -20717,6 +20724,20 @@ class LandTest(Base):
             self.w.set_pr(key, land_pr(head), self.t)
         else:
             c["updatedAtAt"] = self.t
+
+    remote_head_reads = True  # `git ls-remote` answers (settled_head); False: no git, or the remote refused it
+
+    def remote_head(self, repo: str, number: Any) -> str | None:
+        """`git ls-remote refs/pull/N/head` as settled_head calls it: the head a test moved behind the daemon's back
+        (github_head), else the one the cache was told -- GitHub agrees with the cache until a test pushes."""
+        key = gg.land_key(f"{repo}#{number}")[0]
+        self.remote_reads.append(key)
+        if not self.remote_head_reads:
+            return None
+        head = self.github_head.get(key)
+        if head:
+            return head
+        return str(((self.w.cache.get(key) or {}).get("data") or {}).get("headRefOid") or "").lower() or None
 
     stale_why: str | None = None  # what the checkout-staleness check answers
     broker = False  # this host's gh is lane-gh's broker client (a lane VM)
@@ -24154,18 +24175,19 @@ class LandTest(Base):
         self.assertEqual(self.reads(), (0, 0, 0, 0))
         self.github_head[self.KEY] = LB  # pushed while the latch held: the cache still says LA
         self.clear_latch()
-        e = self.tick(1)  # the nudge's read shows LB: nothing is judged at LA, LB is judged on the next pass
-        self.assertEqual(self.w.explains(), [])
-        self.assertIn("head_stale", [h.get("event") for h in e["history"]])
         self.w.answers.append(ok_answer(LB))
-        self.tick(1)
+        e = self.tick(1)  # `git ls-remote` settles it on the first pass: LB is judged and pinned, LA never is
         self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
+        self.assertIn("head_repinned", [h.get("event") for h in e["history"]])
+        self.assertEqual(self.remote_reads, [self.KEY])
         self.assert_merged_at(LB)
 
     def test_a_cached_head_no_read_confirms_is_judged_unpinned(self):
         """No read since the latch cleared (the nudge goes unanswered): after LAND_FRESH_WAIT land_judge is asked with
-        no --sha and reads the head itself, never the cache's old one."""
+        no --sha and reads the head itself, never the cache's old one. No ls-remote settles it either (no git on the
+        host, or the remote refused): that is the one case this wait is for."""
         self.nudge_reads = False
+        self.remote_head_reads = False
         self.pr(LA)
         self.land()
         self.latch("rest", self.t + 600)
@@ -24180,6 +24202,62 @@ class LandTest(Base):
         self.assertNotIn("--sha", self.w.explains()[0])
         self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
         self.assert_merged_at(LB)
+
+    def test_a_force_pushed_head_is_repinned_not_parked_for_an_hour(self):
+        """big-red, 2026-11-21: teamleaderleo/leo-workspace#7208 was read at 09:20Z, rebased and force-pushed to
+        48d8a885af67 at ~10:05Z (old head 75f789914eea). Its cache went 45 min unread -- the daemon's own GraphQL
+        reserve, the one "kept for lands", held every PR read -- and still showed 75f789914eea with one PENDING
+        check, so both land requests (10:17Z, 10:26Z) were parked "checks running" at a commit the PR had moved off,
+        each with a wake an hour out: a pin that could never merge, waiting on checks that could never finish there.
+        `git ls-remote` and `gh pr view` both had 48d8a885af67 the whole time."""
+        self.nudge_reads = False  # the daemon's own reads are held: nothing corrects the cache
+        # the cache as the reserve left it: read 45 min before the request, one check PENDING at the old head
+        self.w.set_pr(self.KEY, land_pr(LA, checks=[("ci", "IN_PROGRESS", None)]), self.t - 2700)
+        self.land()
+        self.github_head[self.KEY] = LB  # the force-push: GitHub's head, which no read of ours has seen
+        e = self.tick(1)
+        events = [h.get("event") for h in e["history"]]
+        self.assertNotIn("checks_running", events)  # never parked on the dead head's checks
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"], e["wakeAt"]),
+                         ("waiting", "repin", LB, None))  # due at once, not in LAND_WAIT_DEFAULT
+        self.assertEqual([e for e in ("head_moved", "head_repin") if e in events], ["head_moved", "head_repin"])
+        told = self.w.sent()[-1][-1]
+        self.assertIn(LA[:12], told)  # both shas named, and the pin that was dropped
+        self.assertIn(LB[:12], told)
+        self.assertEqual(self.remote_reads, [self.KEY])
+        # Judged and merged pinned at the head GitHub has, never at the cache's.
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
+        self.assert_merged_at(LB)
+
+    def test_an_unsettled_running_head_waits_the_retry_not_the_hour(self):
+        """No read of ours confirms the head and no ls-remote settles it (no git, or the remote refused): the running
+        wait is LAND_RETRY_DEFAULT, so an unconfirmed pin is looked at again in two minutes. LAND_WAIT_DEFAULT belongs
+        to a head GitHub still has."""
+        self.nudge_reads = False
+        self.remote_head_reads = False
+        # the cache as the reserve left it: read 45 min before the request, one check PENDING at the old head
+        self.w.set_pr(self.KEY, land_pr(LA, checks=[("ci", "IN_PROGRESS", None)]), self.t - 2700)
+        self.land()
+        e = self.tick(1)
+        self.assertEqual((e["state"], e["wait"]["why"]), ("waiting", "checks running"))
+        self.assertEqual(e["wakeAt"] - self.t, gg.LAND_RETRY_DEFAULT)
+        self.assertEqual(self.remote_reads, [self.KEY])
+        # One ls-remote per entry per LAND_REMOTE_HEAD_EVERY: the next passes reuse its answer.
+        for _ in range(3):
+            self.tick(1)
+        self.assertEqual(self.remote_reads, [self.KEY])
+
+    def test_a_confirmed_running_head_keeps_the_whole_wait(self):
+        """The head GitHub itself has, with checks running on it: the wait is the whole LAND_WAIT_DEFAULT, nudging
+        and judging nothing until they finish (the fix narrows no wait that was right)."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick(1)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LA))
+        self.assertEqual(e["wakeAt"] - self.t, gg.LAND_WAIT_DEFAULT)
+        self.assertEqual(self.w.explains(), [])
 
     # -- due rows starved by the login's latch (huge-blue, 2026-11-18 17:18-19:53Z)
 
@@ -25203,8 +25281,10 @@ class LandForwardTest(Base):
     queue = LandTest.queue
     refresh = LandTest.refresh
     nudge_read = LandTest.nudge_read
+    remote_head = LandTest.remote_head
     github_head: dict[str, str] = {}
     nudge_reads = False  # this host forwards: it reads nothing for a judgement
+    remote_head_reads = False  # and settles no head of its own: the executor's queue judges
     land = LandTest.land
     tick = LandTest.tick
     pr = LandTest.pr
@@ -25224,6 +25304,7 @@ class LandForwardTest(Base):
             patch.start()
             self.addCleanup(patch.stop)
         self.t = NOW
+        self.remote_reads: list[str] = []
         self.q = self.queue()
         self.exec_base = Path(self.tmp.name) / "exec-gh"
         self.sent_batches: list[dict] = []
