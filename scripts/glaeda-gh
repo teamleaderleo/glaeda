@@ -7651,10 +7651,19 @@ class Daemon:
 
     @staticmethod
     def note_wait_state(d: Path, rid: str, req: dict) -> None:
-        """The one line BLOCKER's progress lines carry (progress_state), rewritten only when it changes."""
+        """The one line BLOCKER's progress lines carry (progress_state), rewritten only when it changes -- and, once,
+        with the stuck diagnosis for a state that has not changed in WAIT_STUCK_AFTER (progress_update, whose memory
+        lives in REQ["progress"] here, as each tick has a fresh daemon). Written once and left alone: the blocker
+        prints the file only when its text differs from the line it last printed, so an unchanged state is said once
+        and not every WAIT_PROGRESS_EVERY."""
         try:
-            line = progress_state(req["key"], read_cache(req["key"]), str(req.get("until") or "done"),
-                                  float(req.get("grace", RESCUE_GRACE))).replace("\n", " ") + "\n"
+            # a copy: serve_wait keeps a shallow `before`, so a dict mutated in place is never written back
+            seen = dict(req["progress"]) if isinstance(req.get("progress"), dict) else {}
+            said = progress_update(seen, req, read_cache(req["key"]), time.time())
+            req["progress"] = seen
+            if said is None:
+                return
+            line = said.replace("\n  ", " ").replace("\nnext: ", "; next: ").replace("\n", " ") + "\n"
             path = d / f"{rid}.out.state"
             if not path.is_file() or path.read_text() != line:
                 path.write_text(line)
@@ -16439,6 +16448,125 @@ def progress_line(req: dict, state: str, now: float | None = None) -> str:
             f"deadline {utc_clock(began + timeout)}" + (f"; {state}" if state else ""))
 
 
+# A progress line that repeats the one before it is not information. teamleaderleo/leo-workspace#7188, 2026-11-21
+# 09:30-10:06Z: one `wait pr ... --timeout 1800` printed
+#   o/r#7188 OPEN  mergeable=MERGEABLE (UNSTABLE); checks PENDING: 1 passed, 0 failed, 1 pending (of 2, 0 required)
+# at seven consecutive progress lines -- 840 s, half its budget -- and then timed out, while the fact worth saying sat
+# in that same data from the first of them: one check had been pending alone for 14 minutes beside the only sibling it
+# had, which had already passed. That is a stuck check and it is actionable (requeue it, override, or go look at why it
+# never started); the wait said nothing of it, and the reader's context filled with seven identical paragraphs.
+# WAIT_STUCK_AFTER is two progress intervals: the first line says the state, the second would be the first identical
+# repeat, so the diagnosis takes a repeat's place instead of adding a line. (WAIT_DIAGNOSE_AFTER, 120 s, bounds the
+# other silence -- a wait that cannot read at all, glaeda#2316. The two must stay apart: that one says "I cannot see",
+# this one says "I can see, and nothing is moving".)
+WAIT_STUCK_AFTER = 2 * WAIT_PROGRESS_EVERY
+STUCK_NAMED = 5  # how many pending checks a stuck diagnosis names, oldest first
+
+
+def stuck_next(c: dict, key: str) -> str:
+    """A next step for a check that is not moving: its own run, which says whether its job ever got a runner. The wait
+    cannot end before that check does, so the step is about the check and never another identical wait
+    (docs/handbook/wait-that-cannot-end.md)."""
+    _, owner, repo, _ = split_key(key)
+    return f"gh run view {c['runId']} -R {owner}/{repo}" if c.get("runId") \
+        else f"glaeda-gh status pr {key_name(key)} --verbose"
+
+
+def unseen_next(data: dict, key: str) -> str:
+    """A next step for an unfinished check this wait cannot name, because the rollup it read stopped at 100 contexts:
+    the page past that one, listing what has not completed. Never this same wait again
+    (docs/handbook/wait-that-cannot-end.md: every `next:` names something that can change the state it waits on)."""
+    _, owner, repo, _ = split_key(key)
+    sha = data.get("headRefOid") or ""
+    return (f"""gh api "repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100&page=2" """
+            """--jq '.check_runs[]|select(.status!="completed")|.name'""" if sha
+            else f"glaeda-gh status pr {key_name(key)} --verbose")
+
+
+def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RESCUE_GRACE,
+               now: float | None = None) -> str | None:
+    """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
+    pending and how long each has been (the age is the load-bearing part -- "pending" alone reads the same at 20 s and
+    at 14 min), that their siblings have finished when they have, and a next step for a check that is not moving.
+
+    None while there is nothing to say: the state has not been still that long, the target is not a PR (a run's status
+    is its own state), or nothing is pending. Never the blind read of glaeda#2316, which is the opposite case: there
+    nothing was read and the words name the bucket and the reset; here the data is current and no part of it moves."""
+    now = time.time() if now is None else now
+    if unchanged < WAIT_STUCK_AFTER or split_key(key)[0] != "pr":
+        return None
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("checks"), list) or not data["checks"]:
+        return None
+    if not all(isinstance(c, dict) for c in data["checks"]):
+        return None  # a cache this shape is a bug elsewhere; the note is never the thing that raises into a wait
+    groups = classify(data, now, grace)
+    pending = groups["pending"]
+    # What the rollup's own counts say is unfinished past the 100 contexts it returned. The one check that decided
+    # manaflow-ai/cmux#48834 (1501 s, 2026-11-21) was there, so everything 25 minutes of waiting said about it was
+    # "0 pending, 1 more unfinished past the first 100" -- a line that reads as self-contradictory because the count
+    # it can see and the count it cannot are in the same breath. A read that did not happen is unknown
+    # (docs/handbook/missing-read-counted-as-a-value.md): the wait names that part as unseen instead of absorbing it.
+    unseen = max(0, pending_on_every_page(data) - len(pending) - len(groups["held"]))
+    if not pending and not unseen:
+        return None
+
+    def since(c: dict) -> float | None:
+        started = iso_epoch(c.get("startedAt"))
+        return started if started is not None and started <= now else None
+
+    def said(c: dict) -> str:
+        started = since(c)
+        return (f"{label(c)} pending {span(now - started)} (since {utc_clock(started)})" if started is not None
+                else f"{label(c)} pending (GitHub reports no start time for it)")
+    oldest = sorted(pending, key=lambda c: since(c) if since(c) is not None else now)
+    named = "; ".join(said(c) for c in oldest[:STUCK_NAMED])
+    more = f"; +{len(oldest) - STUCK_NAMED} more pending" if len(oldest) > STUCK_NAMED else ""
+    done = len(groups["passed"]) + len(groups["failed"])
+    siblings = (f", and its {done} sibling(s) have finished ({len(groups['passed'])} passed, "
+                f"{len(groups['failed'])} failed)" if done else "")
+    alone = (" A lone check pending beside siblings that all passed is usually stuck, not slow."
+             if len(pending) == 1 and not unseen and groups["passed"] and not groups["failed"]
+             and not groups["held"] else "")
+    # The rollup can already be red while a `--until done` wait goes on (it ends on the checks, not on the rollup):
+    # cmux#48834 said PENDING against a rollup FAILURE for 25 minutes and never said the two were not the same test.
+    rollup = str(data.get("checkState") or "").upper()
+    disagrees = (f" GitHub's rollup already says {rollup}; this wait ends on the checks it counts, not on the rollup, "
+                 "so a red there does not end it." if rollup in COUNT_BAD else "")
+    stands = (f"{len(pending)} of {len(data['checks'])} checks are still pending" if pending
+              else f"every one of the {len(data['checks'])} checks it can read has finished")
+    lines = [f"glaeda-gh: WARNING: {key_name(key)} has not changed for {span(unchanged)}: "
+             f"{stands}{siblings}.{alone}{disagrees}"]
+    if pending:
+        lines.append(f"  not moving: {named}{more}")
+    if unseen:
+        lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
+                     "rollup returned; pagination, not this PR, decided that this wait cannot name them")
+    lines.append(f"next: {stuck_next(oldest[0], key) if pending else unseen_next(data, key)}")
+    return "\n".join(lines)
+
+
+def progress_update(seen: dict, req: dict, entry: dict | None, now: float | None = None) -> str | None:
+    """What a wait's next progress line carries, or None for "say nothing": the state whenever it differs from the one
+    the last line carried, that state and a one-time stuck diagnosis (stuck_note) once it has not changed for
+    WAIT_STUCK_AFTER, and nothing at all while it is the state this wait has already said. SEEN is the wait's memory
+    of its own output ({"state", "at", "stuck"}), updated in place; the daemon path keeps the same three on the
+    request, and its blocker drops a line it already printed the same way."""
+    now = time.time() if now is None else now
+    grace = float(req.get("grace", RESCUE_GRACE))
+    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace)
+    if state != seen.get("state"):
+        seen.update(state=state, at=now, stuck=False)
+        return state
+    if seen.get("stuck"):
+        return None  # the same state, already diagnosed: silence until something actually changes
+    note = stuck_note(req["key"], entry, now - float(seen.get("at") or now), grace, now)
+    if note is None:
+        return None
+    seen["stuck"] = True
+    return f"{state}\n{note}"
+
+
 def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dict:
     """ok, code, reason and next for a decided or timed-out `wait pr|run` (agent output contract)."""
     key, kind = req["key"], req["kind"]
@@ -17269,6 +17397,7 @@ def poll_wait(req: dict) -> int:
     start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     said = time.monotonic()
+    seen: dict = {}  # what the last progress line carried (progress_update): an unchanged state is not said twice
     warned = False
     down, down_since = DownWait(), None
     while True:
@@ -17324,8 +17453,9 @@ def poll_wait(req: dict) -> int:
         if time.monotonic() - said >= WAIT_PROGRESS_EVERY:
             said = time.monotonic()
             with contextlib.suppress(Exception):  # a progress line never stops the wait
-                say_waiting(progress_line(req, progress_state(req["key"], read_cache(req["key"]), req["until"],
-                                                              float(req["grace"]))))
+                state = progress_update(seen, req, read_cache(req["key"]), time.time())
+                if state is not None:
+                    say_waiting(progress_line(req, state))
         time.sleep(min(WAIT_POLL, max(0.1, req["began"] + timeout - time.time())))
 
 
@@ -17350,7 +17480,7 @@ BASH = "/bin/bash"
 BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
 shift 5
 trap '' PIPE
-every=${GLAEDA_WAIT_PROGRESS:-0} said=$SECONDS sayer=
+every=${GLAEDA_WAIT_PROGRESS:-0} said=$SECONDS sayer= last=
 case "$every" in ''|*[!0-9]*) every=0 ;; esac
 mark=$out.mark
 exec 3<>"$fifo" || exec "$@"
@@ -17368,7 +17498,10 @@ while :; do
   if [ "$every" -gt 0 ] && [ $((SECONDS - said)) -ge "$every" ]; then
     said=$SECONDS state=
     [ -f "$out.state" ] && IFS= read -r state < "$out.state"
-    if [ -z "$sayer" ] || ! kill -0 "$sayer" 2>/dev/null; then
+    if [ -n "$state" ] && [ "$state" = "$last" ]; then
+      : # the state it printed last time, to the character: say nothing until something changes
+    elif [ -z "$sayer" ] || ! kill -0 "$sayer" 2>/dev/null; then
+      last=$state
       printf '%s\n' "glaeda-gh: still waiting on $GLAEDA_WAIT_KEY: $((${GLAEDA_WAIT_ELAPSED:-0} + SECONDS))s of ${GLAEDA_WAIT_TIMEOUT}s, deadline $GLAEDA_WAIT_DEADLINE${state:+; $state}" 1>&2 2>/dev/null 3<&- &
       sayer=$!
     fi
