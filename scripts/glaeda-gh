@@ -5,6 +5,8 @@
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
                                                         reuses the repository before it); --json gives a list
+    A target takes whichever form you typed: OWNER/REPO#N, OWNER/REPO/N, a GitHub URL, or a bare N in the
+    repository of the directory you are in (it says which repository it read).
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
     glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
@@ -850,7 +852,17 @@ PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+
 RUN_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/(?:actions/runs/)?(\d+)(?:[/?#].*)?")
 ISSUE_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/issues/)(\d+)(?:[/?#].*)?")
 HEAD_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:@|/commit/)([0-9a-fA-F]{{40}})")
-KEY_RES = {"pr": PR_RE, "run": RUN_RE, "comment": ISSUE_RE, "head": HEAD_RE}
+# A *key's* target comes with its kind named, so the separator before the number can be whichever one the
+# caller typed: `#`, the URL's own path, or a plain `/`. `o/r/5` was 153 of the 358 targets this host's
+# transcripts had refused by 2026-11-21 (a bare number another 173; see cwd_repo), and with the kind given
+# none of it is ambiguous. A pr target still refuses `o/r/issues/5`: an issue is not a pull request.
+# infer_kind keeps the strict forms above, where the kind is *not* given and `o/r/12345678901` is a run.
+PR_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/)(\d+)(?:[/?#].*)?")
+RUN_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/(?:actions/runs/)?)(\d+)(?:[/?#].*)?")
+ISSUE_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/issues/|/)(\d+)(?:[/?#].*)?")
+# `origin` as GitHub writes it, for a bare number's repository (cwd_repo)
+REMOTE_RE = re.compile(rf"(?:git@github\.com:|(?:https?://|ssh://git@)github\.com/)({NAME})/({NAME}?)(?:\.git)?/?")
+KEY_RES = {"pr": PR_KEY_RE, "run": RUN_KEY_RE, "comment": ISSUE_KEY_RE, "head": HEAD_RE}
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
@@ -1116,10 +1128,35 @@ class WatchError(RuntimeError):
 # ---------------------------------------------------------------- keys and files
 
 
+def cwd_repo(cwd: str | None = None) -> str | None:
+    """`owner/repo` of the GitHub `origin` of the directory the caller ran in, or None if it has none.
+
+    This is what a bare `N` names. A bare number was 173 of the 358 targets this host's transcripts had
+    refused by 2026-11-21, more than any other form, and it is the one an agent reaches for while working in
+    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`."""
+    try:
+        done = subprocess.run(["git", "-C", cwd or ".", "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = REMOTE_RE.fullmatch(done.stdout.strip()) if done.returncode == 0 else None
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
-    shares one entry."""
-    match = KEY_RES[kind].fullmatch(text.strip()) if kind in KEY_RES else None
+    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in."""
+    text = text.strip()
+    bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
+    if bare:
+        repo = cwd_repo()
+        if not repo:
+            raise WatchError(f"{text!r} is a number with no repository: name it as OWNER/REPO#{bare.group(1)}, "
+                             f"or run this where the repository's origin is ({os.getcwd()} has none)")
+        # said, not silent: a number resolved against the wrong checkout would read as the right PR
+        text = f"{repo}{'/' if kind == 'run' else '#'}{int(bare.group(1))}"
+        say_waiting(f"glaeda-gh: {bare.group(0)} is {text} (the origin of {os.getcwd()})")
+    match = KEY_RES[kind].fullmatch(text) if kind in KEY_RES else None
     if not match:
         form = {"pr": "OWNER/REPO#N or a pull request URL", "run": "OWNER/REPO/RUN_ID or a run URL",
                 "comment": "OWNER/REPO#N or an issue or pull request URL"}.get(kind, "pr, run or comment")
@@ -10600,12 +10637,15 @@ def land_config() -> dict:
 
 
 def land_key(target: str) -> tuple[str, str, int]:
-    """(key, OWNER/REPO as typed, N) for OWNER/REPO#N or a PR URL."""
-    m = PR_RE.fullmatch(target.strip())
-    if not m:
-        raise WatchError(f"land takes OWNER/REPO#N or a pull request URL, not {target!r}")
-    owner, repo, number = m.groups()
-    return parse_key("pr", target), f"{owner}/{repo}", int(number)
+    """(key, OWNER/REPO as typed, N) for OWNER/REPO#N, OWNER/REPO/N, a PR URL, or a bare N in the repository
+    the caller stands in (parse_key reads both of the loose forms)."""
+    text = target.strip()
+    m = PR_KEY_RE.fullmatch(text)
+    if not m and not BARE_NUMBER.fullmatch(text):
+        raise WatchError(f"land takes OWNER/REPO#N, OWNER/REPO/N or a pull request URL, not {target!r}")
+    key = parse_key("pr", text)  # a bare number names the repository the caller stands in, or raises
+    _, owner, repo, number = split_key(key)
+    return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
 
 
 # Where the session that queues a land is named, in order (acpmux send takes a session's name or id). Read at queue
@@ -16060,10 +16100,12 @@ def status_keys(kind: str, targets: list[str]) -> list[str]:
     repo: str | None = None
     for text in targets:
         bare = BARE_NUMBER.fullmatch(text.strip()) if kind in ("pr", "comment") else None
-        if bare:
-            if repo is None:
-                raise WatchError(f"{text!r} needs an OWNER/REPO#N before it to name its repository")
+        if bare and repo is not None:
             key = f"{kind}:{repo}#{int(bare.group(1))}"
+        elif bare:
+            # no target before it to borrow a repository from: parse_key reads the one the caller stands in
+            key = parse_key(kind, text)
+            repo = split_key(key)[1] + "/" + split_key(key)[2]
         else:
             key = parse_key(kind, text)
             repo = split_key(key)[1] + "/" + split_key(key)[2]
@@ -23402,8 +23444,9 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
         if name == "status":
             s.add_argument("target", nargs="+",
-                           help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL; several are read in one gather, "
-                                "and for pr and comment a bare #N or N reuses the repository before it")
+                           help="OWNER/REPO#N, OWNER/REPO/N or a GitHub URL; several are read in one gather, "
+                                "and a bare #N or N is that number in the repository of the target before it, "
+                                "or of the directory you are in")
             s.add_argument("--field", metavar="F,G",
                            help="print just these values of the --json object, tab-separated, one line per target "
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "

@@ -2653,6 +2653,52 @@ class DaemonTest(Base):
                 gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
             self.assertEqual(pool.token("o"), token)
 
+    def test_the_target_forms_agents_type_are_read(self) -> None:
+        """A named kind makes `o/r/5` and a bare `5` unambiguous, so both are read instead of refused.
+
+        Of the 358 targets this host's transcripts had refused by 2026-11-21, 153 were OWNER/REPO/N and 173
+        a bare number: every one of them a tool call that bought nothing (fewer-tool-calls, as infer_kind)."""
+        self.assertEqual(gg.parse_key("pr", "manaflow-ai/cmux/24474"), "pr:manaflow-ai/cmux#24474")
+        self.assertEqual(gg.parse_key("comment", "Manaflow-AI/cmuxterm-hq/16245"), "comment:manaflow-ai/cmuxterm-hq#16245")
+        self.assertEqual(gg.parse_key("run", "o/r#44872188227"), "run:o/r/44872188227")  # a run, `#` as typed
+        self.assertEqual(gg.parse_key("pr", "o/r/pull/7#issuecomment-5"), "pr:o/r#7")
+        with mock.patch.object(gg, "cwd_repo", lambda *a: "teamleaderleo/leo-workspace"):
+            self.assertEqual(gg.parse_key("pr", "7051"), "pr:teamleaderleo/leo-workspace#7051")
+            self.assertEqual(gg.parse_key("pr", "#7051"), "pr:teamleaderleo/leo-workspace#7051")
+            self.assertEqual(gg.parse_key("run", "44872188227"), "run:teamleaderleo/leo-workspace/44872188227")
+            self.assertEqual(gg.status_keys("pr", ["7051", "#7052"]), ["pr:teamleaderleo/leo-workspace#7051",
+                                                                      "pr:teamleaderleo/leo-workspace#7052"])
+            # a target that names its own repository still rules the bare ones after it
+            self.assertEqual(gg.status_keys("pr", ["o/r/1", "2"]), ["pr:o/r#1", "pr:o/r#2"])
+            self.assertEqual(gg.land_key("12"), ("pr:teamleaderleo/leo-workspace#12",
+                                                 "teamleaderleo/leo-workspace", 12))
+        self.assertEqual(gg.land_key("Manaflow-AI/cmux/24474"), ("pr:manaflow-ai/cmux#24474", "Manaflow-AI/cmux", 24474))
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None):  # nowhere to read it from: still refused, and says so
+            with self.assertRaises(gg.WatchError) as refused:
+                gg.parse_key("pr", "7051")
+        self.assertIn("OWNER/REPO#7051", str(refused.exception))
+
+    def test_kindless_inference_keeps_the_strict_forms(self) -> None:
+        """`o/r/12345678901` with no kind is a run, as it was before the loose key forms: infer_kind reads
+        PR_RE and RUN_RE, which still want `#` or `/pull/` for a pull request."""
+        self.assertEqual(gg.infer_kind(["status", "o/r/44872188227"])[0], ["status", "run", "o/r/44872188227"])
+        self.assertEqual(gg.infer_kind(["wait", "o/r#7051"])[0], ["wait", "pr", "o/r#7051"])
+
+    def test_cwd_repo_reads_the_origin(self) -> None:
+        for url, want in (("git@github.com:teamleaderleo/glaeda.git", "teamleaderleo/glaeda"),
+                          ("https://github.com/manaflow-ai/cmux.git", "manaflow-ai/cmux"),
+                          ("https://github.com/manaflow-ai/cmux", "manaflow-ai/cmux"),
+                          ("ssh://git@github.com/o/r.git", "o/r"),
+                          ("git@gitlab.com:o/r.git", None), ("", None)):
+            done = types.SimpleNamespace(returncode=0, stdout=url + "\n")
+            with mock.patch.object(gg.subprocess, "run", lambda *a, **k: done):
+                self.assertEqual(gg.cwd_repo(), want, url)
+        done = types.SimpleNamespace(returncode=128, stdout="")  # not a repository at all
+        with mock.patch.object(gg.subprocess, "run", lambda *a, **k: done):
+            self.assertIsNone(gg.cwd_repo())
+        with mock.patch.object(gg.subprocess, "run", side_effect=OSError("no git")):
+            self.assertIsNone(gg.cwd_repo())
+
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
             with self.assertRaises(gg.WatchError):
@@ -4901,10 +4947,14 @@ class ClientTest(Base):
         self.assertEqual(gg.status_keys("pr", ["O/R#1", "2", "#3", "o/r#1", "https://github.com/x/y/pull/4", "5"]),
                          ["pr:o/r#1", "pr:o/r#2", "pr:o/r#3", "pr:x/y#4", "pr:x/y#5"])
         self.assertEqual(gg.status_keys("comment", ["o/r#1", "2"]), ["comment:o/r#1", "comment:o/r#2"])
-        with self.assertRaisesRegex(gg.WatchError, "needs an OWNER/REPO#N before it"):
-            gg.status_keys("pr", ["7", "o/r#1"])
-        with self.assertRaises(gg.WatchError):
-            gg.status_keys("run", ["o/r/1", "2"])  # a run has no bare form
+        # a bare number with nothing before it reads the repository the caller stands in (cwd_repo), and
+        # refuses only where there is none; a later one still belongs to the target before it
+        with mock.patch.object(gg, "cwd_repo", lambda *a: "o/r"):
+            self.assertEqual(gg.status_keys("pr", ["7", "x/y#1"]), ["pr:o/r#7", "pr:x/y#1"])
+            self.assertEqual(gg.status_keys("run", ["o/r/1", "2"]), ["run:o/r/1", "run:o/r/2"])
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None):
+            with self.assertRaisesRegex(gg.WatchError, "OWNER/REPO#7"):
+                gg.status_keys("pr", ["7", "o/r#1"])
 
     def test_several_targets_print_a_block_each_and_json_gives_a_list(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
