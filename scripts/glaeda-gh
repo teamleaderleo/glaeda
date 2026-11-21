@@ -3771,7 +3771,7 @@ def pr_head_parent(node: dict, commits: list) -> str:
     against headRefOid, so a read whose commit list lags the head (or a REST read, which carries no parents) says
     nothing rather than naming another commit's parent. A first parent is what proves a merge commit was made on top
     of a known head: land's pin follows the merge its own update-branch made (LandQueue.pin_follow)."""
-    commit = (commits[0] if commits else {}) or {}
+    commit = ((commits[0] if commits else {}) or {}).get("commit") or {}
     oid = str(commit.get("oid") or "").lower()
     head = str(node.get("headRefOid") or "").lower()
     if not oid or not head or oid != head:
@@ -14369,7 +14369,10 @@ def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
     Anything else -- a push, a force-push, an unrelated commit, a merge made on top of something else -- is False, and
     the pin stops the row (head_moved) as it always did. An empty PARENT (a read that does not say) is False: a parent
     that could not be read is not a parent that matched."""
-    return bool(pin) and not land_head_moved(pin, parent) and bool(sent) and not land_head_moved(pin, sent)
+    # bool(parent) and bool(sent) are load-bearing: land_head_moved("pin", "") is False (an unread head has not
+    # moved), so without them a read that said no parent at all would read as a parent that matched.
+    return (bool(pin) and bool(parent) and not land_head_moved(pin, parent)
+            and bool(sent) and not land_head_moved(pin, sent))
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:

@@ -20749,11 +20749,13 @@ class LogScanTest(Base):
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
-def land_pr(head: str, state: str = "OPEN", checks: list | None = None) -> dict:
-    """A PR cache entry's data, as parse_pr stores it."""
+def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "") -> dict:
+    """A PR cache entry's data, as parse_pr stores it. PARENT is the head commit's first parent as the read gave it
+    (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
     return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            **({"headParent": parent} if parent else {}),
             "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
 
 
@@ -22060,6 +22062,89 @@ class LandTest(Base):
         e = self.tick()
         self.assertNotIn("pinSha", e)
         self.assert_merged_at(LB)
+
+    # -- the pin follows the merge commit the queue's own update-branch made
+
+    def update_branch_moved_the_head(self, pin: str = LA) -> dict:
+        """Judge PIN tip_merge, run update_branch at it, and leave the entry waiting for the new head."""
+        self.pr(pin)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=pin)
+        self.w.answers.append(self.tip_merge(pin))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("api")), 1)  # the update-branch was sent, pinned to the pin
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", pin))
+        return e
+
+    def test_the_pin_follows_the_merge_commit_its_own_update_branch_made(self):
+        # manaflow-ai/cmux#48445 (2026-11-21): judged tip_merge at ae9916f4e43f, `step exit=0 kind=update_branch`,
+        # then stopped "the head is 5ac37fd9debf, not the --sha ae9916f4e43f it was queued for" -- and 5ac37fd9debf
+        # was the merge commit that step made, first parent ae9916f4e43f. The daemon refused its own transition and a
+        # person had to read the new head and re-queue. The pin follows that commit now.
+        self.update_branch_moved_the_head()
+        self.pr(LB, parent=LA)  # the merge update-branch made: base merged into the pinned head
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        followed = [h for h in e["history"] if h["event"] == "pin_followed"]
+        self.assertEqual([(h["was"], h["head"], h["parent"], h["step"]) for h in followed],
+                         [(LA[:12], LB[:12], LA[:12], "update_branch")])
+        self.assert_merged_at(LB)  # the merge is still pinned, to the head that was judged
+
+    def test_the_pin_does_not_follow_a_head_whose_first_parent_is_another(self):
+        # The safety argument, and the whole of it: only a first parent that is the pin proves the pinned content is
+        # what is being merged. A push, a force-push or a merge made on top of anything else stops as it always did.
+        self.update_branch_moved_the_head()
+        self.pr(LB, parent=LC)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        # no new judgement and no merge at the new head: only the tip_merge judgement that ran the update-branch
+        self.assertEqual((len(self.w.explains()), self.w.gh_calls("pr", "merge")), (1, []))
+        self.assertEqual([h for h in e["history"] if h["event"] == "pin_followed"], [])
+
+    def test_a_head_whose_first_parent_no_read_says_waits_then_stops_as_before(self):
+        # "the first parent could not be read" is not "the head moved": a read that does not say the parent (a REST
+        # read, a commit list behind the head) is waited for, and past LAND_PIN_PARENT_WAIT the pin stops the row
+        # exactly as it did before this change.
+        self.update_branch_moved_the_head()
+        self.pr(LB)
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"], e["pinFollow"]["head"]),
+                         ("waiting", None, LA, LB))
+        self.assertIn("pin_parent_wait", [h["event"] for h in e["history"]])
+        self.assertEqual((len(self.w.explains()), self.w.gh_calls("pr", "merge")), (1, []))
+        e = self.tick(gg.LAND_PIN_PARENT_WAIT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("pin_parent_unread", [h["event"] for h in e["history"]])
+
+    def test_a_first_parent_read_within_the_wait_is_followed(self):
+        self.update_branch_moved_the_head()
+        self.pr(LB)
+        self.assertEqual(self.tick()["state"], "waiting")
+        self.pr(LB, parent=LA)  # the next read says it
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
+        self.assertNotIn("pinFollow", e)
+
+    def test_a_pin_follow_needs_the_update_branch_to_have_been_sent_at_the_pin(self):
+        self.assertTrue(gg.land_pin_merged(LA, LA, LA))
+        self.assertTrue(gg.land_pin_merged(LA[:12], LA, LA))  # a prefix pin matches the full parent
+        self.assertFalse(gg.land_pin_merged(LA, LC, LA))  # the first parent is another commit
+        self.assertFalse(gg.land_pin_merged(LA, "", LA))  # no read said the first parent
+        self.assertFalse(gg.land_pin_merged(LA, LA, ""))  # no update-branch of ours was sent at the pin
+        self.assertFalse(gg.land_pin_merged(LA, LA, LC))  # ours was sent at another head
+        self.assertFalse(gg.land_pin_merged("", LA, LA))  # unpinned
+
+    def test_a_head_commit_names_its_first_parent_only_when_it_is_the_head(self):
+        def node(oid: str, parents: list[str]) -> dict:
+            return {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+                "oid": oid, "parents": {"nodes": [{"oid": p} for p in parents]}}}]}}
+        self.assertEqual(gg.pr_head_parent(node(LB, [LA, LC]), node(LB, [LA])["commits"]["nodes"]), LA)
+        # A commit list behind the head, no parents at all, or a REST read (no oid, no parents): nothing is claimed.
+        self.assertEqual(gg.pr_head_parent(node(LC, [LA]), node(LC, [LA])["commits"]["nodes"]), "")
+        self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
+        self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
 
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
