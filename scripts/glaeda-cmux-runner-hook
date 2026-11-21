@@ -10065,6 +10065,8 @@ def registration_file(state_dir: Path, runner_dir: Path) -> Path:
 # or its gate is gone.
 GATE_STATE_SCHEMA = 1
 GATE_STATE_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_STATE_EVERY_S") or 30.0)
+# At most this many drifted labels are logged and published (AGENTS.md: human and JSON output stays bounded).
+GATE_LABEL_DRIFT_MAX = 12
 
 
 def gate_state_file(state_dir: Path, runner_dir: Path) -> Path:
@@ -10498,10 +10500,14 @@ class Gate:
         self.cap_feed_at = time.monotonic()
 
         def look() -> None:
+            # cap_labels is assigned once, at the end: a look that narrowed it to the receipt first would drop an
+            # observed-only label for the whole feed read (up to HOST_LOAD_CAP_FEED_TIMEOUT_S), and the main thread
+            # reads it meanwhile - starved_step would see `not want`, release the reserve it holds for a job of that
+            # label and restart its max_hold_s clock, once a minute.
+            receipt: frozenset[str] | None = None
             try:
                 name = runner_config(self.runner_dir)[0]
                 receipt = runner_labels(self.state_dir, name)
-                self.cap_labels = receipt  # the receipt alone until the feed is read, as before
                 path, now = self.state_dir / HOST_LOAD_CAP_FEED_FILE, time.time()
                 summary = None
                 with contextlib.suppress(OSError, ValueError, RecursionError):
@@ -10526,13 +10532,17 @@ class Gate:
                 # they serve: no reserve, no urgent listen, no starved-job answer. What GitHub dispatched is proof.
                 observed = observed_labels(summary, name)
                 self.cap_labels = cap_label_set(receipt, observed)
-                drift = sorted(observed - (receipt or frozenset()))
+                # Drift is a receipt understating itself. With no readable receipt there is nothing to disagree with,
+                # so that is not published as drift: it would report the runner's whole label set as a disagreement.
+                drift = sorted(observed - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
                 if drift != self.cap_label_drift:
                     self.cap_label_drift = drift
                     if drift:
                         gate_log("GitHub dispatches labels this runner's receipt does not list: " + ", ".join(drift))
             except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                 self.cap_summary = None
+                if receipt is not None:  # the feed could not say; reason with the receipt alone, as before
+                    self.cap_labels = receipt
                 gate_log(f"the host load cap's feed look failed ({type(error).__name__}); not holding for it")
 
         self.cap_thread = threading.Thread(target=look, name="load-cap", daemon=True)

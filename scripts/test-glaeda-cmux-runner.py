@@ -46,6 +46,14 @@ WORKER_STEP_EXIT = "runner-worker-step-exit "  # the Runner.Worker stand-in's la
 # stops a process in this machine's own /private/tmp/cmux-ci. test_taking_a_root_stops_its_leftovers sets its own.
 NO_ROOTS = "/nonexistent/glaeda-test-canonical-roots"
 
+sys.path.insert(0, os.fspath(ROOT / "scripts"))
+import glaeda_hook_pin  # noqa: E402
+
+# Pinning at import, as test-glaeda-disk.py does, so that any run of this file pins the hook - a `-k` selection
+# that did not happen to match DrainPinTest used to leave the pin out of the diff and only CI said so.
+if not glaeda_hook_pin.under_ci():
+    glaeda_hook_pin.ensure(check=False)
+
 
 def load(name: str, path: Path):
     loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
@@ -315,8 +323,6 @@ class DrainPinTest(unittest.TestCase):
         """A change to the hook must append its sha256 to glaeda-disk's CMUX_NEXT_DRAIN_HOOK_SHA256, or drain
         refuses every runner that installs it (#1550, #1561). Running this suite on a checkout pins it; under CI
         a missing pin fails here, next to the hook's own tests, with the command to run."""
-        sys.path.insert(0, os.fspath(ROOT / "scripts"))
-        import glaeda_hook_pin
         self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
 
 
@@ -9090,6 +9096,54 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertEqual(hook.observed_labels(summary, "cmux21-glaeda-2"), frozenset({"x"}),
                          "a queued job has no runner, and a sibling's job is not this runner's evidence")
         self.assertEqual(hook.observed_labels(summary, None), frozenset())
+
+    def test_the_union_makes_a_queued_job_of_that_label_visible_to_the_reserve(self) -> None:
+        # The point of hq#16433, at the level of a decision rather than a set: label_queued is what
+        # RESERVE_ON_DEMAND asks before it holds a reserve, and every reader filters the queue with
+        # set(job["labels"]) <= labels. With the receipt alone this queued job is invisible, so the mini holds no
+        # reserve and listens for nothing, while GitHub has already proved it can run the label.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued", ago=120)]
+        self.poll()
+        receipt_only = frozenset({"glaeda-mini", self.SIDE_LIGHT})
+        now = time.time()
+        self.assertFalse(hook.label_queued(self.gate.cap_summary, receipt_only, now),
+                         "the receipt's own set cannot see the job: this is the bug")
+        self.assertTrue(hook.label_queued(self.gate.cap_summary, self.gate.cap_labels, now),
+                        "the set the gate now reasons with sees it, so the reserve is asked for")
+
+    def test_an_observed_label_is_not_dropped_while_the_next_look_reads_the_feed(self) -> None:
+        # cap_labels is read by the main thread while the look runs in cap_thread. A look that narrowed it to the
+        # receipt before reading the feed would, once a minute, take an observed-only label away for the length of
+        # the read; starved_step would then see no want of that label, drop the reserve it holds and restart its
+        # max_hold_s clock. The label must stay put until the new set replaces it.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertIn(self.LABEL, self.gate.cap_labels, "the union holds before the next look")
+        reading, seen = threading.Event(), []
+
+        def slow(now: float) -> dict | None:
+            seen.append(frozenset(self.gate.cap_labels or ()))
+            reading.set()
+            return self.fetch(now)
+
+        with mock.patch.object(hook, "load_cap_fetch", side_effect=slow):
+            self.gate.cap_feed_at = 0.0
+            self.gate.load_capped()
+            self.assertTrue(reading.wait(120), "the look never reached the feed read")
+            self.join()
+        self.assertEqual(seen, [frozenset({"glaeda-mini", self.SIDE_LIGHT, self.LABEL})],
+                         "the label GitHub dispatched is still there mid-read")
+
+    def test_a_receipt_it_cannot_read_is_not_published_as_a_disagreement(self) -> None:
+        # With no readable receipt there is nothing for the dispatches to disagree with. Reporting drift here would
+        # publish the runner's whole label set as "the receipt does not list this", which reads as a fleet-wide fault.
+        (self.state / "instance-2" / "receipt.json").write_text("{ not json")
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertEqual(self.gate.cap_labels, frozenset({self.LABEL}), "the dispatches still stand on their own")
+        self.assertEqual(self.gate.cap_label_drift, [], "an absent receipt is not a receipt that understates itself")
 
 
 class StarvedReserveTest(unittest.TestCase):
