@@ -26155,7 +26155,9 @@ def parser() -> argparse.ArgumentParser:
                                    canonical="`--until {}`", help=f"the same as --until {word}")
             s.add_argument("--timeout", type=seconds, default=3600,
                            help="seconds (default 3600); exit 2 after")
-            s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
+            s.add_argument("--sha", "--head", dest="sha", metavar="SHA",
+                           help="the commit you pushed (git rev-parse HEAD): other heads count as pending; "
+                                "--head is the same flag")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",
                            help=f"hold a failure caused only by a glaeda runner refusing a job at setup this long "
                                 f"for a rescue re-run (default {RESCUE_GRACE}; 0 rules on each attempt)")

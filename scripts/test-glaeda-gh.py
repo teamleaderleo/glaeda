@@ -5103,6 +5103,15 @@ class ClientTest(Base):
         for same in (["wait", "pr", "o/r#5", "7"], ["wait", "run", "o/r"], ["wait", "run", "o", "5"]):
             self.assertEqual(gg.infer_kind(list(same))[0], same)
 
+    def test_wait_takes_head_as_its_sha(self) -> None:
+        """Coordinator, 2026-11-21: "add a `--head` alias for `--sha` on `glaeda-gh wait`"."""
+        sha = "a" * 40
+        for kind, target in (("pr", "o/r#5"), ("run", "o/r/7")):
+            by_sha = gg.parser().parse_args(["wait", kind, target, "--sha", sha])
+            by_head = gg.parser().parse_args(["wait", kind, target, "--head", sha])
+            self.assertEqual(by_head.sha, sha)
+            self.assertEqual(vars(by_head), vars(by_sha))
+
     def test_land_takes_a_head_pin_and_slash_targets(self) -> None:
         """Coordinator, 2026-11-21: `land manaflow-ai/cmux/48704 --match-head-commit SHA` was "unrecognized arguments"."""
         args = gg.parser().parse_args(["land", "manaflow-ai/cmux/48704", "--match-head-commit", "abc1234"])
