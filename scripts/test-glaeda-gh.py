@@ -25132,7 +25132,6 @@ class LandTest(Base):
         Returns REST per minute after the lift (judgments x EXPLAIN_REST_*), the judgments per minute, and when
         each PR merged."""
         self.w.config["resetJudgesPerMinute"] = per_minute
-        self.w.config["windowShare"] = {"rest": 0, "graphql": 0}  # the stagger alone (the window cap: its own test)
         self.q = self.queue()
         pending: set[str] = set()
         self.q.watch = self.q.peek = pending.add
@@ -25260,13 +25259,28 @@ class LandTest(Base):
                 "queueUntil": self.q.queue_quota_until,
                 "queued": sum(1 for n in heads if self.q.entries[f"pr:o/r#{n}"]["state"] == "queued")}
 
-    def test_the_host_cap_keeps_a_windows_judgments_under_its_share_and_judges_a_merge_ready_entry_first(self):
+    def live_graphql(self, room: int, live: list, reset_every: float | None = None) -> None:
+        """The login's GraphQL count as /rate_limit reads it: ROOM judgments' worth over the reserve, less what each
+        live judgment in LIVE (its times) spent; with RESET_EVERY, a new window of that length restores it."""
+        cost, reserve, start = gg.LAND_JUDGE_COST["graphql"], gg.hard_reserve_floor()["graphql"], self.t
+        every = reset_every or gg.LAND_WINDOW_S
+
+        def reading(pool):
+            if pool != "graphql":
+                return None  # REST unpaced here: no reading
+            k = int((self.t - start) // every)
+            spent = sum(1 for at in live if start + k * every <= at)
+            return {"limit": 5000, "remaining": reserve + cost * (room - spent),
+                    "reset": start + (k + 1) * every, "seenAt": self.t}
+        self.q.reading = reading
+
+    def test_the_host_cap_paces_a_windows_judgments_by_the_live_count_and_judges_a_merge_ready_entry_first(self):
         """gcp-agent-lane-1, 2026-11-20: the land queue sent 135 calls in the ten minutes after the 01:38Z reset with 31
-        entries waiting, and GraphQL is the pool that stalls every lane (the coordinator: "put the per-host, per-window
-        cap (merge-ready entries first)"). 40 entries whose judgments answer a plain "unreadable" (retried every
-        LAND_RETRY_DEFAULT) and one judged ok at its head with its merge step next: one window's judgments stay under
-        LAND_WINDOW_SHARE of each pool at LAND_JUDGE_COST each, its first ten minutes under the ramp's slice, and the
-        merge-ready entry is judged first. An entry left out says so."""
+        entries waiting; huge-blue, 2026-11-21: 54 of 72 entries "host cap (graphql)" with 1107 points left under a
+        fixed 0.05 share of 5000. 40 entries whose judgments answer a plain "unreadable" and one judged ok at its head
+        with its merge step next, under a live count of 12 judgments' GraphQL over the reserve: the window's live
+        judgments stay within that count, spread to its reset rather than spent at once, and the merge-ready entry is
+        judged first. An entry left out says so, and is judged from the caches at most once a slot."""
         k = 40
         heads = {n: format(0xC0 + n, "040x") for n in range(1, k + 2)}
         for n, head in heads.items():
@@ -25278,14 +25292,20 @@ class LandTest(Base):
         ready["explain"] = {"at": self.t - 60, "ok": True, "code": "", "head": heads[k + 1],
                             "action": {"kind": "merge", "sha": heads[k + 1]}}
         judged: list[tuple[float, int]] = []
+        live_at: list[float] = []
+        room = 12
+        self.live_graphql(room, live_at)
         real = self.w.run
-
-        cached: list[tuple[float, int]] = []  # cache-only judgments (LAND_CACHE_ONLY_MAX_AGE): charged nothing
+        cached: list[tuple[int, float]] = []  # cache-only judgments, by entry and the pace slot they stood in for
 
         def run(argv, timeout, env):
             if argv[1:3] == [self.w.mh, "explain"]:
                 n = int(argv[4])
-                (cached if "--cache-only" in argv else judged).append((self.t, n))
+                if "--cache-only" in argv:
+                    cached.append((n, (self.q.window or {}).get("graphqlAt", float("-inf"))))
+                    return real(argv, timeout, env)  # the caches miss (cache_answers off)
+                judged.append((self.t, n))
+                live_at.append(self.t)
                 if n == k + 1:
                     rc, doc = ok_answer(heads[n])
                     doc["action"]["number"] = n
@@ -25299,40 +25319,63 @@ class LandTest(Base):
             for key in list(self.w.cache):
                 self.w.cache[key]["updatedAtAt"] = self.t
             self.tick(30)
-        most = min(gg.LAND_WINDOW_SHARE[p] * gg.LAND_POOL / gg.LAND_JUDGE_COST[p] for p in gg.LAND_JUDGE_COST)
         first10 = sum(1 for at, _ in judged if at < start + 600)
         if os.environ.get("LAND_RESET_PROFILE"):
-            print("PROFILE", json.dumps({"judged": len(judged), "first10": first10, "cap": int(most),
+            print("PROFILE", json.dumps({"judged": len(judged), "first10": first10, "room": room,
                                          "first": judged[0][1] if judged else None}))
         self.assertEqual(judged[0][1], k + 1, judged[:3])
-        self.assertLessEqual(len(judged), most)
-        self.assertLessEqual(first10, most * (600 + gg.LAND_WINDOW_RAMP) / gg.LAND_WINDOW_S + 1)
+        self.assertLessEqual(len(judged), room)  # never past the live count's room over the reserve
+        self.assertLess(first10, room)  # spread toward the reset, not spent in its first minutes
         self.assertEqual(self.q.entries[f"pr:o/r#{k + 1}"]["state"], "merged")
-        # GraphQL is the pool capped first: each entry it leaves out is judged once from the caches, which miss here
-        self.assertLessEqual(max(collections.Counter(n for _, n in cached).values(), default=0), 1)
+        self.assertLessEqual(max(collections.Counter(cached).values(), default=0), 1)
         capped = [e for e in self.q.entries.values() if e.get("windowCapped")]
         self.assertTrue(capped)
-        self.assertIn("not judged this window: host cap", gg.land_line(capped[0], self.t, latch=None))
+        self.assertIn("not judged this window: host cap (graphql:", gg.land_line(capped[0], self.t, latch=None))
+
+    def test_a_pool_with_no_reading_is_not_paced(self):
+        """A broker client (gcp-agent-lane-1) reads no /rate_limit of its own: an unknown count is no fixed share
+        either (missing-read-counted-as-a-value.md), so its judgments are not held by the pace; the latch, the quota
+        park and the shim's refusal guard it."""
+        heads = {n: format(0xB0 + n, "040x") for n in range(1, 6)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+            self.land(f"o/r#{n}")
+        self.q.reading = lambda pool: None
+        judged: list[int] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"] and "--cache-only" not in argv:
+                judged.append(int(argv[4]))
+                self.w.answers.append(refusal("unreadable", heads[int(argv[4])], None))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(4):
+            self.tick(30)
+        self.assertEqual(set(judged), set(heads))
+        self.assertFalse([e for e in self.q.entries.values() if e.get("windowCapped")])
 
     def test_an_entry_held_only_by_the_host_cap_is_never_stopped_by_its_wait_deadline(self):
         """Router review of glaeda#2244, F1: the cap's waits counted toward a wait's deadline. Its 200-entry simulation
         stopped an "unreadable" entry after four judgments over 25,470 s although its retries asked for 420 s, the rest
         spent waiting its turn under the cap. Here 10 entries answer a plain "unreadable" (each a 120 s retry) under a
-        cap of four judgments' GraphQL a window, for longer than LAND_UNREAD_DEADLINE: none is stopped on its
+        live count of four judgments' GraphQL a window, for longer than LAND_UNREAD_DEADLINE: none is stopped on its
         deadline."""
-        self.w.config["windowShare"] = {"rest": 0, "graphql": 4 * gg.LAND_JUDGE_COST["graphql"] / gg.LAND_POOL}
         k = 10
         heads = {n: format(0xD0 + n, "040x") for n in range(1, k + 1)}
         for n, head in heads.items():
             self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
             self.land(f"o/r#{n}")
         judged: list[int] = []
+        live_at: list[float] = []
+        self.live_graphql(4, live_at, reset_every=gg.LAND_WINDOW_S)
         real = self.w.run
 
         def run(argv, timeout, env):
-            if argv[1:3] == [self.w.mh, "explain"]:
+            if argv[1:3] == [self.w.mh, "explain"] and "--cache-only" not in argv:
                 n = int(argv[4])
                 judged.append(n)
+                live_at.append(self.t)
                 self.w.answers.append(refusal("unreadable", heads[n], None))
             return real(argv, timeout, env)
         self.q.run = run
@@ -25342,7 +25385,10 @@ class LandTest(Base):
                 self.w.cache[key]["updatedAtAt"] = self.t
             self.tick(60)
         stops = {key: (e.get("stop") or {}).get("code") for key, e in self.q.entries.items() if e["state"] == "stopped"}
-        self.assertGreater(len(judged), k)  # every entry judged, some more than once: the cap opened each window
+        self.assertGreater(len(judged), k)  # every entry judged, some more than once: the pace opened slots each window
+        # each entry judged live in turn: a paced entry wakes at its slot and keeps its place (due_since: paceSince)
+        self.assertGreaterEqual(min(collections.Counter(judged).values()), 2, collections.Counter(judged))
+        self.assertEqual(set(judged), set(heads))
         self.assertEqual(stops, {})
 
     def test_an_entry_capped_only_for_graphql_is_judged_from_the_caches(self):
@@ -25351,8 +25397,10 @@ class LandTest(Base):
         unreadable live reads). An entry the cap leaves out only for GraphQL is judged `explain --cache-only` and
         charged nothing: a cache "ok" merges (the shim judges the merge live), a miss keeps its place under the cap,
         named, with no strike."""
-        self.w.config["windowShare"] = {"rest": 0, "graphql": 1 * gg.LAND_JUDGE_COST["graphql"] / gg.LAND_POOL}
         heads = {n: format(0xE0 + n, "040x") for n in range(1, 4)}
+        live_at: list[float] = []
+        self.live_graphql(1, live_at)  # one judgment's GraphQL over the reserve, live
+        self.w.cache_answers = True  # the hook below answers the cache-only judgments itself
         for n, head in heads.items():
             self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
             self.land(f"o/r#{n}")
@@ -25363,6 +25411,8 @@ class LandTest(Base):
             if argv[1:3] == [self.w.mh, "explain"]:
                 n = int(argv[4])
                 seen.append((n, "--cache-only" in argv))
+                if "--cache-only" not in argv:
+                    live_at.append(self.t)
                 if n == 2:
                     rc, doc = ok_answer(heads[n])
                     doc["action"]["number"] = n
@@ -25378,7 +25428,7 @@ class LandTest(Base):
             self.tick(30)
         live = [n for n, only in seen if not only]
         cached = [n for n, only in seen if only]
-        self.assertLessEqual(len(live), 1, seen)  # the window's GraphQL share (under the ramp: none at first)
+        self.assertLessEqual(len(live), 1, seen)  # the live count's room over the reserve
         self.assertIn(2, cached + live)
         self.assertEqual(self.q.entries["pr:o/r#2"]["state"], "merged")
         missed = [self.q.entries[f"pr:o/r#{n}"] for n in (1, 3) if n not in live]
@@ -25386,8 +25436,60 @@ class LandTest(Base):
         for e in missed:
             self.assertNotEqual(e["state"], "stopped")
             self.assertIn("not judged this window: host cap (graphql", gg.land_line(e, self.t, latch=None))
-            self.assertEqual(sum(1 for n, only in seen if only and f"pr:o/r#{n}" == e["key"]), 1)  # once a window
+            self.assertEqual(sum(1 for n, only in seen if only and f"pr:o/r#{n}" == e["key"]), 1)  # once a slot
         self.assertLessEqual(gg.read_json(gg.land_dir() / "window.json")["graphql"], gg.LAND_JUDGE_COST["graphql"])
+
+    def test_the_same_raised_unreadable_three_times_stops_naming_it_to_its_requester(self):
+        """gcp-agent-lane-1, 2026-11-21: 26 of 38 judgments in 2 h ended "unreadable" and were retried, each holding a
+        worker to learn nothing new (cmux#49035: the same KeyError on every pass). The same raised error text at one
+        head LAND_UNREAD_SAME_STOP times in a row stops the entry, that error named to its requester; each judgment
+        between went to the caches first (they miss here), then live."""
+        self.pr(LA)
+        self.land()
+        why = "land-judge: unreadable: KeyError: 'statusCheckRollup' in read_checks (line 4120)"
+        for n in range(gg.LAND_UNREAD_SAME_STOP):
+            self.w.answers.append(refusal("unreadable", LA, None, reason=why.replace("4120", str(4120 + n))))
+        e = {}
+        for _ in range(60):
+            e = self.tick(60)
+            if e.get("state") == "stopped":
+                break
+        self.assertEqual(e["state"], "stopped")
+        self.assertEqual(e["stop"]["code"], "unreadable_repeated")
+        self.assertIn("KeyError: 'statusCheckRollup'", e["stop"]["reason"])
+        self.assertIn(f"{gg.LAND_UNREAD_SAME_STOP} times in a row", e["stop"]["reason"])
+        self.assertTrue(any("KeyError" in c[-1] for c in self.w.sent()), self.w.sent())
+        explains = [c for c in self.w.calls if c[1:3] == [self.w.mh, "explain"]]
+        self.assertEqual(sum(1 for c in explains if "--cache-only" in c), gg.LAND_UNREAD_SAME_STOP - 1)
+        self.assertEqual(sum(1 for c in explains if "--cache-only" not in c), gg.LAND_UNREAD_SAME_STOP)
+
+    def test_a_transient_unreadable_is_retried_not_stopped_and_a_cache_hit_sends_no_read(self):
+        """A read the broker queued or timed out is not the same failure each time: it retries as before. Its next
+        judgment goes to this host's caches first (read-with-one-quota-route.md), and a cache "ok" merges with no
+        live judgment sent."""
+        self.pr(LA)
+        self.land()
+        why = "land-judge: unreadable: the broker queued the read (timed out after 60 s)"
+        for _ in range(gg.LAND_UNREAD_SAME_STOP):
+            self.w.answers.append(refusal("unreadable", LA, None, reason=why))
+        e = {}
+        for _ in range(gg.LAND_UNREAD_SAME_STOP):
+            for _ in range(30):
+                before = len(self.w.answers)
+                e = self.tick(60)
+                if len(self.w.answers) < before:
+                    break
+        self.assertNotEqual(e.get("state"), "stopped", e.get("stop"))
+        self.w.cache_answers = True
+        self.w.answers.append(ok_answer(LA))
+        live_before = sum(1 for c in self.w.calls if c[1:3] == [self.w.mh, "explain"] and "--cache-only" not in c)
+        for _ in range(60):
+            e = self.tick(60)
+            if e.get("state") == "merged":
+                break
+        self.assertEqual(e["state"], "merged")
+        live_after = sum(1 for c in self.w.calls if c[1:3] == [self.w.mh, "explain"] and "--cache-only" not in c)
+        self.assertEqual(live_after, live_before)  # judged from the caches: no live judgment
 
     def test_an_unreadable_judgment_the_quota_refused_is_parked_until_the_reset_it_names(self):
         """The broker client gcp-agent-lane-1, 2026-11-19 22:38-22:50Z: 63 judgments in 12 minutes, 30 of them
