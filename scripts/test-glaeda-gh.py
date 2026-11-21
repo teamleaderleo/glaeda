@@ -23751,6 +23751,129 @@ class LandTest(Base):
         self.assertIn("every worker busy", gg.land_line(e, self.t, latch=None))  # no park: as before
         self.assertIsNone(gg.land_queue_parked(self.t + 1801))
 
+    def test_status_names_the_queue_park_only_on_a_row_it_holds(self):
+        """One host, 2026-11-21 12:08Z: 18 rows said "held: the land queue is parked until 12:40:59Z (quota)", 3 of
+        them waiting on their own wake past the park's own end: the park was not why they had not moved."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        e.update(state="waiting", wait={"kind": "pr"}, wakeAt=self.t + 2400)
+        self.q.park_queue_quota(self.t + 1800, "quota: GraphQL spent until 09:00Z")
+        queue = gg.land_queue_parked(self.t)
+        self.assertNotIn("held: the land queue is parked", gg.land_line(e, self.t, latch=None, queue=queue))
+        e["wakeAt"] = self.t - 1  # past its wake: a judgment is owed, and the park is what holds it
+        self.assertIn(f"held: the land queue is parked until {gg.utc_clock(self.t + 1800)} (quota)",
+                      gg.land_line(e, self.t, latch=None, queue=queue))
+
+    def test_a_row_whose_own_park_ran_out_is_requeued_behind_a_host_park(self):
+        """A row's own park ending is this queue's own files, no GitHub call: the host-wide park held that step too,
+        so such a row read "waiting (quota)" past its own wake until the host park ended as well."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        e.update(state="waiting", wait={"kind": "quota", "until": self.t + 60, "said": True}, wakeAt=self.t + 60)
+        self.q.park_queue_quota(self.t + 1800, "quota: not judged, retry after 09:00Z (reset)")
+        self.give_reading("rest", 10, self.t + 900)  # under the reserve: the host park holds
+        reads = self.reads()
+        self.tick(61)
+        self.assertEqual((e["state"], e["wait"]), ("queued", None))
+        self.assertEqual(self.reads(), reads)  # re-queued by this queue's own files, nothing read or judged
+        self.assertGreater(self.q.queue_quota_until, self.t)
+
+    def test_a_fresh_reading_above_the_reserve_voids_the_whole_queue_park(self):
+        """One host, 2026-11-21 12:08Z: one row's classifier read (cmux#48940 at 93ecc731b278) was refused for the
+        GraphQL limit and parked the whole queue until 12:40:59Z, while /rate_limit at 12:07:37Z read 3873 REST and
+        4969 GraphQL left and 18 rows of 4 repos and 3 lanes waited behind it. Lands judge over REST: a park GitHub's
+        own count contradicts holds nothing, and the refused row keeps its own park and its own reason."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M:%S", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not be "
+            "read for base_red_excuse.py: RuntimeError: GraphQL: gh api graphql failed")))
+        self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual(self.q.queue_quota_until, said)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")  # before: the whole queue waits for the reset
+        self.tick(300)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.give_reading("rest", 3873, self.t + 900)  # GitHub's own count: the login is not spent
+        self.pr(LB, key=key2)  # a copy read since: the pass judges, never refreshes
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        self.tick(2)
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged, 28 min before the named reset
+        self.assertEqual(self.q.entries[key2]["state"], "merged")
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        over = [r for r in logs if r.get("event") == "land-queue-park-overridden"]
+        self.assertEqual(len(over), 1)
+        self.assertEqual(over[0]["why"], f"GitHub's count reads 3873 REST left, over the "
+                         f"{gg.hard_reserve_floor()['rest']} reserve")
+        e = self.q.entries[self.KEY]  # the row that was refused parks itself, with its own reason
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["until"]), ("waiting", "quota", said))
+
+    def test_a_reading_at_or_under_the_reserve_keeps_the_whole_queue_parked(self):
+        """At or under the hard reserve GitHub's count agrees with the refusal: the park holds as written, and a
+        stale or missing reading never ends it either."""
+        key2 = "pr:o/r#2"
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        self.q.now = self.t
+        self.q.ingest()
+        self.q.park_queue_quota(self.t + 1800, "quota: not judged, retry after 09:00Z (reset)")
+        self.give_reading("rest", gg.hard_reserve_floor()["rest"], self.t + 900)
+        reads = self.reads()
+        self.tick(30)
+        self.assertEqual(self.reads(), reads)
+        self.give_reading("rest", 4000, self.t - 60, seen_ago=1200)  # stale: its reset passed, its count unknown
+        self.tick(30)
+        self.assertEqual(self.reads(), reads)
+        self.assertGreater(self.q.queue_quota_until, self.t)
+
+    def test_a_github_user_id_never_reaches_a_stored_reason(self):
+        """gh quotes the login's numeric account id in its own rate-limit error, and the daemon stored it verbatim in
+        queueParked.reason and in stopped rows' causes, which agents paste into PR and issue bodies (leo-workspace
+        tools/public_body_guard.py refuses it there). The id is dropped where the daemon captures the error; the
+        limit and the reset stay. The id below is a fake."""
+        self.pr(LA)
+        self.land()
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not be "
+            "read for base_red_excuse.py: RuntimeError: GraphQL: gh api graphql failed: gh: API rate limit already "
+            "exceeded for user ID 4242424242.")))
+        e = self.tick()
+        stored = json.dumps([gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE), e,
+                             gg.land_queue_parked(self.t), gg.land_line(e, self.t, latch=None)])
+        self.assertNotIn("4242424242", stored)
+        self.assertIn("user ID <redacted>", stored)
+        self.assertIn(f"retry after {at}Z", stored)  # the actionable words are kept
+        self.assertEqual(gg.land_redact("for user ID 4242424242."), "for user ID <redacted>.")
+        self.assertEqual(gg.land_redact('{"user": 4242424242}'), '{"user": 4242424242}')  # only gh's own sentence
+
+    def test_a_park_an_older_daemon_stored_is_redacted_on_the_way_out(self):
+        """The id is already on disk on every host that parked before this change: `land status` drops it on reading
+        the park file too, not only on writing it. The id below is a fake."""
+        gg.write_json(gg.land_dir() / gg.LAND_QUOTA_FILE, {
+            "until": self.t + 1800, "at": self.t,
+            "reason": "land-judge: refused: quota: gh: API rate limit already exceeded for user ID 4242424242."})
+        self.assertIn("user ID <redacted>", gg.land_queue_parked(self.t)["reason"])
+        self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
+        self.assertNotIn("4242424242", self.queue().queue_quota_reason)
+
     def test_a_parked_queue_still_logs_its_pool_line(self):
         """While parked the tick returned before log_pool: 06:51Z to 08:44Z had two land-pool lines, none naming why."""
         self.pr(LA)

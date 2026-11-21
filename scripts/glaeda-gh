@@ -10964,6 +10964,19 @@ def land_day(at: float) -> str:
     return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%d")
 
 
+# GitHub's numeric account id, which gh quotes in its own rate-limit error ("API rate limit already exceeded for user
+# ID NNNN"). It is personal data, and the queue's text is pasted into PR and issue bodies by every agent that reads
+# `land status` (leo-workspace tools/public_body_guard.py refuses it there), so the daemon drops the id where it
+# captures the error (LandQueue.call) and where it reads a park an older daemon stored (land_queue_parked). The
+# actionable words -- which limit, and the reset -- are kept.
+LAND_USER_ID = re.compile(r"\b(user(?:\s+id)?)\s+\d{3,}\b", re.I)
+
+
+def land_redact(text: Any) -> str:
+    """TEXT with GitHub's numeric user id dropped (LAND_USER_ID)."""
+    return LAND_USER_ID.sub(r"\1 <redacted>", str(text or ""))
+
+
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -11426,7 +11439,12 @@ class LandQueue:
         self.queue_quota_until = (float(quota.get("until")) if isinstance(quota, dict)
                                   and isinstance(quota.get("until"), (int, float))
                                   and not isinstance(quota.get("until"), bool) else 0.0)
-        self.queue_quota_reason = str(quota.get("reason") or "") if isinstance(quota, dict) else ""
+        # redacted on the way in too: a park an older daemon stored carries gh's numeric user id (land_redact)
+        self.queue_quota_reason = land_redact(quota.get("reason") or "") if isinstance(quota, dict) else ""
+        self.queue_quota_at = (float(quota.get("at")) if isinstance(quota, dict)
+                               and isinstance(quota.get("at"), (int, float))
+                               and not isinstance(quota.get("at"), bool) else 0.0)
+        self.queue_park_voided: tuple[float, str] | None = None  # (until, why) of a park a reading voided, logged once
         self.load()
 
     # -- files
@@ -11612,9 +11630,12 @@ class LandQueue:
         if self.refuse():
             return
         if self.queue_quota_parked():
-            # Nothing is judged, read or watched until the named reset, but a PR the cache shows ended still leaves
-            # the queue, and the pool line still says where the queue is (land-pool "queueParked").
+            # The park holds only the steps that need the login it spent: a judgment, a read, a watch or a nudge.
+            # Every step that needs none runs on: a PR the cache shows ended leaves the queue (retire_ended), a row
+            # whose own park has run out is re-queued (unpark_due), and the pool line still says where the queue is
+            # (land-pool "queueParked").
             self.retire_ended()
+            self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.log_pool()
@@ -11979,15 +12000,67 @@ class LandQueue:
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
+    def unpark_due(self) -> None:
+        """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
+        wake and state are this queue's own files, read and written with no GitHub call. Before, the host park
+        returned before the pass that unparks them, so a row whose own wake had passed stayed "waiting (quota)" until
+        the host park ended too, and its status named a park that was already over."""
+        for key in [k for k, e in self.entries.items() if e["state"] == "waiting" and k not in self.jobs]:
+            try:
+                with self.lock:
+                    self.parked(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def queue_park_voided_by(self) -> str | None:
+        """Why GitHub's own count of the login says the host-wide park (park_queue_quota) holds nothing now, else None
+        (it holds as written).
+
+        The park is written from one row's refusal and gates every row's judgment, so it is checked against the
+        login's reading every pass, exactly as a latch mark is (land_latch_judge): a fresh reading
+        (land_reading_state: taken after the park was written, at most LAND_READING_MAX_AGE old, its reset still
+        ahead) above the pool's hard reserve voids it, and so does a window the park was written in that has since
+        refilled (land_window_reset). Lands judge over REST (land_latch's graphql_rest_judges), so REST's count
+        decides: a GraphQL-only refusal never holds a queue REST can serve. A stale or missing reading changes
+        nothing. One host, 2026-11-21 12:08Z: one row's classifier read (cmux#48940 at 93ecc731b278) was refused for
+        the GraphQL limit and parked the queue until 12:40:59Z; /rate_limit at 12:07:37Z read 3873 REST and 4969
+        GraphQL left, and 18 rows of 4 repos and 3 lanes sat "held: the land queue is parked" behind it."""
+        if self.reading is None or not self.queue_quota_at:
+            return None
+        seen = self.reading("rest")
+        reserve = hard_reserve_floor()["rest"]
+        if land_reading_state(seen, self.queue_quota_at, self.now) == "fresh" and seen["remaining"] > reserve:
+            return f"GitHub's count reads {seen['remaining']} REST left, over the {reserve} reserve"
+        if land_window_reset(seen, self.queue_quota_at, self.now):
+            return "GitHub's REST window the park was written in has refilled"
+        return None
+
+    def clear_queue_park(self) -> None:
+        """Forget the host-wide park: its file and this queue's copy of it."""
+        self.queue_quota_until = 0.0
+        self.queue_quota_reason = ""
+        self.queue_quota_at = 0.0
+        (land_dir() / LAND_QUOTA_FILE).unlink(missing_ok=True)
+
     def queue_quota_parked(self) -> bool:
-        """Whether a quota refusal has paused this host's whole land queue until its reset."""
+        """Whether a quota refusal has paused this host's whole land queue until its reset: only while GitHub's own
+        count of the login agrees it is spent (queue_park_voided_by), which is logged once per park
+        (land-queue-park-overridden), so its before and after are measurable. The refused row keeps its own park and
+        its own reason (park_quota) either way."""
         with self.lock:
             if self.queue_quota_until > self.now:
-                return True
+                why = self.queue_park_voided_by()
+                if why is None:
+                    return True
+                if self.queue_park_voided != (self.queue_quota_until, why):
+                    self.queue_park_voided = (self.queue_quota_until, why)
+                    log({"event": "land-queue-park-overridden", "until": utc_clock(self.queue_quota_until),
+                         "why": why, "parkedAt": utc_clock(self.queue_quota_at),
+                         "reason": land_trim(self.queue_quota_reason, 160)})
+                self.clear_queue_park()
+                return False
             if self.queue_quota_until:
-                self.queue_quota_until = 0.0
-                self.queue_quota_reason = ""
-                (land_dir() / LAND_QUOTA_FILE).unlink(missing_ok=True)
+                self.clear_queue_park()
             return False
 
     def park_queue_quota(self, until: float, text: str) -> None:
@@ -12001,7 +12074,9 @@ class LandQueue:
             if self.queue_quota_until >= until and self.queue_quota_until > self.now:
                 return  # a later refusal must never shorten the host-wide hold
             self.queue_quota_until = max(self.queue_quota_until, until)
-            self.queue_quota_reason = land_trim(text, 300)
+            self.queue_quota_reason = land_trim(land_redact(text), 300)
+            self.queue_quota_at = self.now
+            self.queue_park_voided = None
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
@@ -12999,8 +13074,12 @@ class LandQueue:
 
     def call(self, argv: list[str], timeout: float, e: dict | None = None,
              extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        """One child (land_judge, the gh-quota shim, lane-gh) and its output, with GitHub's numeric user id dropped
+        from both streams (land_redact): every stored reason, cause and park text is captured here."""
         try:
-            return self.run(argv, timeout, {**self.env(e), **(extra or {})})
+            got = self.run(argv, timeout, {**self.env(e), **(extra or {})})
+            return subprocess.CompletedProcess(got.args, got.returncode, land_redact(got.stdout) if got.stdout else
+                                               got.stdout, land_redact(got.stderr) if got.stderr else got.stderr)
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout:.0f}s")
         except OSError as error:
@@ -14158,7 +14237,16 @@ def land_queue_parked(now: float) -> dict | None:
     until = (doc or {}).get("until") if isinstance(doc, dict) else None
     if not isinstance(until, (int, float)) or isinstance(until, bool) or until <= now:
         return None
-    return {"until": float(until), "reason": str(doc.get("reason") or "")}
+    return {"until": float(until), "reason": land_redact(doc.get("reason") or "")}  # a park an older daemon stored
+
+
+def land_due_now(e: dict, now: float) -> bool:
+    """Whether E is owed a judgment at NOW, as LandQueue.due reads it: queued, or waiting past its wake."""
+    wake = e.get("wakeAt")
+    if e.get("state") == "queued":
+        return True
+    return e.get("state") == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool) \
+        and wake <= now
 
 
 def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | None = None) -> str:
@@ -14195,7 +14283,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
             and float(e["windowCapped"].get("next") or 0) > now:
         bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
                     f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
-    elif queue and e["state"] in ("queued", "waiting") and not (w.get("kind") == "quota" and e["state"] == "waiting"):
+    elif queue and land_due_now(e, now) and not (w.get("kind") == "quota" and e["state"] == "waiting"):
+        # Only a row the park actually holds: a row whose own wake is still ahead waits for that wake, park or no
+        # park, and saying it is held by the park read as the park being why it had not moved (18 such lines on
+        # one host, 2026-11-21 12:08Z, 3 of them on rows whose next wake was past the park's own end).
         bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
