@@ -17658,6 +17658,9 @@ def say_daemon_problem(code: str, message: str, as_json: bool) -> None:
         print_json_error(code, (text or message).removeprefix("glaeda-gh: "), nxt or "glaeda-gh restart")
 
 
+STATUS_DIRECT_MAX = 5  # direct reads one `status` makes for keys the daemon has not read when its wait ends
+
+
 def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, first_wait: float | None = None,
                fields: list[str] | None = None) -> int:
     """One look at one or more PRs, runs or comment threads. Several targets are registered together
@@ -17689,6 +17692,22 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
     while any(unready(e) for e in entries.values()) and time.monotonic() < deadline:
         time.sleep(1)
         entries = {key: entry if not unready(entry) else read_cache(key) for key, entry in entries.items()}
+    # A key the daemon still has not read (an upstream-fed host asks its upstream for a new key only every
+    # UPSTREAM_NEW, and the upstream may take a cycle or more) gets the one direct read `wait` gives a starved
+    # target, under the same refusals (spent bucket, daemon stop, no login): a PR nobody watches yet is
+    # answered, not "no data yet" after a full cycle. Bounded: STATUS_DIRECT_MAX reads, each DIRECT_READ_BUDGET.
+    began = time.time()
+    for key in [k for k in keys if unready(entries[k]) and split_key(k)[0] in ("pr", "run")][:STATUS_DIRECT_MAX]:
+        kind = split_key(key)[0]
+        blocked = blocked_now(kind)
+        if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
+            say_waiting(f"glaeda-gh: not reading {key_name(key)} directly: {blocked['text']}.")
+            continue
+        say_waiting(f"glaeda-gh: the daemon has not read {key_name(key)} yet; reading GitHub directly once.")
+        error = direct_read({"key": key, "kind": kind, "jobs": jobs, "began": began})
+        if error:
+            say_waiting(f"glaeda-gh: direct read failed: {error}.")
+        entries[key] = read_cache(key)
     outcomes = {key: status_outcome(key, entries[key]) for key in keys}
     if fields is not None:
         sys.stdout.write(render_fields(keys, entries, fields))

@@ -5309,7 +5309,9 @@ class ClientTest(Base):
 
     def status(self, *args, **kwargs) -> tuple[int, str]:
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # these tests are about the daemon's cache: a refused direct read keeps them off GitHub (the fallback is
+        # test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty)
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "direct_read", return_value=gg.DIRECT_QUOTA):
             code = gg.cmd_status(*args, first_wait=0, **kwargs)
         return code, out.getvalue()
 
@@ -5393,6 +5395,8 @@ class ClientTest(Base):
         for row in rows.values():  # no row is the all-blank row that started this
             self.assertFalse(row.endswith("\t\t\t"), row)
         # and the reason plus its next step, per unanswered row, on fd 2 (say_waiting), not mixed into the table
+        # (the direct-read fallback's own two lines about #3 are not part of that contract)
+        said = [line for line in said if "directly once" not in line and "direct read failed" not in line]
         self.assertEqual(len(said), 2, said)
         self.assertIn("o/r#3: the daemon has not read it from GitHub yet", said[0])
         self.assertIn("next: glaeda-gh wait pr o/r#3 --timeout 600", said[0])
