@@ -10378,6 +10378,47 @@ def lume_vm_held(path: Path, cmds: str) -> str:
     return ""
 
 
+def lima_vm_held(path: Path, cmds: str) -> str:
+    """Why a Lima instance is in use, or "": its hostagent's ha.pid names a live process (Lima removes the file when
+    the instance stops; a stale one whose pid was reused keeps the instance, which only errs toward keeping), or a
+    running limactl or lima command names it. An unreadable or malformed ha.pid counts as held."""
+    try:
+        fd = os.open(path / "ha.pid", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return "its ha.pid is unreadable"
+    if fd is not None:
+        try:
+            st = os.fstat(fd)
+            raw = os.read(fd, 64)
+            # the read moves the pid file's atime (Linux relatime): hand Lima's date back, or this probe alone
+            # would make a stopped instance read as used (tart_vm_last_use counts its files' atime)
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError:
+            return "its ha.pid is unreadable"
+        finally:
+            os.close(fd)
+        try:
+            pid = int(raw.decode("ascii", "replace").strip())
+        except ValueError:
+            return "its ha.pid is malformed"
+        if pid <= 0:
+            return "its ha.pid is malformed"
+        try:
+            os.kill(pid, 0)
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except PermissionError:
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except OSError:
+            pass  # a pid file the hostagent left on a crash: nothing runs it
+    for line in cmds.splitlines():
+        if LIMA_VM_RUN.search(line) and re.search(r"(?:^|\s)" + re.escape(path.name) + r"(?:\s|$)", line):
+            return f"a running limactl command names it ({line.strip()[:120]})"
+    return ""
+
+
 # Referenced or stale (Leo, 2026-11-18: "there are dozens if not hundreds of gb of build stuff that just keep getting
 # accumulated. it's too much"). glaeda#2060's host cache budget freed 0 GiB on a 460 GiB fleet mini whose Tart and
 # Lima VMs (~100 GiB that day) sat outside it: ~/.tart/vms/cumv15-1 (30.4 GiB, running), cumv15-build (28.9 GiB,
