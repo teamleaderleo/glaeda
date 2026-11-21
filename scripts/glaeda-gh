@@ -10429,7 +10429,7 @@ LAND_FRESH_WAIT = 120.0
 # on the PR's head ref (refs/pull/N/head, which every push moves, a force-push included): authoritative, and it spends
 # neither the REST nor the GraphQL quota the daemon's own reads need, so it answers while those are held under the
 # daemon's own land reserve. docs/handbook/read-with-one-quota-route.md: every read on the land path has two routes and
-# the first costs no quota when it can. big-red, 2026-11-21: leo-workspace#7208 was read at 09:20Z, rebased and
+# the first costs no quota when it can. 2026-11-21: leo-workspace#7208 was read at 09:20Z, rebased and
 # force-pushed to 48d8a885af67 at ~10:05Z (old head 75f789914eea), and its two land requests (10:17Z, 10:26Z) were each
 # parked "checks running" at 75f789914eea with a wake an hour out -- the cache had gone 45 min unread because the
 # GraphQL reserve "kept for lands" held every PR read -- while `git ls-remote` and `gh pr view` both had 48d8a885af67

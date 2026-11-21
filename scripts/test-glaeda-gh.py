@@ -24204,7 +24204,7 @@ class LandTest(Base):
         self.assert_merged_at(LB)
 
     def test_a_force_pushed_head_is_repinned_not_parked_for_an_hour(self):
-        """big-red, 2026-11-21: teamleaderleo/leo-workspace#7208 was read at 09:20Z, rebased and force-pushed to
+        """2026-11-21: teamleaderleo/leo-workspace#7208 was read at 09:20Z, rebased and force-pushed to
         48d8a885af67 at ~10:05Z (old head 75f789914eea). Its cache went 45 min unread -- the daemon's own GraphQL
         reserve, the one "kept for lands", held every PR read -- and still showed 75f789914eea with one PENDING
         check, so both land requests (10:17Z, 10:26Z) were parked "checks running" at a commit the PR had moved off,
