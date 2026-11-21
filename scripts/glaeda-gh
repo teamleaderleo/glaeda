@@ -4,7 +4,9 @@
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
-                                                        reuses the repository before it); --json gives a list
+                                                        reuses the repository before it); --json gives a list.
+                                                        Text leads with a totals line (how many read, not-found,
+                                                        unread): a `head`/`tail` that drops it shows a fragment
     A target takes whichever form you typed: OWNER/REPO#N, OWNER/REPO/N, a GitHub URL, or a bare N in the
     repository of the directory you are in (it says which repository it read).
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
@@ -61,7 +63,9 @@
                                                         land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
                                                         pinned merge) and tells the requester on a merge or a stop
-    glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day
+    glaeda-gh land status [OWNER/REPO#N] [--json]       each entry's state, last step, refusals; the steps per day.
+                                                        Text leads with the totals by state: no header means you
+                                                        are reading a truncated fragment, not the whole queue
     glaeda-gh land cancel OWNER/REPO#N                  stop landing it (a step already started finishes)
 
 Many sessions share one GitHub account and so one REST quota (5000 requests an hour). Each
@@ -13933,6 +13937,35 @@ def land_stopped_by_cause(entries: list[dict]) -> dict[str, int]:
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def land_state_totals(entries: list[dict]) -> dict[str, int]:
+    """ENTRIES counted by state, in LAND_STATES order (live before finished): exactly one count per row land_line
+    prints, so the header and the body it summarises cannot drift. A state outside LAND_STATES still counts, last,
+    under its own name: a header that dropped it would be the misread it exists to prevent."""
+    seen: dict[str, int] = {}
+    for e in entries:
+        state = str(e.get("state") or "?")
+        seen[state] = seen.get(state, 0) + 1
+    order = {s: i for i, s in enumerate(LAND_STATES)}
+    return dict(sorted(seen.items(), key=lambda kv: (order.get(kv[0], len(order)), kv[0])))
+
+
+def land_status_header(entries: list[dict], target: str | None) -> str:
+    """The first line of `land status`: how many rows follow, by state.
+
+    The point is what its *absence* means. `land status` prints one row per queue entry and runs past a hundred
+    lines on a busy host, and agents read it through `| head -N` or `| tail -N`. 2026-11-21: `land status | tail -25`
+    on one host kept only merged history whose newest row was 81 h old, out of 141 lines whose top rows were the six
+    PRs just enqueued -- and the reader concluded the view omits pending requests and nearly had that non-bug fixed.
+    A truncated read is now self-evidently partial: `tail -25` loses this line too, so a reader who sees no header
+    knows at once they hold a fragment, which no warning note could achieve (the same reader had written the note).
+    `search` has led with "72 found, 10 shown" for the same reason."""
+    counts = land_state_totals(entries)
+    what = f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}" if entries else "no entries"
+    for_t = f" for {target}" if target else ""
+    by = ": " + ", ".join(f"{n} {s}" for s, n in counts.items()) if counts else ""
+    return f"glaeda land: {what}{for_t}{by} (+ steps and stop causes below)"
+
+
 def land_latch_note(note: dict) -> str:
     """One `land status` line for a held latch mark land_latch_judge looked at: whether it holds lands, and what
     GitHub's own count said of it (fresh, stale or unread)."""
@@ -13982,6 +14015,8 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(json.dumps(doc, sort_keys=True))
         return EXIT_OK if entries or not target else EXIT_FAIL
     now = time.time()
+    # First line, before every warning and row: a truncated read is then visibly a fragment (land_status_header).
+    print(land_status_header(entries, target))
     if executor is not None:
         print(f"glaeda land: this host forwards its lands to {doc['executor']}"
               + (f"; {doc['pendingForward']} request(s) wait here to be sent" if doc["pendingForward"] else "")
@@ -16683,12 +16718,33 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
         sys.stdout.write(json.dumps([{"key": k, **(entries[k] or {}), **outcomes[k]} for k in keys],
                                     sort_keys=True) + "\n")
     else:
+        # First line, before the blocks: a sweep of many targets is read through `| head -N` (land_status_header).
+        print(status_sweep_header([outcomes[k] for k in keys]))
         for key in keys:
             emit(key, entries[key], False, outcomes[key])
     if all(o["ok"] for o in outcomes.values()):
         return EXIT_OK
     # not found is an answer (1); a target the daemon has not read yet is one it could not judge (3)
     return EXIT_FAIL if any(o["code"] == "not-found" for o in outcomes.values()) else EXIT_DOWN
+
+
+STATUS_CODE_ORDER = ("ok", "not-found", "no-data-yet")
+
+
+def status_sweep_header(outcomes: list[dict]) -> str:
+    """The first line of a multi-target `status`: how many blocks follow, by outcome.
+
+    Only the sweep gets it. One target "prints exactly what it always has" (cmd_status) and its block is short;
+    a sweep is one multi-line block per target, so a reader who kept the last 25 lines cannot even count the
+    blocks, let alone tell that the ones above were dropped. With this line, their absence says so."""
+    seen: dict[str, int] = {}
+    for o in outcomes:
+        code = str(o.get("code") or "?")
+        seen[code] = seen.get(code, 0) + 1
+    order = {c: i for i, c in enumerate(STATUS_CODE_ORDER)}
+    by = ", ".join(f"{n} {'read' if c == 'ok' else c}"
+                   for c, n in sorted(seen.items(), key=lambda kv: (order.get(kv[0], len(order)), kv[0])))
+    return f"glaeda-gh status: {len(outcomes)} targets: {by} (one block each below)"
 
 
 def status_outcome(key: str, entry: dict | None) -> dict:
