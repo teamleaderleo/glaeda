@@ -15141,7 +15141,12 @@ class PostTest(unittest.TestCase):
                            (403, {}, {"message": "Resource not accessible by integration"}),
                            (502, {}, {}), *[(200, {}, []), (502, {}, {})] * (gg.POST_ATTEMPTS - 1))
         self.step(d, NOW)
-        self.assertEqual(gg.post_state(bad["id"])["error"], "HTTP 404: Not Found")
+        # Not the bare "HTTP 404: Not Found" this pinned before: the line now names the target it could not reach,
+        # which is the word a caller gets wrong (AWriteGithubRefusedNamesWhatItRefusedTest). GitHub's own status and
+        # message still lead it, which is what readers key on.
+        failed = gg.post_state(bad["id"])["error"]
+        self.assertTrue(failed.startswith("HTTP 404: Not Found"), failed)
+        self.assertIn("o/r#404", failed)
         self.step(d, NOW + gg.POST_SPACING)  # a permission refusal fails; it does not hold the queue
         self.assertEqual(gg.post_state(forbidden["id"])["state"], "failed")
         self.assertEqual(d.post_hold, 0.0)
