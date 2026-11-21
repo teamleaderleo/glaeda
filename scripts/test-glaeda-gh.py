@@ -4000,7 +4000,10 @@ class BalanceTest(Base):
         merged = gg.read_cache("pr:o/r#6")["data"]
         self.assertEqual(merged["state"], "MERGED")
         self.assertEqual(merged["checks"][0]["failedSteps"], ["Set up runner"])
-        self.assertEqual(gg.verdict("pr", merged, "green"), held)
+        self.assertIsNone(held)  # open: the refusal inside its grace holds the wait
+        # merged: a refusal still inside its grace is not a red, so the wait ends merged at once rather than failing
+        # (leo-workspace#7310: a merged PR ends a wait whatever its checks still show)
+        self.assertEqual(gg.verdict("pr", merged, "green"), gg.EXIT_OK)
 
     def test_a_pr_that_merges_keeps_its_cached_runner_refusal_over_rest(self) -> None:
         self.merges_with_a_cached_refusal(rest=(4000, 1800), graphql=(50, 3000))
