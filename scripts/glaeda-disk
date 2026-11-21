@@ -9427,6 +9427,38 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
         return None
 
 
+def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
+    """True when tree is gone and its linked worktree record under gitdir/worktrees holds no commit that a branch,
+    tag or remote-tracking ref of the repository does not already reach (so `git worktree prune` loses nothing)."""
+    if os.path.lexists(moved_git_path(os.fspath(tree))):
+        return False
+    wts = gitdir / "worktrees"
+    try:
+        records = [Path(e.path) for e in os.scandir(wts)]
+    except OSError:
+        return False
+    for rec in records:
+        try:
+            named = Path((rec / "gitdir").read_text().strip()).parent
+        except (OSError, ValueError):
+            return False
+        if named != tree:
+            continue
+        if os.path.lexists(rec / "locked"):
+            return False
+        tips = local_tips(rec, worktree_only=True)
+        if tips is None:
+            return False
+        tips = _present_commits(gitdir, tips) if tips else tips
+        if tips is None:
+            return False
+        if not tips:
+            return True
+        left = _git_dir_run(gitdir, "rev-list", *tips, "--not", "--branches", "--tags", "--remotes", timeout=600)
+        return left is not None and not left.strip()
+    return False
+
+
 def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None = None
                  ) -> tuple[str, dict[str, Path], list[Path]]:
     """Every repository a mirror item takes along, found as _nested_loss finds them (checkouts, bare
@@ -9510,6 +9542,12 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         # One elsewhere, or a record whose tree is gone, would lose its repository: kept. The records name
         # absolute paths; after the rename aside, renamed_gitfiles reads them at the new path.
         outside = [w for w in linked if os.path.realpath(moved_git_path(os.fspath(w))) not in found]
+        # A record whose tree is gone keeps nothing but its own HEAD and reflogs, and `git worktree prune` drops it.
+        # When every commit it holds is reachable from a branch, tag or remote-tracking ref, deleting the repository
+        # loses nothing through it: drop it from the judgement. 22 fleet minis kept the 3-7 GiB hot-verify mirror
+        # (/Users/Shared/cmux-build-fleet/cache/hot-verify) as blocked:bundle-failed on every pass, cmux18 with 73
+        # such records from ended steps, all reachable (2026-11-21 fleet audit).
+        outside = [w for w in outside if not _gone_record_is_empty(g, w)]
         if outside:
             # Name every worktree that still exists: a lane VM's /tmp/wt-rd (22.1G) holds a cmux mirror that three
             # checkouts under ~/Projects/checkouts still use (2026-11-18). Re-pointing them is not done here.

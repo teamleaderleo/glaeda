@@ -11068,7 +11068,20 @@ class LinuxLayoutTest(unittest.TestCase):
             rec, _ = self.apply_mirror(unit)
         self.assertEqual(rec["outcome"], "blocked:bundle-failed")
         self.assertTrue((outside / ".git").is_file())
-        shutil.rmtree(outside)  # a stale record: git worktree prune would drop it, but its HEAD is not judged here
+        shutil.rmtree(outside)  # a stale record whose HEAD a branch reaches: git worktree prune drops it, nothing lost
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
+
+    def test_a_gone_worktree_record_holding_its_own_commit_keeps_the_repository(self) -> None:
+        """Fleet audit 2026-11-21: hot-verify mirrors kept for 73 records of ended steps, all reachable, now go; a
+        gone record whose HEAD or reflog holds a commit no branch, tag or remote reaches still keeps the item."""
+        unit, clone, env = self.mirror_unit()
+        outside = self.home / "elsewhere-own"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
+        self.git(outside, "commit", "-q", "--allow-empty", "-m", "only in this worktree", env=env)
+        shutil.rmtree(outside)
+        self.assertIn("1 whose tree is gone", gd.mirror_repos(unit)[0])
+        record = next((clone / ".git/worktrees").iterdir())
+        (record / "locked").write_text("")
         self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
 
     def test_tree_git_dir_reads_a_moved_gitfile_only_while_renamed(self) -> None:
