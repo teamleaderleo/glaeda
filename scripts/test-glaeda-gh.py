@@ -26922,5 +26922,196 @@ class ShorthandFlagTest(unittest.TestCase):
         self.assertEqual(args.job, "build.*")  # search and flaky keep --job as the job-name filter
 
 
+
+class SearchTest(Base):
+    """`glaeda-gh search`: find pull requests and issues over GraphQL search, through this host's one cached
+    route, instead of `gh search` / `gh api search/...` spending the shared REST quota."""
+
+    PR_NODE = {
+        "__typename": "PullRequest", "number": 2301, "title": "glaeda-gh wait: a bare OWNER/REPO N",
+        "url": "https://github.com/o/r/pull/2301", "state": "MERGED", "isDraft": False, "merged": True,
+        "createdAt": "2026-11-20T10:00:00Z", "updatedAt": "2026-11-21T01:00:00Z",
+        "author": {"login": "teamleaderleo"}, "repository": {"nameWithOwner": "o/r"},
+        "headRefName": "lane/bare-n", "headRefOid": "a" * 40, "baseRefName": "main",
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}}
+    ISSUE_NODE = {
+        "__typename": "Issue", "number": 15832, "title": "standing efficiency lane",
+        "url": "https://github.com/o/r/issues/15832", "state": "OPEN",
+        "createdAt": "2026-11-01T10:00:00Z", "updatedAt": "2026-11-21T02:00:00Z",
+        "author": {"login": "teamleaderleo"}, "repository": {"nameWithOwner": "o/r"}}
+
+    def answer(self, nodes: list[dict], total: int | None = None) -> subprocess.CompletedProcess:
+        doc = {"data": {"rateLimit": {"cost": 1, "remaining": 4999},
+                        "search": {"issueCount": total if total is not None else len(nodes), "nodes": nodes}}}
+        return subprocess.CompletedProcess([], 0, json.dumps(doc), "")
+
+    def search(self, *args, **kw) -> tuple[str, list[str]]:
+        """cmd_search's stdout and the argv it asked GitHub with."""
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", return_value=self.answer(kw.pop("nodes", [self.PR_NODE]),
+                                                                          kw.pop("total", None))) as ran, \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_search(*args, **kw), gg.EXIT_OK)
+        return out.getvalue(), ran.call_args[0][0]
+
+    def test_search_reads_graphql_through_this_broker_and_no_rest(self) -> None:
+        text, argv = self.search("prs", ["flaky"], ["o/r"], "all", None, 20, False)
+        self.assertEqual(argv[2:5], ["gh", "api", "graphql"],
+                         "read through this broker, so the cache shares it with every session on the host")
+        self.assertNotIn("search/issues", " ".join(argv), "never GitHub's REST search")
+        query = next(a[len("query="):] for a in argv if a.startswith("query="))
+        self.assertIn("search(type: ISSUE, query: $q, first: $n)", query)
+        self.assertIn("q=flaky is:pr repo:o/r", argv)
+        self.assertIn("n=20", argv)
+        self.assertIn("o/r#2301 merged checks success", text)
+        self.assertIn("glaeda-gh wait: a bare OWNER/REPO N", text)
+
+    def test_a_kept_answer_is_scoped_to_the_repository_the_search_names(self) -> None:
+        """What makes the kept answer old: a write to that repository, not every write on the host."""
+        _text, argv = self.search("prs", [], ["o/r"], "all", None, 20, False)
+        gh_args = argv[argv.index("gh") + 1:]
+        self.assertEqual(gg.gh_cache_graphql_scope(gh_args)[0], "o/r")
+        _text, two = self.search("prs", [], ["o/r", "o/other"], "all", None, 20, False)
+        self.assertIsNone(gg.gh_cache_graphql_scope(two[two.index("gh") + 1:])[0],
+                          "two repositories are not one scope; the answer is still kept, just made old by any write")
+
+    def test_the_search_string_each_flag_builds(self) -> None:
+        for kind, words, repos, state, author, want in (
+                ("prs", [], ["o/r"], "all", None, "is:pr repo:o/r"),
+                ("issues", ["flaky", "test"], [], "open", None, "flaky test is:issue state:open"),
+                ("prs", [], ["o/r"], "merged", "leo", "is:pr is:merged repo:o/r author:leo"),
+                ("both", [], ["o/r", "o/two"], "all", None, "repo:o/r repo:o/two"),
+                ("prs", ["label:lane"], [], "closed", None, "label:lane is:pr state:closed")):
+            with self.subTest(kind=kind, words=words):
+                self.assertEqual(gg.search_terms(kind, words, repos, state, author), want)
+
+    def test_a_qualifier_typed_in_the_query_wins_over_its_flag(self) -> None:
+        # the words are what the caller meant; a flag's qualifier would be ANDed with them
+        for words, kind, state, author, want in (
+                (["is:issue", "flaky"], "prs", "all", None, "is:issue flaky"),
+                (["is:merged"], "prs", "open", None, "is:merged is:pr"),
+                (["author:lawrence"], "both", "all", "leo", "author:lawrence"),
+                (["type:pr"], "issues", "all", None, "type:pr")):
+            with self.subTest(words=words):
+                self.assertEqual(gg.search_terms(kind, words, [], state, author), want)
+
+    def test_a_row_carries_status_prs_field_names(self) -> None:
+        row = gg.search_row(self.PR_NODE)
+        self.assertEqual(row["head"], row["headRefOid"], "`head` is the head commit, as in status_view")
+        self.assertEqual((row["kind"], row["target"], row["number"], row["state"], row["merged"]),
+                         ("pr", "o/r#2301", 2301, "merged", True))
+        self.assertEqual((row["checkState"], row["headRef"], row["baseRef"], row["draft"]),
+                         ("success", "lane/bare-n", "main", False))
+        for field in ("target", "head", "headRefOid", "state", "checks.state", "merged", "url", "title", "number"):
+            with self.subTest(field=field):
+                gg.field_value(row, field)  # the names `status pr --field` takes read the same here
+        issue = gg.search_row(self.ISSUE_NODE)
+        self.assertEqual((issue["kind"], issue["target"], issue["state"]), ("issue", "o/r#15832", "open"))
+        for absent in ("head", "merged", "checks"):
+            self.assertNotIn(absent, issue, "an issue has no pull request's fields")
+
+    def test_json_is_the_whole_object_and_field_just_those_values(self) -> None:
+        text, _argv = self.search("both", ["flaky"], [], "all", None, 20, True,
+                                  nodes=[self.PR_NODE, self.ISSUE_NODE], total=97)
+        doc = json.loads(text)
+        self.assertEqual((doc["total"], doc["shown"], doc["query"]), (97, 2, "flaky"))
+        self.assertEqual([r["target"] for r in doc["rows"]], ["o/r#2301", "o/r#15832"])
+        text, _argv = self.search("prs", [], ["o/r"], "all", None, 20, False, fields=["target", "head", "state"])
+        self.assertEqual(text, f"o/r#2301\t{'a' * 40}\tmerged\n")
+
+    def test_the_kind_filters_the_rows_the_search_returned(self) -> None:
+        both = [self.PR_NODE, self.ISSUE_NODE]
+        text, _argv = self.search("issues", ["flaky"], [], "all", None, 20, False, nodes=both)
+        self.assertIn("o/r#15832", text)
+        self.assertNotIn("o/r#2301", text)
+        text, _argv = self.search("prs", ["flaky"], [], "all", None, 20, False, nodes=both)
+        self.assertIn("o/r#2301", text)
+        self.assertNotIn("o/r#15832", text)
+        text, _argv = self.search("both", ["flaky"], [], "all", None, 20, False, nodes=both)
+        self.assertIn("o/r#2301", text)
+        self.assertIn("o/r#15832", text)
+
+    def test_nothing_matched_says_so_rather_than_printing_an_empty_list(self) -> None:
+        text, _argv = self.search("prs", ["nope"], [], "all", None, 20, False, nodes=[])
+        self.assertIn("0 found", text)
+        self.assertIn("nothing matched", text)
+
+    def test_a_form_it_cannot_serve_names_the_one_that_works(self) -> None:
+        for argv, want in (
+                (["search", "code", "statusCheckRollup"], "code search is not served here"),
+                (["search", "commits", "abc"], "commit search is not served here"),
+                (["search", "repos", "glaeda"], "repository search is not served here")):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(gg.main(argv), 64)
+                self.assertIn(want, err.getvalue())
+                self.assertIn("glaeda-gh search issues|prs QUERY", err.getvalue())
+
+    def test_what_search_refuses_and_the_form_it_names(self) -> None:
+        for args, want in (
+                (("prs", [], ["o/r"], "all", None, 0, False), "--limit must be 1 to 100"),
+                (("prs", [], ["o/r"], "all", None, 101, False), "--limit must be 1 to 100"),
+                (("prs", [], ["not a repo"], "all", None, 20, False), "--repo takes OWNER/REPO"),
+                (("prs", ["repo:o/r"], ["o/r"], "all", None, 20, False), "name the repositories one way"),
+                (("both", [], [], "all", None, 20, False), "search takes a query")):
+            with self.subTest(want=want):
+                with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("asked GitHub anyway")):
+                    with self.assertRaises(gg.WatchError) as ctx:
+                        gg.cmd_search(*args)
+                self.assertIn(want, str(ctx.exception))
+                self.assertIn("glaeda-gh search issues|prs QUERY", str(ctx.exception))
+
+    def test_an_unanswered_search_is_an_error_not_an_empty_result(self) -> None:
+        for done, want in (
+                (subprocess.CompletedProcess([], 1, "", "quota exhausted"), "quota exhausted"),
+                (subprocess.CompletedProcess([], 0, "not json", ""), "unreadable answer"),
+                (subprocess.CompletedProcess([], 0, json.dumps({"errors": [{"message": "bad query"}]}), ""),
+                 "bad query")):
+            with self.subTest(want=want):
+                with mock.patch.object(gg, "run_bounded", return_value=done), self.assertRaises(gg.WatchError) as ctx:
+                    gg.cmd_search("prs", ["x"], [], "all", None, 20, False)
+                self.assertIn(want, str(ctx.exception))
+        with mock.patch.object(gg, "run_bounded", side_effect=OSError("no gh")), self.assertRaises(gg.WatchError):
+            gg.cmd_search("prs", ["x"], [], "all", None, 20, False)
+
+
+class SearchShapeTest(unittest.TestCase):
+    """The shapes agents type for `search`, run as the canonical form with that form said once on stderr."""
+
+    def synonym(self, argv: list[str]) -> tuple[list[str], str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            fixed = gg.search_synonym(argv)
+        return fixed, err.getvalue()
+
+    def test_a_query_with_no_kind_word_searches_both(self) -> None:
+        for argv in (["search", "cmux next"], ["search", "--repo", "o/r"], ["search", "flaky", "--limit", "5"]):
+            with self.subTest(argv=argv):
+                fixed, err = self.synonym(argv)
+                self.assertEqual(fixed[:2], ["search", "both"])
+                self.assertEqual(fixed[2:], argv[1:])
+                self.assertIn("searches both issues and pull requests", err)
+
+    def test_gh_searchs_own_kind_words_are_their_kind(self) -> None:
+        for word, kind in (("issue", "issues"), ("pr", "prs"), ("pulls", "prs"), ("pull-requests", "prs")):
+            with self.subTest(word=word):
+                fixed, err = self.synonym(["search", word, "flaky"])
+                self.assertEqual(fixed, ["search", kind, "flaky"])
+                self.assertIn(f"`{word}` is the kind `{kind}`", err)
+
+    def test_gh_searchs_json_fields_is_this_tools_field(self) -> None:
+        fixed, err = self.synonym(["search", "prs", "flaky", "--json", "number,title"])
+        self.assertEqual(fixed, ["search", "prs", "flaky", "--field", "number,title"])
+        self.assertIn("--json FIELDS is --field FIELDS", err)
+        fixed, err = self.synonym(["search", "prs", "flaky", "--json"])
+        self.assertEqual((fixed, err), (["search", "prs", "flaky", "--json"], ""), "--json alone is the object")
+
+    def test_the_canonical_forms_and_other_commands_are_untouched(self) -> None:
+        for argv in (["search", "prs", "flaky"], ["search", "issues", "--repo", "o/r"], ["search", "both", "x"],
+                     ["search", "--help"], ["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1"], []):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.synonym(list(argv)), (list(argv), ""))
+
 if __name__ == "__main__":
     unittest.main()
