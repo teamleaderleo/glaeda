@@ -5059,10 +5059,57 @@ class ClientTest(Base):
         fields = gg.parse_fields("head,checks.failed")
         self.assertEqual(self.status("pr", "o/r#1", False, False, fields=fields), (0, f"{'a' * 40}\tlint,test\n"))
         code, text = self.status("pr", ["o/r#1", "2", "3"], False, False, fields=gg.parse_fields("state,checks.state"))
-        self.assertEqual(code, gg.EXIT_DOWN)  # #3 has no data yet: an empty row, and a target not judged (3)
-        self.assertEqual(text, "o/r#1\tOPEN\tFAILURE\no/r#2\tMERGED\tSUCCESS\no/r#3\t\t\n")
+        self.assertEqual(code, gg.EXIT_DOWN)  # #3 has no data yet: it says so in the row, and is a target not judged (3)
+        self.assertEqual(text, "o/r#1\tOPEN\tFAILURE\no/r#2\tMERGED\tSUCCESS\n"
+                               "o/r#3\tno-data-yet\tno-data-yet\n")
         code, text = self.status("pr", "o/r#2", False, False, fields=gg.parse_fields("isDraft,checks.total,url"))
         self.assertEqual(text, "false\t1\thttps://github.com/o/r/pull/2\n")
+
+    def test_a_field_row_the_daemon_has_not_read_says_so_instead_of_blanks(self) -> None:
+        """The measured failure: `status pr A B C D --field state,mergedAt,title` on four PRs, three of
+        them unread, printed three rows of empty columns -- and `mergedAt` is empty on every open PR
+        anyway, so nothing in the row told "the daemon has not looked yet" from "this field has no
+        value". A lander batching one `status` read (the cheap, quota-correct thing) took the blanks
+        for facts about the PRs; the exit code said only that *something* was unread, never which row.
+
+        So the contrast is the point of this test: the same `mergedAt` column holds "" on a row that
+        was read and `no-data-yet` on a row that was not, in one batch."""
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("ok")])))
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, state="MERGED", rollup="SUCCESS", checks=[check_run("ok")])))
+        self.put("pr:o/r#4", None, error="NOT_FOUND", missing=True)
+        fields = gg.parse_fields("state,mergedAt,title")
+        said: list[str] = []
+        with mock.patch.object(gg, "say_waiting", said.append):
+            code, text = self.status("pr", ["o/r#1", "2", "3", "4"], False, False, fields=fields)
+        self.assertEqual(code, gg.EXIT_FAIL)  # #4 is not found: an answer (1), not an unjudged target
+        # #1 and #2 render exactly as they did before; #3 and #4 each name why they have no values
+        self.assertEqual(text, "o/r#1\tOPEN\t\tt\n"
+                               "o/r#2\tMERGED\t\tt\n"
+                               "o/r#3\tno-data-yet\tno-data-yet\tno-data-yet\n"
+                               "o/r#4\tnot-found\tnot-found\tnot-found\n")
+        rows = {line.split("\t")[0]: line for line in text.splitlines()}
+        self.assertNotEqual(rows["o/r#1"].split("\t")[2], rows["o/r#3"].split("\t")[2])
+        for row in rows.values():  # no row is the all-blank row that started this
+            self.assertFalse(row.endswith("\t\t\t"), row)
+        # and the reason plus its next step, per unanswered row, on fd 2 (say_waiting), not mixed into the table
+        self.assertEqual(len(said), 2, said)
+        self.assertIn("o/r#3: the daemon has not read it from GitHub yet", said[0])
+        self.assertIn("next: glaeda-gh wait pr o/r#3 --timeout 600", said[0])
+        self.assertIn("o/r#4", said[1])
+        self.assertIn("no such PR or issue on GitHub", said[1])
+        self.assertTrue(said[1].rstrip().splitlines()[-1].startswith("next: "), said[1])
+
+    def test_the_non_field_path_is_untouched_by_the_unread_sentinel(self) -> None:
+        """Only `--field` grew the sentinel. Without it, `status` still prints its block per target,
+        with the reason and `next:` where they always were -- a sentinel leaking in would change what
+        every caller of plain `status` reads."""
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("ok")])))
+        code, text = self.status("pr", ["o/r#1", "3"], False, False)
+        self.assertEqual(code, gg.EXIT_DOWN)
+        self.assertNotIn("no-data-yet", text)
+        self.assertEqual(text, "".join(gg.render(key, gg.read_cache(key), False, gg.status_outcome(key, gg.read_cache(key)))
+                                       for key in ("pr:o/r#1", "pr:o/r#3")))
+        self.assertIn("next: glaeda-gh wait pr o/r#3 --timeout 600", text)
 
     def test_an_unknown_field_names_the_valid_keys(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1)))
@@ -5074,7 +5121,7 @@ class ClientTest(Base):
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", ["o/r#1", "9"], False, False, fields=["head", "hed"])
         self.assertEqual(self.status("pr", "o/r#9", False, False, fields=["head", "checks.failed", "mergeable"]),
-                         (gg.EXIT_DOWN, "\t\t\n"))
+                         (gg.EXIT_DOWN, "no-data-yet\tno-data-yet\tno-data-yet\n"))
         for bad in ("", "head,", "checks..failed"):
             with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
                 gg.parse_fields(bad)

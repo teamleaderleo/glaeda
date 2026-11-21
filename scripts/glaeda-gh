@@ -16368,23 +16368,45 @@ def field_text(value: Any) -> str:
 
 
 def render_fields(keys: list[str], entries: dict[str, dict | None], fields: list[str]) -> str:
-    """One line per key, `fields` tab-separated, prefixed by OWNER/REPO#N when there are several keys. An
-    entry with no data yet prints empty values; a field an entry with data does not have is an error."""
-    lines = []
+    """One line per key, `fields` tab-separated, prefixed by OWNER/REPO#N when there are several keys. A
+    field an entry with data does not have is an error.
+
+    A row the daemon has no answer for prints its outcome code -- `no-data-yet`, or `not-found` for a
+    ref GitHub does not have -- in every column, and its reason and `next:` step go to fd 2 (the rest
+    of the answer is the table on fd 1).
+
+    It used to print empty columns, which made "the daemon has not looked yet" byte-identical to "this
+    field has no value": `status pr A B C D --field state,mergedAt,title` over four PRs, three unread,
+    printed three rows of blanks, and `mergedAt` is empty on every open PR anyway, so there was nothing
+    in the row to tell the two apart. A lander batching one `status` read -- the cheap, quota-correct
+    thing, and what we tell landers to do -- reads those blanks as facts about the PRs and acts on
+    them, while the exit code says only that *something* was unread, never which row. A sentinel is one
+    extra token a parser must learn; a blank is a wrong answer it cannot detect."""
+    lines, problems = [], []
     for key in keys:
-        has = bool((entries.get(key) or {}).get("data"))
-        view = status_view(key, entries.get(key))
+        entry = entries.get(key)
+        has = bool((entry or {}).get("data"))
+        view = status_view(key, entry)
         if not has and split_key(key)[0] == "pr":
             # no data yet: check the names against the shape every PR has, so a typo is refused now
             # rather than printing an empty column until the first read lands
             shape = status_view(key, {"data": parse_pr({"state": "OPEN"})})
             for f in fields:
                 field_value(shape, f)
-        values = [field_text(field_value(view, f)) if has else "" for f in fields]
+        if has:
+            values = [field_text(field_value(view, f)) for f in fields]
+        else:
+            outcome = status_outcome(key, entry)
+            values = [outcome["code"]] * len(fields)
+            problems.append(outcome)
         if len(keys) > 1:
             kind, owner, repo, number = split_key(key)
             values.insert(0, f"{owner}/{repo}{'/' if kind == 'run' else '#'}{number}")
         lines.append("\t".join(values))
+    for outcome in problems:
+        # the agent output contract: what is wrong, then `next:` as the last line (say_waiting's fd 2,
+        # so a caller reading the table off stdout still reads only the table)
+        say_waiting(f"glaeda-gh: {outcome['reason']}\nnext: {outcome['next'] or 'none'}")
     return "".join(f"{line}\n" for line in lines)
 
 
