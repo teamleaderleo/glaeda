@@ -4487,6 +4487,52 @@ def read_rollup(key: str) -> dict | None:
     return doc if isinstance(doc, dict) and doc.get("schema") == ROLLUP_SCHEMA and doc.get("key") == key else None
 
 
+def broker_repo_slugs() -> dict[str, str]:
+    """The OWNER/REPO slugs this host has a checkout of, as the broker recorded them. A local file read: it costs no
+    quota and is never required, so a missing or damaged store is simply no hint."""
+    with contextlib.suppress(Exception):
+        doc = read_json(broker_repos_path())
+        repos = doc.get("repos") if isinstance(doc, dict) else None
+        if isinstance(repos, dict):
+            return {str(k): str(v) for k, v in repos.items() if isinstance(k, str)}
+    return {}
+
+
+def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | None = None) -> str:
+    """One line for a write GitHub refused, which is all its caller ever sees (`post status ID` prints it).
+
+    It names the target, because the target is a word the caller typed and GitHub's own message never repeats it:
+    on 2026-11-21 `post pr manaflow-ai/glaeda` recorded `HTTP 422: Validation Failed (invalid)` and
+    `post comment manaflow-ai/glaeda#2395` recorded `HTTP 404: Not Found`, while the wrong word in both was the
+    owner (glaeda is teamleaderleo/glaeda). It also keeps GitHub's `resource` and `field` next to its `code`, which
+    is what turns `(invalid)` into `(PullRequest.head: invalid)`. One line, no newline: readers take the last line.
+    """
+    repo = str(item.get("repo") or "")
+    parts = []
+    for e in doc.get("errors") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("message"):  # GitHub wrote the sentence; its code adds nothing to it
+            parts.append(str(e["message"]))
+            continue
+        where = ".".join(str(e[k]) for k in ("resource", "field") if e.get(k))
+        code = str(e.get("code") or "")
+        parts.append(f"{where}: {code}" if where and code else where or code)
+    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip()
+    if parts:
+        line += f" ({'; '.join(p for p in parts if p)})"
+    if status == 404 and repo:
+        number = item.get("number")
+        reached = f"{repo}#{number}" if number else repo
+        line += (f": no {reached} this login can write to -- the repository (wrong owner, renamed, or no access)"
+                 + (f" or the number {number}" if number else ""))
+        name = repo.split("/")[-1]
+        elsewhere = sorted(s for s in (known or {}) if s != repo and s.split("/")[-1] == name)
+        if elsewhere:
+            line += f"; a repository named {name} is known here as {', '.join(elsewhere)}"
+    return " ".join(line.split())
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
@@ -6384,10 +6430,7 @@ class Daemon:
                              note="a pull request for this head is already open",
                              error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
         else:
-            errors = "; ".join(str(e.get("message") or e.get("code")) for e in doc.get("errors") or []
-                               if isinstance(e, dict))
-            self.post_finish(path, item, error=f"HTTP {status}: {doc.get('message') or ''}"
-                             + (f" ({errors})" if errors else ""))
+            self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
 
     def post_after(self, item: dict, doc: dict) -> str | None:
         """A new PR's requested reviewers (not content creation, so no spacing); a failure is a note."""
