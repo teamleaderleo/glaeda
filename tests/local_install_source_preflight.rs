@@ -15,7 +15,7 @@ use glaeda::local_install_source_preflight::{
 };
 use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 use glaeda::project_checkout_observation::{
-    PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectCheckoutObserver,
+    PROJECT_CHECKOUT_COMMAND_TIMEOUT, PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT, ProjectCheckoutObserver,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -103,7 +103,18 @@ impl TimedCommandExecutor for ScriptedExecutor {
         spec: &CommandSpec,
         timeout: std::time::Duration,
     ) -> io::Result<ExecutionRecord> {
-        assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+        let argv = spec.displayed_argv();
+        let tree_scan = argv
+            .iter()
+            .any(|argument| argument == "status" || argument == "ls-files");
+        assert_eq!(
+            timeout,
+            if tree_scan {
+                PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT
+            } else {
+                PROJECT_CHECKOUT_COMMAND_TIMEOUT
+            }
+        );
         self.commands.borrow_mut().push(spec.clone());
         let response = self
             .responses

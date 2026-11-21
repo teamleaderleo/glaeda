@@ -121,6 +121,11 @@
         }
       ]
     },
+    "classAcceptanceSha256": {
+      "description": "Present only on a node made eligible by a class acceptance: that class receipt's receiptSha256.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "roleProfiles": {
       "type": "object",
       "additionalProperties": false,

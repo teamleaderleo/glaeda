@@ -1482,5 +1482,285 @@ class FleetTests(unittest.TestCase):
         self.assertLess(len(f.canonical(f.node_status(e, []))), f.MAX_STATUS_BYTES)
 
 
+TOOLCHAIN_OBS = {
+    "cmuxXcodePin": "26",
+    "xcodeVersion": "26.6",
+    "xcodeBuild": "17F113",
+    "macosSdkVersion": "26.5",
+    "zigVersion": "0.16.0",
+    "rustcVersion": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+}
+HARDWARE = {"model": "Mac16,11", "chip": "Apple M4 Pro", "memoryGiB": 48}
+CANDIDATE = {"repository": "teamleaderleo/glaeda", "commit": "5" * 40, "tree": "6" * 40}
+TG = "sha256:" + __import__("hashlib").sha256(
+    (json.dumps(TOOLCHAIN_OBS, sort_keys=True, separators=(",", ":")) + "\n").encode()
+).hexdigest()
+
+
+def class_bootstrap(enrollment_value, *, toolchain=None, hardware=None):
+    toolchain = dict(toolchain or TOOLCHAIN_OBS)
+    value = bootstrap_for(enrollment_value, f.toolchain_generation_of(toolchain))
+    value["observed"] = {"hardware": dict(hardware or HARDWARE), "toolchain": toolchain}
+    return value
+
+
+def class_enrollment(node="cmux-fixture-001", state="eligible", glaeda=C):
+    e = enrollment(state=state)
+    e["nodeId"] = node
+    e["supportedToolchainGenerations"] = [TG]
+    e["glaedaGeneration"] = glaeda
+    return e
+
+
+def std_class_receipt():
+    accepting = class_enrollment()
+    post = class_bootstrap(accepting)
+    local = finalized(accepting, toolchain=TG, post_bootstrap=post)
+    return f.build_class_acceptance(accepting, local, post, "std", CANDIDATE), local
+
+
+class ClassAcceptanceTests(unittest.TestCase):
+    def adopt(self, klass, node=None, *, bootstrap=None, expected=None, fleet_class="std",
+              contract=None, candidate=None):
+        node = node or class_enrollment("cmux-fixture-002", state="enrolling")
+        return f.adopt_class_receipt(
+            node,
+            klass,
+            expected or klass["receiptSha256"],
+            fleet_class,
+            bootstrap or class_bootstrap(node),
+            contract or klass["glaedaFleetContractGeneration"],
+            candidate or CANDIDATE,
+        )
+
+    def test_one_local_acceptance_makes_a_matching_node_eligible(self):
+        klass, local = std_class_receipt()
+        self.assertEqual(klass["fleetClass"], "std")
+        self.assertEqual(klass["hardware"], HARDWARE)
+        self.assertEqual(klass["toolchain"]["xcodeBuild"], "17F113")
+        self.assertEqual(klass["glaedaCandidate"], CANDIDATE)
+        self.assertEqual(klass["acceptingNodeId"], "cmux-fixture-001")
+        self.assertEqual(klass["acceptingReceiptSha256"], f.digest(local))
+        self.assertEqual(f.validate_class_acceptance(copy.deepcopy(klass)), klass)
+
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        receipt = self.adopt(klass, node)
+        self.assertEqual(receipt["nodeId"], "cmux-fixture-002")
+        self.assertEqual(receipt["executionClass"], f.CLASS_EXECUTION_CLASS)
+        self.assertEqual(receipt["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertIsNone(receipt["localExecutionAttemptSha256"])
+        self.assertEqual(receipt["result"], "accepted")
+
+        eligible = f.transition(node, "eligible", None, [receipt])
+        self.assertEqual(eligible["state"], "eligible")
+        self.assertEqual(eligible["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertTrue(f.node_status(eligible, [receipt])["routingCandidateEligible"])
+
+    def test_every_mismatching_field_is_named_and_refused(self):
+        klass, _ = std_class_receipt()
+        light = dict(HARDWARE, chip="Apple M4", memoryGiB=16, model="Mac16,10")
+        other_xcode = dict(TOOLCHAIN_OBS, xcodeBuild="17F200")
+        cases = {
+            "hardware.chip": {"hardware": light},
+            "hardware.memoryGiB": {"hardware": dict(HARDWARE, memoryGiB=64)},
+            "toolchain.xcodeBuild": {"toolchain": other_xcode},
+        }
+        for field, change in cases.items():
+            with self.subTest(field=field):
+                node = class_enrollment("cmux-fixture-002", state="enrolling")
+                bootstrap = class_bootstrap(node, **change)
+                node["supportedToolchainGenerations"] = [bootstrap["toolchainGeneration"]]
+                with self.assertRaisesRegex(f.FleetError, "run accept-local") as caught:
+                    self.adopt(klass, node, bootstrap=bootstrap)
+                self.assertIn(field, str(caught.exception))
+        node = class_enrollment("cmux-fixture-002", state="enrolling", glaeda=D)
+        with self.assertRaisesRegex(f.FleetError, "glaedaGeneration"):
+            self.adopt(klass, node)
+        with self.assertRaisesRegex(f.FleetError, "glaedaFleetContractGeneration"):
+            self.adopt(klass, contract=B)
+        with self.assertRaisesRegex(f.FleetError, "glaedaCandidate"):
+            self.adopt(klass, candidate=dict(CANDIDATE, commit="7" * 40))
+        with self.assertRaisesRegex(f.FleetError, "this node is class light"):
+            self.adopt(klass, fleet_class="light")
+
+    def test_a_node_must_pass_its_own_bootstrap(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        blocked = class_bootstrap(node)
+        blocked["eligibleForEnrollment"] = False
+        blocked["blockingChecks"] = ["diskAdmission"]
+        with self.assertRaisesRegex(f.FleetError, "blocking checks"):
+            self.adopt(klass, node, bootstrap=blocked)
+        with self.assertRaisesRegex(f.FleetError, "enrolling node"):
+            self.adopt(klass, class_enrollment("cmux-fixture-002", state="eligible"))
+
+    def test_class_receipt_integrity(self):
+        klass, _ = std_class_receipt()
+        edited = copy.deepcopy(klass)
+        edited["hardware"]["memoryGiB"] = 16
+        with self.assertRaisesRegex(f.FleetError, "digest does not match"):
+            f.validate_class_acceptance(edited)
+        # Re-sealed by whoever edited it: the digest is now self-consistent, so the
+        # operator's expected digest is what refuses it.
+        body = {k: v for k, v in edited.items() if k != "receiptSha256"}
+        resealed = {**body, "receiptSha256": f.digest(body)}
+        with self.assertRaisesRegex(f.FleetError, "operator expected"):
+            self.adopt(resealed, expected=klass["receiptSha256"])
+        toolchain_lie = copy.deepcopy(klass)
+        toolchain_lie["toolchain"]["zigVersion"] = "0.15.0"
+        body = {k: v for k, v in toolchain_lie.items() if k != "receiptSha256"}
+        with self.assertRaisesRegex(f.FleetError, "disagrees with its observations"):
+            f.validate_class_acceptance({**body, "receiptSha256": f.digest(body)})
+        extra = dict(klass, nodeSerial="C02XXXX")
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_class_acceptance(extra)
+
+    def test_only_a_current_local_acceptance_seeds_a_class(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        with self.assertRaisesRegex(f.FleetError, "does not chain"):
+            f.build_class_acceptance(eligible, derived, class_bootstrap(eligible), "std", CANDIDATE)
+        accepting = class_enrollment(state="enrolling")
+        local = finalized(accepting, toolchain=TG, post_bootstrap=class_bootstrap(accepting))
+        with self.assertRaisesRegex(f.FleetError, "eligible node"):
+            f.build_class_acceptance(accepting, local, class_bootstrap(accepting), "std", CANDIDATE)
+        stale = class_enrollment()
+        stale["enrollmentGeneration"] += 1
+        with self.assertRaisesRegex(f.FleetError, "acceptance_enrollment_stale"):
+            f.build_class_acceptance(stale, local, class_bootstrap(stale), "std", CANDIDATE)
+        bare = class_enrollment()
+        with self.assertRaisesRegex(f.FleetError, "no hardware or toolchain identity"):
+            f.build_class_acceptance(bare, local, bootstrap_for(bare, TG), "std", CANDIDATE)
+
+    def test_class_derived_receipt_shape_is_closed(self):
+        klass, local = std_class_receipt()
+        derived = self.adopt(klass)
+        missing = {k: v for k, v in derived.items() if k != "classAcceptanceSha256"}
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_acceptance_receipt(missing)
+        with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
+            f.validate_acceptance_receipt(dict(local, classAcceptanceSha256=A))
+        with self.assertRaisesRegex(f.FleetError, "class acceptance digest"):
+            f.validate_acceptance_receipt(dict(derived, classAcceptanceSha256=None))
+
+    def test_enrollment_records_and_forgets_the_class_it_relied_on(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        other = dict(eligible, classAcceptanceSha256=A)
+        by_role = {r["role"]: r for r in f.node_status(other, [derived])["roles"]}
+        self.assertEqual(by_role["cmux_macos_native_build"]["reason"], "acceptance_class_stale")
+        quarantined = f.transition(eligible, "quarantined", "toolchain_mismatch")
+        self.assertEqual(quarantined["classAcceptanceSha256"], klass["receiptSha256"])
+        renewed = f.transition(quarantined, "enrolling", None)
+        self.assertNotIn("classAcceptanceSha256", renewed)
+        # A node accepted locally keeps the legacy shape.
+        local_node = class_enrollment(state="enrolling")
+        local = finalized(local_node, toolchain=TG, post_bootstrap=class_bootstrap(local_node))
+        self.assertEqual(
+            set(f.transition(local_node, "eligible", None, [local])),
+            f.ENROLLMENT_KEYS,
+        )
+
+    def test_a_class_receipt_counts_only_while_the_enrollment_names_it(self):
+        klass, _ = std_class_receipt()
+        node = class_enrollment("cmux-fixture-002", state="enrolling")
+        derived = self.adopt(klass, node)
+        eligible = f.transition(node, "eligible", None, [derived])
+        # Swapped onto a node that became eligible some other way, it does not count.
+        legacy = {k: v for k, v in eligible.items() if k != "classAcceptanceSha256"}
+        by_role = {r["role"]: r for r in f.node_status(legacy, [derived])["roles"]}
+        self.assertEqual(by_role["cmux_macos_native_build"]["reason"], "acceptance_class_stale")
+        # Draining and back re-records the same class receipt.
+        draining = f.transition(eligible, "draining", None)
+        back = f.transition(draining, "eligible", None, [derived])
+        self.assertEqual(back["classAcceptanceSha256"], klass["receiptSha256"])
+        # A class receipt offered next to a stale one records nothing it did not rest on.
+        stale = dict(derived, enrollmentGeneration=derived["enrollmentGeneration"] + 1)
+        with self.assertRaisesRegex(f.FleetError, "current accepted role receipt"):
+            f.transition(node, "eligible", None, [stale])
+        with self.assertRaisesRegex(f.FleetError, "no local execution attempt"):
+            f.validate_acceptance_receipt(dict(derived, localExecutionAttemptSha256=E))
+
+    def test_candidate_identity_believes_only_the_running_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            for name in ("cmux_fleet.py", "cmux_fleet_bootstrap.py"):
+                (root / "scripts" / name).write_bytes((MODULE_PATH.parent / name).read_bytes())
+            files = {
+                f"scripts/{name}": {"sha256": f._file_sha256(root / "scripts" / name)[7:], "size": 1}
+                for name in ("cmux_fleet.py", "cmux_fleet_bootstrap.py")
+            }
+            files["bin/glaeda"] = {"sha256": C[7:], "size": 1}
+            manifest = {"schema": f.CANDIDATE_MANIFEST_SCHEMA, "files": files, "source": CANDIDATE}
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(f.candidate_identity(C, root), CANDIDATE)
+            with self.assertRaisesRegex(f.FleetError, "running bin/glaeda"):
+                f.candidate_identity(D, root)
+            (root / "scripts/cmux_fleet.py").write_text("# edited after staging\n")
+            with self.assertRaisesRegex(f.FleetError, "running scripts/cmux_fleet.py"):
+                f.candidate_identity(C, root)
+            (root / "manifest.json").unlink()
+            with self.assertRaisesRegex(f.FleetError, "staged Glaeda candidate"):
+                f.candidate_identity(C, root)
+
+    def test_export_and_adopt_run_only_a_read_only_bootstrap(self):
+        klass, local = std_class_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.chmod(0o700)
+
+            def private(name, value):
+                path = root / name
+                path.write_bytes(f.canonical(value))
+                path.chmod(0o600)
+                return path
+
+            accepting = class_enrollment()
+            node = class_enrollment("cmux-fixture-002", state="enrolling")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            (root / "cmux").mkdir()
+            (root / "cache").mkdir()
+            calls = []
+
+            def fake_run(argv, **kwargs):
+                calls.append((argv, kwargs["env"]))
+                self.assertIn("cmux_fleet_bootstrap.py", " ".join(map(str, argv)))
+                self.assertEqual(argv[argv.index("--cache-root") + 1], str(root / "cache"))
+                return __import__("subprocess").CompletedProcess(
+                    argv, 0, stdout=f.canonical(class_bootstrap(current)), stderr=b"",
+                )
+
+            common = dict(cmux_root=root / "cmux", glaeda=glaeda, cache_root=root / "cache")
+            with (
+                mock.patch.dict(f.os.environ, {"PATH": "/usr/bin:/bin", "SECRET": "x"}, clear=True),
+                mock.patch.object(f.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(f, "candidate_identity", return_value=dict(CANDIDATE)),
+                mock.patch.object(f, "fleet_contract_generation", return_value=local["glaedaFleetContractGeneration"]),
+            ):
+                current = accepting
+                exported = f.export_class_acceptance(
+                    private("enrollment.json", accepting), private("acceptance.json", local), "std", **common,
+                )
+                current = node
+                adopted = f.adopt_class_acceptance(
+                    private("node.json", node), private("std.json", exported), exported["receiptSha256"],
+                    "std", **common,
+                )
+        self.assertEqual(exported, klass)
+        self.assertEqual(adopted["classAcceptanceSha256"], klass["receiptSha256"])
+        self.assertEqual(len(calls), 2)
+        for _argv, env in calls:
+            self.assertNotIn("SECRET", env)
+            self.assertNotIn("TMPDIR", env)
+            self.assertEqual(env["LC_ALL"], "C")
+
+
 if __name__ == "__main__":
     unittest.main()

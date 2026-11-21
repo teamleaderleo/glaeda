@@ -3,12 +3,13 @@ fn main() {
         [
             "compilation_caching_cas.proto",
             "compilation_caching_kv.proto",
+            "fleet_cas.proto",
         ],
         ["proto"],
     )
     .unwrap();
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true)
         .compile_fds(fds)
         .unwrap();
 }

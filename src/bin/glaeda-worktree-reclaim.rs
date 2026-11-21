@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::builder::TypedValueParser;
 use clap::{Parser, ValueEnum};
 use glaeda::linked_worktree_reclaim::{
+    DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS, GithubLookup, LINKED_WORKTREE_GIT_TIMEOUT,
     LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision,
     LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto,
-    list_linked_worktrees, observe_linked_worktrees, plan_linked_worktree_reclaim,
-    reclaim_linked_worktree,
+    LocalBranchDecision, LocalBranchDeletion, LocalBranchFinishedEvidence, LocalBranchReport,
+    ProcessUseEvidence, landed_worktree_tips, list_linked_worktrees, observe_linked_worktrees,
+    plan_linked_worktree_reclaim, reclaim_linked_worktree, reclaim_local_branches,
 };
 use glaeda::process::ProcessExecutor;
 use glaeda::project_checkout_observation::ProjectCheckoutObserver;
@@ -20,21 +23,47 @@ const REPORT_SCHEMA_VERSION: u8 = 1;
 const GIT_PROGRAM: &str = "/usr/bin/git";
 const MAX_REPOSITORIES: usize = 32;
 
-/// Default idle window: a day.
+/// Default idle window for unfinished work: three days.
 ///
-/// The Cargo target planner defaults to a week because a wrong reclaim costs a rebuild. Here every
-/// eligible worktree is already clean and preserved, so recreating one costs a single
-/// `git worktree add`. Agent scratch worktrees churn daily, and a week would leave most of them
-/// out of reach.
-const DEFAULT_IDLE_SECONDS: i64 = 24 * 60 * 60;
+/// Every eligible worktree is already clean and preserved, so the window only weighs disruption:
+/// someone may come back to unfinished work, and a worktree a process is working in is refused
+/// outright however old its Git activity looks. Under disk pressure a caller passes a shorter one.
+const DEFAULT_IDLE_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// Default idle window for finished work (landed in a remote default branch, squash-merged, or
+/// upstream deleted): an hour, the policy floor. Nobody returns to it, so it is only clutter.
+const DEFAULT_FINISHED_IDLE_SECONDS: i64 = 60 * 60;
 
 /// Default number of worktrees one run may remove. A budget keeps an unattended run bounded even
 /// if every observation is wrong in the same way.
 const DEFAULT_MAX_RECLAIMS: usize = 32;
 
+/// Default number of local branches one run may delete across all repositories.
+const DEFAULT_MAX_BRANCH_DELETIONS: usize = 64;
+
+/// Where `gh` is looked for when `--gh` is not given, after `~/.local/bin/gh`; scheduled jobs
+/// run with a minimal PATH.
+const GH_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"];
+
+/// Environment passed to `gh` so it finds its configuration and stored credentials.
+const GH_ENVIRONMENT: [&str; 8] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "USER",
+    // Linux: gh reads a keyring-stored token through the session bus.
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
 // Ignored files are gone for good; everything else comes back with `git worktree add` at the
 // preserved commit, and a detached HEAD is pinned under refs/glaeda/worktree-pins/ first.
 const COMPENSATION: &str = "git_worktree_add_at_preserved_commit";
+
+// A deleted branch comes back with `git branch <name> <commit>` from the receipt.
+const BRANCH_COMPENSATION: &str = "git_branch_at_receipt_commit";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -59,17 +88,61 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MAX_RECLAIMS)]
     max_reclaims: usize,
 
-    /// Seconds without Git activity before a worktree may be reclaimed.
+    /// Seconds without Git activity before a worktree holding unfinished work may be reclaimed.
     #[arg(long, default_value_t = DEFAULT_IDLE_SECONDS)]
     minimum_idle_seconds: i64,
 
-    /// List every worktree in human output, not only the actionable ones.
+    /// Seconds without Git activity before a worktree whose work has landed may be reclaimed.
+    #[arg(long, default_value_t = DEFAULT_FINISHED_IDLE_SECONDS)]
+    finished_idle_seconds: i64,
+
+    /// Also delete local branches that no worktree has checked out and whose work has landed,
+    /// after the finished window. Runs after worktree removal, which frees their branches.
+    #[arg(long)]
+    branches: bool,
+
+    /// Inspect/delete local branches only; skip worktree and process scans. Implies --branches.
+    /// Checked-out, rebasing, bisecting, protected, recent and unfinished branches stay protected.
+    #[arg(long)]
+    branches_only: bool,
+
+    /// `gh` used to ask GitHub whether a branch's pull request merged (squash merges that main
+    /// has since changed further look unfinished to Git alone). Found automatically if omitted.
+    #[arg(long)]
+    gh: Option<PathBuf>,
+
+    /// Decide from Git alone, without asking GitHub whether a pull request merged: applies to
+    /// worktree work state and to --branches.
+    #[arg(long, conflicts_with = "gh")]
+    no_github: bool,
+
+    /// Most local branches one run may delete across all repositories.
+    #[arg(long, default_value_t = DEFAULT_MAX_BRANCH_DELETIONS)]
+    max_branch_deletions: usize,
+
+    /// List every worktree (and, with --branches, every branch) in human output, not only the
+    /// actionable ones.
     #[arg(long)]
     all: bool,
 
     /// Select human or JSON output.
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     output: OutputFormat,
+
+    /// Most worktrees observed at once, which is also the most Git processes this runs at once
+    /// (1 to 8). Kept low by default so a sweep never crowds the host's own work.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS,
+        value_parser = clap::value_parser!(u8).range(1..=8).map(usize::from),
+    )]
+    git_workers: usize,
+
+    /// Skip a repository that cannot be listed (a broken or unreadable checkout): name it and its
+    /// error on stderr and in the report, sweep the rest, and do not fail the run for it. For a
+    /// caller that discovers checkouts itself; a mistyped --repository still exits 2 without it.
+    #[arg(long)]
+    skip_unlisted: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -99,6 +172,9 @@ enum WorktreeResult {
 struct WorktreeReport {
     /// Position among linked worktrees in `git worktree list` order, starting at 1.
     ordinal: usize,
+    /// The registered checkout path. The report goes to the operator who owns these checkouts,
+    /// and an ordinal alone had to be mapped back through `git worktree list` by hand.
+    path: PathBuf,
     #[serde(flatten)]
     result: WorktreeResult,
 }
@@ -112,6 +188,8 @@ struct Summary {
     prunable: usize,
     unobservable: usize,
     reclaimed: usize,
+    /// Linked registrations deliberately not scanned in --branches-only mode.
+    skipped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +201,7 @@ enum RepositoryResult {
     },
     Unlisted {
         code: &'static str,
+        problem: &'static str,
     },
 }
 
@@ -130,6 +209,8 @@ enum RepositoryResult {
 struct RepositoryReport {
     /// Position of the repository among the `--repository` arguments, starting at 1.
     ordinal: usize,
+    /// The `--repository` argument, so a skipped checkout is named in the receipt.
+    path: PathBuf,
     /// Free bytes on the repository's filesystem around this repository's removals.
     #[serde(skip_serializing_if = "Option::is_none")]
     available_bytes_before: Option<u64>,
@@ -137,6 +218,22 @@ struct RepositoryReport {
     available_bytes_after: Option<u64>,
     #[serde(flatten)]
     result: RepositoryResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branches: Option<BranchSection>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum BranchSection {
+    Listed {
+        eligible: usize,
+        deleted: usize,
+        branches: Vec<LocalBranchReport>,
+    },
+    Unlisted {
+        code: &'static str,
+        problem: &'static str,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -145,8 +242,14 @@ struct Report {
     schema_version: u8,
     mutation_performed: bool,
     compensation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_compensation: Option<&'static str>,
     minimum_idle_seconds: i64,
+    finished_idle_seconds: i64,
     max_reclaims: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_branch_deletions: Option<usize>,
+    git_workers: usize,
     budget_exhausted: bool,
     circuit_breaker_tripped: bool,
     repositories: Vec<RepositoryReport>,
@@ -161,7 +264,10 @@ fn main() -> ExitCode {
             "one run accepts at most 32 repositories",
         );
     }
-    let policy = match LinkedWorktreeReclaimPolicy::new(cli.minimum_idle_seconds) {
+    let policy = match LinkedWorktreeReclaimPolicy::with_finished_window(
+        cli.minimum_idle_seconds,
+        cli.finished_idle_seconds,
+    ) {
         Ok(policy) => policy,
         Err(error) => return fail(cli.output, error.code(), error.problem()),
     };
@@ -177,34 +283,98 @@ fn main() -> ExitCode {
         );
     };
     let observer = match ProjectCheckoutObserver::new(GIT_PROGRAM) {
-        Ok(observer) => observer,
+        Ok(observer) => observer.with_command_timeout(LINKED_WORKTREE_GIT_TIMEOUT),
         Err(error) => return fail(cli.output, error.code, error.problem),
     };
     let executor = ProcessExecutor;
 
+    let branches_requested = cli.branches || cli.branches_only;
     let mut remaining_budget = cli.max_reclaims;
+    let mut remaining_branch_budget = cli.max_branch_deletions;
+    let github = (!cli.no_github)
+        .then(|| {
+            cli.gh.clone().or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/bin/gh"))
+                    .into_iter()
+                    .chain(GH_CANDIDATES.iter().map(PathBuf::from))
+                    .find(|path| path.is_file())
+            })
+        })
+        .flatten()
+        .map(|gh_program| GithubLookup {
+            gh_program,
+            environment: GH_ENVIRONMENT
+                .iter()
+                .filter_map(|key| {
+                    std::env::var(key)
+                        .ok()
+                        .map(|value| ((*key).to_owned(), value))
+                })
+                .collect(),
+        });
+    let mut branch_budget_exhausted = false;
     let mut budget_exhausted = false;
     let mut circuit_breaker_tripped = false;
     let mut mutation_performed = false;
+    // The process listing is the host's, not one checkout's: --skip-unlisted never hides it.
+    let mut host_evidence_failed = false;
     let mut repositories = Vec::with_capacity(cli.repositories.len());
 
     for (index, repository) in cli.repositories.iter().enumerate() {
-        let inventory = match list_linked_worktrees(&observer, repository, &executor) {
+        let mut inventory = match list_linked_worktrees(&observer, repository, &executor) {
             Ok(inventory) => inventory,
             Err(error) => {
                 repositories.push(RepositoryReport {
                     ordinal: index + 1,
+                    path: repository.clone(),
                     available_bytes_before: None,
                     available_bytes_after: None,
-                    result: RepositoryResult::Unlisted { code: error.code() },
+                    result: RepositoryResult::Unlisted {
+                        code: error.code(),
+                        problem: error.problem(),
+                    },
+                    branches: None,
                 });
                 continue;
             }
         };
         let available_bytes_before = cli.apply.then(|| available_bytes(repository)).flatten();
-        let observations = observe_linked_worktrees(&observer, &inventory, &executor);
+        let observations = if cli.branches_only {
+            Vec::new()
+        } else {
+            let evidence = match ProcessUseEvidence::collect(&executor) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    host_evidence_failed = true;
+                    repositories.push(RepositoryReport {
+                        ordinal: index + 1,
+                        path: repository.clone(),
+                        available_bytes_before: None,
+                        available_bytes_after: None,
+                        result: RepositoryResult::Unlisted {
+                            code: error.code(),
+                            problem: error.problem(),
+                        },
+                        branches: None,
+                    });
+                    continue;
+                }
+            };
+            if let Some(github) = github.as_ref() {
+                inventory.record_landed_tips(landed_worktree_tips(
+                    &observer, &inventory, github, &executor,
+                ));
+            }
+            observe_linked_worktrees(&observer, &inventory, &evidence, &executor, cli.git_workers)
+        };
         let mut summary = Summary {
             linked: inventory.linked().len(),
+            skipped: if cli.branches_only {
+                inventory.linked().len()
+            } else {
+                0
+            },
             ..Summary::default()
         };
         let mut worktrees = Vec::with_capacity(inventory.linked().len());
@@ -269,14 +439,61 @@ fn main() -> ExitCode {
             };
             worktrees.push(WorktreeReport {
                 ordinal: position + 1,
+                path: entry.path().to_path_buf(),
                 result,
             });
         }
+        let branches =
+            (branches_requested && !circuit_breaker_tripped).then(|| match reclaim_local_branches(
+                &observer,
+                &inventory,
+                policy.finished_idle_seconds(),
+                now_seconds,
+                cli.apply,
+                &mut remaining_branch_budget,
+                cli.all,
+                github.as_ref(),
+                &executor,
+            ) {
+                Ok(branches) => {
+                    let eligible = branches
+                        .iter()
+                        .filter(|branch| {
+                            matches!(branch.decision, LocalBranchDecision::Eligible { .. })
+                        })
+                        .count();
+                    let deleted = branches
+                        .iter()
+                        .filter(|branch| branch.deletion == Some(LocalBranchDeletion::Deleted))
+                        .count();
+                    mutation_performed |= deleted > 0;
+                    let attempted = branches
+                        .iter()
+                        .filter(|branch| branch.deletion.is_some())
+                        .count();
+                    circuit_breaker_tripped |= branches
+                        .iter()
+                        .any(|branch| branch.deletion == Some(LocalBranchDeletion::GitRefused));
+                    branch_budget_exhausted |=
+                        cli.apply && !circuit_breaker_tripped && eligible > attempted;
+                    BranchSection::Listed {
+                        eligible,
+                        deleted,
+                        branches,
+                    }
+                }
+                Err(error) => BranchSection::Unlisted {
+                    code: error.code(),
+                    problem: error.problem(),
+                },
+            });
         repositories.push(RepositoryReport {
             ordinal: index + 1,
+            path: repository.clone(),
             available_bytes_before,
             available_bytes_after: cli.apply.then(|| available_bytes(repository)).flatten(),
             result: RepositoryResult::Listed { summary, worktrees },
+            branches,
         });
     }
 
@@ -289,9 +506,13 @@ fn main() -> ExitCode {
         schema_version: REPORT_SCHEMA_VERSION,
         mutation_performed,
         compensation: COMPENSATION,
+        branch_compensation: branches_requested.then_some(BRANCH_COMPENSATION),
         minimum_idle_seconds: policy.minimum_idle_seconds(),
+        finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
-        budget_exhausted,
+        max_branch_deletions: branches_requested.then_some(cli.max_branch_deletions),
+        git_workers: cli.git_workers,
+        budget_exhausted: budget_exhausted || branch_budget_exhausted,
         circuit_breaker_tripped,
         repositories,
     };
@@ -308,13 +529,30 @@ fn main() -> ExitCode {
         },
         OutputFormat::Human => render_human(&report, cli.apply, cli.all),
     }
-    let any_unlisted = report
-        .repositories
-        .iter()
-        .any(|repository| matches!(repository.result, RepositoryResult::Unlisted { .. }));
+    let mut any_unlisted = false;
+    for repository in &report.repositories {
+        let unlisted = match (&repository.result, &repository.branches) {
+            (RepositoryResult::Unlisted { code, problem }, _) => {
+                Some(("repository", code, problem))
+            }
+            (_, Some(BranchSection::Unlisted { code, problem })) => {
+                Some(("branches of", code, problem))
+            }
+            _ => None,
+        };
+        if let Some((what, code, problem)) = unlisted {
+            any_unlisted = true;
+            if cli.skip_unlisted {
+                eprintln!(
+                    "glaeda-worktree-reclaim: skipped {what} {}: {code}: {problem}",
+                    repository.path.display()
+                );
+            }
+        }
+    }
     if circuit_breaker_tripped {
         ExitCode::from(3)
-    } else if any_unlisted {
+    } else if host_evidence_failed || (any_unlisted && !cli.skip_unlisted) {
         // A mistyped or invalid repository must not pass silently in an unattended run.
         ExitCode::from(2)
     } else {
@@ -331,13 +569,17 @@ fn render_human(report: &Report, apply: bool, all: bool) {
     let mut eligible_total = 0;
     for repository in &report.repositories {
         match &repository.result {
-            RepositoryResult::Unlisted { code } => {
-                println!("repository {}: not listed: {code}", repository.ordinal);
+            RepositoryResult::Unlisted { code, .. } => {
+                println!(
+                    "repository {} ({}): not listed: {code}",
+                    repository.ordinal,
+                    repository.path.display()
+                );
             }
             RepositoryResult::Listed { summary, worktrees } => {
                 eligible_total += summary.eligible;
                 println!(
-                    "repository {}: {} linked worktrees: {} eligible ({} need a HEAD pin), {} refused, {} prunable, {} unobservable{}",
+                    "repository {}: {} linked worktrees: {} eligible ({} need a HEAD pin), {} refused, {} prunable, {} unobservable, {} skipped{}",
                     repository.ordinal,
                     summary.linked,
                     summary.eligible,
@@ -345,6 +587,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                     summary.refused,
                     summary.prunable,
                     summary.unobservable,
+                    summary.skipped,
                     if apply {
                         format!(", {} reclaimed", summary.reclaimed)
                     } else {
@@ -353,7 +596,35 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                 );
                 for worktree in worktrees {
                     if let Some(line) = worktree_line(&worktree.result, all) {
-                        println!("  #{}: {line}", worktree.ordinal);
+                        println!(
+                            "  #{} {}: {line}",
+                            worktree.ordinal,
+                            worktree.path.display()
+                        );
+                    }
+                }
+                match &repository.branches {
+                    None => {}
+                    Some(BranchSection::Unlisted { code, .. }) => {
+                        println!("  branches: not listed: {code}");
+                    }
+                    Some(BranchSection::Listed {
+                        eligible,
+                        deleted,
+                        branches,
+                    }) => {
+                        eligible_total += eligible;
+                        println!(
+                            "  branches: {eligible} finished and idle{}",
+                            if apply {
+                                format!(", {deleted} deleted")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        for branch in branches {
+                            println!("    {}", branch_line(branch));
+                        }
                     }
                 }
                 if let (Some(before), Some(after)) = (
@@ -372,8 +643,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
     if apply {
         if report.budget_exhausted {
             println!(
-                "stopped at the --max-reclaims budget of {}; run again to continue",
-                report.max_reclaims
+                "stopped at the --max-reclaims or --max-branch-deletions budget; run again to continue"
             );
         }
         if report.circuit_breaker_tripped {
@@ -382,12 +652,14 @@ fn render_human(report: &Report, apply: bool, all: bool) {
             );
         }
     } else if eligible_total > 0 {
-        println!("nothing was changed; run again with --apply to reclaim the eligible worktrees");
+        println!(
+            "nothing was changed; run again with --apply to reclaim eligible worktrees or local branches"
+        );
     } else {
         println!("nothing was changed");
     }
     if !all {
-        println!("#N is the Nth linked entry of `git worktree list`; --all lists every worktree");
+        println!("--all lists every worktree");
     }
 }
 
@@ -448,6 +720,39 @@ fn worktree_line(result: &WorktreeResult, all: bool) -> Option<String> {
             .then(|| "prunable: registration is stale (directory or .git file missing)".to_owned()),
         WorktreeResult::Unobservable { code } => Some(format!("unobservable: {code}")),
     }
+}
+
+fn branch_line(branch: &LocalBranchReport) -> String {
+    let state = match (&branch.deletion, &branch.decision) {
+        (Some(LocalBranchDeletion::Deleted), _) => "deleted".to_owned(),
+        (Some(LocalBranchDeletion::Changed), _) => "kept: changed since it was checked".to_owned(),
+        (Some(LocalBranchDeletion::GitRefused), _) => "kept: git refused the delete".to_owned(),
+        (
+            None,
+            LocalBranchDecision::Eligible {
+                idle_seconds,
+                finished,
+            },
+        ) => format!(
+            "eligible, idle {}h, {}",
+            idle_seconds / 3_600,
+            match finished {
+                LocalBranchFinishedEvidence::DefaultBranch =>
+                    "landed on a default branch".to_owned(),
+                LocalBranchFinishedEvidence::MergedPullRequest { repository, number } => {
+                    format!("merged as {repository}#{number}")
+                }
+            }
+        ),
+        (None, LocalBranchDecision::Kept { reason }) => format!(
+            "kept: {}",
+            serde_json::to_value(reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        ),
+    };
+    format!("{} {}: {state}", branch.name, short(&branch.commit))
 }
 
 fn short(commit: &str) -> &str {

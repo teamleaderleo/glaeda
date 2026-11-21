@@ -17,6 +17,17 @@
 //!   that residual risk.
 //! - History reached only through this worktree's reflog or `ORIG_HEAD`, which Git itself already
 //!   treats as garbage once it expires.
+//! - The objects of this worktree's own submodule repositories. A submodule counts as preserved
+//!   when it is clean, at the commit the superproject records, and every ref it holds is reachable
+//!   from its remote-tracking refs or from that commit when a superproject remote's default branch
+//!   records it (the published gitlink); those objects then come back from the remote, not disk,
+//!   and a remote that later drops them takes them with it. Any ref under `refs/remotes/` counts,
+//!   including one written by hand or fetched from a local path, as does whatever branch
+//!   `refs/remotes/<name>/HEAD` names; a default branch that records a commit its submodule remote
+//!   never had is trusted too. History the submodule reaches
+//!   only through its reflog goes too, even when preserved superproject history records it. The
+//!   decision says so with
+//!   [`LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes`].
 //!
 //! Shared refs mean branches, tags, and remote-tracking refs. `refs/stash`, prefetch refs, and other
 //! worktrees' per-worktree refs are rewritten or dropped by routine commands, so they never count
@@ -39,7 +50,17 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::process::{ExecutionRecord, MAX_CAPTURED_STREAM_BYTES, TimedCommandExecutor};
-use crate::project_checkout_observation::{ProjectBranchState, ProjectCheckoutObserver};
+use crate::project_checkout_observation::{
+    ProjectBranchState, ProjectCheckoutObservationError, ProjectCheckoutObserver,
+};
+
+mod branches;
+
+pub use branches::{
+    GITHUB_SECRET_ENVIRONMENT, GithubLookup, LocalBranchDecision, LocalBranchDeletion,
+    LocalBranchFinishedEvidence, LocalBranchKeepReason, LocalBranchReport, MAX_LOCAL_BRANCHES,
+    landed_worktree_tips, reclaim_local_branches,
+};
 
 pub const LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION: u8 = 1;
 
@@ -69,12 +90,22 @@ const OPERATION_MARKERS: [&str; 6] = [
     "rebase-apply",
 ];
 
-/// Per-worktree Git entries whose modification time records Git activity in that worktree.
+/// Per-worktree Git entry whose modification time records Git activity in that worktree.
 ///
 /// The index is deliberately absent: any tool running a plain `git status` rewrites it, so its
 /// mtime measures who looked rather than who worked, and staged changes already veto as tracked
-/// changes.
-const ACTIVITY_ENTRIES: [&str; 2] = ["HEAD", "logs/HEAD"];
+/// changes. So is the mtime of `logs/HEAD`: `git gc` (and `git maintenance run --auto`) runs
+/// `reflog expire --all`, which rewrites every worktree's reflog file. On a repository busy
+/// enough to keep gc running (Big Red, 2026-09-24: gc every ~30 s) every worktree looked active
+/// and a gc landing mid-run read as a future timestamp. The reflog's newest entry keeps the time
+/// Git wrote it, so activity comes from that instead.
+const ACTIVITY_ENTRY: &str = "HEAD";
+
+/// The per-worktree HEAD reflog, whose newest entry records the last HEAD move.
+const HEAD_REFLOG: &str = "logs/HEAD";
+
+/// How much of a reflog's end is read to find its newest entry.
+const REFLOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// `rev-list` selectors for the ref namespaces whose tips survive routine Git commands and so can
 /// preserve a commit: branches, tags, and remote-tracking refs.
@@ -82,6 +113,20 @@ const PRESERVING_REF_SELECTORS: [&str; 3] = ["--branches", "--tags", "--remotes"
 
 /// Per-worktree ref namespaces that vanish with the worktree.
 const PER_WORKTREE_REF_PATTERNS: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritten/"];
+
+/// Whether the work a worktree holds has landed, which decides how long it is kept once idle.
+///
+/// Removal is already lossless (see the module docs), so this only weighs disruption: a finished
+/// worktree nobody touches is clutter, while an unfinished one may be picked up again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkState {
+    /// The worktree made a commit of its own, and HEAD is in a remote's default branch or every
+    /// file it changed is already identical there (a squash merge).
+    Finished,
+    /// Anything else, including every case the checks could not settle.
+    InProgress,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,13 +152,20 @@ pub struct LinkedWorktreeFacts {
     pub hidden_index_entries_present: bool,
     /// A submodule path holds a `.git` entry, or per-worktree submodule repositories exist.
     pub populated_submodules_present: bool,
+    /// Every populated submodule is clean, checked out at the commit the superproject records,
+    /// and holds nothing its remote-tracking refs, or that commit when a superproject remote's
+    /// default branch records it, do not reach. True when none is populated.
+    pub submodules_preserved_on_remotes: bool,
     /// Refs under this worktree's own `refs/worktree/`, `refs/bisect/`, or `refs/rewritten/`.
     pub per_worktree_refs_present: bool,
     /// The checkout directory belongs to the effective user that would remove it.
     pub owned_by_current_user: bool,
     pub head_reachability: HeadReachability,
-    /// Newest modification time, in Unix seconds, across per-worktree Git activity entries and
-    /// the checkout root directory.
+    /// A process has its working directory (or, on Linux, an open file) inside the checkout.
+    pub in_use: bool,
+    pub work_state: WorkState,
+    /// Newest of the checkout root's and HEAD's modification times and the newest HEAD reflog
+    /// entry, in Unix seconds.
     pub last_activity_seconds: i64,
 }
 
@@ -132,14 +184,16 @@ pub enum LinkedWorktreeReclaimVeto {
     UntrackedEntriesPresent,
     /// Index flags hide possible edits from `git status`.
     HiddenIndexEntriesPresent,
-    /// Submodule repositories are populated inside this worktree and may hold unique commits or
-    /// edits that status deliberately does not inspect.
+    /// Submodule repositories are populated inside this worktree and at least one may hold
+    /// unique commits or edits: see [`LinkedWorktreeFacts::submodules_preserved_on_remotes`].
     PopulatedSubmodulesPresent,
     /// Per-worktree refs exist and would vanish with the worktree.
     PerWorktreeRefsPresent,
     /// The checkout belongs to a different user than the one planning its removal.
     NotOwnedByCurrentUser,
-    /// Git activity happened inside the policy's idle window.
+    /// A running process is working inside the checkout.
+    InUse,
+    /// Git activity happened inside the idle window for its work state.
     RecentlyActive,
 }
 
@@ -156,6 +210,7 @@ impl LinkedWorktreeReclaimVeto {
             Self::PopulatedSubmodulesPresent => "populated_submodules_present",
             Self::PerWorktreeRefsPresent => "per_worktree_refs_present",
             Self::NotOwnedByCurrentUser => "not_owned_by_current_user",
+            Self::InUse => "in_use",
             Self::RecentlyActive => "recently_active",
         }
     }
@@ -173,6 +228,11 @@ pub enum LinkedWorktreeReclaimAuthority {
     /// Everything the worktree holds, ignored files aside, already exists elsewhere in the
     /// repository or is covered by the named compensation.
     PreservedInRepository,
+    /// As [`Self::PreservedInRepository`], and the worktree's own submodule repositories hold
+    /// nothing their remote-tracking refs, or the gitlink a superproject remote's default branch
+    /// records, do not reach. Their objects go with the worktree, so
+    /// recreating it (`git submodule update --init`) fetches them from those remotes again.
+    PreservedInRepositoryAndSubmoduleRemotes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -187,26 +247,55 @@ pub enum LinkedWorktreeReclaimCompensation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkedWorktreeReclaimPolicy {
     minimum_idle_seconds: i64,
+    finished_idle_seconds: i64,
 }
 
 impl LinkedWorktreeReclaimPolicy {
-    /// Build a policy from an explicit idle window.
+    /// Build a policy whose one idle window applies to finished and unfinished work alike.
     ///
     /// # Errors
     ///
     /// Refuses a window below [`MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS`].
     pub const fn new(minimum_idle_seconds: i64) -> Result<Self, LinkedWorktreeReclaimError> {
-        if minimum_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS {
+        Self::with_finished_window(minimum_idle_seconds, minimum_idle_seconds)
+    }
+
+    /// Build a policy with a separate, usually shorter, window for finished work.
+    ///
+    /// # Errors
+    ///
+    /// Refuses either window below [`MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS`].
+    pub const fn with_finished_window(
+        minimum_idle_seconds: i64,
+        finished_idle_seconds: i64,
+    ) -> Result<Self, LinkedWorktreeReclaimError> {
+        if minimum_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS
+            || finished_idle_seconds < MIN_LINKED_WORKTREE_RECLAIM_IDLE_SECONDS
+        {
             return Err(idle_window_too_small());
         }
         Ok(Self {
             minimum_idle_seconds,
+            finished_idle_seconds,
         })
     }
 
+    /// The idle window for unfinished work.
     #[must_use]
     pub const fn minimum_idle_seconds(self) -> i64 {
         self.minimum_idle_seconds
+    }
+
+    #[must_use]
+    pub const fn finished_idle_seconds(self) -> i64 {
+        self.finished_idle_seconds
+    }
+
+    const fn window_for(self, work_state: WorkState) -> i64 {
+        match work_state {
+            WorkState::Finished => self.finished_idle_seconds,
+            WorkState::InProgress => self.minimum_idle_seconds,
+        }
     }
 }
 
@@ -242,7 +331,8 @@ impl LinkedWorktreeReclaimDecision {
 pub struct LinkedWorktreeReclaimPlan {
     schema_version: u8,
     decision: LinkedWorktreeReclaimDecision,
-    minimum_idle_seconds: i64,
+    /// The idle window that applied to this worktree's work state.
+    idle_window_seconds: i64,
 }
 
 impl LinkedWorktreeReclaimPlan {
@@ -257,8 +347,8 @@ impl LinkedWorktreeReclaimPlan {
     }
 
     #[must_use]
-    pub const fn minimum_idle_seconds(&self) -> i64 {
-        self.minimum_idle_seconds
+    pub const fn idle_window_seconds(&self) -> i64 {
+        self.idle_window_seconds
     }
 }
 
@@ -269,8 +359,8 @@ impl LinkedWorktreeReclaimPlan {
 ///
 /// # Errors
 ///
-/// Refuses facts whose last activity is in the future relative to `now_seconds`, or whose idle
-/// arithmetic would overflow. Disagreeing clocks are not evidence a decision should rest on.
+/// Refuses facts whose idle arithmetic would overflow. Activity newer than `now_seconds` is
+/// planned as recently active, never as idle.
 pub fn plan_linked_worktree_reclaim(
     facts: &LinkedWorktreeFacts,
     policy: LinkedWorktreeReclaimPolicy,
@@ -295,7 +385,7 @@ pub fn plan_linked_worktree_reclaim(
     if facts.hidden_index_entries_present {
         vetoes.push(LinkedWorktreeReclaimVeto::HiddenIndexEntriesPresent);
     }
-    if facts.populated_submodules_present {
+    if facts.populated_submodules_present && !facts.submodules_preserved_on_remotes {
         vetoes.push(LinkedWorktreeReclaimVeto::PopulatedSubmodulesPresent);
     }
     if facts.per_worktree_refs_present {
@@ -304,14 +394,18 @@ pub fn plan_linked_worktree_reclaim(
     if !facts.owned_by_current_user {
         vetoes.push(LinkedWorktreeReclaimVeto::NotOwnedByCurrentUser);
     }
+    if facts.in_use {
+        vetoes.push(LinkedWorktreeReclaimVeto::InUse);
+    }
 
     let idle_seconds = now_seconds
         .checked_sub(facts.last_activity_seconds)
         .ok_or_else(idle_overflow)?;
-    if idle_seconds < 0 {
-        return Err(future_timestamp());
-    }
-    if idle_seconds < policy.minimum_idle_seconds {
+    // Activity newer than the clock reading is recent by definition. A sweep reads the clock once
+    // and then observes for many minutes on a loaded host, so a worktree touched meanwhile shows
+    // up here; a clock stepped backwards keeps worktrees too, which is the safe direction.
+    let window = policy.window_for(facts.work_state);
+    if idle_seconds < window {
         vetoes.push(LinkedWorktreeReclaimVeto::RecentlyActive);
     }
 
@@ -320,7 +414,11 @@ pub fn plan_linked_worktree_reclaim(
 
     let decision = if vetoes.is_empty() {
         LinkedWorktreeReclaimDecision::Eligible {
-            authority: LinkedWorktreeReclaimAuthority::PreservedInRepository,
+            authority: if facts.populated_submodules_present {
+                LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes
+            } else {
+                LinkedWorktreeReclaimAuthority::PreservedInRepository
+            },
             compensation: match facts.head_reachability {
                 HeadReachability::ReachableFromSharedRef => {
                     LinkedWorktreeReclaimCompensation::NoneRequired
@@ -338,7 +436,216 @@ pub fn plan_linked_worktree_reclaim(
     Ok(LinkedWorktreeReclaimPlan {
         schema_version: LINKED_WORKTREE_RECLAIM_SCHEMA_VERSION,
         decision,
-        minimum_idle_seconds: policy.minimum_idle_seconds,
+        idle_window_seconds: window,
+    })
+}
+
+// --- Process evidence ------------------------------------------------------
+
+/// Where running processes of this user are working, from one bounded observation.
+///
+/// Linux reads every readable process's working directory and open files from `/proc`. macOS asks
+/// `lsof` for working directories only: every open file of every process exceeds the 1 MiB capture
+/// limit on a busy Mac, and a process working in a checkout normally has its cwd there. Paths are
+/// kept private and only ever compared.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProcessUseEvidence {
+    paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for ProcessUseEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessUseEvidence")
+            .field("paths", &self.paths.len())
+            .finish()
+    }
+}
+
+const LSOF_PROGRAM: &str = "/usr/sbin/lsof";
+const LSOF_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl ProcessUseEvidence {
+    /// Evidence from explicit paths, for callers that observed processes themselves and for tests.
+    #[must_use]
+    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
+    }
+
+    /// Observe the processes running now.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no process could be observed at all (this process always has a working
+    /// directory, so empty evidence means the source is unusable) or `lsof` fails. Callers must
+    /// then treat every checkout as possibly in use.
+    pub fn collect(
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<Self, LinkedWorktreeReclaimError> {
+        let proc_root = Path::new("/proc/self/cwd");
+        let paths = if proc_root.exists() {
+            collect_proc_paths()
+        } else {
+            let spec = crate::process::CommandSpec::new(LSOF_PROGRAM)
+                .argument("-n")
+                .argument("-P")
+                .argument("-w")
+                .argument("-Fn")
+                .argument("-a")
+                .argument("-d")
+                .argument("cwd");
+            let record = executor
+                .execute_with_timeout(&spec, LSOF_TIMEOUT)
+                .map_err(|_| process_evidence_unavailable())?;
+            // lsof exits 1 when some process could not be fully read; anything else is a failure.
+            if !matches!(record.status, Some(0 | 1)) {
+                return Err(process_evidence_unavailable());
+            }
+            parse_lsof_names(&record.stdout)
+        };
+        if paths.is_empty() {
+            return Err(process_evidence_unavailable());
+        }
+        Ok(Self { paths })
+    }
+
+    /// Whether any observed path is `directory` itself or inside it.
+    #[must_use]
+    pub fn uses(&self, directory: &Path) -> bool {
+        self.paths.iter().any(|path| path.starts_with(directory))
+    }
+}
+
+fn collect_proc_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return paths;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let process = entry.path();
+        // Other users' processes are unreadable; that is expected, not a finding.
+        if let Ok(cwd) = std::fs::read_link(process.join("cwd")) {
+            paths.push(cwd);
+        }
+        if let Ok(descriptors) = std::fs::read_dir(process.join("fd")) {
+            paths.extend(
+                descriptors
+                    .flatten()
+                    .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
+                    .filter(|target| target.is_absolute()),
+            );
+        }
+    }
+    paths
+}
+
+fn parse_lsof_names(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|name| name.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
+// --- Work state ------------------------------------------------------------
+
+/// Most changed paths compared against a default branch; a larger branch counts as unfinished.
+const MAX_FINISHED_COMPARE_PATHS: usize = 512;
+
+/// Decide whether `commit` has landed.
+///
+/// A worktree that never made a commit of its own did nothing yet, however recently what it
+/// checked out reached a default branch, so it stays in progress. An upstream marked `[gone]` is not
+/// used: follow-up commits after the remote branch was deleted are common. Every question is asked
+/// from the main worktree, and any failure answers "in progress", which only keeps the worktree
+/// longer.
+fn observe_work_state(
+    observer: &ProjectCheckoutObserver,
+    repository: &Path,
+    commit: &str,
+    authored: bool,
+    executor: &impl TimedCommandExecutor,
+) -> WorkState {
+    if !authored {
+        return WorkState::InProgress;
+    }
+    let run = |arguments: &[&str]| observer.git(repository, arguments, executor).ok();
+    let Some(heads) = run(&["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"])
+        .filter(|record| record.success)
+    else {
+        return WorkState::InProgress;
+    };
+    for target in heads
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("refs/remotes/"))
+    {
+        match run(&["merge-base", "--is-ancestor", commit, target]).and_then(|r| r.status) {
+            Some(0) => return WorkState::Finished,
+            Some(1) => {}
+            _ => continue,
+        }
+        let Some(base) = run(&["merge-base", commit, target]).filter(|record| record.success)
+        else {
+            continue;
+        };
+        let base = base.stdout.trim().to_owned();
+        // --no-renames: a rename must list both names, or a branch that renamed `a` to `a2`
+        // would compare only `a2` and miss that the default branch still has `a`.
+        let Some(changed) = run(&["diff", "--no-renames", "--name-only", "-z", &base, commit])
+            .filter(|record| record.success)
+        else {
+            continue;
+        };
+        let paths: Vec<String> = changed
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        if paths.is_empty() || paths.len() > MAX_FINISHED_COMPARE_PATHS {
+            continue;
+        }
+        let mut arguments = vec!["diff", "--no-renames", "--quiet", commit, target, "--"];
+        arguments.extend(paths.iter().map(String::as_str));
+        if run(&arguments).and_then(|record| record.status) == Some(0) {
+            return WorkState::Finished;
+        }
+    }
+    WorkState::InProgress
+}
+
+/// Whether this worktree made a commit of its own, according to its HEAD reflog.
+///
+/// Moving HEAD by syncing (`merge --ff-only`, `pull` fast-forward, `reset`, `checkout`) is not
+/// work: such a worktree would otherwise look finished as soon as main contains what it synced to.
+/// An expired or unreadable reflog answers `false`, which only keeps the worktree longer.
+fn authored_work(git_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read(git_dir.join(HEAD_REFLOG)) else {
+        return false;
+    };
+    text.split(|byte| *byte == b'\n').any(|line| {
+        let Some(tab) = line.iter().position(|byte| *byte == b'\t') else {
+            return false;
+        };
+        let subject = &line[tab + 1..];
+        let fast_forward = subject.windows(12).any(|window| window == b"Fast-forward");
+        [
+            &b"commit"[..],
+            b"cherry-pick",
+            b"revert",
+            b"rebase (finish)",
+        ]
+        .iter()
+        .any(|action| subject.starts_with(action))
+            || ((subject.starts_with(b"merge ") || subject.starts_with(b"pull")) && !fast_forward)
     })
 }
 
@@ -392,12 +699,22 @@ pub struct LinkedWorktreeInventory {
     repository: PathBuf,
     common_dir: PathBuf,
     linked: Vec<LinkedWorktreeEntry>,
+    /// `branch -> tip` a merged pull request contains, supplied by the caller (see
+    /// [`landed_worktree_tips`]); observation itself stays offline.
+    landed_tips: std::collections::BTreeMap<String, String>,
 }
 
 impl LinkedWorktreeInventory {
     #[must_use]
     pub fn linked(&self) -> &[LinkedWorktreeEntry] {
         &self.linked
+    }
+
+    /// Record branch tips known to have landed through a merged pull request. A worktree on one
+    /// of these branches, still at exactly that tip, counts as finished. This only shortens the
+    /// idle window: removal keeps the branch either way.
+    pub fn record_landed_tips(&mut self, tips: std::collections::BTreeMap<String, String>) {
+        self.landed_tips = tips;
     }
 }
 
@@ -471,6 +788,7 @@ pub fn list_linked_worktrees(
         repository: repository.to_path_buf(),
         common_dir,
         linked,
+        landed_tips: std::collections::BTreeMap::new(),
     })
 }
 
@@ -485,9 +803,10 @@ pub fn observe_linked_worktree(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
     entry: &LinkedWorktreeEntry,
+    evidence: &ProcessUseEvidence,
     executor: &impl TimedCommandExecutor,
 ) -> Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError> {
-    observe_detailed(observer, inventory, entry, executor).map(|observed| observed.facts)
+    observe_detailed(observer, inventory, entry, evidence, executor).map(|observed| observed.facts)
 }
 
 /// Facts plus the exact identities an executor must bind its action to.
@@ -497,6 +816,9 @@ struct ObservedWorktree {
     branch: Option<String>,
     git_dir: PathBuf,
     fingerprint: AdministrativeFingerprint,
+    /// The worktree's own submodule repositories, fingerprinted like `git_dir` before their
+    /// content was read. Empty unless every one of them was proven preserved.
+    submodule_fingerprints: Vec<(PathBuf, AdministrativeFingerprint)>,
 }
 
 /// Modification time and size of the per-worktree entries any Git activity rewrites.
@@ -531,6 +853,7 @@ fn observe_detailed(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
     entry: &LinkedWorktreeEntry,
+    evidence: &ProcessUseEvidence,
     executor: &impl TimedCommandExecutor,
 ) -> Result<ObservedWorktree, LinkedWorktreeReclaimError> {
     if entry.prunable {
@@ -557,7 +880,11 @@ fn observe_detailed(
     let fingerprint = administrative_fingerprint(&git_dir)?;
     let observation = observer
         .observe(&checkout, executor)
-        .map_err(|_| checkout_unobservable())?;
+        .map_err(|error| match error.code {
+            "observation_timed_out" => git_timed_out(),
+            "source_changed" => checkout_changed(),
+            _ => checkout_unobservable(),
+        })?;
     let linked = git_dir != common_dir;
     if linked && read_gitdir_backlink(&git_dir)? != checkout.join(".git") {
         return Err(administrative_directory_mismatch());
@@ -596,10 +923,25 @@ fn observe_detailed(
 
     let index = scan_index(&read_index(&git_dir.join("index"))?)?;
     let mut populated_submodules_present = directory_nonempty(&git_dir.join("modules"))?;
+    let mut populated_gitlinks = Vec::new();
     for path in &index.gitlink_paths {
         let relative = relative_index_path(path)?;
-        populated_submodules_present |= submodule_path_populated(&checkout.join(relative))?;
+        if submodule_path_populated(&checkout.join(relative))? {
+            populated_submodules_present = true;
+            populated_gitlinks.push(relative.to_path_buf());
+        }
     }
+    let submodule_fingerprints = if populated_submodules_present {
+        observe_submodule_preservation(
+            observer,
+            &checkout,
+            &git_dir,
+            &populated_gitlinks,
+            executor,
+        )?
+    } else {
+        Some(Vec::new())
+    };
 
     let operation_in_progress = OPERATION_MARKERS
         .iter()
@@ -614,6 +956,18 @@ fn observe_detailed(
         ProjectBranchState::Detached => None,
     };
     let head = observation.commit().as_str().to_owned();
+    // Like the git-only test, only a worktree that made a commit of its own can be finished: a
+    // fresh branch whose name and start point match an old merged pull request did nothing yet.
+    let authored = authored_work(&git_dir);
+    let landed = authored
+        && branch
+            .as_ref()
+            .is_some_and(|name| inventory.landed_tips.get(name) == Some(&head));
+    let work_state = if landed {
+        WorkState::Finished
+    } else {
+        observe_work_state(observer, &inventory.repository, &head, authored, executor)
+    };
 
     let facts = LinkedWorktreeFacts {
         linked,
@@ -623,6 +977,7 @@ fn observe_detailed(
         untracked_entry_count: observation.untracked_entry_count(),
         hidden_index_entries_present: index.hidden_entries_present,
         populated_submodules_present,
+        submodules_preserved_on_remotes: submodule_fingerprints.is_some(),
         per_worktree_refs_present,
         // Compared with the effective user rather than the parent directory: shared scratch roots
         // such as `/tmp` are root-owned, and the parent's owner says nothing about who may remove
@@ -632,6 +987,8 @@ fn observe_detailed(
             .uid()
             == rustix::process::geteuid().as_raw(),
         head_reachability,
+        in_use: evidence.uses(&checkout),
+        work_state,
         last_activity_seconds,
     };
     Ok(ObservedWorktree {
@@ -640,13 +997,21 @@ fn observe_detailed(
         branch,
         git_dir,
         fingerprint,
+        submodule_fingerprints: submodule_fingerprints.unwrap_or_default(),
     })
 }
 
-/// Most concurrent observations [`observe_linked_worktrees`] runs.
+/// Most concurrent observations [`observe_linked_worktrees`] runs, whatever a caller asks for.
 pub const MAX_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 8;
 
-/// Observe every inventory entry with a small bounded pool, in inventory order.
+/// Concurrent observations when the caller does not say: each worker runs one Git read at a
+/// time, so this is also the most Git processes a sweep runs at once. cosmic-gray, a Mac that
+/// hosts agent sessions, ran eight `git status` at once under the old core-count pool (2026-10-21)
+/// and its own reads then ran past their deadlines. Two keeps a 70-worktree sweep near a minute.
+pub const DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 2;
+
+/// Observe every inventory entry with a pool of `workers` (clamped to one through
+/// [`MAX_LINKED_WORKTREE_OBSERVATION_WORKERS`]), in inventory order.
 ///
 /// Each observation runs several `git status`-class reads, which dominate a sweep: sequentially a
 /// 33-worktree cmux checkout took about 50 seconds. Stale registrations are reported as errors
@@ -655,18 +1020,33 @@ pub const MAX_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 8;
 pub fn observe_linked_worktrees(
     observer: &ProjectCheckoutObserver,
     inventory: &LinkedWorktreeInventory,
+    evidence: &ProcessUseEvidence,
     executor: &(impl TimedCommandExecutor + Sync),
+    workers: usize,
 ) -> Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> {
-    let entries = &inventory.linked;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
+    bounded_map(&inventory.linked, workers, |entry| {
+        Some(observe_linked_worktree(
+            observer, inventory, entry, evidence, executor,
+        ))
+    })
+    .into_iter()
+    .map(|result| result.unwrap_or_else(|| Err(observation_lost())))
+    .collect()
+}
+
+/// Apply `work` to every item on at most `workers` threads (clamped to one through
+/// [`MAX_LINKED_WORKTREE_OBSERVATION_WORKERS`]), returning results in item order. An item whose
+/// worker panicked is `None`.
+fn bounded_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    work: impl Fn(&T) -> Option<R> + Sync,
+) -> Vec<Option<R>> {
+    let workers = workers
         .clamp(1, MAX_LINKED_WORKTREE_OBSERVATION_WORKERS)
-        .min(entries.len().max(1));
+        .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut ordered: Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> = (0..entries
-        .len())
-        .map(|_| Err(observation_lost()))
-        .collect();
+    let mut ordered: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
     let observed = std::thread::scope(|scope| {
         let handles = (0..workers)
             .map(|_| {
@@ -674,13 +1054,10 @@ pub fn observe_linked_worktrees(
                     let mut local = Vec::new();
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(entry) = entries.get(index) else {
+                        let Some(item) = items.get(index) else {
                             break;
                         };
-                        local.push((
-                            index,
-                            observe_linked_worktree(observer, inventory, entry, executor),
-                        ));
+                        local.push((index, work(item)));
                     }
                     local
                 })
@@ -705,7 +1082,7 @@ fn git(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git(checkout, arguments, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
 }
 
@@ -718,8 +1095,16 @@ fn git_bounded(
 ) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
     let record = observer
         .git_bounded(checkout, arguments, max_stdout_bytes, executor)
-        .map_err(|_| unavailable())?;
+        .map_err(|error| git_failure(&error))?;
     require_success(record)
+}
+
+fn git_failure(error: &ProjectCheckoutObservationError) -> LinkedWorktreeReclaimError {
+    if error.code == "observation_timed_out" {
+        git_timed_out()
+    } else {
+        unavailable()
+    }
 }
 
 fn require_success(record: ExecutionRecord) -> Result<ExecutionRecord, LinkedWorktreeReclaimError> {
@@ -1043,6 +1428,393 @@ fn entry_present(path: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
     }
 }
 
+// --- Submodules ------------------------------------------------------------
+//
+// `git worktree remove` deletes the worktree's `modules/` directory, and with it every commit,
+// branch, stash, and edit that exists only in those submodule repositories. A submodule counts as
+// preserved only when all of that is reachable from its remote-tracking refs or is the exact commit
+// a superproject remote's default branch records for it: the remote is where `git submodule update`
+// fetches that commit from again. Everything else -- an unusual layout, a nested submodule, a
+// filter, a single unreached ref -- keeps the worktree.
+
+/// Most submodule repositories one worktree's `modules/` directory may hold. More fail closed.
+const MAX_SUBMODULE_REPOSITORIES: usize = 64;
+
+/// Deepest `modules/` nesting searched for repositories (`modules/vendor/bonsplit` is two).
+const MAX_SUBMODULE_REPOSITORY_DEPTH: usize = 8;
+
+/// Fingerprints of every submodule repository when all are preserved on their remotes, `None`
+/// when any is not. Errors mean the evidence could not be read.
+fn observe_submodule_preservation(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+    git_dir: &Path,
+    populated_gitlinks: &[PathBuf],
+    executor: &impl TimedCommandExecutor,
+) -> Result<Option<Vec<(PathBuf, AdministrativeFingerprint)>>, LinkedWorktreeReclaimError> {
+    let Some(repositories) = submodule_repositories(&git_dir.join("modules"))? else {
+        return Ok(None);
+    };
+    // Taken before any submodule content is read, like the worktree's own fingerprint.
+    let fingerprints = repositories
+        .iter()
+        .map(|repository| Ok((repository.clone(), administrative_fingerprint(repository)?)))
+        .collect::<Result<Vec<_>, LinkedWorktreeReclaimError>>()?;
+    // Each repository must be the checkout of exactly one populated gitlink: a repository no
+    // checkout uses keeps an index and a `core.worktree` nothing here inspects.
+    let published_bases = superproject_published_bases(observer, checkout, executor)?;
+    let mut checked_out = Vec::with_capacity(populated_gitlinks.len());
+    for relative in populated_gitlinks {
+        let Some(preserved) = submodule_checkout_preserved(
+            observer,
+            checkout,
+            relative,
+            &repositories,
+            &published_bases,
+            executor,
+        )?
+        else {
+            return Ok(None);
+        };
+        checked_out.push(preserved);
+    }
+    checked_out.sort_by(|left, right| left.repository.cmp(&right.repository));
+    if !checked_out
+        .iter()
+        .map(|preserved| &preserved.repository)
+        .eq(repositories.iter())
+    {
+        return Ok(None);
+    }
+    for preserved in &checked_out {
+        if !submodule_repository_preserved(
+            observer,
+            &preserved.repository,
+            preserved.published_commit.as_deref(),
+            executor,
+        )? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(fingerprints))
+}
+
+/// Every Git repository beneath `modules/`, canonicalized; `None` for any layout this module does
+/// not recognize (a symlink, a stray file, a repository nested inside another, a repository with
+/// linked worktrees of its own, too many).
+fn submodule_repositories(root: &Path) -> Result<Option<Vec<PathBuf>>, LinkedWorktreeReclaimError> {
+    let mut repositories = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && depth == 0 => {
+                return Ok(Some(repositories));
+            }
+            Err(_) => return Err(unavailable()),
+        };
+        if is_git_directory(&directory)? {
+            // Nested submodules, and linked worktrees of the submodule whose per-worktree refs,
+            // HEADs and indexes live under `worktrees/` and go with it, are not proven here.
+            if depth == 0
+                || directory_nonempty(&directory.join("modules"))?
+                || directory_nonempty(&directory.join("worktrees"))?
+            {
+                return Ok(None);
+            }
+            if repositories.len() >= MAX_SUBMODULE_REPOSITORIES {
+                return Ok(None);
+            }
+            repositories.push(std::fs::canonicalize(&directory).map_err(|_| unavailable())?);
+            continue;
+        }
+        if depth >= MAX_SUBMODULE_REPOSITORY_DEPTH {
+            return Ok(None);
+        }
+        for entry in entries {
+            let entry = entry.map_err(|_| unavailable())?;
+            let file_type = entry.file_type().map_err(|_| unavailable())?;
+            if !file_type.is_dir() {
+                return Ok(None);
+            }
+            pending.push((entry.path(), depth + 1));
+        }
+    }
+    repositories.sort();
+    Ok(Some(repositories))
+}
+
+fn is_git_directory(directory: &Path) -> Result<bool, LinkedWorktreeReclaimError> {
+    let is = |name: &str, directory_expected: bool| match std::fs::symlink_metadata(
+        directory.join(name),
+    ) {
+        Ok(metadata) => Ok(if directory_expected {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(unavailable()),
+    };
+    Ok(is("HEAD", false)? && is("objects", true)? && is("refs", true)?)
+}
+
+/// One populated gitlink path: an absorbed checkout of a repository under `modules/`, clean, at
+/// the commit the superproject's HEAD and index both record, with nothing Git would hide from
+/// status. Returns that repository, or `None` when anything does not hold.
+fn submodule_checkout_preserved(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+    relative: &Path,
+    repositories: &[PathBuf],
+    published_bases: &[String],
+    executor: &impl TimedCommandExecutor,
+) -> Result<Option<PreservedCheckout>, LinkedWorktreeReclaimError> {
+    let path = checkout.join(relative);
+    // A `.git` directory here is an embedded repository, which removal deletes outright.
+    match std::fs::symlink_metadata(path.join(".git")) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    }
+    if std::fs::canonicalize(&path).map_err(|_| unavailable())? != path {
+        return Ok(None);
+    }
+    let Ok(git_dir) = absolute_git_path(observer, &path, "--git-dir", executor) else {
+        return Ok(None);
+    };
+    let Ok(git_dir) = std::fs::canonicalize(git_dir) else {
+        return Ok(None);
+    };
+    if !repositories.contains(&git_dir) {
+        return Ok(None);
+    }
+    let top_level = git(observer, &path, &["rev-parse", "--show-toplevel"], executor)?;
+    if top_level.stdout.strip_suffix('\n').map(Path::new) != Some(path.as_path()) {
+        return Ok(None);
+    }
+
+    // Content filters run configured programs during status; the superproject refuses them too.
+    let filters = observer
+        .git(
+            &path,
+            &[
+                "config",
+                "--includes",
+                "--get-regexp",
+                "^filter\\..*\\.(clean|process)$",
+            ],
+            executor,
+        )
+        .map_err(|error| git_failure(&error))?;
+    if filters.status != Some(1) || !filters.stdout.is_empty() || !filters.stderr.is_empty() {
+        return Ok(None);
+    }
+    let index = scan_index(&read_index(&git_dir.join("index"))?)?;
+    if index.hidden_entries_present || !index.gitlink_paths.is_empty() {
+        return Ok(None);
+    }
+    for marker in OPERATION_MARKERS {
+        if entry_present(&git_dir.join(marker))? {
+            return Ok(None);
+        }
+    }
+    let status = observer
+        .git_with_limits(
+            &path,
+            &[
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            crate::project_checkout_observation::MAX_PROJECT_STATUS_OUTPUT_BYTES,
+            crate::project_checkout_observation::PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT,
+            executor,
+        )
+        .map_err(|error| git_failure(&error))
+        .and_then(require_success)?;
+    if !status.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(relative_text) = relative.to_str() else {
+        return Ok(None);
+    };
+    let submodule_head = git(
+        observer,
+        &path,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        executor,
+    )?;
+    // A submodule added but not yet committed has no recorded commit, so nothing preserves it.
+    let recorded = observer
+        .git(
+            checkout,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("HEAD:{relative_text}"),
+            ],
+            executor,
+        )
+        .map_err(|error| git_failure(&error))?;
+    if recorded.status != Some(0) {
+        return Ok(None);
+    }
+    let staged = git(
+        observer,
+        checkout,
+        &[
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+            &format!(":(literal){relative_text}"),
+        ],
+        executor,
+    )?;
+    let recorded = recorded.stdout.strip_suffix('\n').unwrap_or_default();
+    let staged_matches = staged
+        .stdout
+        .strip_prefix("160000 ")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(object, rest)| {
+            object == recorded && rest == format!("0\t{relative_text}\0")
+        });
+    let at_recorded_commit = !recorded.is_empty()
+        && staged_matches
+        && submodule_head.stdout.strip_suffix('\n') == Some(recorded);
+    if !at_recorded_commit {
+        return Ok(None);
+    }
+    let mut published = false;
+    for base in published_bases {
+        let at_base = observer
+            .git(
+                checkout,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{base}:{relative_text}"),
+                ],
+                executor,
+            )
+            .map_err(|error| git_failure(&error))?;
+        if at_base.status == Some(0) && at_base.stdout.strip_suffix('\n') == Some(recorded) {
+            published = true;
+            break;
+        }
+    }
+    Ok(Some(PreservedCheckout {
+        repository: git_dir,
+        published_commit: published.then(|| recorded.to_owned()),
+    }))
+}
+
+/// A populated gitlink whose checkout passed [`submodule_checkout_preserved`].
+struct PreservedCheckout {
+    repository: PathBuf,
+    /// The checked-out commit, when a superproject remote's default branch records it at this path.
+    published_commit: Option<String>,
+}
+
+/// Superproject commits whose recorded gitlinks count as published: HEAD's merge base with each
+/// remote's default branch.
+///
+/// A submodule is fetched by exact commit (`git submodule update` asks the remote for the
+/// recorded object), so a clone often holds its checked-out commit without any remote-tracking
+/// ref reaching it. A default branch's history is then the evidence the remote has it: it is what
+/// review and every fresh checkout go through. Any other pushed branch is not, since Git pushes a
+/// superproject that records an unpushed submodule commit without complaint.
+fn superproject_published_bases(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+    executor: &impl TimedCommandExecutor,
+) -> Result<Vec<String>, LinkedWorktreeReclaimError> {
+    let head = git(
+        observer,
+        checkout,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        executor,
+    )?;
+    let head = head
+        .stdout
+        .strip_suffix('\n')
+        .unwrap_or_default()
+        .to_owned();
+    let defaults = git(
+        observer,
+        checkout,
+        &["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"],
+        executor,
+    )?;
+    let mut bases = Vec::new();
+    for target in defaults
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("refs/remotes/"))
+    {
+        let base = observer
+            .git(checkout, &["merge-base", &head, target], executor)
+            .map_err(|error| git_failure(&error))?;
+        if base.status == Some(0)
+            && let Some(commit) = base.stdout.strip_suffix('\n')
+            && !commit.is_empty()
+            && !commit.contains('\n')
+        {
+            bases.push(commit.to_owned());
+        }
+    }
+    Ok(bases)
+}
+
+/// Every ref and HEAD of one submodule repository is reachable from its remote-tracking refs, or
+/// from `published_commit`, the commit a superproject remote's default branch records for it.
+fn submodule_repository_preserved(
+    observer: &ProjectCheckoutObserver,
+    repository: &Path,
+    published_commit: Option<&str>,
+    executor: &impl TimedCommandExecutor,
+) -> Result<bool, LinkedWorktreeReclaimError> {
+    let Some(repository_text) = repository.to_str() else {
+        return Ok(false);
+    };
+    let git_dir = format!("--git-dir={repository_text}");
+    let remotes = git(
+        observer,
+        repository,
+        &[
+            &git_dir,
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/remotes/",
+        ],
+        executor,
+    )?;
+    if remotes.stdout.is_empty() {
+        return Ok(false);
+    }
+    // `--all` is every ref (stash included) plus HEAD; walking stops at the remote-tracking refs
+    // and the published commit.
+    let mut arguments = vec![
+        git_dir.as_str(),
+        "rev-list",
+        "-n1",
+        "--all",
+        "--not",
+        "--remotes",
+    ];
+    arguments.extend(published_commit);
+    let unreached = git(observer, repository, &arguments, executor)?;
+    Ok(unreached.stdout.is_empty())
+}
+
 /// A submodule path holds data unless it is absent or an empty directory.
 ///
 /// Status runs with submodules ignored, so anything at a gitlink path -- a repository, a gitfile, or
@@ -1071,14 +1843,70 @@ fn last_activity_seconds(
     let mut newest = std::fs::symlink_metadata(checkout)
         .map_err(|_| unavailable())?
         .mtime();
-    for name in ACTIVITY_ENTRIES {
-        match std::fs::symlink_metadata(git_dir.join(name)) {
-            Ok(metadata) => newest = newest.max(metadata.mtime()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(unavailable()),
-        }
+    match std::fs::symlink_metadata(git_dir.join(ACTIVITY_ENTRY)) {
+        Ok(metadata) => newest = newest.max(metadata.mtime()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unavailable()),
+    }
+    if let Some(entry) = newest_reflog_entry_seconds(&git_dir.join(HEAD_REFLOG))? {
+        newest = newest.max(entry);
     }
     Ok(newest)
+}
+
+/// Time of the newest entry in a reflog, `None` when it is absent or empty.
+///
+/// An entry is `<old> <new> <identity> <seconds> <zone>\t<message>`; the seconds are the
+/// second-to-last field before the tab. A tail that cannot be parsed is unobservable.
+fn newest_reflog_entry_seconds(path: &Path) -> Result<Option<i64>, LinkedWorktreeReclaimError> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    };
+    let length = file.metadata().map_err(|_| unavailable())?.len();
+    let start = length.saturating_sub(REFLOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| unavailable())?;
+    let mut tail = Vec::new();
+    file.take(REFLOG_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .map_err(|_| unavailable())?;
+    parse_newest_reflog_entry(&tail)
+}
+
+fn parse_newest_reflog_entry(tail: &[u8]) -> Result<Option<i64>, LinkedWorktreeReclaimError> {
+    // The highest time in the tail, not the last line's: an entry written with a backdated
+    // committer date (GIT_COMMITTER_DATE) must not hide newer entries before it. The first line
+    // may be cut by the tail window, and the last may still be being written, so a line counts
+    // only when the field before its time closes an identity (`<email>`); if none does, the
+    // reflog is unobservable rather than idle.
+    let mut newest = None;
+    let mut saw_line = false;
+    for line in tail
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        saw_line = true;
+        let header = line.split(|byte| *byte == b'\t').next().unwrap_or_default();
+        let header = header.strip_suffix(b"\r").unwrap_or(header);
+        let mut fields = header.rsplit(|byte| *byte == b' ');
+        let _zone = fields.next();
+        let seconds = fields
+            .next()
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<i64>().ok());
+        let identity_closed = fields.next().is_some_and(|field| field.ends_with(b">"));
+        if let (Some(seconds), true) = (seconds, identity_closed) {
+            newest = Some(newest.map_or(seconds, |current: i64| current.max(seconds)));
+        }
+    }
+    match (saw_line, newest) {
+        (false, _) => Ok(None),
+        (true, Some(seconds)) => Ok(Some(seconds)),
+        (true, None) => Err(unavailable()),
+    }
 }
 
 // --- Execution -------------------------------------------------------------
@@ -1095,6 +1923,12 @@ fn last_activity_seconds(
 
 /// Namespace for commits pinned before their only worktree is removed.
 pub const LINKED_WORKTREE_PIN_REF_PREFIX: &str = "refs/glaeda/worktree-pins/";
+
+/// Deadline for each constant-cost Git command of a reclaim sweep: reads, plus the `update-ref`
+/// pins and branch deletions, which are safer finished than killed partway. See
+/// [`ProjectCheckoutObserver::with_command_timeout`]. The sweep runs in the background, where a
+/// read that answers in 30 seconds beats a worktree that stays unobservable for another hour.
+pub const LINKED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Deadline for one `git worktree remove`, which scales with ignored build output in the tree.
 pub const LINKED_WORKTREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -1208,7 +2042,12 @@ pub fn reclaim_linked_worktree(
     now_seconds: i64,
     executor: &impl TimedCommandExecutor,
 ) -> LinkedWorktreeReclaimOutcome {
-    let observed = match observe_detailed(observer, inventory, entry, executor) {
+    // Fresh process evidence for this removal: the run-wide snapshot may be minutes old.
+    let evidence = match ProcessUseEvidence::collect(executor) {
+        Ok(evidence) => evidence,
+        Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
+    };
+    let observed = match observe_detailed(observer, inventory, entry, &evidence, executor) {
         Ok(observed) => observed,
         Err(error) => return LinkedWorktreeReclaimOutcome::Unobservable { code: error.code() },
     };
@@ -1246,7 +2085,9 @@ pub fn reclaim_linked_worktree(
     // Final guard, as close to removal as possible. Git's own check covers new untracked files,
     // staging, locks, and path swaps, but not hidden-flag edits or a new detached commit, so any
     // movement of HEAD or per-worktree Git state since observation keeps the worktree. The window
-    // that remains is the time between these reads and Git's own status check.
+    // that remains is the time between these reads and Git's own status check, or, for a
+    // worktree with submodules, the status check below; ref-only changes inside a submodule
+    // repository (a new tag or branch) in that window are not seen.
     let head_unchanged = git(
         observer,
         &entry.path,
@@ -1255,9 +2096,46 @@ pub fn reclaim_linked_worktree(
     )
     .is_ok_and(|record| record.stdout.strip_suffix('\n') == Some(observed.head.as_str()));
     let fingerprint_unchanged = administrative_fingerprint(&observed.git_dir)
-        .is_ok_and(|fingerprint| fingerprint == observed.fingerprint);
+        .is_ok_and(|fingerprint| fingerprint == observed.fingerprint)
+        && observed
+            .submodule_fingerprints
+            .iter()
+            .all(|(repository, before)| {
+                administrative_fingerprint(repository).is_ok_and(|after| after == *before)
+            });
     if !head_unchanged || !fingerprint_unchanged {
         return LinkedWorktreeReclaimOutcome::Changed { target };
+    }
+    // Git refuses to remove any worktree with submodules, so a proven one needs `--force`, which
+    // also skips Git's own cleanliness check. Run that check here instead, as Git would: the
+    // superproject with untracked files shown and submodule contents included. Git's check trips
+    // on a `modules/` directory even when it is empty, so that needs `--force` too.
+    let force = observed.facts.populated_submodules_present
+        || matches!(entry_present(&observed.git_dir.join("modules")), Ok(true));
+    if force {
+        let clean = observer
+            .git_with_limits(
+                &entry.path,
+                &[
+                    "-c",
+                    "status.showUntrackedFiles=normal",
+                    "status",
+                    "--porcelain",
+                    "--ignore-submodules=none",
+                ],
+                crate::project_checkout_observation::MAX_PROJECT_STATUS_OUTPUT_BYTES,
+                crate::project_checkout_observation::PROJECT_CHECKOUT_TREE_SCAN_TIMEOUT,
+                executor,
+            )
+            .is_ok_and(|record| {
+                record.success
+                    && record.status == Some(0)
+                    && record.stderr.is_empty()
+                    && record.stdout.is_empty()
+            });
+        if !clean {
+            return LinkedWorktreeReclaimOutcome::Changed { target };
+        }
     }
 
     let Some(checkout) = entry.path.to_str() else {
@@ -1265,17 +2143,21 @@ pub fn reclaim_linked_worktree(
             code: registration_aliased().code(),
         };
     };
+    // Repository config could hide untracked files from Git's own cleanliness check.
+    let mut arguments = vec![
+        "-c",
+        "status.showUntrackedFiles=normal",
+        "worktree",
+        "remove",
+    ];
+    if force {
+        // One `--force` never removes a locked worktree; that takes two.
+        arguments.push("--force");
+    }
+    arguments.extend(["--", checkout]);
     let removal = observer.git_with_limits(
         &inventory.repository,
-        &[
-            // Repository config could hide untracked files from Git's own cleanliness check.
-            "-c",
-            "status.showUntrackedFiles=normal",
-            "worktree",
-            "remove",
-            "--",
-            checkout,
-        ],
+        &arguments,
         MAX_CAPTURED_STREAM_BYTES,
         LINKED_WORKTREE_REMOVE_TIMEOUT,
         executor,
@@ -1290,27 +2172,20 @@ pub fn reclaim_linked_worktree(
 
     // Fresh post-effect observation decides the outcome, whatever the command reported.
     let directory_gone = matches!(entry_present(&entry.path), Ok(false));
-    let still_registered = match git_bounded(
-        observer,
-        &inventory.repository,
-        &["worktree", "list", "--porcelain", "-z"],
-        MAX_CAPTURED_STREAM_BYTES,
-        executor,
-    )
-    .and_then(|record| parse_worktree_list(&record.stdout))
-    {
-        Ok(entries) => entries.iter().any(|listed| listed.path == entry.path),
-        Err(error) => {
-            return LinkedWorktreeReclaimOutcome::Incomplete {
-                code: error.code(),
-                target: Some(target),
-            };
-        }
-    };
+    let still_registered =
+        match registered_after_removal(observer, &inventory.repository, &entry.path, executor) {
+            Ok(registered) => registered,
+            Err(error) => {
+                return LinkedWorktreeReclaimOutcome::Incomplete {
+                    code: error.code(),
+                    target: Some(target),
+                };
+            }
+        };
     let observed_intact = exit == RemovalExit::ExitedNonZero
         && !directory_gone
         && still_registered
-        && observe_detailed(observer, inventory, entry, executor)
+        && observe_detailed(observer, inventory, entry, &evidence, executor)
             .is_ok_and(|after| !after.facts.tracked_changes_present && after.head == observed.head);
     match classify_removal(exit, directory_gone, still_registered, observed_intact) {
         RemovalClass::Reclaimed => LinkedWorktreeReclaimOutcome::Reclaimed {
@@ -1323,6 +2198,31 @@ pub fn reclaim_linked_worktree(
             target: Some(target),
         },
     }
+}
+
+/// Whether `checkout` is still registered, read right after its `git worktree remove`.
+///
+/// This read decides the outcome, and a failure stops the whole batch, so it gets the removal's
+/// deadline rather than the 60 s read deadline: on a nearly full disk, or beside a running
+/// repack, `worktree list` right after a large removal can take longer than a minute, and a slow
+/// answer is not evidence of a broken end state.
+fn registered_after_removal(
+    observer: &ProjectCheckoutObserver,
+    repository: &Path,
+    checkout: &Path,
+    executor: &impl TimedCommandExecutor,
+) -> Result<bool, LinkedWorktreeReclaimError> {
+    let record = observer
+        .git_with_limits(
+            repository,
+            &["worktree", "list", "--porcelain", "-z"],
+            MAX_CAPTURED_STREAM_BYTES,
+            LINKED_WORKTREE_REMOVE_TIMEOUT,
+            executor,
+        )
+        .map_err(|error| git_failure(&error))?;
+    let entries = parse_worktree_list(&require_success(record)?.stdout)?;
+    Ok(entries.iter().any(|listed| listed.path == checkout))
 }
 
 /// Pin one exact commit under a create-only ref and confirm it resolves.
@@ -1493,6 +2393,22 @@ const fn checkout_unobservable() -> LinkedWorktreeReclaimError {
     )
 }
 
+const fn checkout_changed() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "checkout_changed",
+        "the checkout changed between two observations; it is probably in use",
+    )
+}
+
+const fn git_timed_out() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "git_timed_out",
+        "a Git read did not finish before its deadline",
+    )
+}
+
 const fn index_too_large() -> LinkedWorktreeReclaimError {
     error(
         LinkedWorktreeReclaimErrorKind::InvalidOutput,
@@ -1549,19 +2465,19 @@ const fn invalid_index() -> LinkedWorktreeReclaimError {
     )
 }
 
-const fn future_timestamp() -> LinkedWorktreeReclaimError {
-    error(
-        LinkedWorktreeReclaimErrorKind::DisagreeingEvidence,
-        "future_timestamp",
-        "the observed worktree activity is newer than the supplied clock reading",
-    )
-}
-
 const fn idle_overflow() -> LinkedWorktreeReclaimError {
     error(
         LinkedWorktreeReclaimErrorKind::Overflow,
         "idle_overflow",
         "the idle window could not be computed without overflow",
+    )
+}
+
+const fn process_evidence_unavailable() -> LinkedWorktreeReclaimError {
+    error(
+        LinkedWorktreeReclaimErrorKind::Unavailable,
+        "process_evidence_unavailable",
+        "which processes are working in checkouts could not be observed",
     )
 }
 
@@ -1592,6 +2508,47 @@ mod tests {
         LinkedWorktreeReclaimPolicy::new(DAY).expect("valid policy")
     }
 
+    /// Run `bounded_map` over `items` with `workers` and return the most calls ever in flight.
+    fn peak_in_flight(items: usize, workers: usize) -> (usize, Vec<usize>) {
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let inputs: Vec<usize> = (0..items).collect();
+        let outputs = bounded_map(&inputs, workers, |item| {
+            let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Some(item * 10)
+        });
+        (
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            outputs
+                .into_iter()
+                .map(|output| output.expect("observed"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn observation_pool_never_runs_more_than_its_workers() {
+        // cosmic-gray, 2026-10-21: eight `git status` at once on a Mac that hosts sessions.
+        let (peak, outputs) = peak_in_flight(12, 2);
+        assert!(peak <= 2, "peak {peak} exceeded two workers");
+        assert_eq!(outputs, (0..12).map(|item| item * 10).collect::<Vec<_>>());
+        let (peak, _) = peak_in_flight(12, 1);
+        assert_eq!(peak, 1);
+    }
+
+    #[test]
+    fn observation_pool_clamps_workers_to_the_declared_range() {
+        let (peak, _) = peak_in_flight(3, 0);
+        assert_eq!(peak, 1, "zero workers still observes, one at a time");
+        let (peak, _) = peak_in_flight(40, 64);
+        assert!(peak <= MAX_LINKED_WORKTREE_OBSERVATION_WORKERS);
+        let (_, outputs) = peak_in_flight(0, 2);
+        assert!(outputs.is_empty());
+    }
+
     fn clean_idle() -> LinkedWorktreeFacts {
         LinkedWorktreeFacts {
             linked: true,
@@ -1601,11 +2558,70 @@ mod tests {
             untracked_entry_count: 0,
             hidden_index_entries_present: false,
             populated_submodules_present: false,
+            submodules_preserved_on_remotes: true,
             per_worktree_refs_present: false,
             owned_by_current_user: true,
             head_reachability: HeadReachability::ReachableFromSharedRef,
+            in_use: false,
+            work_state: WorkState::InProgress,
             last_activity_seconds: NOW - 2 * DAY,
         }
+    }
+
+    #[test]
+    fn a_process_working_inside_vetoes_however_idle() {
+        let facts = LinkedWorktreeFacts {
+            in_use: true,
+            last_activity_seconds: NOW - 30 * DAY,
+            ..clean_idle()
+        };
+        let plan = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect("plan");
+        assert_eq!(plan.decision().vetoes(), [LinkedWorktreeReclaimVeto::InUse]);
+    }
+
+    #[test]
+    fn finished_work_uses_the_shorter_window() {
+        let policy =
+            LinkedWorktreeReclaimPolicy::with_finished_window(3 * DAY, 3_600).expect("policy");
+        let two_hours = LinkedWorktreeFacts {
+            last_activity_seconds: NOW - 2 * 3_600,
+            ..clean_idle()
+        };
+        let unfinished = plan_linked_worktree_reclaim(&two_hours, policy, NOW).expect("plan");
+        assert_eq!(
+            unfinished.decision().vetoes(),
+            [LinkedWorktreeReclaimVeto::RecentlyActive]
+        );
+        assert_eq!(unfinished.idle_window_seconds(), 3 * DAY);
+        let finished = LinkedWorktreeFacts {
+            work_state: WorkState::Finished,
+            ..two_hours
+        };
+        let plan = plan_linked_worktree_reclaim(&finished, policy, NOW).expect("plan");
+        assert!(plan.decision().is_eligible());
+        assert_eq!(plan.idle_window_seconds(), 3_600);
+        assert_eq!(
+            LinkedWorktreeReclaimPolicy::with_finished_window(DAY, 60)
+                .unwrap_err()
+                .code(),
+            "idle_window_too_small"
+        );
+    }
+
+    #[test]
+    fn process_evidence_matches_whole_path_components() {
+        let evidence = ProcessUseEvidence::from_paths([
+            PathBuf::from("/w/a/src/main.rs"),
+            PathBuf::from("/w/b"),
+        ]);
+        assert!(evidence.uses(Path::new("/w/a")));
+        assert!(evidence.uses(Path::new("/w/b")));
+        assert!(!evidence.uses(Path::new("/w/a-sibling")));
+        assert!(!evidence.uses(Path::new("/w/c")));
+        assert_eq!(
+            parse_lsof_names("p1\nfcwd\nn/w/a\np2\nfcwd\nn/\nnnot-a-path\n"),
+            [PathBuf::from("/w/a"), PathBuf::from("/")]
+        );
     }
 
     #[test]
@@ -1638,6 +2654,34 @@ mod tests {
     }
 
     #[test]
+    fn submodules_preserved_on_remotes_are_eligible_under_their_own_authority() {
+        let facts = LinkedWorktreeFacts {
+            populated_submodules_present: true,
+            submodules_preserved_on_remotes: true,
+            ..clean_idle()
+        };
+        let plan = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect("plan");
+        assert!(matches!(
+            plan.decision(),
+            LinkedWorktreeReclaimDecision::Eligible {
+                authority: LinkedWorktreeReclaimAuthority::PreservedInRepositoryAndSubmoduleRemotes,
+                ..
+            }
+        ));
+        let unproven = LinkedWorktreeFacts {
+            submodules_preserved_on_remotes: false,
+            ..facts
+        };
+        assert_eq!(
+            plan_linked_worktree_reclaim(&unproven, policy(), NOW)
+                .expect("plan")
+                .decision()
+                .vetoes(),
+            &[LinkedWorktreeReclaimVeto::PopulatedSubmodulesPresent]
+        );
+    }
+
+    #[test]
     fn every_applicable_veto_is_reported_in_order() {
         let facts = LinkedWorktreeFacts {
             linked: false,
@@ -1647,9 +2691,12 @@ mod tests {
             untracked_entry_count: 3,
             hidden_index_entries_present: true,
             populated_submodules_present: true,
+            submodules_preserved_on_remotes: false,
             per_worktree_refs_present: true,
             owned_by_current_user: false,
             head_reachability: HeadReachability::OnlyFromThisWorktree,
+            in_use: true,
+            work_state: WorkState::InProgress,
             last_activity_seconds: NOW,
         };
         let plan = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect("plan");
@@ -1665,6 +2712,7 @@ mod tests {
                 LinkedWorktreeReclaimVeto::PopulatedSubmodulesPresent,
                 LinkedWorktreeReclaimVeto::PerWorktreeRefsPresent,
                 LinkedWorktreeReclaimVeto::NotOwnedByCurrentUser,
+                LinkedWorktreeReclaimVeto::InUse,
                 LinkedWorktreeReclaimVeto::RecentlyActive,
             ]
         );
@@ -1696,13 +2744,90 @@ mod tests {
     }
 
     #[test]
-    fn future_activity_is_disagreeing_evidence() {
+    fn activity_after_the_clock_reading_is_recent() {
         let facts = LinkedWorktreeFacts {
             last_activity_seconds: NOW + 1,
             ..clean_idle()
         };
-        let error = plan_linked_worktree_reclaim(&facts, policy(), NOW).expect_err("future");
-        assert_eq!(error.code(), "future_timestamp");
+        assert_eq!(
+            plan_linked_worktree_reclaim(&facts, policy(), NOW)
+                .expect("plan")
+                .decision()
+                .vetoes(),
+            &[LinkedWorktreeReclaimVeto::RecentlyActive]
+        );
+    }
+
+    #[test]
+    fn newest_reflog_entry_time_is_read_from_the_last_line() {
+        let zero = "0".repeat(40);
+        let one = "1".repeat(40);
+        let log = format!(
+            "{zero} {one} A U Thor <a@example.com> 1790000000 -0700\tclone: from x\n\
+             {one} {zero} A U Thor <a@example.com> 1790000100 +0000\tcheckout: moving\n"
+        );
+        assert_eq!(
+            parse_newest_reflog_entry(log.as_bytes()).unwrap(),
+            Some(1_790_000_100)
+        );
+        // a backdated last entry does not hide the newer one before it
+        let backdated = format!(
+            "{zero} {one} A <a@b> 1790000500 +0000\tcommit: now\n\
+             {one} {zero} A <a@b> 1577836800 +0000\tcommit: GIT_COMMITTER_DATE=2020\n"
+        );
+        assert_eq!(
+            parse_newest_reflog_entry(backdated.as_bytes()).unwrap(),
+            Some(1_790_000_500)
+        );
+        // a torn first entry (all-zero old id, part of the new id) is not time 0
+        assert_eq!(
+            parse_newest_reflog_entry(format!("{zero} 3010").as_bytes())
+                .unwrap_err()
+                .code(),
+            "unavailable"
+        );
+        assert_eq!(parse_newest_reflog_entry(b"").unwrap(), None);
+        assert_eq!(parse_newest_reflog_entry(b"\n\n").unwrap(), None);
+        assert_eq!(
+            parse_newest_reflog_entry(b"garbage without a time\n")
+                .unwrap_err()
+                .code(),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn rewriting_the_reflog_file_is_not_activity() {
+        let dir = std::env::temp_dir().join(format!(
+            "glaeda-reclaim-reflog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let checkout = dir.join("checkout");
+        let git_dir = dir.join("gitdir");
+        std::fs::create_dir_all(git_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/x\n").unwrap();
+        let zero = "0".repeat(40);
+        std::fs::write(
+            git_dir.join("logs/HEAD"),
+            format!("{zero} {zero} A <a@b> 1000 +0000\tcommit: x\n"),
+        )
+        .unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(500);
+        for path in [&checkout, &git_dir.join("HEAD")] {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        // gc just rewrote logs/HEAD: its mtime is now, its newest entry is still 1000
+        let activity = last_activity_seconds(&git_dir, &checkout);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(activity.unwrap(), 1000);
     }
 
     #[test]
@@ -1722,6 +2847,59 @@ worktree /wt/b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads
         assert_eq!(entries[0].path(), Path::new("/repo"));
         assert!(entries[1].locked() && !entries[1].prunable());
         assert!(!entries[2].locked() && entries[2].prunable());
+    }
+
+    /// Answers `worktree list` only when given the removal's deadline, as a slow Git would.
+    struct SlowListExecutor;
+
+    impl crate::process::CommandExecutor for SlowListExecutor {
+        fn execute(&self, _spec: &crate::process::CommandSpec) -> std::io::Result<ExecutionRecord> {
+            panic!("the reclaim must use the timed executor")
+        }
+    }
+
+    impl TimedCommandExecutor for SlowListExecutor {
+        fn execute_with_timeout(
+            &self,
+            spec: &crate::process::CommandSpec,
+            timeout: Duration,
+        ) -> std::io::Result<ExecutionRecord> {
+            if timeout < LINKED_WORKTREE_REMOVE_TIMEOUT {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            Ok(ExecutionRecord {
+                argv: spec.displayed_argv(),
+                environment_keys: spec.environment.keys().cloned().collect(),
+                status: Some(0),
+                success: true,
+                stdout: "worktree /repo\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0"
+                    .to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_slow_list_after_removal_still_decides_the_outcome() {
+        let observer = ProjectCheckoutObserver::new("/usr/bin/git")
+            .expect("observer")
+            .with_command_timeout(LINKED_WORKTREE_GIT_TIMEOUT);
+        let registered = registered_after_removal(
+            &observer,
+            Path::new("/repo"),
+            Path::new("/wt/gone"),
+            &SlowListExecutor,
+        );
+        assert_eq!(registered, Ok(false));
+        assert_eq!(
+            registered_after_removal(
+                &observer,
+                Path::new("/repo"),
+                Path::new("/repo"),
+                &SlowListExecutor
+            ),
+            Ok(true)
+        );
     }
 
     #[test]

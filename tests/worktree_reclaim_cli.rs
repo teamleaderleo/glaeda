@@ -11,6 +11,8 @@ const GIT: &str = "/usr/bin/git";
 const TOUCH: &str = "/usr/bin/touch";
 /// Older than any idle window the tests use.
 const LONG_AGO: &str = "202001010000";
+/// `LONG_AGO` (2020-01-01 00:00 local) as reflog seconds; any time that old is idle.
+const LONG_AGO_SECONDS: &str = "1577836800";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
@@ -56,9 +58,24 @@ impl Fixture {
         path
     }
 
-    /// Make every activity signal of one linked worktree old.
+    /// Make every activity signal of one linked worktree old: its reflog entries' own times and
+    /// the modification times of the checkout, HEAD and the reflog file.
     fn age(&self, name: &str) {
         let git_dir = self.main.join(".git/worktrees").join(name);
+        let reflog = git_dir.join("logs/HEAD");
+        if let Ok(text) = std::fs::read_to_string(&reflog) {
+            let aged: String = text
+                .lines()
+                .map(|line| {
+                    let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+                    let mut fields: Vec<&str> = header.split(' ').collect();
+                    let at = fields.len() - 2;
+                    fields[at] = LONG_AGO_SECONDS;
+                    format!("{}\t{message}\n", fields.join(" "))
+                })
+                .collect();
+            std::fs::write(&reflog, aged).expect("backdate reflog entries");
+        }
         for path in [
             self.root.join(name),
             git_dir.join("HEAD"),
@@ -70,6 +87,36 @@ impl Fixture {
                 .output()
                 .expect("run touch");
             assert_child_success("backdate fixture", &output);
+        }
+    }
+
+    /// Make every activity signal of one linked worktree exactly `seconds` old.
+    fn age_by(&self, name: &str, seconds: u64) {
+        let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+        let epoch = at
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs()
+            .to_string();
+        let git_dir = self.main.join(".git/worktrees").join(name);
+        let reflog = git_dir.join("logs/HEAD");
+        let text = fs::read_to_string(&reflog).expect("read reflog");
+        let aged: String = text
+            .lines()
+            .map(|line| {
+                let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+                let mut fields: Vec<&str> = header.split(' ').collect();
+                let at = fields.len() - 2;
+                fields[at] = &epoch;
+                format!("{}\t{message}\n", fields.join(" "))
+            })
+            .collect();
+        fs::write(&reflog, aged).expect("backdate reflog entries");
+        for path in [self.root.join(name), git_dir.join("HEAD"), reflog] {
+            fs::File::open(&path)
+                .expect("open for times")
+                .set_times(fs::FileTimes::new().set_modified(at))
+                .expect("backdate");
         }
     }
 
@@ -177,6 +224,126 @@ fn report(output: &Output) -> serde_json::Value {
     document["repositories"][0].clone()
 }
 
+/// Landed work goes after the short window, unfinished work waits for the long one, and a process
+/// working inside keeps any worktree however old its Git activity is.
+#[test]
+fn work_state_picks_the_window_and_a_working_process_vetoes() {
+    let fixture = Fixture::new();
+
+    // Squash-merged: main gains the same file content in a different commit.
+    let landed = fixture.add("landed");
+    fs::write(landed.join("feature.txt"), "feature\n").expect("write feature");
+    git(&landed, &["add", "feature.txt"]);
+    commit(&landed, "feature on its branch");
+    fs::write(fixture.main.join("feature.txt"), "feature\n").expect("write squashed feature");
+    git(&fixture.main, &["add", "feature.txt"]);
+    commit(&fixture.main, "feature (squashed)");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    fixture.age_by("landed", 2 * 60 * 60);
+
+    // Created from main and never committed to: it did nothing yet, so it is not finished.
+    fixture.add("fresh");
+    fixture.age_by("fresh", 2 * 60 * 60);
+
+    // Only synced to main (fast-forward), never committed: not finished either.
+    let synced = fixture.add("synced");
+    git(&synced, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&synced, &["merge", "--ff-only", "main"]);
+    let reflog = fs::read_to_string(fixture.main.join(".git/worktrees/synced/logs/HEAD"))
+        .expect("synced reflog");
+    assert!(
+        reflog.contains("Fast-forward"),
+        "the sync really moved HEAD"
+    );
+    fixture.age_by("synced", 2 * 60 * 60);
+
+    // Renamed tracked.txt to renamed.txt; main gained renamed.txt but kept tracked.txt.
+    let renamed = fixture.add("renamed");
+    git(&renamed, &["mv", "tracked.txt", "renamed.txt"]);
+    commit(&renamed, "rename");
+    fs::write(fixture.main.join("renamed.txt"), "initial\n").expect("write renamed copy");
+    git(&fixture.main, &["add", "renamed.txt"]);
+    commit(&fixture.main, "copy, not rename");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    fixture.age_by("renamed", 2 * 60 * 60);
+
+    let unfinished = fixture.add("unfinished");
+    fs::write(unfinished.join("wip.txt"), "wip\n").expect("write wip");
+    git(&unfinished, &["add", "wip.txt"]);
+    commit(&unfinished, "work in progress");
+    fixture.age_by("unfinished", 2 * 60 * 60);
+
+    let busy = fixture.add("busy");
+    fixture.age("busy");
+    let mut sleeper = Command::new("/bin/sleep")
+        .arg("60")
+        .current_dir(&busy)
+        .spawn()
+        .expect("start a process working in the worktree");
+
+    let output = fixture.plan(&fixture.main);
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let document = document(&output);
+    assert_eq!(document["finished_idle_seconds"], 3_600);
+    assert_eq!(document["minimum_idle_seconds"], 3 * 24 * 60 * 60);
+    let report = document["repositories"][0].clone();
+    let order = fixture.linked_order();
+    let by_name = |name: &str| {
+        let ordinal = order
+            .iter()
+            .position(|entry| entry == name)
+            .expect("listed")
+            + 1;
+        report["worktrees"]
+            .as_array()
+            .expect("worktree array")
+            .iter()
+            .find(|worktree| worktree["ordinal"] == ordinal)
+            .expect("reported ordinal")
+            .clone()
+    };
+
+    let landed = by_name("landed");
+    assert_eq!(landed["facts"]["work_state"], "finished");
+    assert_eq!(landed["decision"]["decision"], "eligible");
+
+    let unfinished = by_name("unfinished");
+    assert_eq!(unfinished["facts"]["work_state"], "in_progress");
+    assert_eq!(
+        unfinished["decision"]["vetoes"],
+        serde_json::json!(["recently_active"])
+    );
+
+    for name in ["fresh", "synced", "renamed"] {
+        let worktree = by_name(name);
+        assert_eq!(worktree["facts"]["work_state"], "in_progress", "{name}");
+        assert_eq!(
+            worktree["decision"]["vetoes"],
+            serde_json::json!(["recently_active"]),
+            "{name}"
+        );
+    }
+
+    let busy = by_name("busy");
+    assert_eq!(busy["facts"]["in_use"], true);
+    assert_eq!(busy["decision"]["vetoes"], serde_json::json!(["in_use"]));
+}
+
 /// Every worktree state the planner distinguishes, observed through the real binary and real Git.
 #[test]
 fn plan_classifies_real_worktrees_and_changes_nothing() {
@@ -265,11 +432,14 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     );
     assert_eq!(by_name("missing")["result"], "prunable");
 
-    let text = String::from_utf8(serde_json::to_vec(&document).expect("serialize")).expect("UTF-8");
-    assert!(
-        !text.contains(fixture.root.to_str().expect("UTF-8")),
-        "report must not publish checkout paths"
-    );
+    // Each worktree carries its registered path, so an operator never maps ordinals by hand.
+    for name in &order {
+        let path = by_name(name)["path"]
+            .as_str()
+            .expect("worktree path")
+            .to_owned();
+        assert!(path.ends_with(&format!("/{name}")), "{path} is not {name}");
+    }
 
     assert_eq!(
         git_output(&fixture.main, &["worktree", "list", "--porcelain"]).stdout,
@@ -280,6 +450,32 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
         refs_before
     );
     assert!(dirty.join("scratch.txt").exists());
+}
+
+/// The observation pool is a declared setting: two by default (a Mac that hosts agent sessions
+/// must not see eight `git status` at once), one to eight when asked, recorded in the receipt.
+#[test]
+fn git_workers_is_declared_bounded_and_recorded() {
+    let fixture = Fixture::new();
+    fixture.add("one");
+    fixture.add("two");
+    fixture.add("three");
+    let default = document(&fixture.plan(&fixture.main));
+    assert_eq!(default["git_workers"], 2);
+    let single = document(&fixture.run(&fixture.main, &["--git-workers", "1"]));
+    assert_eq!(single["git_workers"], 1);
+    assert_eq!(
+        single["repositories"][0]["summary"], default["repositories"][0]["summary"],
+        "the pool size changes how fast, never what is decided"
+    );
+    for refused in ["0", "9", "many"] {
+        let output = fixture.run(&fixture.main, &["--git-workers", refused]);
+        assert_eq!(output.status.code(), Some(2), "--git-workers {refused}");
+        assert!(
+            output.stdout.is_empty(),
+            "--git-workers {refused} ran anyway"
+        );
+    }
 }
 
 #[test]
@@ -295,6 +491,87 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(document["repositories"][0]["result"], "unlisted");
     assert_eq!(document["repositories"][0]["code"], "not_main_worktree");
+}
+
+/// The hourly sweep passes every checkout it found, and one broken checkout (cosmic-gray,
+/// 2026-10-22: a clone whose alternate's commit-graph chain was gone, so every Git command warned)
+/// made each run exit 2. With --skip-unlisted that checkout is named with its error on stderr and in
+/// the report, the others are still swept, and the run exits 0.
+#[test]
+fn skip_unlisted_names_a_broken_checkout_and_sweeps_the_rest() {
+    let fixture = Fixture::new();
+    fixture.add("linked");
+    let broken = fixture.root.join("broken");
+    fs::create_dir_all(&broken).expect("create broken checkout");
+    git(&broken, &["init", "-b", "main"]);
+    commit(&broken, "fixture");
+    git(&broken, &["branch", "lane"]);
+    let graphs = broken.join(".git/objects/info/commit-graphs");
+    fs::create_dir_all(&graphs).expect("create commit-graph folder");
+    fs::write(
+        graphs.join("commit-graph-chain"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .expect("write a chain naming a missing graph");
+    let missing = fixture.root.join("missing");
+    let arguments = |extra: &[&str]| {
+        let mut command = Command::new(BINARY);
+        for repository in [&broken, &fixture.main, &missing] {
+            command.arg("--repository").arg(repository);
+        }
+        command
+            .args(["--branches", "--output", "json"])
+            .args(extra)
+            .output()
+            .expect("run worktree reclaim")
+    };
+
+    let strict = arguments(&[]);
+    assert_eq!(
+        strict.status.code(),
+        Some(2),
+        "without --skip-unlisted an unlisted repository still fails the run"
+    );
+
+    let output = arguments(&["--skip-unlisted"]);
+    let document = document(&output);
+    let repositories = document["repositories"].as_array().expect("repositories");
+    assert_eq!(repositories.len(), 3);
+    assert_eq!(
+        repositories[1]["result"], "listed",
+        "the good checkout is swept"
+    );
+    assert_eq!(
+        repositories[1]["path"],
+        fixture.main.to_str().expect("UTF-8")
+    );
+    assert_eq!(repositories[1]["summary"]["linked"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Git reads the commit-graph only where it reads commits, so the broken checkout may fail at
+    // its listing or at its branches; either way it is named, with its error.
+    for (index, path) in [(0, &broken), (2, &missing)] {
+        let entry = &repositories[index];
+        let path = path.to_str().expect("UTF-8 fixture path");
+        assert_eq!(entry["path"], path);
+        let failed = if entry["result"] == "unlisted" {
+            entry
+        } else {
+            &entry["branches"]
+        };
+        assert_eq!(failed["result"], "unlisted", "{path}: {entry}");
+        assert!(failed["code"].as_str().is_some_and(|code| !code.is_empty()));
+        assert!(
+            failed["problem"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("skipped") && line.contains(&format!(" {path}: "))),
+            "stderr names {path}: {stderr}"
+        );
+    }
 }
 
 fn git_as_user(checkout: &Path, arguments: &[&str]) {
@@ -372,13 +649,49 @@ fn hidden_unique_state_is_never_eligible() {
     fs::create_dir(&source).expect("create submodule source");
     git(&source, &["init", "-b", "main"]);
     commit(&source, "source commit");
-    let absorbed = fixture.add("absorbed");
-    git_as_user(
-        &absorbed,
-        &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
-    );
-    git_as_user(&absorbed, &["commit", "-m", "add absorbed submodule"]);
+    commit(&source, "second source commit");
+    let add_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        git_as_user(&worktree, &["commit", "-m", "add absorbed submodule"]);
+        worktree
+    };
+    // Clean, at the recorded commit, and on its remote: preserved, so it does not veto.
+    add_submodule("absorbed");
     fixture.age("absorbed");
+    // A submodule commit recorded by the superproject but never pushed.
+    let unpushed = add_submodule("sub-unpushed");
+    commit(&unpushed.join("sub"), "only this submodule has it");
+    git_as_user(
+        &unpushed,
+        &["commit", "-am", "record unpushed submodule commit"],
+    );
+    fixture.age("sub-unpushed");
+    // An untracked file inside the submodule, which superproject status does not see.
+    let dirty = add_submodule("sub-dirty");
+    fs::write(dirty.join("sub/scratch.txt"), "local\n").expect("write submodule scratch");
+    fixture.age("sub-dirty");
+    // A submodule checked out away from the commit the superproject records.
+    let moved = add_submodule("sub-moved");
+    git(&moved.join("sub"), &["checkout", "--detach", "HEAD~1"]);
+    fixture.age("sub-moved");
+    // A submodule with a linked worktree of its own, whose per-worktree state lives in the
+    // submodule repository that removal deletes.
+    let with_worktree = add_submodule("sub-worktree");
+    let submodule_worktree = fixture.root.join("submodule-own-worktree");
+    git(
+        &with_worktree.join("sub"),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            submodule_worktree.to_str().expect("UTF-8"),
+        ],
+    );
+    fixture.age("sub-worktree");
 
     // A per-worktree ref pointing at a commit nothing else reaches.
     let per_worktree = fixture.add("per-worktree");
@@ -440,10 +753,19 @@ fn hidden_unique_state_is_never_eligible() {
         vetoes_of(&entry_by_name(&fixture, &report, "embedded")),
         ["populated_submodules_present"]
     );
+    let absorbed = entry_by_name(&fixture, &report, "absorbed");
+    assert_eq!(absorbed["decision"]["decision"], "eligible", "{absorbed}");
     assert_eq!(
-        vetoes_of(&entry_by_name(&fixture, &report, "absorbed")),
-        ["populated_submodules_present"]
+        absorbed["decision"]["authority"],
+        "preserved_in_repository_and_submodule_remotes"
     );
+    for name in ["sub-unpushed", "sub-dirty", "sub-moved", "sub-worktree"] {
+        assert_eq!(
+            vetoes_of(&entry_by_name(&fixture, &report, name)),
+            ["populated_submodules_present"],
+            "{name}"
+        );
+    }
     assert_eq!(
         vetoes_of(&entry_by_name(&fixture, &report, "per-worktree")),
         ["per_worktree_refs_present"]
@@ -688,6 +1010,131 @@ fn apply_reclaims_only_eligible_worktrees_and_pins_orphan_heads() {
     assert_eq!(again["repositories"][0]["summary"]["eligible"], 0);
 }
 
+/// Git refuses to remove any worktree with submodules; a preserved one is removed with its
+/// submodule repositories, and one whose submodule holds local data is kept.
+#[test]
+fn apply_reclaims_a_worktree_whose_submodules_are_on_their_remotes() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    let add_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        git_as_user(&worktree, &["commit", "-m", "add submodule"]);
+        worktree
+    };
+    let preserved = add_submodule("preserved");
+    fixture.age("preserved");
+    let dirty = add_submodule("dirty");
+    fs::write(dirty.join("sub/scratch.txt"), "local\n").expect("write submodule scratch");
+    fixture.age("dirty");
+
+    let receipt = document(&fixture.run(&fixture.main, &["--apply"]));
+    assert_eq!(receipt["circuit_breaker_tripped"], false);
+    assert_eq!(receipt["repositories"][0]["summary"]["reclaimed"], 1);
+    assert!(!preserved.exists(), "preserved worktree removed");
+    assert!(
+        !fixture.main.join(".git/worktrees/preserved").exists(),
+        "its submodule repositories went with it"
+    );
+    assert!(
+        dirty.join("sub/scratch.txt").exists(),
+        "dirty submodule kept"
+    );
+    assert!(
+        ref_exists(&source, "refs/heads/main"),
+        "the submodule's remote is untouched"
+    );
+    assert_eq!(fixture.linked_order(), ["dirty"]);
+}
+
+/// `git submodule update` fetches the recorded commit itself, so a clone often has no
+/// remote-tracking ref reaching its HEAD. A superproject remote's default branch that records it
+/// counts as the evidence; an unpushed recording, or one pushed only on another branch, does not.
+#[test]
+fn a_submodule_commit_recorded_by_published_superproject_history_is_preserved() {
+    let fixture = Fixture::new();
+    let remote = fixture.root.join("super-remote.git");
+    git(
+        &fixture.root,
+        &[
+            "init",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().expect("UTF-8"),
+        ],
+    );
+    git(
+        &fixture.main,
+        &["remote", "add", "origin", remote.to_str().expect("UTF-8")],
+    );
+    let source = fixture.root.join("submodule-source");
+    fs::create_dir(&source).expect("create submodule source");
+    git(&source, &["init", "-b", "main"]);
+    commit(&source, "source commit");
+    git(&source, &["checkout", "-b", "side"]);
+    commit(&source, "side commit");
+    git(&source, &["checkout", "main"]);
+
+    let pinned_submodule = |name: &str| {
+        let worktree = fixture.add(name);
+        git_as_user(
+            &worktree,
+            &["submodule", "add", source.to_str().expect("UTF-8"), "sub"],
+        );
+        let sub = worktree.join("sub");
+        git(&sub, &["checkout", "--detach", "origin/side"]);
+        // As if only the recorded commit had been fetched: no remote-tracking ref reaches it.
+        git(&sub, &["update-ref", "-d", "refs/remotes/origin/side"]);
+        git_as_user(&worktree, &["add", "sub"]);
+        // The name keeps the two recording commits distinct: made in the same second, identical
+        // commits would share an id, and the pushed one would publish both.
+        git_as_user(
+            &worktree,
+            &["commit", "-m", &format!("record the side commit in {name}")],
+        );
+        worktree
+    };
+    // Landed on the superproject remote's default branch.
+    let published = pinned_submodule("published");
+    git(&published, &["push", "origin", "published:main"]);
+    git(&fixture.main, &["remote", "set-head", "origin", "main"]);
+    fixture.age("published");
+    pinned_submodule("unpublished");
+    fixture.age("unpublished");
+    // A pushed branch recording a submodule commit only this worktree has: Git pushes the
+    // superproject without the submodule, so a branch other than the default proves nothing.
+    let branch_pushed = pinned_submodule("branch-pushed");
+    commit(&branch_pushed.join("sub"), "only this submodule has it");
+    git_as_user(
+        &branch_pushed,
+        &["commit", "-am", "record a submodule commit nobody pushed"],
+    );
+    git(&branch_pushed, &["push", "origin", "branch-pushed"]);
+    fixture.age("branch-pushed");
+
+    let report = report(&fixture.plan(&fixture.main));
+    let published = entry_by_name(&fixture, &report, "published");
+    assert_eq!(published["decision"]["decision"], "eligible", "{published}");
+    assert_eq!(
+        published["decision"]["authority"],
+        "preserved_in_repository_and_submodule_remotes"
+    );
+    for name in ["unpublished", "branch-pushed"] {
+        assert_eq!(
+            vetoes_of(&entry_by_name(&fixture, &report, name)),
+            ["populated_submodules_present"],
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn apply_stops_at_the_reclaim_budget() {
     let fixture = Fixture::new();
@@ -745,5 +1192,416 @@ fn a_partial_removal_trips_the_circuit_breaker() {
     assert!(
         untouched.exists(),
         "the batch stopped before the next worktree"
+    );
+}
+
+/// Commit on the current branch with committer and author dates `seconds` ago.
+fn commit_aged(checkout: &Path, message: &str, seconds: u64) {
+    let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+    let date = format!(
+        "@{} +0000",
+        at.duration_since(UNIX_EPOCH).expect("epoch").as_secs()
+    );
+    let output = Command::new(GIT)
+        .arg("-C")
+        .arg(checkout)
+        .args([
+            "-c",
+            "user.name=Glaeda Test",
+            "-c",
+            "user.email=glaeda-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .env_clear()
+        .env("HOME", checkout)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run fixture Git");
+    assert_child_success("aged commit", &output);
+}
+
+/// Rewrite every entry of one branch's reflog to `seconds` ago.
+fn age_branch_reflog(repository: &Path, branch: &str, seconds: u64) {
+    let at = SystemTime::now() - std::time::Duration::from_secs(seconds);
+    let epoch = at
+        .duration_since(UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs()
+        .to_string();
+    let reflog = repository.join(".git/logs/refs/heads").join(branch);
+    let text = fs::read_to_string(&reflog).expect("read branch reflog");
+    let aged: String = text
+        .lines()
+        .map(|line| {
+            let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+            let mut fields: Vec<&str> = header.split(' ').collect();
+            let at = fields.len() - 2;
+            fields[at] = &epoch;
+            format!("{}\t{message}\n", fields.join(" "))
+        })
+        .collect();
+    fs::write(&reflog, aged).expect("backdate branch reflog");
+}
+
+/// Make a branch off main holding one aged commit that adds `file`; land the same file on main
+/// when `land` is set. Returns to main.
+fn branch_with_work(fixture: &Fixture, name: &str, file: &str, land: bool, seconds: u64) {
+    let main = &fixture.main;
+    git(main, &["checkout", "-q", "-b", name]);
+    fs::write(main.join(file), format!("{name}\n")).expect("write branch file");
+    git(main, &["add", file]);
+    commit_aged(main, name, seconds);
+    git(main, &["checkout", "-q", "main"]);
+    if land {
+        fs::write(main.join(file), format!("{name}\n")).expect("write squashed file");
+        git(main, &["add", file]);
+        commit(main, &format!("{name} (squashed)"));
+    }
+    age_branch_reflog(main, name, seconds);
+}
+
+fn branch_entry(report: &serde_json::Value, name: &str) -> serde_json::Value {
+    report["branches"]["branches"]
+        .as_array()
+        .expect("branch list")
+        .iter()
+        .find(|branch| branch["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("branch {name} missing from {report:#}"))
+}
+
+/// `--branches` deletes only finished, idle, unprotected branches no worktree has checked out.
+#[test]
+fn branches_mode_deletes_only_finished_idle_branches() {
+    for mode in ["--branches", "--branches-only"] {
+        assert_branches_mode(mode);
+    }
+}
+
+fn assert_branches_mode(mode: &str) {
+    let fixture = Fixture::new();
+    let hours = 60 * 60;
+    branch_with_work(&fixture, "landed", "landed.txt", true, 2 * hours);
+    branch_with_work(&fixture, "unfinished", "wip.txt", false, 2 * hours);
+    branch_with_work(&fixture, "recent", "recent.txt", true, 60);
+    branch_with_work(&fixture, "kept", "kept.txt", true, 2 * hours);
+    // Landed and idle, but a worktree is mid-rebase of it (HEAD detached) or bisecting it.
+    branch_with_work(&fixture, "rebasing", "rebasing.txt", true, 2 * hours);
+    branch_with_work(&fixture, "bisecting", "bisecting.txt", true, 2 * hours);
+    let rebase_worktree = fixture.root.join("rebase-wt");
+    git(
+        &fixture.main,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            rebase_worktree.to_str().expect("UTF-8 fixture path"),
+        ],
+    );
+    let rebase_state = fixture.main.join(".git/worktrees/rebase-wt/rebase-merge");
+    fs::create_dir_all(&rebase_state).expect("create rebase state");
+    fs::write(rebase_state.join("head-name"), "refs/heads/rebasing\n").expect("write head-name");
+    fs::write(fixture.main.join(".git/BISECT_START"), "bisecting\n").expect("write BISECT_START");
+    git(
+        &fixture.main,
+        &["config", "--add", "glaeda.keepBranch", "kept"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "config",
+            "branch.landed.description",
+            "gone with the branch",
+        ],
+    );
+    // Checked out in a worktree: kept even though its work has landed.
+    let checked = fixture.add("checked");
+    fs::write(checked.join("checked.txt"), "checked\n").expect("write checked file");
+    git(&checked, &["add", "checked.txt"]);
+    commit_aged(&checked, "checked", 2 * hours);
+    fs::write(fixture.main.join("checked.txt"), "checked\n").expect("land checked file");
+    git(&fixture.main, &["add", "checked.txt"]);
+    commit(&fixture.main, "checked (squashed)");
+    age_branch_reflog(&fixture.main, "checked", 2 * hours);
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+
+    let plan = report(&fixture.run(&fixture.main, &[mode, "--no-github", "--all"]));
+    assert_eq!(plan["branches"]["result"], "listed");
+    assert_eq!(plan["branches"]["eligible"], 1, "{plan:#}");
+    let landed = branch_entry(&plan, "landed");
+    assert_eq!(landed["decision"], "eligible");
+    assert_eq!(landed["evidence"], "default_branch");
+    for (name, reason) in [
+        ("unfinished", "in_progress"),
+        ("recent", "recently_active"),
+        ("kept", "protected"),
+        // Checked out in the main worktree, which is checked before the protected names.
+        ("main", "checked_out"),
+        ("checked", "checked_out"),
+        ("rebasing", "checked_out"),
+        ("bisecting", "checked_out"),
+    ] {
+        assert_eq!(branch_entry(&plan, name)["reason"], reason, "{name}");
+    }
+    assert!(
+        ref_exists(&fixture.main, "refs/heads/landed"),
+        "a plan deletes nothing"
+    );
+
+    let applied = report(&fixture.run(&fixture.main, &[mode, "--no-github", "--apply"]));
+    assert_eq!(applied["branches"]["deleted"], 1, "{applied:#}");
+    assert_eq!(branch_entry(&applied, "landed")["outcome"], "deleted");
+    assert!(!ref_exists(&fixture.main, "refs/heads/landed"));
+    let description = Command::new(GIT)
+        .arg("-C")
+        .arg(&fixture.main)
+        .args(["config", "branch.landed.description"])
+        .output()
+        .expect("run git config");
+    assert!(
+        !description.status.success(),
+        "the branch's config section goes too"
+    );
+    for name in [
+        "unfinished",
+        "recent",
+        "kept",
+        "main",
+        "checked",
+        "rebasing",
+        "bisecting",
+    ] {
+        assert!(
+            ref_exists(&fixture.main, &format!("refs/heads/{name}")),
+            "{name} kept"
+        );
+    }
+}
+
+/// Without `--branches` the report has no branch section and no branch is touched.
+#[test]
+fn branches_are_untouched_without_the_flag() {
+    let fixture = Fixture::new();
+    branch_with_work(&fixture, "landed", "landed.txt", true, 2 * 60 * 60);
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let applied = report(&fixture.run(&fixture.main, &["--apply"]));
+    assert!(applied.get("branches").is_none());
+    assert!(ref_exists(&fixture.main, "refs/heads/landed"));
+}
+
+/// A squash-merged worktree whose files main changed again looks unfinished to Git alone; a merged
+/// pull request containing its tip makes it finished, and only at exactly that tip.
+#[test]
+fn a_merged_pull_request_finishes_a_worktree_git_alone_cannot() {
+    let fixture = Fixture::new();
+    git(
+        &fixture.main,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    for name in ["squashed", "moved-on", "unmerged"] {
+        let checkout = fixture.add(name);
+        fs::write(checkout.join("tracked.txt"), format!("{name}\n")).expect("write change");
+        git(&checkout, &["add", "tracked.txt"]);
+        commit(&checkout, "change tracked.txt");
+    }
+    // Main squash-merges them, then edits the same file again, so no path comparison matches.
+    fs::write(fixture.main.join("tracked.txt"), "later\n").expect("write later main");
+    git(&fixture.main, &["add", "tracked.txt"]);
+    commit(&fixture.main, "squash, then more");
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let tip = |name: &str| {
+        String::from_utf8(git_output(&fixture.root.join(name), &["rev-parse", "HEAD"]).stdout)
+            .expect("UTF-8 commit")
+            .trim()
+            .to_owned()
+    };
+    // A fresh branch whose name and start point match an old merged pull request: no work yet.
+    fixture.add("reused");
+    let reused_tip = tip("reused");
+    let squashed_tip = tip("squashed");
+    let moved_on_merged = tip("moved-on");
+    // moved-on kept working after its pull request merged: its new tip is not in the PR head.
+    let moved_on = fixture.root.join("moved-on");
+    fs::write(moved_on.join("after.txt"), "after\n").expect("write follow-up");
+    git(&moved_on, &["add", "after.txt"]);
+    commit(&moved_on, "follow-up after merge");
+    for name in ["squashed", "moved-on", "unmerged", "reused"] {
+        fixture.age_by(name, 2 * 60 * 60);
+    }
+
+    // A fake gh: squashed and moved-on have merged pull requests into main, unmerged has none.
+    let gh = fixture.root.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+[ "$1" = api ] && [ "$2" = graphql ] || exit 1
+fields=""
+for arg in "$@"; do
+  case "$arg" in
+    b[0-9]*=*)
+      key="${{arg%%=*}}"; name="${{arg#*=}}"
+      case "$name" in
+        squashed) nodes='{{"number":1,"headRefOid":"{squashed_tip}","baseRefName":"main"}}' ;;
+        moved-on) nodes='{{"number":2,"headRefOid":"{moved_on_merged}","baseRefName":"main"}}' ;;
+        reused) nodes='{{"number":3,"headRefOid":"{reused_tip}","baseRefName":"main"}}' ;;
+        *) nodes='' ;;
+      esac
+      fields="$fields,\"$key\":{{\"nodes\":[$nodes]}}" ;;
+  esac
+done
+printf '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}}%s}}}}}}' "$fields"
+"#
+        ),
+    )
+    .expect("write fake gh");
+    let output = Command::new("/bin/chmod")
+        .args(["+x", gh.to_str().expect("UTF-8 fixture path")])
+        .output()
+        .expect("run chmod");
+    assert_child_success("make fake gh executable", &output);
+
+    let with_github = report(&fixture.run(
+        &fixture.main,
+        &["--gh", gh.to_str().expect("UTF-8 fixture path")],
+    ));
+    assert_eq!(
+        entry_by_name(&fixture, &with_github, "squashed")["facts"]["work_state"],
+        "finished"
+    );
+    assert_eq!(
+        entry_by_name(&fixture, &with_github, "squashed")["decision"]["decision"],
+        "eligible"
+    );
+    for name in ["moved-on", "unmerged", "reused"] {
+        let entry = entry_by_name(&fixture, &with_github, name);
+        assert_eq!(entry["facts"]["work_state"], "in_progress", "{name}");
+        assert_eq!(
+            entry["decision"]["vetoes"],
+            serde_json::json!(["recently_active"]),
+            "{name}"
+        );
+    }
+
+    let without = report(&fixture.run(&fixture.main, &["--no-github"]));
+    assert_eq!(
+        entry_by_name(&fixture, &without, "squashed")["facts"]["work_state"],
+        "in_progress"
+    );
+}
+
+/// A branch-only sweep skips worktree contents entirely and cannot delete a checkout, even
+/// when --apply is set and its idle window elapsed. Invalid indexes remain untouched too.
+#[test]
+fn branches_only_skips_worktree_scans_and_preserves_local_files() {
+    let fixture = Fixture::new();
+    let checkout = fixture.add("linked");
+    fixture.age("linked");
+    let scratch = checkout.join("scratch.txt");
+    fs::write(&scratch, "uncommitted\n").expect("write local work");
+    let index = fixture.main.join(".git/worktrees/linked/index");
+    fs::write(&index, "not an index").expect("invalidate worktree index");
+
+    for apply in [false, true] {
+        let mut arguments = vec!["--branches-only", "--no-github", "--all"];
+        if apply {
+            arguments.push("--apply");
+        }
+        let receipt = document(&fixture.run(&fixture.main, &arguments));
+        assert_eq!(receipt["mutation_performed"], false);
+        let repository = &receipt["repositories"][0];
+        assert_eq!(repository["summary"]["linked"], 1);
+        assert_eq!(repository["summary"]["skipped"], 1);
+        assert_eq!(repository["summary"]["unobservable"], 0);
+        assert_eq!(repository["summary"]["reclaimed"], 0);
+        assert_eq!(repository["worktrees"], serde_json::json!([]));
+        assert_eq!(branch_entry(repository, "linked")["reason"], "checked_out");
+        assert_eq!(
+            fs::read_to_string(&scratch).expect("scratch retained"),
+            "uncommitted\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&index).expect("index retained"),
+            "not an index"
+        );
+        assert!(checkout.exists());
+    }
+}
+
+#[test]
+fn branches_only_honors_the_branch_deletion_budget() {
+    let fixture = Fixture::new();
+    for name in ["first", "second"] {
+        branch_with_work(&fixture, name, &format!("{name}.txt"), true, 2 * 60 * 60);
+    }
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let receipt = document(&fixture.run(
+        &fixture.main,
+        &[
+            "--branches-only",
+            "--no-github",
+            "--apply",
+            "--max-branch-deletions",
+            "1",
+        ],
+    ));
+    assert_eq!(receipt["budget_exhausted"], true);
+    assert_eq!(receipt["repositories"][0]["branches"]["eligible"], 2);
+    assert_eq!(receipt["repositories"][0]["branches"]["deleted"], 1);
+    assert_eq!(
+        usize::from(ref_exists(&fixture.main, "refs/heads/first"))
+            + usize::from(ref_exists(&fixture.main, "refs/heads/second")),
+        1,
     );
 }

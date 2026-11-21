@@ -785,7 +785,7 @@ mod tests {
     use crate::artifact::{CommitId, GitTreeId};
     use crate::local_install_plan::{LocalInstallSourceIdentity, LocalInstallToolchainIdentity};
     use crate::process::{CommandExecutor, ProcessExecutor, TimedCommandExecutor};
-    use crate::project_checkout_observation::PROJECT_CHECKOUT_COMMAND_TIMEOUT;
+    use crate::project_checkout_observation::expected_git_timeout;
 
     use super::*;
 
@@ -973,7 +973,7 @@ mod tests {
             if spec.program == self.rustdoc {
                 return Ok(success_record(spec, "rustdoc 1.97.1 (exact)\n"));
             }
-            assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+            assert_eq!(timeout, expected_git_timeout(spec));
             let response = self.git.borrow_mut().pop_front().expect("Git response");
             Ok(record(spec, response))
         }

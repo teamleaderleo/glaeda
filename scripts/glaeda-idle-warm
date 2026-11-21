@@ -1,0 +1,1539 @@
+#!/usr/bin/env python3
+"""glaeda-idle-warm: while an owned cmux mini is idle, build NEXT's tip (feat-cmux-next) into a root whose kept build is far.
+
+    glaeda-idle-warm              plan: would this mini warm now, which root, and why not
+    glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
+    glaeda-idle-warm --fuzz           plan: would the UI fuzzer lane run now, and why not
+    glaeda-idle-warm --apply --fuzz   the UI fuzzer lane (the 1-minute idle-fuzz LaunchAgent): fuzz main's build
+                                      beside compiles until a GUI job wants the console; on a trusted-only
+                                      mini, instead replay a finding the collector asked to see (fuzz/replays)
+
+cmux compile admission on an owned mini starts from the root's kept build (cmux owned_build_state.py) or a
+kept seed. What it compiles depends on how far that start is from the job's tree (cmux warm_distance.py):
+near (at most 5 app Swift files, no package interface change, no hot file) never recompiled the `cmux` module,
+far and rebuild did, about 220 s more per admission (cmuxterm-hq#661 WS6). A kept build is the last pull
+request's, merged onto a main that has since moved, so after a quiet spell every root is far: at 04:00Z on
+2026-09-26, 19 of 22 roots on 12 minis were rebuild-tier from main's head, while each mini sat idle 17 to 33%
+of the evening. Seeds do not close that gap on every mini (the light minis' width has no seeds, and a seed
+lands a build behind main), so an idle root builds main's head into its own kept state, and the next pull
+request admitted there compiles its own diff only.
+
+It runs only when all of these hold, cheapest check first, and says which one stopped it:
+  * a macOS mini that is not on NEVER_HOSTS (cmux-mac-mini is the production iOS soak box; Lawrence's machines
+    run the fleet coordinator) and has no KILL_SWITCH file;
+  * glaeda runners in capacity mode (--capacity-units), none trusted-only (a seeder), whose deployed hook yields
+    to jobs (its WARM_HOLDER); the hook is loaded from the runner, so the model and locks are the ones jobs use;
+  * no compile or Xcode test running (xcodebuild, SWBBuildService) and no compile-class job started or
+    ended in the last IDLE_S (other jobs may run: the load and capacity gates and admission's preemption
+    keep them first);
+  * 1-minute load under LOAD_PER_CORE per core, thermal pressure nominal,
+    no reservation or fleet build on the host lock;
+  * a root whose kept build the hook predicts far or rebuild for main's head (the seed prefetch's mirror),
+    or any root when the hook can compare none, not already built or failed for that head, outside a
+    failure backoff.
+Then it takes that root's token, a persistent-dd token and a compile's units through the capacity ledger, under
+admission.lock, with the host lock shared, exactly as a compile admission would, and writes WARM_HOLDER before
+letting admission.lock go. Every job's admission stops it (SIGTERM) and waits for those locks; on SIGTERM it
+kills the build's process group at once and exits, which releases them. cmux's scripts/ci/owned_catch_up.sh,
+from a checkout of main's head kept under ci/.catch-up, does the build: the same check, prefer, adopt, record,
+compile and keep steps a main dispatch's compile admission runs, and every step is safe to kill.
+
+--fuzz is a separate lane (see fuzz() below): cmux's UI fuzzer runs at low priority beside compiles and
+catch-ups, holds no capacity, and is stopped the moment a job wants the gui token.
+
+The build is trusted main code run as the build user on a PR mini. Pull requests admitted to that root already
+share its kept state, so it adds no new trust boundary. One run at a time (flock on ci/.catch-up/lock). Prints
+one JSON line.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+HOME = Path.home()
+REPO_URL = os.environ.get("GLAEDA_IDLE_WARM_REPO", "https://github.com/manaflow-ai/cmux.git")
+# The branch an idle root keeps building: cmux NEXT's tip. Classic `main` is no longer maintained, and every PR
+# the owned minis compile now merges onto feat-cmux-next, so a root warmed at main's head was far for all of them.
+# An idle Mac that keeps building the tip is also the simple fallback that the tip still builds between nightlies
+# (Leo, 2026-11-12: "we still want to ensure that things work. there is the fallback simple route of 'this one just
+# keeps building that shit'"). "main" in the names below means this branch.
+BRANCH = os.environ.get("GLAEDA_IDLE_WARM_BRANCH") or "feat-cmux-next"
+BRANCH_REFSPEC = f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"
+# Hostnames (lowercase, no .local) this never runs on: cmux-mac-mini (production iOS soak, hostname
+# cmuxs-Mac-mini-5) and Lawrence's machines (the fleet coordinator and subrouter).
+NEVER_HOSTS = ("cmuxs-mac-mini-5",)
+NEVER_HOST_WORDS = ("lawrence",)
+KILL_SWITCH = HOME / ".config/glaeda/idle-warm.disabled"
+JOB_LOG = HOME / "Library/Logs/glaeda-cmux-jobs.jsonl"
+# A compile or an Xcode test run. Other jobs (guards, package tests, light lanes) no longer stop a catch-up:
+# on 2026-09-27 a running Runner.Worker stopped 60% of runs on the std minis, which are almost never without
+# one, so roots stayed on other pull requests' builds. The load and capacity gates still hold, and every
+# job's admission preempts a catch-up.
+BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)")
+# No job started or ended for this long. 12 PR minis, 2026-09-25/27 (glaeda-cmux-jobs.jsonl, 1286 gaps between
+# busy spells, catch-up builds 135 to 630 s): 600 s left 334 gaps eligible and finished about 190 catch-ups;
+# 180 s leaves 657 and finishes about 330, with 35% of starts preempted by a job instead of 29%. A preempted
+# catch-up costs the job at most the 5 s yield and never counts as a failure (settle_attempt).
+IDLE_S = 180
+LOAD_PER_CORE = 0.25
+BUILD_TIMEOUT_S = 45 * 60
+GIT_TIMEOUT_S = 1800  # the first clone of cmux and its submodules
+# Commits of main the checkout keeps: the head the seed prefetch mirror names (minutes behind main) plus the
+# 50 first-parent ancestors cmux's seed lookup walks (seed_derived_data.py ANCESTOR_LIMIT): a mirror up to 150
+# commits behind main still finds every seed candidate.
+CLONE_DEPTH = 200
+FAILURE_BACKOFF_S = 6 * 3600  # after FAILURES_TO_PAUSE failed builds in a row
+FAILURES_TO_PAUSE = 3
+KEEP_LOGS = 12
+# Main's head: an ls-remote each run, and a mirror fetch like glaeda-seed-prefetch's when main moved.
+LS_REMOTE_TIMEOUT_S = 20
+MIRROR_DEPTH = 60  # glaeda-seed-prefetch DEPTH
+MIRROR_FETCH_TIMEOUT_S = 180
+PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+GIT = shutil.which("git", path=PATH) or "/usr/bin/git"
+
+_child: subprocess.Popen | None = None
+_holder: Path | None = None
+_grouped = False  # we lead the process group the build runs in
+_fuzzing = False  # a fuzz run (and its app) is under way
+FUZZ_STOP_GRACE_S = 5.0
+
+
+def record(**fields: Any) -> dict[str, Any]:
+    return {"tool": "glaeda-idle-warm", "time": int(time.time()), **fields}
+
+
+# ---------------------------------------------------------------- gates
+
+
+def host_names() -> list[str]:
+    """Every name this Mac goes by: its hostname and, on macOS, its LocalHostName and ComputerName."""
+    names = [socket.gethostname()]
+    for key in ("LocalHostName", "ComputerName"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            names.append(subprocess.run(["/usr/sbin/scutil", "--get", key], capture_output=True, text=True,
+                                        timeout=5).stdout.strip())
+    return [name for name in names if name]
+
+
+def host_denied(names: list[str] | None = None) -> str:
+    for name in names if names is not None else host_names():
+        host = name.lower().split(".")[0].replace(" ", "-").replace("\u2019", "").replace("'", "")
+        if host in NEVER_HOSTS or any(word in host for word in NEVER_HOST_WORDS):
+            return f"{host} never runs an idle catch-up"
+    return ""
+
+
+def runner_dirs(home: Path = HOME) -> list[Path]:
+    return sorted(path for path in home.glob("actions-runner-glaeda*") if (path / "glaeda-hooks").is_dir())
+
+
+def load_hook(runner_dir: Path) -> Any:
+    """The hook module the runner's jobs run, so the ledger, the model and the yield are theirs."""
+    path = runner_dir / "glaeda-hooks" / "glaeda-cmux-runner-hook"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_warm", os.fspath(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
+    loader.exec_module(module)
+    return module
+
+
+def runner_setup(dirs: list[Path]) -> tuple[Any, dict[str, Any]] | str:
+    """(hook module, {units, roots, compile_slots, xcode}) or why this mini's runners rule a catch-up out."""
+    if not dirs:
+        return "no glaeda runner on this mini"
+    scripts = []
+    for runner in dirs:
+        try:
+            scripts.append((runner / "glaeda-hooks" / "job-started.sh").read_text())
+        except (OSError, UnicodeDecodeError):
+            return f"cannot read {runner.name}'s job-started hook"
+    if any("--trusted-ref" in text for text in scripts):
+        return "a trusted-only runner (a seeder) runs here"
+    try:
+        hook = load_hook(dirs[0])
+    except Exception as error:  # noqa: BLE001
+        return f"cannot load the runner hook ({type(error).__name__})"
+    if not hasattr(hook, "WARM_HOLDER") or not hasattr(hook, "warm_root_costs"):
+        return "the runner hook predates the idle catch-up (it would not yield to jobs)"
+    scopes = [hook.runner_scope(runner) for runner in dirs]
+    units = max(scope.units for scope in scopes)
+    if units <= 0:
+        return "runners are not in capacity mode"
+    xcode = ""
+    for text in scripts:
+        found = re.search(r"\s--toolchain-xcode\s+(\S+)", text)
+        if found:
+            xcode = found.group(1)
+    if not xcode.endswith(".app") or not Path(xcode).is_dir():
+        return "no toolchain Xcode pin in the runner hooks"
+    return hook, {"units": units, "roots": max(scope.roots for scope in scopes),
+                  "compile_slots": max(scope.compile_slots for scope in scopes), "xcode": xcode}
+
+
+def running() -> str:
+    """The first running job or build (its executable's name), or '' when none. Unknown counts as busy."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return "cannot list processes"
+    if out.returncode != 0:
+        return "cannot list processes"
+    for command in out.stdout.splitlines():
+        if BUSY.search(command):
+            words = command.split()
+            return os.path.basename(words[0]) if words else "a build"
+    return ""
+
+
+# Job classes (glaeda-cmux-runner-hook) whose start or end restarts the quiet window: the compiles and the
+# simulator builds, which a catch-up would slow most. Light, product and gui test jobs no longer do.
+QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated", "tour")
+
+
+def compile_state(path: Path = JOB_LOG, now: float | None = None) -> tuple[float | None, str]:
+    """(when the last compile-class job started or ended, one still running) from the jobs log.
+
+    A compile admitted before the quiet window, and still before xcodebuild (checkout, seed download),
+    shows no busy process, and its admission has already passed, so nothing would preempt a catch-up:
+    a started event without its completed one (at most BUILD_TIMEOUT_S old) counts as running."""
+    now = time.time() if now is None else now
+    try:
+        with open(path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - 262144))
+            lines = log.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, ""
+    last = None
+    open_jobs: dict[tuple, str] = {}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("class") not in QUIET_CLASSES:
+            continue
+        times = [event.get(key) for key in ("ended_at", "at", "started_at")]
+        times = [t for t in times if isinstance(t, (int, float))]
+        if times:
+            last = max(times) if last is None else max(last, *times)
+        key = tuple(event.get(field) for field in ("runner", "run_id", "run_attempt", "job"))
+        if event.get("event") == "started" and times and now - max(times) < BUILD_TIMEOUT_S:
+            open_jobs[key] = f"{event.get('job')} on {event.get('runner')}"
+        else:
+            open_jobs.pop(key, None)
+    return last, next(iter(open_jobs.values()), "")
+
+
+def last_compile_at(path: Path = JOB_LOG) -> float | None:
+    """When the last compile-class job on this mini started or ended (its telemetry log), or None."""
+    return compile_state(path)[0]
+
+
+def last_job_at(path: Path = JOB_LOG) -> float | None:
+    """When the last job on this mini started or ended (its telemetry log), or None if none ever did."""
+    try:
+        with open(path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            size = log.tell()
+            log.seek(max(0, size - 65536))
+            lines = log.read().decode("utf-8", "replace").splitlines()
+        stamp = path.stat().st_mtime
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            times = [event.get(key) for key in ("ended_at", "at", "started_at")]
+            return max([stamp, *(t for t in times if isinstance(t, (int, float)))])
+    return stamp
+
+
+def idle_refusal(hook: Any, now: float, state: Path) -> str:
+    busy = running()
+    if busy:
+        return f"busy: {busy}"
+    last, open_job = compile_state(now=now)
+    if open_job:
+        return f"a compile is running: {open_job}"
+    if last is not None and now - last < IDLE_S:
+        return f"a compile ran {int(now - last)} s ago (idle after {IDLE_S} s)"
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return "cannot read the load"
+    cores = os.cpu_count() or 1
+    if load >= LOAD_PER_CORE * cores:
+        return f"1-minute load {load:.1f} on {cores} cores"
+    level = hook.thermal_pressure_level()
+    if level is None or level > 0:
+        return f"thermal pressure {level if level is not None else 'unknown'}"
+    # No free-disk floor of its own (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming),
+    # but the nightly reserve every PR runner keeps (nightly_reserve_refusal) holds here too.
+    why = nightly_reserve_refusal(hook)
+    if why:
+        return why
+    host_lock = os.fspath(FLEET_DIR / "host.lock")
+    held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
+    if held:
+        return held
+    if os.path.exists(host_lock) and hook.lock_waiters(host_lock, set()):
+        return "a fleet build is waiting for the host lock"  # flock has no writer preference: let it in
+    return ""
+
+
+def nightly_reserve(hook: Any) -> tuple[float, float] | None:
+    """(the dedicated nightly builder's disk floor here, one job's growth) in GiB from the runners' own hook
+    (builder_reserve_gib, job_disk_gib); (0, 0) with no dedicated builder or a hook that predates those helpers;
+    None when they fail or answer something that is not a finite number, which keeps a catch-up from starting."""
+    if not (hasattr(hook, "builder_reserve_gib") and hasattr(hook, "job_disk_gib")):
+        return 0.0, 0.0
+    try:
+        builder = float(hook.builder_reserve_gib(HOME))
+        growth = float(hook.job_disk_gib())
+    except Exception:  # noqa: BLE001 - a reserve we cannot read is not a reserve we may ignore
+        return None
+    if not (math.isfinite(builder) and math.isfinite(growth)) or builder < 0 or growth < 0:
+        return None
+    return (builder, growth) if builder > 0 else (0.0, 0.0)
+
+
+def nightly_waiter_refusal(hook: Any) -> str:
+    """Why a nightly job's wait for free disk keeps a catch-up off (it waits, or its markers cannot be read), or ''.
+    A hook without nightly_disk_waiter predates the reserve: nothing to read."""
+    if not hasattr(hook, "nightly_disk_waiter"):
+        return ""
+    try:
+        # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
+        with os.scandir(FLEET_DIR / "capacity"):
+            pass
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    try:
+        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+    except Exception as error:  # noqa: BLE001
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    return f"a nightly job waits here for free disk ({waiter})" if waiter else ""
+
+
+def nightly_reserve_refusal(hook: Any) -> str:
+    """Why a catch-up must not start for the nightly builder's disk, or ''. A PR runner on a mini with a dedicated
+    nightly builder listens only with the builder's floor plus one job's growth free, and none starts while a
+    nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
+    On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
+    listener was held off and every PR runner with it."""
+    why = nightly_waiter_refusal(hook)
+    if why:
+        return why
+    reserve = nightly_reserve(hook)
+    if reserve is None:
+        return "cannot read the dedicated nightly builder's disk reserve"
+    builder, growth = reserve
+    if builder <= 0:
+        return ""
+    free = free_bytes(FLEET_DIR)
+    need = (builder + growth) * 1024 ** 3
+    if free is None or free < need:
+        return (f"{(free or 0) / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's {builder:g} GiB "
+                f"floor + {growth:g} GiB for a build")
+    return ""
+
+
+# ---------------------------------------------------------------- which root
+
+
+def mirror_head(mirror: Path) -> str:
+    try:
+        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", f"refs/remotes/origin/{BRANCH}"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.strip()
+    return head if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+def remote_head() -> str:
+    """Main's head on GitHub (one unauthenticated ls-remote, no API quota), or '' when it cannot say."""
+    try:
+        out = subprocess.run([GIT, "ls-remote", REPO_URL, f"refs/heads/{BRANCH}"], capture_output=True, text=True,
+                             timeout=LS_REMOTE_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.split()[0] if out.returncode == 0 and out.stdout.split() else ""
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
+def main_head(state: Path) -> str:
+    """Main's head in the seed prefetch's blobless mirror, brought up to GitHub's first, or ''.
+
+    The mirror moves only when glaeda-seed-prefetch runs, 4 to 26 minutes behind main on 2026-09-27, so a
+    push waited that long plus this agent's interval before an idle root rebuilt it. Now each run asks
+    GitHub for main's head (ls-remote) and, when the mirror lacks it, fetches main into the mirror the way
+    the prefetch does, under the prefetch's own lock (skipped while the prefetch holds it: it is fetching)."""
+    mirror = state / ".prefetch" / "cmux.git"
+    head = mirror_head(mirror)
+    remote = remote_head()
+    if not remote or remote == head or not (mirror / "HEAD").is_file():
+        return head
+    lock = None
+    try:
+        lock = os.open(mirror.parent / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        subprocess.run([GIT, "-C", os.fspath(mirror), "fetch", "-q", "--filter=blob:none",
+                        f"--depth={MIRROR_DEPTH}", "origin", BRANCH_REFSPEC],
+                       capture_output=True, timeout=MIRROR_FETCH_TIMEOUT_S,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        if lock is not None:
+            os.close(lock)
+    return mirror_head(mirror)
+
+
+# Which far root first: a known rebuild, then far, then a kept build the hook could not compare, then a root with
+# no kept build at all (a cold build, the costliest to warm).
+TIER_ORDER = {"rebuild": 0, "far": 1, "unknown": 2, "cold": 3}
+
+
+def pick_root(hook: Any, roots: int, head: str, state: Path, memory: dict[str, Any]) -> tuple[int, dict] | str:
+    """The root to warm (1-based) and the hook's predictions, or why none."""
+    order = list(range(roots))
+    ranked, predicted = hook.warm_root_costs(order, head, None, os.fspath(state))
+    if not ranked:
+        # The hook compares nothing when no kept build carries the stamp fields it reads, as on a light mini
+        # whose last owned compile predates them (cmux-austin-mini-0/1: 261 of 261 runs on 2026-09-26 stopped
+        # here). Rank every root unknown instead: one catch-up per root per head stamps it in the current
+        # format, so the hook compares it from then on.
+        predicted = {f"root-{copy + 1}": {"tier": "unknown", "app_swift_files": -1,
+                                          "why": "the hook could not compare any kept build"} for copy in order}
+    done = memory.get("roots")
+    done = done if isinstance(done, dict) else {}
+    far = []
+    for copy in order:
+        guess = predicted.get(f"root-{copy + 1}") or {}
+        tier = guess.get("tier")
+        if tier not in TIER_ORDER:
+            continue  # near, or not predicted
+        last = done.get(str(copy + 1))
+        if isinstance(last, dict) and last.get("head") == head:
+            continue  # built, or tried, for this head already
+        # A root that keeps main comes first: cmux keeps one per multi-root mini at main (owned_build_state.py
+        # holds_last_main) as every pull request's near start, and nothing but this agent moves it forward.
+        far.append((0 if keeps_main(hook, copy + 1, state) else 1, TIER_ORDER[tier],
+                    -(guess.get("app_swift_files") or 0), copy))
+    if not far:
+        return "every root is near main's head, or was warmed for it"
+    return sorted(far)[0][-1] + 1, predicted
+
+
+def keeps_main(hook: Any, root: int, state: Path) -> bool:
+    """Root ROOT's kept build is a build of main (a stamp with no pull request)."""
+    try:
+        stamp = hook.root_stamp(root, os.fspath(state))
+    except Exception:  # noqa: BLE001 - an older hook, or an unreadable stamp: rank as before
+        return False
+    return isinstance(stamp, dict) and not stamp.get("pr")
+
+
+# ---------------------------------------------------------------- locks
+
+
+def take(hook: Any, capacity: Path, setup: dict[str, Any], root: int) -> tuple[list[int], list[str]] | str:
+    """The root's token, a persistent-dd token and a compile's units, with the host lock shared, under
+    admission.lock, and WARM_HOLDER written before admission.lock is released; or why not."""
+    global _holder
+    capacity.mkdir(parents=True, exist_ok=True)
+    admission = os.open(capacity / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    fds: list[int] = []
+    try:
+        try:
+            fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "an admission is running"
+        host = os.open(FLEET_DIR / "host.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        fds.append(host)
+        try:
+            fcntl.flock(host, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return "a fleet build holds the host lock"
+        held = []
+        fd = hook.lock_file(capacity / f"root-{root}.token", fcntl.LOCK_EX)
+        if fd is None:
+            return f"root-{root} is taken"
+        fds.append(fd)
+        held.append(f"root-{root}")
+        for copy in range(setup["compile_slots"]):
+            name = "persistent-dd" if copy == 0 else f"persistent-dd-{copy}"
+            fd = hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX)
+            if fd is not None:
+                fds.append(fd)
+                held.append(name)
+                break
+        else:
+            return "every persistent-dd token is taken"
+        units = min(hook.CLASS_COST["compile"][0], setup["units"])
+        for slot in range(setup["units"]):
+            if units == 0:
+                break
+            fd = hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX)
+            if fd is not None:
+                fds.append(fd)
+                held.append(f"unit-{slot}")
+                units -= 1
+        if units:
+            return "not enough capacity units are free"
+        holder = capacity / hook.WARM_HOLDER
+        incoming = capacity / f".{hook.WARM_HOLDER}.{os.getpid()}"
+        incoming.write_text(json.dumps({"pid": os.getpid(), "held": held, "root": root}) + "\n")
+        incoming.rename(holder)
+        _holder = holder
+        taken, fds = fds, []
+        return taken, held
+    except OSError as error:
+        return f"cannot take the ledger ({type(error).__name__})"
+    finally:
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        os.close(admission)
+
+
+def release(fds: list[int]) -> None:
+    """Close the locks first, then drop the holder file: a holder file that outlives the locks only makes an
+    admission look for a catch-up that is gone, while locks that outlive the file would refuse it."""
+    global _holder
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    if _holder is not None:
+        with contextlib.suppress(OSError, ValueError):
+            if json.loads(_holder.read_text()).get("pid") == os.getpid():
+                _holder.unlink()
+        _holder = None
+
+
+def own_group() -> bool:
+    """Lead a process group of our own, which the build joins, so one killpg ends both (and so does the hook's)."""
+    try:
+        if os.getpgid(0) != os.getpid():
+            os.setpgid(0, 0)
+        return os.getpgid(0) == os.getpid()
+    except OSError:
+        return False
+
+
+def kill_build(passes: int = 3) -> bool:
+    """SIGKILL every other process in our group (the build and anything it started); whether the group was seen
+    empty (False when ps failed or members outlived every pass)."""
+    me = os.getpid()
+    for _ in range(passes):
+        try:
+            ps = subprocess.Popen(["/bin/ps", "-axo", "pid=,pgid="], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return False
+        try:
+            out, _ = ps.communicate(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            with contextlib.suppress(OSError):
+                ps.kill()
+            with contextlib.suppress(OSError, subprocess.SubprocessError):  # bounded: the caller escalates
+                ps.wait(timeout=2)
+            return False
+        if ps.returncode != 0:  # a failed ps lists nothing, which is not an empty group
+            return False
+        # ps runs in our group too: it is not a member to kill or to wait for
+        members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
+                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) not in (me, ps.pid)]
+        if not members:
+            return True
+        for pid in members:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        time.sleep(0.05)
+    return False
+
+
+def stop_fuzz_child() -> None:
+    """Give the fuzzer a chance to run its shutdown hook before removing its process group.
+
+    The fuzzer owns the app's PTY/session cleanup.  Killing it first skips that cleanup and can leave a
+    Ghostty shell behind after the idle lane has gone away.  A wedged fuzzer still gets escalated by the
+    process-group cleanup in stop().
+    """
+    child = _child
+    if child is None:
+        return
+    with contextlib.suppress(OSError):
+        child.send_signal(signal.SIGTERM)
+    try:
+        child.wait(timeout=FUZZ_STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            child.kill()
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            child.wait(timeout=1)
+
+
+def forget_inode_override() -> None:
+    """The adopt steps set a per-user Xcode default that the build step deletes after the compile; a kill
+    in between leaves it set for the user's other builds. No job runs while a catch-up does, so none needs it."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["/usr/bin/defaults", "delete", "com.apple.dt.XCBuild", "IgnoreFileSystemDeviceInodeChanges"],
+                       capture_output=True, timeout=2)
+
+
+def stop(signum: int, _frame: Any) -> None:
+    """A job's admission (or launchd) wants us gone: stop the lane, then ourselves with the rest of the group.
+    The fuzz runner gets a bounded SIGTERM first so it can close its PTY/session; the process-group cleanup
+    below remains the final guard for the app or a wedged runner. The kernel drops the locks with the last fd,
+    and the hook ignores a holder file whose pid is dead."""
+    if _child is not None:
+        if _fuzzing:
+            stop_fuzz_child()
+        else:
+            with contextlib.suppress(OSError):
+                _child.kill()
+    if _grouped:
+        kill_build(passes=1)  # within the hook's WARM_YIELD_S; the killpg below takes the rest
+        if _fuzzing:
+            # Never forget_inode_override here: the fuzz lane runs beside jobs, and a compile between its adopt
+            # and its build needs that default. The lane never sets it.
+            dismiss_crash_dialogs()
+            release([])  # the holder file names us: drop it so a reused pid is never signalled for it
+        else:
+            forget_inode_override()
+        os.killpg(os.getpid(), signal.SIGKILL)
+    os._exit(128 + signum)
+
+
+# ---------------------------------------------------------------- build
+
+
+def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
+    subprocess.run([GIT, "-C", os.fspath(checkout), *args], check=True, capture_output=True, timeout=timeout,
+                   env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+
+
+# The catch-up checkout reads cmux's objects through the mini's one full mirror (glaeda-git-mirror) instead of
+# keeping its own copy. Leo, 2026-11-18: seeds and shared caches are read through, not copied to the internal disk.
+# Without it the checkout held every blob of the tip it built (1.21 GB for a feat-cmux-next tip, cmuxterm-hq RFD
+# 0008) and each later head's changed blobs, beside a mirror on the same disk that already had them all. The mirror
+# never removes an object (gc.auto 0, `repack --geometric`), which is what makes borrowing it safe; a rebuilt
+# mirror (a reseed is a new directory) may lack an object the checkout relied on, so the checkout records which
+# mirror it borrowed (as the runner hook's borrowers do) and starts over when that changes. A mini with no usable
+# mirror clones from GitHub as before.
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+BORROW_REPACK_TIMEOUT_S = 300
+
+
+def git_mirror() -> Path:
+    return Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git") / "cmux.git"
+
+
+def mirror_identity(mirror: Path) -> dict[str, Any] | None:
+    """The mirror's objects directory when it is a usable full mirror (glaeda-git-mirror verified it, no repair
+    pending, not shallow), as {"objects", "ino", "birth"}; else None. The runner hook's test, kept in step."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not os.path.isdir(objects) or objects.is_symlink() or mirror.is_symlink() \
+                or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+    except OSError:
+        return None
+    identity: dict[str, Any] = {"objects": os.fspath(objects), "ino": st.st_ino}
+    if (birth := getattr(st, "st_birthtime", None)) is not None:
+        identity["birth"] = birth
+    return identity
+
+
+def borrowed(git_dir: Path) -> tuple[list[str], Any]:
+    """The checkout's alternates and its borrow record (None when it has none or it cannot be read)."""
+    try:
+        alternates = [line.strip() for line in (git_dir / "objects/info/alternates").read_text().splitlines()
+                      if line.strip()]
+    except OSError:
+        alternates = []
+    try:
+        recorded = json.loads((git_dir / BORROW_RECORD).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    return alternates, recorded
+
+
+def borrow(git_dir: Path, identity: dict[str, Any]) -> None:
+    """Point GIT_DIR's object store at the mirror's and record which mirror that is."""
+    info = git_dir / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(identity["objects"] + "\n")
+    incoming = git_dir / f".{BORROW_RECORD}.{os.getpid()}"
+    incoming.write_text(json.dumps(identity) + "\n")
+    incoming.rename(git_dir / BORROW_RECORD)
+
+
+def prepare_checkout(work: Path, head: str) -> None:
+    """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after.
+
+    Shallow and blobless: main's newest CLONE_DEPTH commits, their trees, and the blobs of what is checked
+    out; submodules at depth 1, as a job's checkout takes them. A full clone is 2.4 GB, and on
+    cmux-austin-mini-0 GitHub sent it at about 0.6 MB/s (0.9 GB in 25 minutes, 2026-09-27), so the
+    30-minute timeout ended every first clone and the next run started it over. The build reads only the
+    checkout, and the seed lookup only main's first 50 first-parent ancestors (CMUX_SEED_GIT_DIR); git fetches
+    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small.
+
+    Where the mini keeps a usable git mirror, the checkout borrows its objects (BORROW_RECORD above): the clone
+    and each fetch take from GitHub only what the mirror lacks, and the checked-out blobs are read from the
+    mirror, not stored again. A checkout cloned before it borrowed drops its own copies once (`repack -a -d -l`)."""
+    checkout = work / "cmux"
+    git_dir = checkout / ".git"
+    mirror = mirror_identity(git_mirror())
+    if git_dir.is_dir():
+        alternates, recorded = borrowed(git_dir)
+        if alternates and (mirror is None or alternates != [mirror["objects"]] or not isinstance(recorded, dict)
+                           or recorded.get("ino") != mirror["ino"] or recorded.get("birth") != mirror.get("birth")):
+            shutil.rmtree(checkout, ignore_errors=True)  # its mirror went or was rebuilt: start over
+    repack = False
+    if not git_dir.is_dir():
+        shutil.rmtree(checkout, ignore_errors=True)
+        reference = ["--reference", os.fspath(git_mirror())] if mirror is not None else []
+        subprocess.run([GIT, "clone", "-q", f"--depth={CLONE_DEPTH}", "--filter=blob:none", "--no-checkout",
+                        *reference, REPO_URL, os.fspath(checkout)], check=True, capture_output=True,
+                       timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+        if mirror is not None:
+            borrow(git_dir, mirror)
+    elif mirror is not None and not borrowed(git_dir)[0]:
+        borrow(git_dir, mirror)
+        repack = True
+    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", BRANCH_REFSPEC)
+    git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
+    git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
+    git(checkout, "clean", "-ffdxq")
+    git(checkout, "submodule", "sync", "-q", "--recursive")
+    git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force", "--depth=1")
+    git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
+    if repack:  # drop the local copies of what the mirror now serves; a failed repack leaves the store as it was
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            git(checkout, "repack", "-a", "-d", "-l", "-q", timeout=BORROW_REPACK_TIMEOUT_S)
+
+
+def last_result(log: Path) -> dict[str, Any]:
+    """The build's result line: the last JSON line in its log's tail."""
+    try:
+        with open(log, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 65536))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):
+        if line.startswith('{"kept"'):
+            with contextlib.suppress(ValueError):
+                result = json.loads(line)
+                if isinstance(result, dict):
+                    return result
+    return {}
+
+
+BUILD_DISK_WATCH_S = 15.0
+END_CHILD_WAIT_S = 10.0
+
+
+def end_child() -> None:
+    """Kill the build and reap it, then kill what is left of our group (anything the build started; reaping the
+    child first, so its zombie is not counted). When the child outlives END_CHILD_WAIT_S, or the group cannot be
+    seen empty, our whole group ends, us included, so no build process outlives the locks we hold (as stop() does)."""
+    assert _child is not None
+    with contextlib.suppress(OSError):
+        _child.kill()
+    try:
+        _child.wait(timeout=END_CHILD_WAIT_S)
+    except subprocess.TimeoutExpired:
+        if _grouped:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        raise
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
+
+
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path, stop_below: int | None = None,
+          nightly_waiter: Any = None) -> dict[str, Any]:
+    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
+    stop_below, the build is killed once free disk drops under it, and with nightly_waiter (a callable: why, or
+    ''), once a nightly job waits for free disk; both are read every BUILD_DISK_WATCH_S."""
+    global _child
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
+    env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
+    started = time.monotonic()
+    with open(log, "ab") as output:
+        _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
+                                   os.fspath(state)], cwd=checkout, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=output, stderr=subprocess.STDOUT)
+    deadline = started + BUILD_TIMEOUT_S
+    try:
+        while True:
+            try:
+                watched = stop_below is not None or nightly_waiter is not None
+                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if watched else BUILD_TIMEOUT_S,
+                                                        deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            free = free_bytes(FLEET_DIR) if stop_below else None
+            low = stop_below is not None and (free is None or free < stop_below)  # unknown free disk is short
+            waiting = nightly_waiter() if nightly_waiter is not None and not low else ""
+            if low or waiting or time.monotonic() >= deadline:
+                end_child()
+                if waiting:
+                    reason = f"stopped: {waiting}"
+                elif not low:
+                    reason = f"timed out after {BUILD_TIMEOUT_S} s"
+                elif free is None:
+                    reason = "stopped: cannot read free disk while the dedicated nightly builder keeps a floor"
+                else:
+                    reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
+                              f"{stop_below / 1024 ** 3:g} GiB floor")
+                return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
+    finally:
+        _child = None
+    # anything the build left running in our group (a detached build service); a group that cannot be seen
+    # empty ends whole, us included, so nothing of the build outlives the locks (the attempt stays recorded)
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
+    result = last_result(log)
+    if not result:
+        result = {"kept": "false", "reason": f"exit {code}, no result line"}
+    result["wall_seconds"] = round(time.monotonic() - started, 1)
+    return result
+
+
+def trim_logs(logs: Path) -> None:
+    old = sorted(logs.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale in old[KEEP_LOGS:]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
+
+
+# ---------------------------------------------------------------- fuzz (preemptible gap fill)
+
+# The idle UI fuzzer: cmux's scripts/fuzz (dogfood/fuzz) drives a copy of the newest main build this mini kept
+# through random but valid action sequences (splits, tabs, workspaces, drags, palette, settings, windows) and
+# records every crash, hang, error log or broken layout invariant with a minimized repro and frames under
+# FUZZ_DIR/runs, for the collector to file as cmux issues.
+#
+# It is its own lane (`--apply --fuzz`, the idle-fuzz LaunchAgent), not what the catch-up does when nothing is left
+# to warm. Compiles do not stop it: it runs at FUZZ_NICE beside them, holds no capacity unit and no token, and so
+# never delays or refuses an admission. What it must never share is the console session. So it starts only when
+# this user owns an unlocked console, no job holds the gui token or wants it (take-gui), no Xcode test and no other
+# cmux DEV app runs, and the host has no reservation (a person dogfooding a PR build there). It names its pid in
+# the hook's FUZZ_HOLDER, and every job that takes the gui token (admission of a gui class, or take-gui) stops it
+# first with SIGTERM, which ends its process group, the app included (the fuzzer starts it as its own child). As a
+# second line, for runners whose hook predates FUZZ_HOLDER, the lane itself watches for the same things every
+# FUZZ_WATCH_S while the fuzzer runs and stops at the first.
+#
+# On by default on every mini with glaeda runners, except NEVER_HOSTS and FUZZ_KILL_SWITCH; it ships with glaeda.
+# On a trusted-only mini it fuzzes nothing and only runs the collector's replay requests (REPLAY_* below).
+FUZZ_MINUTES = 10
+FUZZ_MINIMIZE_MINUTES = 5  # per finding
+FUZZ_MAX_FINDINGS = 2
+FUZZ_TIMEOUT_S = (FUZZ_MINUTES + FUZZ_MAX_FINDINGS * FUZZ_MINIMIZE_MINUTES + 6) * 60
+FUZZ_KEEP_BUILDS = 2
+FUZZ_KEEP_ENGINES = 2
+FUZZ_KEEP_QUIET_RUNS = 10  # runs without a finding
+FUZZ_KEEP_FINDING_RUNS = 30  # runs with one, until the collector files them; the oldest go first past this
+# The fuzzer keeps a margin above this mini's runner disk floor, so it is never why a job is refused for disk. The
+# floor is the highest --min-free-gib of its job-started hooks (glaeda-cmux-runner writes the manifest's
+# defaults.disk.min_free_gib there), else the fleet default of 30 GiB (cmuxterm-hq build-fleet/mini-fleet.json).
+# It starts only at floor + FUZZ_START_HEADROOM_GIB, the manifest's defaults.disk.job_growth_gib (which the runners'
+# hooks do not carry), since a run grows: staged clones stop sharing blocks once a catch-up rebuilds, plus traces
+# and kept engines. watch() stops it below floor + FUZZ_STOP_HEADROOM_GIB. Until 2026-10-03 it needed a fixed 90 GiB.
+FUZZ_DEFAULT_MIN_FREE_GIB = 30
+FUZZ_START_HEADROOM_GIB = 20
+FUZZ_STOP_HEADROOM_GIB = 10
+# Beside a compile: the compile keeps the cores it wants. The manual runs of 2026-09-28 used nice 10 beside PR
+# compiles on eight minis and saw no stall or hang the app did not also show alone.
+FUZZ_NICE = 10
+# How often the lane itself looks for a GUI job while the fuzzer runs (the reservation, the process list and the
+# gui token). A backstop only: the hook stops the lane before any job takes the gui token. The token probe takes
+# its flock for an instant, which a gui runner's listener gate could read as taken, so it stays infrequent.
+FUZZ_WATCH_S = 1.0
+FUZZ_TOKEN_S = 3.0
+FUZZ_APP = "cmux DEV.app"
+# The collector (cmuxterm-hq build-fleet/fuzz) files a finding only once it reproduces on a replay it asked for:
+# its mini-serve.sh drops a request (replay.py, the collector's own fuzzer and the repro steps) in
+# fuzz/replays/<nonce>/ and the lane runs it under the same rules and the same preemption, against the newest main
+# build. Only on a trusted-only mini (main pushes only): on a PR mini the build user, and so any pull request job,
+# can rewrite the request, the kept build and the answer, so a replay there proves nothing. A trusted-only mini
+# never fuzzes, and a PR mini never replays.
+REPLAY_TIMEOUT_S = 5 * 60
+REPLAY_MAX_AGE_S = 24 * 3600
+REPLAY_NAME = re.compile(r"req\.[A-Za-z0-9]{6,32}")
+FUZZ_KILL_SWITCH = HOME / ".config/glaeda/idle-fuzz.disabled"
+XCODE_TEST = re.compile(r"(^|/)(xctest|XCTRunner)(\s|$)|-Runner\.app/")
+# A job step asking for the gui token (glaeda-canonical-root take-gui runs the hook's take-gui phase).
+WANTS_GUI = re.compile(r"glaeda-cmux-runner-hook\s+take-gui(\s|$)|glaeda-canonical-root\s+take-gui(\s|$)")
+DEV_APP = re.compile(r"/cmux DEV[^/]*\.app/Contents/MacOS/")
+
+def fuzz_dir() -> Path:
+    return FLEET_DIR / "fuzz"
+
+
+def console_refusal(hook: Any) -> str:
+    """Why this user cannot drive the console now: another user (or nobody) owns it, or it is screen-locked.
+    The hook's own reading (its listener gate's), so both agree on what an usable console is."""
+    try:
+        if os.stat("/dev/console").st_uid != os.getuid():
+            return "another user owns the console"
+    except OSError:
+        return "cannot read the console owner"
+    try:
+        state = hook.console_state()
+    except Exception:  # noqa: BLE001 - an older hook
+        state = None
+    if state is None:
+        return "cannot read the console session"
+    return "" if state.state == "unlocked" else f"the console session is {state.state}"
+
+
+def ps(field: str) -> list[str] | None:
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", f"{field}="], capture_output=True, text=True,
+                             errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+def gui_process(ours: str = "") -> str:
+    """A process that means a GUI job or a person has the console: an Xcode test, a job step asking for the gui
+    token, or a cmux DEV app that is not under OURS (the fuzzer's own staged builds). '' when none.
+
+    Tests and apps are matched on the executable (comm), never the arguments: a compile's link, codesign and
+    dsymutil steps name `cmux DEV.app/Contents/MacOS/cmux DEV` and `...-Runner.app/` in theirs."""
+    executables, commands = ps("comm"), ps("command")
+    if executables is None or commands is None:
+        return "cannot list processes"
+    for program in executables:
+        program = program.strip()
+        if XCODE_TEST.search(program):
+            return "an Xcode test is running"
+        if DEV_APP.search(program) and not (ours and program.startswith(ours)):
+            return "another cmux DEV app is running"
+    for command in commands:
+        if WANTS_GUI.search(command):
+            return "a job is asking for the gui token"
+    return ""
+
+
+def gui_refusal(hook: Any, capacity: Path, ours: str = "") -> str:
+    """A GUI job on this mini (the gui token held, an Xcode test, a take-gui) or another cmux DEV app."""
+    if not hook.probe(capacity / "gui.token"):
+        return "a job holds the gui token"
+    return gui_process(ours)
+
+
+def reservation_refusal(hook: Any, now: float) -> str:
+    """An active (or unreadable) host reservation: someone is dogfooding on this mini's console."""
+    try:
+        return hook.reservation_refusal(os.fspath(FLEET_DIR / "reservation.json"), now) or ""
+    except Exception as error:  # noqa: BLE001 - a marker we cannot read refuses, as it does for jobs
+        return f"cannot read the reservation ({type(error).__name__})"
+
+
+def main_roots(hook: Any, roots: int, state: Path) -> list[tuple[int, str, float]]:
+    """(root, main commit, when kept) for each root whose kept build is a main build, newest first."""
+    found = []
+    for root in range(1, roots + 1):
+        try:
+            stamp = hook.root_stamp(root, os.fspath(state))
+        except Exception:  # noqa: BLE001 - an older hook or an unreadable stamp
+            continue
+        sha = stamp.get("merged_onto") if isinstance(stamp, dict) and not stamp.get("pr") else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        store = state if root == 1 else state / f"cmux-ci-{root}"
+        if not (store / "derived-data" / "Build" / "Products" / "Debug" / FUZZ_APP).is_dir():
+            continue
+        try:
+            found.append((root, sha, (store / "stamp.json").stat().st_mtime))
+        except OSError:
+            continue
+    return sorted(found, key=lambda item: -item[2])
+
+
+def staged(kind: str, marker: str) -> list[Path]:
+    """Complete staged copies under FUZZ_DIR/KIND (each with its MARKER file), newest first. A copy a kill cut
+    short is a dot directory without the marker, and never counts."""
+    found = []
+    for path in (fuzz_dir() / kind).glob("*"):
+        if path.name.startswith(".") or not (path / marker).is_file():
+            continue
+        with contextlib.suppress(OSError):
+            found.append((path.stat().st_mtime, path))
+    return [path for _, path in sorted(found, key=lambda item: -item[0])]
+
+
+def staged_builds() -> list[Path]:
+    return [path for path in staged("builds", "build.json") if (path / FUZZ_APP).is_dir()]
+
+
+def stage_build(state: Path, root: int, sha: str) -> Path | str:
+    """Copy root ROOT's kept main app (an APFS clone: seconds, no space) to FUZZ_DIR/builds/SHA, or why not.
+
+    Without the root's token, which would stop a gui runner's listener while it is held: the kept build changes
+    only when a job's `keep` rewrites stamp.json, so a stamp read the same before and after the copy means the
+    copy is of one build. The copy is the fuzzer's own; a running app must not sit under a job's adopt."""
+    store = state if root == 1 else state / f"cmux-ci-{root}"
+    source = store / "derived-data" / "Build" / "Products" / "Debug" / FUZZ_APP
+    builds = fuzz_dir() / "builds"
+    builds.mkdir(parents=True, exist_ok=True)
+    for stale in builds.glob(".*"):  # copies a kill cut short
+        shutil.rmtree(stale, ignore_errors=True)
+    def identity() -> tuple[bytes, int, float]:  # a job's keep swaps derived-data in, then rewrites the stamp
+        info = os.stat(store / "derived-data")
+        return (store / "stamp.json").read_bytes(), info.st_ino, info.st_mtime
+    before = identity()
+    final = builds / sha
+    incoming = builds / f".{sha}.{os.getpid()}"
+    incoming.mkdir()
+    subprocess.run(["/bin/cp", "-Rc", os.fspath(source), os.fspath(incoming / FUZZ_APP)], check=True,
+                   capture_output=True, timeout=600)
+    if identity() != before:
+        shutil.rmtree(incoming, ignore_errors=True)
+        return f"root-{root}'s kept build changed while it was copied"
+    (incoming / "build.json").write_text(json.dumps({"sha": sha, "root": root, "at": int(time.time())}) + "\n")
+    shutil.rmtree(final, ignore_errors=True)
+    incoming.rename(final)
+    for stale in staged_builds()[FUZZ_KEEP_BUILDS:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    return final
+
+
+ENGINE_PATHS = ("scripts/fuzz", "dogfood/fuzz")
+
+
+def stage_engine(state: Path, sha: str) -> Path | None:
+    """The fuzzer (scripts/fuzz and dogfood/fuzz) at SHA, the build's main commit, exported from git into
+    FUZZ_DIR/engines/SHA; or the newest engine staged before; or None. GLAEDA_IDLE_FUZZ_ENGINE names a checkout
+    to run as is.
+
+    Exported, not run from the catch-up's checkout: a catch-up now runs beside the fuzzer and checks out a newer
+    main under it. git archive reads committed objects only, from the catch-up checkout or the seed prefetch
+    mirror (both blobless clones of cmux; a missing blob is fetched on demand)."""
+    override = os.environ.get("GLAEDA_IDLE_FUZZ_ENGINE")
+    if override:
+        checkout = Path(override)
+        return checkout if (checkout / "scripts" / "fuzz").is_file() and (checkout / "dogfood" / "fuzz").is_dir() else None
+    engines = fuzz_dir() / "engines"
+    final = engines / sha
+    if (final / ".complete").is_file():
+        return final
+    engines.mkdir(parents=True, exist_ok=True)
+    for stale in engines.glob(".*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    for repo in (["-C", os.fspath(state / ".catch-up" / "cmux")], ["--git-dir", os.fspath(state / ".prefetch" / "cmux.git")]):
+        incoming = engines / f".{sha}.{os.getpid()}"
+        incoming.mkdir()
+        try:
+            archive = subprocess.run([GIT, *repo, "archive", "--format=tar", sha, "--", *ENGINE_PATHS],
+                                     capture_output=True, timeout=300,
+                                     env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+            if archive.returncode == 0:
+                subprocess.run(["/usr/bin/tar", "-xf", "-", "-C", os.fspath(incoming)], input=archive.stdout,
+                               check=True, capture_output=True, timeout=120)
+                if (incoming / "scripts" / "fuzz").is_file() and (incoming / "dogfood" / "fuzz").is_dir():
+                    (incoming / ".complete").write_text(sha + "\n")
+                    shutil.rmtree(final, ignore_errors=True)
+                    incoming.rename(final)
+                    for old in staged("engines", ".complete")[FUZZ_KEEP_ENGINES:]:
+                        shutil.rmtree(old, ignore_errors=True)
+                    return final
+        except (OSError, subprocess.SubprocessError):
+            pass
+        shutil.rmtree(incoming, ignore_errors=True)
+    kept = staged("engines", ".complete")
+    return kept[0] if kept else None
+
+
+def pending_replay(now: float | None = None) -> Path | None:
+    """The oldest replay request the collector left (fuzz/replays/req.XXXX with .ready, no .done), or None. Requests
+    older than REPLAY_MAX_AGE_S, answered or not, are removed: the collector asks again if it still wants one."""
+    now = time.time() if now is None else now
+    found = []
+    try:
+        entries = list((fuzz_dir() / "replays").iterdir())
+    except OSError:
+        return None
+    for path in entries:
+        if not REPLAY_NAME.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
+            continue
+        try:
+            ready = (path / ".ready").stat().st_mtime
+        except OSError:
+            continue
+        if now - ready > REPLAY_MAX_AGE_S:
+            shutil.rmtree(path, ignore_errors=True)
+            continue
+        if not (path / ".done").exists() and (path / "replay.py").is_file():
+            found.append((ready, path))
+    return min(found)[1] if found else None
+
+
+def hold_fuzz(hook: Any, capacity: Path) -> str:
+    """Name our pid in the hook's FUZZ_HOLDER, so a job that takes the gui token stops us first; or why not."""
+    global _holder
+    name = getattr(hook, "FUZZ_HOLDER", "idle-fuzz.json")
+    try:
+        capacity.mkdir(parents=True, exist_ok=True)
+        holder = capacity / name
+        incoming = capacity / f".{name}.{os.getpid()}"
+        incoming.write_text(json.dumps({"pid": os.getpid(), "held": [], "fuzz": True}) + "\n")
+        incoming.rename(holder)
+    except OSError as error:
+        return f"cannot write the fuzz holder ({type(error).__name__})"
+    _holder = holder
+    return ""
+
+
+def trim_fuzz_runs(runs: Path) -> None:
+    """Keep the newest FUZZ_KEEP_QUIET_RUNS finished runs without a finding and FUZZ_KEEP_FINDING_RUNS with one."""
+    quiet, found = [], []
+    now = time.time()
+    for run_dir in runs.glob("*"):
+        try:
+            stamp = run_dir.stat().st_mtime
+        except OSError:
+            continue
+        try:
+            summary = json.loads((run_dir / "summary.json").read_text())
+        except (OSError, ValueError):
+            # A job's preemption kills the fuzzer before it writes its summary: past the longest run, it is done.
+            if now - stamp < FUZZ_TIMEOUT_S:
+                continue
+            summary = {"findings": [os.fspath(p.parent) for p in run_dir.glob("session-*/finding.json")]}
+        findings = summary.get("findings") if isinstance(summary, dict) else None
+        (found if isinstance(findings, list) and findings else quiet).append((stamp, run_dir))
+    for kept, group in ((FUZZ_KEEP_QUIET_RUNS, quiet), (FUZZ_KEEP_FINDING_RUNS, found)):
+        for _, stale in sorted(group, key=lambda item: -item[0])[kept:]:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
+def free_bytes(path: Path) -> int | None:
+    try:
+        stat = os.statvfs(path)
+    except OSError:
+        return None
+    return stat.f_bavail * stat.f_frsize
+
+
+def runner_floor_bytes(hook: Any) -> int:
+    """This mini's runner disk floor: the highest --min-free-gib among its runners, else FUZZ_DEFAULT_MIN_FREE_GIB."""
+    floors = [0.0]
+    for runner in runner_dirs():
+        with contextlib.suppress(Exception):
+            floors.append(float(hook.runner_scope(runner).min_free_gib))
+    return int((max(floors) or FUZZ_DEFAULT_MIN_FREE_GIB) * 1024 ** 3)
+
+
+def watch(hook: Any, capacity: Path, ours: str, timeout_s: float,
+          stop_below: int | None = None) -> tuple[int | None, str]:
+    """Wait for the fuzzer (_child); (its exit code or None, why it was stopped or '').
+
+    Stops at the first sign of a GUI job: a reservation or (every FUZZ_WATCH_S) an Xcode test, a take-gui or
+    another cmux DEV app, or (every FUZZ_TOKEN_S) the gui token taken twice in a row (a listener gate's probe holds
+    it for an instant). With stop_below, also once free disk drops under it (every FUZZ_WATCH_S, one statvfs)."""
+    assert _child is not None
+    deadline = time.monotonic() + timeout_s
+    next_token = 0.0
+    token_taken = 0
+    while True:
+        try:
+            return _child.wait(timeout=FUZZ_WATCH_S), ""
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        if now >= deadline:
+            return None, f"timed out after {timeout_s:g} s"
+        why = reservation_refusal(hook, time.time())
+        if why:
+            return None, why
+        if stop_below is not None:
+            free = free_bytes(FLEET_DIR)
+            if free is not None and free < stop_below:
+                floor = stop_below - FUZZ_STOP_HEADROOM_GIB * 1024 ** 3
+                return None, (f"{free // 1024 ** 3} GiB free, under the runners' {floor / 1024 ** 3:g} GiB floor "
+                              f"+ {FUZZ_STOP_HEADROOM_GIB}")
+        why = gui_process(ours)
+        if why and why != "cannot list processes":
+            return None, why
+        if now >= next_token:
+            next_token = now + FUZZ_TOKEN_S
+            token_taken = 0 if hook.probe(capacity / "gui.token") else token_taken + 1
+            if token_taken >= 2:
+                return None, "a job holds the gui token"
+
+
+def fuzz_setup() -> tuple[Any, int, bool] | str:
+    """(the runner hook, how many canonical roots, whether a trusted-only runner runs here: then the lane only
+    replays) or why this mini does not fuzz."""
+    dirs = runner_dirs()
+    if not dirs:
+        return "no glaeda runner on this mini"
+    try:
+        # Only picks the mode: the collector decides from the fleet manifest which minis it trusts to replay.
+        trusted = all("--trusted-ref" in (runner / "glaeda-hooks" / "job-started.sh").read_text() for runner in dirs)
+        hook = load_hook(dirs[0])
+        scopes = [hook.runner_scope(runner) for runner in dirs]
+    except Exception as error:  # noqa: BLE001
+        return f"cannot load the runner hook ({type(error).__name__})"
+    # Only capacity-mode admission stops the fuzzer before a gui job (take_capacity's yield_idle_fuzz).
+    if max(scope.units for scope in scopes) <= 0:
+        return "runners are not in capacity mode"
+    return hook, max(1, max(scope.roots for scope in scopes)), trusted
+
+
+def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
+    """The fuzz lane: fuzz the newest main build this mini kept, beside whatever compiles; one JSON record."""
+    global _child, _grouped, _fuzzing
+    now = time.time() if now is None else now
+    base = record(mode="fuzz")
+    if platform.system() != "Darwin":
+        return {**base, "state": "skip", "reason": "not macOS"}
+    why = host_denied()
+    if why:
+        return {**base, "state": "skip", "reason": why.replace("an idle catch-up", "the idle fuzzer")}
+    if FUZZ_KILL_SWITCH.exists():
+        return {**base, "state": "skip", "reason": f"{FUZZ_KILL_SWITCH} exists"}
+    setup = fuzz_setup()
+    if isinstance(setup, str):
+        return {**base, "state": "skip", "reason": setup}
+    hook, roots_n, trusted = setup
+    capacity = FLEET_DIR / "capacity"
+    why = reservation_refusal(hook, now) or console_refusal(hook) or gui_refusal(hook, capacity)
+    if why:
+        return {**base, "state": "skip", "reason": why}
+    replay = pending_replay(now) if trusted else None
+    if not trusted:  # requests an older collector left here: never answered on a PR mini
+        shutil.rmtree(fuzz_dir() / "replays", ignore_errors=True)
+    if trusted and replay is None:
+        return {**base, "state": "skip", "reason": "a trusted-only runner (a seeder) runs here: it only replays for "
+                                                   "the collector, and no replay waits"}
+    free = free_bytes(FLEET_DIR)
+    floor = 0 if trusted else runner_floor_bytes(hook)
+    start = floor + FUZZ_START_HEADROOM_GIB * 1024 ** 3
+    if not trusted and (free is None or free < start):
+        return {**base, "state": "skip", "reason": f"{(free or 0) // 1024 ** 3} GiB free, the fuzzer needs "
+                                                   f"{start / 1024 ** 3:g} (the runners' {floor / 1024 ** 3:g} GiB "
+                                                   f"floor + {FUZZ_START_HEADROOM_GIB})"}
+    roots = main_roots(hook, roots_n, state)
+    kept = {path.name: path for path in staged_builds()}
+    newest = roots[0] if roots else None
+    if newest is None and not kept:
+        return {**base, "state": "skip", "reason": "no main build kept or staged on this mini"}
+    fuzz_dir().mkdir(parents=True, exist_ok=True)
+    lock = os.open(fuzz_dir() / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock)
+        return {**base, "state": "skip", "reason": "another fuzz run is under way"}
+    try:
+        if replay is not None:  # the run that held the lock may have answered it
+            replay = pending_replay()
+            if replay is None:
+                return {**base, "state": "skip", "reason": "the replay was answered"}
+        if not apply:
+            what = f"replay {replay.name} on" if replay else "fuzz"
+            return {**base, "state": "plan", "would": f"{what} main {(newest[1] if newest else next(iter(kept)))[:12]}"}
+        _grouped = own_group()
+        if not _grouped:
+            return {**base, "state": "skip", "reason": "cannot lead a process group for the fuzzer"}
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, stop)
+        with contextlib.suppress(OSError):
+            os.nice(max(0, FUZZ_NICE - os.nice(0)))
+        why = hold_fuzz(hook, capacity)
+        if why:
+            return {**base, "state": "skip", "reason": why}
+        _fuzzing = True
+        if newest is not None and newest[1] not in kept:
+            build = stage_build(state, newest[0], newest[1])
+            if isinstance(build, str):
+                return {**base, "state": "skip", "reason": build}
+        else:
+            build = kept[newest[1]] if newest else next(iter(kept.values()))
+        engine = None if replay else stage_engine(state, build.name)
+        if engine is None and replay is None:
+            return {**base, "state": "skip", "reason": "no fuzzer (scripts/fuzz) for this build"}
+        ours = os.fspath(fuzz_dir() / "builds") + "/"
+        # A job that took the gui token before our holder was written never saw it: look again now.
+        why = reservation_refusal(hook, time.time()) or gui_refusal(hook, capacity, ours)
+        if why:
+            return {**base, "state": "skip", "reason": why}
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
+        env["PATH"] = PATH
+        if replay is not None:
+            return run_replay(hook, capacity, ours, build, replay, env, base)
+        runs = fuzz_dir() / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        seed = int.from_bytes(os.urandom(4), "big") >> 1
+        out = runs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{build.name[:12]}-{seed}"
+        out.mkdir()
+        started = time.monotonic()
+        with open(out / "fuzz.log", "ab") as log:
+            _child = subprocess.Popen(
+                [sys.executable, os.fspath(engine / "scripts" / "fuzz"), "run", "--app", os.fspath(build / FUZZ_APP),
+                 "--minutes", str(FUZZ_MINUTES), "--minimize-minutes", str(FUZZ_MINIMIZE_MINUTES),
+                 "--max-findings", str(FUZZ_MAX_FINDINGS), "--seed", str(seed), "--out", os.fspath(out),
+                 "--label", "main", "--sha", build.name],
+                cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S,
+                              stop_below=floor + FUZZ_STOP_HEADROOM_GIB * 1024 ** 3)
+        _child = None
+        kill_build()  # the app and anything else the fuzzer left in our group
+        dismiss_crash_dialogs()
+        try:
+            summary = json.loads((out / "summary.json").read_text())
+        except (OSError, ValueError):
+            summary = None
+        summary = summary if isinstance(summary, dict) else {}
+        findings = summary.get("findings")
+        trim_fuzz_runs(runs)
+        return {**base, "state": "stopped" if stopped else "fuzzed", **({"reason": stopped} if stopped else {}),
+                "build": build.name, "run": out.name, "exit": code, "steps": summary.get("steps"),
+                "findings": len(findings) if isinstance(findings, list) else 0,
+                "wall_seconds": round(time.monotonic() - started, 1)}
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return {**base, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+    finally:
+        if _child is not None:  # watch() raised: the fuzzer and its app must not outlive the holder
+            with contextlib.suppress(OSError):
+                _child.kill()
+            _child = None
+            kill_build()
+        _fuzzing = False
+        release([])
+        os.close(lock)
+
+
+def run_replay(hook: Any, capacity: Path, ours: str, build: Path, request: Path, env: dict[str, str],
+               base: dict[str, Any]) -> dict[str, Any]:
+    """Run the collector's replay request against BUILD: `replay.py --app APP --sha SHA --out REQUEST/out`, with
+    the fuzz lane's holder, watch and preemption. Answered (REQUEST/.done, what the collector reads) unless a job
+    stopped it, which leaves the request for the next tick. Called from fuzz(), inside its lock and holder."""
+    global _child
+    out = request / "out"
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir()
+    started = time.monotonic()
+    with open(out / "replay.log", "ab") as log:
+        _child = subprocess.Popen(
+            [sys.executable, "-I", os.fspath(request / "replay.py"), "--app", os.fspath(build / FUZZ_APP),
+             "--sha", build.name, "--out", os.fspath(out)],
+            cwd=request, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    code, stopped = watch(hook, capacity, ours, REPLAY_TIMEOUT_S)
+    _child = None
+    kill_build()
+    dismiss_crash_dialogs()
+    result = {**base, "request": request.name, "build": build.name, "exit": code,
+              "wall_seconds": round(time.monotonic() - started, 1)}
+    if stopped and not stopped.startswith("timed out"):
+        shutil.rmtree(out, ignore_errors=True)
+        return {**result, "state": "stopped", "reason": stopped}
+    done = request / ".done.incoming"
+    done.write_text(json.dumps({"build": build.name, "exit": code, "reason": stopped}) + "\n")
+    done.rename(request / ".done")
+    return {**result, "state": "replayed", **({"reason": stopped} if stopped else {})}
+
+
+def dismiss_crash_dialogs() -> None:
+    """A crash the fuzzer caused leaves macOS's crash dialog (not in our process group) on the console, over the
+    next GUI job: close it. -u: only this user's dialog (the job's own), never another account's."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-x", "Problem Reporter"],
+                       capture_output=True, timeout=2)
+
+
+# ---------------------------------------------------------------- run
+
+
+def load_memory(path: Path) -> dict[str, Any]:
+    """What earlier runs recorded (per-root heads, failures, pause); a missing or malformed file starts over."""
+    try:
+        memory = json.loads(path.read_text())
+    except (OSError, ValueError):
+        memory = {}
+    if not isinstance(memory, dict):
+        memory = {}
+    if not isinstance(memory.get("roots"), dict):
+        memory["roots"] = {}
+    return memory
+
+
+def settle_attempt(memory: dict[str, Any], last_job: float | None = None) -> str:
+    """A build a kill cut short, left in MEMORY: '' when there is none. Preempted by a job, it is simply dropped
+    (the next idle spell tries again); killed with no job since it started, it counts as a failed try of that
+    head, like a build that failed."""
+    attempt = memory.pop("attempt", None)
+    if not isinstance(attempt, dict) or not isinstance(attempt.get("at"), int):
+        return ""
+    last_job = last_job_at() if last_job is None else last_job
+    if last_job is not None and last_job >= attempt["at"]:
+        return "preempted by a job"
+    memory["roots"][str(attempt.get("root"))] = {"head": attempt.get("head"), "at": attempt["at"], "kept": False}
+    memory["failures"] = int(memory.get("failures") or 0) + 1
+    if memory["failures"] >= FAILURES_TO_PAUSE:
+        memory["paused_until"] = int(time.time()) + FAILURE_BACKOFF_S
+        memory["failures"] = 0
+    return "killed with no job"
+
+
+def save_memory(path: Path, memory: dict[str, Any]) -> None:
+    incoming = path.with_name(f".{path.name}.{os.getpid()}")
+    incoming.write_text(json.dumps(memory, sort_keys=True) + "\n")
+    incoming.rename(path)
+
+
+def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
+    global _grouped
+    now = time.time() if now is None else now
+    if platform.system() != "Darwin":
+        return record(state="skip", reason="not macOS")
+    why = host_denied()
+    if why:
+        return record(state="skip", reason=why)
+    if KILL_SWITCH.exists():
+        return record(state="skip", reason=f"{KILL_SWITCH} exists")
+    stores = [state, *(state / f"cmux-ci-{k}" for k in range(2, 100))]
+    if not any((store / "seed-source.json").is_file() for store in stores):
+        return record(state="skip", reason="no owned compile has run on this mini")
+    setup = runner_setup(runner_dirs())
+    if isinstance(setup, str):
+        return record(state="skip", reason=setup)
+    hook, scope = setup
+    work = state / ".catch-up"
+    work.mkdir(parents=True, exist_ok=True)
+    lock = os.open(work / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return record(state="skip", reason="another catch-up is running")
+        memory_path = work / "state.json"
+        memory = load_memory(memory_path)
+        if apply and settle_attempt(memory):  # a plan never writes state
+            save_memory(memory_path, memory)
+        paused = memory.get("paused_until") or 0
+        if isinstance(paused, (int, float)) and now < paused:
+            return record(state="skip", reason=f"paused after {FAILURES_TO_PAUSE} failed builds until {int(paused)}")
+        why = idle_refusal(hook, now, state)
+        if why:
+            return record(state="skip", reason=why)
+        head = main_head(state)
+        if not head:
+            return record(state="skip", reason="no main head in the seed prefetch mirror")
+        picked = pick_root(hook, scope["roots"], head, state, memory)
+        if isinstance(picked, str):
+            return record(state="skip", reason=picked, head=head)
+        root, predicted = picked
+        base = record(head=head, root=root, predicted=predicted)
+        if not apply:
+            return {**base, "state": "plan", "would": f"build main's head into root-{root}"}
+        try:
+            prepare_checkout(work, head)
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", b"") or b""
+            detail = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
+            return {**base, "state": "error", "reason": f"checkout: {type(error).__name__} {detail.strip()[-160:]}"}
+        # The checkout may have taken minutes: look again before taking anything.
+        why = idle_refusal(hook, time.time(), state)
+        if why:
+            return {**base, "state": "skip", "reason": why}
+        _grouped = own_group()
+        if not _grouped:
+            return {**base, "state": "skip", "reason": "cannot lead a process group for the build"}
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(signum, stop)
+        taken = take(hook, FLEET_DIR / "capacity", scope, root)
+        if isinstance(taken, str):
+            return {**base, "state": "skip", "reason": taken}
+        fds, held = taken
+        try:
+            busy = running()  # a job that started while the locks were taken: it will ask for them
+            if busy:
+                return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            # the reserve and the nightly waiters again, now the locks are ours: either may have changed since
+            why = nightly_reserve_refusal(hook)
+            if why:
+                return {**base, "state": "skip", "reason": why}
+            reserve = nightly_reserve(hook)
+            if reserve is None:
+                return {**base, "state": "skip", "reason": "cannot read the dedicated nightly builder's disk reserve"}
+            builder = reserve[0]
+            logs = work / "logs"
+            logs.mkdir(exist_ok=True)
+            log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
+            # Kept if we are killed: a kill with no job behind it (the gate shedding our load) counts as a
+            # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
+            memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
+            save_memory(memory_path, memory)
+            result = build(work / "cmux", root, state, scope["xcode"], log,
+                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None,
+                           nightly_waiter=(lambda: nightly_waiter_refusal(hook)) if builder > 0 else None)
+            memory.pop("attempt", None)
+            trim_logs(logs)
+        finally:
+            release(fds)
+        kept = result.get("kept") == "true"
+        memory["roots"][str(root)] = {"head": head, "at": int(time.time()), "kept": kept}
+        memory["failures"] = 0 if kept else int(memory.get("failures") or 0) + 1
+        if memory["failures"] >= FAILURES_TO_PAUSE:
+            memory["paused_until"] = int(time.time()) + FAILURE_BACKOFF_S
+            memory["failures"] = 0
+        save_memory(memory_path, memory)
+        return {**base, "state": "applied", "held": held, "result": result}
+    finally:
+        os.close(lock)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--fuzz", action="store_true",
+                        help="the UI fuzzer lane instead of the catch-up (with --apply: run it)")
+    args = parser.parse_args(argv)
+    state = Path(os.environ.get("GLAEDA_SEED_STATE") or FLEET_DIR / "ci")
+    print(json.dumps(fuzz(args.apply, state) if args.fuzz else run(args.apply, state)), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

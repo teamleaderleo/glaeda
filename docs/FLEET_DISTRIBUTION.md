@@ -107,5 +107,20 @@ rollback. No automatic predecessor upgrade is authorized by this format.
 
 For now, an operator selects an exact reviewed candidate, preserves the previous
 generation, and runs the enrollment renewal and acceptance sequence after updating.
+
+A fleet tool change (`cmux_fleet.py`, `cmux_fleet_bootstrap.py`) reaches minis only in
+a new candidate: a staged generation runs its own copy, and the digest of both files
+is the fleet contract generation every acceptance binds. So a new candidate stales
+every node and class acceptance. Roll one out like this:
+
+1. After the change merges, dispatch `fleet-candidate.yml` on the merged commit and
+   take the run ID from it.
+2. From the operator Mac, `glaeda-mini-fleet upgrade --candidate-run RUN` shows the plan;
+   with `--yes` it downloads and checks the candidate, runs one `accept-local` per hardware
+   class on a seed, exports and records the class receipt and the candidate pin in the
+   fleet manifest, and renews every other node onto the candidate by class adoption. See
+   [Updating the fleet](CMUX_FLEET_ENROLLMENT.md#updating-the-fleet). The fleet manifest's
+   `candidate` is the pin `onboard` and `repair` then use; nothing reads a pin from cmux.
+
 Repository-side automation should build on this same bundle, without requiring
 the CMUX team to design a second distribution system.

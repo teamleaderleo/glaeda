@@ -5,6 +5,14 @@
   "never_touch": [
     "coordinator-mini"
   ],
+  "lan": {
+    "subnet": "10.0.8.",
+    "auth": "agent",
+    "note": "the minis reach each other's port 22 on this LAN; ssh -A from the operator lends the source its key"
+  },
+  "runner": {
+    "org": "example-org"
+  },
   "keys": {
     "coordinator": {
       "fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -26,17 +34,23 @@
       "status": "review"
     }
   },
-  "classes": {
+  "hardware": {
     "m4pro-48": {
       "model": "Mac16,11",
       "chip": "Apple M4 Pro",
       "cpus": 14,
-      "memory_gib": 48
+      "memory_gib": 48,
+      "acceptance": {
+        "xcode_build": "17C529",
+        "candidate": "59ca9c9bd1bb",
+        "node": "cmux-mac-001"
+      }
     },
     "m4-16": {
       "model": "Mac16,10",
       "chip": "Apple M4",
-      "memory_gib": 16
+      "memory_gib": 16,
+      "compile_lane": false
     }
   },
   "defaults": {
@@ -78,6 +92,7 @@
         "service-cache"
       ],
       "exclusive": true,
+      "loopback_options": "from=\"127.0.0.1,::1\",no-agent-forwarding,no-X11-forwarding",
       "no_backups": false
     },
     "launchd": {
@@ -86,14 +101,35 @@
       ]
     },
     "disk": {
-      "min_free_gib": 100
+      "min_free_gib": 30
     },
-    "controller_token": "present"
+    "controller_token": "present",
+    "toolchain": {
+      "xcode": {
+        "app": "/Applications/Xcode.app",
+        "version": "26.3",
+        "build": "17C529",
+        "select": true
+      },
+      "metal": true,
+      "zig_min": "0.16.0",
+      "rustup_default": "stable",
+      "python_min": "3.13",
+      "cmux": {
+        "repo": "manaflow-ai/cmux",
+        "ref": "main",
+        "root": "~/cmux",
+        "submodule_depth": 1
+      }
+    }
   },
   "hosts": {
     "build-mini-1": {
       "hostname": "build-mini-1",
-      "class": "m4pro-48",
+      "node_id": "cmux-mac-001",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
       "roles": [
         "dev-builds",
         "ci-runner"
@@ -102,7 +138,10 @@
     },
     "build-mini-2": {
       "hostname": "Build-Mini-2",
-      "class": "m4pro-48",
+      "node_id": "cmux-mac-002",
+      "hardware": "m4pro-48",
+      "class": "std",
+      "availability": "dedicated",
       "roles": [
         "nightly",
         "ios-simulators"
@@ -111,7 +150,9 @@
     },
     "small-mini": {
       "hostname": "small-mini",
-      "class": "m4-16",
+      "hardware": "m4-16",
+      "class": "light",
+      "availability": "dedicated",
       "note": "runs other services; record only",
       "overrides": {
         "apply": false,

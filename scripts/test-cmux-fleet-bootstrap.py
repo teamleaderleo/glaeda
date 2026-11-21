@@ -95,7 +95,17 @@ class Tests(unittest.TestCase):
             "cmux-mac-build-large",
         )
         self.assertFalse(result["eligibleForEnrollment"])
-        self.assertEqual(result["blockingChecks"], ["diskAdmission", "xcodePin"])
+        self.assertEqual(result["blockingChecks"], ["xcodePin"])
+        self.assertEqual(result["warningChecks"], ["diskAdmission"])
+
+    def test_a_disk_floor_warns_and_never_blocks_enrollment(self):
+        for failed in (("diskAdmission",), ("nativeCacheDiskAdmission",), ("diskAdmission", "nativeCacheDiskAdmission")):
+            result = b.evaluate(observation(failed=failed), ["cmux_macos_native_build"], "cmux-mac-build-large")
+            self.assertTrue(result["eligibleForEnrollment"], failed)
+            self.assertEqual(result["blockingChecks"], [])
+            self.assertEqual(result["warningChecks"], sorted(failed))
+        for check in b.WARNING_CHECKS:
+            self.assertIn(check, b.BLOCKING_FIXES)  # the warning names its fix
 
     def test_wrong_os_role_refused(self):
         with self.assertRaisesRegex(b.BootstrapError, "incompatible"):
@@ -306,7 +316,10 @@ class Tests(unittest.TestCase):
         if name == "xcodebuild":
             return "Xcode 26.0\nBuild version 26A123"
         if name == "xcrun":
-            return "metal version 32023" if "metal" in rest else "26.0"
+            if "metal" in rest:
+                return ("metal version 32023\nTarget: air64-apple-darwin25.5.0\n"
+                        "InstalledDir: /private/var/run/mnt/MetalToolchain-v17.6.7KPGHG/bin")
+            return "26.0"
         if name == "zig":
             return "0.16.0"
         if name == "rustup":
@@ -318,22 +331,124 @@ class Tests(unittest.TestCase):
         if name == "pmset":
             return "AC Power:\n sleep 0\nBattery Power:\n sleep 10"
         if name == "sysctl":
+            if "hw.model" in rest:
+                return "Mac16,11"
+            if "machdep.cpu.brand_string" in rest:
+                return "Apple M4 Pro"
             return str(64 * 1024**3)
         raise AssertionError(argv)
 
-    def _collect_macos(self, root, cache_root, visible):
+    def _collect_macos(self, root, cache_root, visible, macos_version="26.5", xcode_version="26.0", sdk_version="26.0"):
+        def command(argv, **kwargs):
+            name = Path(argv[0]).name
+            if name == "xcodebuild":
+                return f"Xcode {xcode_version}\nBuild version {xcode_version.split('.')[0]}A123"
+            if name == "xcrun" and "metal" not in argv[1:]:
+                return sdk_version
+            return self._macos_command(argv, **kwargs)
+
         with (
             mock.patch.object(b.platform, "system", return_value="Darwin"),
-            mock.patch.object(b.platform, "mac_ver", return_value=("26.5", ("", "", ""), "arm64")),
+            mock.patch.object(b.platform, "mac_ver", return_value=(macos_version, ("", "", ""), "arm64")),
             mock.patch.object(b.platform, "machine", return_value="arm64"),
             mock.patch.object(b, "executable", side_effect=lambda n: f"/usr/bin/{n}"),
-            mock.patch.object(b, "run", side_effect=self._macos_command),
+            mock.patch.object(b, "run", side_effect=command),
             mock.patch.object(
                 b.shutil, "which",
                 side_effect=lambda name, path=None: f"/usr/bin/{name}" if visible else None,
             ),
         ):
             return b.collect_macos(root, root / "glaeda", 1, "cmux-mac-build-large", cache_root)
+
+    def test_rust_is_observed_from_the_cmux_checkout(self):
+        # rustup picks the toolchain from the working directory, so a probe run
+        # elsewhere (a Glaeda checkout pins its own Rust) moves the toolchain
+        # generation between enrollment and acceptance.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / "glaeda").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            seen = {}
+            original = self._macos_command
+
+            def command(argv, **kwargs):
+                if Path(argv[0]).name in ("rustup", "cargo", "rustc"):
+                    seen[" ".join(argv[1:])] = kwargs.get("cwd")
+                return original(argv, **kwargs)
+
+            with mock.patch.object(self, "_macos_command", side_effect=command):
+                self._collect_macos(root, cache_root, visible=True)
+            self.assertTrue(seen)
+            self.assertEqual(set(seen.values()), {root}, seen)
+
+    def test_xcode_pin_accepts_the_major_cmux_pins(self):
+        # cmux#14050 changed .xcode-version from "26.0" to "26".
+        for pin in ("26", "26.0", "26\n".strip()):
+            self.assertTrue(b.xcode_pin_ready(pin, "26.6", "26.5"), pin)
+        self.assertTrue(b.xcode_pin_ready("27", "27.0", "27.0"))
+        self.assertTrue(b.xcode_pin_ready("27", "27.1", "27.1"))
+        self.assertFalse(b.xcode_pin_ready("25", "25.4", "25.4"))
+        self.assertFalse(b.xcode_pin_ready("26", "25.4", "26.5"))
+        self.assertFalse(b.xcode_pin_ready("26", "260.1", "26.5"))
+        self.assertFalse(b.xcode_pin_ready("26", "26.6", "15.5"))
+        self.assertFalse(b.xcode_pin_ready("26", None, "26.5"))
+        self.assertFalse(b.xcode_pin_ready("", "26.6", "26.5"))
+
+    def test_macos_observation_accepts_a_major_only_xcode_version_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / ".xcode-version").write_text("26\n", encoding="utf-8")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            self.assertTrue(self._collect_macos(root, cache_root, visible=True)["checks"]["xcodePin"])
+
+    def test_macos_27_observation_is_supported_with_a_matching_xcode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / ".xcode-version").write_text("27\n", encoding="utf-8")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            observed = self._collect_macos(
+                root, cache_root, visible=True, macos_version="27.0.1", xcode_version="27.0", sdk_version="27.0"
+            )
+        self.assertTrue(observed["checks"]["supportedOs"])
+        self.assertTrue(observed["checks"]["xcodePin"])
+
+    def test_macos_observation_reports_class_identity(self):
+        # cmux_fleet.py class acceptance binds these; the digest must be the
+        # toolchain generation so a node cannot report one and run another.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            observed = self._collect_macos(root, cache_root, visible=True)
+        self.assertEqual(
+            observed["observed"]["hardware"],
+            {"model": "Mac16,11", "chip": "Apple M4 Pro", "memoryGiB": 64},
+        )
+        toolchain = observed["observed"]["toolchain"]
+        self.assertEqual(toolchain["xcodeBuild"], "26A123")
+        self.assertEqual(toolchain["xcodeVersion"], "26.0")
+        # The asset mount path differs between identical hosts, so only the version line counts.
+        self.assertEqual(toolchain["metalVersion"], "metal version 32023")
+        self.assertEqual(
+            observed["toolchainGeneration"], b.digest_bytes(b.canonical(toolchain))
+        )
+        self.assertNotIn("serial", json.dumps(observed).lower())
 
     def test_macos_observation_reports_workload_tool_visibility(self):
         # collect_macos cannot run on the host that runs this suite, so its
@@ -432,6 +547,69 @@ class Tests(unittest.TestCase):
                 raw.replace("sleep              0", "sleep              1")
             )
         )
+
+
+    def test_failed_commands_name_the_missing_thing_and_its_fix(self):
+        def fake(output, code=1):
+            return subprocess.CompletedProcess([], code, stdout=output)
+
+        cases = (
+            (["/usr/bin/xcrun", "metal", "--version"],
+             "error: error: cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain",
+             "xcrun metal --version failed: Metal Toolchain missing; run xcodebuild -downloadComponent MetalToolchain"),
+            (["/usr/bin/xcodebuild", "-version"],
+             "DVTPlugInLoading: Failed to load code for plug-in; run xcodebuild -runFirstLaunch",
+             "xcodebuild -version failed: " + b.FIRST_LAUNCH_FIX),
+            (["/opt/homebrew/bin/rustup", "run", "1.88.0"],
+             "error: toolchain '1.88.0-aarch64-apple-darwin' is not installed",
+             "rustup run 1.88.0 failed: Rust toolchain 1.88.0-aarch64-apple-darwin is not installed; "
+             "run rustup toolchain install 1.88.0-aarch64-apple-darwin"),
+            (["/usr/bin/git", "status"], "fatal: not a git repository\n", "git status failed: exit 1: fatal: not a git repository"),
+        )
+        for argv, output, message in cases:
+            with self.subTest(argv=argv), mock.patch.object(b.subprocess, "run", return_value=fake(output)):
+                with self.assertRaises(b.BootstrapError) as raised:
+                    b.run(argv)
+                self.assertEqual(str(raised.exception), message)
+
+    def test_missing_tools_and_files_name_their_fix(self):
+        with mock.patch.object(b.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(b.BootstrapError, "required command is missing: zig; brew install zig as the Homebrew owner"):
+                b.executable("zig")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(b.BootstrapError, "git submodule update --init"):
+                b.cmux_required_zig_version(root)
+            with self.assertRaisesRegex(b.BootstrapError, "rust-toolchain.toml is missing"):
+                b.cmux_diff_rust_toolchain(root)
+        self.assertEqual(b.minimum_zig_version('.{\n    .minimum_zig_version = "0.16.0",\n}\n'), "0.16.0")
+        self.assertIsNone(b.minimum_zig_version(".{}"))
+        self.assertTrue(b.submodule_status_ready(" a1 ghostty (heads/main)\n a2 vendor/bonsplit"))
+        self.assertFalse(b.submodule_status_ready("-a1 ghostty"))
+        self.assertFalse(b.submodule_status_ready(""))
+
+    def test_errors_from_older_candidates_are_explained(self):
+        self.assertEqual(
+            b.explain_error("[Errno 2] No such file or directory: '/Users/cmux/cmux/ghostty/build.zig.zon'"),
+            b.SUBMODULE_FIX,
+        )
+        self.assertIn("xcodebuild -downloadComponent MetalToolchain",
+                      b.explain_error("required command failed: xcrun"))
+        self.assertIn("brew install rustup", b.explain_error("required command is missing: cargo"))
+        self.assertEqual(b.explain_error("something else"), "something else")
+
+    def test_every_check_the_collectors_emit_has_a_fix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / "glaeda").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            macos = self._collect_macos(root, cache_root, visible=True)
+        linux = observation("linux")
+        for checks in (macos["checks"], linux["checks"]):
+            self.assertEqual(set(checks) - set(b.BLOCKING_FIXES), set())
+        self.assertNotIn("\u2014", " ".join(b.BLOCKING_FIXES.values()))
 
 
 if __name__ == "__main__":

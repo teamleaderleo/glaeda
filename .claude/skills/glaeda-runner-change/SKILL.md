@@ -1,0 +1,97 @@
+---
+name: glaeda-runner-change
+description: "Change and roll out glaeda's cmux runner tooling safely: glaeda-cmux-runner, glaeda-cmux-runner-hook (admission, capacity ledger, lock holders, listener gate, job telemetry), glaeda-cmux-runner-fleet, glaeda-fleet-status and glaeda-mini-fleet. Use before editing any of those scripts or their docs, and when deploying a hook change to the minis."
+---
+
+# Change the glaeda runner tooling
+
+The hook runs inside every CI job on every mini. A crash in `job-started` refuses the job; a lock bug strands a
+mini. Keep changes small, observable and reversible.
+
+## Before editing
+
+- Read `AGENTS.md` and the contract doc for the surface: `docs/CMUX_MINI_RUNNER.md` (hook, runner, capacity,
+  telemetry), `docs/FLEET_STATUS.md` (status sources and findings), `docs/GLAEDA_OTA.md` (deploys).
+- Work in your own worktree from `origin/main` (`~/.local/bin/glaeda-worktree add --no-build <glaeda checkout> NAME origin/main`,
+  then `git switch -c BRANCH`). The main checkout may be in use by fleet jobs.
+- Never cap GUI capture concurrency with a fixed runner or unit count; gate it on measured CPU and memory
+  load (Leo, 2026-10-19). Webview captures belong on Linux (cmux's gallery advisory run), not a mini.
+
+## Rules the tests enforce
+
+- No em dashes (U+2014) in the runner, hook, fleet, status tooling or their docs (`NoEmDashTest`).
+- Output stays bounded and typed. No secrets, raw logs, environment dumps, process arguments or private paths
+  (home paths become `~`). Job telemetry names processes by executable basename and user only.
+- Subprocesses use absolute paths and argument vectors (`/bin/ps`, `/usr/sbin/sysctl`), with timeouts. In the hook
+  `subprocess.run` is `run_bounded` (`RunIsBoundedTest`): the standard one waits with no limit for the child it
+  killed at the timeout, so an unkillable child (a `/bin/ps` stuck in the kernel on a wedged mini) held
+  `Set up runner` for a whole job timeout. A `Popen` you add bounds its post-kill `communicate()`/`wait()` too.
+- Observation never becomes admission: telemetry and status findings must not refuse, delay or fail a job.
+- Anything forked from the hook detaches twice, points stdio at /dev/null (the runner reads the hook's output
+  until EOF), and must not keep lock fds it does not own. A pid file for a new helper must not match the
+  `host-lock-holder*` glob, or the listener gate will count it as a lock holder.
+- A new script goes into the `compile()` path list in `.github/workflows/ci.yml`; a new `scripts/test-*.py` goes
+  into the test list there.
+
+## Test
+
+Run only the cases you changed; the Verify workflow runs the full suites in shards.
+
+```bash
+python3 scripts/test-glaeda-cmux-runner.py JobTelemetryTest -v   # one class, or -k NAME
+python3 scripts/test-glaeda-fleet-status.py -k NAME
+python3 scripts/test-glaeda-cmux-runner-fleet.py -k NAME
+python3 scripts/test-glaeda-mini-fleet.py -k NAME
+./scripts/verify focused                                         # Rust, when src/ changes
+```
+
+The hook test harness sets `GLAEDA_RUNNER_TELEMETRY=0`; tests that need the sampler enable it explicitly.
+CI runs on Linux: guard macOS-only commands (`sysctl vm.loadavg`, `pmset`) so they degrade to `None`.
+
+## Review and merge
+
+Concurrency, persistence and privilege changes (locks, holders, capacity, anything forked from the hook) need an
+independent review of the exact head before merge; a read-only subagent review with the diff and the failure
+modes above is the usual route. Routine low-risk changes may be self-reviewed after checks pass. Docs-only PRs
+skip Verify; say so in the PR.
+
+## Roll out
+
+```bash
+scripts/glaeda-cmux-runner-fleet                     # plan: eligible members and runner counts
+scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts ONE  # canary first
+scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis              # then the rest
+```
+
+The runners are org-scoped. An apply without `--org` refuses every instance ("already has a runner install")
+and changes nothing. Run it from a worktree at `origin/main`, not the shared base checkout.
+
+The downgrade guard enforces that: `--apply` refuses, changing nothing on any member, when HEAD is not origin's
+`main` (read live with `git ls-remote`; a stale local `origin/main` cannot vouch for it) or when a member's
+`~/glaeda-runner/scripts/.glaeda-source.json` names a commit that is not an ancestor of HEAD (a downgrade, or a
+branch deployed by hand), or when the staged files or the fleet tool itself have uncommitted changes or are
+marked `--assume-unchanged` or `--skip-worktree`. The refusal names the member, its
+stamped commit and HEAD; the plan lists the same findings. A member with no stamp, or an unreadable one, is not a
+downgrade and the output says so. To deploy anyway (a deliberate rollback, a branch canary), pass
+`--allow-downgrade "REASON"`: the reason is printed and recorded in each staged stamp as `allowDowngrade`. Never
+pass it to get past a refusal you have not read. A canary stamped that way and then squash-merged is never an
+ancestor of main, so the next run from origin's `main` rolls it forward ("rolling forward from a deliberate
+off-main deploy") instead of refusing. It does so even while that PR is still open: a run from main replaces an
+active, unmerged canary by design, so re-stage the canary afterwards if it should keep running. The stamp names the HEAD the guard checked. Running from an OTA release
+copy (no git checkout) needs `--allow-downgrade`. A shallow checkout fails closed (an older stamp reads as not an
+ancestor): `git fetch --unshallow` first.
+`glaeda-fleet-status` reports members whose stamp is behind or off origin/main (`tooling.behind`,
+`tooling.not_ancestor`).
+
+A merged hook or runner change needs no `--apply`: `glaeda-update` (`docs/GLAEDA_OTA.md`) brings every
+runner mini's `~/glaeda-runner/scripts` copy and the runners' hook files to the installed release every 10
+minutes, swapping a busy runner's hook in its next gap between jobs. Use `--apply` for new runners, labels or
+capacity, and for a deliberate canary or rollback. A hook installed from a newer commit or edited by hand is
+kept, not downgraded.
+
+job-started.sh runs the hook file fresh for every job, so a staged hook takes effect for the next job without a
+restart. After the canary, run a job there and check the new behavior on the host (for telemetry:
+`ssh MEMBER 'tail -n 1 ~/Library/Logs/glaeda-cmux-jobs.jsonl'`), then `scripts/glaeda-fleet-status --host MEMBER`.
+Kill switch for telemetry without a redeploy: `GLAEDA_RUNNER_TELEMETRY=0` in the runner LaunchAgent environment.
+
+Diagnosing a job or host rather than changing tooling: use the `glaeda-fleet-diagnose` skill.

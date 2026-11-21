@@ -1,0 +1,2210 @@
+#!/usr/bin/env python3
+"""One typed, bounded status document for the build fleet, for humans and agents alike.
+
+    glaeda-fleet-status [status] [collect options] [--out FILE] [--html FILE] [--output text|json]
+    glaeda-fleet-status collect  [collect options] --sources-out FILE
+    glaeda-fleet-status build SOURCES.json [--out FILE] [--html FILE] [--output text|json]
+    glaeda-fleet-status render STATUS.json [--html FILE] [--output text|json]
+
+Collection joins what exists today, each source optional and read-only:
+
+  --manifest                 members, classes, roles, never_touch (glaeda-mini-fleet manifest)
+  (default on)               glaeda-mini-fleet check and preflight, from one SSH probe per member
+  --controller-status PATH   cmuxterm-hq build-fleet/status.py --json (or --controller-json FILE)
+  --github-runners SCOPE     runners of orgs/OWNER or repos/OWNER/REPO: online, busy, labels
+  --queue-repo OWNER/REPO    queued jobs per label in that repository (repeatable)
+  --cache NAME=URL           cache health endpoint, e.g. a /healthz URL (repeatable)
+  --live-builder-status PATH optional cmux-live status.json (requires explicit --live-builder-profile)
+  --live-builder-profile ID  policy profile attached to the live-builder status source
+  (default on)               Lima instance counts and orphans per member (--no-lima to skip)
+  (default on)               disk per member: free space, cache families and owners (glaeda-disk --json),
+                             the last fleet-cas-prune and gc lines, bytes reclaimed in 24 h (--no-disk to skip)
+  (default on)               runner jobs per member over 24 h: how many ran contended (the runner hook's
+                             ~/Library/Logs/glaeda-cmux-jobs.jsonl), and what used the CPU (--no-jobs to skip)
+  (default on)               runner tooling per member: the commit its ~/glaeda-runner/scripts/.glaeda-source.json
+                             stamp names, against this checkout's local origin/main ref (never fetched here):
+                             how far behind, or not an ancestor at all (--no-tooling to skip)
+  (default on)               the root daemon-heal LaunchDaemon per macOS member: installed, and its own report
+                             judged by glaeda-daemon-heal (passes running, kept on the stable release), as
+                             daemon_heal_missing and daemon_heal_stale (--no-daemon-heal to skip)
+
+Every finding carries a typed action {id, who: agent|password|person, safe_to_apply, command, note}:
+`command` runs from the operator machine, `safe_to_apply` is true only for read-only commands, and
+members in the manifest's never_touch list never get an agent action. Every source and finding
+carries observed_at so a stale view shows as stale. Nothing here changes any machine, except that
+glaeda-disk, like every report run of it, may rewrite its own size snapshot (~/.cache/glaeda-disk).
+
+The optional live-builder source consumes only `cmux-live-builder-status/v1` from the bounded local
+status file. The profile is explicit policy input; host names never imply CI enrollment. Unknown,
+blocked, stale, or missing observations remain warnings and never produce an automatic command.
+
+Exit status: 0 no error findings, 1 at least one error finding, 2 the tool itself failed.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-fleet-status/v1"
+SOURCES_SCHEMA = SCHEMA + "/sources"
+LIVE_BUILDER_SCHEMA = "cmux-live-builder-status/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SSH = "/usr/bin/ssh"
+SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
+
+WHO = ("agent", "password", "person")
+SEVERITIES = ("error", "warn", "info")
+SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs",
+                "tooling", "daemon_heal", "live_builder")
+# A source older than this at build time is itself a finding.
+DEFAULT_MAX_AGE = 900
+MAX_MEMBERS = 128
+MAX_FINDINGS = 500
+MAX_TEXT = 240
+MAX_COMMAND = 400
+MAX_LABELS = 16
+MAX_DECLARED_RUNNERS = 16  # glaeda_fleet_labels.MAX_RUNNERS: a bundle's count past it is not trusted further
+MAX_QUEUE_RUNS = 25
+# Org scopes list every ephemeral hosted runner too.
+MAX_RUNNER_PAGES = 10
+MAX_LIMA = 64
+MAX_DISK_FAMILIES = 24
+GIB = 1024**3
+MAX_DOCUMENT_BYTES = 512 * 1024
+MAX_LIVE_BUILDER_BYTES = 32 * 1024
+LIMA_TIMEOUT = 30
+GH_TIMEOUT = 30
+CONTROLLER_TIMEOUT = 60
+CACHE_TIMEOUT = 5
+# glaeda-disk judges live verdicts (open files, running commands) on top of its size snapshot: ~15 s.
+DISK_TIMEOUT = 90
+JOBS_TIMEOUT = 30
+JOBS_WINDOW_S = 24 * 3600
+TOOLING_TIMEOUT = 30
+GIT_TIMEOUT = 30
+SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+TOOLING_STATES = ("current", "behind", "not_ancestor", "none", "unreadable", "unjudged")
+LIVE_BUILDER_HEALTH_FIELDS = ("preflight", "config", "identity", "xcode", "toolchain", "host_tools", "verifier",
+                              "cef_secrets", "publish_secrets", "disk")
+LIVE_BUILDER_HEALTH_STATES = frozenset(("pass", "blocked", "unknown"))
+LIVE_BUILDER_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}\Z")
+LIVE_BUILDER_REASON_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,63}\Z")
+LIVE_BUILDER_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+LIVE_BUILDER_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+MAX_CONTENDED_JOBS = 5  # per member, newest first
+CONSOLE_STATES = ("unlocked", "locked", "no_user")
+# A retired owner's family above this is worth a person's decision.
+RETIRED_WARN_BYTES = 5 * GIB
+# glaeda-disk's user-tmp-test-residue reaps test scratch 12 h idle; this many past 12 h means it is not keeping up
+# (~55,000 entries on one CI mini stalled every pressure pass, 2026-10-26).
+TMP_RESIDUE_WARN = 10_000
+# fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
+PRUNE_SILENT_SECONDS = 3 * 3600
+PRUNE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-prune"
+# glaeda-disk families whose bytes are also counted in another family (both sit inside checkouts).
+DOUBLE_COUNTED = frozenset({"cargo-target", "checkout-build"})
+GC_SUSPECT = re.compile(r"kept entries naming no stored object: (\d+)")
+
+# Only these reach child processes; the document never carries any of them.
+CHILD_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "SSH_AUTH_SOCK", "TMPDIR",
+             "XDG_CONFIG_HOME", "GH_HOST", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR",
+             "CMUX_CI_TOKEN_FILE", "CMUX_CI_TOKEN", "CMUX_CI_CONTROLLER", "GLAEDA_MINI_FLEET_MANIFEST",
+             "GLAEDA_CMUX_ROOT")
+SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+\S+|"
+                       r"(?i:(?:token|secret|password)\s*[=:]\s*)\S+)")
+PRIVATE_HOME_RE = re.compile(r"/Users/[^/\s'\"]+")
+# A fix becomes a command only when every ;/&& part is: optional VAR=value words, a known program or a
+# path, then plain argument words. Anything else, including every shell metacharacter, stays a note.
+WORD = r"[A-Za-z0-9_./=:@~+,%-]+"
+PROGRAM = r"(?:sudo|cd|brew|rustup|git|launchctl|xcodebuild|xcode-select|pmset|env|glaeda-[a-z-]+|(?:/|\./|~/|scripts/)[A-Za-z0-9_./@+-]+)"
+# Shell syntax anywhere means the text is not ours to run; ; and && are the only separators allowed.
+SHELL_SYNTAX = re.compile(r"[$`|<>()*?!{}\[\]'\"\\#&]")
+COMMAND_PART = re.compile(rf"(?:[A-Z_][A-Z0-9_]*={WORD} )*{PROGRAM}(?: {WORD})*")
+# Words that only prose uses; a part carrying one is a sentence that starts like a command.
+PROSE_WORDS = frozenset({"the", "a", "an", "it", "its", "where", "when", "then", "which", "that", "this", "is",
+                         "are", "was", "on", "if", "after", "before", "first", "see", "shows", "comes", "until"})
+# A host we will put after ssh: no option-looking or shell-looking names.
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+LIMA_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+# controller status.py states that need someone.
+CONTROLLER_FINDINGS = {
+    "stale": ("error", "restore_worker_heartbeat", "person",
+              "worker heartbeat is older than 120 s; a 401 loop in the worker log means it needs a new controller token"),
+    "unhealthy": ("error", "inspect_worker", "person", "controller marks the worker unhealthy"),
+    "policy unknown": ("warn", "update_worker_policy", "person",
+                       "worker advertises no current admission policy; it cannot be judged ready"),
+    "below CMUX start floor": ("warn", "free_disk", "agent", "free space is below the CMUX start floor"),
+    "excluded": ("info", "none", "person", "fleet.json withdraws this worker from the managed pool"),
+}
+
+
+def controller_worker_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize both HQ status.py rows and the live controller API shape.
+
+    The controller's ``/v1/status`` and ``/v1/workers`` endpoints return a
+    mapping keyed by worker name, while the older HQ status projection returns
+    ``[{host, state, ...}]``.  Keeping the normalization here prevents the
+    operator report from silently dropping the richer live fields that explain
+    a pause (for example a missing ``with-host-lock`` executable).
+    """
+    raw = data.get("workers") or []
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+    if not isinstance(raw, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        row = dict(value)
+        row.setdefault("host", name)
+        row.setdefault("name", name)
+        claim = clean(row.get("claim_paused") or "", 40)
+        if claim:
+            row.setdefault("state", claim)
+        elif row.get("healthy") is False:
+            row.setdefault("state", "unhealthy")
+        elif row.get("online") is False:
+            row.setdefault("state", "stale")
+        elif row.get("running"):
+            row.setdefault("state", "busy")
+        else:
+            row.setdefault("state", "ready")
+        rows.append(row)
+    return rows
+# glaeda-mini-fleet check areas that block builds outright.
+CHECK_ERRORS = frozenset({"reach", "identity", "enrollment", "worker"})
+PREFLIGHT_UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def clean(text: Any, limit: int = MAX_TEXT) -> str:
+    """Bounded, single-line, secret-free, home-path-free text."""
+    value = " ".join(str(text or "").split())
+    value = SECRET_RE.sub("[redacted]", value)
+    value = PRIVATE_HOME_RE.sub("~", value)
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def norm(name: Any) -> str:
+    value = str(name or "").strip().lower()
+    return value[:-6] if value.endswith(".local") else value
+
+
+def child_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in CHILD_ENV if k in os.environ}
+
+
+def source(data: Any = None, error: str | None = None, observed_at: int | None = None) -> dict[str, Any]:
+    return {"ok": error is None, "error": clean(error) if error else None,
+            "observed_at": observed_at if observed_at is not None else now(), "data": data}
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def as_command(fix: Any) -> str | None:
+    """The fix when it is a command in the closed grammar above; None when any part reads as prose."""
+    text = str(fix or "").strip()
+    if not text or text != " ".join(text.split(" ")) or any(ord(ch) < 32 for ch in text):
+        return None
+    if SHELL_SYNTAX.search(text.replace("&&", "")):
+        return None
+    parts = [p.strip() for p in re.split(r";|&&", text)]
+    for part in parts:
+        if not part or not COMMAND_PART.fullmatch(part) or PROSE_WORDS & set(part.lower().split()):
+            return None
+    return text
+
+
+def remote(host: str, command: str, tty: bool = False) -> str | None:
+    """ssh HOST 'command' from the operator machine, or None when the host is not a plain name."""
+    if not HOST_RE.match(host):
+        return None
+    return f"ssh {'-t ' if tty else ''}-- {host} {shlex.quote(command)}"
+
+
+def num(value: Any) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def stamp_of(value: Any) -> int | None:
+    return int(value) if num(value) is not None else None
+
+
+def live_builder_stamp(value: Any) -> int | None:
+    """Accept the HQ contract's numeric or UTC ISO-8601 measurement time."""
+    stamp = stamp_of(value)
+    if stamp is not None:
+        return stamp
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def live_builder_token(value: Any, pattern: re.Pattern[str]) -> str | None:
+    """Keep only bounded public identifiers from the live-builder receipt."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
+
+
+# ---------------------------------------------------------------- collection (read-only)
+
+
+def _load(name: str, path: Path) -> Any:
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+def mini_fleet() -> Any:
+    sys.path.insert(0, os.fspath(SCRIPT_DIR))
+    return _load("glaeda_mini_fleet", SCRIPT_DIR / "glaeda-mini-fleet")
+
+
+def host_process(manifest: dict[str, Any], host: str, user: str, command: str,
+                 timeout: int) -> subprocess.CompletedProcess:
+    """Run a bounded read-only command using the manifest's host route."""
+    fleet = mini_fleet()
+    argv = fleet.ssh_command(manifest, host, user, command)
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                          env=child_env(), check=False)
+    return fleet.ssh_result(manifest, host, proc)
+
+
+def daemon_heal() -> Any:
+    """glaeda-daemon-heal, for its judge: one reading of a root report for this tool and glaeda-mini-health."""
+    return sys.modules.get("glaeda_daemon_heal") or _load("glaeda_daemon_heal", SCRIPT_DIR / "glaeda-daemon-heal")
+
+
+def runner_hook() -> Any:
+    """The runner hook module, for its console parser: one definition of a locked console for both."""
+    return sys.modules.get("glaeda_cmux_runner_hook") or _load("glaeda_cmux_runner_hook",
+                                                              SCRIPT_DIR / "glaeda-cmux-runner-hook")
+
+
+def fleet_labels() -> Any:
+    return sys.modules.get("glaeda_fleet_labels") or _load("glaeda_fleet_labels", SCRIPT_DIR / "glaeda_fleet_labels.py")
+
+
+def declared_runners(manifest: dict[str, Any], name: str) -> int | None:
+    """How many runner instances the manifest declares on a member (glaeda-cmux-runner-fleet's count), or None
+    when it declares none or the member's runner config cannot be read."""
+    try:
+        summary, _ = fleet_labels().member_labels(manifest, name, lambda app: True)
+    except Exception:  # noqa: BLE001  (a malformed manifest leaves the count unknown, never the document)
+        return None
+    if (summary or {}).get("dedicatedOnly"):  # no pool instance is declared there (glaeda_fleet_labels DEDICATED_ONLY)
+        return None
+    runners = (summary or {}).get("runners")
+    if not (isinstance(runners, int) and not isinstance(runners, bool) and runners > 0):
+        return None
+    # the gateway runners come after the pool instances, then the sim-first runner, then the small runners
+    extra = [(summary or {}).get("gatewayRunners"), (summary or {}).get("simRunners"),
+             (summary or {}).get("smallRunners")]
+    return runners + sum(n for n in extra if isinstance(n, int) and not isinstance(n, bool) and n > 0)
+
+
+def runner_names(member: str, count: int) -> list[str]:
+    """The names glaeda-cmux-runner gives a member's instances: <member>-glaeda, then <member>-glaeda-K."""
+    return [f"{member}-glaeda" + (f"-{k}" if k else "") for k in range(count)]
+
+
+def manifest_source(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Only what the document needs: no keys, users, or overrides."""
+    hosts = {}
+    for name, host in manifest["hosts"].items():
+        hosts[name] = {"class": host.get("class"), "roles": sorted(host.get("roles") or []),
+                       "hostname": host.get("hostname"), "node_id": host.get("node_id"),
+                       "lima_expected": sorted((host.get("lima") or {}).get("expected") or [])}
+        if (declared := declared_runners(manifest, name)) is not None:
+            hosts[name]["runners_declared"] = declared
+    return source({"fleet": clean(manifest.get("fleet", "")), "hosts": hosts,
+                   "never_touch": sorted(manifest.get("never_touch") or [])})
+
+
+def collect_fleet(fleet: Any, manifest: dict[str, Any], hosts: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """check and preflight from one observation, so both describe the same moment."""
+    try:
+        observed = fleet.observe(manifest, hosts, preflight=True)
+    except Exception as error:  # the mini-fleet owns its own failure text
+        failed = source(error=f"glaeda-mini-fleet observe: {error}")
+        return failed, failed
+    stamps = {h: (observed["hosts"].get(h) or {}).get("observed_at") for h in hosts}
+    try:
+        issues = fleet.check(manifest, observed, hosts)
+        check = source({"issues": issues, "observed_at": stamps})
+    except Exception as error:
+        check = source(error=f"glaeda-mini-fleet check: {type(error).__name__}: {error}")
+    try:
+        results = fleet.preflight(manifest, observed, hosts)
+        preflight = source({"hosts": {r["host"]: {"ready": r["ready"], "checks": r["checks"]} for r in results},
+                            "observed_at": stamps})
+    except Exception as error:
+        preflight = source(error=f"glaeda-mini-fleet preflight: {type(error).__name__}: {error}")
+    return check, preflight
+
+
+def collect_controller(status_py: Path | None, controller_json: Path | None) -> dict[str, Any] | None:
+    if controller_json:
+        try:
+            data = json.loads(controller_json.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            return source(error=f"{controller_json.name}: {error}")
+        return source(data, observed_at=int(controller_json.stat().st_mtime))
+    if not status_py:
+        return None
+    try:
+        proc = subprocess.run([sys.executable, os.fspath(status_py), "--json"], capture_output=True, text=True,
+                              timeout=CONTROLLER_TIMEOUT, env=child_env(), cwd=os.fspath(status_py.parent), check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return source(error=f"status.py: {type(error).__name__}")
+    if proc.returncode != 0:
+        tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
+        return source(error=f"status.py exited {proc.returncode}: {tail}")
+    try:
+        return source(json.loads(proc.stdout))
+    except json.JSONDecodeError:
+        return source(error="status.py printed something other than JSON")
+
+
+def collect_live_builder(status_path: Path | None, profile: str | None) -> dict[str, Any] | None:
+    """Read the optional, local, secret-free cmux16 live-builder status contract.
+
+    The profile is supplied by fleet policy rather than inferred from a hostname or role.  The
+    status file is intentionally bounded and only a fixed public receipt subset is retained.
+    """
+    if status_path is None:
+        return None
+    if not isinstance(profile, str) or not LIVE_BUILDER_TOKEN_RE.fullmatch(profile):
+        return source(error="live-builder profile is required")
+    try:
+        if status_path.stat().st_size > MAX_LIVE_BUILDER_BYTES:
+            return source(error="live-builder status is too large")
+        raw = status_path.read_bytes()
+    except (OSError, ValueError):
+        return source(error="live-builder status is unreadable")
+    if len(raw) > MAX_LIVE_BUILDER_BYTES or b"\x00" in raw:
+        return source(error="live-builder status is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return source(error="live-builder status is not JSON")
+    if not isinstance(payload, dict) or payload.get("schema") != LIVE_BUILDER_SCHEMA:
+        return source(error="live-builder status has an unsupported schema")
+    measured_at = live_builder_stamp(payload.get("measured_at"))
+    host_id = live_builder_token(payload.get("host_id"), LIVE_BUILDER_TOKEN_RE)
+    host_role = live_builder_token(payload.get("host_role"), LIVE_BUILDER_TOKEN_RE)
+    status_profile = live_builder_token(payload.get("profile"), LIVE_BUILDER_TOKEN_RE)
+    if measured_at is None or host_id is None or host_role is None or status_profile is None:
+        return source(error="live-builder status is missing identity or measured_at")
+    if status_profile != profile:
+        return source(error="live-builder status profile does not match policy")
+    health_payload = payload.get("health")
+    if not isinstance(health_payload, dict):
+        return source(error="live-builder status has no health object")
+    health = {name: state if state in LIVE_BUILDER_HEALTH_STATES else "unknown"
+              for name in LIVE_BUILDER_HEALTH_FIELDS
+              for state in [health_payload.get(name)]}
+    last_payload = payload.get("last")
+    last: dict[str, str] = {}
+    if isinstance(last_payload, dict):
+        for field, pattern in (("event", LIVE_BUILDER_REASON_RE), ("result", LIVE_BUILDER_REASON_RE),
+                               ("reason", LIVE_BUILDER_REASON_RE), ("branch", LIVE_BUILDER_BRANCH_RE),
+                               ("sha", SHA_RE), ("tag", LIVE_BUILDER_TAG_RE)):
+            value = live_builder_token(last_payload.get(field), pattern)
+            if value is not None:
+                last[field] = value
+    return source({"schema": LIVE_BUILDER_SCHEMA, "host_id": host_id, "host_role": host_role,
+                   "profile": profile, "health": health, "last": last}, observed_at=measured_at)
+
+
+def gh_json(gh: str, path: str) -> Any:
+    proc = subprocess.run([gh, "api", "-H", "Accept: application/vnd.github+json", path], capture_output=True,
+                          text=True, timeout=GH_TIMEOUT, env=child_env(), check=False)
+    if proc.returncode != 0:
+        tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
+        raise Failure(f"gh api {path.split('?')[0]}: {tail}")
+    return json.loads(proc.stdout)
+
+
+def collect_runners(gh: str | None, scope: str | None) -> dict[str, Any] | None:
+    if not scope:
+        return None
+    if not gh:
+        return source(error="gh is not installed")
+    runners = []
+    truncated = True
+    try:
+        for page in range(1, MAX_RUNNER_PAGES + 1):
+            doc = gh_json(gh, f"{scope}/actions/runners?per_page=100&page={page}")
+            batch = doc.get("runners") or []
+            for r in batch:
+                labels = [str(label.get("name")) for label in r.get("labels") or []
+                          if isinstance(label, dict) and label.get("name")]
+                runners.append({"name": r.get("name"), "status": r.get("status"), "busy": bool(r.get("busy")),
+                                "labels": sorted(labels)})
+            if len(batch) < 100:
+                truncated = False
+                break
+    except (Failure, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, AttributeError, TypeError) as error:
+        return source(error=str(error))
+    return source({"scope": scope, "runners": runners, "truncated": truncated})
+
+
+def collect_queue(gh: str | None, repos: list[str]) -> dict[str, Any] | None:
+    if not repos:
+        return None
+    if not gh:
+        return source(error="gh is not installed")
+    jobs: list[dict[str, Any]] = []
+    runs_read = 0
+    left_unread = False
+    try:
+        for repo in repos:
+            for status in ("queued", "in_progress"):
+                runs = gh_json(gh, f"repos/{repo}/actions/runs?status={status}&per_page=20").get("workflow_runs") or []
+                for run in runs:
+                    if runs_read >= MAX_QUEUE_RUNS:
+                        left_unread = True
+                        break
+                    runs_read += 1
+                    listed = gh_json(gh, f"repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
+                    for job in listed.get("jobs") or []:
+                        if job.get("status") == "queued":
+                            jobs.append({"repo": repo, "run_id": run["id"], "job_id": job.get("id"),
+                                         "name": clean(job.get("name"), 120),
+                                         "labels": sorted(job.get("labels") or [])[:MAX_LABELS],
+                                         "created_at": job.get("created_at")})
+    except (Failure, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, TypeError) as error:
+        return source(error=str(error))
+    return source({"repos": repos, "jobs": jobs, "runs_read": runs_read, "truncated": left_unread})
+
+
+def collect_cache(endpoints: list[str]) -> dict[str, Any] | None:
+    if not endpoints:
+        return None
+    rows = []
+    for spec in endpoints:
+        name, _, url = spec.partition("=")
+        if not url.startswith(("http://", "https://")):
+            raise Failure(f"--cache wants NAME=URL, got {spec!r}")
+        row = {"name": name, "reachable": False, "healthy": False, "http_status": None, "observed_at": now()}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=CACHE_TIMEOUT) as res:
+                row.update(reachable=True, http_status=res.status, healthy=200 <= res.status < 300)
+        except urllib.error.HTTPError as error:
+            row.update(reachable=True, http_status=error.code)
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        rows.append(row)
+    return source({"endpoints": rows})
+
+
+LIMA_SCRIPT = (
+    "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
+    "command -v limactl >/dev/null 2>&1 || { echo '{\"no_lima\":true}'; exit 0; }; "
+    "limactl list --json 2>/dev/null | head -n " + str(MAX_LIMA)
+)
+
+
+def lima_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, LIMA_SCRIPT, LIMA_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, LIMA_SCRIPT],
+                               capture_output=True, text=True, timeout=LIMA_TIMEOUT, env=child_env(), check=False))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    instances = []
+    for line in proc.stdout.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("no_lima"):
+            return {"reachable": True, "installed": False, "instances": [], "observed_at": now()}
+        if isinstance(item, dict):
+            instances.append({"name": str(item.get("name") or "")[:80], "status": str(item.get("status") or "")[:20]})
+    return {"reachable": True, "installed": True, "instances": instances, "observed_at": now()}
+
+
+def collect_lima(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return lima_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else lima_host(h, manifest["ssh_user"])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"hosts": results})
+
+
+# Read-only: prints, tails and a stat. glaeda-disk runs only over an existing size snapshot (without one it
+# would du every family first) and with a max age far past any snapshot, so a status probe never starts its
+# background re-measure; sizes_at says how old its sizes are instead. Its JSON lists every item with its
+# path, so it is capped in transport and reduced here to family totals. tail -c keeps the newest bytes; a
+# line cut at the front fails to parse and is skipped.
+DISK_SCRIPT = (
+    "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; "
+    "echo @disk; if [ ! -x ~/.local/bin/glaeda-disk ]; then echo '{\"no_glaeda_disk\":true}'; "
+    "elif [ ! -e ~/.cache/glaeda-disk/sizes.json ]; then echo '{\"no_snapshot\":true}'; else "
+    "~/.local/bin/glaeda-disk --json --top 0 --max-age 1000000 2>/dev/null | head -c 4194304; fi; echo; "
+    "echo @sizes_at; stat -f %m ~/.cache/glaeda-disk/sizes.json 2>/dev/null; "
+    "echo @prune; tail -n 48 ~/Library/Logs/glaeda-fleet-cas-prune.jsonl 2>/dev/null | tail -c 131072; echo; "
+    "echo @prune_job_at; stat -f %m ~/Library/LaunchAgents/" + PRUNE_LABEL + ".plist 2>/dev/null; "
+    "echo @fleet_cas; [ -e /Users/Shared/cmux-build-fleet/xcode/fleet-cas.env ] && echo yes; "
+    "echo @receipts; [ -e ~/Projects/recovery/disk-reclaim/receipts.jsonl ] && echo present; "
+    "tail -n 2000 ~/Projects/recovery/disk-reclaim/receipts.jsonl 2>/dev/null | tail -c 2097152; echo; "
+    "echo @now; date +%s"
+)
+
+
+def log_time(value: Any) -> int | None:
+    """The %Y-%m-%dT%H:%M:%S%z stamps glaeda-disk and fleet-cas-prune write."""
+    try:
+        return int(datetime.datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp())
+    except ValueError:
+        return None
+
+
+def json_lines(lines: list[str]) -> list[dict[str, Any]]:
+    out = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def parse_disk(stdout: str, at: int) -> dict[str, Any]:
+    """The probe's sections, reduced to numbers and family names: no paths leave the member."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in stdout.splitlines():
+        if re.fullmatch(r"@[a-z_]+", line.strip()):
+            current = line.strip()[1:]
+            sections[current] = []
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), None)
+    skew = at - remote_now if remote_now is not None else 0  # remote stamps onto this machine's clock
+    row: dict[str, Any] = {"reachable": True, "observed_at": at, "installed": True, "error": None,
+                           "fleet_cas": "yes" in (x.strip() for x in sections.get("fleet_cas", []))}
+    try:
+        report = json.loads("\n".join(sections.get("disk", [])))
+    except json.JSONDecodeError:
+        report = None
+    if not isinstance(report, dict):
+        row["error"] = "glaeda-disk printed no JSON"
+    elif report.get("no_glaeda_disk"):
+        row["installed"] = False
+    elif report.get("no_snapshot"):
+        row["error"] = "glaeda-disk has no size snapshot yet"
+    elif report.get("status") == "deferred":
+        row["measurement_status"] = "deferred"
+        row["error"] = "glaeda-disk deferred: " + clean(report.get("reason"), 60)
+    else:
+        free, total = num(report.get("free")), num(report.get("total"))
+        systems = [f for f in report.get("filesystems") or [] if isinstance(f, dict)]
+        home = next((f for f in systems if f.get("free") == free and f.get("total") == total),
+                    systems[0] if systems else {})
+        sizes: dict[str, int] = {}
+        platforms: dict[str, set[str]] = {}
+        for item in report.get("items") or []:
+            if isinstance(item, dict) and num(item.get("bytes")) is not None:
+                fam = str(item.get("family") or "unknown")
+                sizes[fam] = sizes.get(fam, 0) + int(item["bytes"])
+                platform = str(item.get("platform") or "unknown")
+                if platform not in {"macos", "linux", "shared", "unknown"}:
+                    platform = "unknown"
+                platforms.setdefault(fam, set()).add(platform)
+        owners = report.get("owners") if isinstance(report.get("owners"), dict) else {}
+        families = []
+        for fam in set(sizes) | set(owners):
+            owner = owners.get(fam) if isinstance(owners.get(fam), dict) else {}
+            observed_platforms = platforms.get(fam, set()) - {"unknown"}
+            platform = next(iter(observed_platforms)) if len(observed_platforms) == 1 else (
+                "shared" if observed_platforms else "unknown")
+            families.append({"family": clean(fam, 60), "bytes": sizes.get(fam, 0), "owner": clean(owner.get("owner"), 80),
+                             "retired": owner.get("retired") is True, "platform": platform})
+        families.sort(key=lambda f: (-f["bytes"], f["family"]))
+        sizes_at = next((int(x) for x in sections.get("sizes_at", []) if x.strip().isdigit()), None)
+        accounting = []
+        for entry in report.get("accounting") or []:
+            if not isinstance(entry, dict):
+                continue
+            clean_entry = {"used": num(entry.get("used")), "measured": num(entry.get("measured")),
+                           "unmeasured": num(entry.get("unmeasured")),
+                           "unclassified": num(entry.get("unclassified", entry.get("unmeasured"))),
+                           "reclaimable": num(entry.get("reclaimable")),
+                           "coverage_note": clean(entry.get("coverage_note"), 160), "coverage": []}
+            container = entry.get("container") if isinstance(entry.get("container"), dict) else None
+            if container is not None:
+                clean_entry["container"] = {"status": clean(container.get("status"), 20) or "unknown",
+                                             "total": num(container.get("total")),
+                                             "free": num(container.get("free")),
+                                             "used": num(container.get("used"))}
+            for coverage in entry.get("coverage") or []:
+                if not isinstance(coverage, dict):
+                    continue
+                children = []
+                for child in coverage.get("children") or []:
+                    if isinstance(child, dict) and num(child.get("bytes")) is not None:
+                        children.append({"category": clean(child.get("category"), 80),
+                                         "bytes": int(child["bytes"]), "private": child.get("private") is True,
+                                         "classification": clean(child.get("classification"), 32) or "unknown"})
+                clean_entry["coverage"].append({"scope": clean(coverage.get("scope"), 40),
+                                                  "complete": coverage.get("complete") is True,
+                                                  "platform": clean(coverage.get("platform"), 20),
+                                                  "children": children[:32]})
+            accounting.append(clean_entry)
+        residue = report.get("tmp_test_residue") if isinstance(report.get("tmp_test_residue"), dict) else None
+        row.update(free=free, total=total, low=num(home.get("low")), families=families[:MAX_DISK_FAMILIES],
+                   sizes_at=sizes_at + skew if sizes_at is not None else None, accounting=accounting,
+                   tmp_test_residue=None if residue is None else {
+                       k: int(residue[k]) for k in ("entries", "test_residue", "idle")
+                       if num(residue.get(k)) is not None})
+    job_at = next((int(x) for x in sections.get("prune_job_at", []) if x.strip().isdigit()), None)
+    row["prune_job_at"] = job_at + skew if job_at is not None else None
+    prune_lines = json_lines(sections.get("prune", []))
+    if prune_lines:
+        last = prune_lines[-1]
+        stamp = log_time(last.get("at"))
+        row["prune"] = {"at": stamp + skew if stamp is not None else None, "result": clean(last.get("result"), 160),
+                        "role": clean(last.get("role"), 20), "node_store_bytes": last.get("node_store_bytes"),
+                        "local_cas_bytes": last.get("local_cas_bytes")}
+        gc_lines = [x for x in prune_lines if x.get("gc") not in (None, "not due")]
+        if gc_lines:
+            stamp = log_time(gc_lines[-1].get("at"))
+            # Only the count: the dry run's text is tool output and can carry store paths.
+            suspect = GC_SUSPECT.search(str(gc_lines[-1].get("gc_dry_run") or ""))
+            row["gc"] = {"at": stamp + skew if stamp is not None else None,
+                         "result": clean(gc_lines[-1].get("gc"), 160),
+                         "suspect_entries": int(suspect.group(1)) if suspect else None}
+    receipts = sections.get("receipts", [])
+    if receipts[:1] == ["present"]:
+        since = (remote_now if remote_now is not None else at) - 86400
+        freed = [r for r in json_lines(receipts[1:]) if r.get("outcome") == "reclaimed"
+                 and num(r.get("bytes")) is not None and (log_time(r.get("at")) or 0) >= since]
+        row["reclaimed_24h"] = {"bytes": sum(int(r["bytes"]) for r in freed), "count": len(freed)}
+    return row
+
+
+def disk_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, DISK_SCRIPT, DISK_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, DISK_SCRIPT],
+                               capture_output=True, text=True, timeout=DISK_TIMEOUT, env=child_env(), check=False))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0 and "@now" not in proc.stdout:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_disk(proc.stdout, now())
+
+
+def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return disk_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else disk_host(h, manifest["ssh_user"])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"hosts": results})
+
+
+# Read-only: the tail of the runner hook's per-job log (glaeda-cmux-job/v1; only "completed" lines, or lines with no
+# event from older hooks, carry the host record; "started" and "refused" lines are dropped on the host, so the
+# 400-line tail still holds about 400 completed records). A line cut
+# at the front by tail -c fails to parse and is skipped. @stuck keeps the refusals for a user testmanagerd that
+# outlived SIGKILL (glaeda-cmux-runner-hook recycle_testmanagerd): every XCTest run on that mini would hang.
+# @console is ioreg's console session lines (the runner hook refuses GUI jobs while it is locked or has no user,
+# cmuxterm-hq#757); only its state and user name leave.
+JOBS_SCRIPT = (
+    "echo @jobs; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
+    "| grep -v -e '\"event\":\"started\"' -e '\"event\":\"refused\"' | tail -n 400 | tail -c 1048576; echo; "
+    "echo @stuck; tail -c 8388608 ~/Library/Logs/glaeda-cmux-jobs.jsonl 2>/dev/null "
+    "| grep -e '\"event\":\"refused\"' | grep -e 'testmanagerd: stuck' | tail -n 20; echo; "
+    "echo @console; /usr/sbin/ioreg -n Root -d1 2>/dev/null | grep -e '\"IOConsoleUsers\" =' -e '\"IOConsoleLocked\" =' "
+    "| cut -c1-65536; "
+    "echo @now; date +%s"
+)
+
+
+def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
+    """The last 24 h of job records, reduced to counts and the newest contended jobs' reasons."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in stdout.splitlines():
+        if re.fullmatch(r"@[a-z_]+", line.strip()):
+            current = line.strip()[1:]
+            sections[current] = []
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    remote_now = next((int(x) for x in sections.get("now", []) if x.strip().isdigit()), None)
+    skew = at - remote_now if remote_now is not None else 0
+    since = (remote_now if remote_now is not None else at) - JOBS_WINDOW_S
+    records = [r for r in json_lines(sections.get("jobs", []))
+               if r.get("schema") == "glaeda-cmux-job/v1" and r.get("event", "completed") == "completed"
+               and (num(r.get("ended_at")) or 0) >= since]
+    contended = [r for r in records if r.get("verdict") == "contended"]
+    newest = sorted(contended, key=lambda r: -(num(r.get("ended_at")) or 0))[:MAX_CONTENDED_JOBS]
+    console = runner_hook().parse_console_users("\n".join(sections.get("console", [])))
+    stuck = sorted((num(r.get("at")) or 0 for r in json_lines(sections.get("stuck", []))
+                    if r.get("schema") == "glaeda-cmux-job/v1" and r.get("event") == "refused"
+                    and "testmanagerd: stuck" in str(r.get("decision") or "") and (num(r.get("at")) or 0) >= since),
+                   reverse=True)
+    return {"reachable": True, "observed_at": at, "count": len(records), "contended": len(contended),
+            "console": None if console is None else {"state": console.state, "user": clean(console.user, 64) or None},
+            "testmanagerd_stuck": len(stuck), "testmanagerd_stuck_at": (int(stuck[0]) + skew) if stuck else None,
+            "jobs": [{"job": clean(r.get("job") or "?", 60), "run_id": clean(r.get("run_id"), 32) or None,
+                      "runner": clean(r.get("runner"), 60) or None, "seconds": num(r.get("seconds")),
+                      "ended_at": (int(r["ended_at"]) + skew) if num(r.get("ended_at")) is not None else None,
+                      "outside_cores": num((r.get("cores") or {}).get("outside")) if isinstance(r.get("cores"), dict) else None,
+                      "load_mean": num((r.get("load") or {}).get("mean")) if isinstance(r.get("load"), dict) else None,
+                      "reasons": [clean(x, 160) for x in (r.get("reasons") if isinstance(r.get("reasons"), list) else [])[:3]]}
+                     for r in newest]}
+
+
+def jobs_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, JOBS_SCRIPT, JOBS_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, JOBS_SCRIPT],
+                               capture_output=True, text=True, timeout=JOBS_TIMEOUT, env=child_env(), check=False))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0 and "@now" not in proc.stdout:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_jobs(proc.stdout, now())
+
+
+def collect_jobs(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return jobs_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else jobs_host(h, manifest["ssh_user"])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"hosts": results})
+
+
+# Read-only: the stamp glaeda-cmux-runner-fleet (or glaeda-update) wrote beside the staged runner scripts.
+TOOLING_SCRIPT = "head -c 4096 ~/glaeda-runner/scripts/.glaeda-source.json 2>/dev/null || echo @no-stamp"
+
+
+def git(repo: Path, *args: str) -> tuple[int, str]:
+    binary = shutil.which("git", path=os.environ.get("PATH")) or "/usr/bin/git"
+    try:
+        proc = subprocess.run([binary, "-C", os.fspath(repo), *args], capture_output=True, text=True,
+                              timeout=GIT_TIMEOUT, env=child_env(), check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 124, ""
+    return proc.returncode, proc.stdout.strip()
+
+
+def origin_main(repo: Path) -> str | None:
+    """This checkout's refs/remotes/origin/main, as the last fetch left it; None outside a checkout."""
+    code, out = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}")
+    return out if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out) else None
+
+
+def judge_stamp(stdout: str, main: str | None, repo: Path, at: int) -> dict[str, Any]:
+    """One member's stamp against origin/main: state (TOOLING_STATES), the stamped commit, how far behind."""
+    row: dict[str, Any] = {"reachable": True, "observed_at": at, "origin_main": main, "source": None,
+                           "date": None, "by": None, "behind": None, "note": ""}
+    text = stdout.strip()
+    if text == "@no-stamp":
+        return {**row, "state": "none", "note": "no stamp"}
+    try:
+        stamp = json.loads(text)
+    except ValueError:
+        stamp = None
+    source = str(stamp.get("source") or "") if isinstance(stamp, dict) else ""
+    if not SHA_RE.fullmatch(source):
+        return {**row, "state": "unreadable",
+                "note": "stamp names no commit" if isinstance(stamp, dict) else "stamp is not a JSON object"}
+    row.update(source=source, date=clean(stamp.get("date"), 10) or None, by=clean(stamp.get("by"), 40) or None)
+    if main is None:
+        return {**row, "state": "unjudged", "note": "no local origin/main ref to compare with"}
+    code, _ = git(repo, "merge-base", "--is-ancestor", source, main)
+    if code != 0:
+        note = "" if code == 1 else "not in this checkout: a branch, or newer than its last fetch"
+        return {**row, "state": "not_ancestor", "note": note}
+    code, out = git(repo, "rev-list", "--count", f"{source}..{main}")
+    behind = int(out) if code == 0 and out.isdigit() else None
+    return {**row, "state": "current" if behind == 0 else "behind", "behind": behind}
+
+
+def tooling_host(host: str, user: str, main: str | None, repo: Path,
+                 manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, TOOLING_SCRIPT, TOOLING_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, TOOLING_SCRIPT],
+                               capture_output=True, text=True, timeout=TOOLING_TIMEOUT, env=child_env(), check=False))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return judge_stamp(proc.stdout, main, repo, now())
+
+
+def collect_tooling(manifest: dict[str, Any], hosts: list[str], repo: Path = SCRIPT_DIR.parent) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    main = origin_main(repo)
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return tooling_host(h, manifest["ssh_user"], main, repo, manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else tooling_host(h, manifest["ssh_user"], main, repo)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"origin_main": main, "hosts": results})
+
+
+# Read-only: is the root daemon-heal installed, its report (root writes it 0644), and the member's clock.
+DAEMON_HEAL_MAX_OUT = 70000  # the report's 64 KiB and the markers: output this long is cut short, so refused
+DAEMON_HEAL_SCRIPT = (
+    '{ if [ "$(/usr/bin/uname)" != Darwin ]; then echo @not_darwin; exit 0; fi; '
+    'd="/Library/Application Support/glaeda/daemon-heal"; '
+    'if [ -f "$d/glaeda-daemon-heal" ] && [ -f /Library/LaunchDaemons/com.teamleaderleo.glaeda.daemon-heal.plist ]; '
+    'then echo @installed; else echo @missing; fi; '
+    'if /bin/launchctl print system/com.teamleaderleo.glaeda.daemon-heal >/dev/null 2>&1; then echo @loaded; fi; '
+    'echo @report; /usr/bin/head -c 65536 "$d/state/report.json" 2>/dev/null; echo; echo @now; /bin/date +%s; } '
+    f'| /usr/bin/head -c {DAEMON_HEAL_MAX_OUT}')
+DAEMON_HEAL_STATES = ("current", "stale", "missing")
+
+
+def parse_daemon_heal(stdout: str, at: int) -> dict[str, Any]:
+    """The probe, judged on the member's clock; only the verdict, the tags and a cleaned reason leave it. Output that
+    is not exactly the probe's (a marker twice or out of order, no clock, cut short) is a probe failure, never a
+    verdict."""
+    def failed(why: str) -> dict[str, Any]:
+        return {"reachable": False, "error": f"daemon-heal probe output refused: {why}", "observed_at": at}
+
+    if len(stdout) >= DAEMON_HEAL_MAX_OUT:
+        return failed(f"{DAEMON_HEAL_MAX_OUT} bytes or more")
+    lines = stdout.splitlines()
+    if lines == ["@not_darwin"]:
+        return {"reachable": True, "observed_at": at, "state": "not_darwin"}
+    # @installed|@missing, [@loaded], @report, <one JSON line or nothing>, [""], @now, <seconds>
+    head = lines[:3 if len(lines) > 1 and lines[1] == "@loaded" else 2]
+    if not head or head[0] not in ("@installed", "@missing") or head[-1] != "@report":
+        return failed("no install marker, or markers out of order")
+    rest = lines[len(head):]
+    if len(rest) < 2 or rest[-2] != "@now" or any(x.startswith("@") for x in rest[:-2]):
+        return failed("no clock, or a marker twice")
+    body = [x for x in rest[:-2] if x.strip()]
+    if len(body) > 1 or not re.fullmatch(r"\d{9,11}", rest[-1].strip()):
+        return failed("more than one report line, or a clock that is not seconds")
+    remote_now = int(rest[-1].strip())
+    try:
+        report = json.loads(body[0]) if body else None
+        verdict = daemon_heal().judge(report, remote_now, head[0] == "@installed")
+    except Exception as error:  # noqa: BLE001 (whatever a member's report does, it is a probe failure, not a crash)
+        return failed(f"unreadable report ({type(error).__name__})")
+    if verdict["state"] == "current" and "@loaded" not in head:  # a report from before a bootout reads current
+        verdict = {"state": "stale", "reinstall": True, "why": "the root daemon-heal LaunchDaemon is installed but not loaded"}
+    release = report.get("release") if isinstance(report, dict) else None
+    release = release if isinstance(release, dict) else {}
+    return {"reachable": True, "observed_at": at, "state": verdict["state"], "why": clean(verdict["why"], 200),
+            "reinstall": verdict.get("reinstall") is not False,
+            "tag": clean(release.get("tag"), 40) or None, "wants": clean(release.get("wants"), 40) or None}
+
+
+def daemon_heal_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        proc = (host_process(manifest, host, user, DAEMON_HEAL_SCRIPT, TOOLING_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host,
+                                DAEMON_HEAL_SCRIPT], capture_output=True, text=True, timeout=TOOLING_TIMEOUT,
+                               env=child_env(), check=False))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:  # ValueError: output that is not UTF-8
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return parse_daemon_heal(proc.stdout, now())
+
+
+def collect_daemon_heal(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return daemon_heal_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else daemon_heal_host(h, manifest["ssh_user"])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(probe, targets)))
+    return source({"hosts": results})
+
+
+def collect(args: argparse.Namespace) -> dict[str, Any]:
+    fleet = mini_fleet()
+    try:
+        manifest = fleet.load_manifest(args.manifest)
+        hosts = fleet.select_hosts(manifest, args.hosts)
+    except fleet.Failure as error:
+        raise Failure(str(error)) from None
+    sources: dict[str, Any] = {"manifest": manifest_source(manifest)}
+    if not args.no_fleet_probe:
+        sources["check"], sources["preflight"] = collect_fleet(fleet, manifest, hosts)
+    gh = args.gh or shutil.which("gh")
+    for name, value in (("controller", collect_controller(args.controller_status, args.controller_json)),
+                        ("runners", collect_runners(gh, args.github_runners)),
+                        ("queue", collect_queue(gh, args.queue_repo or [])),
+                        ("cache", collect_cache(args.cache or []))):
+        if value is not None:
+            sources[name] = value
+    live_builder = collect_live_builder(args.live_builder_status, args.live_builder_profile)
+    if live_builder is not None:
+        sources["live_builder"] = live_builder
+    if not args.no_lima:
+        sources["lima"] = collect_lima(manifest, hosts)
+    if not args.no_disk:
+        sources["disk"] = collect_disk(manifest, hosts)
+    if not args.no_jobs:
+        sources["jobs"] = collect_jobs(manifest, hosts)
+    if not args.no_tooling:
+        sources["tooling"] = collect_tooling(manifest, hosts)
+    if not args.no_daemon_heal:
+        sources["daemon_heal"] = collect_daemon_heal(manifest, hosts)
+    return {"schema": SOURCES_SCHEMA, "collected_at": now(), "sources": sources}
+
+
+# ---------------------------------------------------------------- build (pure)
+
+
+class Builder:
+    def __init__(self, sources: dict[str, Any], at: int, max_age: int):
+        self.sources = sources
+        self.at = at
+        self.max_age = max_age
+        manifest = (sources.get("manifest") or {}).get("data") or {"hosts": {}, "never_touch": []}
+        self.hosts: dict[str, dict[str, Any]] = manifest.get("hosts") or {}
+        self.never = set(manifest.get("never_touch") or [])
+        self.findings: list[dict[str, Any]] = []
+        self.state: dict[str, Any] = {}
+        self.members: dict[str, dict[str, Any]] = {}
+        self.aliases: dict[str, str] = {}
+        for name, host in sorted(self.hosts.items()):
+            self.members[name] = {"name": name, "class": host.get("class"), "roles": host.get("roles") or [],
+                                  "never_touch": name in self.never, "observed": {}}
+            self.aliases[norm(name)] = name
+        # A member's name wins over another member's hostname: SSH names and hostnames can cross.
+        for name, host in sorted(self.hosts.items()):
+            for alias in (host.get("hostname"), host.get("node_id")):
+                if alias:
+                    self.aliases.setdefault(norm(alias), name)
+        for name in sorted(self.never - set(self.members)):
+            # Listed so other sources' rows about it land somewhere visible; never probed.
+            self.members[name] = {"name": name, "class": None, "roles": [], "never_touch": True, "observed": {}}
+            self.aliases.setdefault(norm(name), name)
+
+    # ---- identity
+
+    def member_of(self, name: Any) -> str | None:
+        """Exact alias first, then the runner convention '<member>-<suffix>'."""
+        key = norm(name)
+        if key in self.aliases:
+            return self.aliases[key]
+        best = None
+        for alias, member in self.aliases.items():
+            if key.startswith(alias + "-") and (best is None or len(alias) > len(best[0])):
+                best = (alias, member)
+        return best[1] if best else None
+
+    # ---- findings
+
+    def action(self, member: str | None, kind: str, who: str, command: str | None, safe: bool = False,
+               note: str = "", tty: bool = False, on_member: bool = True) -> dict[str, Any]:
+        """safe=True is only ever passed with a literal, read-only command written in this file,
+        never with text derived from a source."""
+        assert who in WHO
+        if member and member in self.never:
+            # never_touch: a person decides, and nothing is marked safe.
+            who, safe, command = "person", False, None
+            note = clean(f"{member} is never_touch; ask its owner. {note}".strip())
+        if command and clean(command, MAX_COMMAND + 1) != command:
+            # Redacting would change what runs; a person reads the finding instead.
+            who, safe, command = "person", False, None
+            note = clean(f"command withheld: it carried text that looks secret, private or too long. {note}".strip())
+        if command and member and on_member:
+            command = remote(member, command, tty=tty or who == "password")
+            if command is None:
+                who, safe = "person", False
+                note = clean(f"member name is not a plain host name; no command. {note}".strip())
+        return {"id": kind, "who": who, "safe_to_apply": bool(safe and command), "command": command,
+                "note": clean(note) if note else ""}
+
+    def finding(self, source_name: str, code: str, severity: str, summary: str, member: str | None,
+                observed_at: int | None, action: dict[str, Any]) -> None:
+        assert severity in SEVERITIES
+        slug = re.sub(r"[^a-z0-9_.:-]+", "-", code.lower())
+        self.findings.append({"id": f"{source_name}.{slug}@{member or 'fleet'}", "source": source_name,
+                              "code": slug, "severity": severity, "member": member,
+                              "summary": clean(summary), "observed_at": observed_at, "action": action})
+
+    def unmapped(self, source_name: str, name: Any, observed_at: int | None) -> None:
+        self.finding(source_name, "unknown_member", "warn",
+                     f"{clean(name, 80)} appears in {source_name} but not in the manifest", None, observed_at,
+                     self.action(None, "add_to_manifest", "person", None,
+                                 note="add it to the fleet manifest or retire it from this source"))
+
+    # ---- sources
+
+    def freshness(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name in SOURCE_NAMES:
+            src = self.sources.get(name)
+            if src is None:
+                out[name] = {"state": "not_collected", "observed_at": None, "age_seconds": None, "error": None}
+                continue
+            stamp = stamp_of(src.get("observed_at")) if isinstance(src, dict) else None
+            if not isinstance(src, dict):
+                src = {"ok": False, "error": "malformed source"}
+            age = None if stamp is None else max(0, self.at - stamp)
+            if not src.get("ok"):
+                state = "unavailable"
+                self.finding(name, "unavailable", "warn", f"{name} could not be read: {src.get('error')}", None, stamp,
+                             self.action(None, "restore_source", "person", None,
+                                         note=f"fix access to the {name} source, then refresh"))
+            elif age is None:
+                state = "stale"
+                self.finding(name, "no_observation_time", "warn", f"{name} carries no usable observation time", None,
+                             None, self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
+                                               on_member=False))
+            elif age > self.max_age:
+                state = "stale"
+                self.finding(name, "stale", "warn", f"{name} is {age} s old (limit {self.max_age} s)", None, stamp,
+                             self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
+                                         on_member=False))
+            else:
+                state = "fresh"
+            out[name] = {"state": state, "observed_at": stamp, "age_seconds": age,
+                         "error": clean(src.get("error")) if src.get("error") else None}
+        return out
+
+    def data(self, name: str) -> dict[str, Any] | None:
+        src = self.sources.get(name)
+        if not isinstance(src, dict) or not src.get("ok"):
+            return None
+        data = src.get("data")
+        if data is not None and not isinstance(data, dict):
+            raise Failure(f"{name}: data is a {type(data).__name__}, want an object")
+        return data
+
+    def fresh(self, name: str) -> bool:
+        return self.state.get(name, {}).get("state") == "fresh"
+
+    def stamp(self, name: str) -> int | None:
+        src = self.sources.get(name)
+        return stamp_of(src.get("observed_at")) if isinstance(src, dict) else None
+
+    def fold_check(self) -> None:
+        data = self.data("check")
+        if not data:
+            return
+        stamps = data.get("observed_at") or {}
+        for host, at in stamps.items():
+            member = self.member_of(host)
+            if member in self.members and stamp_of(at) is not None:
+                self.members[member]["observed"]["check"] = stamp_of(at)
+        for issue in data.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            member = self.member_of(issue.get("host"))
+            at = stamp_of(stamps.get(issue.get("host"))) or self.stamp("check")
+            if member is None:
+                self.unmapped("check", issue.get("host"), at)
+                continue
+            area = str(issue.get("area") or "unknown")
+            self.members[member]["observed"]["check"] = at
+            severity = "info" if area == "pending" else "error" if area in CHECK_ERRORS else "warn"
+            fix = str(issue.get("fix") or "")
+            typed = issue.get("action") or {}
+            if typed.get("kind") in ("clone_xcode", "add_key"):
+                # apply runs every typed action for the host, add_key included, which widens access.
+                act = self.action(member, typed["kind"], "agent",
+                                  f"scripts/glaeda-mini-fleet apply --host {shlex.quote(member)} --yes",
+                                  note="apply runs every typed fix for this host; review with the same command "
+                                       "without --yes first", on_member=False)
+            elif area == "reach":
+                act = self.action(member, "restore_reach", "person", None,
+                                  note="check the host is up, on the tailnet, and the SSH key is loaded")
+            elif area == "disk":
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                                  note="reports where the space went; it also refreshes its own snapshot")
+            else:
+                command = as_command(fix)
+                who = "password" if command and command.startswith("sudo ") else "agent" if command else "person"
+                act = self.action(member, f"fix_{area}", who, command, note="" if command else fix)
+            self.finding("check", area, severity, str(issue.get("detail") or area), member, at, act)
+
+    def fold_preflight(self) -> None:
+        data = self.data("preflight")
+        if not data:
+            return
+        stamps = data.get("observed_at") or {}
+        for host, result in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            at = stamp_of(stamps.get(host)) or self.stamp("preflight")
+            if member is None:
+                self.unmapped("preflight", host, at)
+                continue
+            if not isinstance(result, dict):
+                continue
+            self.members[member]["preflight_ready"] = bool(result.get("ready"))
+            self.members[member]["observed"]["preflight"] = at
+            for check_id, c in (result.get("checks") or {}).items():
+                if not isinstance(c, dict):
+                    continue
+                state = c.get("state")
+                # preflight measures onboarding readiness; a blocker there is not a broken member today.
+                if state == "fail" or state == "unknown":
+                    severity = "warn"
+                elif state == "todo":
+                    severity = "info"
+                else:
+                    continue
+                if check_id == "reach" and any(f["member"] == member and f["code"] == "reach" for f in self.findings):
+                    continue
+                if state == "unknown" and check_id not in PREFLIGHT_UNKNOWN_BLOCKS:
+                    continue
+                group = c.get("group") or "person"
+                who = {"self": "agent", "password": "password", "person": "person"}.get(group, "person")
+                fix = str(c.get("fix") or "")
+                command = as_command(fix)
+                if command is None and who != "person":
+                    who = "person"
+                act = self.action(member, f"preflight_{check_id}", who, command, note="" if command else fix)
+                self.finding("preflight", check_id, severity, f"{check_id}: {c.get('detail') or state}", member, at, act)
+
+    def fold_controller(self) -> None:
+        data = self.data("controller")
+        if not data:
+            return
+        at = self.stamp("controller")
+        for row in controller_worker_rows(data):
+            host = row.get("host") or row.get("name")
+            member = self.member_of(host)
+            if member is None:
+                self.unmapped("controller", host, at)
+                continue
+            state = clean(row.get("state") or "unknown", 40)
+            host_bin = row.get("host_bin") if isinstance(row.get("host_bin"), dict) else {}
+            running = row.get("running") if isinstance(row.get("running"), list) else []
+            self.members[member]["controller"] = {
+                "state": state, "busy": row.get("busy") is True, "free_gib": num(row.get("free_gib")),
+                "sample_age_seconds": num(row.get("sample_age_seconds")), "active_jobs": num(row.get("active_jobs")),
+                "controller_route": "cmux-lawrence" if isinstance(data.get("workers"), dict) else None,
+                "claim_paused": clean(row.get("claim_paused"), 40) if row.get("claim_paused") else None,
+                "host_bin": host_bin,
+                "running": running[:4],
+            }
+            self.members[member]["observed"]["controller"] = at
+
+            # Live controller status carries the reason the worker is paused,
+            # but the old report used to collapse it into an opaque warning.
+            # Make the repair boundary explicit so nobody sends a stale
+            # Tailscale auth link or treats an active runner job as a dead host.
+            claim = clean(row.get("claim_paused") or "", 40)
+            current_bins = host_bin.get("current") if isinstance(host_bin.get("current"), list) else []
+            refused_bins = host_bin.get("refused") if isinstance(host_bin.get("refused"), dict) else {}
+            lock_missing = (
+                claim == "host_lock"
+                and ("with-host-lock" in refused_bins or "with-host-lock" not in current_bins)
+            )
+            if lock_missing:
+                self.finding(
+                    "controller", "host_lock_tool_missing", "error",
+                    f"controller: {host} admission paused (host_lock); "
+                    "with-host-lock is missing. Repair through cmux-lawrence's controller route; "
+                    "do not send a Tailscale login link.",
+                    member, at,
+                    self.action(member, "repair_host_lock_tool", "person", None,
+                                note="use the cmux-lawrence controller mini to reach the runner, "
+                                     "copy the peer-verified tool, and re-observe the worker"),
+                )
+                continue
+            if claim == "runner_job":
+                detail = (
+                    f"controller: {host} is paused for a runner-owned job; "
+                    "inspect Runner.Worker/process evidence before treating it as stale"
+                )
+                severity = "info" if running else "warn"
+                self.finding("controller", "runner_job", severity, detail, member, at,
+                             self.action(member, "inspect_runner_job", "person", None,
+                                         note="a runner-owned job is not necessarily visible in the controller job list"))
+                continue
+            known = CONTROLLER_FINDINGS.get(state)
+            if known is None and state in ("ready", "busy"):
+                continue
+            severity, kind, who, note = known or ("warn", "inspect_worker", "person", f"controller state {state}")
+            if kind == "none":
+                act = self.action(member, kind, who, None, note=note)
+            elif kind == "free_disk":
+                act = self.action(member, "diagnose_disk", "agent", "~/.local/bin/glaeda-disk",
+                                  note="reports where the space went; delete stale build output only after "
+                                       "checking nothing builds")
+            else:
+                act = self.action(member, kind, who, None, note=note)
+            self.finding("controller", state.replace(" ", "_"), severity,
+                         f"controller: {state}; {clean(row.get('action'), 160)}", member, at, act)
+
+    def fold_live_builder(self) -> None:
+        """Join the optional live-builder health receipt without granting it fleet authority."""
+        data = self.data("live_builder")
+        if not data:
+            return
+        at = self.stamp("live_builder")
+        member = self.member_of(data.get("host_id"))
+        if member is None:
+            self.unmapped("live_builder", data.get("host_id"), at)
+            return
+        health_payload = data.get("health") if isinstance(data.get("health"), dict) else {}
+        health = {name: health_payload.get(name, "unknown")
+                  if health_payload.get(name) in LIVE_BUILDER_HEALTH_STATES else "unknown"
+                  for name in LIVE_BUILDER_HEALTH_FIELDS}
+        last_payload = data.get("last") if isinstance(data.get("last"), dict) else {}
+        last = {key: clean(last_payload.get(key), 128) for key in
+                ("event", "result", "reason", "branch", "sha", "tag") if last_payload.get(key)}
+        self.members[member]["live_builder"] = {
+            "host_id": clean(data.get("host_id"), 64),
+            "host_role": clean(data.get("host_role"), 64) or "unknown",
+            "profile": clean(data.get("profile"), 64) or "unknown",
+            "health": health,
+            "last": last,
+        }
+        self.members[member]["observed"]["live_builder"] = at
+        for check, state in health.items():
+            if state == "pass":
+                continue
+            self.finding("live_builder", check, "warn",
+                         f"live-builder {check}: {state} ({self.members[member]['live_builder']['profile']})",
+                         member, at,
+                         self.action(member, f"inspect_live_builder_{check}", "person", None,
+                                     note="refresh the bounded live-builder preflight receipt; no fleet action is automatic"))
+
+    def fold_runners(self) -> list[tuple[str | None, dict[str, Any]]]:
+        """Every runner in scope with its member (None for hosted or foreign runners)."""
+        data = self.data("runners")
+        if not data:
+            return []
+        at = self.stamp("runners")
+        every: list[tuple[str | None, dict[str, Any]]] = []
+        by_member: dict[str, list[dict[str, Any]]] = {}
+        for r in data.get("runners") or []:
+            if not isinstance(r, dict):
+                continue
+            member = self.member_of(r.get("name"))
+            labels = [str(label) for label in r.get("labels") or [] if isinstance(label, str)]
+            row = {"name": clean(r.get("name"), 80), "status": clean(r.get("status"), 20), "busy": r.get("busy") is True,
+                   "labels": sorted(labels)}
+            every.append((member, row))
+            if member is None:
+                continue  # hosted or foreign runners in the same scope are not fleet members
+            by_member.setdefault(member, []).append({**row, "labels": [clean(x, 60) for x in row["labels"][:MAX_LABELS]]})
+            if row["status"] != "online":
+                self.finding("runners", f"offline:{row['name']}", "error", f"runner {row['name']} is {row['status']}",
+                             member, at,
+                             self.action(member, "restart_runner", "agent",
+                                         "launchctl list | grep -i actions.runner", safe=True,
+                                         note="read-only: shows the runner's launchd job; restart it with "
+                                              "launchctl kickstart -k gui/$(id -u)/<label> once confirmed"))
+        for member, rows in by_member.items():
+            self.members[member]["runners"] = rows[:8]
+            self.members[member]["observed"]["runners"] = at
+        if data.get("truncated"):
+            self.finding("runners", "truncated", "info",
+                         f"runner list stopped at {len(data.get('runners') or [])}; missing runners are not judged",
+                         None, at, self.action(None, "narrow_runner_scope", "person", None,
+                                               note="point --github-runners at the repository the fleet registers to"))
+            return every
+        for name, m in self.members.items():
+            if "ci-runner" not in m["roles"] or name in self.never:
+                continue
+            # every runner in scope: a name under the member's short hostname maps to no member (member_of)
+            registered = {norm(r["name"]) for _, r in every}
+            declared = (self.hosts.get(name) or {}).get("runners_declared")
+            if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+                # every declared instance by name: a host with some runners left still lost the others
+                # under the member's name (glaeda-cmux-runner-fleet passes --member) or, for an older install, the
+                # host's own name (glaeda-cmux-runner's default): either registration is that instance
+                # (glaeda-cmux-runner's default takes the short hostname: worker.example.com registers worker-glaeda)
+                aliases = {short for a, owner in self.aliases.items() if owner == name
+                           for short in (a, re.sub(r"[^a-z0-9-]+", "-", a.split(".")[0]).strip("-"))}
+                count = min(declared, MAX_DECLARED_RUNNERS)
+                missing = [n for k, n in enumerate(runner_names(name, count))
+                           if not any(norm(runner_names(a, k + 1)[k]) in registered for a in aliases)]
+                if not missing:
+                    continue
+                m["runners_missing"] = missing
+                summary = (f"{len(missing)} of {declared} declared runner(s) not registered: {', '.join(missing)}")
+            elif name in by_member:
+                continue
+            else:
+                summary = "manifest role ci-runner but no runner registered"
+            self.finding("runners", "missing", "error", summary, name, at,
+                         self.action(name, "register_runner", "person", None,
+                                     note="re-register the missing runner(s): scripts/glaeda-cmux-runner on the "
+                                          "member with a runner token from an org admin"))
+        return every
+
+    def fold_queue(self, runners: list[tuple[str | None, dict[str, Any]]]) -> None:
+        data = self.data("queue")
+        if not data:
+            return
+        at = self.stamp("queue")
+        complete = self.fresh("runners") and not (self.data("runners") or {}).get("truncated")
+        groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for job in data.get("jobs") or []:
+            if not isinstance(job, dict):
+                continue
+            labels = tuple(sorted(str(label) for label in job.get("labels") or [] if isinstance(label, str)))
+            if "self-hosted" not in {label.lower() for label in labels}:
+                continue  # hosted and Blacksmith labels are not ours to judge
+            groups.setdefault(labels, []).append(job)
+        if groups and not complete:
+            self.finding("queue", "unjudged", "info",
+                         f"{sum(len(j) for j in groups.values())} queued self-hosted job(s) not judged: the runner "
+                         "list is missing, stale, unavailable or truncated", None, at,
+                         self.action(None, "refresh_status", "agent", "glaeda-fleet-status", safe=True,
+                                     on_member=False, note="collect with --github-runners set to the scope the "
+                                                           "fleet registers to"))
+            return
+        for labels, jobs in sorted(groups.items()):
+            want = {label.lower() for label in labels}
+            fits = [(m, r) for m, r in runners if want <= {label.lower() for label in r["labels"]}]
+            online = [(m, r) for m, r in fits if r["status"] == "online"]
+            if online:
+                continue
+            members = sorted({m for m, _ in fits if m})
+            label_text = clean(",".join(labels), 120)
+            summary = (f"{len(jobs)} queued job(s) want [{label_text}] and no online runner has those labels; "
+                       f"should have taken it: {', '.join(members) or 'no registered runner'}")
+            self.finding("queue", f"no_eligible_runner:{label_text}", "error", summary, None, at,
+                         self.action(None, "restore_runner_capacity", "person", None,
+                                     note="bring one of the named runners online or relabel one; GitHub never "
+                                          "re-routes a queued job"))
+
+    def fold_cache(self) -> list[dict[str, Any]]:
+        data = self.data("cache")
+        if not data:
+            return []
+        rows = []
+        for row in (data.get("endpoints") or [])[:16]:
+            if not isinstance(row, dict):
+                continue
+            row = {"name": clean(row.get("name"), 40), "reachable": row.get("reachable") is True,
+                   "healthy": row.get("healthy") is True, "http_status": num(row.get("http_status")),
+                   "observed_at": stamp_of(row.get("observed_at"))}
+            rows.append(row)
+            if row["healthy"]:
+                continue
+            code = "unreachable" if not row.get("reachable") else "unhealthy"
+            self.finding("cache", f"{code}:{row.get('name')}", "error",
+                         f"cache {row.get('name')} is {code} (HTTP {row.get('http_status')})", None,
+                         row.get("observed_at"),
+                         self.action(None, "inspect_cache", "person", None,
+                                     note="its owner checks the volume and the service; a 503 means the volume "
+                                          "is not mounted"))
+        return rows
+
+    def fold_lima(self) -> None:
+        data = self.data("lima")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["lima"] = at
+            if not row.get("reachable"):
+                m["lima"] = {"reachable": False}
+                continue
+            instances = [i for i in row.get("instances") or [] if isinstance(i, dict) and i.get("name")][:MAX_LIMA]
+            expected = set(self.hosts.get(member, {}).get("lima_expected") or [])
+            # Stopped or Broken only; an instance with no status is unknown, not an orphan.
+            orphans = [str(i.get("name") or "") for i in instances
+                       if i.get("status") in ("Stopped", "Broken") and i.get("name") not in expected]
+            m["lima"] = {"reachable": True, "installed": row.get("installed") is True, "total": len(instances),
+                         "running": sum(i.get("status") == "Running" for i in instances),
+                         "orphans": [clean(n, 64) for n in orphans[:16]]}
+            for name in orphans[:16]:
+                plain = bool(LIMA_NAME_RE.match(name))
+                self.finding("lima", f"orphan:{clean(name, 64)}", "info",
+                             f"Lima instance {clean(name, 64)} is stopped and not expected", member, at,
+                             self.action(member, "delete_lima_instance", "agent" if plain else "person",
+                                         f"limactl delete -- {name}" if plain else None,
+                                         note="deletes the VM disk; confirm nothing owns it first"))
+
+    def fold_disk(self) -> None:
+        data = self.data("disk")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["disk"] = at
+            if not row.get("reachable"):
+                m["disk"] = {"reachable": False}
+                # A host that answers ssh but whose probe timed out is not the same as a host that is down.
+                self.finding("disk", "probe_failed", "info", f"disk probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            report = self.action(member, "report_disk", "agent", "~/.local/bin/glaeda-disk",
+                                 note="reports where the space went and what is reclaimable; it may refresh "
+                                      "its own size snapshot")
+            warned = False
+
+            def warn(code: str, summary: str, act: dict[str, Any]) -> None:
+                nonlocal warned
+                warned = True
+                self.finding("disk", code, "warn", summary, member, at, act)
+
+            families = []
+            for f in (row.get("families") or [])[:MAX_DISK_FAMILIES]:
+                if isinstance(f, dict) and num(f.get("bytes")) is not None:
+                    families.append({"family": clean(f.get("family"), 60), "bytes": int(f["bytes"]),
+                                     "owner": clean(f.get("owner"), 80), "retired": f.get("retired") is True,
+                                     "platform": clean(f.get("platform"), 20) or "unknown"})
+            free, total, low = num(row.get("free")), num(row.get("total")), num(row.get("low"))
+            prune = row.get("prune") if isinstance(row.get("prune"), dict) else None
+            gc = row.get("gc") if isinstance(row.get("gc"), dict) else None
+            reclaimed = row.get("reclaimed_24h") if isinstance(row.get("reclaimed_24h"), dict) else None
+            m["disk"] = {
+                "reachable": True, "installed": row.get("installed") is not False,
+                "error": clean(row.get("error"), 160) if row.get("error") else None,
+                "free_bytes": free, "total_bytes": total, "low_bytes": low,
+                "under_pressure": free is not None and low is not None and free < low,
+                "cache_bytes": sum(f["bytes"] for f in families if f["family"] not in DOUBLE_COUNTED),
+                "families": families,
+                "accounting": row.get("accounting") if isinstance(row.get("accounting"), list) else [],
+                "sizes_at": stamp_of(row.get("sizes_at")), "fleet_cas": row.get("fleet_cas") is True,
+                "prune_job_at": stamp_of(row.get("prune_job_at")),
+                "prune": None if prune is None else {
+                    "at": stamp_of(prune.get("at")), "result": clean(prune.get("result"), 120),
+                    "role": clean(prune.get("role"), 20) if prune.get("role") else None,
+                    "node_store_bytes": num(prune.get("node_store_bytes")),
+                    "local_cas_bytes": num(prune.get("local_cas_bytes"))},
+                "gc": None if gc is None else {"at": stamp_of(gc.get("at")), "result": clean(gc.get("result"), 120),
+                                               "suspect_entries": stamp_of(gc.get("suspect_entries"))},
+                "reclaimed_24h": None if reclaimed is None else {
+                    "bytes": num(reclaimed.get("bytes")) or 0, "count": num(reclaimed.get("count")) or 0},
+                "tmp_test_residue": row.get("tmp_test_residue") if isinstance(row.get("tmp_test_residue"), dict)
+                else None,
+            }
+            d = m["disk"]
+            if not d["installed"]:
+                self.finding("disk", "no_glaeda_disk", "info", "glaeda-disk is not installed in ~/.local/bin",
+                             member, at, self.action(member, "install_glaeda_disk", "person", None,
+                                                     note="glaeda-mini-setup --apply installs it with its "
+                                                          "pressure job"))
+                warned = True  # nothing else to summarize
+            elif d["error"]:
+                self.finding("disk", "unreadable", "info", f"disk report unreadable: {d['error']}", member, at, report)
+                warned = True
+            if d["under_pressure"]:
+                warn("pressure", f"{gib(free)} GiB free of {gib(total)}, below the pressure threshold "
+                                 f"{gib(low)} GiB", report)
+            for f in families:
+                if f["retired"] and f["bytes"] > RETIRED_WARN_BYTES:
+                    warn(f"retired_owner:{f['family']}",
+                         f"{f['family']} holds {gib(f['bytes'])} GiB and its owner ({f['owner']}) is retired",
+                         self.action(member, "retire_cache", "person", None,
+                                     note="its owner's launchd service is not loaded; glaeda-disk only reports "
+                                          "this family, so a person decides whether it goes"))
+            residue = d["tmp_test_residue"] or {}
+            if (residue.get("idle") or 0) >= TMP_RESIDUE_WARN:
+                warn("tmp_test_residue", f"{residue['idle']} test scratch entries in $TMPDIR untouched 12 h+ "
+                                         f"({residue.get('entries', '?')} entries in all)", report)
+            for what, line in (("prune", d["prune"]), ("gc", d["gc"])):
+                result = (line or {}).get("result") or ""
+                if result.startswith(("failed", "skipped: kept entries")):
+                    warn(f"{what}_{'failed' if result.startswith('failed') else 'skipped'}",
+                         f"fleet-cas {what} {when(line['at'], self.at)}: {result}",
+                         self.action(member, f"inspect_{what}", "person", None,
+                                     note="read ~/Library/Logs/glaeda-fleet-cas-prune.jsonl and its .err; "
+                                          "nothing is deleted while gc is skipped"))
+            last = (d["prune"] or {}).get("at")
+            if d["fleet_cas"] and d["prune"] is None and d["prune_job_at"] is None:
+                warn("prune_missing", "fleet-cas host without the fleet-cas-prune LaunchAgent",
+                     self.action(member, "install_prune_job", "person", None,
+                                 note="glaeda-mini-setup --apply installs it with the disk jobs"))
+            elif d["fleet_cas"]:
+                # No line yet: judge from when the job was installed, so a new install is not silent.
+                since = last if last is not None else None if d["prune"] else d["prune_job_at"]
+                if since is None or self.at - since > PRUNE_SILENT_SECONDS:
+                    what = (f"last fleet-cas-prune line {when(last, self.at)}" if last is not None else
+                            "last fleet-cas-prune line carries no readable time" if d["prune"] else
+                            f"no fleet-cas-prune line since the job was installed {when(since, self.at)}")
+                    warn("prune_silent", f"{what} on a fleet-cas host",
+                         self.action(member, "inspect_prune_job", "agent", f"launchctl list {PRUNE_LABEL}",
+                                     safe=True, note="read-only: shows whether the hourly LaunchAgent is loaded "
+                                                     "and its last exit status"))
+            if not warned:
+                self.finding("disk", "summary", "info", f"disk: {disk_line(d, self.at)}", member, at, report)
+
+    # ---- document
+
+    def fold_jobs(self) -> None:
+        """A runner job that ran contended is slow for a reason that is not the change under test: say which."""
+        data = self.data("jobs")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["jobs"] = at
+            if not row.get("reachable"):
+                m["jobs"] = {"reachable": False}
+                self.finding("jobs", "probe_failed", "info", f"jobs probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            jobs = [j for j in (row.get("jobs") or [])[:MAX_CONTENDED_JOBS] if isinstance(j, dict)]
+            count, contended = int(num(row.get("count")) or 0), int(num(row.get("contended")) or 0)
+            m["jobs"] = {"reachable": True, "window_seconds": JOBS_WINDOW_S, "count": count,
+                         "contended": contended,
+                         "contended_jobs": [{"job": clean(j.get("job"), 60), "run_id": clean(j.get("run_id"), 32) or None,
+                                             "runner": clean(j.get("runner"), 60) or None,
+                                             "seconds": num(j.get("seconds")), "ended_at": stamp_of(j.get("ended_at")),
+                                             "outside_cores": num(j.get("outside_cores")),
+                                             "load_mean": num(j.get("load_mean")),
+                                             "reasons": [clean(x, 160) for x in (j.get("reasons") if isinstance(j.get("reasons"), list) else [])[:3]]}
+                                            for j in jobs]}
+            console = row.get("console") if isinstance(row.get("console"), dict) else None
+            state = console.get("state") if console else None
+            m["jobs"]["console"] = None if state not in CONSOLE_STATES else {
+                "state": state, "user": clean(console.get("user"), 64) or None}
+            if state in ("locked", "no_user"):
+                who = f" ({m['jobs']['console']['user']})" if m["jobs"]["console"]["user"] else ""
+                self.finding("jobs", f"console_{state}", "warn",
+                             f"console session{who} is screen-locked: GUI jobs are refused here" if state == "locked"
+                             else "no user is logged in at the console: GUI jobs are refused here", member, at,
+                             self.action(member, "unlock_console", "person", None,
+                                         note="log the console user in and turn off the screen lock and display "
+                                              "sleep; the gui runner listens again within a minute (cmuxterm-hq#757)"))
+            stuck = int(num(row.get("testmanagerd_stuck")) or 0)
+            if stuck:
+                m["jobs"]["testmanagerd_stuck"] = stuck
+                self.finding("jobs", "testmanagerd_stuck", "warn",
+                             f"{stuck} XCTest job(s) refused in 24 h: the runner user's testmanagerd outlived "
+                             "SIGKILL, so every XCTest run here would hang", member,
+                             stamp_of(row.get("testmanagerd_stuck_at")) or at,
+                             self.action(member, "show_testmanagerd", "agent",
+                                         "/usr/bin/pgrep -lf testmanagerd", safe=True,
+                                         note="a person decides on a logout or reboot; the hook never does either"))
+            if contended:
+                latest = m["jobs"]["contended_jobs"][0] if m["jobs"]["contended_jobs"] else {}
+                why = "; ".join(latest.get("reasons") or []) or "no reason recorded"
+                run = f" (run {latest['run_id']})" if latest.get("run_id") else ""
+                self.finding("jobs", "contended", "warn",
+                             f"{contended} of {count} runner jobs in 24 h ran contended; latest "
+                             f"{latest.get('job') or '?'}{run}: {why}", member, at,
+                             self.action(member, "show_job_records", "agent",
+                                         "tail -n 20 ~/Library/Logs/glaeda-cmux-jobs.jsonl", safe=True,
+                                         note="each line names this job's cores, the other runner jobs' and the "
+                                              "top processes outside them"))
+
+    def fold_tooling(self) -> None:
+        """Runner tooling behind origin/main is a rollout not done yet; off origin/main is a downgrade waiting."""
+        data = self.data("tooling")
+        if not data:
+            return
+        main = data.get("origin_main") if isinstance(data.get("origin_main"), str) else None
+        main = main[:12] if main and SHA_RE.fullmatch(main) else "?"
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["tooling"] = at
+            if not row.get("reachable"):
+                m["tooling"] = {"reachable": False}
+                self.finding("tooling", "probe_failed", "info", f"tooling probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            state = row.get("state") if row.get("state") in TOOLING_STATES else "unreadable"
+            commit = str(row.get("source") or "")
+            commit = commit if SHA_RE.fullmatch(commit) else None
+            behind = stamp_of(row.get("behind"))
+            m["tooling"] = {"reachable": True, "state": state, "source": commit, "date": clean(row.get("date"), 10) or None,
+                            "by": clean(row.get("by"), 40) or None, "behind": behind, "origin_main": main,
+                            "note": clean(row.get("note"), 120)}
+            short = (commit or "?")[:12]
+            dated = f" ({m['tooling']['date']})" if m["tooling"]["date"] else ""
+            if state == "behind":
+                count = f"{behind} commits" if behind is not None else "some commits"
+                self.finding("tooling", "behind", "warn",
+                             f"runner tooling at {short}{dated} is {count} behind origin/main {main}", member, at,
+                             self.action(member, "roll_out_tooling", "agent",
+                                         "scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group "
+                                         f"glaeda-minis --hosts {member}", on_member=False,
+                                         note="from a worktree at origin/main; plan first without --apply"))
+            elif state == "not_ancestor":
+                why = f" ({m['tooling']['note']})" if m["tooling"]["note"] else ""
+                self.finding("tooling", "not_ancestor", "warn",
+                             f"runner tooling at {short}{dated} is not an ancestor of origin/main {main}{why}",
+                             member, at,
+                             self.action(member, "decide_tooling_source", "person", None,
+                                         note="a diverged or newer deploy; glaeda-cmux-runner-fleet --apply refuses "
+                                              "this member until origin/main contains it, or --allow-downgrade "
+                                              "REASON"))
+            elif state in ("none", "unreadable", "unjudged"):
+                self.finding("tooling", {"none": "no_stamp"}.get(state, state), "info",
+                             f"runner tooling: {m['tooling']['note'] or state}; not judged", member, at,
+                             self.action(member, "none", "person", None,
+                                         note="glaeda-cmux-runner-fleet --apply writes the stamp"))
+
+    def fold_daemon_heal(self) -> None:
+        """A macOS member whose root daemon-heal is missing, or whose own report says it stopped or fell behind."""
+        data = self.data("daemon_heal")
+        if not data:
+            return
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["daemon_heal"] = at
+            if not row.get("reachable"):
+                m["daemon_heal"] = {"reachable": False}
+                self.finding("daemon_heal", "probe_failed", "info",
+                             f"daemon-heal probe failed: {clean(row.get('error'), 160)}", member, at,
+                             self.action(member, "retry_probe", "agent", "glaeda-fleet-status", safe=True,
+                                         on_member=False))
+                continue
+            if row.get("state") == "not_darwin":
+                continue
+            state = row.get("state") if row.get("state") in DAEMON_HEAL_STATES else "stale"
+            m["daemon_heal"] = {"reachable": True, "state": state, "tag": clean(row.get("tag"), 40) or None,
+                                "wants": clean(row.get("wants"), 40) or None, "why": clean(row.get("why"), 200)}
+            if state == "current":
+                continue
+            summary = f"root daemon-heal: {m['daemon_heal']['why'] or state}"
+            if row.get("reinstall") is False:  # it cannot read its channel or refused a release: a reinstall is no fix
+                action = self.action(member, "read_daemon_heal_report", "agent",
+                                     "/usr/bin/python3 -c 'import json; print(json.load(open(\"/Library/Application "
+                                     "Support/glaeda/daemon-heal/state/report.json\")).get(\"release\"))'", safe=True,
+                                     note="release.error says why; it retries every release.every_s")
+            else:
+                action = self.action(member, "install_daemon_heal", "password", None,
+                                     note="one root install of the stable release, pinned to its hashes "
+                                          "(docs/CMUX_MINI_RUNNER.md, 2l2); it keeps itself current after that")
+            self.finding("daemon_heal", f"daemon_heal_{state}", "warn", summary, member, at, action)
+
+    def build(self) -> dict[str, Any]:
+        self.state = self.freshness()
+        self.fold_check()
+        self.fold_preflight()
+        self.fold_controller()
+        self.fold_live_builder()
+        runners = self.fold_runners()
+        self.fold_queue(runners)
+        cache = self.fold_cache()
+        self.fold_lima()
+        self.fold_disk()
+        self.fold_jobs()
+        self.fold_tooling()
+        self.fold_daemon_heal()
+        findings = dedupe(self.findings)
+        rank = {s: i for i, s in enumerate(SEVERITIES)}
+        findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
+        dropped = max(0, len(findings) - MAX_FINDINGS)
+        findings = findings[:MAX_FINDINGS]
+        while True:
+            doc = self.assemble(findings, cache, dropped)
+            if len(canonical(doc)) <= MAX_DOCUMENT_BYTES:
+                return doc
+            # Drop the least severe first; never drop an error to fit.
+            if not findings or findings[-1]["severity"] == "error":
+                raise Failure(f"status document exceeds {MAX_DOCUMENT_BYTES} bytes even with only error findings")
+            findings = findings[:-1]
+            dropped += 1
+
+    def assemble(self, findings: list[dict[str, Any]], cache: list[dict[str, Any]], dropped: int) -> dict[str, Any]:
+        members = []
+        for name, m in list(sorted(self.members.items()))[:MAX_MEMBERS]:
+            m = {**m, "class": clean(m["class"], 40) if m["class"] else None,
+                 "roles": [clean(r, 40) for r in m["roles"][:8]] if isinstance(m["roles"], list) else []}
+            mine = [f for f in findings if f["member"] == name]
+            counts = {s: sum(f["severity"] == s for f in mine) for s in SEVERITIES}
+            seen = [v for v in m["observed"].values() if v is not None]
+            status = ("unknown" if not seen else "broken" if counts["error"] else
+                      "attention" if counts["warn"] else "ok")
+            members.append({**m, "status": status, "counts": counts,
+                            "observed_at": min(seen) if seen else None})
+        fleet_counts = {s: sum(f["severity"] == s for f in findings) for s in SEVERITIES}
+        doc = {
+            "schema": SCHEMA,
+            "generated_at": self.at,
+            "max_age_seconds": self.max_age,
+            "sources": self.state,
+            "fleet": {
+                "members": len(self.members),
+                "by_status": {s: sum(m["status"] == s for m in members)
+                              for s in ("ok", "attention", "broken", "unknown")},
+                "findings": fleet_counts,
+                "safe_to_apply": sum(f["action"]["safe_to_apply"] for f in findings),
+                "never_touch": sorted(self.never),
+                "cache": cache,
+                "truncated_findings": dropped,
+            },
+            "members": members,
+            "findings": findings,
+        }
+        return doc
+
+
+MERGEABLE = frozenset({"check", "preflight"})
+
+
+def dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """check and preflight often name the same fix for a member: keep one, the more severe, and say so."""
+    out: list[dict[str, Any]] = []
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    ids: set[str] = set()
+    rank = {s: i for i, s in enumerate(SEVERITIES)}
+    for f in findings:
+        command = f["action"]["command"]
+        key = (f["member"], command) if command and f["member"] and f["source"] in MERGEABLE else None
+        if key and key in seen and seen[key]["source"] != f["source"]:
+            kept = seen[key]
+            kept["also"] = sorted({*kept.get("also", []), f["id"]})
+            if rank[f["severity"]] < rank[kept["severity"]]:
+                kept["severity"] = f["severity"]
+            continue
+        base, n = f["id"], 2
+        while f["id"] in ids:
+            f["id"] = f"{base}#{n}"
+            n += 1
+        ids.add(f["id"])
+        if key:
+            seen[key] = f
+        out.append(f)
+    return out
+
+
+def build(bundle: dict[str, Any], at: int | None = None, max_age: int = DEFAULT_MAX_AGE) -> dict[str, Any]:
+    if not isinstance(bundle, dict) or bundle.get("schema") != SOURCES_SCHEMA:
+        raise Failure(f"not a {SOURCES_SCHEMA} bundle")
+    sources = bundle.get("sources")
+    if not isinstance(sources, dict) or "manifest" not in sources:
+        raise Failure("sources bundle has no manifest source")
+    try:
+        return Builder(sources, now() if at is None else at, max_age).build()
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise Failure(f"sources bundle does not match this tool's format ({type(error).__name__}: {error})") from None
+
+
+# ---------------------------------------------------------------- render
+
+
+def gib(value: Any) -> str:
+    return "?" if num(value) is None else f"{value / GIB:.1f}"
+
+
+def disk_line(d: dict[str, Any] | None, at: int) -> str:
+    """One compact line per member for both renderers."""
+    if not d:
+        return ""
+    if not d.get("reachable"):
+        return "unreachable"
+    if not d.get("installed"):
+        return "glaeda-disk not installed"
+    parts = []
+    if d.get("error"):
+        parts.append(d["error"])
+    else:
+        parts.append(f"free {gib(d.get('free_bytes'))}/{gib(d.get('total_bytes'))} GiB"
+                     f"{' UNDER PRESSURE' if d.get('under_pressure') else ''} (low {gib(d.get('low_bytes'))})")
+        retired = sum(f["bytes"] for f in d.get("families") or [] if f.get("retired"))
+        top = ", ".join(f"{f['family']} {gib(f['bytes'])}" for f in (d.get("families") or [])[:3] if f["bytes"])
+        parts.append(f"caches {gib(d.get('cache_bytes'))} GiB" + (f" [{top}]" if top else "")
+                     + (f", RETIRED {gib(retired)} GiB" if retired else ""))
+        categories = []
+        for entry in d.get("accounting") or []:
+            for coverage in entry.get("coverage") or []:
+                for child in coverage.get("children") or []:
+                    if child.get("bytes"):
+                        label = str(child.get("category") or "unknown")
+                        categories.append(f"{label} {gib(child['bytes'])}")
+        if categories:
+            parts.append("accounted " + ", ".join(categories[:3]))
+        accounting_totals = []
+        for entry in d.get("accounting") or []:
+            if entry.get("reclaimable") is not None:
+                accounting_totals.append(f"reclaimable {gib(entry['reclaimable'])} GiB")
+            if entry.get("unclassified") is not None:
+                accounting_totals.append(f"unclassified {gib(entry['unclassified'])} GiB")
+            container = entry.get("container") or {}
+            if container.get("free") is not None:
+                accounting_totals.append(f"APFS container free {gib(container['free'])} GiB")
+        if accounting_totals:
+            parts.append("; ".join(accounting_totals[:3]))
+    prune, gc = d.get("prune"), d.get("gc")
+    if prune:
+        result = str(prune.get("result") or "?").split(" (")[0]
+        parts.append(f"prune {result} {when(prune.get('at'), at)}")
+    elif d.get("fleet_cas"):
+        parts.append("prune no run yet" if d.get("prune_job_at") else "prune job missing")
+    if gc:
+        parts.append(f"gc {str(gc.get('result') or '?').split(',')[0]} {when(gc.get('at'), at)}")
+    reclaimed = d.get("reclaimed_24h")
+    if reclaimed:
+        parts.append(f"reclaimed 24h {gib(reclaimed.get('bytes'))} GiB")
+    residue = d.get("tmp_test_residue")
+    if residue and "test_residue" in residue:
+        parts.append(f"tmp test scratch {residue['test_residue']} ({residue.get('idle', '?')} idle 12h+)")
+    return clean("; ".join(parts), MAX_TEXT)
+
+
+def jobs_line(j: dict[str, Any] | None) -> str:
+    """One compact line per member: job count, contended count, and the newest contended job's first reason."""
+    if not j:
+        return ""
+    if not j.get("reachable"):
+        return "unreachable"
+    state = (j.get("console") or {}).get("state")
+    console = {"locked": "; console LOCKED", "no_user": "; console NO USER"}.get(state, "")
+    if not j.get("count"):
+        return "no job records" + console
+    line = f"{j['count']} jobs, {j.get('contended') or 0} contended"
+    latest = (j.get("contended_jobs") or [{}])[0]
+    if j.get("contended") and latest:
+        line += f"; latest {latest.get('job') or '?'}: {(latest.get('reasons') or ['?'])[0]}"
+    return clean(line + console, MAX_TEXT)
+
+
+def tooling_line(t: dict[str, Any] | None) -> str:
+    if not t:
+        return ""
+    if not t.get("reachable"):
+        return "unreachable"
+    short, main = (t.get("source") or "?")[:12], t.get("origin_main") or "?"
+    if t.get("state") == "current":
+        return f"{short}, origin/main"
+    if t.get("state") == "behind":
+        return f"{short}, {t['behind'] if t.get('behind') is not None else '?'} behind origin/main {main}"
+    if t.get("state") == "not_ancestor":
+        return clean(f"{short}, NOT an ancestor of origin/main {main}", MAX_TEXT)
+    return clean(t.get("note") or t.get("state") or "?", MAX_TEXT)
+
+
+def daemon_heal_line(d: dict[str, Any] | None) -> str:
+    if not d:
+        return ""
+    if not d.get("reachable"):
+        return "unreachable"
+    return clean(f"{d.get('state')}: {d.get('why') or ''}", MAX_TEXT)
+
+
+def when(stamp: Any, at: int) -> str:
+    if stamp is None:
+        return "never"
+    age = max(0, at - int(stamp))
+    return f"{age}s ago" if age < 120 else f"{age // 60}m ago" if age < 7200 else f"{age // 3600}h ago"
+
+
+def render_text(doc: dict[str, Any]) -> str:
+    at = doc["generated_at"]
+    lines = []
+    width = max([6, *(len(m["name"]) for m in doc["members"])])
+    lines.append(f"{'member':<{width}}  {'status':<9}  err warn  observed")
+    for m in doc["members"]:
+        mark = " (never_touch)" if m["never_touch"] else ""
+        lines.append(f"{m['name']:<{width}}  {m['status']:<9}  {m['counts']['error']:>3} {m['counts']['warn']:>4}  "
+                     f"{when(m['observed_at'], at)}{mark}")
+    disk = [(m["name"], disk_line(m.get("disk"), at)) for m in doc["members"] if m.get("disk")]
+    if disk:
+        lines.append("")
+        lines.append("disk:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in disk)
+    jobs = [(m["name"], jobs_line(m.get("jobs"))) for m in doc["members"] if m.get("jobs")]
+    if jobs:
+        lines.append("")
+        lines.append("jobs (24 h):")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in jobs)
+    tooling = [(m["name"], tooling_line(m.get("tooling"))) for m in doc["members"] if m.get("tooling")]
+    if tooling:
+        lines.append("")
+        lines.append("runner tooling:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in tooling)
+    heal = [(m["name"], daemon_heal_line(m.get("daemon_heal"))) for m in doc["members"] if m.get("daemon_heal")]
+    if heal:
+        lines.append("")
+        lines.append("root daemon-heal:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in heal)
+    live_builders = []
+    for m in doc["members"]:
+        live = m.get("live_builder")
+        if not live:
+            continue
+        blocked = [name for name, state in live.get("health", {}).items() if state != "pass"]
+        live_builders.append((m["name"], live.get("profile") or "unknown", ",".join(blocked) or "ready"))
+    if live_builders:
+        lines.append("")
+        lines.append("live builders:")
+        lines.extend(f"  {name:<{width}}  {profile}: {state}" for name, profile, state in live_builders)
+    stale = [f"{n} {s['state']}" for n, s in doc["sources"].items() if s["state"] in ("stale", "unavailable")]
+    if stale:
+        lines.append("")
+        lines.append("sources: " + ", ".join(stale))
+    for who in WHO:
+        mine = [f for f in doc["findings"] if f["action"]["who"] == who and f["severity"] != "info"]
+        if not mine:
+            continue
+        lines.append("")
+        lines.append({"agent": "an agent can run", "password": "needs a password", "person": "needs a person"}[who] + ":")
+        for f in mine:
+            safe = " [safe]" if f["action"]["safe_to_apply"] else ""
+            lines.append(f"  {f['severity']:<5} {f['member'] or 'fleet'}: {f['summary']}")
+            if f["action"]["command"]:
+                lines.append(f"        {f['action']['command']}{safe}")
+            elif f["action"]["note"]:
+                lines.append(f"        ({f['action']['note']})")
+    fleet = doc["fleet"]
+    lines.append("")
+    lines.append(f"{fleet['members']} members: " + ", ".join(f"{v} {k}" for k, v in fleet["by_status"].items() if v)
+                 + f"; {fleet['findings']['error']} errors, {fleet['findings']['warn']} warnings, "
+                   f"{fleet['safe_to_apply']} safe to apply")
+    if fleet["truncated_findings"]:
+        lines.append(f"{fleet['truncated_findings']} findings dropped to stay within bounds")
+    return "\n".join(lines)
+
+
+PAGE_STYLE = """
+:root{--bg:#fbfbfa;--fg:#1d1d1b;--muted:#6b6b66;--line:#e3e2dd;--card:#fff;--ok:#2f7d4f;--warn:#a26a00;
+--err:#b3261e;--info:#4a5a73;--code:#f2f1ec}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#ecebe6;--muted:#9c9b95;
+--line:#2d2d2a;--card:#1e1e1c;--ok:#6cc08b;--warn:#e0a83a;--err:#f08079;--info:#9fb0cc;--code:#262624}}
+:root[data-theme="dark"]{--bg:#161615;--fg:#ecebe6;--muted:#9c9b95;--line:#2d2d2a;--card:#1e1e1c;--ok:#6cc08b;
+--warn:#e0a83a;--err:#f08079;--info:#9fb0cc;--code:#262624}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 8px}
+.sub{color:var(--muted);margin:0 0 16px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.tile b{display:block;font-size:22px}.tile span{color:var(--muted);font-size:13px}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card)}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;font-size:14px}
+th{color:var(--muted);font-weight:600}
+.s-ok{color:var(--ok)}.s-attention,.s-warn,.s-stale{color:var(--warn)}.s-broken,.s-error,.s-unavailable{color:var(--err)}
+.s-unknown,.s-info,.s-not_collected{color:var(--info)}
+code{background:var(--code);border-radius:4px;padding:2px 4px;font-size:13px;word-break:break-all}
+.pill{border:1px solid var(--line);border-radius:10px;padding:0 6px;font-size:12px;color:var(--muted)}
+"""
+
+
+def render_html(doc: dict[str, Any]) -> str:
+    at = doc["generated_at"]
+    e = html.escape
+    fleet = doc["fleet"]
+    out = ["<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+           "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+           "<title>Fleet status</title><style>", PAGE_STYLE, "</style></head><body><main>",
+           "<h1>Fleet status</h1>",
+           f"<p class=\"sub\">Generated {e(time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(at)))} from "
+           f"<code>{e(doc['schema'])}</code>. Sources older than {doc['max_age_seconds']} s show as stale.</p>",
+           "<div class=\"tiles\">"]
+    for label, value in (("members", fleet["members"]), ("broken", fleet["by_status"]["broken"]),
+                         ("attention", fleet["by_status"]["attention"]), ("errors", fleet["findings"]["error"]),
+                         ("warnings", fleet["findings"]["warn"]), ("safe to apply", fleet["safe_to_apply"])):
+        out.append(f"<div class=\"tile\"><b>{value}</b><span>{e(label)}</span></div>")
+    out.append("</div><h2>Sources</h2><div class=\"scroll\"><table><tr><th>source</th><th>state</th>"
+               "<th>observed</th><th>error</th></tr>")
+    for name, s in doc["sources"].items():
+        out.append(f"<tr><td>{e(name)}</td><td class=\"s-{e(s['state'])}\">{e(s['state'])}</td>"
+                   f"<td>{e(when(s['observed_at'], at))}</td><td>{e(s['error'] or '')}</td></tr>")
+    out.append("</table></div><h2>Members</h2><div class=\"scroll\"><table><tr><th>member</th><th>class</th>"
+               "<th>status</th><th>controller</th><th>runners</th><th>lima</th><th>disk</th><th>jobs (24 h)</th><th>errors</th>"
+               "<th>warnings</th>"
+               "<th>observed</th></tr>")
+    for m in doc["members"]:
+        ctl = m.get("controller") or {}
+        runners = ", ".join(f"{r['name']} {r['status']}{' busy' if r['busy'] else ''}" for r in m.get("runners") or [])
+        lima = m.get("lima") or {}
+        lima_text = ("" if not lima else "unreachable" if not lima.get("reachable") else
+                     "not installed" if not lima.get("installed") else
+                     f"{lima['running']}/{lima['total']} running, {len(lima['orphans'])} orphan")
+        tag = " <span class=\"pill\">never_touch</span>" if m["never_touch"] else ""
+        out.append(f"<tr><td>{e(m['name'])}{tag}</td><td>{e(str(m['class'] or ''))}</td>"
+                   f"<td class=\"s-{e(m['status'])}\">{e(m['status'])}</td><td>{e(str(ctl.get('state', '')))}</td>"
+                   f"<td>{e(runners)}</td><td>{e(lima_text)}</td><td>{e(disk_line(m.get('disk'), at))}</td>"
+                   f"<td>{e(jobs_line(m.get('jobs')))}</td>"
+                   f"<td>{m['counts']['error']}</td>"
+                   f"<td>{m['counts']['warn']}</td><td>{e(when(m['observed_at'], at))}</td></tr>")
+    out.append("</table></div>")
+    titles = {"agent": "An agent can run", "password": "Needs a password", "person": "Needs a person"}
+    for who in WHO:
+        mine = [f for f in doc["findings"] if f["action"]["who"] == who]
+        if not mine:
+            continue
+        out.append(f"<h2>{titles[who]} ({len(mine)})</h2><div class=\"scroll\"><table><tr><th>severity</th>"
+                   "<th>member</th><th>finding</th><th>action</th><th>observed</th></tr>")
+        for f in mine:
+            a = f["action"]
+            safe = " <span class=\"pill\">safe to apply</span>" if a["safe_to_apply"] else ""
+            body = f"<code>{e(a['command'])}</code>{safe}" if a["command"] else ""
+            if a["note"]:
+                body += f"<div class=\"sub\">{e(a['note'])}</div>"
+            out.append(f"<tr><td class=\"s-{e(f['severity'])}\">{e(f['severity'])}</td>"
+                       f"<td>{e(f['member'] or 'fleet')}</td><td>{e(f['summary'])}<div class=\"sub\">"
+                       f"{e(f['id'])}</div></td><td>{body}</td><td>{e(when(f['observed_at'], at))}</td></tr>")
+        out.append("</table></div>")
+    if fleet["truncated_findings"]:
+        out.append(f"<p class=\"sub\">{fleet['truncated_findings']} findings dropped to stay within bounds.</p>")
+    out.append("</main></body></html>\n")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- cli
+
+
+def write(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise Failure(f"{path}: {error}") from None
+
+
+def emit(doc: dict[str, Any], args: argparse.Namespace) -> int:
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    if args.out:
+        write(args.out, text)
+    if args.html:
+        write(args.html, render_html(doc))
+    if args.output == "json":
+        print(text, end="")
+    else:
+        print(render_text(doc))
+    return 1 if doc["fleet"]["findings"]["error"] else 0
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=__doc__.split("\n\n", 1)[1])
+    p.add_argument("command", nargs="?", default="status", choices=("status", "collect", "build", "render"))
+    p.add_argument("input", nargs="?", type=Path, help="build: a sources bundle; render: a status document")
+    p.add_argument("--manifest", type=Path)
+    p.add_argument("--host", action="append", dest="hosts", help="limit to these members (repeatable)")
+    p.add_argument("--no-fleet-probe", action="store_true", help="skip glaeda-mini-fleet check and preflight")
+    p.add_argument("--no-lima", action="store_true", help="skip the Lima instance listing")
+    p.add_argument("--no-disk", action="store_true", help="skip the per-member disk and cache probe")
+    p.add_argument("--no-jobs", action="store_true", help="skip the per-member runner job records")
+    p.add_argument("--no-tooling", action="store_true", help="skip the per-member runner tooling stamp")
+    p.add_argument("--no-daemon-heal", action="store_true", help="skip the per-member root daemon-heal probe")
+    p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
+    p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
+    p.add_argument("--live-builder-status", type=Path,
+                   help="local cmux-live state/status.json (requires --live-builder-profile)")
+    p.add_argument("--live-builder-profile", help="explicit fleet policy profile for the live-builder status")
+    p.add_argument("--github-runners", metavar="SCOPE", help="orgs/OWNER or repos/OWNER/REPO")
+    p.add_argument("--queue-repo", action="append", metavar="OWNER/REPO")
+    p.add_argument("--cache", action="append", metavar="NAME=URL")
+    p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--max-age", type=int, default=DEFAULT_MAX_AGE, help="seconds before a source counts as stale")
+    p.add_argument("--sources-out", type=Path, help="also write the collected sources bundle here")
+    p.add_argument("--out", type=Path, help="write the status document here (atomically)")
+    p.add_argument("--html", type=Path, help="write the human page here (atomically)")
+    p.add_argument("--output", choices=("text", "json"), default="text")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if args.github_runners and not re.fullmatch(r"(orgs/[\w.-]+|repos/[\w.-]+/[\w.-]+)", args.github_runners):
+            raise Failure("--github-runners wants orgs/OWNER or repos/OWNER/REPO")
+        for repo in args.queue_repo or []:
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+                raise Failure(f"--queue-repo wants OWNER/REPO, got {repo!r}")
+        if args.command in ("build", "render") and not args.input:
+            raise Failure(f"{args.command} needs an input file")
+        if args.command == "render":
+            doc = read_json(args.input)
+            if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
+                raise Failure(f"{args.input}: not a {SCHEMA} document")
+            return emit(doc, argparse.Namespace(**{**vars(args), "out": None}))
+        if args.command == "build":
+            return emit(build(read_json(args.input), max_age=args.max_age), args)
+        if args.manifest is None:
+            args.manifest = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST",
+                                                "~/.config/glaeda/mini-fleet.json")).expanduser()
+        bundle = collect(args)
+        if args.sources_out:
+            write(args.sources_out, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
+        if args.command == "collect":
+            if not args.sources_out:
+                print(json.dumps(bundle, indent=2, sort_keys=True))
+            return 0
+        return emit(build(bundle, max_age=args.max_age), args)
+    except Failure as error:
+        print(f"glaeda-fleet-status: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

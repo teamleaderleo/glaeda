@@ -681,9 +681,7 @@ mod tests {
 
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
     use crate::project_catalog::ProjectCatalog;
-    use crate::project_checkout_observation::{
-        PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectCheckoutObserver,
-    };
+    use crate::project_checkout_observation::{ProjectCheckoutObserver, expected_git_timeout};
     use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 
     use super::{
@@ -789,7 +787,7 @@ mod tests {
             spec: &CommandSpec,
             timeout: std::time::Duration,
         ) -> io::Result<ExecutionRecord> {
-            assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
+            assert_eq!(timeout, expected_git_timeout(spec));
             self.commands.borrow_mut().push(spec.clone());
             if let Some(root) = self.mutation_root.as_ref()
                 && !self.mutated.replace(true)
