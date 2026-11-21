@@ -20749,11 +20749,12 @@ class LogScanTest(Base):
 LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
-def land_pr(head: str, state: str = "OPEN", checks: list | None = None) -> dict:
+def land_pr(head: str, state: str = "OPEN", checks: list | None = None, draft: bool = False) -> dict:
     """A PR cache entry's data, as parse_pr stores it."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
     return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "isDraft": draft,
             "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
 
 
@@ -20965,6 +20966,11 @@ class LandTest(Base):
 
     def pr(self, head: str, key: str = KEY, **kw: Any) -> None:
         self.w.set_pr(key, land_pr(head, **kw), self.t)
+
+    def store_pr(self, data: dict, key: str = KEY, at: float | None = None) -> None:
+        """A PR in the daemon's cache *on disk* (cache_dir), which the `land` CLI reads with no fake in between."""
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "data": data, "dataAt": time.time() if at is None else at})
 
     def assert_merged_at(self, head: str) -> None:
         merges = self.w.gh_calls("pr", "merge")
@@ -23428,6 +23434,11 @@ class LandTest(Base):
         for said in ("GraphQL: Pull Request is not mergeable (mergePullRequest)", "the PR is a draft review"):
             self.assertIsNone(gg.LAND_STEP_DRAFT.search(said), said)
         self.pr(LA)
+        # Converted to a draft *after* its request, which is why this check cannot be replaced by the request-time
+        # one: at the request this host's read said the PR was ready, so land_draft_refusal has nothing to answer.
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "data": land_pr(LA), "dataAt": time.time()})
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1))
         self.land()
         self.w.gh_rc["merge"] = 1
         self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
@@ -23438,6 +23449,66 @@ class LandTest(Base):
         self.assertIn("still a draft", e["stop"]["reason"])
         self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
         self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
+
+    def test_land_refuses_a_draft_pr_at_the_request_and_names_gh_pr_ready(self):
+        """The other half of the one above: *when* the answer comes. efficiency-standing-lane, 2026-11-21: one host's
+        queue stopped 7 rows merge_draft 139 min after their own land requests in total (median 13.6 min, worst
+        53.3 min: manaflow-ai/cmuxterm-hq#16729),
+        every refusal carrying "land-judge (pass): ok: ... may merge at <sha>" -- a full CI wait, a judgment and a
+        merge call spent on `isDraft`, which was already true when `land` was typed, and 65 more minutes sitting
+        stopped. A request this host can answer from its cache is answered at once, with the step that clears it."""
+        self.pr(LA, draft=True)
+        self.store_pr(land_pr(LA, draft=True))
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
+                mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("no read, no judge, no step")):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, "b" * 40)
+        self.assertEqual(rc, gg.EXIT_FAIL)
+        self.assertIn("o/r#1 is a draft", said[0])
+        self.assertIn("GitHub refuses every merge on a draft", said[0])
+        self.assertIn("stays yours", said[0])  # nothing here marks a PR ready: [hold-own-pr]
+        # The step, with the pin carried through, so the re-land is still pinned to the head the caller judged.
+        self.assertIn(f"next: gh pr ready 1 -R o/r, then glaeda-gh land o/r#1 --match-head-commit {'b' * 40}",
+                      said[0])
+        self.assertEqual(list(gg.LandQueue.requests_dir().glob("*.json"))
+                         if gg.LandQueue.requests_dir().is_dir() else [], [])
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
+        self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+
+    def test_a_draft_read_that_is_stale_or_shadowed_by_a_write_refuses_nothing(self):
+        """A refusal built from a read that may no longer hold is never final: it is queued as before, and the
+        merge-time check answers it. So the request-time check keeps inside the live-field bound, and drops a read a
+        write that could have marked the PR ready (the brokered `gh pr ready` itself) came after."""
+        self.assertEqual(gg.LAND_DRAFT_AGE, gg.BROKER_MAX_AGE)  # isDraft is in BROKER_LIVE_FIELDS
+        now = time.time()
+        draft = land_pr(LA, draft=True)
+        self.store_pr(draft, at=now)
+        self.assertIsNotNone(gg.land_draft_refusal(self.KEY, "o/r", 1))
+        for at, writes, why in ((now - gg.LAND_DRAFT_AGE - 1, {}, "older than the live-field bound"),
+                                (now + 600, {}, "stamped in the future"),
+                                (now, {"o/r pr 1": now + 1}, "a `gh pr ready` write after the read"),
+                                (now, {"*": now + 1}, "a write with no repository of its own")):
+            self.store_pr(draft, at=at)
+            gg.write_json(gg.gh_cache_dir() / "writes.json", writes)
+            self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), why)
+        gg.write_json(gg.gh_cache_dir() / "writes.json", {})
+        for data, why in ((land_pr(LA), "not a draft"), (land_pr(LA, state="MERGED", draft=True), "not open"),
+                          ({"state": "OPEN"}, "no isDraft stored"),):
+            self.store_pr(data, at=now)
+            self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), why)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "data": draft, "dataAt": now, "error": "quota"})
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), "a failed read")
+        (gg.cache_dir() / gg.file_name(self.KEY)).unlink()
+        self.assertIsNone(gg.land_draft_refusal(self.KEY, "o/r", 1), "no read at all")
 
     CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'

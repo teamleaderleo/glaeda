@@ -10588,6 +10588,23 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 # requester's call.
 LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request is in draft state\b"
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
+# The other half of the same answer: *when* it is given. Stopping at the first merge refusal still spends the whole
+# wait before it -- the CI wait, the judgment, the merge call -- on a property of the PR the request could have read.
+# efficiency-standing-lane, 2026-11-21: one host's queue stopped 7 rows merge_draft, 139 min between their land
+# requests and those refusals in total (median 13.6, worst 53.3: manaflow-ai/cmuxterm-hq#16729), every refusal
+# carrying "land-judge (pass): ok: ... may merge at <sha>" -- the judge passed, the checks passed, and the merge
+# was refused for `isDraft`, which was already true when `land` was typed. They then sat stopped another 65 min in total waiting to be noticed. Re-queued after a
+# `gh pr ready` they merged in 30-136 s, first try, all of them.
+# So `land` answers it at the request now (land_draft_refusal), under three bounds:
+# - no read of its own: only this host's cache, so a land is still queued whatever the quota (check_land_pin's rule).
+#   An absent, failed or stale read refuses nothing, and the request is queued exactly as before.
+# - LAND_DRAFT_AGE, the live-field bound BROKER_MAX_AGE (`isDraft` is in BROKER_LIVE_FIELDS): a draft read older than
+#   that is not an answer anything may refuse on, and a write that could have marked the PR ready (gh_cache_writes,
+#   stamped by the brokered `gh pr ready` itself) after the read drops it too.
+# - the merge-time check above stays: a PR can be converted back to a draft after its request, and this one answers
+#   only the rows where the cache already knew. Nothing here marks a PR ready either -- `gh pr ready` is the
+#   requester's call, as it is above, and [hold-own-pr] exists so a draft can be a deliberate hold.
+LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cycle is 60 s)
 # A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
 # from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
 # push that resolves it can. efficiency-standing-lane, 2026-11-21: one host's `land status` held four rows stopped
@@ -14514,7 +14531,7 @@ def land_print_answer(out: dict, as_json: bool, key: str, where: str) -> None:
 
 def land_forward_exit(out: dict, wait: float) -> int:
     state = out.get("state")
-    if out.get("code") == "land_judge_missing":
+    if out.get("code") in LAND_REQUEST_REFUSED:
         return EXIT_FAIL
     if state == "merged":
         return EXIT_OK
@@ -14548,14 +14565,20 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
         except WatchError as error:
             why = str(error)
         else:
-            if out.get("ok") or out.get("code") == "land_judge_missing":
+            if out.get("ok") or out.get("code") in LAND_REQUEST_REFUSED:
                 staged.unlink(missing_ok=True)  # taken (or refused for good, and said so below)
             else:
                 why = f"{name}: {land_trim(out.get('reason') or out.get('code'), 200)}"
         if not why:
-            land_print_answer(out, as_json, key, name)
-            if out.get("code") == "land_judge_missing" and not as_json:
-                say_waiting(f"glaeda land: refused on {name}: {out.get('reason')}\nnext: {out.get('next')}")
+            if out.get("code") in LAND_REQUEST_REFUSED:
+                # A request-time refusal, not a queued land: the human line is the refusal and its step, never
+                # "requested; the daemon takes it next tick", which land_print_answer would print for an empty entry.
+                if as_json:
+                    print(json.dumps(out, sort_keys=True))
+                else:
+                    say_waiting(f"glaeda land: refused on {name}: {out.get('reason')}\nnext: {out.get('next')}")
+            else:
+                land_print_answer(out, as_json, key, name)
             return land_forward_exit(out, wait)
     out = {"ok": True, "key": key, "state": "requested", "requester": requester, "request": rid, "entry": None,
            "forwardTo": name, "pending": why}
@@ -14591,6 +14614,39 @@ def check_land_pin(repo: str, number: int, pin: str | None) -> None:
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
 
 
+# The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
+# the executor unchanged (cmd_land_forwarded prints them and drops the staged copy, land_forward_exit fails on them),
+# because the executor is the host that holds the cache and the land-judge the answer came from.
+LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft")
+
+
+def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple[str, str] | None:
+    """(why, the step that clears it) when this host already knows REPO#NUMBER is a draft, else None.
+
+    No read of its own (LAND_DRAFT_AGE's comment): this answers from the daemon's cache or not at all, so a land is
+    still queued under a spent quota, and an absent, failed, stale or write-shadowed read refuses nothing. The
+    merge-time check (LAND_STEP_DRAFT) stays either way."""
+    cached = read_cache(key) or {}
+    data, at = cached.get("data"), cached.get("dataAt")
+    if cached.get("error") or not isinstance(data, dict) or not isinstance(at, (int, float)) \
+            or isinstance(at, bool):
+        return None
+    now = time.time()
+    if not 0 <= now - at <= LAND_DRAFT_AGE:
+        return None  # older than the live-field bound (or stamped in the future): not an answer to refuse on
+    if data.get("isDraft") is not True or data.get("state") != "OPEN" or data.get("merged"):
+        return None
+    writes = gh_cache_writes()
+    if any(writes.get(stamp, 0.0) >= at for stamp in gh_cache_stamps(["pr", repo, str(number)], repo) or []):
+        return None  # a write that could have marked it ready (`gh pr ready` itself) came after the read
+    name = f"{repo}#{number}"
+    pinned = f" --match-head-commit {pin}" if pin else ""
+    return (f"{name} is a draft ({int(now - at)} s ago, by this host's last read of it): GitHub refuses every merge "
+            f'on a draft ("Pull Request is still a draft"), so the land would wait out its checks, judge them, and '
+            f"stop at the merge. Nothing here marks a PR ready: a draft can be a deliberate hold, so it stays yours",
+            f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}{pinned}")
+
+
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
              pin: str | None = None, override: dict | None = None) -> int:
     """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
@@ -14601,6 +14657,17 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
+    draft = land_draft_refusal(key, repo, number, sha)
+    if draft is not None:
+        # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
+        # spent on an answer the first merge would have given ~20 min later (LAND_DRAFT_AGE's comment).
+        why, nxt = draft
+        if as_json:
+            print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": why, "next": nxt},
+                             sort_keys=True))
+        else:
+            say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
+        return EXIT_FAIL
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
@@ -14745,6 +14812,20 @@ def cmd_land_serve(text: str) -> int:
         print(json.dumps({"ok": False, "code": "land_judge_missing", "reason": why, "next": nxt,
                           "host": policy_host()}, sort_keys=True))
         return EXIT_FAIL
+    if op == "land":
+        # The executor holds the cache (a forwarding host's may know nothing of the PR), so the request-time draft
+        # answer is given here too, in the shape the forwarder prints and exits on (LAND_REQUEST_REFUSED).
+        try:
+            key, repo, number = land_key(str(req.get("target") or ""))
+            pin = land_pin_sha(req.get("sha"))
+        except (WatchError, TypeError):
+            key = repo = pin = ""  # land_serve_one below answers a target or pin this host cannot read
+            number = 0
+        draft = land_draft_refusal(key, repo, number, pin) if key else None
+        if draft is not None:
+            print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": draft[0], "next": draft[1],
+                              "host": policy_host()}, sort_keys=True))
+            return EXIT_FAIL
     if op == "batch":
         accepted, refused = [], []
         for item in (req.get("requests") or [])[:LAND_FORWARD_BATCH]:
