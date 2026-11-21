@@ -26414,9 +26414,24 @@ def positional_capacity(p: argparse.ArgumentParser) -> float:
     return total
 
 
+def spelled_long_flag(word: str, options: dict[str, bool]) -> str | None:
+    """WORD as one of OPTIONS' long flags, an abbreviation of one included: argparse's `allow_abbrev` is on,
+    so `--contain` is `--contains` and `--time` is `--timeout`. None when it is no long flag of this command,
+    or an abbreviation several of them answer to (which argparse refuses itself)."""
+    if not word.startswith("--") or word in ("--", "---"):
+        return None
+    if word in options:
+        return word
+    hits = [option for option in options if option.startswith(word)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def positional_words(raw: list[str]) -> list[tuple[int, str]]:
     """(index, word) for every word of RAW[1:] that is a positional: no flag, and no flag's value. Stops at a
-    bare `--`, past which nothing is this tool's own."""
+    bare `--`, past which nothing is this tool's own.
+
+    A flag's value counts for nothing even where the flag is abbreviated (`--contain x`), or the call this
+    reads as one word too deep is one argparse accepts (review of #2381, F3)."""
     options = flag_options(raw)
     out: list[tuple[int, str]] = []
     i = 1
@@ -26425,7 +26440,9 @@ def positional_words(raw: list[str]) -> list[tuple[int, str]]:
         if word == "--":
             break
         if word.startswith("-") and word != "-":
-            i += 2 if options.get(word.split("=", 1)[0]) and "=" not in word else 1
+            name = word.split("=", 1)[0]
+            takes_value = options.get(spelled_long_flag(name, options) or name)
+            i += 2 if takes_value and "=" not in word else 1
             continue
         out.append((i, word))
         i += 1
@@ -26485,16 +26502,25 @@ def doubled_kind_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     (first, one), (second, two) = found[0], found[1]
     if one not in words or two not in words:
         return raw, []
-    readings = {one: [w for i, w in enumerate(raw) if i != second],
-                two: [w for i, w in enumerate(raw) if i != first]}
-    scoped = {normalized_flag(option): scope for option, scope in kind_scoped_options(node, words).items()}
+    without_second = [w for i, w in enumerate(raw) if i != second]
+    if one == two:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + without_second)}` (`{one}` is one word of "
+              f"`{raw[0]}`, typed twice)", file=sys.stderr)
+        return without_second, []
+    readings = {one: without_second, two: [w for i, w in enumerate(raw) if i != first]}
+    by_option = kind_scoped_options(node, words)
+    scoped = {normalized_flag(option): scope for option, scope in by_option.items()}
+    options = flag_options(raw)
     narrowed: set[str] = set(readings)
     evidence: list[str] = []
     for word in raw[1:]:
         if word == "--":
             break
+        if not word.startswith("--"):
+            continue  # a flag's value, a target, a body: data, never evidence (review of #2381, F1)
         name = word.split("=", 1)[0]
-        scope = scoped.get(normalized_flag(name))
+        scope = scoped.get(normalized_flag(name)) or scoped.get(
+            normalized_flag(spelled_long_flag(name, options) or name))
         if scope is not None and not narrowed <= scope:
             narrowed &= scope
             evidence.append(f"`{name}` is {' or '.join(sorted(scope))}'s")
@@ -26503,11 +26529,39 @@ def doubled_kind_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + readings[kept])}` (`{one} {two}` is two words "
               f"of `{raw[0]}`, and {'; '.join(evidence)})", file=sys.stderr)
         return readings[kept], []
+    told = f", and the flags typed scope to neither: {'; '.join(evidence)}" if not narrowed else ""
     refusal = [f"glaeda-gh: `{one} {two}` is two words of `{raw[0]}`, which takes one: `{raw[0]} {one}` and "
                f"`{raw[0]} {two}` are both calls that run and they do not do the same thing, so neither "
-               f"word is dropped for you"]
-    refusal += [f"next: {' '.join(['glaeda-gh'] + reading)}" for reading in readings.values()]
+               f"word is dropped for you{told}"]
+    refusal += [f"next: {' '.join(['glaeda-gh'] + own_kinds_flags(reading, kind, by_option, options))}"
+                for kind, reading in readings.items()]
     return raw, refusal
+
+
+def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[str]],
+                    options: dict[str, bool]) -> list[str]:
+    """ARGV without the flags whose own help scopes them away from KIND, each with its value.
+
+    A `next:` line is printed to be run, so it carries only what its own reading takes: `post pr comment
+    o/r#1 --title t --status-key k` offers `post pr o/r#1 --title t`, not a call `post_item` refuses for
+    `--status-key` (review of #2381, F4)."""
+    scoped = {normalized_flag(option): scope for option, scope in by_option.items()}
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        word = argv[i]
+        if word == "--":
+            out.extend(argv[i:])
+            break
+        name = word.split("=", 1)[0]
+        spelled = spelled_long_flag(name, options) or name
+        scope = scoped.get(normalized_flag(name)) or scoped.get(normalized_flag(spelled))
+        if word.startswith("--") and scope is not None and kind not in scope:
+            i += 2 if options.get(spelled) and "=" not in word else 1
+            continue
+        out.append(word)
+        i += 1
+    return out
 
 
 def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
