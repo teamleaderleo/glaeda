@@ -9208,7 +9208,12 @@ class StarvedReserveTest(unittest.TestCase):
         self.assertTrue(all(0 <= turn < 1 for turn in turns))
         spread = hook.StarvedReserve(600.0, 1200.0, 1800.0)
         first = hosts[turns.index(min(turns))]
-        at = summary["jobs"][1]["created"] + 600 + min(turns) * 1200 + 1
+        # Half way between the first turn and the second: exactly one mini is due whatever the key hashed to. A fixed
+        # "+ 1 second" was due two minis whenever the two smallest turns fell inside the same second of the 1200 s
+        # spread (a gap under 1/1200), which a key's hash does about one run in a hundred: glaeda#2288's shard 3 on
+        # 2026-11-21 read two mini names where one was due, and cost the PR a rerun of the shard.
+        low, second = sorted(turns)[:2]
+        at = summary["jobs"][1]["created"] + 600 + (low + second) / 2 * 1200
         summary = dict(summary, at=at, delivery=at)
         due = [host for host in hosts if hook.starved_job(summary, labels, host, at, spread)]
         self.assertEqual(due, [first], "only the first mini's turn has come")
