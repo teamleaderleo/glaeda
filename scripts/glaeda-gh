@@ -1122,6 +1122,17 @@ COST_WEIGHTED = ("pr",)
 READ_COST_DEFAULT = {("pr", "rest"): 2.5, ("pr", "graphql"): 1.0}
 READ_COST_MIN_READS = 20
 READ_COST_FLOOR = 0.05  # a measured cost of nothing (every read a 304) still costs something to route on
+# And reads per second of the daemon's own time: a bucket's quota is not its only bound. A REST PR read is a dozen
+# requests sent one after another (the pull, check-run pages, statuses, workflow runs, job lists), nearly all of them
+# 304s, which are free, so read_cost fell to READ_COST_FLOOR and PRs stayed on REST whatever GraphQL had left.
+# huge-blue, 2026-11-21 20:30-20:45Z: GraphQL back with 2875 points, every PR still on REST, 599 REST requests in
+# 600 s (572 free) at ~0.65 s each on the tick's one thread, 32-53 PR reads stored per 600 s, waited PR data 9119 s
+# old behind 1498 deferred keys, while one GraphQL query reads up to a batch of PRs. route() weighs each bucket by
+# the lesser of what its quota affords and what its measured seconds per read afford (read_seconds: the wall time
+# of the reads over the last READ_SECONDS_WINDOW, a slot wait or a slow edge included).
+READ_SECONDS_DEFAULT = {("pr", "rest"): 4.0, ("pr", "graphql"): 0.5}
+READ_SECONDS_MIN_READS = 10
+READ_SECONDS_WINDOW = 900.0
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
@@ -4566,6 +4577,7 @@ class Daemon:
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.paths: dict[str, str] = dict(BUCKETS)  # the bucket each kind reads over now
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
+        self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
@@ -5555,6 +5567,19 @@ class Daemon:
                     if r["bucket"] == bucket and r["kind"] == kind)
         return max(READ_COST_FLOOR, spent / reads)
 
+    def read_seconds(self, kind: str, bucket: str) -> float:
+        """The daemon's own seconds per KIND entry read over BUCKET, over the last READ_SECONDS_WINDOW (a GraphQL
+        query's time shared by the entries it read); READ_SECONDS_DEFAULT until READ_SECONDS_MIN_READS entries."""
+        rows = [r for r in self.read_secs if r[1] == kind and r[2] == bucket and self.now - r[0] < READ_SECONDS_WINDOW]
+        n = sum(r[4] for r in rows)
+        if n < READ_SECONDS_MIN_READS:
+            return READ_SECONDS_DEFAULT[(kind, bucket)]
+        return max(0.01, sum(r[3] for r in rows) / n)
+
+    def note_read_seconds(self, kind: str, bucket: str, seconds: float, entries: int) -> None:
+        if kind in COST_WEIGHTED and entries > 0:
+            self.read_secs.append((self.now, kind, bucket, max(0.0, seconds), entries))
+
     def route(self, kind: str) -> str:
         """The bucket this kind reads over this tick: the richer one. A kind leaves its current bucket
         only when the other is SWITCH_MARGIN richer (or the current one stopped), so the reads move in
@@ -5577,6 +5602,10 @@ class Daemon:
             if cost:
                 here = here if here < 0 else here / cost[current]
                 there = there if there < 0 else there / cost[OTHER[current]]
+                # and no faster than the daemon's own time reads them (READ_SECONDS_DEFAULT)
+                secs = {b: self.read_seconds(kind, b) for b in (current, OTHER[current])}
+                here = here if here < 0 else min(here, 1.0 / secs[current])
+                there = there if there < 0 else min(there, 1.0 / secs[OTHER[current]])
             # Below its floor while the other bucket is not: move, whatever the margin says. The reverse never
             # moves by the margin (a low bucket about to reset can look richer), so the two cannot flap.
             low = self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
@@ -5587,7 +5616,8 @@ class Daemon:
                      "perMinute": {b: round(r * 60, 1) for b, r in ((current, here), (OTHER[current], there))
                                    if r >= 0},
                      **({"stopped": {current: self.stopped_why(current)}} if here < 0 else {}),
-                     **({"readCost": {b: round(c, 2) for b, c in cost.items()}} if cost else {})})
+                     **({"readCost": {b: round(c, 2) for b, c in cost.items()},
+                         "readSeconds": {b: round(self.read_seconds(kind, b), 2) for b in cost}} if cost else {})})
                 self.paths[kind] = current = OTHER[current]
         return current
 
@@ -7502,9 +7532,11 @@ class Daemon:
                 if cut is not None and self.now - cut <= RESUME_MAX and not (isinstance(data_at, (int, float))
                                                                              and data_at >= cut):
                     self.resume_key, self.resume_from = e["key"], cut
+                began = time.monotonic()
                 try:
                     with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
                         self.rest_fetch[e["key"].split(":", 1)[0]](e)
+                    self.note_read_seconds(kind, "rest", time.monotonic() - began, 1)
                 except OutOfTime:
                     # No reason: a tick spent waiting for GraphQL slots ends here too, and a stall the valve must act on
                     # would read as a budget's deferral (review of glaeda#2189, F1)
@@ -7720,6 +7752,7 @@ class Daemon:
         if app_reads:
             hour["app"] = app_reads
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
+        self.read_secs = [r for r in self.read_secs if self.now - r[0] < READ_SECONDS_WINDOW]
         self.gql_log = [g for g in self.gql_log if self.now - g[0] < 3600]
         graphql_by: dict[str, dict[str, int]] = {}
         for _, why, points in self.gql_log:
@@ -8253,9 +8286,12 @@ class Daemon:
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
             try:
+                began = time.monotonic()
                 with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
                     error = fetch(chunk)
                 spilled, self.spill = self.spill, []
+                if not error:
+                    self.note_read_seconds(kind, "graphql", time.monotonic() - began, len(chunk) - len(spilled))
                 limited, self.limited = self.limited, []
             except OutOfTime:
                 self.defer(chunk + [e for c in queue for e in c])  # no reason, as in the REST loop

@@ -19831,6 +19831,51 @@ class ConcurrentWaitsRestTest(Base):
         self.daemon.reads = self.daemon.reads[:5]  # too few reads to measure: the default stands
         self.assertEqual(self.daemon.read_cost("pr", "rest"), gg.READ_COST_DEFAULT[("pr", "rest")])
 
+    def huge_blue_2045(self) -> None:
+        """huge-blue, 2026-11-21 20:45Z: GraphQL back with 2875 points, REST 4103 left, nearly every REST request a
+        free 304 (read_cost at its floor), and REST PR reads ~8 s each (12 requests, ~0.65 s apiece, one thread)."""
+        self.daemon.now = NOW
+        self.daemon.started_tick = NOW - 1800
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4103, "reset": NOW + 180},
+                              "graphql": {"limit": 5000, "remaining": 2875, "reset": NOW + 1140}}
+        self.daemon.reads = [(NOW - 60, "pr", "rest")] * 40
+        minute = int(NOW // 60) - 1
+        self.daemon.spend = {minute: {"rest\tGET /repos/{owner}/{repo}/pulls/{id}\tpr\to/r": [480, 1, 0]}}
+        self.daemon.paths["pr"] = "rest"
+
+    def test_quota_alone_kept_prs_on_a_rest_that_reads_one_pr_in_eight_seconds(self) -> None:
+        self.huge_blue_2045()
+        self.assertAlmostEqual(self.daemon.read_cost("pr", "rest"), gg.READ_COST_FLOOR)
+        self.daemon.read_secs = [(NOW - 30 * i, "pr", "rest", 8.0, 1) for i in range(20)]
+        self.assertEqual(self.daemon.route("pr"), "graphql", "PRs stayed on REST: 0.12 reads/s against GraphQL's batches")
+
+    def test_with_nothing_measured_the_default_seconds_route_prs_to_graphql(self) -> None:
+        self.huge_blue_2045()
+        self.daemon.read_secs = []
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+
+    def test_a_slow_graphql_leaves_prs_on_a_fast_rest(self) -> None:
+        self.huge_blue_2045()
+        # GraphQL queries waiting on the login's slots: 10 s a PR; REST answering on a kept connection, 1 s a PR
+        self.daemon.read_secs = ([(NOW - 30 * i, "pr", "rest", 1.0, 1) for i in range(20)]
+                                 + [(NOW - 30 * i, "pr", "graphql", 100.0, 10) for i in range(3)])
+        self.assertEqual(self.daemon.route("pr"), "rest")
+
+    def test_read_seconds_are_measured_per_entry_over_the_window(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.read_secs = [(NOW - 10, "pr", "graphql", 3.0, 10)] * 2 + [(NOW - gg.READ_SECONDS_WINDOW - 1, "pr", "graphql", 999.0, 10)]
+        self.assertAlmostEqual(self.daemon.read_seconds("pr", "graphql"), 0.3)
+        self.daemon.read_secs = [(NOW - 10, "pr", "rest", 3.0, 1)] * 3  # too few: the default stands
+        self.assertEqual(self.daemon.read_seconds("pr", "rest"), gg.READ_SECONDS_DEFAULT[("pr", "rest")])
+        self.daemon.note_read_seconds("run", "rest", 5.0, 1)  # only the cost-weighted kinds are timed
+        self.assertEqual(len(self.daemon.read_secs), 3)
+
+    def test_ticks_time_the_pr_reads_they_make(self) -> None:
+        self.ten_minutes_over_rest()
+        timed = [r for r in self.daemon.read_secs if r[1] == "pr"]
+        self.assertTrue(timed, "no PR read was timed")
+        self.assertTrue(all(r[3] >= 0 and r[4] >= 1 for r in timed), timed)
+
 
 class CmuxWaitsRestCostTest(Base):
     """claude-sr2-coord, 2026-11-17 09:41Z and 10:36Z: cosmic-gray's REST pool drained at 127-169/min, and the daemon's
