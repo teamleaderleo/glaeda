@@ -6042,6 +6042,19 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
         os.close(gd._PRESSURE_PASS_HANDLE)
 
+    def test_a_second_pressure_apply_skips_before_queueing_behind_a_running_eviction(self) -> None:
+        # 2026-11-21: with the pass lock taken after the evict.lock queue, 8 to 14 pressure applies still waited
+        # in that queue at once on one mini; the second must leave at once, never join the queue
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        with (self.root / "pressure-pass.lock").open("a") as held, (self.root / "evict.lock").open("a") as ev:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(ev, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "wait_for_evict_lock", side_effect=AssertionError("queued")):
+                status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+
     def test_the_kill_switch_deletes_nothing_and_says_so(self) -> None:
         off = self.root / "disk-off"
         off.write_text("")
