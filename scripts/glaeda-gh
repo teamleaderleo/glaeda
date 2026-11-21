@@ -3963,7 +3963,7 @@ def daemon_policy() -> dict:
         floors[bucket] = (f if f > raised else raised + (f - r), raised)
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
-    return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
+    return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute, "events": doc.get("events") is not False,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
                        "stale": alarms.get("stale") is not False, "staleRestart": alarms.get("staleRestart") is not False,
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
@@ -4048,6 +4048,285 @@ def read_rollup(key: str) -> dict | None:
     return doc if isinstance(doc, dict) and doc.get("schema") == ROLLUP_SCHEMA and doc.get("key") == key else None
 
 
+# ---------------------------------------------------------------- PR event streams (gh event listen)
+
+# Lawrence, 2026-11-19, on GitHub's 2026-11-18 changelog ("wait for pull request events with GitHub CLI"): "we should
+# start using this everywhere". gh 2.105.0 added `gh event listen --resource PR_URL --event TYPE --follow`: one
+# CloudEvent JSON line per event on stdout, status lines on stderr, exit 8 at --timeout. It is a preview: an account
+# without Event Streams access gets HTTP 403 "Event subscriptions are not enabled for this account" and exit 1.
+# The daemon, not each `wait`, holds the listener: one per PR a wait is blocked on, for every session on the host
+# (an account has a limited number of subscriptions, and gh reuses one for the same PR and events across hosts). An
+# event marks the PR nudged, so the next tick re-reads it (NUDGE_MIN bounds the points); the PR's own read stays the
+# truth, events only say when to read. Polling is the fallback, kept whole: with no gh 2.105, no access, or a stream
+# that closed, the PR keeps its cycle. With a live stream and nothing left to finish (every check completed, the
+# mergeability computed) the PR waits on people (a review, a merge, a push), which the events cover, so it is polled
+# only every EVENT_BACKSTOP; while any check runs the cycle stays (a suite reports only when it completes, and commit
+# statuses send no event). Off: gh-daemon.json "events": false, or GLAEDA_GH_EVENTS=0.
+EVENT_STREAMS = os.environ.get("GLAEDA_GH_EVENTS") != "0"
+EVENT_GH: str | None = None  # the gh to run (tests); None: broker_real_gh(), never the shim chain
+EVENT_GH_MIN = (2, 105, 0)
+EVENT_GH_PATHS = (os.fspath(Path.home() / ".local/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh")
+EVENT_TYPES = ("com.github.pull_request.review.submitted.v1", "com.github.pull_request.state.changed.v1",
+               "com.github.pull_request.head.changed.v1", "com.github.pull_request.merge_conflict.v1",
+               "com.github.pull_request.check_suite.status.changed.v1")
+EVENT_MAX = 20  # listeners at once (each holds a subscription; an account may hold only so many)
+EVENT_LIFETIME = 3600  # each listener's --timeout: one the daemon lost (SIGKILL) ends within this; exit 8 starts the next
+EVENT_RETRY = 30.0  # a PR's stream that ended is opened again after this, doubling up to EVENT_RETRY_MAX
+EVENT_RETRY_MAX = 900.0
+EVENT_STABLE = 600.0  # a stream that lived this long resets its retry delay
+EVENT_DENIED_RETRY = 3600.0  # an account GitHub refused is asked again this rarely (access may be granted meanwhile)
+EVENT_GH_RECHECK = 600.0  # the real gh's path is looked up again this often (an upgrade's mtime is seen every tick)
+EVENT_BACKSTOP = 300.0  # a waited PR with a live stream and nothing left to finish is still polled this often
+EVENT_TIMEOUT_EXIT = 8
+EVENT_ERR_KEEP = 2048
+EVENT_DENIED = re.compile(r"not enabled for this account|event subscriptions are in preview|HTTP 40[134]\b", re.I)
+EVENT_UNSUPPORTED = re.compile(r'unknown command "event"|unknown flag', re.I)
+
+
+def gh_version_of(text: str) -> tuple[int, ...] | None:
+    m = re.search(r"gh version (\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def pr_url_of(key: str) -> str:
+    _, owner, repo, number = split_key(key)
+    return f"https://github.com/{owner}/{repo}/pull/{number}"
+
+
+def events_settled(data: dict | None) -> bool:
+    """Whether a PR waits only on what its events cover: every check completed and read in full, nothing required
+    still unreported, mergeability computed. Anything else keeps the poll cycle."""
+    if not data or data.get("checksTruncated") or data.get("checksPageError") or data.get("requiredMissing"):
+        return False
+    if data.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
+        return False
+    return all(c.get("status") == "COMPLETED" for c in data.get("checks") or [])
+
+
+class EventStreams:
+    """The daemon's `gh event listen` children, one per PR key. tick() starts, reads and ends them and returns the
+    keys to re-read. Every child is the daemon's own (started here, tracked by its Popen), stopped by stop_all()."""
+
+    def __init__(self) -> None:
+        self.streams: dict[str, dict[str, Any]] = {}
+        self.retry_at: dict[str, float] = {}
+        self.backoff: dict[str, float] = {}
+        self.unavailable: str | None = None
+        self.unavailable_until = float("-inf")
+        self.gh_path: str | None = None  # the gh the listeners run (EventStreams.gh)
+        self.gh_list: list[str] | None = None
+        self.gh_found_at = float("-inf")
+        self.versions: dict[tuple[str, float], tuple[int, ...] | None] = {}  # (path, mtime) -> its version
+        self.events = 0
+        self.saved = 0  # PR polls a live stream stood in for (Daemon.due's backstop)
+        self.started = 0
+        self.ended = 0
+        self.last_event_at: float | None = None
+
+    def live(self, key: str) -> bool:
+        s = self.streams.get(key)
+        return bool(s and s["attached"] and s["proc"].poll() is None)
+
+    def view(self) -> dict:
+        return {"live": sum(1 for k in self.streams if self.live(k)), "open": len(self.streams),
+                "events": self.events, "pollsSaved": self.saved, "started": self.started, "ended": self.ended,
+                "lastEventAt": self.last_event_at, "unavailable": self.unavailable,
+                "retryAt": self.unavailable_until if self.unavailable else None, "gh": self.gh_path}
+
+    def refuse(self, why: str, until: float) -> None:
+        if self.unavailable != why and not why.startswith("off "):  # (off is the operator's own word: no log line)
+            log({"event": "events-unavailable", "why": why})
+        self.unavailable, self.unavailable_until = why, until
+
+    def candidates(self, now: float) -> list[str]:
+        """The gh binaries to try, best first: the one the broker uses, then the usual install paths (a host whose
+        first gh is an older Homebrew one may hold a newer one in ~/.local/bin). Looked up again every EVENT_GH_RECHECK."""
+        if EVENT_GH:
+            return [EVENT_GH]
+        if self.gh_list is None or now - self.gh_found_at >= EVENT_GH_RECHECK:
+            found: list[str] = []
+            with contextlib.suppress(WatchError):
+                found.append(broker_real_gh())
+            found += list(EVENT_GH_PATHS)
+            self.gh_list, self.gh_found_at = list(dict.fromkeys(found)), now
+        return self.gh_list
+
+    def version(self, path: str) -> tuple[int, ...] | None | bool:
+        """PATH's gh version, read once per binary (path and mtime: an upgrade in place is read again); False when
+        there is no such file."""
+        try:
+            seen = (path, os.stat(path).st_mtime)
+        except OSError:
+            return False
+        if seen not in self.versions:
+            try:
+                out = run_bounded([path, "--version"]).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            self.versions[seen] = gh_version_of(out)
+        return self.versions[seen]
+
+    def gh(self, now: float) -> str | None:
+        """The first candidate gh that is new enough, else None with the reason in self.unavailable."""
+        older = None
+        for path in self.candidates(now):
+            version = self.version(path)
+            if version and version >= EVENT_GH_MIN:
+                self.gh_path = path
+                if self.unavailable and (self.unavailable.startswith("gh ") or self.unavailable.startswith("no gh")):
+                    self.unavailable, self.unavailable_until = None, float("-inf")  # upgraded: try at once
+                return path
+            if version is not False and older is None:
+                older = (path, version)
+        self.gh_path = None
+        want = ".".join(map(str, EVENT_GH_MIN))
+        if older is None:
+            self.refuse("no gh found", now + EVENT_GH_RECHECK)
+        else:
+            shown = ".".join(map(str, older[1])) if older[1] else "of unknown version"
+            self.refuse(f"gh {shown} < {want} ({older[0]})", now + EVENT_GH_RECHECK)
+        return None
+
+    def start(self, key: str, gh: str, now: float) -> None:
+        argv = [gh, "event", "listen", "--resource", pr_url_of(key), "--event", ",".join(EVENT_TYPES),
+                "--follow", "--timeout", f"{EVENT_LIFETIME}s"]
+        env = {k: v for k, v in os.environ.items() if k != GRAPHQL_SLOT_ENV}
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=env, close_fds=True)
+        except OSError as error:
+            self.retry(key, now)
+            log({"event": "events-start-failed", "key": key, "error": describe(error)})
+            return
+        for stream in (proc.stdout, proc.stderr):
+            os.set_blocking(stream.fileno(), False)
+        self.streams[key] = {"proc": proc, "out": b"", "err": b"", "since": now, "attached": False, "events": 0}
+        self.started += 1
+
+    def retry(self, key: str, now: float) -> None:
+        delay = min(EVENT_RETRY_MAX, self.backoff.get(key, EVENT_RETRY / 2) * 2)
+        self.backoff[key] = delay
+        self.retry_at[key] = now + delay
+
+    @staticmethod
+    def read_some(stream: Any) -> bytes:
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(stream.fileno(), 65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def drain(self, key: str, s: dict, now: float, nudge: set[str]) -> None:
+        s["out"] += self.read_some(s["proc"].stdout)
+        *lines, s["out"] = s["out"].split(b"\n")
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                kind = str((json.loads(line) or {}).get("type") or "?")
+            except (ValueError, AttributeError):
+                kind = "unparsed"
+            s["events"] += 1
+            self.events += 1
+            self.last_event_at = now
+            nudge.add(key)
+            log({"event": "pr-event", "key": key, "type": kind})
+        err = self.read_some(s["proc"].stderr)
+        if err:
+            s["err"] = (s["err"] + err)[-EVENT_ERR_KEEP:]
+            text = err.decode("utf-8", "replace")
+            if not s["attached"] and not EVENT_DENIED.search(text) and not EVENT_UNSUPPORTED.search(text):
+                s["attached"] = True  # gh says so on stderr; events before this are not replayed: read once now
+                nudge.add(key)
+
+    def close(self, s: dict) -> None:
+        for stream in (s["proc"].stdout, s["proc"].stderr):
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+    def finish(self, key: str, s: dict, code: int, now: float, nudge: set[str]) -> None:
+        del self.streams[key]
+        self.close(s)
+        self.ended += 1
+        nudge.add(key)  # events while it was away are lost: read the PR once now
+        text = s["err"].decode("utf-8", "replace").strip()
+        last = (text.splitlines() or [""])[-1][:300]
+        if EVENT_DENIED.search(text):
+            self.refuse(f"GitHub refused: {last}", now + EVENT_DENIED_RETRY)
+            self.stop_all()  # the account is refused: every other listener is too
+        elif EVENT_UNSUPPORTED.search(text):
+            self.versions.clear()  # read the versions again
+            self.refuse(f"gh has no event listen: {last}", now + EVENT_GH_RECHECK)
+        elif code == EVENT_TIMEOUT_EXIT:
+            self.retry_at[key] = now  # EVENT_LIFETIME reached: listen again at once
+        else:
+            if now - s["since"] >= EVENT_STABLE or s["events"]:
+                self.backoff.pop(key, None)
+            self.retry(key, now)
+            log({"event": "events-closed", "key": key, "exit": code, "why": last})
+
+    def stop(self, key: str) -> None:
+        s = self.streams.pop(key, None)
+        if s is None:
+            return
+        proc = s["proc"]
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=1)
+        self.close(s)
+
+    def stop_all(self) -> None:
+        for key in list(self.streams):
+            self.stop(key)
+
+    def tick(self, now: float, want: list[str], enabled: bool = True) -> set[str]:
+        """Read every listener, end the ones nobody waits on, start the wanted ones that may run. The keys to re-read."""
+        nudge: set[str] = set()
+        for key, s in list(self.streams.items()):
+            self.drain(key, s, now, nudge)
+            code = s["proc"].poll()
+            if code is not None:
+                self.drain(key, s, now, nudge)
+                self.finish(key, s, code, now, nudge)
+        wanted = list(dict.fromkeys(want))[:EVENT_MAX]
+        for key in list(self.streams):
+            if key not in wanted or not enabled:
+                self.stop(key)
+        for key in list(self.retry_at):
+            if key not in wanted:
+                self.retry_at.pop(key, None)
+                self.backoff.pop(key, None)
+        if not enabled:
+            self.refuse("off (gh-daemon.json events: false, or GLAEDA_GH_EVENTS=0)", float("inf"))
+            return nudge
+        if self.unavailable and self.unavailable.startswith("off "):
+            self.unavailable, self.unavailable_until = None, float("-inf")
+        if not wanted:
+            return nudge
+        gh = self.gh(now)
+        if gh is None or (self.unavailable and now < self.unavailable_until):
+            return nudge
+        if self.unavailable:
+            log({"event": "events-retry", "why": self.unavailable})
+            self.unavailable, self.unavailable_until = None, float("-inf")
+        for key in wanted:
+            if key not in self.streams and now >= self.retry_at.get(key, float("-inf")):
+                self.start(key, gh, now)
+        return nudge
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
@@ -4089,6 +4368,7 @@ class Daemon:
         self.rollup_keys: tuple[float, frozenset[str]] = (float("nan"), frozenset())  # (self.now, rollup_wanted)
         self.rollup_swept = float("-inf")
         self.on_event_procs: dict[str, subprocess.Popen] = {}  # on-event commands started and not reaped yet, by key
+        self.events = EventStreams()  # gh event listen children, one per waited PR (EventStreams)
         self.on_event_pending: bool | None = None  # whether on-event.json holds runs to resolve (None: not read yet)
         self.on_event_seen: tuple | None = None  # on-event.json's stat when on_event_pending was learned
         self.on_event_kept: list[dict] = []  # matching runs a busy state lock held back: the cursor is past them
@@ -6565,6 +6845,15 @@ class Daemon:
             return interval
         return min(max(IDLE_BACKOFF_MAX, interval), max(interval, idle))
 
+    def events_tick(self, entries: list[dict]) -> None:
+        """One `gh event listen` per open PR a wait is blocked on (oldest wait first); an event, an attach or a
+        stream's end nudges the PR, so the reads below take it this tick (EventStreams)."""
+        want = [e for e in entries if e["key"].startswith("pr:") and self.waited(e)  # read once first: an open PR
+                and (e["cache"] or {}).get("data") and not terminal("pr", (e["cache"] or {}).get("data"))]
+        want.sort(key=self.wait_start)
+        enabled = EVENT_STREAMS and self.policy.get("events", True)
+        self.nudged |= self.events.tick(self.now, [e["key"] for e in want], enabled)
+
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
@@ -6671,6 +6960,12 @@ class Daemon:
                 if (kind == "pr" and path == "rest" and self.waited(e) and not terminal(kind, c.get("data"))
                         and self.now - self.wait_start(e) >= LONG_WAIT_AFTER):
                     want = max(want, interval * LONG_WAIT_FACTOR)  # a long wait over REST (a nudge still reads it)
+                began = e.get("waitBegan")
+                if (kind == "pr" and self.events.live(e["key"]) and events_settled(c.get("data"))
+                        and not (isinstance(began, (int, float)) and began > c.get("fetchedAt", 0))):
+                    if since >= interval / 2 and since < EVENT_BACKSTOP - interval / 2:
+                        self.events.saved += 1  # a poll the cycle would have sent: the events stand for it
+                    want = max(want, EVENT_BACKSTOP)  # its events nudge it; a new wait still gets its first read
                 if want > interval and since < want - interval / 2:
                     continue  # unread and unwaited: polled about as often as it was last read
                 out.append(e)
@@ -6898,6 +7193,11 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+        try:
+            with self.phase("events"):
+                self.events_tick(entries)
+        except Exception as error:  # noqa: BLE001  events only say when to read: polling goes on without them
+            self.errors.append(f"events: {describe(error)} at {error_site(error)}")
         # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
         self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
         self.deferred_before = dict(self.deferred_since)
@@ -7233,6 +7533,7 @@ class Daemon:
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
+                  "events": self.events.view(),
                   "newestData": dict(self.newest_data),
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
@@ -14257,6 +14558,10 @@ def serve(foreground_ok: bool = False) -> int:
     stamp = me.stat().st_mtime
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
+    import atexit
+    # (a test double built without Daemon.__init__ has no streams)
+    stop_streams = getattr(getattr(daemon, "events", None), "stop_all", lambda: None)
+    atexit.register(stop_streams)  # a normal exit leaves no `gh event listen` behind
     log({"event": "start", "pid": os.getpid()})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
@@ -14285,6 +14590,7 @@ def serve(foreground_ok: bool = False) -> int:
             if daemon.valve_due is not None:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = me.stat().st_mtime != stamp
             due = reexec_due(changed, daemon.land_busy(), daemon.reexec_waiting, time.monotonic(),
@@ -14300,12 +14606,14 @@ def serve(foreground_ok: bool = False) -> int:
                     daemon.reexec_waiting = time.monotonic()
             elif due is not None:
                 log({"event": "reexec", **({"why": due} if due != "reexec" else {})})
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
                 # this daemon still polls, but its lock is on a file nobody can see, so every client reads
                 # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
                 log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
+                stop_streams()  # its listeners are its own: the new daemon opens its own
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass
@@ -17264,6 +17572,18 @@ def controller_line(ctl: dict) -> str:
     return "controller: starting"
 
 
+def events_line(ev: dict) -> str:
+    """`budget`'s line for the PR event streams (EventStreams.view)."""
+    if ev.get("unavailable"):
+        retry = ev.get("retryAt")
+        again = f"; next try in {max(0, int(retry - time.time()))}s" if isinstance(retry, (int, float)) \
+            and math.isfinite(retry) else ""
+        return f"pr events: polling only ({ev['unavailable']}){again}"
+    return (f"pr events: {ev.get('live', 0)} live listeners of {ev.get('open', 0)} open, {ev.get('events', 0)} events, "
+            f"{ev.get('pollsSaved', 0)} polls saved since start" + (f", last event {age(ev['lastEventAt'])}"
+                                                                     if ev.get("lastEventAt") else ""))
+
+
 def spend_lines(spend: Any) -> list[str]:
     """`budget`'s spend tables from daemon.json spendBy (Daemon.spend_by)."""
     if not isinstance(spend, dict):
@@ -18014,6 +18334,8 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
+        if isinstance(status.get("events"), dict):
+            print(events_line(status["events"]))
         hour = status.get("lastHour")
         if isinstance(hour, dict):
             print(f"daemon requests in the last hour: {hour.get('rest', 0)} REST, {hour.get('rest304', 0)} more "

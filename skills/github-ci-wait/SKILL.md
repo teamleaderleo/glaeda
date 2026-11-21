@@ -16,6 +16,14 @@ reply then reaches `wait` within a few seconds at no quota cost. Public repos ne
 private ones (cmuxterm-hq) need `~/.config/cmux/build-fleet/controller.token`. Without the
 controller everything still works by polling, only slower; `glaeda-gh budget` says which.
 
+GitHub's PR events (`gh event listen`, gh 2.105.0 and later, a preview that needs Event Streams
+access) are the daemon's job too: it holds one listener per PR a `wait pr` is blocked on, for every
+session, and re-reads the PR within a tick of a review, a merge or close, a push, a conflict or a
+finished check suite. Nothing changes in how you wait: keep using `glaeda-gh wait pr`. Never run
+`gh event listen` yourself in a loop or per session (each one holds one of the account's few
+subscriptions). With an older gh, no access, or a stream that dropped, the daemon polls as before;
+`glaeda-gh budget` prints a `pr events:` line saying which.
+
 ## Wait and check
 
 ```bash
@@ -308,6 +316,7 @@ never a raw API loop:
 
 - `gh run watch`, `gh pr checks --watch`, or `gh run view` / `gh pr view` / `gh api .../comments`
   in a loop.
+- `gh event listen` of your own, per session or in a loop: `glaeda-gh wait pr` uses the daemon's.
 - Per-PR REST scans: listing PRs, then `gh api repos/.../pulls/<n>/files` (or `/reviews`, `/commits`) for each.
 - `gh run view --json jobs` just to learn which step failed: the `wait` summary already names it.
 - Calling the real gh by absolute path, or `CMUX_GH_BROKER_DISABLE=1`, to get past the broker.
