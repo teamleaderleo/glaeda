@@ -9458,6 +9458,21 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertEqual(self.gate.cap_labels, frozenset({self.LABEL}), "the dispatches still stand on their own")
         self.assertEqual(self.gate.cap_label_drift, [], "an absent receipt is not a receipt that understates itself")
 
+    def test_poll_leaves_no_look_running_for_the_next_call_to_coalesce_into(self) -> None:
+        # glaeda#2386: cap_look() starts nothing while the previous cap_thread is alive, so a body that calls
+        # load_capped() (or patches what the look reads and then calls it) straight after poll() can have that call
+        # swallowed by poll's own leftover look and never see the read it is testing. Three bodies here read gate
+        # state right after poll() and would have to remember the join themselves. The helper ends its last look
+        # instead, so no body can forget it.
+        def slow(now: float) -> dict | None:
+            time.sleep(0.25)  # long enough that a look still running at the return is not a timing accident
+            return self.fetch(now)
+
+        with mock.patch.object(hook, "load_cap_fetch", side_effect=slow):
+            self.poll()
+        self.assertFalse(self.gate.cap_thread is not None and self.gate.cap_thread.is_alive(),
+                         "poll left a look running: the next call coalesces into it and does nothing")
+
 
 class StarvedReserveTest(unittest.TestCase):
     """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
