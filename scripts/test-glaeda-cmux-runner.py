@@ -9359,6 +9359,7 @@ class HostLoadCapTest(unittest.TestCase):
         self.receipt(["glaeda-mini", self.SIDE_LIGHT])
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
+        self.join()  # poll's last look may still be reading; load_capped below would skip as one already runs
         self.assertIn(self.LABEL, self.gate.cap_labels, "the union holds before the next look")
         reading, seen = threading.Event(), []
 
