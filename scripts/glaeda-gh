@@ -10590,10 +10590,10 @@ LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request 
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
 # The other half of the same answer: *when* it is given. Stopping at the first merge refusal still spends the whole
 # wait before it -- the CI wait, the judgment, the merge call -- on a property of the PR the request could have read.
-# big-red, 2026-11-21: 7 rows stopped merge_draft, 139 min between their land request and the refusal in total
-# (median 13.6, worst 53.3: manaflow-ai/cmuxterm-hq#16729), every refusal carrying "land-judge (pass): ok: ... may
-# merge at <sha>" -- the judge passed, the checks passed, and the merge was refused for `isDraft`, which was already
-# true when `land` was typed. They then sat stopped another 65 min in total waiting to be noticed. Re-queued after a
+# efficiency-standing-lane, 2026-11-21: one host's queue stopped 7 rows merge_draft, 139 min between their land
+# requests and those refusals in total (median 13.6, worst 53.3: manaflow-ai/cmuxterm-hq#16729), every refusal
+# carrying "land-judge (pass): ok: ... may merge at <sha>" -- the judge passed, the checks passed, and the merge
+# was refused for `isDraft`, which was already true when `land` was typed. They then sat stopped another 65 min in total waiting to be noticed. Re-queued after a
 # `gh pr ready` they merged in 30-136 s, first try, all of them.
 # So `land` answers it at the request now (land_draft_refusal), under three bounds:
 # - no read of its own: only this host's cache, so a land is still queued whatever the quota (check_land_pin's rule).
@@ -14812,6 +14812,20 @@ def cmd_land_serve(text: str) -> int:
         print(json.dumps({"ok": False, "code": "land_judge_missing", "reason": why, "next": nxt,
                           "host": policy_host()}, sort_keys=True))
         return EXIT_FAIL
+    if op == "land":
+        # The executor holds the cache (a forwarding host's may know nothing of the PR), so the request-time draft
+        # answer is given here too, in the shape the forwarder prints and exits on (LAND_REQUEST_REFUSED).
+        try:
+            key, repo, number = land_key(str(req.get("target") or ""))
+            pin = land_pin_sha(req.get("sha"))
+        except (WatchError, TypeError):
+            key = repo = pin = ""  # land_serve_one below answers a target or pin this host cannot read
+            number = 0
+        draft = land_draft_refusal(key, repo, number, pin) if key else None
+        if draft is not None:
+            print(json.dumps({"ok": False, "key": key, "code": "land_draft", "reason": draft[0], "next": draft[1],
+                              "host": policy_host()}, sort_keys=True))
+            return EXIT_FAIL
     if op == "batch":
         accepted, refused = [], []
         for item in (req.get("requests") or [])[:LAND_FORWARD_BATCH]:
