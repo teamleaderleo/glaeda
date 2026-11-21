@@ -23400,6 +23400,41 @@ class LandTest(Base):
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
         self.assertIn("rearmed", [h["event"] for h in e["history"]])
 
+    def test_a_rearmed_stop_that_repeats_its_stop_tells_the_requester_once(self):
+        # efficiency-scout pass 6, 2026-11-21: cmux#47074's session was woken 3 times in 19 h by retry_deadline, each
+        # the same unreadable webview verdict. The first stop is told; the re-armed ones that stop the same are not.
+        e = self.stop_retry_deadline()
+        stops = lambda: [c for c in self.w.sent() if " stopped: " in " ".join(c)]  # noqa: E731
+        self.assertEqual(len(stops()), 1)
+        for n in range(1, gg.LAND_REARM_CAP + 1):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
+            self.tick(gg.LAND_REARM_AFTER)
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        self.assertEqual(len(stops()), 1)
+        self.assertEqual([h.get("quiet") for h in e["history"] if h["event"] == "stopped"][-gg.LAND_REARM_CAP:],
+                         ["repeat"] * gg.LAND_REARM_CAP)
+        # a land by hand is a new ask: its stop is told again
+        self.land()
+        self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 13
+        e = self.tick()
+        for _ in range(13):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
+        self.assertEqual(len(stops()), 2)
+
+    def test_land_stop_repeats_reads_code_head_and_reason_without_counts(self):
+        last = {"code": "retry_deadline", "head": "abc", "reason": "waited 10152 s (deadline 7200 s, 3 judgments)"}
+        st = {"code": "retry_deadline", "head": "abc", "reason": "waited 10153 s (deadline 7200 s, 4 judgments)"}
+        self.assertTrue(gg.land_stop_repeats(last, st))
+        self.assertFalse(gg.land_stop_repeats({**last, "head": "def"}, st))
+        self.assertFalse(gg.land_stop_repeats({**last, "code": "review_cannot_start"}, st))
+        self.assertFalse(gg.land_stop_repeats({**last, "reason": "waited 1 s: still train_wait"}, st))
+        self.assertFalse(gg.land_stop_repeats(None, st))
+        self.assertTrue(gg.land_stop_repeats({k: v for k, v in last.items() if k != "head"}, st))
+
     def test_a_rearmed_entry_that_reads_clean_merges(self):
         self.stop_retry_deadline()
         self.w.answers.append(ok_answer(LA))

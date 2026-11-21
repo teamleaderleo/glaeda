@@ -10973,6 +10973,24 @@ LAND_RERUN_CAP = 3
 LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
+# LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
+# same reason once its counts and seconds are left out) tells its requester nothing: they were told at the first stop,
+# and every acpmux notice is a whole model turn for them. efficiency-scout pass 6, 2026-11-21: cmux#47074's session
+# was woken 3 times in 19 h by retry_deadline, each the same unreadable webview verdict, and coordinators answered
+# "nothing for me" to repeat notices 6+ times. A new head, another code or reason, or a fresh `land` (which clears
+# lastStop) is told as before; the quiet stop is in the entry's history ("quiet": "repeat") and the daemon's log.
+LAND_STOP_DIGITS = re.compile(r"\d+(?:\.\d+)?")
+
+
+def land_stop_repeats(last: Any, st: dict) -> bool:
+    """Whether stop ST repeats LAST, the stop its entry was re-armed from (LAND_STOP_REPEAT's comment)."""
+    if not isinstance(last, dict) or not last.get("code"):
+        return False
+    gist = lambda d: LAND_STOP_DIGITS.sub("#", " ".join(str(d.get("reason") or "").split()))  # noqa: E731
+    # a stop saved before stops kept their head has none: its head is not known to differ
+    same_head = "head" not in last or (last.get("head") or "") == (st.get("head") or "")
+    return (last.get("code") == st.get("code") and same_head
+            and gist(last) == gist(st))
 # An --after PR whose predecessor's land stopped keeps waiting for it this long (consider, after_stopped), telling its
 # requester once: landing the predecessor again, or merging it, resumes the whole chain, and nobody re-queues the PRs
 # behind it (before, each stopped at once: cmux#46237, #46217, #46236 behind #46157, #46183, #46220). Past it, it
@@ -12325,7 +12343,7 @@ class LandQueue:
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
-                     stepTransient=None)
+                     stepTransient=None, lastStop=None)  # a land by hand is told its stop again (LAND_STOP_REPEAT)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e))
         else:
@@ -15138,15 +15156,21 @@ class LandQueue:
 
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)
-        e.update(state="stopped", wait=None, wakeAt=None, action=None,
-                 stop={"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now})
+        st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
+              "head": e.get("head") or ""}
+        repeat = land_stop_repeats(e.get("lastStop"), st)
+        e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
-        self.history(e, "stopped", code=code, reason=land_reason(reason, 160))
+        self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
         msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
         if nxt:
             msg += f" next: {land_trim(nxt, 300)}"
+        if repeat:
+            # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
+            log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
+            return
         self.notify(e, e.get("requester") or "", msg)
 
     def notify(self, e: dict, to: str, message: str) -> None:
