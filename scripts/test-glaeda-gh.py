@@ -28725,5 +28725,191 @@ class PrintedTargetNotationTest(unittest.TestCase):
                 self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
 
 
+class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
+    """Leo's rule for this class of mistake: "we need a bunch of synonyms for code for you guys where it just
+    goes 'eh close enough' and works" / "Mistakes should also be auto fixed and ran properly, a lot of these
+    are pretty mechanical." Measured 2026-11-21: `glaeda-gh comment manaflow-ai/cmux#1` was argparse's
+    "invalid choice: 'comment'" and `next: glaeda-gh --help` -- the caller had named the right concept and
+    missed only that it lives under `post`."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_the_table_is_walked_off_the_parser_so_it_cannot_drift(self) -> None:
+        """No hand-written list: the commands and their words are read off `parser()` itself, both spellings
+        argparse has for a dispatch word (a nested subparser under `log`, a first positional's `choices`
+        under `post`), so a command added or renamed upstream is in the table the same day."""
+        tops, table = gg.nesting_table()
+        top = gg.parser()
+        named = {a.dest: a for a in top._actions}
+        self.assertEqual(tops, frozenset(gg.first_slot_words(top)), "the top level is the parser's own")
+        self.assertIn("post", tops)
+        for word, parents in table.items():
+            for parent in parents:
+                self.assertIn(word, gg.first_slot_words(gg.child_parser(top, parent)),
+                              f"{parent} {word} must be a word the parser itself takes")
+        # the two spellings, each found: `log job` nests a parser, `post comment` is a positional's choice
+        self.assertIn("log", table["job"])
+        self.assertIn("post", table["comment"])
+        self.assertIsNot(gg.child_parser(top, "log"), gg.child_parser(gg.child_parser(top, "log"), "job"))
+        self.assertIs(gg.child_parser(top, "post"), gg.child_parser(gg.child_parser(top, "post"), "comment"))
+        self.assertTrue(named, "parser() still builds")
+
+    def test_a_word_exactly_one_command_takes_routes_to_that_command(self) -> None:
+        for typed, canonical in (
+                (["review", "o/r#1"], ["post", "review", "o/r#1"]),
+                (["job", "o/r", "123"], ["log", "job", "o/r", "123"]),
+                (["errors", "o/r", "123"], ["log", "errors", "o/r", "123"]),
+                (["flaky", "o/r"], ["log", "flaky", "o/r"]),
+                (["replay", "--run-file", "/tmp/x"], ["on-event", "replay", "--run-file", "/tmp/x"]),
+                (["file", "/tmp/x", "--exists"], ["wait", "file", "/tmp/x", "--exists"]),
+                (["prs", "some query"], ["search", "prs", "some query"]),
+                (["both", "some query"], ["search", "both", "some query"]),
+                (["pid", "4242"], ["wait", "pid", "4242"])):
+            self.err.truncate(0), self.err.seek(0)
+            self.assertEqual(gg.nesting_synonym(list(typed)), (canonical, []))
+            said = self.err.getvalue()
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + canonical)}`", said)
+            self.assertIn(f"`{typed[0]}` is a word of `{canonical[0]}`", said)
+
+    def test_a_word_several_commands_take_is_refused_naming_every_one(self) -> None:
+        """`comment` is a real three-way collision in this tree: a word of `status` (a read), of `wait` (a
+        read that blocks) and of `post` (a write on a public thread). Guessing for the caller would guess
+        between reading and writing, so it refuses and names all three, each as a line that runs."""
+        for word in ("comment", "pr", "run"):
+            fixed, refusal = gg.nesting_synonym([word, "o/r#1"])
+            self.assertEqual(fixed, [word, "o/r#1"], "argv is never half-rewritten when it refuses")
+            self.assertGreater(len(refusal), 2, f"{word} has more than one real parent")
+            parents = sorted(gg.nesting_table()[1][word])
+            self.assertIn(f"`{word}` is a word of {len(parents)} commands", refusal[0])
+            for parent in parents:
+                self.assertIn(f"{parent} {word}", refusal[0])
+                self.assertIn(f"next: glaeda-gh {parent} {word} o/r#1", refusal)
+        comment = gg.nesting_synonym(["comment", "manaflow-ai/cmux#1"])[1]
+        self.assertEqual(sorted(comment[1:]), ["next: glaeda-gh post comment manaflow-ai/cmux#1",
+                                               "next: glaeda-gh status comment manaflow-ai/cmux#1",
+                                               "next: glaeda-gh wait comment manaflow-ai/cmux#1"])
+
+    def test_the_refusal_is_the_whole_call_and_nothing_runs(self) -> None:
+        """The exit code a usage error already has, and no request queued: an ambiguous write must not post."""
+        with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
+            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1"]), 64)
+        self.assertIn("not a command of its own", self.err.getvalue())
+
+    def test_the_callers_own_flags_narrow_an_ambiguous_word_to_one_command(self) -> None:
+        """The one narrowing done is evidence the caller typed, read off the parsers: `--body` is an option of
+        `post` and of neither `status` nor `wait`, so `comment ... --body` is `post comment`. `--json`, which
+        all three have, narrows nothing and still refuses."""
+        self.assertEqual(gg.nesting_synonym(["comment", "o/r#1", "--body", "hi"]),
+                         (["post", "comment", "o/r#1", "--body", "hi"], []))
+        self.assertEqual(gg.nesting_synonym(["comment", "o/r#1", "--body-file", "-"]),
+                         (["post", "comment", "o/r#1", "--body-file", "-"], []))
+        self.assertEqual(gg.nesting_synonym(["pr", "o/r", "--title", "t", "--head", "h"])[0][:2], ["post", "pr"])
+        self.assertEqual(gg.nesting_synonym(["run", "o/r/12", "--jobs", "--timeout", "60"])[0][:2], ["wait", "run"])
+        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--json"])
+        self.assertEqual(fixed, ["comment", "o/r#1", "--json"])
+        self.assertTrue(refusal, "a flag every candidate has is no evidence: it still refuses")
+        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--nonsense"])
+        self.assertTrue(refusal, "a flag no candidate has does not get to pick the command either")
+
+    def test_every_spelling_that_works_today_is_left_exactly_as_typed(self) -> None:
+        for typed in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1", "--timeout", "60"],
+                      ["post", "comment", "o/r#1", "--body", "hi"], ["log", "job", "o/r", "1"],
+                      ["search", "prs", "repo:o/r"], ["land", "o/r#1"], ["on-event", "status"],
+                      ["gh", "pr", "view", "1"], ["coord-alert", "x"], ["wait-resume", "x"],
+                      ["--help"], ["-h"], [], ["o/r#1"], ["nonsense", "x"], ["checks", "o/r", "a" * 40]):
+            self.assertEqual(gg.nesting_synonym(list(typed)), (list(typed), []), typed)
+            self.assertEqual(gg.flag_spelling_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a canonical call says nothing on stderr")
+
+
+class AFlagsCaseConventionTest(unittest.TestCase):
+    """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
+    spelling two real options would both answer to is refused rather than picked."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_a_flag_in_another_case_convention_is_read_as_this_tools_spelling(self) -> None:
+        for typed, canonical in (
+                (["post", "comment", "o/r#1", "--bodyFile", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--body_file", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--BODY-FILE", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--statusKey", "k"], "--status-key"),
+                (["post", "comment", "o/r#1", "--status_key", "k"], "--status-key"),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--maxAge", "5"], "--max-age"),
+                (["wait", "pr", "o/r#1", "--rescue_grace", "5"], "--rescue-grace"),
+                (["log", "search", "o/r", "pat", "--Conclusion", "any"], "--conclusion")):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.flag_spelling_synonym(list(typed))
+            self.assertEqual(refusal, [])
+            self.assertIn(canonical, fixed)
+            self.assertNotIn(typed[-2], fixed)
+            self.assertIn(f"`{typed[-2]}` is `{canonical}`", self.err.getvalue())
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + fixed)}`", self.err.getvalue())
+            self.assertEqual(gg.parser().parse_args(fixed).__dict__["command"], typed[0])
+        joined = gg.flag_spelling_synonym(["post", "comment", "o/r#1", "--bodyFile=/p"])
+        self.assertEqual(joined[0][-1], "--body-file=/p", "the --flag=value form keeps its value")
+
+    def test_body_and_body_file_are_never_aliased_to_each_other(self) -> None:
+        """`post --body` is inline text and `post --body-file` is a path. They are two options, one letter
+        apart in normalised form, and nothing here may move a caller from one to the other: only an *exact*
+        match after lowercasing and dropping `-`/`_` decides, never a prefix and never a substring."""
+        for typed in (["post", "comment", "o/r#1", "--body", "hi"],
+                      ["post", "comment", "o/r#1", "--body-file", "/p"],
+                      ["post", "comment", "o/r#1", "--body", "--body-file"],
+                      ["post", "comment", "o/r#1", "--body-file", "-", "--json"]):
+            self.assertEqual(gg.flag_spelling_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "the canonical spellings say nothing")
+        # `--file` is not `--body-file`: no option normalises to `file`, so it is left for argparse as today
+        self.assertEqual(gg.flag_spelling_synonym(["post", "comment", "o/r#1", "--file", "/p"]),
+                         (["post", "comment", "o/r#1", "--file", "/p"], []))
+        for short in ("--file", "--bod", "--b", "--bodyf", "--fileBody", "--body-files"):
+            fixed, refusal = gg.flag_spelling_synonym(["post", "comment", "o/r#1", short, "/p"])
+            self.assertEqual((fixed, refusal), (["post", "comment", "o/r#1", short, "/p"], []), short)
+        # and the two options still mean exactly what they mean today
+        inline = gg.parser().parse_args(["post", "comment", "o/r#1", "--body", "hi"])
+        self.assertEqual((inline.body, inline.body_file), ("hi", None))
+        path = gg.parser().parse_args(["post", "comment", "o/r#1", "--body-file", "/p"])
+        self.assertEqual((path.body, path.body_file), (None, "/p"))
+
+    def test_a_spelling_two_real_options_answer_to_is_refused_naming_both(self) -> None:
+        """The collision this must never resolve silently. The real `post` has no two options that normalise
+        alike, so the refusal path is driven with a small synthetic option set in which `--body-file` and
+        `--bodyfile` both exist: `--bodyFile` is then how *both* are spelled, and the caller is asked which,
+        with a line per option that runs. Nothing is rewritten."""
+        options = {"--body": True, "--body-file": True, "--bodyfile": True, "--json": False}
+        typed = ["post", "comment", "o/r#1", "--bodyFile", "/p", "--json"]
+        with mock.patch.object(gg, "flag_options", return_value=options):
+            fixed, refusal = gg.flag_spelling_synonym(list(typed))
+        self.assertEqual(fixed, typed, "argv is never half-rewritten when it refuses")
+        self.assertIn("`--bodyFile` is how 2 different options of this command are spelled", refusal[0])
+        for option in ("--body-file", "--bodyfile"):
+            self.assertIn(option, refusal[0])
+            self.assertIn(f"next: glaeda-gh post comment o/r#1 {option} /p --json", refusal)
+        self.assertNotIn("--body ", refusal[0] + " ", "an option that normalises differently is not named")
+        with mock.patch.object(gg, "flag_options", return_value=options):
+            self.assertEqual(gg.main(typed), 64)
+        self.assertIn("different options of this command are spelled", self.err.getvalue())
+
+    def test_a_flags_value_is_data_and_never_read_as_a_spelling(self) -> None:
+        """The word after an option that takes a value is a body, a path or a regular expression. Even when it
+        looks like one of this tool's flags in another case, it is left exactly as the caller typed it."""
+        typed = ["post", "comment", "o/r#1", "--body", "--bodyFile", "--json"]
+        self.assertEqual(gg.flag_spelling_synonym(list(typed)), (typed, []))
+        # argparse itself refuses an option-looking value in a separate word, so the form that reaches it is
+        # --body=VALUE: the value is still data, and still untouched here.
+        joined = ["post", "comment", "o/r#1", "--body=--bodyFile", "--json"]
+        self.assertEqual(gg.flag_spelling_synonym(list(joined)), (joined, []))
+        self.assertEqual(gg.parser().parse_args(joined).body, "--bodyFile")
+        past = ["log", "search", "o/r", "pat", "--", "--maxAge"]
+        self.assertEqual(gg.flag_spelling_synonym(list(past)), (past, []))
+
 if __name__ == "__main__":
     unittest.main()
