@@ -1388,7 +1388,18 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hook.job_tier(**{**dev, "job": "release-compile"}), hook.TIER_NIGHTLY)
         daily = {**dev, "event_name": "workflow_dispatch",
                  "event": {"repository": CMUX, "inputs": {"dev_daily": "true"}}}
-        self.assertEqual(hook.job_tier(**daily), hook.TIER_DEV)
+        # DELIVERY_COMPILE_FIRST: delivery compiles (the DEV daily's, the promote compile) rank nightly, so the nightly
+        # slot takes them (DEV daily run 44941204257 waited 76 min on the side label); a push's DEV compile stays DEV
+        self.assertEqual(hook.job_tier(**daily), hook.TIER_NIGHTLY)
+        self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**daily)), "the nightly slot takes the DEV daily compile")
+        self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**{**dev, "job": "release-compile"})))
+        self.assertIsNotNone(hook.nightly_slot_refusal(hook.job_tier(**dev)), "a push's DEV compile is no delivery")
+        for overrides in ({"event": {"repository": CMUX, "inputs": {"dev_daily": "false"}}},
+                          {"event": {"repository": CMUX}}, {"ref": "refs/heads/main"},
+                          {"workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/main"},
+                          {"job": "release-compile"}, {"job": "swift-test"}, {"repository": "other/cmux"}):
+            with self.subTest(daily=overrides):
+                self.assertNotEqual(hook.job_tier(**{**daily, **overrides}), hook.TIER_NIGHTLY)
         self.assertEqual(hook.job_tier(**{**dev, "job": "swift-test"}), "")
         self.assertEqual(hook.job_tier(**{**dev, "event_name": "pull_request"}), "")
         # FEED_TREE: a feat-cmux-next push's cmux-tui tree build feeds that push's nightly, so it ranks with the DEV
