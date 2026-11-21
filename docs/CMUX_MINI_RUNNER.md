@@ -1294,7 +1294,9 @@ app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and wo
 One exception, `HQ_MAIN_DISPATCH` (2026-11-21): a runner trusted for `manaflow-ai/cmuxterm-hq` on `refs/heads/main`
 (cmux24's hq-fleet-route, hq-census, hq-report and hq-runner-maker; cmux17's and cmux22's hq-two-mac) also takes a
 `workflow_dispatch` of that repository when `GITHUB_REF`, the payload's `ref` and the `GITHUB_WORKFLOW_REF` branch are
-all `refs/heads/main` and the workflow file is HQ's own. Such a run executes main's own workflow at main's head, and
+all `refs/heads/main` and the workflow file is one of HQ's that route there (`HQ_DISPATCH_WORKFLOWS`:
+`fleet-reconciler-*`, fleet-selfheal, freestyle-runners, next-dogfood, synthetic-probes and
+synthetic-probes-environments-production; not a workflow whose `runs-on` is a dispatch input). Such a run executes main's own workflow at main's head, and
 only someone with write access can start it, the same trust as a push to main; HQ's workflows routed to these runners
 take PR numbers and phases as inputs, never a ref to run. A dispatch of another ref or repository, and pull_request,
 merge_group and workflow_run (as events or payload keys), stay refused, and cmux's trusted runners refuse every

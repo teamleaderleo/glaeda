@@ -3045,8 +3045,23 @@ TRUSTED_EVENTS = ("push", "schedule")
 # runners take PR numbers and phases as inputs, never a ref to check out and run, and a new one is reviewed on main.
 # Only HQ, only main: a dispatch of another ref or repository, and pull_request, workflow_run and merge_group (payload
 # keys included), stay refused. HQ's runs-on lines send a dispatch here only while vars.HQ_OWNED_DISPATCH is 'live'.
+# And only HQ's workflow files that route to these runners (HQ_DISPATCH_WORKFLOWS, exact names or a "*" prefix): HQ main
+# also has workflows whose runs-on is a dispatch input (screenshare-bench-*-host.yml's `inputs.runner`), which would
+# let a dispatcher put main's code with their own inputs here; a new workflow for these runners is added here.
 HQ_DISPATCH_REPO = "manaflow-ai/cmuxterm-hq"
 HQ_DISPATCH_REF = "refs/heads/main"
+HQ_DISPATCH_WORKFLOWS = ("fleet-reconciler-*", "fleet-selfheal.yml", "freestyle-runners.yml", "next-dogfood.yml",
+                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml")
+
+
+def hq_dispatch_workflow(workflow_path: str) -> bool:
+    """Whether workflow_path (OWNER/REPO/.github/workflows/FILE, no @ref) is one of HQ_DISPATCH_WORKFLOWS. Pure."""
+    prefix = f"{HQ_DISPATCH_REPO}/.github/workflows/"
+    if not workflow_path.lower().startswith(prefix) or "/" in workflow_path[len(prefix):]:
+        return False
+    name = workflow_path[len(prefix):]
+    return any(name.startswith(w[:-1]) and name.endswith(".yml") if w.endswith("*") else name == w
+               for w in HQ_DISPATCH_WORKFLOWS)
 UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
 TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 # ONE_MINI_NIGHTLY: main's classic nightly.yml signing and publishing jobs, which cmux routes to the trusted signing
@@ -3197,8 +3212,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     if hq_dispatch:
         workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
         if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
-                and workflow_path.lower().startswith(f"{HQ_DISPATCH_REPO}/.github/workflows/")):
-            return (f"{why}; a workflow_dispatch only of {trusted_ref} with its own workflow file "
+                and hq_dispatch_workflow(workflow_path)):
+            return (f"{why}; a workflow_dispatch only of {trusted_ref} with one of its own workflow files that route "
+                    f"here ({', '.join(HQ_DISPATCH_WORKFLOWS)}) "
                     f"(ref {ref or '(unset)'}, payload ref {event.get('ref')!r}, workflow {workflow_ref or '(unset)'})")
         return None
     if dispatch:

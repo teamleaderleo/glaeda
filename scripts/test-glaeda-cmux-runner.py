@@ -671,6 +671,9 @@ class HookTest(unittest.TestCase):
                 "job": "integrations-production", "run_attempt": "1"}
         self.assertIsNone(hook.trusted_refusal(**args))
         self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
+        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "workflow_ref": wf.replace("synthetic-probes.yml", name)}))
+        self.assertIsNone(hook.trusted_refusal(**{**args, "trusted_repo": "Manaflow-AI/cmuxterm-hq"}))
         for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):
             self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": event_payload}))
         pr = {"number": 1, "head": {"repo": hq}, "base": {"repo": hq}}
@@ -683,6 +686,13 @@ class HookTest(unittest.TestCase):
             "workflow file of another repository": {
                 "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{main}"},
             "no workflow ref": {"workflow_ref": None},
+            "an HQ workflow that does not route here (runs-on from an input)": {
+                "workflow_ref": f"manaflow-ai/cmuxterm-hq/.github/workflows/screenshare-bench-linux-host.yml@{main}"},
+            "an @ smuggled into the workflow path": {"workflow_ref": f"{wf}@refs/heads/lane/x"},
+            "a tag": {"ref": "refs/tags/v1", "event": {**payload, "ref": "refs/tags/v1"},
+                      "workflow_ref": wf.replace(main, "refs/tags/v1")},
+            "a nested workflow path": {
+                "workflow_ref": f"manaflow-ai/cmuxterm-hq/.github/workflows/x/synthetic-probes.yml@{main}"},
             "dispatch from another repository": {"repository": "manaflow-ai/cmux",
                                                  "event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
             "repo env and payload differ": {"event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
