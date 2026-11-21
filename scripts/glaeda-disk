@@ -7783,7 +7783,37 @@ def rustup_verdict(path: Path) -> str:
     for tc in pinned:
         if path.name == tc or path.name.startswith(tc + "-"):
             return "a pinned toolchain (default, override, RUSTUP_TOOLCHAIN or rust-toolchain file)"
+    for tc in receipt_toolchains():
+        if path.name == tc or path.name.startswith(tc + "-"):
+            return "a toolchain a class receipt on this node needs (its rustc or the DiffSidecar pin)"
     return ""
+
+
+def receipt_toolchains() -> set[str]:
+    """Every Rust toolchain a cmux-fleet class receipt on this node needs installed (glaeda-cmux-runner-hook
+    receipt_rust_toolchains: the receipt's rustc, whose toolchain the hook makes the default per job, and the
+    DiffSidecar pin it probes with `rustup run`). Without one the gate holds every listener off (2026-11-21:
+    the m6-16 minis and the Ultra roots, after a sweep took 1.88.0 and 1.99.1)."""
+    out: set[str] = set()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "glaeda/cmux-fleet/class-acceptance"
+    try:
+        files = sorted(config.glob("*.json"))[:64]
+    except OSError:
+        return out
+    for f in files:
+        try:
+            want = json.loads(f.read_text()).get("toolchain") or {}
+        except (OSError, ValueError, AttributeError, UnicodeDecodeError):
+            continue
+        if not isinstance(want, dict):
+            continue
+        m = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
+        if m:
+            out.add(m.group(1))
+        diff = str(want.get("diffRustToolchain") or "").strip()
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?", diff):
+            out.add(diff)
+    return out
 
 
 def keep_verdict(fam: "Family", path: Path) -> str:
@@ -11735,7 +11765,7 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     (str(HOME / ".codex"), "Codex CLI state"),
     (str(HOME / ".claude"), "Claude Code state"),
     (str(HOME / "Applications"), "user-installed apps"),
-    (str(HOME / ".rustup"), "rustup toolchains (home-caches reclaims stale ones)"),
+    (str(HOME / ".rustup"), "rustup toolchains (never reclaimed: toolchain_keep holds the rustup home)"),
     (str(HOME / ".local"), "installed tools (glaeda's bin among them)"),
 )
 

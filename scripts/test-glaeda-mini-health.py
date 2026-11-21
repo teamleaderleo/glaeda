@@ -238,6 +238,11 @@ class FakeMini(health.Mini):
     def toolchain_missing(self):
         return self.toolchain_gone
 
+    receipt_absent: list[str] = []
+
+    def receipt_toolchains_absent(self):
+        return list(self.receipt_absent)
+
     def install_rust_toolchain(self, toolchain):
         self.toolchain_installs.append(toolchain)
         return True, f"installed Rust toolchain {toolchain}"
@@ -353,6 +358,46 @@ class NodeEligibility(unittest.TestCase):
                                    {"DEVELOPER_DIR": "/Applications/Xcode_26.6.app/Contents/Developer"})])
         mini._hook.xcode_refusal = lambda xcode_app, env: 1 / 0
         self.assertIsNone(mini.toolchain_mismatch(), "a hook that cannot answer is no finding")
+
+    def test_receipt_toolchains_are_read_from_the_hook_for_the_required_fleet_class(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m6-16")
+        asked: list[tuple[str, Path]] = []
+
+        def absent(fleet_class, home):
+            asked.append((fleet_class, home))
+            return ["1.88.0"]
+
+        mini._hook.receipt_toolchains_absent = absent
+        self.assertEqual(mini.receipt_toolchains_absent(), ["1.88.0"])
+        self.assertEqual(asked, [("m6-16", self.home)])
+        mini._hook.receipt_toolchains_absent = lambda fleet_class, home: 1 / 0
+        self.assertEqual(mini.receipt_toolchains_absent(), [], "a hook that cannot answer is no finding")
+
+    def test_no_receipt_toolchain_look_without_require_eligible(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --fleet-class m6-16")
+        mini._hook.receipt_toolchains_absent = lambda fleet_class, home: ["1.88.0"]
+        self.assertEqual(mini.receipt_toolchains_absent(), [])
+
+    def test_the_toolchain_install_runs_rustup_on_the_workload_path_from_the_home(self) -> None:
+        # the agent's launchd PATH (/usr/bin:/bin:...) has no Homebrew rustup: every install exited 127
+        mini = health.Mini(self.home)
+        calls: list[tuple[list[str], dict, str]] = []
+
+        def sh(argv, timeout=15, env=None, cwd=None):
+            calls.append((argv, env or {}, cwd))
+            return (0, "1.88.0-aarch64-apple-darwin\n1.99.1-aarch64-apple-darwin (default)\n"
+                    if argv[1:3] == ["toolchain", "list"] else "")
+
+        with mock.patch.object(health, "sh", sh), mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            self.assertEqual(mini.install_rust_toolchain("1.88.0"), (True, "installed Rust toolchain 1.88.0"))
+            self.assertEqual(calls[0][0], ["rustup", "toolchain", "install", "1.88.0", "--profile", "minimal"])
+            for _argv, env, cwd in calls:
+                self.assertEqual(env["PATH"], health.CHECKOUT_PROBE_PATH)
+                self.assertTrue(env["PATH"].startswith("/opt/homebrew/bin:"))
+                self.assertEqual(cwd, os.fspath(self.home))
+            self.assertEqual(mini.install_rust_toolchain("1.98.1-aarch64-apple-darwin")[0], False,
+                             "installed but not listed")
+            self.assertEqual(mini.install_rust_toolchain("1.88.0; rm -rf ~"), (False, "refused unsafe Rust toolchain name"))
 
     def test_a_missing_rust_toolchain_is_read_from_the_hook_for_a_fleet_node(self) -> None:
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
@@ -536,6 +581,22 @@ class Detection(Base):
         self.assertEqual(report["findings"], [])
         self.assertEqual(self.mini.toolchain_installs, ["1.98.1-aarch64-apple-darwin"])
         self.assertEqual(report["heals"][0]["id"], "node_toolchain_missing:1.98.1-aarch64-apple-darwin")
+
+    def test_a_toolchain_the_class_receipt_needs_is_installed_whatever_the_refusal_says(self) -> None:
+        # 2026-11-21 ~00:00-00:52Z: the gate held the m6-16 minis on "diffRustcVersion '' != 'rustc 1.88.0'" and the
+        # Ultra roots on "rust toolchain 1.99.1-... is not installed"; node_refusal (no toolchain probes) said nothing
+        self.mini.receipt_absent = ["1.99.1", "1.88.0"]
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.toolchain_installs, ["1.99.1", "1.88.0"])
+        self.assertEqual([h["id"] for h in report["heals"]],
+                         ["node_toolchain_missing:1.99.1", "node_toolchain_missing:1.88.0"])
+
+    def test_a_refusal_naming_a_receipt_toolchain_installs_it_once(self) -> None:
+        self.mini.receipt_absent = ["1.98.1"]
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        self.run_once()
+        self.assertEqual(self.mini.toolchain_installs, ["1.98.1"])
 
     def test_missing_toolchain_refusal_is_pending_when_install_fails(self) -> None:
         self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"

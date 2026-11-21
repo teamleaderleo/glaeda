@@ -8013,6 +8013,62 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertGreaterEqual(float(self.runs.read_text().split()[0]), released - 0.01)
 
 
+class ReceiptRustToolchainsTest(unittest.TestCase):
+    """2026-11-21: a sweep removed the m6-16 receipt's DiffSidecar pin (1.88.0) and the Ultra receipt's rustc
+    (1.99.1), and the gate held every listener off for hours. The hook names what a receipt needs installed."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("XDG_CONFIG_HOME", "RUSTUP_HOME"):
+            os.environ.pop(key, None)
+
+    def receipt(self, toolchain: dict) -> None:
+        d = self.home / ".config/glaeda/cmux-fleet/class-acceptance"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "m6-16.json").write_text(json.dumps({"toolchain": toolchain}))
+
+    def install(self, *names: str) -> None:
+        for name in names:
+            (self.home / ".rustup/toolchains" / name / "bin").mkdir(parents=True)
+
+    def test_the_receipt_rustc_and_diffsidecar_pin_are_required(self) -> None:
+        want = {"rustcVersion": "rustc 1.99.1 (58cf8f9c3 2026-10-13)", "diffRustToolchain": "1.88.0",
+                "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        self.assertEqual(hook.receipt_rust_toolchains(want), ["1.99.1", "1.88.0"])
+        self.assertEqual(hook.receipt_rust_toolchains({**want, "diffRustcVersion": ""}), ["1.99.1"],
+                         "toolchain_refusal probes the pin only when the receipt records its rustc")
+        self.assertEqual(hook.receipt_rust_toolchains({"rustcVersion": "unknown", "diffRustToolchain": "stable; x",
+                                                       "diffRustcVersion": "rustc 1"}), [])
+        self.assertEqual(hook.receipt_rust_toolchains({"rustcVersion": "rustc 1.88.0", "diffRustToolchain": "1.88.0",
+                                                       "diffRustcVersion": "rustc 1.88.0"}), ["1.88.0"])
+
+    def test_absent_toolchains_are_read_from_the_rustup_home(self) -> None:
+        self.receipt({"rustcVersion": "rustc 1.99.1 (58cf8f9c3 2026-10-13)", "diffRustToolchain": "1.88.0",
+                      "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"})
+        self.install("1.95.0-aarch64-apple-darwin", "1.99.1-aarch64-apple-darwin")
+        self.assertEqual(hook.receipt_toolchains_absent("m6-16", self.home), ["1.88.0"])
+        self.install("1.88.0-aarch64-apple-darwin")
+        self.assertEqual(hook.receipt_toolchains_absent("m6-16", self.home), [])
+        self.assertEqual(hook.receipt_toolchains_absent("m4pro-48", self.home), [], "no receipt, nothing to name")
+        shutil.rmtree(self.home / ".rustup")
+        self.assertEqual(hook.receipt_toolchains_absent("m6-16", self.home), ["1.99.1", "1.88.0"])
+        os.environ["RUSTUP_HOME"] = os.fspath(self.home / "rh")
+        (self.home / "rh/toolchains/1.99.1-aarch64-apple-darwin").mkdir(parents=True)
+        self.assertEqual(hook.receipt_toolchains_absent("m6-16", self.home), ["1.88.0"])
+
+    def test_glaeda_disk_and_the_health_agent_name_toolchains_the_same_way(self) -> None:
+        loader = importlib.machinery.SourceFileLoader("glaeda_mini_health_names", os.fspath(HOOK.parent / "glaeda-mini-health"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        sys.modules[loader.name] = module
+        loader.exec_module(module)
+        self.assertEqual(module.RUST_TOOLCHAIN_NAME.pattern, hook.RUST_TOOLCHAIN_NAME.pattern)
+
+
 class XcodeToolchainTest(unittest.TestCase):
     """The pool Xcode's toolchain: the listener's env, and the check that a host's xcrun resolves inside it."""
 
