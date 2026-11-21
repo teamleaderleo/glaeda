@@ -23514,6 +23514,28 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
 
 
+class ShorthandFlag(argparse.Action):
+    """A flag agents type for a canonical form (`--merged` for `--until merged`, `--job ID` for the JOB_ID
+    argument): run it as that form, and say the canonical form on stderr once, so the next call uses it."""
+
+    def __init__(self, option_strings, dest, canonical: str = "", **kw):
+        self.canonical = canonical
+        super().__init__(option_strings, dest, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        value = self.const if self.nargs == 0 else values
+        setattr(namespace, self.dest, value)
+        say_waiting(f"glaeda-gh: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
+
+
+class OptionalJobId(argparse.Action):
+    """JOB_ID when `--job ID` may stand for it: an absent JOB_ID leaves what `--job` set, whichever came first."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is not None:
+            setattr(namespace, self.dest, values)
+
+
 def parser() -> argparse.ArgumentParser:
     p = Parser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
@@ -23540,10 +23562,14 @@ def parser() -> argparse.ArgumentParser:
                        help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
         if name == "wait":
-            s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
+            until = s.add_mutually_exclusive_group()
+            until.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
                                 "all but merged exit 4 once the PR conflicts with its base")
+            for word in ("green", "done", "required", "merged"):
+                until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
+                                   canonical="`--until {}`", help=f"the same as --until {word}")
             s.add_argument("--timeout", type=seconds, default=3600,
                            help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
@@ -23593,10 +23619,13 @@ def parser() -> argparse.ArgumentParser:
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
     lj = lgs.add_parser("job", help="print one job's log (exit 0 only with the log on stdout)")
     lj.add_argument("repo", metavar="OWNER/REPO")
-    lj.add_argument("job", type=int, metavar="JOB_ID")
     le = lgs.add_parser("errors", help="one job's error-level lines, grouped by step, not the whole log")
     le.add_argument("repo", metavar="OWNER/REPO")
-    le.add_argument("job", type=int, metavar="JOB_ID")
+    for one in (lj, le):
+        job = one.add_mutually_exclusive_group(required=True)
+        job.add_argument("job", type=int, nargs="?", action=OptionalJobId, metavar="JOB_ID")
+        job.add_argument("--job", dest="job", type=int, action=ShorthandFlag, metavar="ID",
+                         canonical="`{prog} OWNER/REPO {}`", help="the same as JOB_ID")
     le.add_argument("--max", type=int, default=40, metavar="N", help="lines shown (default 40)")
     le.add_argument("--json", action="store_true")
     for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "

@@ -26791,5 +26791,74 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
 
 
+class ShorthandFlagTest(unittest.TestCase):
+    """`wait --merged` is `wait --until merged` and `log errors|job OWNER/REPO --job ID` is the JOB_ID argument:
+    agents type them, so they run, with the canonical form on stderr; giving both forms is a usage error."""
+
+    def parse(self, argv: list[str]):
+        err = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=err)):
+            args = gg.parser().parse_args(argv)
+        return args, err.getvalue()
+
+    def refused(self, argv: list[str]) -> str:
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=err)), \
+                contextlib.redirect_stdout(out), mock.patch.object(gg.Parser, "argv", argv):
+            with self.assertRaises(SystemExit) as ctx:
+                gg.parser().parse_args(argv)
+        self.assertEqual(ctx.exception.code, 64)
+        return err.getvalue()
+
+    def test_each_wait_shorthand_is_its_until(self):
+        for word in ("green", "done", "required", "merged"):
+            with self.subTest(word=word):
+                args, err = self.parse(["wait", "pr", "o/r#1", f"--{word}", "--timeout", "60"])
+                self.assertEqual(args.until, word)
+                self.assertEqual(args.timeout, 60)
+                self.assertIn(f"--{word} ran as `--until {word}`", err)
+
+    def test_wait_shorthand_with_until_is_refused(self):
+        for argv in (["wait", "pr", "o/r#1", "--merged", "--until", "done"],
+                     ["wait", "pr", "o/r#1", "--until", "merged", "--merged"],
+                     ["wait", "pr", "o/r#1", "--merged", "--green"]):
+            with self.subTest(argv=argv):
+                self.assertIn("not allowed with argument", self.refused(argv))
+
+    def test_wait_until_forms_unchanged(self):
+        args, err = self.parse(["wait", "pr", "o/r#1"])
+        self.assertEqual((args.until, err), ("green", ""))
+        for word in ("green", "done", "required", "merged"):
+            with self.subTest(word=word):
+                args, err = self.parse(["wait", "pr", "o/r#1", "--until", word])
+                self.assertEqual((args.until, err), (word, ""))
+        self.assertIn("invalid choice", self.refused(["wait", "pr", "o/r#1", "--until", "nope"]))
+
+    def test_log_job_flag_is_the_job_id(self):
+        for kind in ("errors", "job"):
+            for argv in (["log", kind, "o/r", "--job", "136749709509"],
+                         ["log", kind, "--job", "136749709509", "o/r"],
+                         ["log", kind, "o/r", "--job=136749709509"]):
+                with self.subTest(argv=argv):
+                    args, err = self.parse(argv)
+                    self.assertEqual((args.kind, args.repo, args.job), (kind, "o/r", 136749709509))
+                    self.assertIn(f"--job ran as `glaeda-gh log {kind} OWNER/REPO 136749709509`", err)
+
+    def test_log_job_id_both_or_neither_is_refused(self):
+        for kind in ("errors", "job"):
+            with self.subTest(kind=kind):
+                self.assertIn("not allowed with argument",
+                              self.refused(["log", kind, "o/r", "5", "--job", "6"]))
+                self.assertIn("is required", self.refused(["log", kind, "o/r"]))
+
+    def test_log_positional_job_id_unchanged(self):
+        args, err = self.parse(["log", "errors", "o/r", "5", "--max", "3"])
+        self.assertEqual((args.repo, args.job, args.max, err), ("o/r", 5, 3, ""))
+        args, err = self.parse(["log", "job", "o/r", "5"])
+        self.assertEqual((args.repo, args.job, err), ("o/r", 5, ""))
+        args, _ = self.parse(["log", "search", "o/r", "boom", "--job", "build.*"])
+        self.assertEqual(args.job, "build.*")  # search and flaky keep --job as the job-name filter
+
+
 if __name__ == "__main__":
     unittest.main()
