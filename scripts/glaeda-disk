@@ -16615,6 +16615,61 @@ def disk_off() -> str:
     return ""
 
 
+# A full disk stopped glaeda-disk itself: its first state write (sizes.<pid>.tmp, the evict owner) died with ENOSPC,
+# launchd's stderr log could not take the traceback (exit 120), and every pass ended before it freed a byte. A fleet
+# host sat at 0.1 GiB free with 39 GiB of idle build scratch and a reclaimable 5.4 GB checkout for half an hour
+# (2026-11-21). The reserve is the room those writes need: a run that finds the home volume under
+# FULL_DISK_RELEASE_UNDER deletes it first, and an applying pass that ends with FULL_DISK_REFILL_OVER free writes it
+# again. A host that never had one, or used it, is no worse off than before.
+FULL_DISK_RESERVE_BYTES = 512 * 1024**2
+FULL_DISK_RELEASE_UNDER = 1024**3
+FULL_DISK_REFILL_OVER = 10 * 1024**3
+
+
+def full_disk_reserve_path() -> Path:
+    return HOME / ".cache/glaeda-disk/full-disk-reserve"
+
+
+def release_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> int:
+    """Delete the reserve when the volume is nearly full, so this run's own writes have room. Bytes freed, or 0."""
+    path = path or full_disk_reserve_path()
+    left = (free or _home_free)()
+    if left is None or left >= FULL_DISK_RELEASE_UNDER:
+        return 0
+    try:
+        size = path.stat().st_size
+        path.unlink()
+    except OSError:
+        return 0
+    return size
+
+
+def refill_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> bool:
+    """Write the reserve again when there is room for it to spare. True when one exists afterwards."""
+    path = path or full_disk_reserve_path()
+    with contextlib.suppress(OSError):
+        if path.stat().st_size >= FULL_DISK_RESERVE_BYTES:
+            return True
+    left = (free or _home_free)()
+    if left is None or left < FULL_DISK_REFILL_OVER:
+        return False
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        chunk = b"\0" * (8 * 1024**2)  # written, not truncated: a sparse file would reserve nothing
+        with open(tmp, "wb") as f:
+            for _ in range(FULL_DISK_RESERVE_BYTES // len(chunk)):
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
+
+
 def _home_free() -> int | None:
     try:
         return free_bytes(HOME)[0]
@@ -16752,6 +16807,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "default_targets": bool(RUN.get("default_targets")), "config_sha256": RUN.get("config_sha256"),
            "floor_gib": RUN.get("floor_gib"),
            "release": glaeda_disk_release(),
+           "full_disk_reserve_released": RUN.get("full_disk_reserve_released", 0),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
@@ -16778,6 +16834,8 @@ def _logged_main(args: list[str]) -> int:
     RUN.clear()
     OUT_OF_BAND_RUN = ""  # one reset per run, before any early return of _main_impl can leave a stale reason
     RUN["caller"] = run_caller()
+    if released := release_full_disk_reserve():
+        RUN["full_disk_reserve_released"] = released
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)
@@ -16793,6 +16851,8 @@ def _logged_main(args: list[str]) -> int:
         # coalesced into a running one, or deferred, does not start it: that one may still be deleting.
         if status == 0 and RUN.get("apply") and not RUN.get("off") and RUN.get("skipped") in CENSUS_AFTER_SKIPS:
             launch_background_census()
+        if RUN.get("apply") and not RUN.get("off"):
+            refill_full_disk_reserve()
         return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")

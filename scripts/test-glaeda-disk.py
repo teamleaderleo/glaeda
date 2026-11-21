@@ -143,6 +143,13 @@ class GlaedaDiskTest(unittest.TestCase):
         gd._DISCOVERED.clear()
         self.gd_keep = gd.NESTED_KEEP
         gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
+        # an --apply main() refills the full-disk reserve: never 512 MiB in the real home
+        reserve, real_path, real_bytes = (self.root.parent / f"{self.root.name}-reserve",
+                                          gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES)
+        gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES = (lambda: reserve), 8 * 1024**2
+        self.addCleanup(setattr, gd, "full_disk_reserve_path", real_path)
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", real_bytes)
+        self.addCleanup(lambda: reserve.unlink(missing_ok=True))
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
@@ -3660,6 +3667,38 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(v, {"a": ("git-checkout", ["commits no remote confirms"]),
                              "b": ("git-checkout", ["commits no remote confirms"])})
         self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
+
+    def test_a_nearly_full_disk_gets_the_reserve_back_before_anything_writes(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        roomy, tight, full = (lambda: gd.FULL_DISK_REFILL_OVER), (lambda: gd.FULL_DISK_REFILL_OVER - 1), (lambda: 0)
+        self.assertFalse(gd.refill_full_disk_reserve(reserve, tight))  # no spare room: no reserve
+        self.assertFalse(reserve.exists())
+        self.assertTrue(gd.refill_full_disk_reserve(reserve, roomy))
+        self.assertEqual(reserve.stat().st_size, gd.FULL_DISK_RESERVE_BYTES)
+        self.assertGreaterEqual(reserve.stat().st_blocks * 512, gd.FULL_DISK_RESERVE_BYTES)  # not sparse
+        self.assertEqual(gd.release_full_disk_reserve(reserve, tight), 0)  # tight is not full: kept
+        self.assertTrue(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), gd.FULL_DISK_RESERVE_BYTES)
+        self.assertFalse(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), 0)  # already used
+        self.assertEqual(list(reserve.parent.iterdir()), [])  # no tmp left behind
+
+    def test_a_reserve_that_cannot_be_written_leaves_nothing(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        real_open = open
+
+        def enospc_after_open(path, mode="r", *a, **k):
+            f = real_open(path, mode, *a, **k)
+            if "w" in mode:
+                f.write = lambda b: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left on device"))
+            return f
+        with mock.patch("builtins.open", enospc_after_open):
+            self.assertFalse(gd.refill_full_disk_reserve(reserve, lambda: gd.FULL_DISK_REFILL_OVER))
+        self.assertEqual(list(reserve.parent.iterdir()), [])
 
     def test_the_fleet_git_mirror_vouches_like_a_server(self) -> None:
         root, origin = self._tmp_repos()
