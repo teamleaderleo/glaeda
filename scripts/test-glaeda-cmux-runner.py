@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import copy
 import datetime
+import errno
 import fcntl
 import functools
 import hashlib
@@ -3424,6 +3425,46 @@ class HookTest(unittest.TestCase):
         killed.wait()
         self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "a killed waiter's marker goes with it")
         self.assertFalse(marker.exists())
+
+    def test_a_ledger_file_it_cannot_open_refuses_the_signing_job_at_once_naming_it(self) -> None:
+        """LEDGER_ERROR_IS_FINAL: a fleet Mac, 2026-11-21, cmux nightly run 44898080726's generate-nightly-deltas logged
+        "cannot take the ledger (PermissionError)" for SIGNING_DRAIN_WAIT_S, holding the whole mini, and was refused
+        anyway. An error waiting cannot clear refuses at once, names the file, and leaves no hold. Here gateway-0.token,
+        a token only the exclusive class takes, is a directory (EISDIR): a PermissionError a root test run cannot
+        make."""
+        self.fleet()
+        (self.dir / "capacity" / "gateway-0.token").mkdir(parents=True)
+        started = time.monotonic()
+        signer = self.nightly_signer("n0", "30", "--nightly-runner")
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{signer.pid}"
+        out, _ = signer.communicate(timeout=60)
+        self.assertEqual(signer.returncode, 1, out)
+        self.assertLess(time.monotonic() - started, 20, "refused at once, not after the drain's bound")
+        self.assertIn("refused: cannot take the ledger (IsADirectoryError on ", out)
+        self.assertIn("gateway-0.token", out)
+        self.assertIn(hook.LEDGER_FINAL_MARK, out)
+        self.assertNotIn("waiting (", out)
+        self.assertFalse(marker.exists(), "refused: no waiter marker holds the mini")
+        self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
+        self.assertTrue(self.lock_free(), "the refused job let go of everything it took")
+
+    def test_only_a_ledger_error_waiting_can_clear_is_a_capacity_wait(self) -> None:
+        """LEDGER_ERROR_IS_FINAL: permissions, a read-only volume or a wrong file type never pass by waiting; running
+        out of descriptors or disk can."""
+        for number, name in ((errno.EACCES, PermissionError), (errno.EPERM, PermissionError),
+                             (errno.EROFS, OSError), (errno.ELOOP, OSError), (errno.EISDIR, IsADirectoryError),
+                             (errno.ENOTDIR, NotADirectoryError)):
+            with self.subTest(errno=number):
+                note = hook.ledger_error_note(name(number, os.strerror(number), "/fleet/capacity/fast-0.token"))
+                self.assertFalse(note.startswith("capacity:"), note)
+                self.assertIn(hook.LEDGER_FINAL_MARK, note)
+                self.assertIn("on /fleet/capacity/fast-0.token", note)
+        for number in (errno.EMFILE, errno.ENFILE, errno.ENOSPC):
+            with self.subTest(errno=number):
+                note = hook.ledger_error_note(OSError(number, os.strerror(number), "/fleet/capacity/unit-3"))
+                self.assertTrue(note.startswith("capacity: cannot take the ledger (OSError on /fleet/capacity/unit-3)"),
+                                note)
+                self.assertNotIn(hook.LEDGER_FINAL_MARK, note)
 
     def test_a_draining_signing_job_keeps_draining_when_a_fleet_build_starts_waiting(self) -> None:
         """cmux13s, 2026-10-31 03:05Z: three sign-nightly-identity-legacy jobs in 30 s were refused at once with "a
