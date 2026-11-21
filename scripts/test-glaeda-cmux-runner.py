@@ -779,9 +779,12 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 18)
+        self.assertEqual(len(signing), 19)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
+        # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
+        self.assertIn("sign-live-code-variant", signing)
+        self.assertNotIn("build-live-code-variant", signing)
         # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
         # here like its push; its payload names the same ref
         dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
@@ -797,7 +800,7 @@ class HookTest(unittest.TestCase):
                           {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
                           {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
                           {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
-                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          {"job": "build-nightly-app"}, {"job": "build-live-code-variant"}, {"job": "decide"}, {"job": None},
                           *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
                                                                           "merge_group")]):
             with self.subTest(dispatch=overrides):
