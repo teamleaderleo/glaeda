@@ -11400,6 +11400,61 @@ class FileAndPidWaitTest(unittest.TestCase):
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
 
+    def test_a_word_for_a_command_runs_as_that_command(self) -> None:
+        """`pr-state o/r#1 o/r#2` (called so on gcp-agent-lane-2, 2026-11-21, and refused with the bare list of
+        commands) runs `status o/r#1 o/r#2`, and a case, a prefix or a typo of a command runs as it too."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for given, want in (("pr-state", "status"), ("pr_state", "status"), ("state", "status"),
+                                ("STATUS", "status"), ("stat", "status"), ("statsu", "status"),
+                                ("quota", "budget"), ("runner", "runners")):
+                self.assertEqual(gg.command_spelling_synonym([given, "o/r#1"]), ([want, "o/r#1"], []),
+                                 f"{given} -> {want}")
+        self.assertEqual(err.getvalue().count("read as"), 8)
+        self.assertIn("is no command", err.getvalue())
+        # The rewrite parses, and the kind a bare target implies is still inferred from it afterwards.
+        fixed, said = gg.infer_kind(gg.command_spelling_synonym(["pr-state", "o/r#1"])[0])
+        self.assertEqual(fixed[:2], ["status", "pr"])
+        self.assertTrue(said)
+        self.assertEqual(gg.parser().parse_args(fixed).command, "status")
+
+    def test_a_command_a_nesting_word_and_a_stranger_are_all_left_alone(self) -> None:
+        """A real command is never rewritten; a word nesting_synonym owns stays its; a word near nothing keeps
+        argparse's own refusal, with the commands in it."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for same in (["status", "pr", "o/r#1"], ["land", "o/r#1"], ["--help"], [],
+                         ["gh", "pr", "view", "1"], ["comment", "o/r#1"], ["job", "o/r", "7"],
+                         ["frobnicate", "o/r#1"], ["xyzzy"]):
+                self.assertEqual(gg.command_spelling_synonym(list(same)), (same, []), " ".join(same))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_only_the_first_word_is_read_as_a_command(self) -> None:
+        """`wait run o/r/1` keeps its kind: `run` is a prefix of `runners`, and a word after the command is a
+        kind or a target, never a command (which is why this is not in Parser._get_value)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["wait", "run", "o/r/1"]),
+                             (["wait", "run", "o/r/1"], []))
+            self.assertEqual(gg.parser().parse_args(["wait", "run", "o/r/1"]).kind, "run")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_word_as_close_to_two_commands_refuses_naming_both(self) -> None:
+        """Nothing is guessed between two commands: the refusal names each as a line that runs. No two real
+        commands are one edit apart, so the pair comes from a patched command set."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["seach", "cmux next"]),  # one edit from `search`
+                             (["search", "cmux next"], []))
+        self.assertEqual(err.getvalue().count("read as"), 1)
+        tops, table = gg.nesting_table()
+        with mock.patch.object(gg, "nesting_table", lambda: (frozenset({"read", "real"}), table)):
+            fixed, refusal = gg.command_spelling_synonym(["reat", "o/r#1"])
+        self.assertEqual(fixed, ["reat", "o/r#1"])
+        self.assertIn("is no command", refusal[0])
+        self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
+        self.assertIn("read", tops)  # the real table is untouched by the patch above
+
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
         (both cost a usage error, 2026-11-21)."""

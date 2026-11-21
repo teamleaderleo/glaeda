@@ -29966,6 +29966,12 @@ CHOICE_SYNONYMS = {
     "issue": ("issues", "new-issue", "newissue", "bug", "file-issue"),
     "label": ("labels", "add-label", "add-labels", "tag"),
     "close": ("close-issue", "close-pr"),
+    # Commands (command_spelling_synonym reads the same table for the first word). `status` reads the state of
+    # pull requests and runs, which is what every one of these words asks for; the words for a write are left
+    # refused, since a write nobody typed is the one rewrite that cannot be taken back.
+    "status": ("pr-state", "pr-status", "prstate", "run-state", "state", "states", "check-state"),
+    "budget": ("quota", "spend", "spent", "usage"),
+    "search": ("find", "query"),
 }
 CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
 
@@ -31017,6 +31023,37 @@ def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[s
         out.append(word)
         i += 1
     return out
+def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """The first word as the one command it means: (argv, refusal lines).
+
+    glaeda#2368 gave every choice *argument* a case, a synonym, a prefix and a typo of its choices, and
+    glaeda#2358 routes a word that lives under another command. The commands themselves got neither: argparse
+    keeps a subparsers action's choices as a mapping, and `Parser._get_value` reads only a list or tuple.
+    Measured on gcp-agent-lane-2, 2026-11-21: `glaeda-gh pr-state o/r#7547 o/r#7537 ...` -- the merge state of
+    four pull requests in one gather -- was refused with the bare list of commands, which names every command
+    and not which one answers the ask, and finding `status` cost another call.
+
+    So the first word goes through the same `close_choice` as every other choice, and a word as close to two
+    commands is refused naming both, as the other two rewriters refuse. Only the *first* word is read: for a
+    subparsers action argparse hands `_get_value` every word of the call, where `wait run o/r/1` would read
+    `run` as a prefix of `runners` -- which is why this lives here and not in `_get_value`."""
+    if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, table = nesting_table()
+    word = raw[0]
+    if word in tops or word in table:
+        return raw, []  # a command, or a word nesting_synonym owns and routes
+    meant, near = close_choice(word, sorted(tops))
+    if not meant:
+        if len(near) > 1:
+            return raw, [f"glaeda-gh: `{word}` is no command, and is as close to `{'` as to `'.join(near)}`: "
+                         f"which one decides what this does, so it is not guessed",
+                         *(f"next: {' '.join(['glaeda-gh', c] + raw[1:])}" for c in near)]
+        return raw, []  # nothing near it: argparse refuses it with the commands, as it always has
+    fixed = [meant] + raw[1:]
+    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` (`{word}` is no command; `{meant}` is the "
+          f"one it means)", file=sys.stderr)
+    return fixed, []
 
 
 def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
@@ -31099,10 +31136,11 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, doubled_kind_synonym, flag_spelling_synonym):
-        # The nesting first, then the flags: which options a command has depends on which command it is.
-        # `doubled_kind_synonym` sits between them: it only looks at a call that already leads with a real
-        # command, which is what `nesting_synonym` has just made sure of, and it reads flags only by name.
+    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym, flag_spelling_synonym):
+        # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
+        # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
+        # sits between them: it only looks at a call that already leads with a real command, which is what the
+        # two before it have just made sure of, and it reads flags only by name.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
