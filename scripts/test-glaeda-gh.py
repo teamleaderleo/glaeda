@@ -2976,7 +2976,8 @@ def workflow_check(name: str, run_id: int, workflow: str = "CI", conclusion: str
                    suite: str | None = None, node_id: str | None = None) -> dict:
     return {**check_run(name, "COMPLETED" if conclusion else "IN_PROGRESS", conclusion), "id": node_id,
             "databaseId": run_id * 10, "startedAt": iso(NOW - 60),
-            "checkSuite": {"conclusion": suite if suite is not None else conclusion,
+            # the suite's id as FakeGitHub's REST check runs give it (their check_suite id is the run's)
+            "checkSuite": {"conclusion": suite if suite is not None else conclusion, "databaseId": run_id,
                            "workflowRun": {"databaseId": run_id, "workflow": {"name": workflow, "databaseId": {"CI": 77, "Lint": 78}[workflow]}}}}
 
 
