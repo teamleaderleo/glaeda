@@ -1272,7 +1272,10 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     if ours and configured and not github_listed and isinstance(getattr(ctx, "github_labels", None), str):
         # the minis hold no gh login (or one that cannot list runners): the fleet read GitHub's labels with its own
         # and passed them. Without them, every apply re-registered each idle runner in place (the token path
-        # below) whatever its labels were.
+        # below) whatever its labels were. The flag carries no name, so what ties the reading to this runner is
+        # that a run whose name is not this install's own is refused before here (receipt_conflict: "this Mac
+        # already has a runner install"); the fleet passes no --name and reads for the name it derives the same
+        # way. A reading from a lookup here carries an id and is checked against the receipt's below.
         github_listed, github_found = True, {"labels": sorted({label.strip() for label in ctx.github_labels.split(",")
                                                               if label.strip()})}
     # This install registered that name before and lost its local .runner (an interrupted relabel):
@@ -1328,7 +1331,14 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         # hq#16433: the one authoritative reading of this runner's labels in the whole plan. apply_install records
         # it in the receipt whatever it does about the rest of this action, so the gate stops reasoning from a
         # receipt that only ever held what some earlier apply *asked* for.
-        reg["githubLabels"] = sorted(github_found["labels"])
+        found_id = github_found.get("id")
+        if found_id is not None and registered.get("runnerId") not in (None, found_id):
+            # the name now resolves to a registration this install never made (another machine took the name, or a
+            # hand re-register): those are some other runner's labels, and recording them would have this gate keep
+            # room for work it can never be handed. Overstating is the one direction a receipt must never drift.
+            reg["githubLabelsIgnored"] = {"id": found_id, "receiptRunnerId": registered.get("runnerId")}
+        else:
+            reg["githubLabels"] = sorted(github_found["labels"])
     drifts = []
     if ours and configured and had is not None:
         drifts.append(label_drift("receipt", had, ctx.labels))
@@ -1885,9 +1895,10 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         if not isinstance(reg_doc, dict) or not reg_doc.get("owned"):
             continue  # no registration of ours to correct; the create and adopt paths below write the whole one
         observed = list(act["githubLabels"])
-        if reg_doc.get("labels") != observed or reg_doc.get("labelsSource") != "github":
-            reg_doc.update(labels=observed, labelsSource="github", labelsObservedAt=utc_now())
-            act["receiptLabels"] = observed
+        # stamped on every confirming read, not only a changing one: the whole receipt is rewritten each apply
+        # anyway, and a reader of labelsObservedAt must be able to tell how fresh the reading is.
+        reg_doc.update(labels=observed, labelsSource="github", labelsObservedAt=utc_now())
+        act["receiptLabels"] = observed
     for act in actions:
         act.setdefault("applied", False)
         if failed:
@@ -1931,7 +1942,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                                                "runnerId": act.get("runnerId"), "owned": True}
                 act["state"] = "updated"
         elif kind == "register" and state == "unchanged" and not receipt_doc.get("registration"):
-            adopted = adopt_registration(ctx)
+            adopted = adopt_registration(ctx, act.get("githubLabels"))
             if adopted:
                 receipt_doc["registration"] = adopted
                 act["note"] = "adopted the registration an interrupted --apply finished in this directory"
@@ -2031,16 +2042,22 @@ def local_runner(ctx: Context) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
-def adopt_registration(ctx: Context) -> dict[str, Any] | None:
+def adopt_registration(ctx: Context, github_labels: list[str] | None = None) -> dict[str, Any] | None:
     """An earlier --apply timed out while config.sh kept going and registered anyway. Only called for
-    a directory this command owns (marker + receipt), and only for the exact name and scope asked for."""
+    a directory this command owns (marker + receipt), and only for the exact name and scope asked for.
+    github_labels: this plan's reading of what GitHub holds for it (hq#16433). Without one, ctx.labels is what
+    this run would *ask* for - the manifest or hostname default - which can be a superset of the labels that
+    interrupted register actually got, so the receipt says which of the two it holds."""
     local = local_runner(ctx)
     if not local or local.get("agentName") != ctx.name:
         return None
     if str(local.get("gitHubUrl") or "").rstrip("/").lower() != ctx.scope_url.lower():
         return None
+    observed = sorted(github_labels) if github_labels else None
     return {"owned": True, "scope": ctx.org or ctx.repo, "org": bool(ctx.org), "name": ctx.name,
-            "labels": ctx.labels, "runnerId": local.get("agentId"), "adopted": True}
+            "labels": observed or ctx.labels, "labelsSource": "github" if observed else "requested",
+            **({"labelsObservedAt": utc_now()} if observed else {}),  # only a GitHub reading has an observed time
+            "runnerId": local.get("agentId"), "adopted": True}
 
 
 def verify_local(ctx: Context, act: dict[str, Any], wait: bool) -> None:

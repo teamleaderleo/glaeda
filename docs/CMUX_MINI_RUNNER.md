@@ -972,6 +972,27 @@ passes neither `--labels` nor `--manifest` keeps the labels and name it register
 and never relabels. If `--replace` itself was interrupted after GitHub assigned the
 new id, the id check blocks; pass `--replace` to take the name back.
 
+**What `registration.labels` means** (hq#16433). It used to hold what some earlier
+apply *asked* GitHub for, which only a successful relabel rewrote: once GitHub held a
+newer set, every later pass read GitHub, found nothing to do (an `unchanged` register
+writes a registration only when there is none) and left the receipt understating the
+runner for good. The gate reads exactly these labels (`cap_labels`) and drops every
+feed job whose labels they do not cover, so an understating receipt hides takeable
+jobs. Now, whenever a plan read GitHub's own labels for this runner, `--apply` records
+that reading - including when the relabel it wanted is blocked (the runner is mid-job)
+or fails - and two fields say what the set is:
+
+- `labelsSource`: `github` (read from GitHub for this runner), `registered` (what a
+  register or relabel of ours just got), or `requested` (an adopted registration no
+  reading covered: the manifest or hostname default, which can overstate it).
+- `labelsObservedAt`: when that reading was taken, stamped on every confirming pass.
+
+A reading is recorded only when the registration behind it is the one this receipt
+made: `lookup_runner` finds a runner by name, so a name that now carries a different
+id leaves the receipt alone and the plan says `githubLabelsIgnored`. Overstating is the
+one direction a receipt must never drift - claiming a label GitHub does not hold has
+the gate keep room for work this runner can never be handed.
+
 The plan names every label drift on the register step: `label drift (receipt)` or
 `label drift (GitHub)`, "registered labels differ from what this version would
 register: +added -removed". A re-run without `--manifest` still reports GitHub drift,

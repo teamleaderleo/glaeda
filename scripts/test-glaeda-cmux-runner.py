@@ -16507,6 +16507,26 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
         self.assertFalse(runner.exists())
 
+    def test_an_adopted_registration_records_github_labels_not_the_ones_this_run_would_ask_for(self) -> None:
+        # config.sh outlived our timeout, so the receipt holds no registration and the next pass adopts the one on
+        # disk. ctx.labels there is what this run *would* register - the manifest or hostname default - which can be
+        # a superset of what the interrupted config.sh actually got, so the adopted receipt would overstate the
+        # runner (hq#16433). This plan read GitHub for it; the adoption records that reading instead.
+        with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
+                subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
+                               capture_output=True, check=False), (127, "timed out after 900 seconds"))[1]):
+            self.invoke("--apply", expect=1)
+        runners = json.loads((self.state / "runners.json").read_text())
+        held = sorted({label["name"] for label in runners["runners"][0]["labels"]} | {"glaeda-side-std"})
+        runners["runners"][0]["labels"] = [{"name": name} for name in held]  # not a set this run would ask for
+        (self.state / "runners.json").write_text(json.dumps(runners))
+        second = self.invoke("--apply")
+        self.assertIn("adopted", self.by_kind(second)["register"]["note"])
+        reg = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())["registration"]
+        self.assertEqual(reg["labels"], held, "what GitHub holds for it, not what this run would have asked for")
+        self.assertEqual(reg["labelsSource"], "github")
+        self.assertTrue(reg["labelsObservedAt"], "stamped, so a reader can tell how fresh the reading is")
+
     def test_uninstall_deregisters_an_unadopted_interrupted_registration(self) -> None:
         with mock.patch.object(cr, "run_with_token", side_effect=lambda argv, token, cwd, timeout=900: (
                 subprocess.run(argv, env={**os.environ, "ACTIONS_RUNNER_INPUT_TOKEN": token}, cwd=cwd,
@@ -17435,6 +17455,47 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(on_disk["labels"], ["ARM64", "glaeda-extra", "glaeda-mini", "macOS", "self-hosted"],
                          "a blocked relabel still records what GitHub holds today")
         self.assertEqual(on_disk["labelsSource"], "github")
+
+    def test_a_name_that_now_points_at_another_registration_never_rewrites_our_labels(self) -> None:
+        # Overstating is the one direction a receipt must never drift: a receipt claiming a label GitHub does not
+        # hold has the gate keep room for work this runner can never be handed. lookup_runner finds a runner by
+        # name, and a name can move (another machine registered it, an operator re-registered it by hand), so the
+        # reading is recorded only when the registration behind it is the one this receipt made.
+        receipt_path = self.home / ".local/state/glaeda/cmux-runner/receipt.json"
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            ours = json.loads(receipt_path.read_text())["registration"]
+            held = sorted(ours["labels"])
+            runners = json.loads((self.state / "runners.json").read_text())
+            runners["runners"][0]["id"] = ours["runnerId"] + 1000  # a registration this install never made
+            runners["runners"][0]["labels"] = [{"name": name} for name in
+                                               ("self-hosted", "glaeda-mini", "glaeda-ios-sim")]
+            (self.state / "runners.json").write_text(json.dumps(runners))
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(plan)["register"]
+        self.assertNotIn("githubLabels", register, "another runner's labels are never recorded as ours")
+        self.assertEqual(register["githubLabelsIgnored"],
+                         {"id": ours["runnerId"] + 1000, "receiptRunnerId": ours["runnerId"]})
+        self.assertEqual(sorted(json.loads(receipt_path.read_text())["registration"]["labels"]), held,
+                         "the receipt keeps the labels of the registration it does own")
+
+    def test_a_name_that_is_not_this_installs_own_never_reaches_a_label_reading(self) -> None:
+        # --github-labels carries no name: it is the reading glaeda-cmux-runner-fleet took for the name it derived
+        # itself, so nothing in the flag proves it describes the runner this run is about. What pins it is this
+        # refusal - a run naming a runner other than the one installed here stops at the receipt, before any label
+        # is planned or recorded. Asserted here so the assumption the recording rests on cannot be loosened quietly.
+        real_which = cr.which
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            labels = ",".join(first["registration"]["labels"])
+            with mock.patch.object(cr, "which",
+                                   lambda name, extra=(): None if name == "gh" else real_which(name, extra)):
+                plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std",
+                                   "--name", "someone-elses-runner", "--github-labels", labels, gh=False)
+        kinds = self.by_kind(plan)
+        self.assertEqual(kinds["receipt"]["state"], "blocked")
+        self.assertIn("this Mac already has a runner install", kinds["receipt"]["note"])
+        self.assertNotIn("register", kinds, "no register action, so no reading of another name's labels")
 
     def test_manifest_blocks_when_github_labels_cannot_be_read(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
