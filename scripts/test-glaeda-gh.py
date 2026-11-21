@@ -21243,6 +21243,7 @@ class LandWorld:
     def __init__(self, tmp: str) -> None:
         self.cache: dict[str, dict] = {}
         self.answers: list[tuple[int, dict]] = []
+        self.cache_answers = False  # a `explain --cache-only` takes the next queued answer (else: a cache miss)
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
         self.gh_rc: dict[str, int] = {}
@@ -21289,6 +21290,12 @@ class LandWorld:
         if self.raise_on and self.raise_on in " ".join(argv):
             raise LandCrash(argv)
         if argv[1:3] == [self.mh, "explain"]:
+            if "--cache-only" in argv and not self.cache_answers:
+                # the caches hold nothing here unless a test queues the cache-only answer itself (cache_answers):
+                # an unreadable answer's cache-first judgment (LAND_UNREAD_SAME_STOP) misses, as on a cold host
+                doc = {"ok": False, "code": "unreadable", "reason": "cache-only: not held in this host's caches",
+                       "cacheOnly": True, "cacheMiss": True}
+                return subprocess.CompletedProcess(argv, 3, json.dumps(doc) + "\n", "")
             rc, doc = self.answers.pop(0)
             if "--cache-only" in argv:  # as merge_hold marks a cache-only answer (its explain_main)
                 doc = {**doc, "cacheOnly": True,

@@ -10748,6 +10748,21 @@ LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a ju
 # never completes stops retry_deadline at LAND_UNREAD_DEADLINE, and re-arms (LAND_REARM_*) as before.
 LAND_UNREAD_DEADLINE = 6 * 3600.0
 LAND_UNREAD_CODES = frozenset({"unreadable"})
+# An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
+# read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
+# (`explain --cache-only`, no read sent, no broker queue waited on); only a cache miss goes live, on the pass after.
+# And the same unreadable text (digits aside) LAND_UNREAD_SAME_STOP times in a row at one head stops the entry with
+# that text named to its requester, instead of retrying it for LAND_UNREAD_DEADLINE. gcp-agent-lane-1, 2026-11-21
+# 18:05-20:05Z: 26 of 38 judgments ended "unreadable"/retry, one judgment held its worker 3+ min on one broker read,
+# and cmux#49035 was judged unreadable 5+ times (16:11-19:12Z) on one base_red_excuse.py GraphQL RuntimeError.
+LAND_UNREAD_SAME_STOP = 3
+# Only a read that failed for a reason of its own counts toward that stop: a raised error (a traceback, a
+# RuntimeError) that is no timeout or wait. A read that timed out or waited (a broker queue, a rate limit, a verdict
+# not published yet) is the world's state, not the read's, and still retries to LAND_UNREAD_DEADLINE (cmux#46754: the
+# live webview-verdict read "took over 40 s" each time, then read).
+LAND_UNREAD_RAISED = re.compile(r"Traceback|\b\w*(?:Error|Exception)\b")
+LAND_UNREAD_TRANSIENT = re.compile(r"timed? ?out|timeout|took over|deadline|retry after|rate.?limit|secondary|queued|"
+                                   r"busy|not published|cache-only", re.I)
 # A train_wait (another PR's merge-train reservation holds the base for a file this one changes) is a retry land_judge
 # itself bounds: the reservation lives TRAIN_HOLD_S (1.5 h) from the holder's head, under the retry's 2 h. So its budget
 # is the reservation's, keyed on the holder and its head: a new holder head is a new reservation and a new budget. Keyed
@@ -11018,12 +11033,16 @@ LAND_LATCH_STARVED_WINDOWS = 2
 # empty within ~8 minutes of every reset.
 LAND_RESET_JUDGES_PER_MIN = 2
 LAND_RESET_STAGGER_S = 3600.0
-# The host's cap on judgments per quota window (LandQueue.window_room): each judgment is charged LAND_JUDGE_COST of
-# each pool, and a window's judgments spend at most land.json "windowShare" (else LAND_WINDOW_SHARE) of each pool's
-# LAND_POOL, REST and GraphQL counted apart, however many entries wait. Within a window the cap opens in step with the
-# clock (LAND_WINDOW_RAMP ahead of it), so the reset's first minutes get a slice, not the whole window. A window starts
-# at the login latch's clear (its reset) or, with none, at the first judgment past the last window's end. An entry the
-# cap leaves out keeps its place (judge_order) and says so (land_line: "not judged this window: host cap"). Measured
+# The host's pace of judgments (LandQueue.window_room): each judgment is charged LAND_JUDGE_COST of each pool, and the
+# pace comes from GitHub's own live count of the login (the land queue's reading: /rate_limit, free): what is left over
+# the pool's hard reserve (hard_reserve_floor), spread evenly over the time to its reset. A judgment starts when the
+# last one charged to that pool is at least cost / pace ago, and none starts while what is left is under one judgment's
+# cost. So the spend follows the login's real state, never a fixed share: the share this replaced (land.json
+# "windowShare", else 0.05 GraphQL and 0.10 REST of a fixed 5000 an hour, ramped over 10 min) held 54 of 72 waiting
+# lands on huge-blue at 2026-11-21 20:05Z "not judged this window: host cap (graphql)" with 1107 GraphQL points left on
+# the login. With no fresh reading (a lane-gh broker client, a refused /rate_limit) a pool is unpaced: the login's
+# latch, the queue park and the shim's own refusal are what is measured there. An entry the pace leaves out keeps its
+# place (judge_order) and says so (land_line: "not judged this window: host cap"). Measured
 # on the broker client gcp-agent-lane-1 from gh-quota's calls.jsonl: one judgment sent about 5 calls, 2-3 of them
 # GraphQL-shaped (`pr view`, `api graphql`; 01:38-01:48Z 2026-11-20: 116 over ~23 judgments, 44 GraphQL; 22:38-22:50Z
 # 2026-11-19: 517 over ~63, 217 GraphQL), and the queue sent 135 calls in the ten minutes after the 01:38Z reset with
@@ -11036,11 +11055,8 @@ LAND_RESET_STAGGER_S = 3600.0
 # The coordinator, 2026-11-20: right after the GraphQL reset glaeda land held PRs "not judged this window: host cap
 # (graphql)" while their verdict was a cache read away (cmux#46128, #46236, #46782 had sat 6 h on unreadable reads).
 LAND_CACHE_ONLY_MAX_AGE = 900  # merge_hold's own --cache-only bound (its CACHE_ONLY_MAX_S)
-LAND_POOL = 5000.0  # each pool per login per hour (REST core, GraphQL points)
 LAND_JUDGE_COST = {"rest": 5.0, "graphql": 3.0}
-LAND_WINDOW_SHARE = {"rest": 0.10, "graphql": 0.05}
 LAND_WINDOW_S = 3600.0
-LAND_WINDOW_RAMP = 600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
@@ -12982,16 +12998,18 @@ class LandQueue:
             self.save(e)
         return True
 
-    def window_shares(self) -> dict[str, float]:
-        """land.json "windowShare" ({"rest": r, "graphql": g}, each 0..1; 0 leaves that pool uncapped), else
-        LAND_WINDOW_SHARE."""
-        given = self.config().get("windowShare")
-        out = dict(LAND_WINDOW_SHARE)
-        if isinstance(given, dict):
-            for pool, value in given.items():
-                if pool in out and isinstance(value, (int, float)) and not isinstance(value, bool):
-                    out[pool] = min(1.0, max(0.0, float(value)))
-        return out
+    def pace_next(self, pool: str, w: dict) -> tuple[float, dict | None] | None:
+        """When POOL's next judgment may start under the login's live count (the pace comment above LAND_JUDGE_COST),
+        and the reading it came from; None when the pool is unpaced (no fresh reading)."""
+        seen = self.reading(pool) if self.reading is not None else None
+        if land_reading_state(seen, None, self.now) != "fresh":
+            return None
+        cost = LAND_JUDGE_COST[pool]
+        spendable = float(seen["remaining"]) - hard_reserve_floor()[pool]
+        if spendable < cost:
+            return float(seen["reset"]), seen  # spent to the reserve: the next judgment after the reset
+        gap = cost * max(0.0, float(seen["reset"]) - self.now) / spendable
+        return float(w.get(f"{pool}At", float("-inf"))) + gap, seen
 
     def window_now(self) -> dict[str, float]:
         """This quota window's record ({"start", "rest", "graphql"}: what its judgments were charged), kept in the land
@@ -12999,40 +13017,56 @@ class LandQueue:
         or, once LAND_WINDOW_S has passed, now."""
         if self.window is None:
             doc = read_json(land_dir() / "window.json")
-            self.window = {k: float(doc.get(k) or 0.0) for k in ("start", "rest", "graphql")} \
-                if isinstance(doc, dict) else {"start": float("-inf"), "rest": 0.0, "graphql": 0.0}
+            self.window = {k: float(doc[k]) for k in ("start", "rest", "graphql", "restAt", "graphqlAt")
+                           if isinstance(doc.get(k), (int, float)) and not isinstance(doc.get(k), bool)} \
+                if isinstance(doc, dict) else {}
+            self.window.setdefault("start", float("-inf"))
         w = self.window
+        last = {k: w[k] for k in ("restAt", "graphqlAt") if k in w}  # the pace's clock outlives a window
         if self.latch_cleared > w["start"] and self.latch_cleared <= self.now:
-            self.window = w = {"start": self.latch_cleared, "rest": 0.0, "graphql": 0.0}
+            self.window = w = {"start": self.latch_cleared, "rest": 0.0, "graphql": 0.0, **last}
         elif self.now >= w["start"] + LAND_WINDOW_S:
-            self.window = w = {"start": self.now, "rest": 0.0, "graphql": 0.0}
+            self.window = w = {"start": self.now, "rest": 0.0, "graphql": 0.0, **last}
+        w.setdefault("rest", 0.0)
+        w.setdefault("graphql", 0.0)
         return w
 
     def window_room(self, e: dict) -> bool:
-        """Whether one more judgment fits this window's share of every capped pool (LAND_WINDOW_SHARE's comment), the
-        share opened in step with the clock. Left out: noted once per window in E's history, its status says when the
-        next window opens, counted in the pass's land-pool line ("capped")."""
+        """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
+        out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
+        read, counted in the pass's land-pool line ("capped")."""
         w = self.window_now()
-        opened = min(1.0, (self.now - w["start"] + LAND_WINDOW_RAMP) / LAND_WINDOW_S)
-        over = [pool for pool, share in self.window_shares().items()
-                if share and w[pool] + LAND_JUDGE_COST[pool] > share * LAND_POOL * opened]
+        nexts = {pool: self.pace_next(pool, w) for pool in LAND_JUDGE_COST}
+        over = [pool for pool, got in nexts.items() if got is not None and got[0] > self.now]
         e.pop("cacheOnlyJudge", None)
+        e.pop("paceNext", None)
+        first = e.pop("unreadCacheFirst", None)
+        if first is not None and not over:
+            # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
+            e["cacheOnlyJudge"] = "unread"
+            return True
         if not over:
             return True
         pool = over[0]
-        if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == w["start"]:
-            # Only GraphQL is capped: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
-            # One that missed already this window waits for the next, as any capped entry does.
-            e["cacheOnlyJudge"] = w["start"]
+        slot = float(w.get("graphqlAt", float("-inf")))
+        nxt, seen = nexts[pool]
+        if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == slot:
+            # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
+            # One that missed already in this slot waits for the next, as any capped entry does.
+            e["cacheOnlyJudge"] = slot
+            e["paceNext"] = nxt
             return True
         self.pass_capped += 1
         # Held by the cap from here to its judgment: not counted toward its wait's deadline (LAND_WAIT_HELD), as a
         # latch or a quota park is. Router review of glaeda#2244, F1: a 200-entry simulation stopped an "unreadable"
         # entry after four judgments over 25,470 s although its retries asked for 420 s, the rest waiting its turn.
         e.setdefault("cappedSince", self.now)
-        if float((e.get("windowCapped") or {}).get("start") or float("-inf")) != w["start"]:
-            e["windowCapped"] = {"start": w["start"], "at": self.now, "pool": pool, "next": w["start"] + LAND_WINDOW_S}
-            self.history(e, "window_capped", pool=pool, spent=round(w[pool]), next=utc_clock(w["start"] + LAND_WINDOW_S))
+        stamp = float(w.get(f"{pool}At", float("-inf")))
+        if float((e.get("windowCapped") or {}).get("start") or float("-inf")) != stamp:
+            e["windowCapped"] = {"start": stamp, "at": self.now, "pool": pool, "next": nxt,
+                                 "remaining": (seen or {}).get("remaining"), "reset": (seen or {}).get("reset")}
+            self.history(e, "window_capped", pool=pool, spent=round(w[pool]), next=utc_clock(nxt),
+                         remaining=(seen or {}).get("remaining"))
             self.save(e)
         return False
 
@@ -13040,8 +13074,10 @@ class LandQueue:
         """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk; a cache-only judgment
         (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
-        for pool, cost in LAND_JUDGE_COST.items():
-            w[pool] += 0.0 if e.get("cacheOnlyJudge") == w["start"] else cost
+        if not isinstance(e.get("cacheOnlyJudge"), float):  # a pace slot's cache-only judgment sends nothing
+            for pool, cost in LAND_JUDGE_COST.items():
+                w[pool] += cost
+                w[f"{pool}At"] = self.now
         e.pop("windowCapped", None)
         write_json(land_dir() / "window.json", w)
 
@@ -13720,8 +13756,13 @@ class LandQueue:
         argv = [self.path("python", Path(sys.executable)).as_posix(), os.fspath(mh),
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
         cache_only = e.pop("cacheOnlyJudge", None)
-        if cache_only is not None:
-            argv += ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]  # GraphQL's share is spent this window
+        pace_next = e.pop("paceNext", None)
+        cached = argv + ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]
+        # After an unreadable answer: the caches first, live only on a miss (LAND_UNREAD_SAME_STOP's comment); paced out
+        # of GraphQL: the caches alone (the comment above LAND_JUDGE_COST)
+        tries = [cached, argv] if cache_only == "unread" else [cached] if cache_only is not None else [argv]
+        if cache_only == "unread":
+            cache_only = None
         snap, _ = self.snapshot(e["key"], sha)
         extra = {}
         if snap is not None:
@@ -13735,34 +13776,46 @@ class LandQueue:
                 extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
         with self.lock:
             self.count("snapshot" if extra else "live")
-        got = self.call(argv, LAND_EXPLAIN_DEADLINE, extra=extra)
-        answer = None
-        for line in reversed((got.stdout or "").strip().splitlines()):
-            with contextlib.suppress(ValueError):
-                doc = json.loads(line)
-                if isinstance(doc, dict):
-                    answer = doc
-                    break
-        if answer is None or got.returncode not in (0, 1, 3):
-            why = land_reason(got.stderr or got.stdout or f"exit {got.returncode}")
-            return {"ok": False, "code": "explain_failed", "reason": f"land_judge explain exit {got.returncode}: {why}",
-                    "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
-        if got.returncode != 0:
-            answer["ok"] = False
+        for n, run_argv in enumerate(tries):
+            got = self.call(run_argv, LAND_EXPLAIN_DEADLINE, extra=extra)
+            answer = None
+            for line in reversed((got.stdout or "").strip().splitlines()):
+                with contextlib.suppress(ValueError):
+                    doc = json.loads(line)
+                    if isinstance(doc, dict):
+                        answer = doc
+                        break
+            if answer is None or got.returncode not in (0, 1, 3):
+                why = land_reason(got.stderr or got.stdout or f"exit {got.returncode}")
+                return {"ok": False, "code": "explain_failed",
+                        "reason": f"land_judge explain exit {got.returncode}: {why}",
+                        "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
+            if got.returncode != 0:
+                answer["ok"] = False
+            if n + 1 < len(tries) and answer.get("cacheMiss") \
+                    and not LAND_STEP_QUOTA.search(str(answer.get("reason") or "")):
+                with self.lock:
+                    self.count("unread_cache_miss")  # the caches could not judge it: read live now
+                continue
+            if n + 1 < len(tries):
+                with self.lock:
+                    self.count("unread_cache_hit")  # judged from the caches: no read sent, no broker queue waited on
+            break
         if cache_only is not None and answer.get("cacheMiss") \
                 and not LAND_STEP_QUOTA.search(str(answer.get("reason") or "")):  # a quota refusal parks as before
-            # The caches could not judge it: it keeps its place under the cap until the next window, no strike, and
+            # The caches could not judge it: it keeps its place under the cap until the pace's next slot, no strike, and
             # the time it waits there is not counted toward its wait's deadline (cappedSince, LAND_WAIT_HELD).
-            nxt = float(cache_only) + LAND_WINDOW_S
+            nxt = float(pace_next) if isinstance(pace_next, (int, float)) else self.now + LAND_RETRY_DEFAULT
             with self.lock:
                 e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now}
                 e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt}
                 e.setdefault("cappedSince", self.now)
                 self.history(e, "window_capped", pool="graphql", cacheOnly="miss", next=utc_clock(nxt))
             return {"ok": False, "code": "host_cap", "head": sha, "cacheMiss": True,
-                    "reason": f"not judged this window: host cap (graphql), and this host's caches could not judge it "
+                    "reason": f"not judged this window: host cap (graphql: the login's live pace), and this host's "
+                              f"caches could not judge it "
                               f"({land_reason(answer.get('reason'), 200)})",
-                    "next": f"none (judged again once the next window opens at {utc_clock(nxt)})",
+                    "next": f"none (judged again once the pace's next slot opens at {utc_clock(nxt)})",
                     "action": {"v": 1, "kind": "retry", "after_s": max(LAND_RETRY_DEFAULT, nxt - self.now)}}
         return answer
 
@@ -13844,6 +13897,8 @@ class LandQueue:
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            if self.unread_repeated(e, answer, head):
+                return
             if answer.get("ok") or act.get("kind") in LAND_WAIT_KINDS:
                 # A wait on the checks (bounded on its own: checks_stuck) between two waits gives the next its whole
                 # deadline. Any other step between keeps the budget: a fetch, repin, review or retarget is bounded by
@@ -13873,6 +13928,34 @@ class LandQueue:
                 return
             self.save(e)
         self.take(e, act, answer)
+
+    def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
+        """Under the lock, for each judged answer (LAND_UNREAD_SAME_STOP's comment): an "unreadable" one counts its
+        text in a row at HEAD and sends the next judgment to the caches first (unreadCacheFirst); the run's
+        LAND_UNREAD_SAME_STOP-th stops E naming the read, and True. A cache-only answer keeps the run as it is; any
+        other answer ends it."""
+        code = str(answer.get("code") or "")
+        if answer.get("cacheOnly"):
+            return False
+        if code not in LAND_UNREAD_CODES:
+            e.pop("unreadRun", None)
+            e.pop("unreadCacheFirst", None)
+            return False
+        text = land_reason(answer.get("reason"), 200)
+        same = re.sub(r"\d+", "#", text)
+        run = e.get("unreadRun") or {}
+        n = int(run.get("count") or 0) + 1 if run.get("text") == same and run.get("head") == head else 1
+        e["unreadRun"] = {"text": same, "head": head, "count": n}
+        raised = bool(LAND_UNREAD_RAISED.search(text)) and not LAND_UNREAD_TRANSIENT.search(text)
+        if n < LAND_UNREAD_SAME_STOP or not raised:
+            if str((answer.get("action") or {}).get("kind") or "retry") == "retry":
+                e["unreadCacheFirst"] = head  # a step it names (a fetch) is work: run as named
+            return False
+        e.pop("unreadCacheFirst", None)
+        self.stop(e, "unreadable_repeated", f"the same read could not complete {n} times in a row at "
+                  f"{head[:12]}: {text}", land_trim(answer.get("next")) or
+                  f"fix the read it names, then glaeda-gh land {e['repo']}#{e['number']}")
+        return True
 
     def streak(self, e: dict, sig: str, retry: bool = False, counts: bool = True) -> bool:
         """Count one refusal; True when it is the one that stops the entry. COUNTS false: the same refusal again
@@ -14730,8 +14813,8 @@ class LandQueue:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
                  stop={"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now})
-        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing
-            e.pop(held, None)
+        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun"):
+            e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160))
         self.save(e)
         msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
@@ -14961,8 +15044,11 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
                     f"{utc_clock(float(held.get('dueSince') or 0))})")
     elif (e.get("windowCapped") or {}) and e["state"] in ("queued", "waiting") \
             and float(e["windowCapped"].get("next") or 0) > now:
-        bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
-                    f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
+        wc = e["windowCapped"]
+        left = f": {wc['remaining']} left, resets {time.strftime('%H:%MZ', time.gmtime(float(wc['reset'])))}" \
+            if isinstance(wc.get("remaining"), int) and isinstance(wc.get("reset"), (int, float)) else ""
+        bits.append(f"not judged this window: host cap ({wc.get('pool')}{left}; next slot "
+                    f"{time.strftime('%H:%M:%SZ', time.gmtime(float(wc['next'])))})")
     elif queue and land_due_now(e, now) and not (w.get("kind") == "quota" and e["state"] == "waiting"):
         # Only a row the park actually holds: a row whose own wake is still ahead waits for that wake, park or no
         # park, and saying it is held by the park read as the park being why it had not moved (18 such lines on
