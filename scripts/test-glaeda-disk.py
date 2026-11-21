@@ -15555,6 +15555,23 @@ class OwnedElsewhereTest(unittest.TestCase):
         self.assertIn("apply:   python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py pressure", text)
         self.assertTrue(all(p.exists() for p in self.store.iterdir()))  # report only
 
+    def test_a_pass_skipped_for_the_lock_says_it_did_not_run_beside_the_last_that_ran(self) -> None:
+        log = self.home / gd.WORKTREE_RECLAIM_STATE_REL / "log.jsonl"
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"kind": "summary", "mode": "pressure", "at": "2026-11-21T21:40:00+0000",
+                                 "skipped": "locked", "ran": False,
+                                 "why": "did not run: the cleaner lock is held by pid 7 (disk_hygiene.py run)"}) + "\n")
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("worktree_reclaim's last attempt: pressure at 2026-11-21T21:40:00+0000 did not run (did not run: "
+                      "the cleaner lock is held by pid 7 (disk_hygiene.py run)); the last pass that ran: pressure at "
+                      "2026-11-18T19:51:33+0000, freed 0.0 GB", text)
+        self.assertNotIn("(locked)", text)
+        log.write_text(json.dumps({"kind": "summary", "mode": "pressure", "at": "T", "skipped": "locked"}) + "\n")
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("did not run (skipped: locked); no pass that ran in the log's last 1 MiB", text)
+
     def test_an_unreadable_session_list_is_named_not_guessed(self) -> None:
         gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 3: no daemon"
         self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
