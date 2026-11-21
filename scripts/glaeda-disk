@@ -11392,6 +11392,52 @@ def runner_floor_gib(home: Path = HOME) -> float:
     return floor
 
 
+# QUEUED_WANT (Leo, 2026-11-21: "man glaeda needs to be more aggressive... again!"; the ask: work "against a target
+# free figure derived from the queued jobs' min_free_bytes, not a hand-set floor"). The build-fleet worker, while it
+# is paused for disk with a job it could take but for disk, keeps capacity/fleet-disk.want-<pid> fresh with the
+# controller's disk_wanted_bytes for this host (cmux-fleet-disk-want/v1: since, want_bytes, free_bytes, who; the
+# runner hook's FLEET_DISK_WANT reads the same marker). A pressure pass raises every volume's low and target to that
+# want plus the policy margins, so it frees what the queued job needs instead of stopping at the hand-set policy
+# target. Markers are written by another account and read as untrusted: a stale one (QUEUED_WANT_FRESH_S) or one
+# whose worker is gone is no want.
+QUEUED_WANT_PREFIX = "fleet-disk.want-"
+QUEUED_WANT_FRESH_S = 180.0
+
+
+def queued_disk_want(capacity_dir: Path | None = None, now: float | None = None) -> int:
+    """The largest live queued-job disk want on this host (bytes), or 0."""
+    capacity_dir = FLEET_DIR / "capacity" if capacity_dir is None else capacity_dir
+    now = time.time() if now is None else now
+    best = 0
+    try:
+        markers = list(capacity_dir.glob(f"{QUEUED_WANT_PREFIX}*"))
+    except OSError:
+        return 0
+    for marker in markers:
+        if marker.name.endswith(".tmp"):
+            continue
+        try:
+            pid = int(marker.name[len(QUEUED_WANT_PREFIX):])
+            st = marker.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 64 * 1024 or now - st.st_mtime >= QUEUED_WANT_FRESH_S:
+                continue
+            if not 0 < pid < 2 ** 31:
+                continue
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # another account's live worker
+        except (OSError, ValueError):
+            continue
+        try:
+            want = json.loads(marker.read_text()).get("want_bytes")
+            if isinstance(want, bool) or not isinstance(want, int) or want <= 0 or want > 1 << 50:
+                continue
+        except (OSError, ValueError, AttributeError, RecursionError, UnicodeDecodeError):
+            continue
+        best = max(best, want)
+    return best
+
+
 # A fleet reservation hands a host to one person for a while. On a reserved fleet mini only floor-pressure eviction
 # runs: no idle sweep, and a pressure run acts only below the runner floor and works only back to the floor plus
 # target_margin_gib, so state its holder keeps idle is not aged out. The list is never part of this repository: the
@@ -15776,6 +15822,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 budget_base[dev] = (fs.low, fs.target)
                 fss[dev] = replace(fs, low=max(fs.low, fs.free + 1), target=max(fs.target, fs.free + row["over"]))
         BUDGET_WARM_DEVS = frozenset(budget_base)
+    # QUEUED_WANT: a queued job's disk want raises the volumes' low and target (never lowers them)
+    if (a.pressure and ROLE == "fleet-mini" and DARWIN and not RUNNER_CACHE_PROFILE and not reserved
+            and not a.family and a.need is None and not a.cmux_next_drain and not a.root_override):
+        want = queued_disk_want()
+        if want > 0:
+            RUN["queued_want_bytes"] = want
+            low_want = want + int(POLICY["low_margin_gib"] * GIB)
+            target_want = want + int(POLICY["target_margin_gib"] * GIB)
+            for dev, fs in list(fss.items()):
+                if fs.tmpfs:
+                    continue
+                cap = fs.total - GIB  # a want above the volume is met by nothing; aim at all of it
+                fss[dev] = replace(fs, low=max(fs.low, min(low_want, cap)), target=max(fs.target, min(target_want, cap)))
+            print(f"queued job wants {gib(want).strip()} free: target raised to it plus "
+                  f"{POLICY['target_margin_gib']:g} GiB")
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)

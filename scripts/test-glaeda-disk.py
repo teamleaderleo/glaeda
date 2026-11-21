@@ -15321,5 +15321,36 @@ class OwnedElsewhereTest(unittest.TestCase):
         self.assertIn("cannot stat", gd.unreadable_why(str(self.home / "gone")))
 
 
+
+class QueuedDiskWantTest(unittest.TestCase):
+    """QUEUED_WANT: the fleet worker's live fleet-disk.want-<pid> markers set the pressure target."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cap = Path(self.tmp.name)
+
+    def write(self, pid: int, body: object, age: float = 0.0, name: str | None = None) -> Path:
+        marker = self.cap / (name or f"fleet-disk.want-{pid}")
+        marker.write_text(body if isinstance(body, str) else json.dumps(body))
+        if age:
+            at = time.time() - age
+            os.utime(marker, (at, at))
+        return marker
+
+    def test_largest_live_fresh_want(self) -> None:
+        self.write(os.getpid(), {"schema": "cmux-fleet-disk-want/v1", "since": 1, "want_bytes": 30 * gd.GIB})
+        self.write(os.getppid(), {"since": 1, "want_bytes": 50 * gd.GIB})
+        self.assertEqual(gd.queued_disk_want(self.cap), 50 * gd.GIB)
+
+    def test_stale_dead_and_malformed_markers_are_no_want(self) -> None:
+        self.write(os.getpid(), {"since": 1, "want_bytes": 90 * gd.GIB}, age=gd.QUEUED_WANT_FRESH_S + 5)
+        self.write(2 ** 31 - 2, {"since": 1, "want_bytes": 80 * gd.GIB})  # no such process
+        self.write(os.getppid(), {"since": 1, "want_bytes": True})
+        self.write(0, {"want_bytes": 70 * gd.GIB}, name=f"fleet-disk.want-{os.getpid()}.tmp")
+        self.write(0, "not json", name="fleet-disk.want-x")
+        self.assertEqual(gd.queued_disk_want(self.cap), 0)
+        self.assertEqual(gd.queued_disk_want(self.cap / "missing"), 0)
+
 if __name__ == "__main__":
     unittest.main()
