@@ -872,6 +872,50 @@ ISSUE_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pul
 # `origin` as GitHub writes it, for a bare number's repository (cwd_repo)
 REMOTE_RE = re.compile(rf"(?:git@github\.com:|(?:https?://|ssh://git@)github\.com/)({NAME})/({NAME}?)(?:\.git)?/?")
 KEY_RES = {"pr": PR_KEY_RE, "run": RUN_KEY_RE, "comment": ISSUE_KEY_RE, "head": HEAD_RE}
+# `KIND:TARGET` -- the notation this tool *prints* for a target, and so the string an agent copies out of a
+# line and back into the next call. parse_key's output (`pr:owner/repo#5`, `run:owner/repo/123`) names the
+# target in every waiting, still-waiting and summary line, and until 2026-11-21 handing one back was an
+# argparse refusal ("argument kind: invalid choice: 'pr:teamleaderleo/leo-workspace/7241'") that cost a
+# whole background wait: the job printed a usage block and exited having waited on nothing. Accepted
+# everywhere a target is: the prefix carries the kind, so nothing here is a guess across kinds -- a prefix
+# naming a *different* kind than the command's refuses, and names the spellings (drop_kind_prefix).
+PREFIX_KINDS = ("pr", "run", "comment", "head", "file", "pid", "until")
+STATUS_KINDS = ("pr", "run", "comment")  # the kinds `status` takes; `head` is read for a PR, never asked for
+WAIT_KINDS = STATUS_KINDS + ("file", "pid", "until")
+KIND_PREFIX_RE = re.compile(rf"({'|'.join(PREFIX_KINDS)}):\s*(\S.*)", re.I | re.S)
+# The spellings of one target, for a refusal to name. `wait until`'s own targets (`quota:rest`) hold a
+# colon that is not a kind, and a URL's `https:` is not one either: both fall through unchanged.
+KIND_FORMS = {"pr": "OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N, a bare N in this checkout, or a pull request URL",
+              "run": "OWNER/REPO/RUN_ID, OWNER/REPO#RUN_ID, run:OWNER/REPO/RUN_ID, or a run URL",
+              "comment": "OWNER/REPO#N, OWNER/REPO/N, comment:OWNER/REPO#N, a bare N in this checkout, "
+                         "or an issue or pull request URL",
+              "head": "OWNER/REPO@SHA, head:OWNER/REPO@SHA, or a commit URL",
+              "file": "a path, or file:PATH", "pid": "a process id, or pid:PID",
+              "until": "quota, quota:rest, quota:graphql, an ISO time, a UTC time (14:40Z) or a duration (45m)"}
+
+
+def split_kind_prefix(text: str) -> tuple[str, str] | None:
+    """`("pr", "o/r#5")` for `pr:o/r#5`, the notation this tool prints; None when there is no kind prefix."""
+    match = KIND_PREFIX_RE.fullmatch(text.strip())
+    return (match.group(1).lower(), match.group(2).strip()) if match else None
+
+
+def drop_kind_prefix(text: str, kind: str, also: tuple[str, ...] = ()) -> str:
+    """TEXT without the `KIND:` prefix this tool prints for it, for a caller that already knows the kind.
+
+    A prefix naming another kind is never read as this one: `wait pr run:o/r/123` refuses, and says which
+    spellings a pr target has, rather than reading the run id as a pull request number. ALSO names the
+    other prefixes this caller accepts (`post comment pr:o/r#5` posts on that pull request's thread)."""
+    split = split_kind_prefix(text)
+    if split is None:
+        return text.strip()
+    named, rest = split
+    if named == kind or named in also:
+        return rest
+    forms = KIND_FORMS.get(kind, "")
+    raise WatchError(f"{text!r} names a {named} target, but this is a {kind} target: a {kind} is "
+                     f"{forms or 'named by its own form'}"
+                     + (f"; a {named} target goes to a {named} call" if named in PREFIX_KINDS else ""))
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
@@ -1154,8 +1198,9 @@ def cwd_repo(cwd: str | None = None) -> str | None:
 
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
-    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in."""
-    text = text.strip()
+    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
+    and a target already spelled the way this function prints it (`pr:o/r#5`) is taken as it stands."""
+    text = drop_kind_prefix(text, kind)
     bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
     if bare:
         repo = cwd_repo()
@@ -10739,11 +10784,11 @@ def land_config() -> dict:
 
 def land_key(target: str) -> tuple[str, str, int]:
     """(key, OWNER/REPO as typed, N) for OWNER/REPO#N, OWNER/REPO/N, a PR URL, or a bare N in the repository
-    the caller stands in (parse_key reads both of the loose forms)."""
-    text = target.strip()
+    the caller stands in (parse_key reads both of the loose forms), or `pr:OWNER/REPO#N` as this tool prints it."""
+    text = drop_kind_prefix(target, "pr")
     m = PR_KEY_RE.fullmatch(text)
     if not m and not BARE_NUMBER.fullmatch(text):
-        raise WatchError(f"land takes OWNER/REPO#N, OWNER/REPO/N or a pull request URL, not {target!r}")
+        raise WatchError(f"land takes {KIND_FORMS['pr']}, not {target!r}")
     key = parse_key("pr", text)  # a bare number names the repository the caller stands in, or raises
     _, owner, repo, number = split_key(key)
     return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
@@ -23198,9 +23243,12 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("post pr needs --head, --base and --title")
         item.update(repo=args.target, head=args.head, base=args.base, title=args.title, reviewers=args.reviewer or [])
     else:
-        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(args.target)
+        # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
+        # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
+        target = drop_kind_prefix(args.target, args.kind, also=("pr", "comment"))
+        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(target)
         if not m:
-            raise WatchError(f"post {args.kind} takes OWNER/REPO#N or a GitHub URL")
+            raise WatchError(f"post {args.kind} takes OWNER/REPO#N, pr:OWNER/REPO#N or a GitHub URL")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
@@ -23945,11 +23993,29 @@ class Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         nxt = usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        say_waiting(f"{self.prog}: error: {message}")
+        spellings = kind_spellings(message)
+        say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
-            print_json_error("usage", message, nxt)
+            print_json_error("usage", message + (f" ({spellings})" if spellings else ""), nxt)
         raise SystemExit(64)
+
+
+KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
+
+
+def kind_spellings(message: str) -> str:
+    """What a refused *kind* is told about the spellings of a target, so the reader is not left to work out
+    that a separator was the problem. argparse's own line ("invalid choice: 'pr:o/r/7241'") lists the kinds
+    and nothing else, which reads as "pr is not a kind" when the kind was there all along."""
+    bad = KIND_CHOICE.search(message)
+    if not bad:
+        return ""
+    split = split_kind_prefix(bad.group(1))
+    if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
+        return f"a {split[0]} target is {KIND_FORMS.get(split[0], 'named by its own form')}"
+    return ("the kind comes first and the whole target is one word: `pr OWNER/REPO#N`, `run OWNER/REPO/RUN_ID`, "
+            "`pr:OWNER/REPO#N` as this tool prints it, or `OWNER/REPO#N` with no kind at all")
 
 
 def print_json_error(code: str, reason: str, nxt: str) -> None:
@@ -24102,8 +24168,15 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
     ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if wait_joined else ""
-    if first.startswith("-") or first in ("pr", "run", "comment", "file", "pid", "until"):
+    if first.startswith("-") or first in WAIT_KINDS:
         return raw, ran_as
+    # `wait pr:o/r#5` -- this tool's own notation for a target, copied out of a line it printed -- is
+    # `wait pr o/r#5`: the prefix carries the kind, so the kind slot is where it goes.
+    prefixed = split_kind_prefix(first)
+    if prefixed and prefixed[0] in (WAIT_KINDS if cmd == "wait" else STATUS_KINDS):
+        kind, rest = prefixed
+        fixed = [cmd, kind, rest] + raw[2:]
+        return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
         return raw, ran_as
@@ -24141,10 +24214,11 @@ def parser() -> argparse.ArgumentParser:
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
     for name in ("status", "wait"):
         s = sub.add_parser(name)
-        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
+        s.add_argument("kind", choices=WAIT_KINDS if name == "wait" else STATUS_KINDS)
         if name == "status":
             s.add_argument("target", nargs="+",
-                           help="OWNER/REPO#N, OWNER/REPO/N or a GitHub URL; several are read in one gather, "
+                           help="OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, or a GitHub URL; "
+                                "several are read in one gather, "
                                 "and a bare #N or N is that number in the repository of the target before it, "
                                 "or of the directory you are in")
             s.add_argument("--field", metavar="F,G",
@@ -24152,7 +24226,9 @@ def parser() -> argparse.ArgumentParser:
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
                                 "lists print comma-joined")
         else:
-            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
+            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, a GitHub URL, or the KIND:TARGET "
+                                                 "form this tool prints (pr:OWNER/REPO#N, run:OWNER/REPO/RUN_ID), "
+                                                 "with or without the kind before it")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         s.add_argument("--verbose", action="store_true",
