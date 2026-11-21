@@ -16340,7 +16340,12 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         if sha and not str(data.get("headRefOid") or "").startswith(sha):
             return EXIT_OK  # it merged at another head: the commit waited for is not the one that landed, nothing to wait for
         if until != "done":
-            return check_verdict(data, until, now, grace, settle)  # at the head waited for: a runner refusal in its grace still holds
+            # at the head waited for: a finished red still decides, but a check still pending never holds a merged PR
+            # (leo-workspace#7310, 2026-11-21: `wait pr` with no --until saw MERGED at 1398 s and ran to its 1800 s
+            # timeout on one non-required check that was still pending)
+            # (a runner refusal inside its rescue grace is held, not pending: it still holds, and ends with the grace)
+            decided = check_verdict(data, until, now, grace, settle)
+            return EXIT_OK if decided is None and not classify(data, now, grace)["held"] else decided
         # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
         # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
         # still fails; a pending, missing or other-head check no longer holds the wait.
