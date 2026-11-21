@@ -660,6 +660,68 @@ class HookTest(unittest.TestCase):
                                        "--no-disk", repo="manaflow-ai/cmux").returncode, 0,
                          "without --trusted-ref a same-repo PR is admitted as before")
 
+    def test_hq_trusted_runner_admits_only_mains_own_dispatch(self) -> None:
+        # HQ_MAIN_DISPATCH: a runner trusted for cmuxterm-hq's main also takes a main workflow_dispatch of HQ
+        hq = {"full_name": "manaflow-ai/cmuxterm-hq", "fork": False, "default_branch": "main"}
+        main = "refs/heads/main"
+        wf = f"manaflow-ai/cmuxterm-hq/.github/workflows/synthetic-probes.yml@{main}"
+        payload = {"ref": main, "repository": hq, "inputs": {"job": "integrations-production"}}
+        args = {"event_name": "workflow_dispatch", "ref": main, "repository": "manaflow-ai/cmuxterm-hq",
+                "event": payload, "trusted_ref": main, "trusted_repo": "manaflow-ai/cmuxterm-hq", "workflow_ref": wf,
+                "job": "integrations-production", "run_attempt": "1"}
+        self.assertIsNone(hook.trusted_refusal(**args))
+        self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
+        for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": event_payload}))
+        pr = {"number": 1, "head": {"repo": hq}, "base": {"repo": hq}}
+        refused = {
+            "dispatch of another branch": {"ref": "refs/heads/lane/x", "event": {**payload, "ref": "refs/heads/lane/x"},
+                                           "workflow_ref": wf.replace(main, "refs/heads/lane/x")},
+            "ref env and payload differ": {"event": {**payload, "ref": "refs/heads/lane/x"}},
+            "payload ref missing": {"event": {"repository": hq}},
+            "workflow file from another branch": {"workflow_ref": wf.replace(main, "refs/heads/lane/x")},
+            "workflow file of another repository": {
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{main}"},
+            "no workflow ref": {"workflow_ref": None},
+            "dispatch from another repository": {"repository": "manaflow-ai/cmux",
+                                                 "event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
+            "repo env and payload differ": {"event": {**payload, "repository": {**CMUX, "default_branch": "main"}}},
+            "payload carries a pull_request": {"event": {**payload, "pull_request": pr}},
+            "payload carries a workflow_run": {"event": {**payload, "workflow_run": {}}},
+            "payload carries a merge_group": {"event": {**payload, "merge_group": {}}},
+            "pull_request": {"event_name": "pull_request", "ref": "refs/pull/1/merge",
+                             "event": {"pull_request": pr, "repository": hq}},
+            "pull_request_target": {"event_name": "pull_request_target"},
+            "workflow_run": {"event_name": "workflow_run", "event": {"workflow_run": {}, "repository": hq}},
+            "merge_group": {"event_name": "merge_group", "ref": "refs/heads/gh-readonly-queue/main/pr-1"},
+            "runner trusted for another HQ branch": {"trusted_ref": "refs/heads/lane/x"},
+            "payload missing": {"event": None},
+        }
+        for name, overrides in refused.items():
+            with self.subTest(name):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+        # cmux's trusted runners keep refusing a main dispatch (its inputs can name refs/pull/N/merge)
+        cmux = {"event": {**payload, "repository": {**CMUX, "default_branch": "main"}}, "repository": "manaflow-ai/cmux",
+                "trusted_repo": "manaflow-ai/cmux", "workflow_ref": f"manaflow-ai/cmux/.github/workflows/x.yml@{main}"}
+        self.assertIn("not workflow_dispatch", hook.trusted_refusal(**{**args, **cmux}))
+        # end to end through the hook, as cmux24's runners call it
+        environ = {"GITHUB_REF": main, "GITHUB_WORKFLOW_REF": wf, "GITHUB_JOB": "integrations-production"}
+        for name, event_name, ref, body, workflow_ref, admitted in (
+                ("main dispatch", "workflow_dispatch", main, payload, wf, True),
+                ("branch dispatch", "workflow_dispatch", "refs/heads/lane/x", {**payload, "ref": "refs/heads/lane/x"},
+                 wf.replace(main, "refs/heads/lane/x"), False),
+                ("pull request", "pull_request", "refs/pull/1/merge", {"pull_request": pr, "repository": hq}, wf,
+                 False)):
+            with self.subTest(f"hook: {name}"):
+                path = event(self.dir, "hq-" + name.replace(" ", "-"), body)
+                result = self.run_hook("job-started", event_name, path, "--allowed-repo", "manaflow-ai/cmuxterm-hq",
+                                       "--trusted-ref", main, "--trusted-repo", "manaflow-ai/cmuxterm-hq", "--no-disk",
+                                       repo="manaflow-ai/cmuxterm-hq",
+                                       env={**environ, "GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref})
+                self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+                if not admitted:
+                    self.assertIn("refused: ", result.stdout)
+
     def test_trusted_next_nightly_is_an_exact_opt_in(self) -> None:
         ref = "refs/heads/nightly-next"
         payload = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}}

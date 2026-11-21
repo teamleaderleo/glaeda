@@ -3033,9 +3033,20 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
-# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The one
-# exception is ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only (trusted_refusal).
+# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The
+# exceptions are ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only, and HQ_MAIN_DISPATCH (trusted_refusal).
 TRUSTED_EVENTS = ("push", "schedule")
+# HQ_MAIN_DISPATCH (2026-11-21, the coordinator on cmuxterm-hq#14636: "the fleet_route hook admits only main push and
+# schedule jobs. Let it admit workflow_dispatch on main too"): a runner trusted for manaflow-ai/cmuxterm-hq's main
+# (cmux24's hq-fleet-route, hq-census, hq-report and hq-runner-maker, cmux17's and cmux22's hq-two-mac) also takes a
+# workflow_dispatch of that repository at refs/heads/main, from a workflow file on main. Such a run executes main's own
+# workflow at main's head, and only a person or App with write access can start it: the same trust as a push to main.
+# The input-ref risk above is cmux's (app-host-test-rerun takes refs/pull/N/merge); HQ's workflows that route to these
+# runners take PR numbers and phases as inputs, never a ref to check out and run, and a new one is reviewed on main.
+# Only HQ, only main: a dispatch of another ref or repository, and pull_request, workflow_run and merge_group (payload
+# keys included), stay refused. HQ's runs-on lines send a dispatch here only while vars.HQ_OWNED_DISPATCH is 'live'.
+HQ_DISPATCH_REPO = "manaflow-ai/cmuxterm-hq"
+HQ_DISPATCH_REF = "refs/heads/main"
 UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
 TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 # ONE_MINI_NIGHTLY: main's classic nightly.yml signing and publishing jobs, which cmux routes to the trusted signing
@@ -3139,7 +3150,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     """Why a job is not merged code of trusted_repo on trusted_ref, or None. Pure. For a push or schedule the
     workflow file and the default checkout come from that ref, so PR code runs only if a merged workflow
     fetches it (docs/CMUX_MINI_RUNNER.md 2e)."""
-    why = f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs"
+    hq_main = trusted_repo.lower() == HQ_DISPATCH_REPO and trusted_ref == HQ_DISPATCH_REF
+    why = (f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push, schedule and workflow_dispatch jobs"
+           if hq_main else f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs")
     if (trusted_next_nightly or trusted_next_signing) and (
             trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
@@ -3154,7 +3167,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return None
     # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
     dispatch = trusted_next_signing and event_name == "workflow_dispatch"
-    if event_name not in TRUSTED_EVENTS and not dispatch:
+    # HQ_MAIN_DISPATCH: checked below like a push: payload, repository, ref and workflow file from main
+    hq_dispatch = hq_main and event_name == "workflow_dispatch"
+    if event_name not in TRUSTED_EVENTS and not dispatch and not hq_dispatch:
         return f"{why}, not {event_name}"
     if not isinstance(event, dict):
         return f"{why}; the event payload is missing"
@@ -3179,6 +3194,13 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
                                             "signing job push or dispatch" if trusted_next_signing else ""))))
+    if hq_dispatch:
+        workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
+        if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
+                and workflow_path.lower().startswith(f"{HQ_DISPATCH_REPO}/.github/workflows/")):
+            return (f"{why}; a workflow_dispatch only of {trusted_ref} with its own workflow file "
+                    f"(ref {ref or '(unset)'}, payload ref {event.get('ref')!r}, workflow {workflow_ref or '(unset)'})")
+        return None
     if dispatch:
         # ONE_MINI_NIGHTLY: main's classic nightly signing and publishing jobs, from main's exact nightly.yml
         if not (ref == trusted_ref and event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@{ref}"

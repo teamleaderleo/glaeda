@@ -1291,6 +1291,15 @@ Its runners then:
 workflow_dispatch is refused: a dispatched workflow on main can check out any ref from its inputs (cmux's
 app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and workflow_run are refused too.
 
+One exception, `HQ_MAIN_DISPATCH` (2026-11-21): a runner trusted for `manaflow-ai/cmuxterm-hq` on `refs/heads/main`
+(cmux24's hq-fleet-route, hq-census, hq-report and hq-runner-maker; cmux17's and cmux22's hq-two-mac) also takes a
+`workflow_dispatch` of that repository when `GITHUB_REF`, the payload's `ref` and the `GITHUB_WORKFLOW_REF` branch are
+all `refs/heads/main` and the workflow file is HQ's own. Such a run executes main's own workflow at main's head, and
+only someone with write access can start it, the same trust as a push to main; HQ's workflows routed to these runners
+take PR numbers and phases as inputs, never a ref to run. A dispatch of another ref or repository, and pull_request,
+merge_group and workflow_run (as events or payload keys), stay refused, and cmux's trusted runners refuse every
+dispatch as before. HQ sends a dispatch here only while `vars.HQ_OWNED_DISPATCH` is `live`.
+
 `runner.trustedNextNightly: true` is a separate, default-off trust decision for cmux's NEXT nightly.
 It requires a dedicated `manaflow-ai/cmux` trusted main runner with no `dev-builds` role, adds
 `--trusted-next-nightly` to its host hook, and adds the `glaeda-trusted-next-nightly` capability label.
