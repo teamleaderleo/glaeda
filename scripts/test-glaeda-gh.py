@@ -5144,6 +5144,18 @@ class ClientTest(Base):
         self.assertEqual(req.call_args.kwargs["sha"], "b" * 40)
         self.assertFalse([c for c in run.call_args_list if c.args and c.args[0][:1] == ["gh"]])
 
+    def test_land_after_bare_number_takes_the_targets_repository(self) -> None:
+        """`land o/r#9 --after 7` from a directory with no origin: 7 is o/r#7, said on stderr; a full target stays."""
+        err = io.StringIO()
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: None), mock.patch("sys.stderr", err):
+            got = gg.land_after_in("o/r", ["7", "#8", "x/y#3", "pr:o/z#4"])
+        self.assertEqual(got, ["o/r#7", "o/r#8", "x/y#3", "pr:o/z#4"])
+        self.assertIn("7 is o/r#7 (the land target's repository)", err.getvalue())
+        self.assertNotIn("x/y#3 is", err.getvalue())
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: None):
+            self.assertEqual([gg.land_key(a)[0] for a in got],
+                             ["pr:o/r#7", "pr:o/r#8", "pr:x/y#3", "pr:o/z#4"])
+
     def test_wait_with_two_targets_names_the_single_target_form(self) -> None:
         """Lane, 2026-11-21 (glaeda#2323): `status pr` takes several targets and `wait pr` takes one, and the
         refusal was argparse's bare "unrecognized arguments", so a *background* wait exited 64 at once and

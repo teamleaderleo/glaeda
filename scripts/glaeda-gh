@@ -11309,6 +11309,21 @@ def land_key(target: str) -> tuple[str, str, int]:
     return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
 
 
+def land_after_in(repo: str, after: list[str]) -> list[str]:
+    """--after targets with a bare N or #N made OWNER/REPO#N in the land target's own repository, ahead of
+    parse_key's fallback to the caller's cwd origin (a land names its repository, so a bare --after number is
+    that one, from a directory with no origin too). A full target stays as given. Said on stderr."""
+    out = []
+    for a in after:
+        bare = BARE_NUMBER.fullmatch(drop_kind_prefix(a, "pr"))
+        if bare:
+            full = f"{repo}#{int(bare.group(1))}"
+            say_waiting(f"glaeda-gh: {bare.group(1)} is {full} (the land target's repository)")
+            a = full
+        out.append(a)
+    return out
+
+
 # Where the session that queues a land is named, in order (acpmux send takes a session's name or id). Read at queue
 # time, so the session that asked is the one told, whatever --notify it forgot.
 LAND_REQUESTER_KEYS = ("ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "LANE_GH_LANE", "ACPMUX_FROM", "ACPMUX_SESSION_ID",
@@ -15270,6 +15285,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
+    after = land_after_in(repo, after)
     check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
