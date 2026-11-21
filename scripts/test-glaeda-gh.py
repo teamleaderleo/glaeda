@@ -9989,6 +9989,24 @@ class FileAndPidWaitTest(unittest.TestCase):
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
 
+    def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
+        """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
+        (both cost a usage error, 2026-11-21)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.land_notify_synonym(["land", "--notify", "o/r#1"]),
+                             ["land", "o/r#1", "--notify"])
+            self.assertEqual(gg.land_notify_synonym(["land", "--wait", "60", "--notify", "o/r#1"]),
+                             ["land", "--wait", "60", "o/r#1", "--notify"])
+        self.assertEqual(err.getvalue().count("read as `land"), 2)
+        for same in (["land", "o/r#1", "--notify"], ["land", "o/r#1", "--notify", "cosmic/coord"],
+                     ["land", "o/r#1", "--notify", "o/r#2"], ["land", "status"],
+                     ["wait", "--notify", "o/r#1"]):
+            self.assertEqual(gg.land_notify_synonym(same), same)
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--notify"]).notify, "")
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1"]).notify, None)
+        self.assertEqual(gg.land_requester_from(""), gg.land_requester_from(None))
+
     def test_waits_until_a_time_or_the_quota_reset(self) -> None:
         """`wait until`: the wait for "go on at T" (a quota reset) that needs no head SHA (2026-11-18)."""
         now = 1_795_000_000.0  # 2026-11-18T11:06:40Z

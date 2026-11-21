@@ -23578,8 +23578,9 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
-    ld.add_argument("--notify", metavar="HOST/SESSION",
-                    help="who is told on a merge or a stop (default this host/$ACPMUX_SESSION_NAME)")
+    ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
+                    help="who is told on a merge or a stop (with no value, and by default, this "
+                         "host/$ACPMUX_SESSION_NAME)")
     ld.add_argument("--wait", type=seconds, default=0, metavar="S",
                     help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
     ld.add_argument("--json", action="store_true")
@@ -23609,9 +23610,30 @@ def log_job_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+def land_notify_synonym(raw: list[str]) -> list[str]:
+    """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
+    `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
+    usage error, and with one allowed, the flag before the target would swallow it."""
+    if len(raw) < 3 or raw[0] != "land":
+        return raw
+    for i, word in enumerate(raw):
+        if word != "--notify" or i + 1 >= len(raw):
+            continue
+        after = raw[i + 1]
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", after):
+            return raw
+        if any(re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", w) for w in raw[1:i]):
+            return raw  # the target is already there: --notify names something else, odd as it looks
+        fixed = raw[:i] + [after] + ["--notify"] + raw[i + 2:]
+        print(f"glaeda-gh: read as `{' '.join(fixed)}` (--notify takes HOST/SESSION, not the PR; with no "
+              f"value it names this session)", file=sys.stderr)
+        return fixed
+    return raw
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    raw = log_job_synonym(raw)
+    raw = land_notify_synonym(log_job_synonym(raw))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
