@@ -22873,6 +22873,68 @@ def broker_create_call(args: list[str]) -> bool:
     return method == "POST" and bool(BROKER_CREATE_API.fullmatch(path))
 
 
+# `OWNER/REPO#N` on a brokered `gh` line: the one form this tool prints everywhere and the one real gh has
+# never read. `gh pr comment teamleaderleo/glaeda#2323` is not a number and not a URL, so gh's PR finder
+# falls through to its last case and looks for a *branch* of that name: "no pull requests found for branch
+# \"teamleaderleo/glaeda#2323\"", exit 1, after a round trip. The target is unambiguous -- a git branch name
+# cannot hold a `#` (git check-ref-format forbids it) -- so it is `--repo OWNER/REPO` plus the number, which
+# is what gh does read. Narrower than KEY_RES on purpose: a plain `OWNER/REPO/N` is a shape a branch name can
+# have (`feature/v2/3`), and on this surface the fallthrough it would steal is the branch form, which some
+# caller may rely on. A URL already works in gh and is left alone.
+BROKER_HASH_TARGET_RE = re.compile(rf"({NAME})/({NAME})#(\d+)")
+# A run target is a run id, never a branch, so `/` is unambiguous here as it is for RUN_KEY_RE.
+BROKER_RUN_TARGET_RE = re.compile(rf"({NAME})/({NAME})[#/](\d+)")
+# The three word-one commands whose third word is one PR, issue or run, and the kind prefix each may carry.
+BROKER_TARGET_WORDS = {"pr": ("pr", BROKER_HASH_TARGET_RE), "issue": ("comment", BROKER_HASH_TARGET_RE),
+                       "run": ("run", BROKER_RUN_TARGET_RE)}
+
+
+def broker_canonical_target(args: list[str]) -> list[str]:
+    """ARGS with an `OWNER/REPO#N` target rewritten to the `--repo OWNER/REPO` + `N` gh reads, or ARGS
+    unchanged when it is not that exact shape.
+
+    One normalisation at the broker boundary, so every gh verb that takes a PR, issue or run gets it at once
+    (`comment`, `edit`, `close`, `review`, `merge`, `update-branch`, `view`, `checks`, `rerun`, ...) and the
+    answer cache can key and narrowly stamp a call it previously saw only as an opaque word. It never
+    half-rewrites: anything it cannot canonicalise is returned as typed, for gh to rule on."""
+    words, _, _, values = broker_words(args)
+    if len(words) < 3 or words[0] not in BROKER_TARGET_WORDS:
+        return args
+    kind, pattern = BROKER_TARGET_WORDS[words[0]]
+    # From the third word on, not the third word alone: broker_words knows the flags gh *reads* take, so the
+    # value of a write-only flag it does not know (`--add-label x`) lands among the words, and agents type
+    # flags before the target as often as after. Only the first word that is a target is touched.
+    for typed in words[2:]:
+        target = typed
+        split = split_kind_prefix(target)
+        if split is not None:
+            # `pr:o/r#5` as this tool prints it. A prefix naming another kind is not read as this one, here
+            # as in drop_kind_prefix: `gh pr view run:o/r/123` stays as typed, not pull request 123.
+            if split[0] != kind and not (kind == "comment" and split[0] in ("pr", "comment")):
+                return args
+            target = split[1]
+        match = pattern.fullmatch(target)
+        if match:
+            break
+    else:
+        return args
+    owner, repo, number = match.groups()
+    named = values.get("--repo")
+    if named is not None and named.lower() != f"{owner}/{repo}".lower():
+        return args  # `-R` already names a different repository: ambiguous, so gh decides, not this
+    if sum(1 for a in args if a == typed) != 1:
+        return args  # the same word twice (a value as well as the target): no index to rewrite safely
+    at = args.index(typed)
+    if at > 0 and args[at - 1].startswith("-"):
+        # The word after a flag may be that flag's value rather than the target, and whether it is depends on
+        # the verb (`-b` is `--body` to one gh command and `--branch` to another). Left as typed.
+        return args
+    fixed = [*args[:at], number, *args[at + 1:]] + ([] if named is not None else ["--repo", f"{owner}/{repo}"])
+    print(f"glaeda-gh: read as `gh {' '.join(fixed)}` ({typed} is this tool's own form for the target; gh "
+          f"takes the number with --repo, and reads OWNER/REPO#N as a branch name)", file=sys.stderr)
+    return fixed
+
+
 def broker_merge_handoff(args: list[str]) -> int | None:
     """Hand a merge or a create the gh-quota guard has not judged to the guard (exec, so this returns only on
     failure), or None when the call is neither, or is a create and no guard can be run here."""
@@ -22914,6 +22976,14 @@ def broker_merge_handoff(args: list[str]) -> int | None:
 
 def cmd_gh(args: list[str]) -> int:
     """Stand in front of one `gh` invocation. Fails open: anything unexpected runs the real gh."""
+    # The target comes first, so every path below -- the merge handoff's guard, the answer cache's key and
+    # write scope, and gh itself -- sees one canonical line. Not under CMUX_GH_BROKER_DISABLE: whoever sets
+    # that wants the real gh and the line they typed, unchanged.
+    if os.environ.get("CMUX_GH_BROKER_DISABLE") != "1":
+        try:
+            args = broker_canonical_target(args)
+        except Exception as error:  # noqa: BLE001  a rewrite never fails a call: fail open, as typed
+            broker_note({"route": "error", "error": describe(error), "site": "broker_canonical_target"})
     # Before anything else, CMUX_GH_BROKER_DISABLE included: that switch skips this broker, never land_judge.
     try:
         handed = broker_merge_handoff(args)
