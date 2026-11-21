@@ -14026,9 +14026,19 @@ class LandQueue:
             self.wait(e, {"kind": "retry", "why": f"{kind} at {head[:12]} transient ({cls}): backoff {after:.0f} s"},
                       after)
             return None
-        # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
-        # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
-        sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
+        # Every kind's refusals count per head whatever their words: the judgment's streak no longer bounds them
+        # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count. The rule was written for
+        # update_branch and is not special to it -- what reaches here is a non-transient refusal at a head that has
+        # not moved (a timeout or 5xx is counted above and never lands here; draft, conflict and closed are answered
+        # above), and no wording of such a refusal is progress. Keying the count on land_step_class as well let two
+        # classes alternating at one head reset each other, so neither ever reached LAND_STEP_STOP.
+        # efficiency-standing-lane, 2026-11-21: teamleaderleo/glaeda#2320 sat at 5f640aea6348 taking 13 merge calls,
+        # each after its own full judgment, over 2h20m -- the designed bound is 6. Its refusals alternated "To have
+        # the pull request merged after all the requirements have been met, add the `--auto` flag." (11 of them) with
+        # "GraphQL: Pull Request has merge conflicts (mergePullRequest)" (2), and each conflict refusal restarted the
+        # --auto count from n=1: the n sequence read 1,2, 1, 1,2,3, 1, 1,2,3,4,5,6. Seven of the thirteen merge calls
+        # and their judgments bought nothing a prior one had not already answered.
+        sig = f"{kind}|{head}"
         named = land_step_named(out)
         if named and named["kind"] == "wait_pr":
             # Its next is a wait on the checks: taken, never counted toward LAND_STEP_STOP (LAND_WAIT_STUCK bounds it).
@@ -14044,9 +14054,20 @@ class LandQueue:
         e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
         self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
         if n >= LAND_STEP_STOP:
+            # A stop with an empty `next:` ends nobody's hold: the row sits until a person happens to read it. The
+            # refusal's own words are the next step when it names a step this queue runs; when it names none, the
+            # step that can end this hold is still nameable -- read what GitHub still requires at this head, clear
+            # it, and re-land pinned to whatever head that leaves. glaeda#2320's stop carried "" for 95 min.
+            # `--admin` is never the step: routing around a refused merge is forbidden (the rulebook's Safety rule),
+            # and GitHub's own `--auto` hint is not it either -- auto-merge would merge it later unattended, which
+            # is the opposite of handing the row back to its requester.
+            name = key_name(e["key"])
             self.stop(e, f"{kind}_refused", f"the {kind} land_judge named was refused {n} times in a row at "
-                      f"{head[:12]} ({cls}): {land_trim(land_tail(out), 300)}",
-                      land_trim(land_tail(out), 200) if named else "")
+                      f"{head[:12]} (last: {cls}): {land_trim(land_tail(out), 300)}",
+                      land_trim(land_tail(out), 200) if named
+                      else (f"read what GitHub still requires at this head and clear it (a review, a required "
+                            f"check, a branch rule -- never --admin): glaeda-gh status pr {name}; then re-land it "
+                            f"pinned: glaeda-gh land {name} --match-head-commit <its 40-hex head then>"))
             return None
         if named and named["kind"] == "update_branch" and kind != "update_branch":
             self.history(e, "refusal_named", step="update_branch")
