@@ -27370,5 +27370,177 @@ class SearchShapeTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(self.synonym(list(argv)), (list(argv), ""))
 
+
+
+class WaitBlockedByQuotaTest(Base):
+    """Three lanes, 2026-11-21, one GraphQL exhaustion window: `glaeda-gh wait pr <ref> --sha <sha> --timeout 1800`
+    on leo-workspace#7208, leo-workspace#7188 and cmuxterm-hq#16555 each printed `<ref>: no data yet` at all
+    fourteen of its progress lines for the full 1800 s, then `result: timeout`, `last seen: no data yet`, and a
+    `next:` that was the identical command -- which an agent takes, so the loss repeats. The cause was on the same
+    host's disk the whole time (daemon.json modes.graphql "stop", budget.json's GraphQL reading and its reset) and
+    `glaeda-gh budget` printed it throughout. 90 minutes of blocked lane time for a fact three file reads away.
+
+    A wait that cannot read must say which bucket and which reset, say it on its first line, and name a next step
+    that can end the hold (docs/handbook/refusal-next-step-cannot-end-the-hold.md). The three states stay apart:
+    not read yet (retry), cannot be read (a known reset), and a stop a bucket's own reading does not back."""
+
+    RESET = 1200.0  # seconds from NOW: past a 600 s wait's deadline, inside a 1800 s one's
+
+    def records(self, *, mode: str = "stop", remaining: int = 0, reset: float | None = None,
+                bucket: str = "graphql", upstream: bool = False) -> None:
+        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        status = {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
+                  "modes": {"rest": "normal", "graphql": "normal", bucket: mode},
+                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": False}}
+        if upstream:
+            status["upstream"] = {"ok": True}
+        gg.write_json(gg.BASE / "daemon.json", status)
+        gg.write_json(gg.BASE / "budget.json",
+                      {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
+                                "reset": (time.time() + self.RESET) if reset is None else reset}})
+
+    def request(self, timeout: float = 1800.0, began: float | None = None) -> dict:
+        req = gg.wait_request("pr", "o/r#7208", "green", timeout, False, False, "7" * 40, True, gg.RESCUE_GRACE)
+        req["began"] = time.time() if began is None else began
+        return req
+
+    # (a) vs (b): the same empty cache, read differently because the records say different things.
+
+    def test_an_unread_target_with_no_stop_still_only_says_no_data_yet(self) -> None:
+        """The ordinary case is untouched: nothing on disk explains the silence, so nothing is claimed."""
+        self.records(mode="normal", remaining=4000)
+        self.assertIsNone(gg.read_blocked("pr"))
+        self.assertEqual(gg.progress_state("pr:o/r#7208", None), "o/r#7208: no data yet")
+        self.assertIsNone(gg.blocked_start_line("pr:o/r#7208", "pr"))
+        self.assertEqual(gg.wait_outcome(self.request(), gg.EXIT_TIMEOUT, None, 1800)["next"],
+                         gg.wait_command(self.request()))
+
+    def test_no_records_at_all_claims_nothing(self) -> None:
+        self.assertIsNone(gg.read_blocked("pr"))
+        self.assertEqual(gg.progress_state("pr:o/r#7208", None), "o/r#7208: no data yet")
+
+    def test_a_blocked_wait_names_its_bucket_and_reset_on_its_very_first_line(self) -> None:
+        self.records()
+        blocked = gg.read_blocked("pr")
+        self.assertEqual(blocked["bucket"], "graphql")
+        self.assertTrue(blocked["exhausted"])
+        clock = gg.utc_clock(blocked["reset"])
+        said = io.StringIO()
+        with self.diagnostics_in(said), mock.patch.object(gg, "poll_wait", return_value=gg.EXIT_TIMEOUT):
+            gg.cmd_wait("pr", "o/r#7208", "green", 1800, False, False, sha="7" * 40)
+        first = said.getvalue()
+        self.assertIn("GraphQL", first)
+        self.assertIn(clock, first)
+        self.assertIn("cannot be read right now", first)
+        self.assertIn("glaeda-gh wait until " + clock, first, "the start line names the wait that ends")
+        # and every progress line while it blocks says the same, instead of a bare "no data yet"
+        state = gg.progress_state("pr:o/r#7208", None)
+        self.assertIn("GraphQL", state)
+        self.assertIn(clock, state)
+        self.assertIn("no data yet", state, "the old words stay: this adds the reason, it does not hide the state")
+
+    def test_the_named_next_step_is_never_the_command_that_just_returned_nothing(self) -> None:
+        self.records()
+        req = self.request()
+        again = gg.wait_command(req)
+        for result in (gg.EXIT_TIMEOUT, gg.EXIT_INCONCLUSIVE):
+            with self.subTest(result=result):
+                entry = {"key": req["key"], "data": {"checksPageError": "x"}, "dataAt": req["began"] + 1,
+                         "fetchedAt": req["began"] + 1} if result == gg.EXIT_INCONCLUSIVE else None
+                nxt = gg.wait_outcome(req, result, entry, 1800)["next"]
+                self.assertNotEqual(nxt, again)
+                self.assertTrue(nxt.startswith("glaeda-gh wait until "), nxt)
+                self.assertIn("&& " + again, nxt, "it ends with the same wait, after one that can end")
+                self.assertIn(gg.utc_clock(gg.read_blocked("pr")["reset"]), nxt)
+
+    def test_a_reading_with_no_reset_names_the_quota_wait_instead(self) -> None:
+        self.records(reset=0.0)
+        blocked = gg.read_blocked("pr")
+        self.assertIsNone(blocked["reset"])
+        nxt = gg.blocked_next(self.request(), blocked)
+        self.assertTrue(nxt.startswith("glaeda-gh wait until quota --timeout 1800 && glaeda-gh wait pr"), nxt)
+
+    # The deadline: a reset the wait cannot reach ends it now; one it can reach does not.
+
+    def test_a_reset_past_the_deadline_returns_early_and_says_so(self) -> None:
+        self.records()
+        req = self.request(timeout=self.RESET - 600)  # the reset is 600 s after this wait's deadline
+        done = gg.wait_step(req, time.time())
+        self.assertIsNotNone(done, "a wait that cannot reach its reset must not sit out its timeout")
+        code, text = done
+        self.assertEqual(code, gg.EXIT_TIMEOUT, "the same exit code as any expired wait: no consumer learns a new one")
+        self.assertIn("past this wait's deadline", text)
+        self.assertIn("GraphQL", text)
+        self.assertIn("glaeda-gh wait until " + gg.utc_clock(gg.read_blocked("pr")["reset"]), text)
+        self.assertNotIn("\nnext: " + gg.wait_command(req) + "\n", text)
+
+    def test_a_reset_before_the_deadline_keeps_waiting_so_the_read_resumes(self) -> None:
+        self.records()
+        self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET + 600), time.time()),
+                          "reads resume well inside this wait: it must carry on, not give up")
+
+    def test_a_blocked_run_wait_is_left_alone(self) -> None:
+        """A run's finish still arrives over the build controller's feed, which costs no quota, so a stopped bucket
+        is no reason to end a run wait early."""
+        self.records(bucket="rest", mode="stop")
+        req = gg.wait_request("run", "o/r/12345", "done", self.RESET - 600, False, False, None, True, gg.RESCUE_GRACE)
+        self.assertIsNone(gg.wait_step(req, time.time()))
+
+    # (c): a stop the bucket's own reading does not back is said as itself, never as the quota running out.
+
+    def test_a_stop_with_headroom_is_not_called_the_quota_running_out(self) -> None:
+        self.records(remaining=4800)
+        blocked = gg.read_blocked("pr")
+        self.assertFalse(blocked["exhausted"])
+        self.assertIn("still shows headroom", blocked["text"])
+        self.assertNotIn("spent", blocked["text"])
+        # and it never ends a wait early: that belongs to the lane fixing the refusal itself
+        self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET - 600), time.time()))
+
+    def test_a_host_reading_through_another_daemon_names_no_bucket_of_its_own(self) -> None:
+        self.records(upstream=True)
+        self.assertIsNone(gg.read_blocked("pr"))
+
+    def test_a_bucket_that_is_not_the_kinds_route_is_not_its_blocker(self) -> None:
+        self.records(bucket="rest")  # a PR is read over GraphQL; REST stopping says nothing about it
+        self.assertIsNone(gg.read_blocked("pr"))
+        self.assertIsNotNone(gg.read_blocked("run"))
+
+    def test_a_broken_record_costs_the_note_and_never_the_wait(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        (gg.BASE / "daemon.json").write_text("{not json")
+        self.assertIsNone(gg.blocked_now("pr"))
+        with mock.patch.object(gg, "read_blocked", side_effect=RuntimeError("boom")):
+            self.assertIsNone(gg.blocked_now("pr", time.time() + 5))
+        self.assertEqual(gg.progress_state("pr:o/r#7208", None), "o/r#7208: no data yet")
+
+    # The probe that found the cause only at second 1800.
+
+    def test_the_starved_probe_fires_at_the_short_bound_for_a_target_never_read(self) -> None:
+        """Old: STALE_DATA_AFTER (600 s), and in practice the wait's whole timeout, because Daemon.serve_wait hands
+        a wait back only when nothing already explains the silence. New: WAIT_DIAGNOSE_AFTER, once per wait."""
+        self.assertLess(gg.WAIT_DIAGNOSE_AFTER, gg.STALE_DATA_AFTER)
+        self.records(mode="normal", remaining=4000)
+        now = time.time()
+        req = self.request(began=now - gg.WAIT_DIAGNOSE_AFTER - 5)
+        self.assertIsNotNone(gg.wait_starved(req, None, now))
+        self.assertIsNone(gg.wait_starved(self.request(began=now - 30), None, now), "not on the first poll")
+        req["diagnosed"] = True
+        self.assertIsNone(gg.wait_starved(req, None, now), "once per wait: then the old bound again")
+        # a target that *was* read keeps the old bound exactly
+        read = {"key": req["key"], "dataAt": now - gg.WAIT_DIAGNOSE_AFTER - 5, "data": {}}
+        self.assertIsNone(gg.wait_starved(self.request(began=now - gg.WAIT_DIAGNOSE_AFTER - 5), read, now))
+
+    def test_a_disk_visible_quota_stop_spends_no_call_to_be_told_what_the_files_say(self) -> None:
+        """The hard reserve kept back for lands stays intact however many waits block at once: the short probe is
+        off while a stop is readable, and poll_wait says the bucket instead of sending a read that is refused."""
+        self.records()
+        now = time.time()
+        self.assertIsNone(gg.wait_starved(self.request(began=now - gg.WAIT_DIAGNOSE_AFTER - 5), None, now))
+        req = self.request(began=now - gg.STALE_DATA_AFTER - 60)
+        self.assertIsNotNone(gg.wait_starved(req, None, now), "past the old bound it is still said, just not read")
+
+
 if __name__ == "__main__":
     unittest.main()

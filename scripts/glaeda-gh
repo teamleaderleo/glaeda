@@ -16287,11 +16287,148 @@ def wait_command(req: dict) -> str:
     return " ".join(parts + ["--timeout", f"{float(req['timeout']):g}"])
 
 
+# A wait that cannot read its target must say so, name the bucket and the reset, and name a next step that can end
+# the hold (docs/handbook/refusal-next-step-cannot-end-the-hold.md). Three states read as the same "no data yet"
+# today and are not:
+#   (a) the daemon has not got around to reading it yet: transient, and retrying is right;
+#   (b) the daemon cannot read it, because the bucket its reads go over has stopped: it reads nothing for that kind
+#       until a known reset, so the same wait again reads nothing either;
+#   (c) a bucket whose own reading shows headroom is refused anyway: a fault of its own, with its own fix, and
+#       never to be dressed up here as the shared quota running out.
+# (b) is already on this host's disk from the first second, free: daemon.json's `paths` says which bucket each kind
+# is read over now, `modes` what the quota lets that bucket do, `restShare.capped` whether this daemon's own REST
+# share is spent, and budget.json carries that bucket's last reading with its reset. The wait path read none of it.
+# Measured 2026-11-21, one GraphQL exhaustion window: three lanes ran `glaeda-gh wait pr ... --sha ... --timeout
+# 1800` (leo-workspace#7208, leo-workspace#7188, cmuxterm-hq#16555). All three printed `...: no data yet` at every
+# one of their fourteen progress lines for the full 1800 s, then `result: timeout`, `last seen: no data yet` and a
+# `next:` that was the identical command -- which an agent takes. 90 minutes of blocked lane time in one window for
+# a fact three file reads away, and `glaeda-gh budget` on the same host printed the bucket and the reset throughout.
+BUCKET_NAME = {"rest": "REST", "graphql": "GraphQL"}
+WAIT_UNTIL_SLACK = 30  # the `wait until RESET` a blocked wait names gets this much past the reset to be sure of it
+
+
+def read_blocked(kind: str, now: float | None = None) -> dict | None:
+    """Why nothing is being read for KIND's targets now, from the files the daemon already writes every heartbeat:
+    no GitHub call, no quota spent. None when a route is open (state (a) above), or when there is no daemon record
+    to read, or on a host whose reads go through another host's daemon (it has no bucket of its own to name).
+
+    Else {"bucket", "label", "reset", "remaining", "limit", "exhausted", "text"}: `reset` is when reads can resume
+    (None when the reading names none) and `exhausted` is whether the bucket's own reading backs the stop. False
+    there is state (c): the stop is real and worth saying, its cause is not the shared quota running out, and the
+    text must not claim it is."""
+    now = time.time() if now is None else now
+    status = read_json(BASE / "daemon.json")
+    if not isinstance(status, dict) or not isinstance(status.get("modes"), dict):
+        return None
+    if isinstance(status.get("upstream"), dict):
+        return None
+    modes = status["modes"]
+    paths = status.get("paths") if isinstance(status.get("paths"), dict) else {}
+    share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
+    bucket = paths.get(kind) if paths.get(kind) in BUCKET_NAME else BUCKETS.get(kind)
+    if bucket is None:
+        return None
+    # The bucket KIND is routed over has stopped. Daemon.route() already moves a kind off a stopped bucket when the
+    # other one can take its reads, so a kind still routed over a stopped bucket has no second route this tick.
+    if modes.get(bucket) != "stop" and not (bucket == "rest" and share.get("capped") is True
+                                            and modes.get("graphql") == "stop"):
+        return None
+    seen = read_json(BASE / "budget.json") or {}
+    seen = seen.get(bucket) if isinstance(seen.get(bucket), dict) else {}
+    whole = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None  # noqa: E731
+    remaining, limit = whole(seen.get("remaining")), whole(seen.get("limit"))
+    reset = seen.get("reset")
+    reset = float(reset) if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > now else None
+    label = BUCKET_NAME[bucket]
+    reserve = daemon_policy()["floors"][bucket][1]
+    exhausted = remaining is not None and remaining < reserve
+    left = (f"{remaining} of {limit} left" if remaining is not None and limit is not None else
+            f"{remaining} left" if remaining is not None else "its last reading is unknown")
+    when = f", resets {utc_clock(reset)}" if reset is not None else " (its reading names no reset)"
+    if exhausted:
+        text = (f"the shared {label} quota for this login is spent ({left}, under the {reserve} this daemon keeps "
+                f"back for lands{when}): nothing is read for a {kind} until then, so the same wait again reads "
+                "nothing either")
+    else:
+        text = (f"this daemon has stopped its {label} reads, so nothing is read for a {kind} now; its own last "
+                f"{label} reading still shows headroom ({left}{when}), so this is not the shared quota running out")
+    return {"bucket": bucket, "label": label, "reset": reset, "remaining": remaining, "limit": limit,
+            "exhausted": exhausted, "text": text}
+
+
+_blocked_memo: dict[tuple, dict | None] = {}
+
+
+def _blocked_stamp() -> tuple:
+    """What the answer depends on: the two records' mtimes. A memo on this and not on a clock cannot answer from a
+    file that has since changed (the daemon rewrites both every tick)."""
+    out = []
+    for name in ("daemon.json", "budget.json"):
+        try:
+            out.append((BASE / name).stat().st_mtime_ns)
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def blocked_now(kind: str, now: float | None = None) -> dict | None:
+    """read_blocked, but never the reason a wait fails: a bad record or an unreadable config costs the note, not
+    the wait. Memoized on the records' mtimes, so the daemon serving many waits in one tick reads them once."""
+    at = time.time() if now is None else now
+    try:
+        key = (kind, str(BASE), int(at // 1), _blocked_stamp())
+    except Exception:  # noqa: BLE001
+        key = None
+    if key is not None and key in _blocked_memo:
+        return _blocked_memo[key]
+    try:
+        answer = read_blocked(kind, at)
+    except Exception:  # noqa: BLE001  a diagnostic never stops a wait
+        answer = None
+    if key is not None:
+        if len(_blocked_memo) > 64:
+            _blocked_memo.clear()
+        _blocked_memo[key] = answer
+    return answer
+
+
+def blocked_next(req: dict, blocked: dict) -> str:
+    """The `next:` of a wait a stopped bucket blocked: a wait that ends, then the same wait -- never the
+    invocation that just returned nothing, which is worse than no next step because an agent takes it.
+    `wait until HH:MM:SSZ` is the reset this host read itself; `wait until quota` is the fallback when the reading
+    names no reset (it waits out this host's gh-quota marks and is read again on every pass)."""
+    again = wait_command(req)
+    reset = blocked.get("reset")
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool):
+        return (f"glaeda-gh wait until {utc_clock(reset)} "
+                f"--timeout {max(1, int(reset - time.time()) + WAIT_UNTIL_SLACK)} && {again}")
+    return f"glaeda-gh wait until quota --timeout {float(req['timeout']):g} && {again}"
+
+
+def blocked_start_line(key: str, kind: str) -> str | None:
+    """What a wait says before it blocks when nothing can be read for it now: said immediately, because the whole
+    loss this fixes was learning it at the deadline instead."""
+    blocked = blocked_now(kind)
+    if blocked is None:
+        return None
+    resumes = (f" This wait reads nothing before {utc_clock(blocked['reset'])}: "
+               f"`glaeda-gh wait until {utc_clock(blocked['reset'])}` is the wait that ends."
+               if blocked.get("reset") is not None else "")
+    return f"glaeda-gh: {key_name(key)} cannot be read right now: {blocked['text']}.{resumes}"
+
+
 def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
-    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line)."""
+    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line). When nothing
+    is being read for its kind (read_blocked) and the data is not fresh, the line names the bucket and the reset
+    as well: "no data yet" alone reads as "its CI has not started", which is the one thing it does not mean."""
     lines = [line.strip() for line in summary(key, entry, until, grace, False).splitlines()]
     keep = lines[:2] if split_key(key)[0] == "pr" else lines[:1]
-    return "; ".join(line for line in keep if line and not line.startswith("http"))
+    state = "; ".join(line for line in keep if line and not line.startswith("http"))
+    at = (entry or {}).get("dataAt")
+    fresh = (entry or {}).get("data") and isinstance(at, (int, float)) and not isinstance(at, bool) \
+        and time.time() - at < WAIT_PROGRESS_EVERY
+    blocked = None if fresh else blocked_now(split_key(key)[0])
+    return f"{state}; {blocked['text']}" if blocked is not None else state
 
 
 def progress_line(req: dict, state: str, now: float | None = None) -> str:
@@ -16318,15 +16455,18 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     if result == EXIT_TIMEOUT:
         state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
         deadline = utc_clock(float(req["began"]) + float(req["timeout"]))
+        blocked = blocked_now(kind)
         return fail_fields("timeout", f"waited {waited} s for {name} (deadline {deadline}); last seen: {state}",
-                           wait_command(req))
+                           blocked_next(req, blocked) if blocked else wait_command(req))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
     if result == EXIT_INCONCLUSIVE:
         if data.get("checksPageError") or req.get("runsUnread"):
             why = data.get("checksPageError") or "its Actions runs could not be read"
-            return fail_fields("inconclusive", f"{name}: the last read was partial ({why})", wait_command(req))
+            blocked = blocked_now(kind)
+            return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
+                               blocked_next(req, blocked) if blocked else wait_command(req))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; land_judge counts them "
                            "running)")
@@ -16852,6 +16992,21 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
+    # Nothing can be read for this kind until a reset that is past this wait's own deadline, so every second left
+    # would be spent the way the first ones were: on nothing. Return now and name the wait that ends instead of
+    # the one that just did not. Same exit code and the same "timeout" in --json as any other expired wait, so no
+    # consumer has to learn a new one; only PRs, because a run's finish can still arrive over the build
+    # controller's feed, which costs no quota at all.
+    blocked = blocked_now(kind, now) if result is None and not usable and kind == "pr" else None
+    if blocked and blocked.get("exhausted") and blocked["reset"] is not None \
+            and blocked["reset"] >= began + float(req["timeout"]):
+        extra = {"result": "timeout", "waited_s": waited,
+                 "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
+                         f"deadline ({utc_clock(began + float(req['timeout']))}): waiting the rest of it reads "
+                         "nothing"}
+        extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
+                                           f"{blocked['text']}", blocked_next(req, blocked)))
+        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     unread = (data or {}).get("checksPageError") or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
     if now - began >= req["timeout"] and kind == "pr" and until in ("done", "green") and data and unread:
@@ -16945,8 +17100,20 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    say_waiting(waiting_line(key, until, sha, exact, timeout))
+    # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
+    # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
+    blocked_note = blocked_start_line(key, kind)
+    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
     return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle))
+
+
+# A wait whose target was never read once learns why at WAIT_DIAGNOSE_AFTER instead of STALE_DATA_AFTER (600 s, and
+# in practice the wait's whole timeout: Daemon.serve_wait hands a wait back only when nothing already explains the
+# silence, so a quota stop deferred the probe to the deadline). Three 1800 s waits in the 2026-11-21 window learned
+# the cause in their last second. Once per wait, and only when read_blocked() sees no stop on disk: during a real
+# quota stop the answer is free from the files, so this spends no call to be told what is already known -- which is
+# what keeps the hard reserve (the calls kept back for lands) out of it however many waits block at once.
+WAIT_DIAGNOSE_AFTER = 120
 
 
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
@@ -16958,6 +17125,11 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     # waited keys fresher than that), else STALE_DATA_AFTER.
     bound = UPSTREAM_DIRECT_AFTER if upstream_command() is not None and direct_command() is not None \
         else STALE_DATA_AFTER
+    seen_at = (entry or {}).get("dataAt")
+    never_read = not isinstance(seen_at, (int, float)) or isinstance(seen_at, bool)
+    if never_read and not req.get("diagnosed") and bound > WAIT_DIAGNOSE_AFTER \
+            and blocked_now(req.get("kind"), now) is None:
+        bound = WAIT_DIAGNOSE_AFTER
     if now - began < bound:
         return None
     if now - float(req.get("directAt") or float("-inf")) < bound:
@@ -17129,12 +17301,22 @@ def poll_wait(req: dict) -> int:
                 # The daemon heartbeats but has not refreshed this target: say so, loudly, and read it once here
                 # instead of waiting out the timeout on data that old.
                 req["directAt"] = time.time()
-                say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
-                            f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub directly once.")
-                error = direct_read(req)
-                say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
-                            + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
-                               else "\nnext: glaeda-gh restart"))
+                req["diagnosed"] = True
+                blocked = blocked_now(req["kind"])
+                if blocked is not None and blocked.get("exhausted"):
+                    # The files already say why, and a direct read over that bucket is refused before it is sent:
+                    # say the bucket and the reset rather than spend a call to be told the same thing.
+                    say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
+                                f"{int(starved)}s (its heartbeat is fresh, its data is not), because "
+                                f"{blocked['text']}.")
+                else:
+                    say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
+                                f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub "
+                                "directly once.")
+                    error = direct_read(req)
+                    say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
+                                + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
+                                   else "\nnext: glaeda-gh restart"))
                 done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
@@ -17338,7 +17520,10 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    say_waiting(waiting_line(key, until, sha, exact, timeout))
+    # One call: say_waiting drops a line while an earlier write is stuck, and the blocker is the line that
+    # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
+    blocked_note = blocked_start_line(key, kind)
+    say_waiting(waiting_line(key, until, sha, exact, timeout) + (f"\n{blocked_note}" if blocked_note else ""))
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
