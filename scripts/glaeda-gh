@@ -19407,10 +19407,11 @@ def cmd_wait_pid(target: str, timeout: float, as_json: bool, ceiling: float | No
     pid = int(target)
     say_waiting(waiting_line(f"pid {pid}", "it exits", None, True, timeout, ceiling))
     leash = Leash(timeout, ceiling)
-    start, cpu_at = leash.start, -ZOMBIE_CHECK_S
+    start, cpu_at, proc = leash.start, -ZOMBIE_CHECK_S, os.path.exists(f"/proc/{pid}/stat")
     while pid_alive(pid):
         waited = int(time.monotonic() - start)
-        if time.monotonic() - cpu_at >= min(ZOMBIE_CHECK_S, max(1.0, timeout / 4)):
+        # with /proc a CPU read is a file read, every poll; without it a `ps`, at most every ZOMBIE_CHECK_S
+        if proc or time.monotonic() - cpu_at >= min(ZOMBIE_CHECK_S, max(1.0, timeout / 4)):
             cpu_at = time.monotonic()
             leash.see(pid_cpu(pid))  # a process still using CPU is working, not hung
         if leash.left() <= 0:
