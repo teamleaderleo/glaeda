@@ -1876,6 +1876,43 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + gg.TICK + gg.CYCLE)  # the gate opens: the event still counts
         self.assertEqual(len(self.gh.gql_calls()), 2)
 
+    def test_the_feed_says_when_a_pr_is_quiet_for_the_land_queue(self) -> None:
+        """land_feed_quiet (LAND_FEED_QUIET_MAX): quiet for a PR since T while the feed answered without a gap since
+        before T, covers the repository and delivered no run, suite or comment for the PR, its head or its branch."""
+        sha, other = "b" * 40, "c" * 40
+        key = "pr:o/r#1"
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        since = NOW + gg.TICK
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, NOW - 1))  # before the feed was followed
+        self.assertFalse(self.daemon.land_feed_quiet("pr:x/y#1", sha, since))  # a repository it does not cover
+        self.ctl.suites.append({"id": 4, "repo": "o/r", "head_sha": other, "status": "completed"})
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))  # another head
+        self.ctl.comments.append({"repo": "o/r", "number": 1, "id": 7, "author": "a", "body": "SHIP"})
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
+        since = NOW + 3 * gg.TICK + 1
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        self.ctl.runs[5] = {**ctl_run(5, "in_progress"), "head_sha": other,
+                            "pr_heads": [{"number": 1, "head_sha": other}]}
+        self.daemon.tick(NOW + 4 * gg.TICK)
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))  # a push: runs for the PR's new head
+        since = NOW + 4 * gg.TICK + 1
+        self.ctl.suites.append({"id": 6, "repo": "o/r", "head_sha": sha, "status": "completed"})
+        self.daemon.tick(NOW + 5 * gg.TICK)
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))  # its head's checks
+        since = NOW + 5 * gg.TICK + 1
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        self.ctl.down = True  # the feed fails: nothing is quiet until it answers again, and then only from then
+        self.daemon.tick(NOW + 6 * gg.TICK)
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
+        self.ctl.down = False
+        self.daemon.tick(NOW + 6 * gg.TICK + gg.CONTROLLER_ABSENT + 1)
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
+
     def test_a_new_controller_has_to_show_its_coverage_again(self) -> None:
         self.daemon.tick(NOW)
         self.feed_covers()
@@ -25101,6 +25138,153 @@ class LandTest(Base):
         self.assertNotIn("--sha", self.w.explains()[0])
         self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
         self.assert_merged_at(LB)
+
+    # -- the controller's webhook feed (LAND_FEED_QUIET_MAX): retro hq#17174 theme 3
+
+    def feed(self) -> list[float]:
+        """A fake feed: quiet for any PR since T unless an event time in the returned list is at or after T."""
+        events: list[float] = []
+        self.q.feed_quiet = lambda key, sha, since: all(t < since for t in events)
+        return events
+
+    def test_a_head_the_feed_shows_no_push_for_is_pinned_with_no_read(self):
+        """gcp lane, 2026-11-21: 189 of 528 judgments in 16 h were head_unpinned after a park, each land_judge reading
+        the head (and the rest) over REST itself. A feed that delivered nothing for the PR since the cached head was
+        read says no push happened: the head is pinned at once, with no read waited for."""
+        self.nudge_reads = False
+        self.feed()
+        self.pr(LA)
+        self.land()
+        self.latch("rest", self.t + 600)
+        self.tick(30)
+        self.clear_latch()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(self.w.explains()[0][-3:], ["--sha", LA, "--json"])
+        events = [h.get("event") for h in e["history"]]
+        self.assertIn("feed_fresh", events)
+        self.assertNotIn("head_stale", events)
+        self.assertNotIn("head_unpinned", events)
+        self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["feed_fresh"], 1)
+        self.assert_merged_at(LA)
+
+    def test_a_head_the_feed_saw_an_event_for_still_waits_for_a_read(self):
+        """An event for the PR since its head was read (a push brings runs): the cached head is not trusted."""
+        self.nudge_reads = False
+        events = self.feed()
+        self.pr(LA)
+        self.land()
+        self.latch("rest", self.t + 600)
+        self.tick(30)
+        events.append(self.t)
+        self.clear_latch()
+        e = self.tick(1)
+        self.assertEqual(self.w.explains(), [])
+        self.assertIn("head_stale", [h.get("event") for h in e["history"]])
+
+    def test_a_wait_verdict_the_feed_shows_nothing_against_is_not_judged_again(self):
+        """A wait judged at the head stands while the feed shows no run, suite or comment for the PR since: a changed
+        check fingerprint (a stale copy catching up) or a could-not-judge retry's wake asks land_judge nothing. The
+        next event is judged at once, and LAND_FEED_QUIET_MAX bounds the hold."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        e = self.tick()
+        self.assertEqual(e["feedVerdict"]["head"], LA)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("lint", "COMPLETED", "SUCCESS")])  # the copy changes; the feed carried nothing
+        e = self.tick(30)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertIn("feed_quiet", [h.get("event") for h in e["history"]])
+        # An event for the PR: judged at once.
+        events.append(self.t)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(1)
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_a_retry_wake_is_held_while_the_feed_is_quiet_since_the_wait_verdict(self):
+        """A wait's timeout judges (as always); land_judge could not read (unreadable: retry). The retry's wake asks
+        nothing while the feed shows nothing since the wait verdict, which still stands; the next event judges."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        e = self.tick()
+        verdict = dict(e["feedVerdict"])
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60},
+                                      reason="land-judge: unreadable: timed out"))
+        e = self.tick(121)  # its own timeout: judged
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertEqual((e["wait"] or {}).get("kind"), "retry")
+        self.assertEqual(e["feedVerdict"]["at"], verdict["at"])  # unreadable judged nothing: the wait stands
+        for _ in range(10):
+            e = self.tick(60)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertIn("feed_quiet", [h.get("event") for h in e["history"]])
+        events.append(self.t)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(1)
+        self.assertEqual(len(self.w.explains()), 3)
+
+    def test_a_feed_held_wait_is_judged_past_the_bound(self):
+        self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 7200}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("lint", "COMPLETED", "SUCCESS")])
+        self.tick(30)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(gg.LAND_FEED_QUIET_MAX)
+        self.assertEqual(len(self.w.explains()), 2)
+
+    def test_an_unparked_entry_keeps_its_wait_while_the_feed_is_quiet(self):
+        """The costliest cycle measured: a quota park, unparked, judged again (reading GitHub) only to wait again.
+        Unparked with its wait verdict still standing (feed_holds), it waits for the feed's next event instead."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                      reason="land-judge: refused: REST reserve"))
+        e = self.tick(121)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "quota"))
+        e = self.tick(e["wakeAt"] - self.t + 1)
+        for _ in range(5):
+            e = self.tick(60)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        events.append(self.t)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(1)
+        self.assertEqual(len(self.w.explains()), 3)
+
+    def test_an_upstream_copy_the_feed_shows_quiet_is_not_read_again(self):
+        """On a lane VM a copy older than LAND_REFRESH_AFTER is read through the broker; not while the feed shows
+        nothing for the PR since it was read (and within LAND_FEED_QUIET_MAX of it)."""
+        events = self.feed()
+        self.upstream = True
+        self.fresh_head = LA
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - gg.LAND_REFRESH_AFTER - 1
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.w.refreshed, [])
+        self.assert_merged_at(LA)
+        # an event since the read: read again, as before
+        self.pr(LA, key="pr:o/r#2")
+        self.w.cache["pr:o/r#2"]["dataAt"] = self.t - gg.LAND_REFRESH_AFTER - 1
+        events.append(self.t - 1)
+        self.land("o/r#2")
+        self.tick()
+        self.assertEqual(self.w.refreshed, ["pr:o/r#2"])
 
     def test_a_full_pin_is_judged_at_the_pin_with_no_fresh_read(self):
         """transcript-lessons (cmuxterm-hq#16805): with the quota short no read since the latch cleared ever came, so a
