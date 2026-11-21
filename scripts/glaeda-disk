@@ -13464,6 +13464,21 @@ def gap_named(accounting: list[dict[str, Any]]) -> str:
     return f" ({'; '.join(parts)})" if parts else ""
 
 
+RECEIPT_MAX_BYTES = 64 * 1024 * 1024  # a receipt file past this moves to NAME.1 (the one before it goes)
+
+
+def rotate_receipt(receipt: Path, limit: int | None = None) -> bool:
+    """Bound an append-only receipt file: past LIMIT bytes it replaces NAME.1, so two files hold at most twice the
+    limit. Readers take the tail of NAME; the older half is for a person reading back. True when it rotated."""
+    try:
+        if receipt.stat().st_size <= (RECEIPT_MAX_BYTES if limit is None else limit):
+            return False
+        os.replace(receipt, receipt.with_name(receipt.name + ".1"))
+    except OSError:
+        return False
+    return True
+
+
 def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
                             before_fs: list[dict[str, Any]], after_fs: list[dict[str, Any]],
                             before_accounting: list[dict[str, Any]],
@@ -13492,10 +13507,18 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
         "after": {"filesystems": after_fs, "accounting": after_accounting},
         "findings": list(EVICTION_STUCK),
     }
+    written = record
+    if not logical_released and not physical["reclaimed_bytes"]:
+        # A pass that freed nothing (a host under its floor runs one every few minutes) keeps the filesystems and
+        # the totals above, not the full accounting of both sides: 36 KB a line was 160 MB a day on cmux16
+        # (2026-11-20), the receipt file at 568 MB.
+        written = {**record, "slim": True,
+                   "before": {"filesystems": before_fs}, "after": {"filesystems": after_fs}}
     try:
         receipt.parent.mkdir(parents=True, exist_ok=True)
+        rotate_receipt(receipt)
         with receipt.open("a") as handle:
-            handle.write(json.dumps(record) + "\n")
+            handle.write(json.dumps(written) + "\n")
     except OSError:
         # The stdout receipt remains useful even when its requested path is unavailable.
         pass

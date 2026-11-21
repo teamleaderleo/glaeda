@@ -1562,6 +1562,28 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(summary["unchecked_bytes"], 3)
         self.assertEqual(json.loads(receipt.read_text())["before"]["filesystems"][0]["free"], 10)
 
+    def test_eviction_summary_of_a_pass_that_freed_nothing_is_slim_and_the_receipt_is_bounded(self) -> None:
+        receipt = self.root / "slim.jsonl"
+        fs = [{"dev": 1, "mount": "/data", "free": 10, "total": 20, "low": 12, "target": 15,
+               "under": True, "observed": True}]
+        accounting = [{"mount": "/data", "blocked": 7, "unchecked": 3, "accounting_gap": 4,
+                       "top_level": [{"path": "/x" * 200, "bytes": 1}] * 50}]
+        summary = gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(summary["before"]["accounting"], accounting)  # callers still get the whole record
+        line = json.loads(receipt.read_text())
+        self.assertTrue(line["slim"])
+        self.assertNotIn("accounting", line["before"])
+        self.assertEqual((line["blocked_bytes"], line["accounting_gap_bytes"]), (7, 4))
+        self.assertEqual(line["before"]["filesystems"][0]["free"], 10)
+        # a pass that freed something keeps the accounting
+        gd.write_eviction_summary(receipt, "pressure", 5, fs, fs, accounting, accounting)
+        self.assertEqual(json.loads(receipt.read_text().splitlines()[-1])["before"]["accounting"], accounting)
+        # past the limit the file moves aside once, and the next line starts a new one
+        with mock.patch.object(gd, "RECEIPT_MAX_BYTES", 10):
+            gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+        self.assertEqual(len(receipt.with_name("slim.jsonl.1").read_text().splitlines()), 2)
+
     def test_runner_profile_accounting_is_scoped_and_does_not_walk_roots_again(self) -> None:
         path = self.root / "cua-cache" / "frame.bin"
         path.parent.mkdir(parents=True)
