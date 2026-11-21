@@ -23887,7 +23887,7 @@ class LandTest(Base):
 
     def test_a_two_route_refusal_keeps_every_route_s_verdict_in_the_park_reason(self):
         """A read on the land path tries the store, GraphQL then REST, and the refusal names what each answered. The
-        park reason was trimmed flat to 300 characters, which landed inside the first clause: big-red 2026-11-21
+        park reason was trimmed flat to 300 characters, which landed inside the first clause: one lane host 2026-11-21
         12:08Z stored "... GraphQL: gh api graphql failed: ...; REST:" and stopped there, so the one clause that said
         whether REST could still serve the queue was destroyed, and no log on the host kept it. 26 of 27 rows waited
         49 min behind that reason. Every route's verdict must survive the trim; detail inside a clause goes first."""

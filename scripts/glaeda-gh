@@ -10993,7 +10993,7 @@ def land_tail(text: Any, limit: int = LAND_TEXT) -> str:
 # "GraphQL: <160 chars>; REST: <160 chars>; the store: <160 chars>" when the live reads both failed (leo-workspace
 # tools/land_judge/engine.py). Which route failed, and whether another could still answer, is the whole difference
 # between a GraphQL-only outage this host can read around and a GitHub-wide one it cannot -- and that verdict sits in
-# the clauses a head-cut drops first. big-red, 2026-11-21 12:08Z: a queue park's stored reason ended "... GraphQL: gh
+# the clauses a head-cut drops first. One lane host, 2026-11-21 12:08Z: a queue park's stored reason ended "... GraphQL: gh
 # api graphql failed: ...; REST:" and stopped there, because land_trim(text, 300) landed exactly at the start of the
 # REST clause; /rate_limit read 3873 REST left for the same login at 12:07:37Z, so the park that held 26 of 27 rows
 # (4 repos, 3 lanes) for 49 min may have been a GraphQL-only failure, and no log on the host kept what REST said
