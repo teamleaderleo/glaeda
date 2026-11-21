@@ -23874,6 +23874,87 @@ class LandTest(Base):
         self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", self.queue().queue_quota_reason)
 
+    def two_route_reason(self, at: str) -> str:
+        """A refusal of the shape land_judge's head_reds raises when both live reads failed: the prefix, then one
+        clause per route it tried, each up to 160 characters (leo-workspace tools/land_judge/engine.py). The
+        account id below is a fake."""
+        return (f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: the reds at {LA} could not "
+                "be read for base_red_excuse.py: RuntimeError: "
+                "GraphQL: gh api graphql failed: gh: API rate limit already exceeded for user ID 4242424242. "
+                "Run 'gh api rate_limit' to see the limits; "
+                f"REST: check-runs pages disagree on total_count for {LA[:12]} (page 2 of 3 says 61, page 1 said 58); "
+                f"the store: glaeda-gh holds no checks for {LA[:12]} (not read since 11:12Z)")
+
+    def test_a_two_route_refusal_keeps_every_route_s_verdict_in_the_park_reason(self):
+        """A read on the land path tries the store, GraphQL then REST, and the refusal names what each answered. The
+        park reason was trimmed flat to 300 characters, which landed inside the first clause: one lane host 2026-11-21
+        12:08Z stored "... GraphQL: gh api graphql failed: ...; REST:" and stopped there, so the one clause that said
+        whether REST could still serve the queue was destroyed, and no log on the host kept it. 26 of 27 rows waited
+        49 min behind that reason. Every route's verdict must survive the trim; detail inside a clause goes first."""
+        self.pr(LA)
+        self.land()
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        reason = self.two_route_reason(at)
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=reason))
+        e = self.tick()
+        stored = gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE)["reason"]
+        self.assertLessEqual(len(stored), 300)
+        # the defect: a flat head-cut of the same budget spends it all on the first clause, so the routes that
+        # decide whether this host could read around the failure are gone entirely
+        flat = gg.land_trim(gg.land_redact(reason), 300)
+        self.assertNotIn("check-runs pages disagree", flat)
+        self.assertNotIn("the store:", flat)
+        for route, said in (("GraphQL:", "gh api graphql failed"), ("REST:", "check-runs pages disagree"),
+                            ("the store:", "glaeda-gh holds no checks")):
+            self.assertIn(route, stored)
+            self.assertIn(said, stored)  # its label and the words that name the cause, not only the label
+        self.assertIn(f"retry after {at}Z", stored)  # the reset the park is held until still reads
+        # one construction, so every surface of that one stored reason shows the same routes (`land status`'s header
+        # at 200, the pool line at 160): a second cut must not throw away what the first kept
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.cmd_land_status(None, False)
+        line = out.getvalue()
+        self.q.now = self.t
+        self.q.pool_logged = float("-inf")
+        with mock.patch.object(gg, "log") as logged:
+            self.q.log_pool()
+        pool = [c.args[0] for c in logged.call_args_list if c.args and c.args[0].get("event") == "land-pool"]
+        for shown in (line, pool[0]["queueParked"]["reason"]):
+            for route in ("GraphQL:", "REST:", "the store:"):
+                self.assertIn(route, shown, shown)
+        self.assertNotIn("4242424242", json.dumps([stored, line, pool[0]]))
+
+    def test_a_two_route_refusal_keeps_every_route_s_verdict_in_a_stopped_row(self):
+        """The same text is stored and said again when a row stops: the entry's cause (400), its history line (160)
+        and the message its requester gets (300) are all cut from one reason, so all three keep every route."""
+        at = time.strftime("%H:%M:%S", time.gmtime(self.t + 1800))
+        reason = gg.land_redact(self.two_route_reason(at))
+        for limit in (400, 300, 200, 160):
+            got = gg.land_reason(reason, limit)
+            self.assertLessEqual(len(got), limit)
+            for route in ("GraphQL:", "REST:", "the store:"):
+                self.assertIn(route, got, f"{limit}: {got}")
+        # a surface trims what another already trimmed (the park is stored at 300 and shown at 160): the clauses
+        # must still be findable in the trimmed text, or the second cut throws away what the first kept
+        twice = gg.land_reason(gg.land_reason(reason, 300), 160)
+        self.assertEqual(twice, gg.land_reason(gg.land_reason(reason, 300), 160))
+        for route in ("GraphQL:", "REST:", "the store:"):
+            self.assertIn(route, twice, twice)
+
+    def test_a_reason_naming_one_route_is_trimmed_exactly_as_before(self):
+        """Only a reason reporting two or more routes is shared out: everything else keeps land_trim's answer, so no
+        existing message changes shape. A budget too small for every clause to keep its label falls back too."""
+        one = "graphql: HTTP 502: " + "the rollup read closed while reading page 2 of the check suites. " * 8
+        self.assertEqual(gg.land_reason(one, 160), gg.land_trim(one, 160))
+        self.assertEqual(gg.land_reason("", 160), "")
+        self.assertEqual(gg.land_reason(None, 160), "")
+        self.assertEqual(gg.land_reason("a short reason", 160), "a short reason")
+        both = gg.land_redact(self.two_route_reason("09:00:00"))
+        self.assertEqual(gg.land_reason(both, 40), gg.land_trim(both, 40))  # no room for four labels: flat
+        self.assertEqual(gg.land_reason(both, len(both) + 10), both)  # it fits: untouched
+        self.assertEqual(gg.land_reason(" a reason\n  on two lines ", 160), "a reason on two lines")
+
     def test_a_parked_queue_still_logs_its_pool_line(self):
         """While parked the tick returned before log_pool: 06:51Z to 08:44Z had two land-pool lines, none naming why."""
         self.pr(LA)
