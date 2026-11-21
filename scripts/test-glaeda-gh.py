@@ -30184,6 +30184,20 @@ class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
                          ["next: glaeda-gh post comment o/r#1 --status-key k",
                           "next: glaeda-gh post pr o/r#1 --title t"])
 
+    def test_a_help_text_naming_its_kind_in_the_plural_scopes_the_same(self) -> None:
+        """Review of #2381, F5: `wait`'s own help says `comments:`, `runs:` and `PRs:`, so a scope read as
+        the exact word missed every one of them and only `--exists`, `--gone` and `--contains` (`file:`)
+        ever narrowed a `wait` call. A kind named in whatever number and case reads well there is that
+        kind."""
+        node = gg.child_parser(gg.parser(), "wait")
+        scoped = gg.kind_scoped_options(node, gg.first_slot_words(node))
+        self.assertEqual(scoped.get("--author"), frozenset({"comment"}))
+        self.assertEqual(scoped.get("--jobs"), frozenset({"run"}))
+        self.assertEqual(scoped.get("--settle"), frozenset({"pr"}))
+        self.assertEqual(gg.doubled_kind_synonym(["wait", "pr", "comment", "o/r#1", "--author", "bot"]),
+                         (["wait", "comment", "o/r#1", "--author", "bot"], []))
+        self.assertIn("`--author` is comment's", self.err.getvalue())
+
     def test_the_whole_call_refuses_and_nothing_is_posted(self) -> None:
         """A write it cannot read is a usage error, with no request queued: the exit code argparse already
         has for one, and `post_item` never reached."""

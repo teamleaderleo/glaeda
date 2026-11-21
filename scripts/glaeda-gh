@@ -26463,11 +26463,16 @@ def kind_scoped_options(p: argparse.ArgumentParser, kinds: list[str]) -> dict[st
         lead, found, _ = (action.help or "").partition(":")
         if not found:
             continue
-        named = [word for word in re.split(r",\s*|\s+or\s+|\s+", lead.strip()) if word]
-        if named and set(named) <= set(kinds):
+        # A help text names a kind in whatever number and case reads well there -- `wait`'s own options say
+        # `comments:`, `runs:` and `PRs:` -- and that is still the kind it scopes to (review of #2381, F5:
+        # before this, only `--exists`, `--gone` and `--contains` ever narrowed a `wait` call).
+        spelled = {kind.lower().rstrip("s"): kind for kind in kinds}
+        named = [spelled.get(word.lower().rstrip("s")) for word in re.split(r",\s*|\s+or\s+|\s+", lead.strip())
+                 if word]
+        if named and all(named):
             for option in action.option_strings:
                 if option.startswith("--"):
-                    out[option] = frozenset(named)
+                    out[option] = frozenset(word for word in named if word is not None)
     return out
 
 
