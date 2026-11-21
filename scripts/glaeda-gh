@@ -24717,8 +24717,32 @@ def body_guard_refusal(item: dict) -> str | None:
             os.unlink(name)
 
 
+# A host that reads GitHub through an upstream (UPSTREAM_CONFIG) has no login of its own, so the daemon fails
+# every queued write with "this host reads GitHub through its upstream and has no login to post with"
+# (upstream_refuse_posts). Accepting it first costs the caller a whole turn and a `post status` read to learn that
+# (gcp-agent-lane-2, 2026-11-21: three comments were believed queued for an hour, then all three had failed). The
+# refusal happens where the caller is: at accept time, naming the write that does work here.
+def no_login_refusal(item: dict) -> str | None:
+    if upstream_command() is None:
+        return None
+    repo = item.get("repo") or "OWNER/REPO"
+    if item.get("kind") == "pr":
+        hand = f"gh pr create --repo {repo} --title T --body-file F"
+    elif item.get("kind") == "review":
+        hand = f"gh pr review {item.get('number')} --repo {repo} --body-file F"
+    else:
+        hand = f"gh pr comment {item.get('number')} --repo {repo} --body-file F"
+    return (f"this host reads GitHub through its upstream ({UPSTREAM_CONFIG}) and has no login to post with; "
+            f"nothing was queued. Write it with gh, which routes through this host's broker: {hand} "
+            f"(--repo is not optional: without it gh reads the repository of the directory you stand in)")
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
+    why = no_login_refusal(item)
+    if why:
+        print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
+        return 3
     try:
         why = body_guard_refusal(item)
     except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
