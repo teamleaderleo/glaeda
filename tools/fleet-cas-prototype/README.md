@@ -28,6 +28,21 @@ semantics used by the trusted writer marker gate; `write_expected_refused`
 separately identifies the deliberate KV write response from a
 `--read-only-kv` reader node.
 
+`GET /stats` on the same port (HTTP/1.1 beside gRPC: `curl -fsS
+http://<addr>/stats`, or `curl --unix-socket <socket> http://x/stats` on a
+node) serves JSON (`schema: fleet-cas-stats/v1`): `role`, `uptime_s`,
+`starts`, `writers` (a store's `--writers`, null on a node), `windows` (`5m`,
+`1h`, `24h`: `kv_hits`, `kv_misses`, `cas_hits`, `cas_misses`, `puts`,
+`errors`, `write_refused`, bytes, `requests`, `hit_rate`, `kv_hit_rate`;
+rates are null with no lookups), `lifetime` and the raw `counters` of
+`stats.json`. The windows come from per-minute buckets kept for 24 h in
+`<store>/stats-history.txt` (written every minute and at shutdown), so a
+restart keeps them; the raw counters restart at 0 (`instance` changes). On
+2026-11-20/21 the store was down ~21 h and nothing on the network could say
+so: no answer from `/stats` is a down store, and a low 1 h `kv_hit_rate`
+over enough `requests` is a cold or broken one (leo-workspace NOW scrapes
+it and pushes an alarm).
+
 One binary plays two roles:
 
 - **Fleet store**: `fleet-cas tcp:<addr> <store>` serves the same two services

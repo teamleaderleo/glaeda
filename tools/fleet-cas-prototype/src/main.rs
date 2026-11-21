@@ -42,6 +42,7 @@ pub mod fleet {
 mod gc;
 mod sign;
 mod warm;
+mod window;
 
 #[derive(Default)]
 struct Stats {
@@ -65,6 +66,8 @@ struct Stats {
     /// `--read-only-kv`. These are expected for reader nodes and remain part
     /// of `write_failed` for the strict writer marker gate.
     write_expected_refused: AtomicU64,
+    /// Lookups answered with an error (a local read failed).
+    read_errors: AtomicU64,
     /// Identifies this process, so a reader of stats.json can tell that the
     /// counters restarted from 0.
     instance: AtomicU64,
@@ -208,6 +211,7 @@ impl Stats {
             ("write_refused", &self.write_refused),
             ("write_failed", &self.write_failed),
             ("write_expected_refused", &self.write_expected_refused),
+            ("read_errors", &self.read_errors),
             ("instance", &self.instance),
             ("bytes_in", &self.bytes_in),
             ("bytes_out", &self.bytes_out),
@@ -241,6 +245,24 @@ impl Stats {
             .join(",");
         body.push(format!("\"upstream_operations\":{{{operations}}}"));
         format!("{{{}}}", body.join(","))
+    }
+
+    /// The counters `window::History` keeps over time, in `window::KEYS`
+    /// order. Errors are failed writes, failed lookups and failed calls to
+    /// the fleet store (a node's; a store makes none).
+    fn window_counts(&self) -> window::Counts {
+        let v = |c: &AtomicU64| c.load(Relaxed);
+        [
+            v(&self.kv_get_hit),
+            v(&self.kv_get_miss),
+            v(&self.cas_get_hit),
+            v(&self.cas_get_miss),
+            v(&self.cas_put) + v(&self.kv_put),
+            v(&self.write_failed) + v(&self.read_errors) + v(&self.up_errors),
+            v(&self.write_refused),
+            v(&self.bytes_in),
+            v(&self.bytes_out),
+        ]
     }
 
     /// Time one call to the fleet store.
@@ -675,6 +697,14 @@ impl Store {
 }
 
 impl Store {
+    /// Count a lookup that failed (not a miss: the answer is an error).
+    fn counted_read<T>(&self, r: Result<T, Status>) -> Result<T, Status> {
+        if r.is_err() {
+            self.stats.read_errors.fetch_add(1, Relaxed);
+        }
+        r
+    }
+
     fn upstream_backing_off(&self, operation: UpstreamOperation) -> bool {
         let skip = now_ms() < self.upstream_down_until.load(Relaxed);
         if skip {
@@ -1014,7 +1044,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasGetRequest>,
     ) -> Result<Response<cas::CasGetResponse>, Status> {
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.get_or_fetch(&id).await? {
+        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
             Some(obj) => cas::CasGetResponse {
                 outcome: cas::cas_get_response::Outcome::Success as i32,
                 contents: Some(cas::cas_get_response::Contents::Data(obj)),
@@ -1054,7 +1084,7 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasLoadRequest>,
     ) -> Result<Response<cas::CasLoadResponse>, Status> {
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.get_or_fetch(&id).await? {
+        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
             Some(obj) => cas::CasLoadResponse {
                 outcome: cas::cas_load_response::Outcome::Success as i32,
                 contents: Some(cas::cas_load_response::Contents::Data(cas::CasBlob {
@@ -1116,7 +1146,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Status::internal(e.to_string())),
+            Err(e) => return s.counted_read(Err(Status::internal(e.to_string()))),
         }
         s.stats.kv_get_miss.fetch_add(1, Relaxed);
         let Some(up) = s.readable_upstream(UpstreamOperation::KvGet) else {
@@ -1589,17 +1619,37 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         key_log,
     });
 
-    let stats_store = store.clone();
+    let monitor = Arc::new(Monitor {
+        store: store.clone(),
+        history: std::sync::Mutex::new(window::History::load(&root, now_ms())),
+        role: if listen.starts_with("tcp:") {
+            "store"
+        } else if store.sign_key.is_some() {
+            "writer"
+        } else {
+            "node"
+        },
+        listen: listen.clone(),
+        started_ms: now_ms(),
+    });
+    monitor.save();
+    let stats_monitor = monitor.clone();
     let stats_path = root.join("stats.json");
     tokio::spawn(async move {
         let mut last = String::new();
+        let mut saved = Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let line = stats_store.stats.line();
+            let line = stats_monitor.store.stats.line();
             if line != last {
                 // Atomically, so a reader never sees a half-written file.
                 let _ = write_atomic(&stats_path, line.as_bytes());
                 last = line;
+            }
+            stats_monitor.sample();
+            if saved.elapsed() >= HISTORY_SAVE_EVERY {
+                stats_monitor.save();
+                saved = Instant::now();
             }
         }
     });
@@ -1620,22 +1670,15 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             .map_or("no".into(), |k| hex::encode(k.verifying_key().as_bytes()))
     );
     let final_store = store.clone();
+    let final_monitor = monitor.clone();
+    // HTTP/1 too, for `GET /stats` (curl http://ADDR/stats, or
+    // --unix-socket on a node); gRPC clients keep speaking HTTP/2.
     let router = tonic::transport::Server::builder()
+        .accept_http1(true)
         .tcp_nodelay(true)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
-        .add_service(
-            cas::casdb_service_server::CasdbServiceServer::new(CasSvc(store.clone()))
-                .max_decoding_message_size(512 << 20)
-                .max_encoding_message_size(512 << 20),
-        )
-        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(
-            store.clone(),
-        )))
-        .add_service(
-            fleet::fleet_cas_server::FleetCasServer::new(FleetSvc(store))
-                .max_encoding_message_size(512 << 20),
-        );
+        .add_routes(tonic::service::Routes::from(app(store, monitor)));
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -1653,8 +1696,112 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
             .await?;
     }
+    final_monitor.sample();
+    final_monitor.save();
     eprintln!("{}", final_store.stats.line());
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// How often the windowed history is written to disk (and at shutdown): a
+/// crash loses at most this much of it.
+const HISTORY_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The gRPC services and `GET /stats`.
+fn app(store: Arc<Store>, monitor: Arc<Monitor>) -> axum::Router {
+    let mut routes = tonic::service::Routes::builder();
+    routes
+        .add_service(
+            cas::casdb_service_server::CasdbServiceServer::new(CasSvc(store.clone()))
+                .max_decoding_message_size(512 << 20)
+                .max_encoding_message_size(512 << 20),
+        )
+        .add_service(kv::key_value_db_server::KeyValueDbServer::new(KvSvc(
+            store.clone(),
+        )))
+        .add_service(
+            fleet::fleet_cas_server::FleetCasServer::new(FleetSvc(store))
+                .max_encoding_message_size(512 << 20),
+        );
+    routes.routes().into_axum_router().route(
+        "/stats",
+        axum::routing::get(move || {
+            let m = monitor.clone();
+            async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    m.json(),
+                )
+            }
+        }),
+    )
+}
+
+/// What `GET /stats` serves: this process's role and configuration, and its
+/// request counters over 5 min, 1 h and 24 h windows kept across restarts
+/// (`window.rs`). The scraper's contract (leo-workspace NOW):
+/// `windows["1h"].kv_hit_rate` and `windows["1h"].requests`, `uptime_s`,
+/// `writers`.
+struct Monitor {
+    store: Arc<Store>,
+    history: std::sync::Mutex<window::History>,
+    role: &'static str,
+    listen: String,
+    started_ms: u64,
+}
+
+impl Monitor {
+    fn history(&self) -> std::sync::MutexGuard<'_, window::History> {
+        self.history.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sample(&self) {
+        let current = self.store.stats.window_counts();
+        self.history().sample(&current, now_ms());
+    }
+
+    fn save(&self) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if let Err(e) = self.history().save() {
+            if !WARNED.swap(true, Relaxed) {
+                eprintln!("fleet-cas: cannot write {}: {e}", window::HISTORY_FILE);
+            }
+        }
+    }
+
+    fn json(&self) -> String {
+        let now = now_ms();
+        let current = self.store.stats.window_counts();
+        let h = self.history();
+        let writers = match &self.store.writers {
+            None => "null".to_string(),
+            Some(w) => format!(
+                "[{}]",
+                w.iter()
+                    .map(|ip| window::quote(&ip.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
+        let trusted = self
+            .store
+            .trusted
+            .as_ref()
+            .map_or("null".to_string(), |k| k.len().to_string());
+        format!(
+            "{{\"schema\":\"fleet-cas-stats/v1\",\"role\":{},\"listen\":{},\"now_ms\":{now},\"started_ms\":{},\"uptime_s\":{},\"history_started_ms\":{},\"starts\":{},\"writers\":{writers},\"trusted_keys\":{trusted},\"read_only_kv\":{},\"upstream\":{},\"windows\":{},\"lifetime\":{},\"counters\":{}}}",
+            window::quote(self.role),
+            window::quote(&self.listen),
+            self.started_ms,
+            now.saturating_sub(self.started_ms) / 1000,
+            h.first_started_ms,
+            h.starts,
+            self.store.read_only_kv,
+            self.store.upstream.is_some(),
+            window::windows_json(&h, &current, now),
+            window::counts_json(&h.lifetime_with(&current)),
+            self.store.stats.line(),
+        )
+    }
 }
 
 #[cfg(test)]
