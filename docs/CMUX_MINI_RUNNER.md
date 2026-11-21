@@ -329,6 +329,14 @@ What `--apply` does:
      When its schema and run identity match, the completed line embeds a bounded `compile`
      object with cacheable tasks, hits, misses, hit rate, seed distance, compile, fetch and
      link seconds. Malformed or stale sidecars are ignored and removed by the job.
+   - Per-job scratch (opt-in, off by default): with `GLAEDA_JOB_SCRATCH=1` in the runner's
+     environment, an admitted job gets a sparse APFS image (`hdiutil`, no root, cap
+     `GLAEDA_JOB_SCRATCH_SIZE`, default `220g`) mounted at
+     `/Users/Shared/cmux-build-fleet/job-scratch/<runner>/job-<run id>-<attempt>`, and later
+     steps get `TMPDIR=<mount>/tmp` and `CMUX_JOB_SCRATCH=<mount>` through `$GITHUB_ENV`.
+     job-completed (after the job's leftover processes end) detaches it and deletes the image;
+     job-started first drops any stale entry in this runner's own directory and, if one cannot
+     be dropped, runs the job without scratch. Every failure is a hook line, never a failed job.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
      (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
      under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, ends this runner's

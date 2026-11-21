@@ -13665,6 +13665,199 @@ def command_table() -> dict[int, str]:
     return {pid: command for pid, (_ppid, command) in processes().items()}
 
 
+# JOB_SCRATCH (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 1; Leo, 2026-11-21: "man glaeda needs to be
+# more aggressive... again!", then on the design: "oh yeah that makes sense. i guess it's aboute seeing if we can
+# detect deletable before vs deciding after. this seems good."). A job's scratch lives on a disk that exists only for
+# that job: job-started attaches a sparse APFS image (hdiutil, no root; cmuxterm-hq build-fleet/internal/jobvolume's
+# shape) at JOB_SCRATCH_DIR/<runner>/job-<run id>-<attempt> and points the job's TMPDIR into it through $GITHUB_ENV;
+# job-completed detaches it and deletes the image, so nothing the job wrote there outlives it. The mount is never the
+# runner's _work: the runner writes _work/_actions and _work/_temp before the hook runs.
+#
+# Opt-in: GLAEDA_JOB_SCRATCH=1 in the runner's environment (LaunchAgent or the runner's .env); unset or anything else
+# is off, and the hook does nothing here. Everything is best effort: a failure is logged, never fails the job, and a
+# failed create leaves the job with no scratch, as before. Ownership is the runner's own directory: a runner runs one
+# job at a time, so every entry under JOB_SCRATCH_DIR/<this runner> is this runner's and none is live while its
+# job-started or job-completed hook runs. Another runner's directory is never read.
+JOB_SCRATCH_ENV = "GLAEDA_JOB_SCRATCH"
+JOB_SCRATCH_SIZE_ENV = "GLAEDA_JOB_SCRATCH_SIZE"
+JOB_SCRATCH_SIZE = "220g"  # the cap (sparse: allocation follows writes), jobvolume's default
+JOB_SCRATCH_DIR = Path(FLEET_DIR) / "job-scratch"
+JOB_SCRATCH_EXPORT = "CMUX_JOB_SCRATCH"
+HDIUTIL = "/usr/bin/hdiutil"
+HDIUTIL_TIMEOUT_S = 60
+HDIUTIL_ENV = {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+JOB_SCRATCH_ENTRY = re.compile(r"job-[0-9]{1,20}-[0-9]{1,8}")
+JOB_SCRATCH_RUNNER = re.compile(r"[A-Za-z0-9._-]{1,64}")
+JOB_SCRATCH_SIZE_RE = re.compile(r"[1-9][0-9]{0,6}[mMgGtT]")
+
+
+def job_scratch_on(env: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if env is None else env).get(JOB_SCRATCH_ENV, "") == "1"
+
+
+def job_scratch_runner_dir(env: Mapping[str, str] | None = None, base: Path | None = None) -> Path | None:
+    """This runner's own scratch directory, or None when RUNNER_NAME is missing or not a plain name."""
+    name = (os.environ if env is None else env).get("RUNNER_NAME", "")
+    if not JOB_SCRATCH_RUNNER.fullmatch(name) or name in (".", ".."):
+        return None
+    return (JOB_SCRATCH_DIR if base is None else base) / name
+
+
+def job_scratch_id(env: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if env is None else env
+    entry = f"job-{env.get('GITHUB_RUN_ID', '')}-{env.get('GITHUB_RUN_ATTEMPT') or '1'}"
+    return entry if JOB_SCRATCH_ENTRY.fullmatch(entry) else None
+
+
+def hdiutil(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run([HDIUTIL, *argv], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=HDIUTIL_TIMEOUT_S, check=False, env=dict(HDIUTIL_ENV))
+
+
+def job_scratch_mounted(path: Path) -> bool:
+    return os.path.ismount(path)
+
+
+def job_scratch_drop(image: Path, mount: Path) -> str | None:
+    """Detach one entry's mount and delete its image; None when both are gone, else why not. Never walks or deletes
+    a tree: the mount directory is removed only empty (rmdir), the image only as a regular file."""
+    try:
+        mount_stat = os.lstat(mount)
+    except FileNotFoundError:
+        mount_stat = None
+    except OSError as error:
+        return f"{mount.name}: {error.strerror or error}"
+    if mount_stat is not None:
+        if not stat.S_ISDIR(mount_stat.st_mode):
+            return f"{mount.name}: not a directory, left alone"
+        if job_scratch_mounted(mount):
+            try:
+                out = hdiutil("detach", "-force", os.fspath(mount))
+            except (OSError, subprocess.SubprocessError) as error:
+                return f"{mount.name}: hdiutil detach failed: {error}"
+            if job_scratch_mounted(mount):
+                return (f"{mount.name}: still mounted after hdiutil detach (exit {out.returncode}: "
+                        f"{(out.stderr or out.stdout or '').strip()[:200]})")
+        try:
+            os.rmdir(mount)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            return f"{mount.name}: mount directory not removed: {error.strerror or error}"
+    try:
+        image_stat = os.lstat(image)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"{image.name}: {error.strerror or error}"
+    if not stat.S_ISREG(image_stat.st_mode):
+        return f"{image.name}: not a regular file, left alone"
+    try:
+        os.unlink(image)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"{image.name}: not deleted: {error.strerror or error}"
+    return None
+
+
+def job_scratch_reap(runner_dir: Path) -> tuple[list[str], list[str]]:
+    """Every scratch entry in this runner's own directory: (dropped, left with why). Names that are not ours
+    (job-<run>-<attempt>[.sparseimage]) are left alone and reported."""
+    try:
+        names = sorted(os.listdir(runner_dir))
+    except FileNotFoundError:
+        return [], []
+    except OSError as error:
+        return [], [f"{runner_dir}: {error.strerror or error}"]
+    entries: list[str] = []
+    left: list[str] = []
+    for name in names:
+        entry = name[:-len(".sparseimage")] if name.endswith(".sparseimage") else name
+        if not JOB_SCRATCH_ENTRY.fullmatch(entry):
+            left.append(f"{name}: not a job scratch entry, left alone")
+        elif entry not in entries:
+            entries.append(entry)
+    dropped = []
+    for entry in entries:
+        why = job_scratch_drop(runner_dir / f"{entry}.sparseimage", runner_dir / entry)
+        if why:
+            left.append(why)
+        else:
+            dropped.append(entry)
+    return dropped, left
+
+
+def job_scratch_reap_note(runner_dir: Path, dropped: list[str], left: list[str]) -> str | None:
+    parts = []
+    if dropped:
+        parts.append(f"job scratch: dropped {len(dropped)} volume(s) in {runner_dir}: {', '.join(dropped)[:300]}")
+    if left:
+        parts.append(f"job scratch: left {len(left)} in {runner_dir}: {'; '.join(left)[:600]}")
+    return "; ".join(parts) or None
+
+
+def job_scratch_start(env: Mapping[str, str] | None = None, base: Path | None = None,
+                      darwin: bool | None = None) -> list[str]:
+    """job-started, after admission: reap this runner's stale scratch, then attach this job's and export TMPDIR and
+    CMUX_JOB_SCRATCH to later steps. Off (no flag) does nothing and says nothing; any failure is a note, no scratch."""
+    env = os.environ if env is None else env
+    if not job_scratch_on(env):
+        return []
+    if not (sys.platform == "darwin" if darwin is None else darwin):
+        return ["job scratch: skipped: needs macOS hdiutil"]
+    runner_dir = job_scratch_runner_dir(env, base)
+    entry = job_scratch_id(env)
+    if runner_dir is None or entry is None:
+        return ["job scratch: skipped: no plain RUNNER_NAME, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT"]
+    size = env.get(JOB_SCRATCH_SIZE_ENV) or JOB_SCRATCH_SIZE
+    if not JOB_SCRATCH_SIZE_RE.fullmatch(size):
+        return [f"job scratch: skipped: {JOB_SCRATCH_SIZE_ENV}={size[:40]!r} is not a size like 220g"]
+    notes = []
+    dropped, left = job_scratch_reap(runner_dir)
+    if reaped := job_scratch_reap_note(runner_dir, dropped, left):
+        notes.append(reaped)
+    if left:  # at most one stale volume per runner: never stack a new one on one we could not drop
+        return notes + ["job scratch: skipped: this runner's stale scratch is still there"]
+    image, mount = runner_dir / f"{entry}.sparseimage", runner_dir / entry
+    try:
+        runner_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        out = hdiutil("create", "-quiet", "-type", "SPARSE", "-fs", "APFS", "-size", size,
+                      "-volname", f"cmux-job-{runner_dir.name}-{entry[4:]}"[:63], os.fspath(image))
+        if out.returncode != 0:
+            raise RuntimeError(f"hdiutil create exit {out.returncode}: "
+                               f"{(out.stderr or out.stdout or '').strip()[:300]}")
+        mount.mkdir(mode=0o700)
+        out = hdiutil("attach", "-nobrowse", "-owners", "on", "-plist", "-mountpoint", os.fspath(mount),
+                      os.fspath(image))
+        if out.returncode != 0 or not job_scratch_mounted(mount):
+            raise RuntimeError(f"hdiutil attach exit {out.returncode}, mounted {job_scratch_mounted(mount)}: "
+                               f"{(out.stderr or '').strip()[:300]}")
+        tmp = mount / "tmp"
+        tmp.mkdir(mode=0o700)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        why = job_scratch_drop(image, mount)
+        return notes + [f"job scratch: none for this job: {error}" + (f"; cleanup: {why}" if why else "")]
+    notes.append(f"job scratch: {mount} ({size} cap, sparse image {image.name}); "
+                 f"{export_job_env('TMPDIR', os.fspath(tmp), 'glaeda-job-tmpdir')}; "
+                 f"{export_job_env(JOB_SCRATCH_EXPORT, os.fspath(mount), 'glaeda-job-scratch')}")
+    return notes
+
+
+def job_scratch_end(env: Mapping[str, str] | None = None, base: Path | None = None,
+                    darwin: bool | None = None) -> list[str]:
+    """job-completed, after the job's leftover processes are ended: drop every scratch volume of this runner."""
+    env = os.environ if env is None else env
+    if not job_scratch_on(env) or not (sys.platform == "darwin" if darwin is None else darwin):
+        return []
+    runner_dir = job_scratch_runner_dir(env, base)
+    if runner_dir is None:
+        return []
+    dropped, left = job_scratch_reap(runner_dir)
+    note = job_scratch_reap_note(runner_dir, dropped, left)
+    return [note] if note else []
+
+
 def cleanup_job_leftovers(work: str | None = None) -> list[str]:
     """job-completed: end processes left running from this runner's _work. Each pid is signalled only while
     its command is unchanged, so a reused pid is never hit."""
@@ -14785,6 +14978,9 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(testmanagerd)
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        with contextlib.suppress(Exception):  # JOB_SCRATCH: best effort, never fails an admitted job
+            for scratch in job_scratch_start():
+                print(f"{PREFIX}: {scratch}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
@@ -14841,6 +15037,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)
+        with contextlib.suppress(Exception):  # JOB_SCRATCH: its processes are ended; drop its volume
+            for note in job_scratch_end():
+                print(f"{PREFIX}: {note}", flush=True)
         if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
             print(f"{PREFIX}: {borrowed}", flush=True)
         worker = args.watch_pid or current_worker
