@@ -1095,7 +1095,8 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
-  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
+  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
+parents(first: 1) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
@@ -3764,9 +3765,26 @@ def null_contexts_error(count: int) -> str:
     return f"graphql: {count} check context{'s' if count != 1 else ''} came back null (a partial rollup)"
 
 
+def pr_head_parent(node: dict, commits: list) -> str:
+    """The first parent of the PR's head commit as the read gave it (40 hex, lowercase), or "" when this read does not
+    say. Only the head commit's own parent is taken: commits(last: 1) is the head commit, and its oid is checked
+    against headRefOid, so a read whose commit list lags the head (or a REST read, which carries no parents) says
+    nothing rather than naming another commit's parent. A first parent is what proves a merge commit was made on top
+    of a known head: land's pin follows the merge its own update-branch made (LandQueue.pin_follow)."""
+    commit = (commits[0] if commits else {}) or {}
+    oid = str(commit.get("oid") or "").lower()
+    head = str(node.get("headRefOid") or "").lower()
+    if not oid or not head or oid != head:
+        return ""
+    parents = ((commit.get("parents") or {}).get("nodes") or [])
+    first = str(((parents[0] if parents else {}) or {}).get("oid") or "").lower()
+    return first if SHA40.fullmatch(first) else ""
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
+    head_parent = pr_head_parent(node, commits)
     contexts = rollup.get("contexts") or {}
     latest: dict[str, tuple[tuple, dict]] = {}
     superseded: list[dict] = []  # replaced by a newer attempt or run; GitHub's rollup still counts them
@@ -3850,6 +3868,7 @@ def parse_pr(node: dict) -> dict:
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeCommit": node.get("mergeCommit"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
+        **({"headParent": head_parent} if head_parent else {}),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
@@ -10398,6 +10417,9 @@ LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends 
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
+# parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
+LAND_PIN_PARENT_WAIT = 300.0
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -11683,6 +11705,7 @@ class LandQueue:
             e.pop("pinSince", None)
         e.pop("pinWait", None)
         e.pop("pinSeen", None)
+        e.pop("pinFollow", None)  # a re-request decides its own pin: no earlier head's parent wait
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -12727,6 +12750,8 @@ class LandQueue:
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
+                    if self.pin_follow(e, head, data):
+                        return  # the new head's first parent is not read yet: not judged on it
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
@@ -12780,6 +12805,55 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def pin_follow(self, e: dict, head: str, data: dict) -> bool:
+        """E's pin follows HEAD when HEAD is the merge commit this queue's own update-branch just made on top of the
+        pinned head. True while the read does not yet say HEAD's first parent, so nothing is judged on a head whose
+        provenance is unread (LAND_PIN_PARENT_WAIT bounds that wait; past it the pin stops the row as it always did).
+
+        The daemon moved the head itself: judged tip_merge, ran update_branch at the pinned head, and GitHub made a
+        merge commit, so on the next tick the head is not the pin and judge stops the row head_moved -- a refusal built
+        from a state transition the refuser performed. manaflow-ai/cmux#48445, 2026-11-21: `step exit=0 kind=
+        update_branch` at 13:05:45Z, then "the head is 5ac37fd9debf, not the --sha ae9916f4e43f it was queued for";
+        5ac37fd9debf is "Merge branch 'feat-cmux-next' into lane/base-red-16" and its first parent is ae9916f4e43f,
+        the pin. The row sat stopped until a person read the trace, read the new head from GitHub and re-queued it.
+
+        Only that commit is followed, and land_pin_merged is the whole safety argument: the new head's first parent is
+        the pin, and the update-branch was sent pinned (expected_head_sha) to that same commit. Any other head -- a
+        push, a force-push, a merge made on top of something else -- still stops head_moved, unchanged. The pin the
+        merge is made with follows too, so the pinned merge still refuses a head nobody judged."""
+        pin = str(e.get("pinSha") or "")
+        if not pin or not land_head_moved(pin, head):
+            return False  # unpinned, or the head still is the pin: nothing to follow
+        parent = str((data or {}).get("headParent") or "").lower()
+        sent = str(((e.get("updateSent") or {}).get("head")) or "").lower() or str(e.get("preStepHead") or "").lower()
+        if land_pin_merged(pin, parent, sent):
+            e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
+            e.pop("pinFollow", None)
+            # The trace reads as its own safety argument: the old pin, the new head, and the first parent that matched.
+            self.history(e, "pin_followed", was=pin[:12], head=head[:12], parent=parent[:12], step="update_branch")
+            self.save(e)
+            return False
+        if parent or not SHA40.fullmatch(head):
+            e.pop("pinFollow", None)
+            return False  # a parent that is not the pin: judge's head_moved stops it, as it always did
+        # "the first parent could not be read" is not "the head moved": wait for a read that says it, then decide.
+        w = e.get("pinFollow")
+        if not isinstance(w, dict) or w.get("head") != head:
+            w = e["pinFollow"] = {"head": head, "since": self.now}
+            self.history(e, "pin_parent_wait", pin=pin[:12], head=head[:12])
+            self.nudge(e["key"])
+            self.save(e)
+            return True
+        if self.now - float(w.get("since") or 0) >= LAND_PIN_PARENT_WAIT:
+            e.pop("pinFollow", None)
+            self.history(e, "pin_parent_unread", head=head[:12])
+            return False  # no read said this head's parent in time: the pin stops the row as it always did
+        if self.now - float(w.get("nudgedAt") or 0) >= NUDGE_MIN:
+            w["nudgedAt"] = self.now
+            self.nudge(e["key"])
+            self.save(e)
+        return True
 
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
         """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
@@ -14285,6 +14359,17 @@ def land_full_pin(e: dict) -> str:
 def land_head_moved(pin: str, head: str) -> bool:
     """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
     return bool(pin and head) and not head.lower().startswith(pin)
+
+
+def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
+    """True when a new head is safe for E's pin to follow: PARENT, the new head's first parent, is the pinned PIN, and
+    SENT, the head the queue's own update-branch was pinned to (expected_head_sha), is that same commit. GitHub makes
+    update-branch a merge commit on the head branch whose first parent is the branch tip it was pinned to, so a first
+    parent that is the pin proves the pinned content is still exactly what is being merged, with only the base added.
+    Anything else -- a push, a force-push, an unrelated commit, a merge made on top of something else -- is False, and
+    the pin stops the row (head_moved) as it always did. An empty PARENT (a read that does not say) is False: a parent
+    that could not be read is not a parent that matched."""
+    return bool(pin) and not land_head_moved(pin, parent) and bool(sent) and not land_head_moved(pin, sent)
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:
