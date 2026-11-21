@@ -20,6 +20,13 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    "latest". `release.json` also carries a hash-attested policy derived from the exact first-parent
    diff: docs/tests are low risk, ordinary runtime changes are normal risk, and updater, installer,
    runner, release, security, persistence, rollback, or ambiguous changes are high risk.
+
+   The Rust binaries (glaeda, glaeda-worktree-reclaim, fleet-cas) are built once per Rust inputs, not once
+   per push: an actions/cache entry keyed on each set's tracked input blobs, the target and `rustc -Vv`
+   (`scripts/release_build_cache.py`) holds them, so a push that changes only scripts or docs, most of them,
+   reuses the bytes an earlier release built and skips cargo. A hit is used only when the binaries' cargo
+   dep-info names no checkout file the key missed; a changed set builds, with its dependencies restored from
+   a cache keyed on the lock files. Only `main` writes these entries.
 2. **Canary.** The same workflow points `canary.json` at the new release, but only if the new
    commit descends from the current canary, so a slow build never moves canary backwards.
    The `ota-channels` release holds the only mutable files, each with one writer:
@@ -265,6 +272,7 @@ gh workflow run mirror.yml --repo manaflow-ai/glaeda                      # copy
 gh workflow run sync-main.yml --repo teamleaderleo/glaeda                 # sync main both ways now
 gh release download ota-channels --repo teamleaderleo/glaeda -p '*.json' -D /tmp/ota   # what each ring runs
 glaeda-update --status                     # on a host: ring, current, previous, quarantined
+glaeda-update --apply --now                # on one host: the full update now, without waiting for the probe
 tail ~/Library/Logs/glaeda-update.jsonl    # macOS; ~/.local/state/glaeda-update.jsonl on Linux
 ```
 

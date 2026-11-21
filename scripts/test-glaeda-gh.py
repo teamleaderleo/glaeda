@@ -1838,6 +1838,16 @@ class UpstreamTest(Base):
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
 
+    def test_an_upstream_ticks_phases_are_timed_so_the_row_says_where_they_went(self) -> None:
+        """An upstream host's tick returns before every phase a login host wraps, so progress() measured only the
+        three in finish_tick and "most in <phase>" named the biggest of those. gcp-agent-lane-11, 2026-11-21: six
+        daemons said "ticks spent 22.2s, most in land (21.9s)" with 2.2% of the window measured, and the sentence
+        sent a diagnosis at the land queue while the reads it names happen in upstream_read, untimed."""
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 30, "error": None}
+        self.daemon.tick(now=NOW)
+        self.assertLessEqual({"watches", "read upstream"}, set(self.daemon.progress()["spentS"]))
+
     def test_a_failed_pr_read_is_not_called_ok_by_the_head_read_after_it(self) -> None:
         """glaeda#1949: the PR and run read failed, the head read in the same tick succeeded, and upstream_status
         ended "ok". The stale alarm holds only for an "ok" upstream, so it stayed quiet through a real outage."""
@@ -2652,6 +2662,52 @@ class DaemonTest(Base):
         with mock.patch.object(gg, "app_pool_tool", return_value=Path("/x/gh_app_token.py")), mock.patch.object(
                 gg, "run_bounded", return_value=subprocess.CompletedProcess([], 0, token + "\n", "")):
             self.assertEqual(pool.token("o"), token)
+
+    def test_the_target_forms_agents_type_are_read(self) -> None:
+        """A named kind makes `o/r/5` and a bare `5` unambiguous, so both are read instead of refused.
+
+        Of the 358 targets this host's transcripts had refused by 2026-11-21, 153 were OWNER/REPO/N and 173
+        a bare number: every one of them a tool call that bought nothing (fewer-tool-calls, as infer_kind)."""
+        self.assertEqual(gg.parse_key("pr", "manaflow-ai/cmux/24474"), "pr:manaflow-ai/cmux#24474")
+        self.assertEqual(gg.parse_key("comment", "Manaflow-AI/cmuxterm-hq/16245"), "comment:manaflow-ai/cmuxterm-hq#16245")
+        self.assertEqual(gg.parse_key("run", "o/r#44872188227"), "run:o/r/44872188227")  # a run, `#` as typed
+        self.assertEqual(gg.parse_key("pr", "o/r/pull/7#issuecomment-5"), "pr:o/r#7")
+        with mock.patch.object(gg, "cwd_repo", lambda *a: "teamleaderleo/leo-workspace"):
+            self.assertEqual(gg.parse_key("pr", "7051"), "pr:teamleaderleo/leo-workspace#7051")
+            self.assertEqual(gg.parse_key("pr", "#7051"), "pr:teamleaderleo/leo-workspace#7051")
+            self.assertEqual(gg.parse_key("run", "44872188227"), "run:teamleaderleo/leo-workspace/44872188227")
+            self.assertEqual(gg.status_keys("pr", ["7051", "#7052"]), ["pr:teamleaderleo/leo-workspace#7051",
+                                                                      "pr:teamleaderleo/leo-workspace#7052"])
+            # a target that names its own repository still rules the bare ones after it
+            self.assertEqual(gg.status_keys("pr", ["o/r/1", "2"]), ["pr:o/r#1", "pr:o/r#2"])
+            self.assertEqual(gg.land_key("12"), ("pr:teamleaderleo/leo-workspace#12",
+                                                 "teamleaderleo/leo-workspace", 12))
+        self.assertEqual(gg.land_key("Manaflow-AI/cmux/24474"), ("pr:manaflow-ai/cmux#24474", "Manaflow-AI/cmux", 24474))
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None):  # nowhere to read it from: still refused, and says so
+            with self.assertRaises(gg.WatchError) as refused:
+                gg.parse_key("pr", "7051")
+        self.assertIn("OWNER/REPO#7051", str(refused.exception))
+
+    def test_kindless_inference_keeps_the_strict_forms(self) -> None:
+        """`o/r/12345678901` with no kind is a run, as it was before the loose key forms: infer_kind reads
+        PR_RE and RUN_RE, which still want `#` or `/pull/` for a pull request."""
+        self.assertEqual(gg.infer_kind(["status", "o/r/44872188227"])[0], ["status", "run", "o/r/44872188227"])
+        self.assertEqual(gg.infer_kind(["wait", "o/r#7051"])[0], ["wait", "pr", "o/r#7051"])
+
+    def test_cwd_repo_reads_the_origin(self) -> None:
+        for url, want in (("git@github.com:teamleaderleo/glaeda.git", "teamleaderleo/glaeda"),
+                          ("https://github.com/manaflow-ai/cmux.git", "manaflow-ai/cmux"),
+                          ("https://github.com/manaflow-ai/cmux", "manaflow-ai/cmux"),
+                          ("ssh://git@github.com/o/r.git", "o/r"),
+                          ("git@gitlab.com:o/r.git", None), ("", None)):
+            done = types.SimpleNamespace(returncode=0, stdout=url + "\n")
+            with mock.patch.object(gg.subprocess, "run", lambda *a, **k: done):
+                self.assertEqual(gg.cwd_repo(), want, url)
+        done = types.SimpleNamespace(returncode=128, stdout="")  # not a repository at all
+        with mock.patch.object(gg.subprocess, "run", lambda *a, **k: done):
+            self.assertIsNone(gg.cwd_repo())
+        with mock.patch.object(gg.subprocess, "run", side_effect=OSError("no git")):
+            self.assertIsNone(gg.cwd_repo())
 
     def test_bad_keys_are_refused(self) -> None:
         for kind, text in (("pr", "o/r"), ("pr", "o/r#x"), ("run", "o/r"), ("pr", "o/r#1) { x }")):
@@ -4901,10 +4957,14 @@ class ClientTest(Base):
         self.assertEqual(gg.status_keys("pr", ["O/R#1", "2", "#3", "o/r#1", "https://github.com/x/y/pull/4", "5"]),
                          ["pr:o/r#1", "pr:o/r#2", "pr:o/r#3", "pr:x/y#4", "pr:x/y#5"])
         self.assertEqual(gg.status_keys("comment", ["o/r#1", "2"]), ["comment:o/r#1", "comment:o/r#2"])
-        with self.assertRaisesRegex(gg.WatchError, "needs an OWNER/REPO#N before it"):
-            gg.status_keys("pr", ["7", "o/r#1"])
-        with self.assertRaises(gg.WatchError):
-            gg.status_keys("run", ["o/r/1", "2"])  # a run has no bare form
+        # a bare number with nothing before it reads the repository the caller stands in (cwd_repo), and
+        # refuses only where there is none; a later one still belongs to the target before it
+        with mock.patch.object(gg, "cwd_repo", lambda *a: "o/r"):
+            self.assertEqual(gg.status_keys("pr", ["7", "x/y#1"]), ["pr:o/r#7", "pr:x/y#1"])
+            self.assertEqual(gg.status_keys("run", ["o/r/1", "2"]), ["run:o/r/1", "run:o/r/2"])
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None):
+            with self.assertRaisesRegex(gg.WatchError, "OWNER/REPO#7"):
+                gg.status_keys("pr", ["7", "o/r#1"])
 
     def test_several_targets_print_a_block_each_and_json_gives_a_list(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
@@ -9978,6 +10038,35 @@ class FileAndPidWaitTest(unittest.TestCase):
         with self.assertRaises(gg.WatchError):
             gg.cmd_wait_pid("abc", 1, False)
 
+    def test_log_repo_job_flag_reads_as_log_job(self) -> None:
+        """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "o/r", "--job", "7"]), ["log", "job", "o/r", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "o/r", "--job=7"]), ["log", "job", "o/r", "7"])
+        self.assertEqual(err.getvalue().count("read as `log job o/r 7`"), 2)
+        for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
+                     ["log", "flaky", "o/r"]):
+            self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
+        """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
+        (both cost a usage error, 2026-11-21)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.land_notify_synonym(["land", "--notify", "o/r#1"]),
+                             ["land", "o/r#1", "--notify"])
+            self.assertEqual(gg.land_notify_synonym(["land", "--wait", "60", "--notify", "o/r#1"]),
+                             ["land", "--wait", "60", "o/r#1", "--notify"])
+        self.assertEqual(err.getvalue().count("read as `land"), 2)
+        for same in (["land", "o/r#1", "--notify"], ["land", "o/r#1", "--notify", "cosmic/coord"],
+                     ["land", "o/r#1", "--notify", "o/r#2"], ["land", "status"],
+                     ["wait", "--notify", "o/r#1"]):
+            self.assertEqual(gg.land_notify_synonym(same), same)
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1", "--notify"]).notify, "")
+        self.assertEqual(gg.parser().parse_args(["land", "o/r#1"]).notify, None)
+        self.assertEqual(gg.land_requester_from(""), gg.land_requester_from(None))
+
     def test_waits_until_a_time_or_the_quota_reset(self) -> None:
         """`wait until`: the wait for "go on at T" (a quota reset) that needs no head SHA (2026-11-18)."""
         now = 1_795_000_000.0  # 2026-11-18T11:06:40Z
@@ -9985,7 +10074,9 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(gg.until_epoch("2026-11-18T14:40:00Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("14:40Z", now), 1_795_012_800.0)
         self.assertEqual(gg.until_epoch("08:00Z", now), 1_795_075_200.0)  # passed today: tomorrow
-        for bad in ("soon", "2026-11-18T14:40:00", "-5m", "24:30Z", "14:61Z"):
+        self.assertEqual(gg.until_epoch("14:40:05Z", now), 1_795_012_805.0)
+        self.assertEqual(gg.until_epoch("5:20:05Z", now), 1_795_065_605.0)
+        for bad in ("soon", "2026-11-18T14:40:00", "-5m", "24:30Z", "14:61Z", "14:40:61Z"):
             with self.assertRaises(gg.WatchError):
                 gg.until_epoch(bad, now)
         state = self.dir / "gh-quota"
@@ -20648,6 +20739,32 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(pool.keys(), ["pr:o/r#5"])
 
+    def test_a_finished_land_costs_the_pass_no_cache_read(self):
+        """judge_order reads a cache file per row it sorts, so a pass sorts only the rows it can judge.
+
+        gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished (LAND_DONE rows stay for LAND_KEEP, 7 days)
+        and sorted every TICK -- 72,900 cache file reads per 600 s window at 0.30 ms each, which is the whole of the
+        21.9 s the daemon's row charged to "land". The finished rows are still pruned and re-armed, off the sort."""
+        self.five_snapped()
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        done = {f"pr:o/r#{n}" for n in (1, 2, 3)}
+        for key in done:
+            e = self.q.entries[key]
+            e["state"], e["updated"] = "merged", self.t
+            self.q.save(e)
+        reads: list[str] = []
+        real = self.q.cache_of
+        self.q.cache_of = lambda key: (reads.append(key), real(key))[1]
+        self.tick()
+        self.assertEqual([k for k in reads if k in done], [])
+        self.assertEqual(set(self.q.entries) & done, done)  # kept on disk until LAND_KEEP, as before
+        # and a finished row past LAND_KEEP is still pruned, though no pass sorted it (save stamps updated: age it
+        # by ticking, never by writing a time save would overwrite)
+        self.tick(gg.LAND_KEEP + 1)
+        self.assertEqual(set(self.q.entries) & done, set())
+
     def test_a_clean_green_pr_takes_the_next_worker_first(self):
         self.five_snapped()
         for n in range(1, 6):
@@ -22847,6 +22964,28 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 2)
         self.assert_merged_at(LB)
 
+    def test_quota_refusal_parks_the_whole_queue_until_the_named_reset(self):
+        """A dry login pauses every land, so each queued PR does not retry into the same spent pool."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M:%S", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                      reason=f"quota: not judged, retry after {at}Z (reset)"))
+        self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")
+        self.assertEqual(self.q.queue_quota_until, said)
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE)["until"], said)
+        reads = self.reads()
+        self.tick(300)
+        self.assertEqual(self.reads(), reads)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")
+
     def test_a_merge_the_shim_refuses_for_quota_parks_without_a_pr_view(self):
         self.pr(LA)
         self.land()
@@ -23196,7 +23335,9 @@ class LandTest(Base):
             self.tick(5)
         waits = {n: (self.q.entries[f"pr:o/r#{n}"].get("wait") or {}).get("kind") for n in heads}
         return {"judged": len(judged), "perEntry": max(sum(1 for _, m in judged if m == n) for n in heads),
-                "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300)}
+                "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300),
+                "queueUntil": self.q.queue_quota_until,
+                "queued": sum(1 for n in heads if self.q.entries[f"pr:o/r#{n}"]["state"] == "queued")}
 
     def test_the_host_cap_keeps_a_windows_judgments_under_its_share_and_judges_a_merge_ready_entry_first(self):
         """gcp-agent-lane-1, 2026-11-20: the land queue sent 135 calls in the ten minutes after the 01:38Z reset with 31
@@ -23333,16 +23474,16 @@ class LandTest(Base):
         login until 23:38Z"), 40 of them re-judging an entry already "unreadable" at an unchanged head; session
         glaeda-land spent 568 REST, about 9 a judgment (each `pr view`, check-runs and runs read before the refused
         GraphQL read). LAND_QUOTA_REFUSAL read only merge_hold's own "quota: not judged", so these took the
-        "unreadable" retry every LAND_RETRY_DEFAULT (120 s) until the reset. Now such a judgment parks the entry until
-        the reset its words name, as a "quota" answer does: one judgment per entry per window, however many are
-        queued."""
+        "unreadable" retry every LAND_RETRY_DEFAULT (120 s) until the reset. Now the first such refusal parks the
+        whole queue until the reset its words name."""
         k, minutes = 40, 20
         p = self.quota_unreadable_profile(k, minutes, until=self.t + 45 * 60)
         if os.environ.get("LAND_RESET_PROFILE"):
             print("\nPROFILE " + json.dumps(p | {"waits": sorted(set(p["waits"].values()), key=str)}))
-        self.assertEqual(p["perEntry"], 1, p)
-        self.assertEqual(p["judged"], k, p)
-        self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+        self.assertEqual((p["perEntry"], p["judged"], p["first5"]), (1, 1, 1), p)
+        self.assertEqual(set(p["waits"].values()), {"quota", None}, p)
+        self.assertEqual(p["queued"], k - 1, p)
+        self.assertTrue(0 <= p["queueUntil"] - (NOW + 45 * 60) <= 60, p)
 
     def test_an_unreadable_judgment_in_the_brokers_rate_limited_words_is_parked_too(self):
         """lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z: "unreadable" in the broker's words ("gh api graphql
@@ -23352,7 +23493,7 @@ class LandTest(Base):
                  "gh api graphql failed: until {stamp}Z (reset); not sent, retry after {stamp}Z; reason: [RATE_LIMITED] "
                  "GitHub's GraphQL limit. Retry once GitHub answers")
         p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
-        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
+        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota", None}), p)
 
     def test_an_unreadable_judgment_this_hosts_own_guards_refused_is_parked_not_counted(self):
         """gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553 and #12558 stopped retry_deadline after about 6 h of
@@ -23369,7 +23510,8 @@ class LandTest(Base):
             with self.subTest(words=words[:60]):
                 p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
                 self.assertLessEqual(p["perEntry"], 3, p)  # LAND_QUOTA_BACKOFF doubling, not the 120 s retry (10)
-                self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+                self.assertTrue(set(p["waits"].values()) <= {"quota", None}, p)
+                self.assertIn("quota", p["waits"].values(), p)
                 self.tearDown_entries()
 
     def tearDown_entries(self) -> None:
@@ -26447,6 +26589,32 @@ class AppPoolTest(Base):
         self.assertEqual(self.daemon.gql_log, [], "App points do not pace or stop the login")
         self.assertEqual(self.pool.status()["graphqlPoints"], 7)
         self.assertEqual(self.pool.status()["graphqlSeen"]["remaining"], 100)
+
+    def test_a_spent_app_pool_asks_the_spare_app_before_the_login(self) -> None:
+        spare_token = "ghs_" + "s" * 36
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: spare_token, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        spare_calls: list[str] = []
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] == f"Bearer {spare_token}":
+                spare_calls.append(url)
+                return 200, {"x-ratelimit-limit": "12500", "x-ratelimit-remaining": "12000",
+                             "x-ratelimit-reset": str(int(NOW + 1800))}, b'{"spare": true}'
+            return inner(method, url, headers, body)
+
+        self.daemon.transport = transport
+        self.app_answers.append((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message":"API rate limit exceeded"}'))
+        status, _, doc = self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual((status, doc), (200, {"spare": True}))
+        self.assertEqual(self.gh.calls, [], "the login never saw it")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(len(spare_calls), 2, "the spent pool rests, so the next read goes straight to the spare")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(self.pool.status()["spares"][0]["role"], "quota-goblin")
 
     def test_no_app_on_this_host_keeps_the_login_and_asks_again_only_after_a_rest(self) -> None:
         self.ready = False

@@ -239,3 +239,14 @@ the fleet host lock does not count VM clones yet, so a higher cap waits for that
 
 The old `macfleet` skill and direct SSH build allocation path are retired. Keep
 the compatibility files for callers, but do not use them for new operations.
+
+## Headless fleet services are LaunchDaemons
+
+A service the fleet depends on from a host with no one logged in (the fleet-cas store and its gc, the seed
+archive, on cmux-lawrence) is a system LaunchDaemon: `/Library/LaunchDaemons/LABEL.plist`, `UserName` the service
+user, `launchctl bootstrap system`. A LaunchAgent stops when the login session ends, which is what took the store
+down at the 2026-11-20 reboot. `glaeda-fleet-cas store|uninstall` and `glaeda-seed-archive install|uninstall` do it
+through `sudo -n` (or print the root commands for `fleet-sudo HOST ...`), boot out and remove an old gui/UID agent
+first, and adopt a daemon with the same label that was installed by hand. CI-mini roles (runner, node, writer,
+relay, prewarm) stay agents: they need the GUI session. `scripts/test-glaeda-headless-services.py` fails when a
+store/server role is written as an agent or a new agent writer is added without a reason.

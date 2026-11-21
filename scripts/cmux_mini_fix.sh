@@ -76,6 +76,22 @@ host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it i
   say "free"
 }
 
+host_drain() {  # hold new jobs off the fleet host lock until stdin closes (glaeda-mini-fleet onboard --wait)
+  # A host.lock.waiters entry <pid>-onboard, live while perl's pid is: the build worker then leases no new job or
+  # step here, and what runs finishes, so the lock frees between jobs. It takes no lock itself. The caller closes
+  # stdin (or its ssh drops) to remove the entry; no waiters dir means nothing to drain.
+  [ -d "$GLAEDA_FLEET_DIR/host.lock.waiters" ] || { say "no host.lock.waiters here, nothing to drain"; return 0; }
+  perl -e '
+    my $waiter = "$ARGV[0]/host.lock.waiters/$$-onboard";
+    open(my $w, ">", $waiter) or do { print STDERR "glaeda-mini-fleet: cannot write $waiter ($!)\n"; exit 3 };
+    close($w);
+    $SIG{$_} = sub { unlink $waiter; exit 0 } for qw(TERM INT HUP);
+    $| = 1; print "draining\n";
+    my $buf; 1 while sysread(STDIN, $buf, 4096);
+    unlink $waiter;
+  ' "$GLAEDA_FLEET_DIR"
+}
+
 # One changing step at a time per host: an SSH timeout on the operator side does not stop the remote
 # step, so a rerun must not start the same work beside it. A lock whose process is gone is taken over.
 # No step starts while the host is held (see host_held). runner_hold honors only reservations: it exists to

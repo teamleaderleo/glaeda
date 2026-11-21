@@ -1137,6 +1137,14 @@ class UpdateTest(unittest.TestCase):
             self.assertEqual(gu.main(["--apply"]), 0)
         self.assertEqual(full.call_count, 1)
         self.assertEqual(json.loads(printed.getvalue())["trigger"], "channel changed")
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value={**seen, "canary.json": "k2"}), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "current"}) as full, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(gu.main(["--apply", "--now"]), 0)  # unchanged and not due, but asked for by hand
+        self.assertEqual(full.call_count, 1)
+        self.assertEqual(json.loads(printed.getvalue())["trigger"], "asked")
 
     def test_config_defaults_and_refusals(self) -> None:
         path = self.root / "update.json"

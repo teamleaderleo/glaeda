@@ -2046,7 +2046,9 @@ seed from R2. That took 108-158 s idle and up to 760 s paced beside a job, one d
 
 cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps, and the PR minis read from it:
 
-- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 15 seconds as `/bin/sh` running `/usr/bin/python3`
+- **Fill.** The `glaeda-seed-archive` system LaunchDaemon (`/Library/LaunchDaemons`, `UserName` the archive user, installed
+  by `glaeda-seed-archive install --apply` through `sudo -n`, which also boots out and removes the old gui/UID agent; a
+  login-session agent died with the 2026-11-20 reboot) runs every 15 seconds as `/bin/sh` running `/usr/bin/python3`
   (`LAN_PARENT`), so Local Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
   `seed-list-v1` and streams every seed the archive lacks, newest first, so a seed is here about a minute
   after cmux15 keeps it. At every 5 minutes, PR minis that prefetched in between missed here and fell back
@@ -2055,7 +2057,9 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
   exactly as cmux15 sent it, about 2.1-2.4 GB against 9 GB unpacked, so serving it is a read. The volume is
   an APFS sparse bundle on the ExFAT X10 Pro (`glaeda-seed-archive.sparsebundle`, attached by each run).
   macOS privacy lets a launchd job write into an attached image but not onto the external disk itself. The filler checks every file before renaming it into place: all entries
-  under `KEY/`, and the seed manifest present.
+  under `KEY/`, and the seed manifest present. A seed whose entry reads EIO is renamed to `.corrupt-<name>` (never
+  deleted or repaired) and reported as `unreadable` in the run record; the run goes on. The image is unencrypted, so
+  attaching it needs no GUI session or keychain.
 - **Prune.** Oldest use first, while the archive holds more than 800 GiB or the disk has less than 300 GiB
   free. Serving a seed touches it.
 - **Serving.** `glaeda-seed-serve --role archive` refuses everything on a host that has a glaeda runner

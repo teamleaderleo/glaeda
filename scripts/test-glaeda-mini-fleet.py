@@ -164,6 +164,28 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "unknown roles"):
                 mf.load_manifest(path)
 
+    def test_alias_selects_its_host(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        first = next(iter(data["hosts"]))
+        data["hosts"][first]["alias"] = "browser-a"
+        self.assertEqual(mf.select_hosts(data, ["browser-a"]), [first])
+        self.assertEqual(mf.select_hosts(data, [first]), [first])
+
+    def test_bad_or_duplicate_alias_is_refused(self) -> None:
+        names = list(self.manifest["hosts"])
+        cases = [({names[0]: "Browser A"}, "lowercase"),
+                 ({names[0]: "dup", names[1]: "dup"}, "names both"),
+                 ({names[0]: names[1]}, "names both")]
+        for aliases, message in cases:
+            data = copy.deepcopy(self.manifest)
+            for host, alias in aliases.items():
+                data["hosts"][host]["alias"] = alias
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, message):
+                    mf.load_manifest(path)
+
     def test_unknown_key_reference_is_refused(self) -> None:
         data = copy.deepcopy(self.manifest)
         data["defaults"]["authorized_keys"]["allow"].append("ghost")
@@ -2563,8 +2585,10 @@ class FixLibraryTests(unittest.TestCase):
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
                           'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
-        # ...and perl's unlink of the drain waiter entry ios_runtime itself published.
-        self.assertEqual([line.strip() for line in body if "unlink" in line], ['sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\\n" if $_[1]; exit $_[0] }'])
+        # ...and perl's unlink of the drain waiter entry ios_runtime itself published, and host_drain's own entry.
+        self.assertEqual([line.strip() for line in body if "unlink" in line],
+                         ['$SIG{$_} = sub { unlink $waiter; exit 0 } for qw(TERM INT HUP);', 'unlink $waiter;',
+                          'sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\\n" if $_[1]; exit $_[0] }'])
         self.assertFalse([line for line in body if "simctl runtime delete" in line or "simctl delete" in line])
 
     def test_glaeda_setup_preserves_headless_mode(self) -> None:

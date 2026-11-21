@@ -38,8 +38,19 @@ prewarm_label=com.teamleaderleo.glaeda.fleet-cas-prewarm
 cat >"$stub_bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FLEET_CAS_TEST_LAUNCHCTL_LOG:?}"
+[ "$1" = print ] && [ -n "${FLEET_CAS_TEST_PRINT_FAIL:-}" ] && exit 113
+exit 0
 EOF
 chmod +x "$stub_bin/launchctl"
+# No passwordless sudo unless a test says so; a working one runs the command it is given, logged.
+printf '#!/usr/bin/env bash\nexit 1\n' >"$stub_bin/nosudo"
+cat >"$stub_bin/okSudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FLEET_CAS_TEST_SUDO_LOG:?}"
+[ "$1" = chown ] && exit 0
+exec "$@"
+EOF
+chmod +x "$stub_bin/nosudo" "$stub_bin/okSudo"
 
 cat >"$stub_bin/diskutil" <<'EOF'
 #!/usr/bin/env bash
@@ -53,6 +64,7 @@ common_env=(
   FLEET_CAS_ROOT="$root"
   FLEET_CAS_LAUNCH_DAEMONS_DIR="$daemons"
   FLEET_CAS_TEST_LAUNCHCTL_LOG="$temporary_root/launchctl.log"
+  FLEET_CAS_SUDO="$stub_bin/nosudo"
   HOME="$home"
   PATH="$stub_bin:$PATH"
 )
@@ -152,9 +164,23 @@ grep -q 'bootout gui/.*/com.teamleaderleo.glaeda.fleet-cas-node' "$temporary_roo
 
 # A root-installed service is never silently removed by an unprivileged caller.
 : >"$daemons/com.teamleaderleo.glaeda.fleet-cas-store.plist"
-env "${common_env[@]}" "$script" uninstall store --apply >"$temporary_root/root-plan"
+if env "${common_env[@]}" "$script" uninstall store --apply >"$temporary_root/root-plan"; then exit 1; fi
 grep -q "ROOT STEP NEEDED: sudo launchctl bootout system/com.teamleaderleo.glaeda.fleet-cas-store" "$temporary_root/root-plan"
 test -e "$daemons/com.teamleaderleo.glaeda.fleet-cas-store.plist"
+
+# With passwordless sudo, uninstall removes the daemon, its gc daemon and both old agents.
+: >"$daemons/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist"
+: >"$home/Library/LaunchAgents/com.teamleaderleo.glaeda.fleet-cas-store.plist"
+: >"$home/Library/LaunchAgents/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist"
+: >"$temporary_root/sudo.log"
+env "${common_env[@]}" FLEET_CAS_SUDO="$stub_bin/okSudo" FLEET_CAS_TEST_SUDO_LOG="$temporary_root/sudo.log" \
+  "$script" uninstall store --apply >"$temporary_root/root-apply"
+test ! -e "$daemons/com.teamleaderleo.glaeda.fleet-cas-store.plist"
+test ! -e "$daemons/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist"
+test ! -e "$home/Library/LaunchAgents/com.teamleaderleo.glaeda.fleet-cas-store.plist"
+test ! -e "$home/Library/LaunchAgents/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist"
+grep -q 'launchctl bootout system/com.teamleaderleo.glaeda.fleet-cas-store$' "$temporary_root/sudo.log"
+grep -q 'launchctl bootout system/com.teamleaderleo.glaeda.fleet-cas-store-gc$' "$temporary_root/sudo.log"
 
 # A custom store root must already be mounted. This prevents a controller rollout from
 # silently creating the CAS on its boot volume when an APFS sparsebundle was not mounted.
@@ -340,17 +366,63 @@ if env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --store 100.
   >/dev/null 2>"$relay_root/both.err"; then exit 1; fi
 grep -q 'drop --store' "$relay_root/both.err"
 
-# The store host's own gc agent: a custom store root only, its own label, the gc-only prune.
+# Headless roles are system LaunchDaemons (UserName this user, HOME set), migrated from agents.
+# The store host's own gc: a custom store root only, its own label, the gc-only prune.
 ROOT=/Volumes/glaeda-fleet-cas launch_root=$relay_root/launch here=$repo_root FLEET_CAS_ROOT=/Volumes/glaeda-fleet-cas
-PATH="$stub_bin:$PATH" write_store_prune
-gc_plist=$AGENTS/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist
+LAUNCH_DAEMONS=$relay_root/daemons LOGS=$relay_root/logs SUDO="$stub_bin/okSudo"
+export FLEET_CAS_TEST_SUDO_LOG=$relay_root/sudo.log FLEET_CAS_TEST_LAUNCHCTL_LOG=$temporary_root/launchctl.log
+eval "$(sed -n '/^state_for()/,/^}/p;/^runner_for()/,/^}/p;/^plist_for()/,/^}/p' "$script")"
+mkdir -p "$LAUNCH_DAEMONS"
+eval "$(sed -n '/^root_run()/,/^health_failed()/p' "$script" | sed '$d')"
+unset -f bootstrap
+unset -f say; say() { :; }
+gc=com.teamleaderleo.glaeda.fleet-cas-store-gc
+: >"$AGENTS/$gc.plist"   # the old agent
+: >"$relay_root/sudo.log"
+PATH="$stub_bin:$PATH" apply=1 write_store_prune
+gc_plist=$LAUNCH_DAEMONS/$gc.plist
+test ! -e "$AGENTS/$gc.plist"
+grep -q "bootout gui/.*/$gc" "$temporary_root/launchctl.log"
+grep -q "launchctl bootstrap system $gc_plist" "$relay_root/sudo.log"
 tr -d ' \n' <"$gc_plist" >"$relay_root/gc.flat"
+grep -q "<key>UserName</key><string>$(id -un)</string>" "$relay_root/gc.flat"
+grep -q "<key>HOME</key><string>$HOME</string>" "$relay_root/gc.flat"
 grep -q "<string>$relay_root/launch/glaeda-fleet-cas-prune</string><string>--apply</string><string>--store-gc-only</string>" "$relay_root/gc.flat"
 grep -q '<key>GLAEDA_FLEET_CAS_ROOT</key><string>/Volumes/glaeda-fleet-cas</string>' "$relay_root/gc.flat"
 grep -q '<key>StartInterval</key><integer>3600</integer>' "$relay_root/gc.flat"
 cmp "$repo_root/scripts/glaeda-fleet-cas-prune" "$relay_root/launch/glaeda-fleet-cas-prune"
+# A re-run with the same daemon loaded changes nothing (no second bootstrap).
+: >"$relay_root/sudo.log"
+PATH="$stub_bin:$PATH" apply=1 write_store_prune
+! grep -q bootstrap "$relay_root/sudo.log"
+# Without sudo and without a daemon it stops with the root commands, and writes no agent.
+rm -f "$gc_plist"
+if (FLEET_CAS_TEST_PRINT_FAIL=1 SUDO="$stub_bin/nosudo" PATH="$stub_bin:$PATH" apply=1 write_store_prune) 2>"$relay_root/nosudo.err"; then exit 1; fi
+test ! -e "$AGENTS/$gc.plist"
+grep -q 'needs a system LaunchDaemon and there is no passwordless sudo' "$relay_root/nosudo.err"
 rm -f "$gc_plist"
 FLEET_CAS_ROOT= PATH="$stub_bin:$PATH" write_store_prune
 test ! -e "$gc_plist"
+
+# The store itself: plist as a daemon, never an agent, even when only an agent exists.
+store=com.teamleaderleo.glaeda.fleet-cas-store
+: >"$AGENTS/$store.plist"
+FLEET_CAS_ROOT=$relay_root/xcode ROOT=$relay_root/xcode; mkdir -p "$ROOT/launchd"
+custom_store_volume_uuid=u custom_store_image=
+FLEET_CAS_ROOT= plist_for store "$store" sys >"$ROOT/launchd/$store.plist"
+tr -d ' \n' <"$ROOT/launchd/$store.plist" >"$relay_root/store.flat"
+grep -q "<key>UserName</key><string>$(id -un)</string>" "$relay_root/store.flat"
+grep -q "<key>EnvironmentVariables</key><dict><key>HOME</key><string>$HOME</string></dict>" "$relay_root/store.flat"
+: >"$relay_root/sudo.log"
+PATH="$stub_bin:$PATH" install_daemon "$store" "$ROOT/launchd/$store.plist"
+test "$DAEMON_STATE" = installed
+test ! -e "$AGENTS/$store.plist"
+cmp "$ROOT/launchd/$store.plist" "$LAUNCH_DAEMONS/$store.plist"
+# An hand-installed daemon that differs is adopted, not duplicated, when sudo is missing.
+printf 'hand\n' >"$LAUNCH_DAEMONS/$store.plist"
+SUDO="$stub_bin/nosudo" PATH="$stub_bin:$PATH" install_daemon "$store" "$ROOT/launchd/$store.plist" 2>"$relay_root/adopt.err"
+test "$DAEMON_STATE" = adopted
+grep -q 'adopting it as is' "$relay_root/adopt.err"
+test "$(cat "$LAUNCH_DAEMONS/$store.plist")" = hand
 
 echo "glaeda-fleet-cas role-scoped uninstall and bind-wait tests passed"

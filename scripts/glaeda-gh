@@ -5,6 +5,8 @@
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
                                                         reuses the repository before it); --json gives a list
+    A target takes whichever form you typed: OWNER/REPO#N, OWNER/REPO/N, a GitHub URL, or a bare N in the
+    repository of the directory you are in (it says which repository it read).
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
     glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
@@ -13,7 +15,7 @@
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
     glaeda-gh wait file PATH [--exists|--gone] [--contains REGEX] [--timeout S]   a file, instead of a sleep loop
     glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
-    glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
+    glaeda-gh wait until quota|TIME [--timeout S]       a time (14:40Z, 14:40:05Z, 2026-11-18T14:40:00Z, 45m) or this host's quota reset
     glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
                                                         every check of those commits, read once for all sessions
     glaeda-gh log job OWNER/REPO JOB_ID                a finished job's log: kept here, else the build controller,
@@ -282,8 +284,9 @@ when this file changes, so an update takes effect without a restart.
   which `land status` prints) and `land` refuses to queue (land_judge_missing). router-review is routerReview, else
   the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
-  A quota refusal (land_judge's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
-  per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
+  A quota refusal (land_judge's, or the shim's on the merge) parks the whole host queue until the reset it names;
+  the refusing PR also keeps its 0-120 s per-caller wake, with no read, judge, watch or nudge before it (`land status`:
+  "parked until HH:MMZ (quota)");
   one that names no time backs off 5, 10, 20 ... at most 60 min. While the login's latch mark holds
   (rest-exhausted.json / graphql-exhausted.json under $GH_QUOTA_STATE, lw#5626) no entry is judged at all.
   A host whose land.json names an "executor" (a program taking one JSON line on stdin, answering one, e.g.
@@ -850,7 +853,17 @@ PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+
 RUN_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/(?:actions/runs/)?(\d+)(?:[/?#].*)?")
 ISSUE_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/issues/)(\d+)(?:[/?#].*)?")
 HEAD_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:@|/commit/)([0-9a-fA-F]{{40}})")
-KEY_RES = {"pr": PR_RE, "run": RUN_RE, "comment": ISSUE_RE, "head": HEAD_RE}
+# A *key's* target comes with its kind named, so the separator before the number can be whichever one the
+# caller typed: `#`, the URL's own path, or a plain `/`. `o/r/5` was 153 of the 358 targets this host's
+# transcripts had refused by 2026-11-21 (a bare number another 173; see cwd_repo), and with the kind given
+# none of it is ambiguous. A pr target still refuses `o/r/issues/5`: an issue is not a pull request.
+# infer_kind keeps the strict forms above, where the kind is *not* given and `o/r/12345678901` is a run.
+PR_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/)(\d+)(?:[/?#].*)?")
+RUN_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/(?:actions/runs/)?)(\d+)(?:[/?#].*)?")
+ISSUE_KEY_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/issues/|/)(\d+)(?:[/?#].*)?")
+# `origin` as GitHub writes it, for a bare number's repository (cwd_repo)
+REMOTE_RE = re.compile(rf"(?:git@github\.com:|(?:https?://|ssh://git@)github\.com/)({NAME})/({NAME}?)(?:\.git)?/?")
+KEY_RES = {"pr": PR_KEY_RE, "run": RUN_KEY_RE, "comment": ISSUE_KEY_RE, "head": HEAD_RE}
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
@@ -1116,10 +1129,35 @@ class WatchError(RuntimeError):
 # ---------------------------------------------------------------- keys and files
 
 
+def cwd_repo(cwd: str | None = None) -> str | None:
+    """`owner/repo` of the GitHub `origin` of the directory the caller ran in, or None if it has none.
+
+    This is what a bare `N` names. A bare number was 173 of the 358 targets this host's transcripts had
+    refused by 2026-11-21, more than any other form, and it is the one an agent reaches for while working in
+    a worktree of the repository the number belongs to -- where the answer is sitting in `origin`."""
+    try:
+        done = subprocess.run(["git", "-C", cwd or ".", "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = REMOTE_RE.fullmatch(done.stdout.strip()) if done.returncode == 0 else None
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
-    shares one entry."""
-    match = KEY_RES[kind].fullmatch(text.strip()) if kind in KEY_RES else None
+    shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in."""
+    text = text.strip()
+    bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
+    if bare:
+        repo = cwd_repo()
+        if not repo:
+            raise WatchError(f"{text!r} is a number with no repository: name it as OWNER/REPO#{bare.group(1)}, "
+                             f"or run this where the repository's origin is ({os.getcwd()} has none)")
+        # said, not silent: a number resolved against the wrong checkout would read as the right PR
+        text = f"{repo}{'/' if kind == 'run' else '#'}{int(bare.group(1))}"
+        say_waiting(f"glaeda-gh: {bare.group(0)} is {text} (the origin of {os.getcwd()})")
+    match = KEY_RES[kind].fullmatch(text) if kind in KEY_RES else None
     if not match:
         form = {"pr": "OWNER/REPO#N or a pull request URL", "run": "OWNER/REPO/RUN_ID or a run URL",
                 "comment": "OWNER/REPO#N or an issue or pull request URL"}.get(kind, "pr, run or comment")
@@ -2545,6 +2583,11 @@ def gh_token() -> str:
 # the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
 # not charged to restShare and their rate headers are not the login's budget: daemon.json appPool says what they spent.
 APP_POOL_ROLE = "ci-watch"
+# Spare App pools (Leo, 2026-11-20: the login's GraphQL was spent, "0 left", while one App pool served every read): a
+# read goes to the first pool of the chain that holds a token, covers the route and is not resting, so a second App
+# (its role in machines/gh-app-roles.json, its token pushed by the key home) is another 12,500 an hour. Comma list of
+# roles after the primary; GLAEDA_GH_APP_SPARES="" turns the spares off.
+APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", "quota-goblin") or "").replace(" ", "").split(",") if r)
 APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config/gh-app-tokens")
 APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
 APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
@@ -2633,6 +2676,18 @@ class AppPool:
         self.graphql_points = 0
         self.graphql_seen: dict | None = None
         self.source = ""  # "key" (the App's key is here) or "pushed" (a read-only token the key home pushed)
+        self.spares: list[AppPool] = []  # pools tried after this one's (never nested: a spare has none)
+
+    def with_spares(self, roles: "tuple[str, ...] | list[str]") -> "AppPool":
+        self.spares = [AppPool(role=r, clock=self.clock) for r in roles if r != self.role]
+        return self
+
+    def pick(self, owner: str, scope: str) -> "AppPool | None":
+        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE."""
+        for pool in [self, *self.spares]:
+            if pool.covers(scope) and pool.token(owner):
+                return pool
+        return None
 
     def held_here(self) -> bool:
         """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
@@ -2778,7 +2833,8 @@ class AppPool:
         return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
                 "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
-                "graphqlSeen": self.graphql_seen}
+                "graphqlSeen": self.graphql_seen,
+                **({"spares": [p.status() for p in self.spares]} if self.spares else {})}
 
     def graphql_answered(self, rate: dict, points: int) -> None:
         """Keep an App GraphQL answer in the App pool; it must never become the login's budget or pacing data."""
@@ -4091,7 +4147,9 @@ class Daemon:
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
-        self.app_pool: AppPool | None = AppPool(clock=lambda: self.clock()) if app_pool == "auto" else app_pool
+        self.app_pool: AppPool | None = (
+            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES) if app_pool == "auto" else app_pool)
+        self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
@@ -5370,8 +5428,11 @@ class Daemon:
                  and not self.writing else None)
         route = route_of(method, path)
         scope = pool.scope(owner, method, path, body) if owner else ""
-        app_token = pool.token(owner) if owner and pool.covers(scope) else None
+        chosen = pool.pick(owner, scope) if owner else None
+        app_token = chosen.token(owner) if chosen else None
         if app_token:
+            pool = chosen
+            self.last_app_pool = chosen
             self.last_request_source = "app"
             headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
                        "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
@@ -5408,6 +5469,9 @@ class Daemon:
                 self.sent.append((self.now, "app"))
                 return status, h, doc
             log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
+            if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
+                # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
+                return self.request(method, path, body, etag, free, content)
             # refused: the same read goes on the login at once, as it would have without the App
             self.last_request_source = "login"
             if self.mode(bucket) == "stop" and self.clock() >= self.secondary_until:
@@ -7351,7 +7415,8 @@ class Daemon:
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
         self.upstream_refuse_posts()
-        entries = self.watches()
+        with self.phase("watches"):
+            entries = self.watches()
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
         for e in entries:
@@ -7379,7 +7444,8 @@ class Daemon:
             for part in ([e for e in due if not e["key"].startswith("head:")],
                          [e for e in due if e["key"].startswith("head:")]):
                 if part:
-                    self.upstream_read(ask, part)
+                    with self.phase("read upstream"):
+                        self.upstream_read(ask, part)
                     if self.upstream_status.get("state") == "failing":
                         failed = failed or self.upstream_status
             if failed is not None:
@@ -7688,7 +7754,7 @@ class Daemon:
         if owner is None:
             return []
         scope = pool.scope(owner, method, path, body)
-        if pool.token(owner) is None or not pool.covers(scope):
+        if pool.pick(owner, scope) is None:
             return []
         return entries
 
@@ -8035,8 +8101,8 @@ class Daemon:
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
         if self.last_request_source == "app":
             # The App has its own GraphQL bucket. Do not let its rateLimit answer stop or pace the login.
-            if self.app_pool is not None:
-                self.app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
+            if self.last_app_pool is not None:
+                self.last_app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
             self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
             self.note_spend("graphql", self.gql_reason, 1, points)
@@ -9728,6 +9794,7 @@ LAND_JUDGE_PATHS = (LAND_JUDGE, Path.home() / "Projects/leo-workspace/tools/land
 # 2026-11-17: cmux#44604 stopped after 8 of them).
 LAND_REFUSED_FILE = "refused.json"
 LAND_LATCH_FILE = "latch.json"  # the login's latch mark the queue last saw holding (land_latch), for `land status`
+LAND_QUOTA_FILE = "quota.json"  # host-wide land pause after a quota refusal, for restart-safe queue parking
 LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's warning, while it holds
 # On an upstream host (a lane VM: no login, its PR data is the controller's copy), the land worker's nudge reaches
 # nothing: upstream_tick asks the upstream every UPSTREAM_EVERY and takes whatever copy it has. When that copy of a
@@ -10609,12 +10676,15 @@ def land_config() -> dict:
 
 
 def land_key(target: str) -> tuple[str, str, int]:
-    """(key, OWNER/REPO as typed, N) for OWNER/REPO#N or a PR URL."""
-    m = PR_RE.fullmatch(target.strip())
-    if not m:
-        raise WatchError(f"land takes OWNER/REPO#N or a pull request URL, not {target!r}")
-    owner, repo, number = m.groups()
-    return parse_key("pr", target), f"{owner}/{repo}", int(number)
+    """(key, OWNER/REPO as typed, N) for OWNER/REPO#N, OWNER/REPO/N, a PR URL, or a bare N in the repository
+    the caller stands in (parse_key reads both of the loose forms)."""
+    text = target.strip()
+    m = PR_KEY_RE.fullmatch(text)
+    if not m and not BARE_NUMBER.fullmatch(text):
+        raise WatchError(f"land takes OWNER/REPO#N, OWNER/REPO/N or a pull request URL, not {target!r}")
+    key = parse_key("pr", text)  # a bare number names the repository the caller stands in, or raises
+    _, owner, repo, number = split_key(key)
+    return key, f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", int(number)
 
 
 # Where the session that queues a land is named, in order (acpmux send takes a session's name or id). Read at queue
@@ -11109,6 +11179,11 @@ class LandQueue:
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
+        quota = read_json(land_dir() / LAND_QUOTA_FILE)
+        self.queue_quota_until = (float(quota.get("until")) if isinstance(quota, dict)
+                                  and isinstance(quota.get("until"), (int, float))
+                                  and not isinstance(quota.get("until"), bool) else 0.0)
+        self.queue_quota_reason = str(quota.get("reason") or "") if isinstance(quota, dict) else ""
         self.load()
 
     # -- files
@@ -11282,6 +11357,8 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        if self.queue_quota_parked():
+            return
         latch = self.latch_held()
         ended = land_latch_spread(self.now) if latch is None else None
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
@@ -11291,19 +11368,29 @@ class LandQueue:
         self.pass_latched = 0
         self.pass_staggered = 0
         self.pass_capped = 0
-        for key in sorted(self.entries, key=self.judge_order):
+        # The rows this pass can judge, named before it prunes or re-arms anything, so a re-armed entry is judged from
+        # the next pass as it always was. judge_order reads a cache file per row it sorts: a finished row (LAND_DONE
+        # for up to LAND_KEEP, 7 days) or one a worker already holds would pay for that read and then be skipped on
+        # the first lines of the body. gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished, sorted every
+        # TICK (2s) -- 72,900 cache file reads per 600s window at 0.30 ms each, and the daemon's own row read "ticks
+        # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
+        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]
+        for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
-                if e["state"] in LAND_DONE:
-                    if self.now - float(e.get("updated") or 0) > LAND_KEEP:
-                        (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
-                        del self.entries[key]
-                    elif e["state"] == "stopped" and key not in self.jobs:
-                        with self.lock:
-                            self.rearm(e)  # judged from the next pass
-                    continue
-                if key in self.jobs:
-                    continue
+                if self.now - float(e.get("updated") or 0) > LAND_KEEP:
+                    (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
+                    del self.entries[key]
+                elif e["state"] == "stopped" and key not in self.jobs:
+                    with self.lock:
+                        self.rearm(e)  # judged from the next pass
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        for key in sorted(live, key=self.judge_order):
+            try:
+                if self.queue_quota_parked():
+                    break  # a worker parked the host while this pass was submitting judgments
+                e = self.entries[key]
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
                     with self.lock:
@@ -11597,6 +11684,32 @@ class LandQueue:
         self.save(e)
         return False
 
+    def queue_quota_parked(self) -> bool:
+        """Whether a quota refusal has paused this host's whole land queue until its reset."""
+        with self.lock:
+            if self.queue_quota_until > self.now:
+                return True
+            if self.queue_quota_until:
+                self.queue_quota_until = 0.0
+                self.queue_quota_reason = ""
+                (land_dir() / LAND_QUOTA_FILE).unlink(missing_ok=True)
+            return False
+
+    def park_queue_quota(self, until: float, text: str) -> None:
+        """Pause every queued land until UNTIL, retaining a later existing hold across restarts."""
+        if not isinstance(until, (int, float)) or isinstance(until, bool):
+            return
+        until = float(until)
+        if until <= self.now:
+            return
+        with self.lock:
+            if self.queue_quota_until >= until and self.queue_quota_until > self.now:
+                return  # a later refusal must never shorten the host-wide hold
+            self.queue_quota_until = max(self.queue_quota_until, until)
+            self.queue_quota_reason = land_trim(text, 300)
+            write_json(land_dir() / LAND_QUOTA_FILE,
+                       {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
+
     def park_quota(self, e: dict, text: str) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
         LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
@@ -11610,6 +11723,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
+        self.park_queue_quota(said if said is not None else wake, text)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
@@ -12627,6 +12741,12 @@ class LandQueue:
     def judge_and_take(self, key: str, sha: str) -> None:
         with self.lock:
             e = self.entries[key]
+            if self.queue_quota_parked():
+                if e["state"] == "judging":
+                    e.pop("judging", None)
+                    e.update(state="queued", wait=None, wakeAt=None)
+                    self.save(e)
+                return
             self.check(e)
             judging = e.pop("judging", None) or {}
             counts = judging.get("counts", True)
@@ -16092,10 +16212,12 @@ def status_keys(kind: str, targets: list[str]) -> list[str]:
     repo: str | None = None
     for text in targets:
         bare = BARE_NUMBER.fullmatch(text.strip()) if kind in ("pr", "comment") else None
-        if bare:
-            if repo is None:
-                raise WatchError(f"{text!r} needs an OWNER/REPO#N before it to name its repository")
+        if bare and repo is not None:
             key = f"{kind}:{repo}#{int(bare.group(1))}"
+        elif bare:
+            # no target before it to borrow a repository from: parse_key reads the one the caller stands in
+            key = parse_key(kind, text)
+            repo = split_key(key)[1] + "/" + split_key(key)[2]
         else:
             key = parse_key(kind, text)
             repo = split_key(key)[1] + "/" + split_key(key)[2]
@@ -17276,15 +17398,16 @@ def until_epoch(target: str, now: float) -> float | None:
     match = re.fullmatch(r"(\d+)([smhd])", text)
     if match:
         return now + int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
-    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)Z", text)  # 24:30Z and 14:61Z fall through to the refusal
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?Z", text)  # 24:30Z and 14:61Z fall through to the refusal
     if match:
         day = dt.datetime.fromtimestamp(now, dt.timezone.utc)
-        at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0).timestamp()
+        at = day.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=int(match.group(3) or 0),
+                         microsecond=0).timestamp()
         return at if at > now else at + 86400
     at = iso_epoch(text) if re.match(r"\d{4}-\d\d-\d\dT", text) and re.search(r"(Z|[+-]\d\d:\d\d)$", text) else None
     if at is None:
         raise WatchError(f"wait until takes quota, quota:rest, quota:graphql, an ISO time with a zone "
-                         f"(2026-11-18T14:40:00Z), a UTC time (14:40Z) or a duration (45m), not {target!r}")
+                         f"(2026-11-18T14:40:00Z), a UTC time (14:40Z or 14:40:05Z) or a duration (45m), not {target!r}")
     return at
 
 
@@ -18305,7 +18428,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                   f"{hour.get('kept', 0)} completed-attempt job lists answered from disk (no request)"
                   + (f", {hour['app']} REST on the {APP_POOL_ROLE} App (not the login)" if hour.get("app") else ""))
         pool = status.get("appPool")
-        if isinstance(pool, dict):
+        for pool in ([pool, *(pool.get("spares") or [])] if isinstance(pool, dict) else []):
             seen = pool.get("seen") if isinstance(pool.get("seen"), dict) else {}
             print(f"{pool.get('role', APP_POOL_ROLE)} App pool: {pool.get('served', 0)} reads served, "
                   f"{pool.get('fellBack', 0)} sent again on the login"
@@ -23434,8 +23557,9 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid", "until") if name == "wait" else ()))
         if name == "status":
             s.add_argument("target", nargs="+",
-                           help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL; several are read in one gather, "
-                                "and for pr and comment a bare #N or N reuses the repository before it")
+                           help="OWNER/REPO#N, OWNER/REPO/N or a GitHub URL; several are read in one gather, "
+                                "and a bare #N or N is that number in the repository of the target before it, "
+                                "or of the directory you are in")
             s.add_argument("--field", metavar="F,G",
                            help="print just these values of the --json object, tab-separated, one line per target "
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
@@ -23565,8 +23689,9 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
-    ld.add_argument("--notify", metavar="HOST/SESSION",
-                    help="who is told on a merge or a stop (default this host/$ACPMUX_SESSION_NAME)")
+    ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
+                    help="who is told on a merge or a stop (with no value, and by default, this "
+                         "host/$ACPMUX_SESSION_NAME)")
     ld.add_argument("--wait", type=seconds, default=0, metavar="S",
                     help="wait up to S seconds for it to merge or stop (exit 0 merged, 1 stopped, 2 still going)")
     ld.add_argument("--json", action="store_true")
@@ -23575,8 +23700,51 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def log_job_synonym(raw: list[str]) -> list[str]:
+    """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that."""
+    if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
+        return raw
+    rest = raw[2:]
+    for i, word in enumerate(rest):
+        job = None
+        if word == "--job" and i + 1 < len(rest):
+            job, rest = rest[i + 1], rest[:i] + rest[i + 2:]
+        elif word.startswith("--job="):
+            job, rest = word[6:], rest[:i] + rest[i + 1:]
+        if job is not None:
+            if not job.isdigit():
+                return raw
+            fixed = ["log", "job", raw[1], job] + rest
+            print(f"glaeda-gh: read as `{' '.join(fixed)}` (log OWNER/REPO --job ID is `log job OWNER/REPO ID`)",
+                  file=sys.stderr)
+            return fixed
+    return raw
+
+
+def land_notify_synonym(raw: list[str]) -> list[str]:
+    """`land --notify OWNER/REPO#N` is `land OWNER/REPO#N --notify` (agents type the flag first, and a bare
+    `--notify` means this session): say so on stderr and run that. 2026-11-21: a bare `--notify` cost an argparse
+    usage error, and with one allowed, the flag before the target would swallow it."""
+    if len(raw) < 3 or raw[0] != "land":
+        return raw
+    for i, word in enumerate(raw):
+        if word != "--notify" or i + 1 >= len(raw):
+            continue
+        after = raw[i + 1]
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", after):
+            return raw
+        if any(re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", w) for w in raw[1:i]):
+            return raw  # the target is already there: --notify names something else, odd as it looks
+        fixed = raw[:i] + [after] + ["--notify"] + raw[i + 2:]
+        print(f"glaeda-gh: read as `{' '.join(fixed)}` (--notify takes HOST/SESSION, not the PR; with no "
+              f"value it names this session)", file=sys.stderr)
+        return fixed
+    return raw
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    raw = land_notify_synonym(log_job_synonym(raw))
     if raw and raw[0] == "gh":
         # Everything after `gh` belongs to the real gh, flags and all: argparse must not see it.
         if raw[1:2] == ["--install-shim"] or raw[1:2] == ["--print-shim"]:
