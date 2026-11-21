@@ -10545,6 +10545,19 @@ LAND_SNAPSHOT_SCHEMA = "land-judge-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# A wait parked on the PR's checks is read at full pace again this long before it wakes, so the judgment its own
+# timeout asks for is handed a snapshot instead of paying for a live read. Two constants decided this on their own:
+# a parked entry's unwaited read comes at most every LAND_PEEK_EVERY (600 s), which is strictly looser than the
+# LAND_SNAPSHOT_MAX_AGE (300 s) a snapshot must be inside, so a wait_pr verdict that slept its 1800 s woke with a
+# cache that could not qualify -- snapshot() answered "wait", snapshot_wait() nudged a read and gave it
+# LAND_SNAPSHOT_WAIT, and when that ran out the judgment went live. Measured on this host 2026-11-17..21: the
+# snapshot share of explains fell 94% -> 85% -> 71% -> 56% -> 35% as more lands parked on check waits, and 136 of
+# 232 snapshot waits ended snapshot_missing. An explain costs a median of 4 GitHub calls (p90 24, max 52, 82%
+# REST), and the ones at an unmoved fingerprint cost no less than the rest, so this is where that spend goes.
+# Nothing about the judgment changes: it is asked at the same moment, of the same tool, and every verdict's own
+# wait is still honoured to the second. Only the evidence handed to it is fresh. Inside LAND_SNAPSHOT_MAX_AGE with
+# room for the read to land, and the read is one the daemon's batch was going to make anyway.
+LAND_WAKE_PREFETCH = 180.0
 # Judgments run on the land workers and are handed one only when one is free (LandQueue.judge), least recently judged
 # first (LandQueue.judge_order). huge-blue, 2026-11-18: every due judgment went onto the pool's own queue at once (596
 # lands, 4 workers), hours deep; each update's re-exec (glaeda releases land 10-60 min apart) dropped that queue and
@@ -12498,6 +12511,16 @@ class LandQueue:
             self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=LAND_WORKERS_MAX, thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
+    def wake_near(self, e: dict) -> bool:
+        """True while E is parked and its wake is within LAND_WAKE_PREFETCH: its PR is read at full pace for that last
+        stretch, so the judgment its own timeout is about to ask for is handed a rollup snapshot inside
+        LAND_SNAPSHOT_MAX_AGE instead of a cache as old as the wait it slept through (LAND_WAKE_PREFETCH). Decides
+        only which reads the daemon's batch makes first, never when the judgment happens or what it answers."""
+        wake = e.get("wakeAt")
+        if e["state"] != "waiting" or not isinstance(wake, (int, float)) or isinstance(wake, bool):
+            return False
+        return 0.0 <= float(wake) - self.now <= LAND_WAKE_PREFETCH
+
     def keep_watching(self, e: dict) -> None:
         """The PR, its --after PRs and whatever it waits on stay watched and waited, so the daemon reads them at
         full pace: only while E is due (due), or waits on its own push's new head. Otherwise (LAND_PEEK_EVERY) its PR
@@ -12505,7 +12528,7 @@ class LandQueue:
         --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        waited = self.due(e) or w.get("kind") == "head_change"
+        waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])

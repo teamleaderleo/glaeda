@@ -21164,6 +21164,44 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
 
+    def test_a_wait_parked_on_the_checks_is_read_at_full_pace_before_its_own_wake(self):
+        # Measured on this host's own land entries 2026-11-17..21: the snapshot share fell 94% -> 35% and 136 of 232
+        # snapshot waits ended snapshot_missing. Two constants decided it: a parked entry's unwaited read comes at most every
+        # LAND_PEEK_EVERY (600 s), looser than the LAND_SNAPSHOT_MAX_AGE (300 s) a snapshot must be inside, so a
+        # wait_pr verdict that slept 1800 s could not wake with a cache that qualified and paid for a live read. The
+        # last LAND_WAKE_PREFETCH before the wake is read at full pace instead.
+        self.assertLess(gg.LAND_WAKE_PREFETCH, gg.LAND_SNAPSHOT_MAX_AGE)  # the read must land inside the bound
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.snap_pr(LA, snap_head=LA)
+        self.land()
+        peeks: list[str] = []
+        self.q.peek = peeks.append  # the unwaited read a parked entry gets; self.w.watched is the full-pace one
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        # Parked with its wake far off: peeked, never read at full pace, so the daemon spends nothing on a PR it is
+        # not about to judge.
+        self.w.watched.clear()
+        self.tick(1800 - gg.LAND_WAKE_PREFETCH - 60)
+        self.assertNotIn(self.KEY, self.w.watched)
+        self.assertIn(self.KEY, peeks)
+        self.assertEqual(len(self.w.explains()), 1)  # and nothing judged early: its own wait still runs
+        # Inside the prefetch window: read at full pace, still not judged.
+        self.tick(90)
+        self.assertIn(self.KEY, self.w.watched)
+        self.assertEqual(len(self.w.explains()), 1)
+        # Its timeout: judged, and handed a snapshot rather than reading live.
+        self.snap_pr(LA, snap_head=LA)  # the read the prefetch asked for
+        day = gg.land_day(self.t)
+        live_before = gg.land_counts()[day].get("live") or 0
+        self.w.answers.append(ok_answer(LA))
+        self.tick(gg.LAND_WAKE_PREFETCH)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
+        self.assertEqual(gg.land_counts()[day].get("live") or 0, live_before)
+        self.assertNotIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
+        self.assert_merged_at(LA)
+
     class FakePool:
         """A worker pool whose jobs run only when a test says so: what was handed to it, in order."""
 
