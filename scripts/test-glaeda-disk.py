@@ -3158,13 +3158,10 @@ class GlaedaDiskTest(unittest.TestCase):
                                       "--receipt", os.fspath(self.receipt())])
             return status, out.getvalue(), survey
 
-        # Under pressure but above the emergency floor (10% of 460 GiB): it still defers.
+        # Under pressure but above the emergency floor (10% of 460 GiB): a pressure apply goes on too.
         status, out, survey = run(100)
-        self.assertEqual(status, 3)
-        self.assertIn("measurement_busy", out)
-        survey.assert_not_called()
-        # A deferred run lets go of the eviction lock it took, not only at exit.
-        self.assertIsNone(gd._EVICT_HANDLE)
+        self.assertNotIn("measurement_busy", out)
+        survey.assert_called()
         # Nearly empty: it goes on.
         status, out, survey = run(0.9)
         self.assertNotIn("measurement_busy", out)
@@ -6003,7 +6000,7 @@ class GlaedaDiskTest(unittest.TestCase):
         lock = self.root / "measure.lock"
         with lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply", "--refresh"], free_gib=100.0)
         survey.assert_not_called()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["skipped"], "measurement_busy")
@@ -13741,6 +13738,43 @@ class DeadItemsTest(unittest.TestCase):
         (self.home / ".lima/slot-1").symlink_to(store / "slot-0")
         self.assertEqual(gd.candidates(fam), [], "an instance that is a symlink is never followed")
         self.assertTrue((store / "slot-0").exists())
+
+    def test_an_idle_bench_lume_image_goes_unless_a_lume_vm_or_the_bench_runs(self) -> None:
+        """The computer-use bench's pinned Lume images (/Users/Shared/cu-driver-bench/.lume/<vm>): a pull brings one
+        back, so an idle one goes; the bench running, a lume run, or a lume command naming it keeps it."""
+        root = self.root / "cu-driver-bench/.lume"
+        image = root / "cu-bench-base-26-5-2"
+        (image / "disk.img").parent.mkdir(parents=True)
+        (image / "disk.img").write_bytes(b"x" * 4096)
+        (root / ".cache").mkdir()
+        self.age(root, 26)
+        self.assertTrue(gd.lume_root_safe(root))
+        fam = gd.lume_bench_family(root)
+        self.assertEqual([p.name for p in gd.candidates(fam)], ["cu-bench-base-26-5-2"], "dot entries are no items")
+        self.assertIn(fam.id, gd.REMOTE_COPY_FAMILIES)
+        for cmds, held in (("", False),
+                           ("/bin/bash scripts/measure/cu-driver-bench.sh --runs 3\n", True),
+                           ("/opt/homebrew/bin/lume run cu-bench-base-26-5-2 --no-display\n", True),
+                           ("/opt/homebrew/bin/lume run some-other-vm\n", True),
+                           ("/opt/homebrew/bin/lume pull ghcr.io/x/cu-bench-base-26-5-2:pinned\n", False),
+                           ("/opt/homebrew/bin/lume stop cu-bench-base-26-5-2\n", True),
+                           ("/usr/bin/vim notes-on-lume.txt\n", False)):
+            self.assertEqual(bool(gd.lume_vm_held(image, cmds)), held, cmds)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/lume run cu-bench-base-26-5-2\n")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "in-use", items["cu-bench-base-26-5-2"].reasons)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "reclaimable", items["cu-bench-base-26-5-2"].reasons)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["cu-bench-base-26-5-2"]], {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(image.exists())
+        link = self.root / "linked/.lume"
+        link.parent.mkdir()
+        link.symlink_to(root)
+        self.assertFalse(gd.lume_root_safe(link), "a symlinked root is never walked")
 
     def test_journey_cache_entries_unused_for_days_go(self) -> None:
         cache = self.home / gd.JOURNEY_CACHE

@@ -5272,6 +5272,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                                mirror_exclude=FLEET_CACHE_MIRROR_KEEP,
                                platform="macos"))
+        if lume_root_safe(LUME_BENCH_ROOT):
+            fams.append(lume_bench_family(LUME_BENCH_ROOT))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
             fams.append(ci_ios_family(ci_ios))
@@ -7347,6 +7349,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "cmux-ghosttykit-cache",
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
     "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
+    "lume-bench-images",   # LUME_BENCH_IMAGES: a pulled bench image; a lume command or open disk.img still keeps it
     *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS),  # journey rounds are no CI job; a running app still keeps its build
     INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
 })
@@ -10149,7 +10152,7 @@ TART_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, TART_VMS})
 # Caches whose every item has a remote copy to pull back (a registry image, Apple's IPSW): under pressure they go
 # whatever their age (Leo, 2026-11-18, via the coordinator: a cache the controller SSD or R2 also holds is
 # reclaimable no matter how old). Seeds in the LAN archive already go at once (item_window's `archived`).
-REMOTE_COPY_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS})
+REMOTE_COPY_FAMILIES = frozenset({TART_IMAGES, TART_IPSWS, "lume-bench-images"})  # the last: LUME_BENCH_IMAGES
 # Two days past Tart's last access: APFS moves atime at most once a day, so an image cloned daily still reads in use.
 TART_IDLE_HOURS = 2 * 24.0
 TART_DIGEST_PREFIX = "sha256:"
@@ -10335,44 +10338,43 @@ LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
 ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS, "hq-tip-loop-work"}  # walked only when tart_root_safe(root)
 
 
-def lima_vm_held(path: Path, cmds: str) -> str:
-    """Why a Lima instance is in use, or "": its hostagent's ha.pid names a live process (Lima removes the file when
-    the instance stops; a stale one whose pid was reused keeps the instance, which only errs toward keeping), or a
-    running limactl or lima command names it. An unreadable or malformed ha.pid counts as held."""
+# The computer-use driver bench's Lume VM images (cmux scripts/measure/cu-driver-bench.sh: LUME_HOME is
+# /Users/Shared/cu-driver-bench/.lume, one directory per VM, each a full macOS disk pulled from a pinned image tag).
+# No family listed them: one fleet mini held 26.7 GiB there at 0 GiB free (2026-11-21), and the gap read as
+# "unclassified". The bench pulls the pinned image again when it is missing, so an image nothing runs is a remote
+# copy (REMOTE_COPY_FAMILIES: under pressure it goes whatever its age). A running lume or bench command naming it,
+# an open file (the Virtualization framework holds disk.img open while a VM runs) or a .glaeda-keep.json claim
+# keeps it. A root that is a symlink, or under a symlinked parent, is never walked.
+LUME_BENCH_IMAGES = "lume-bench-images"
+LUME_BENCH_ROOT = Path("/Users/Shared/cu-driver-bench/.lume")
+LUME_VM_RUN = re.compile(r"(?:^|/)lume\s")
+LUME_BENCH_RUN = re.compile(r"(?:^|/)cu-driver-bench(?:\.sh)?(?:\s|$)")
+
+
+def lume_root_safe(root: Path) -> bool:
+    """Whether the bench's Lume root may be walked: it and its parent are real directories, not symlinks."""
     try:
-        fd = os.open(path / "ha.pid", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        fd = None
+        return (not root.is_symlink() and not root.parent.is_symlink() and root.is_dir()
+                and os.path.realpath(root) == os.path.abspath(root))
     except OSError:
-        return "its ha.pid is unreadable"
-    if fd is not None:
-        try:
-            st = os.fstat(fd)
-            raw = os.read(fd, 64)
-            # the read moves the pid file's atime (Linux relatime): hand Lima's date back, or this probe alone
-            # would make a stopped instance read as used (tart_vm_last_use counts its files' atime)
-            with contextlib.suppress(OSError, NotImplementedError):
-                os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
-        except OSError:
-            return "its ha.pid is unreadable"
-        finally:
-            os.close(fd)
-        try:
-            pid = int(raw.decode("ascii", "replace").strip())
-        except ValueError:
-            return "its ha.pid is malformed"
-        if pid <= 0:
-            return "its ha.pid is malformed"
-        try:
-            os.kill(pid, 0)
-            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
-        except PermissionError:
-            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
-        except OSError:
-            pass  # a pid file the hostagent left on a crash: nothing runs it
+        return False
+
+
+def lume_bench_family(root: Path) -> "Family":
+    return Family(LUME_BENCH_IMAGES, root, True, "the computer-use bench pulls its pinned Lume image again",
+                  depth=1, skip_prefixes=(".",), min_idle_hours=DEFAULT_AGE_HOURS,
+                  owner="cmux computer-use driver bench (scripts/measure/cu-driver-bench.sh)",
+                  rebuild_minutes=20, platform="macos")
+
+
+def lume_vm_held(path: Path, cmds: str) -> str:
+    """Why a bench Lume VM is in use, or "": the bench runs, a lume VM runs, or a lume command names it."""
+    name = re.compile(r"(?:^|[\s=/])" + re.escape(path.name) + r"(?:[\s/]|$)")
     for line in cmds.splitlines():
-        if LIMA_VM_RUN.search(line) and re.search(r"(?:^|\s)" + re.escape(path.name) + r"(?:\s|$)", line):
-            return f"a running limactl command names it ({line.strip()[:120]})"
+        if LUME_BENCH_RUN.search(line):
+            return f"the computer-use bench runs ({line.strip()[:120]})"
+        if LUME_VM_RUN.search(line) and (name.search(line) or re.search(r"\srun(?:\s|$)", line)):
+            return f"a running lume command holds it ({line.strip()[:120]})"
     return ""
 
 
@@ -11132,6 +11134,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
             reasons.append(why)
         if fam.id == LIMA_VMS and not blind and (why := lima_vm_held(path, cmds)):
+            reasons.append(why)
+        if fam.id == LUME_BENCH_IMAGES and not blind and (why := lume_vm_held(path, cmds)):
             reasons.append(why)
         if media_tour_dd(fam, path) and media_tour_tag_held(path):
             reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
@@ -13852,6 +13856,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
                 or (fam.id == LIMA_VMS and lima_vm_held(p, cmds))
+                or (fam.id == LUME_BENCH_IMAGES and lume_vm_held(p, cmds))
                 or (fam.id in BUILD_STATE_FAMILY_IDS and build_state_held(fam, p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
@@ -16082,11 +16087,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         measure_lock.close()
         measure_lock = None
         _ACTIVE_MEASURE_HANDLE = None
-        # Below the emergency floor a pressure apply goes on without the lock, as a report does: it
-        # re-measures its candidates itself (fresh_for_apply), and a background refresh can take up to
-        # its 600 s budget (cmux9s, 2026-10-21: every pressure run skipped at 0.9 GiB free while a
-        # refresh held the lock, with 32 GiB of finished steps' spm-scratch reclaimable).
-        if (a.pressure and not (a.apply and EMERGENCY_DEVS)) or a.refresh:
+        # A pressure apply under its low goes on without the lock: it re-measures its candidates itself
+        # (fresh_for_apply), the eviction lock already keeps two applies apart, and a background refresh
+        # can take up to its 600 s budget (2026-10-21: every pressure run skipped at 0.9 GiB free while a
+        # refresh held the lock; 2026-11-21: two minis at 11 and 0 GiB free skipped every 15-minute pass
+        # above the emergency floor). Only a report-only pressure run or a refresh still defers.
+        if (a.pressure and not a.apply) or a.refresh:
             if measure_lock is not None:
                 measure_lock.close()
                 measure_lock = None
