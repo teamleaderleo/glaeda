@@ -27310,6 +27310,40 @@ class AppPoolTest(Base):
         self.assertEqual([e["key"] for e in due], [entry["key"]])
         self.assertEqual(self.minted, ["manaflow-ai"], "eligibility checks the App before spending login quota")
 
+    def test_a_mixed_owner_set_below_the_reserve_reads_the_app_owners_instead_of_nothing(self) -> None:
+        """One watch on an account with no App installed (teamleaderleo) made every App-servable watch beside it
+        ineligible too, because eligibility builds one query for the whole set and AppPool.owner_of refuses a
+        cross-owner query: under a login stop the daemon then read none of them. big-red 2026-11-21 11Z watched 18
+        manaflow-ai and 14 teamleaderleo keys, so no PR set was ever eligible."""
+        self.daemon.budget = {
+            "rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][1] - 1, "reset": NOW + 900},
+            "graphql": {"limit": 5000, "remaining": gg.FLOORS["graphql"][1] - 1, "reset": NOW + 900},
+        }
+        mine = [{"key": "pr:manaflow-ai/cmux#1", "cache": None, "touched": NOW},
+                {"key": "pr:teamleaderleo/glaeda#2", "cache": None, "touched": NOW},
+                {"key": "pr:manaflow-ai/cmux#3", "cache": None, "touched": NOW}]
+        self.assertEqual(self.daemon.app_entries_eligible("pr", mine, "graphql"), [],
+                         "the mixed set names two owners, so no one installation can answer it")
+        self.daemon.last_cycle["pr"] = NOW - gg.CYCLE
+        due = self.daemon.due("pr", list(mine))
+        self.assertEqual([e["key"] for e in due], ["pr:manaflow-ai/cmux#1", "pr:manaflow-ai/cmux#3"],
+                         "the App's owner is read; the owner with one pool waits for its reset")
+
+    def test_a_graphql_batch_never_mixes_owners_so_the_app_can_take_it(self) -> None:
+        """A batch that mixes owners has no App and all of it goes on the login's 5,000 points an hour while the role
+        Apps hold 12,500 each: 108 of big-red's 163 login GraphQL points in the 2026-11-21 11Z hour were spent by
+        cross-owner batches."""
+        keys = [f"pr:manaflow-ai/cmux#{i}" if i % 2 else f"pr:teamleaderleo/glaeda#{i}" for i in range(1, 13)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertTrue(sent, "the batch was sent")
+        for chunk in sent:
+            owners = {k.split(":", 1)[1].split("/")[0] for k in chunk}
+            self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
+        self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
+
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
         """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has
         its own limits, so the daemon's App reads go on while the login waits, and a login read is still held."""

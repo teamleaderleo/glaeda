@@ -6770,6 +6770,12 @@ class Daemon:
         if app_mine:
             mine = app_mine
             mode = "normal"
+        elif mode == "stop":
+            # The whole set is eligible for nothing only because it mixes owners: read the owners an App can answer
+            # rather than nothing. The others have one pool (the login) and wait for its reset, as they must.
+            app_mine = self.app_eligible_by_owner(kind, mine, path)
+            if app_mine:
+                mine, mode = app_mine, "normal"
         if (mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped())) and not app_mine:
             # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
@@ -7851,6 +7857,20 @@ class Daemon:
             return []
         return entries
 
+    def app_eligible_by_owner(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
+        """app_entries_eligible asked per owner, unioned in ENTRIES' order. It builds one representative request for
+        the whole set, so a set that mixes owners is eligible for nothing at all (AppPool.owner_of returns None for a
+        cross-owner query): one watch on an account with no App installed made every App-servable watch beside it
+        ineligible too, and under a login stop due() then read none of them. big-red 2026-11-21 11Z watched 18
+        manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
+        groups: dict[str, list[dict]] = {}
+        for e in entries:
+            groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+        if len(groups) < 2:
+            return self.app_entries_eligible(kind, entries, bucket)
+        ok = {e["key"] for g in groups.values() for e in self.app_entries_eligible(kind, g, bucket)}
+        return [e for e in entries if e["key"] in ok]
+
     @property
     def rest_fetch(self) -> dict[str, Callable[[dict], None]]:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
@@ -7877,7 +7897,17 @@ class Daemon:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
-            return alone + [rest[i:i + size] for i in range(0, len(rest), size)]
+            # One owner per query. An App installation answers a read only when the whole query names one owner
+            # (AppPool.owner_of returns None for a cross-owner body), so a batch that mixes owners has no App and
+            # all of it -- the App-servable entries included -- goes on the shared login's 5,000 points an hour
+            # while the role Apps hold 12,500 each. big-red 2026-11-21 11Z: 18 manaflow-ai and 14 teamleaderleo
+            # watches interleaved at GQL_BATCH 15, so 108 of the hour's 163 login GraphQL points were spent by
+            # cross-owner batches and only 5 by a manaflow-ai batch an App could take. Grouping costs one query per
+            # owner (a query is a point at most, and an App's costs the login nothing).
+            groups: dict[str, list[dict]] = {}
+            for e in rest:
+                groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+            return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
