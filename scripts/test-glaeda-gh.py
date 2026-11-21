@@ -742,6 +742,80 @@ class UnfinishedStatusTest(Base):
         self.assertEqual(gg.verdict("pr", data, "green", self.SHA, now=NOW), gg.EXIT_OK)
         self.assertIsNone(gg.verdict("pr", self.data(check_run("ci")), "green", self.SHA, now=NOW))
 
+    def expected(self, repo: str = "teamleaderleo/leo-workspace", contexts=("ws-check",)) -> None:
+        """Name this repo's expected contexts the way a host does, through the config file."""
+        gg.write_json(gg.EXPECTED_CONFIG, {repo: list(contexts)})
+        self.addCleanup(gg.EXPECTED_CONFIG.unlink)
+
+    def finished(self, *nodes: dict, ago: float, repo: str = "teamleaderleo/leo-workspace") -> dict:
+        """A head whose only check passed AGO seconds ago, and whose expected ws-check was never posted:
+        leo-workspace#7209's exact shape -- `1 passed, 0 failed, 0 pending (of 1, 0 required)`, rollup SUCCESS.
+        NODES are extra checks on the same head, finished at the same time."""
+        done = check_run("GitGuardian Security Checks")
+        done["completedAt"] = iso(NOW - ago)
+        node = pr_node(7209, rollup="SUCCESS", checks=[done, *nodes])
+        node.update(url=f"https://github.com/{repo}/pull/7209", headRefOid=self.SHA,
+                    mergeStateStatus="CLEAN", updatedAt=iso(NOW - ago))
+        return gg.parse_pr(node)
+
+    def test_a_done_wait_ends_once_the_deciding_checks_have_ended(self) -> None:
+        """teamleaderleo/leo-workspace#7209, 2026-11-21: `--until done --timeout 1500` spent all 25 minutes on
+        `mergeable=MERGEABLE (CLEAN)`, `1 passed, 0 failed, 0 pending (of 1, 0 required)`, rollup SUCCESS, held only
+        by `expected, not posted yet: ws-check` -- a context land-judge [never-without-ci] already excuses on a green
+        head 20 min old. The wait outlasted the hold it serves. A done wait ends once every check that decides has
+        ended, and names what it ended without (docs/handbook/done-wait-held-by-stragglers.md)."""
+        self.expected()
+        key = "pr:teamleaderleo/leo-workspace#7209"
+        held = self.finished(ago=gg.EXPECTED_UNPOSTED_AFTER - 60)
+        self.assertIsNone(gg.verdict("pr", held, "done", self.SHA, now=NOW),
+                          "inside the lander's own bound the context may still post: it holds")
+        self.assertNotIn("done without", gg.summary(key, {"data": held}))
+
+        past = self.finished(ago=gg.EXPECTED_UNPOSTED_AFTER + 60)
+        self.assertEqual(gg.verdict("pr", past, "done", self.SHA, now=NOW), gg.EXIT_OK,
+                         "past it the lander would not hold, so neither does a done wait")
+        said = gg.summary(key, {"data": past})
+        self.assertIn("done without: ws-check", said)
+        self.assertIn("expected here and never posted", said)
+        self.assertIn("land-judge excuses the same context at 20 min", said)
+        self.assertIn("so a done wait holds no longer than it does", said)
+        # a `merged` wait still needs the merge, so nothing there is done without anything
+        self.assertNotIn("done without", gg.summary(key, {"data": past}, until="merged"))
+        self.assertEqual(gg.EXPECTED_UNPOSTED_AFTER, 20 * 60,
+                         "the bound is the lander's own, so the wait cannot outlast the hold it serves")
+
+    def test_green_and_required_still_wait_for_an_unposted_expected_context(self) -> None:
+        """The cut is `done`'s alone. `green` and `required` mean every expected context reported, which is what
+        #3538 decided; changing them would make a never-posted ws-check read as success there."""
+        self.expected()
+        past = self.finished(ago=gg.EXPECTED_UNPOSTED_AFTER * 3)
+        for until in ("green", "required"):
+            self.assertIsNone(gg.verdict("pr", past, until, self.SHA, now=NOW), until)
+        self.assertEqual(gg.verdict("pr", past, "done", self.SHA, now=NOW), gg.EXIT_OK)
+
+    def test_a_check_that_has_not_ended_still_holds_a_done_wait(self) -> None:
+        """"Every check that decides has ended" is the whole condition: one still running decides, so the age of the
+        others buys nothing. A completedAt that cannot be read is unknown, not past
+        (docs/handbook/missing-read-counted-as-a-value.md)."""
+        self.expected()
+        data = self.finished(ago=gg.EXPECTED_UNPOSTED_AFTER * 3)
+        running = check_run("build", status="IN_PROGRESS", conclusion=None)
+        running["completedAt"] = None
+        data["checks"] = [*data["checks"], running]
+        self.assertIsNone(gg.verdict("pr", data, "done", self.SHA, now=NOW))
+        self.assertEqual(gg.expected_unposted(data, NOW), [])
+        self.assertNotIn("done without", gg.summary("pr:teamleaderleo/leo-workspace#7209", {"data": data}))
+
+    def test_nothing_is_ended_without_when_nothing_is_missing(self) -> None:
+        """A head where the expected context did post ends on its own merits, and says nothing extra."""
+        self.expected()
+        data = self.finished(status_context("ws-check"), ago=gg.EXPECTED_UNPOSTED_AFTER * 3)
+        self.assertEqual(gg.verdict("pr", data, "done", self.SHA, now=NOW), gg.EXIT_OK)
+        self.assertEqual(gg.expected_unposted(data, NOW), [])
+        self.assertNotIn("done without", gg.summary("pr:teamleaderleo/leo-workspace#7209", {"data": data}))
+        # and a repo nothing is expected of is untouched by any of this, however old its head
+        self.assertEqual(gg.expected_unposted(self.finished(ago=10**6, repo="o/r"), NOW), [])
+
     def test_an_empty_head_inside_the_settle_window_is_not_started(self) -> None:
         data = self.data(pushed=NOW - 60)
         self.assertIsNone(gg.verdict("pr", data, "green", self.SHA, now=NOW))
