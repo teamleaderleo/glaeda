@@ -8348,12 +8348,19 @@ NETWORK_URL = re.compile(r"(https?|ssh|git|git\+ssh|ssh\+git)://|[^/.][^/:]*:(?!
 
 
 TRUSTED_LOCAL_REMOTES: tuple[str, ...] = ()  # tests: local repos standing in for a server
+# The fleet git mirror (the cmux-git-mirror family: report only, kept by role, never deleted here) is a server copy:
+# glaeda-git-mirror fetches it from GitHub, and jobs and checkouts clone from it. A checkout whose only remote is
+# that path had no network remote, so nothing counted as pushed and its bundle had to carry the whole history:
+# /Users/cmux/m2l-viewer on a fleet host kept 5.4 GB for "no room: its peak needs 5.4G free" with 13 commits
+# (2.2 MB) unpushed (2026-11-21).
+FLEET_MIRROR_REMOTES: tuple[str, ...] = ("/Users/Shared/cmux-build-fleet/git",)
 
 
 def network_remotes(gitdir: Path) -> list[str] | None:
-    """Remotes on another machine. A local path or file:// remote can be one more scratch repo
-    about to be deleted too (two clones fetching from each other vouch for commits that exist
-    nowhere else), so it never counts as a copy. None when the config cannot be read."""
+    """Remotes on another machine, or the fleet git mirror (FLEET_MIRROR_REMOTES). Any other local path or
+    file:// remote can be one more scratch repo about to be deleted too (two clones fetching from each other
+    vouch for commits that exist nowhere else), so it never counts as a copy. None when the config cannot be
+    read."""
     out = _git_dir_run(gitdir, "config", "--get-regexp", r"^remote\..*\.url$")
     if out is None:
         return [] if _git_dir_run(gitdir, "rev-parse", "--git-dir") is not None else None
@@ -8361,7 +8368,8 @@ def network_remotes(gitdir: Path) -> list[str] | None:
     for line in out.splitlines():
         key, _, url = line.partition(" ")
         name = key[len("remote."):-len(".url")]
-        trusted = any(url == t or url.startswith(t + "/") for t in TRUSTED_LOCAL_REMOTES)
+        trusted = any(url.rstrip("/") == t or url.startswith(t + "/")
+                      for t in (*TRUSTED_LOCAL_REMOTES, *FLEET_MIRROR_REMOTES))
         if trusted or (NETWORK_URL.match(url) and not url.startswith("file:")):
             names.add(name)
         else:

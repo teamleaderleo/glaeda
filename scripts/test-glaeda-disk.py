@@ -3661,6 +3661,21 @@ class GlaedaDiskTest(unittest.TestCase):
                              "b": ("git-checkout", ["commits no remote confirms"])})
         self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
 
+    def test_the_fleet_git_mirror_vouches_like_a_server(self) -> None:
+        root, origin = self._tmp_repos()
+        a = root / "a"
+        self._git("clone", "-q", str(origin), str(a))
+        gd.TRUSTED_LOCAL_REMOTES = ()
+        self.assertEqual(gd.network_remotes(a / ".git"), [])  # a plain local path is no copy
+        self.addCleanup(setattr, gd, "FLEET_MIRROR_REMOTES", gd.FLEET_MIRROR_REMOTES)
+        gd.FLEET_MIRROR_REMOTES = (str(origin.parent),)  # as cmux.git sits under the fleet's git/
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        head = self._git("-C", str(a), "rev-parse", "HEAD").strip()
+        pushed = self._git("-C", str(origin), "rev-parse", "HEAD").strip()
+        why, _, known = gd._server_known(a / ".git", ["origin"], {head, pushed})
+        self.assertEqual((why, known), ("", [pushed]))  # the bundle needs only the commit made here
+
     def test_network_remote_urls(self) -> None:
         for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
                     "big-red:Projects/x", "git://h/r"):
