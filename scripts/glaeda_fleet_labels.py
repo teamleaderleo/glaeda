@@ -169,7 +169,7 @@ def side_classes(klass: str) -> tuple[str, ...]:
     to be doing much of anything and we're underutilizing the ultras", after "accept all labels"). Until then side
     labels widened only downward (a std side runner carried glaeda-side-light-xcode-<v>, a light one never
     glaeda-side-std-xcode-<v>): at 2026-11-21 01:09Z glaeda-side-std-xcode-26.6 had 151 jobs queued, the oldest
-    2h59m, while the light M6 minis cmux17 and cmux21 sat at 7% and 1% CPU (the controller's /v1/status headroom).
+    2h59m, while two light minis sat at 7% and 1% CPU (the build controller's headroom reading).
     The hook still admits each job by its own measured need (HEAD_FIT, the capacity ledger and the listener gate),
     so a 16 GB mini whose runner carries the std side label listens for a std side job only with room for it.
     Earlier: on 2026-10-20 at 22:22Z the light side label had 133 jobs queued on 3 online runners while 51 std side
