@@ -23513,6 +23513,26 @@ def cmd_on_event_replay(run_file: Path, jobs_file: Path | None, wait: float, as_
     return EXIT_OK
 
 
+REPO_ONLY_RE = re.compile(rf"({NAME})/({NAME})")
+
+
+def join_repo_and_number(raw: list[str]) -> list[str] | None:
+    """`wait run OWNER/REPO RUN_ID`, `wait pr OWNER/REPO N` (also status, and `land OWNER/REPO N`): the repository and
+    the number as two words, joined into the one target the command takes (coordinator, 2026-11-21: `glaeda-gh wait run
+    manaflow-ai/cmuxterm-hq 44884634507` failed "unrecognized arguments"). None when the words are not that shape."""
+    cmd, rest = raw[0], raw[1:]
+    kind = ""
+    if cmd != "land":
+        if len(rest) < 3 or rest[0] not in ("pr", "run"):
+            return None
+        kind, rest = rest[0], rest[1:]
+    if len(rest) < 2 or not REPO_ONLY_RE.fullmatch(rest[0]) or not re.fullmatch(r"#?\d+", rest[1]):
+        return None
+    number = rest[1].lstrip("#")
+    target = f"{rest[0]}/{number}" if kind == "run" else f"{rest[0]}#{number}"
+    return [cmd] + ([kind] if kind else []) + [target] + rest[2:]
+
+
 def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     """`wait|status|land` called without the kind run as the call meant (fewer-tool-calls).
 
@@ -23521,6 +23541,9 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
         return raw, ""
     cmd, first = raw[0], raw[1]
+    joined = join_repo_and_number(raw)
+    if joined:
+        return joined, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + joined)}`"
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"

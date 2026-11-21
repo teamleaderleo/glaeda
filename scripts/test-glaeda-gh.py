@@ -4784,6 +4784,23 @@ class ClientTest(Base):
                      ["land", "o/r#5"], ["land", "status"], ["budget", "o/r#5"], ["wait"]):
             self.assertEqual(gg.infer_kind(list(same)), (same, ""))
 
+    def test_a_repo_and_a_number_are_joined(self) -> None:
+        """Coordinator, 2026-11-21: `wait run manaflow-ai/cmuxterm-hq 44884634507` was "unrecognized arguments"."""
+        want = {
+            ("wait", "run", "manaflow-ai/cmuxterm-hq", "44884634507", "--timeout", "60"):
+                ["wait", "run", "manaflow-ai/cmuxterm-hq/44884634507", "--timeout", "60"],
+            ("wait", "pr", "o/r", "5"): ["wait", "pr", "o/r#5"],
+            ("status", "pr", "o/r", "#7", "--json"): ["status", "pr", "o/r#7", "--json"],
+            ("land", "o/r", "12"): ["land", "o/r#12"],
+        }
+        for given, fixed in want.items():
+            got, note = gg.infer_kind(list(given))
+            self.assertEqual(got, fixed)
+            self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
+            gg.parser().parse_args(got)
+        for same in (["wait", "pr", "o/r#5", "7"], ["wait", "run", "o/r"], ["wait", "run", "o", "5"]):
+            self.assertEqual(gg.infer_kind(list(same))[0], same)
+
     def test_a_usage_error_names_the_right_form(self) -> None:
         self.assertEqual(gg.usage_next(["wait", "pr", "manaflow-ai/cmuxterm-hq", "0"]),
                          "glaeda-gh wait pr manaflow-ai/cmuxterm-hq#0 --timeout 1800")
