@@ -21424,8 +21424,10 @@ class LogScanTest(Base):
             code, text = self.run_cmd(gg.cmd_log_errors, "o/r", 9, as_json=True, rest=self.no_rest)
         doc = json.loads(text)
         self.assertEqual((code, doc["run"]), (0, 9))
-        self.assertEqual([j["job"] for j in doc["jobs"]], [2, 4])  # the green job is not a failure, so not read
-        self.assertEqual(doc["jobs"][0]["total"], 6)
+        # Newest job first, the order the history is scanned in; the green job of the same run is no failure,
+        # so it is never read.
+        self.assertEqual([j["job"] for j in doc["jobs"]], [4, 2])
+        self.assertEqual({j["job"]: j["total"] for j in doc["jobs"]}, {4: 1, 2: 6})
         self.assertIn("run 9", err.getvalue())
 
     def test_errors_of_a_number_that_is_no_job_and_no_run_names_both_readings(self) -> None:
