@@ -1119,6 +1119,31 @@ class GlaedaDiskTest(unittest.TestCase):
             os.environ["RUSTUP_TOOLCHAIN"] = "nightly"
             self.assertTrue(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"))
 
+    def test_rustup_toolchains_a_class_receipt_needs_stay(self) -> None:
+        """2026-11-21: a sweep took 1.88.0 (the m6-16 receipt's DiffSidecar pin) and the gate held every listener off.
+        A toolchain a class receipt on the node names (its rustc, its diffRustToolchain) stays, default or not."""
+        home = self.root / "home"
+        rh = self.rustup_home(home)
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"")
+        receipts = home / ".config/glaeda/cmux-fleet/class-acceptance"
+        receipts.mkdir(parents=True)
+        (receipts / "m6-16.json").write_text(json.dumps({"toolchain": {
+            "rustcVersion": "rustc 1.90.0 (58cf8f9c3 2026-10-13)", "diffRustToolchain": "1.88.0",
+            "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}}))
+        (receipts / "broken.json").write_text("{")
+        (rh / "settings.toml").write_text('version = "12"\ndefault_toolchain = "stable"\n')
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
+            for key in ("RUSTUP_TOOLCHAIN", "XDG_CONFIG_HOME"):
+                os.environ.pop(key, None)
+            self.assertEqual(gd.receipt_toolchains(), {"1.90.0", "1.88.0"})
+            tcs = rh / "toolchains"
+            for tc in ("1.88.0-aarch64-apple-darwin", "1.90.0-aarch64-apple-darwin"):
+                self.assertIn("class receipt", gd.rustup_verdict(tcs / tc), tc)
+            self.assertEqual(gd.rustup_verdict(tcs / "nightly-aarch64-apple-darwin"), "")
+            self.assertTrue(gd.toolchain_held(tcs / "nightly-aarch64-apple-darwin"), "the rustup home is held whole")
+
     def test_apply_rechecks_a_discovered_cache_for_a_new_clone(self) -> None:
         home = self.root / "home"
         cache = home / ".npm/_cacache"

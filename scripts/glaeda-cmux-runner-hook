@@ -3863,6 +3863,53 @@ def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path
     return f"{match.group(1)}-{host.group(1)}" if match and host else None
 
 
+# The rustup toolchains a class receipt needs installed: its rustc (toolchain_refusal points rustup's default at it under
+# the host lock) and the DiffSidecar pin (diffRustToolchain, probed with `rustup run`). 2026-11-18 19:08Z a cruft sweep
+# removed 1.88.0 from the m6-16 minis (it kept only rustup's default, the newest and checkout pins); from 2026-11-21
+# ~00:00Z the gate held the m6-16 minis off on "diffRustcVersion '' != 'rustc 1.88.0'" and the Ultra roots on "rust
+# toolchain 1.99.1-... is not installed" until a hand install at 00:52Z. glaeda-mini-health reads this list
+# (node_toolchain_missing, healed with `rustup toolchain install X --profile minimal`), and glaeda-disk and the fleet's
+# cruft sweep keep every toolchain a class receipt on the node names.
+RUST_TOOLCHAIN_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?")
+
+
+def receipt_rust_toolchains(want: dict[str, Any]) -> list[str]:
+    """The exact toolchains (1.99.1, or 1.88.0-aarch64-apple-darwin as the receipt spells it) a class receipt's toolchain
+    section needs installed, in order, without repeats; a field that names no exact version adds nothing."""
+    out: list[str] = []
+    rustc = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
+    if rustc:
+        out.append(rustc.group(1))
+    diff = str(want.get("diffRustToolchain") or "").strip()
+    if diff and want.get("diffRustcVersion") and RUST_TOOLCHAIN_NAME.fullmatch(diff):
+        out.append(diff)
+    return list(dict.fromkeys(out))
+
+
+def rust_toolchain_installed(name: str, installed: list[str]) -> bool:
+    """NAME (1.88.0, or with its triple) is one of rustup's installed toolchain directory names."""
+    return any(have == name or have.startswith(name + "-") for have in installed)
+
+
+def receipt_toolchains_absent(fleet_class: str, home: Path | None = None) -> list[str]:
+    """The receipt_rust_toolchains of this node's FLEET_CLASS receipt that rustup's home ($RUSTUP_HOME, else ~/.rustup)
+    has no toolchain directory for; [] when there is no readable receipt. A directory listing only, no rustup run, so
+    the health agent can ask it every pass whatever its own PATH."""
+    home = home or Path.home()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
+    receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
+    want = receipt.get("toolchain") if isinstance(receipt, dict) and isinstance(receipt.get("toolchain"), dict) else {}
+    needed = receipt_rust_toolchains(want)
+    if not needed:
+        return []
+    root = Path(os.environ.get("RUSTUP_HOME") or home / ".rustup") / "toolchains"
+    try:
+        installed = [e.name for e in os.scandir(root) if e.is_dir()]
+    except OSError:
+        installed = []
+    return [name for name in needed if not rust_toolchain_installed(name, installed)]
+
+
 def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: str | None,
                       align: bool = True) -> tuple[str | None, str]:
     """Require every probed string to equal the class receipt's. With align (under the host lock), first
