@@ -850,6 +850,43 @@ class HeadRunOrderTest(unittest.TestCase):
                            {"run": 920, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}]])
         self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
 
+    def test_a_failed_run_stores_its_job_step_count_once(self) -> None:
+        """land-judge judges a stored red as a live one (runner_refused: a failed job with no step run is the runner's
+        refusal): each failure row's identity gets `steps`, read once per job by node id; a read that fails leaves
+        it absent (unknown, never 0)."""
+        runs: dict = {}
+        order: dict = {}
+        failed: dict = {}
+        nodes = [{**self.node("web / a", 10, "t0", "t1", "FAILURE"), "id": "CR_10"},
+                 {**self.node("web / b", 11, "t0", "t1", "FAILURE"), "id": "CR_11"},
+                 {**self.node("web / c", 12, "t0", "t1"), "id": "CR_12"}]
+        gg.fold_contexts(nodes, runs, {}, {}, order=order, failed=failed)
+        self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
+        asked: list = []
+
+        def graphql(query: str, variables: dict) -> tuple:
+            asked.append(variables["ids"])
+            return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
+                                       {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
+
+        fake = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+                                     graphql=graphql)
+        data = gg.head_data("a" * 40, runs, {}, {}, order)
+        gg.Daemon.head_steps(fake, data, failed)
+        rows = {r[0]: r for rs in data["runs"].values() for r in rs}
+        self.assertEqual((rows[10][5]["steps"], rows[11][5]["steps"]), (0, 2))
+        self.assertNotIn("steps", rows[12][5])
+        gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
+        self.assertEqual(asked, [["CR_10", "CR_11"]])
+        down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+                                     graphql=lambda q, v: (None, "graphql: down"))
+        again = gg.head_data("a" * 40, runs, {}, {}, order)
+        again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
+                         for k, rs in again["runs"].items()}
+        gg.Daemon.head_steps(down, again, failed)
+        self.assertTrue(all("steps" not in r[5] for rs in again["runs"].values() for r in rs))
+        self.assertIn("id databaseId", gg.HEAD_CONTEXTS)  # the read asks for the node id
+
     def test_rest_nodes_keep_them_too_and_no_order_writes_none(self) -> None:
         nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "web / react-apps-base-check", "status": "completed",
                                                   "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
@@ -21050,6 +21087,26 @@ class LandTest(Base):
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
         self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
 
+    def test_a_queued_prs_head_is_registered_for_land_judge_when_queued_and_when_it_moves(self):
+        heads: list[str] = []
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                              nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
+                              config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
+                              behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
+                              snapshot_of=self.snaps.get, head_watch=heads.append)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}"])
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}"])  # renewed only every LAND_TOUCH
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the head moved: a new key, at once
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}", f"head:o/r@{LB}"])
+        self.tick(gg.LAND_TOUCH + 1)
+        self.assertEqual(heads[-1], f"head:o/r@{LB}")
+        self.assertEqual(len(heads), 3)
+
     def test_tip_merge_update_branch_head_race_then_merge(self):
         self.pr(LA)
         self.land()
@@ -25234,7 +25291,8 @@ class LandTest(Base):
         calls: list[tuple[str, bool, bool]] = []
 
         def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
-            calls.append((key, waited, once))
+            if not key.startswith("head:"):  # a queued PR's head for land-judge's checks read (watch_head)
+                calls.append((key, waited, once))
         p = mock.patch.object(gg, "register", register)
         p.start()
         self.addCleanup(p.stop)
