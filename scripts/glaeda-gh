@@ -875,18 +875,17 @@ JOIN_MENTION = re.compile(r"(?<![\w.`])@[A-Za-z0-9][\w-]*")  # an @mention: a bo
 # busiest threads in that hour.
 POST_STATUS_MAX = 6 * 3600
 STATUS_KEY = re.compile(r"[\w.:=@/-]{1,120}")
-# A review-running marker (leo-workspace tools/review_running.py) still queued once it can no longer hold anything is
-# retired as superseded, never sent: its run's verdict or done line (`<!-- review-run=<run> -->`, or a comment keyed
-# `review-run=<run>`) is queued or was posted on the thread, or its `at=` is MARK_HOLD old (review_running.running()
-# skips a run started HOLD_S ago, so it would hold no merge). Receipts go out first (outbox_gate), so on huge-blue
-# 2026-11-21 15:4xZ about 206 markers sat behind them. Another run's receipt at the same head never retires a marker:
-# that run's own hold is the second-review case of cmux#31529. A review-service marker is never retired by age: its
-# GitHub time starts the SLOW_S clock a SHIP lands on. RUN_ENDS records, per thread, the runs the outbox posted an end
-# for (kept RUN_ENDS_KEEP).
+# A review-running marker (leo-workspace tools/review_running.py) still queued once its own run has ended is retired as
+# superseded, never sent: its run's verdict or done line (`<!-- review-run=<run> -->`, or a comment keyed
+# `review-run=<run>`) is queued or was posted on the thread. Sent after that end, it would hold the head's merge for
+# nothing (review_running._runs counts only an end that comes after the marker). Receipts go out first (outbox_gate), so
+# on huge-blue 2026-11-21 15:4xZ about 206 markers sat behind them. Nothing else retires one: another run's receipt at
+# the same head leaves that run's own hold standing (cmux#31529's second review), and an old marker whose run never
+# ended still starts review_running.slow()'s SHIP clock once posted (review_model). A queued end counts even if its own
+# post later fails: the run has ended either way. RUN_ENDS records, per thread, the runs the outbox posted an end for
+# (kept RUN_ENDS_KEEP).
 REVIEW_MARK = re.compile(r"^<!-- review-running sha=([0-9a-f]{40}) at=(\S+) run=(run-[0-9a-f]{16}) by=([\w -]*) -->", re.I)
 RUN_END = re.compile(r"<!-- review-run=(run-[0-9a-f]{16}) -->")
-MARK_HOLD = 30 * 60  # review_running.HOLD_S
-MARK_REQUESTED = "review service"  # review_running.REQUESTED
 RUN_ENDS = "run-ends.json"
 RUN_ENDS_KEEP = 24 * 3600
 POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox posted there
@@ -938,23 +937,21 @@ def run_end_of(item: Any) -> str | None:
     return ended.group(1) if ended else None
 
 
-def superseded_by(item: Any, queue: list[tuple[Path, Any]], ended: dict, now: float) -> str | None:
+def superseded_by(item: Any, queue: list[tuple[Path, Any]], ended: dict) -> str | None:
     """Why a queued review-running marker need not go out (REVIEW_MARK's notes), or None: it must."""
     if not isinstance(item, dict) or item.get("kind") != "comment":
         return None
     mark = REVIEW_MARK.match(str(item.get("body") or ""))
     if not mark:
         return None
-    run, who, thread = mark.group(3), mark.group(4).strip(), thread_of(item)
-    if run in ((ended.get(thread) or {}).get("runs") or {}):
+    run, thread = mark.group(3), thread_of(item)
+    record = ended.get(thread)
+    runs = record.get("runs") if isinstance(record, dict) else None
+    if isinstance(runs, dict) and run in runs:
         return f"its run {run} already posted its verdict or done line on {thread}"
     for _, other in queue:
         if other is not item and thread_of(other) == thread and run_end_of(other) == run:
             return f"its run {run} has its verdict or done line queued ({other.get('id')})"
-    with contextlib.suppress(ValueError):
-        started = dt.datetime.fromisoformat(mark.group(2).replace("Z", "+00:00"))
-        if who != MARK_REQUESTED and started.tzinfo is not None and now - started.timestamp() >= MARK_HOLD:
-            return f"its run {run} started {int((now - started.timestamp()) // 60)} min ago: it would hold no merge"
     return None
 
 
@@ -966,11 +963,14 @@ def note_run_ends(item: Any, at: float) -> None:
     path = BASE / RUN_ENDS
     doc = read_json(path)
     doc = doc if isinstance(doc, dict) else {}
-    doc.setdefault(thread_of(item), {}).setdefault("runs", {})[run] = at
+    record = doc.get(thread_of(item))
+    runs = record.get("runs") if isinstance(record, dict) else None
+    doc[thread_of(item)] = {"runs": {**(runs if isinstance(runs, dict) else {}), run: at}}
     cut = at - RUN_ENDS_KEEP
     for thread in list(doc):
-        runs = (doc[thread] or {}).get("runs") if isinstance(doc[thread], dict) else None
-        runs = {r: t for r, t in (runs or {}).items() if isinstance(t, (int, float)) and t > cut}
+        runs = doc[thread].get("runs") if isinstance(doc[thread], dict) else None
+        runs = {r: t for r, t in (runs if isinstance(runs, dict) else {}).items()
+                if isinstance(t, (int, float)) and t > cut}
         if runs:
             doc[thread] = {"runs": runs}
         else:
@@ -6047,7 +6047,7 @@ class Daemon:
         ended = ended if isinstance(ended, dict) else {}
         gone: set[Path] = set()
         for path, item in marks:
-            why = superseded_by(item, queue, ended, self.now)
+            why = superseded_by(item, queue, ended)
             if why:
                 self.post_finish(path, item, superseded=why)
                 gone.add(path)
@@ -6494,8 +6494,9 @@ class Daemon:
                 self.post_finish(mpath, other, url=url, number=number, error=error,
                                  note=f"posted in one comment with {len(item['group'])} other queued comment"
                                       f"{'s' if len(item['group']) > 1 else ''} for this thread")
-        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write
-            gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
+        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write (none: unsent)
+            if not superseded:
+                gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
         log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error,
              **({"why": superseded} if superseded else {})})
 

@@ -14226,16 +14226,21 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/4/comments", "/repos/o/r/issues/5/comments"])
         self.assertEqual(gg.post_state(elsewhere["id"])["state"], "posted")  # the same tick: the retirement cost no turn
 
-    def test_a_marker_past_the_hold_is_retired_but_a_review_service_one_is_not(self) -> None:
-        old = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16, ago=gg.MARK_HOLD)
-        young = self.marker("o/r#6", "e" * 40, "run-" + "5" * 16, ago=gg.MARK_HOLD - 60)
-        asked = self.marker("o/r#6", "e" * 40, "run-" + "6" * 16, ago=2 * gg.MARK_HOLD, who="review service")
-        ok = (201, {}, {"html_url": "u"})
-        d, t = self.daemon(ok, ok)
+    def test_an_old_marker_whose_run_never_ended_still_goes_out(self) -> None:
+        # once posted it starts review_running.slow()'s clock, which lets a SHIP at the head land
+        old = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16, ago=3 * 3600)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
         self.step(d, NOW)
-        self.step(d, NOW + gg.POST_SPACING)
-        self.assertEqual([gg.post_state(i["id"])["state"] for i in (old, young, asked)], ["superseded", "posted", "posted"])
-        self.assertIn("would hold no merge", gg.post_state(old["id"])["note"])
+        self.assertEqual(gg.post_state(old["id"])["state"], "posted")
+
+    def test_a_malformed_run_ends_record_retires_nothing_and_holds_no_write(self) -> None:
+        gg.write_json(gg.BASE / gg.RUN_ENDS, {"o/r#6": ["run-" + "4" * 16], "o/r#7": {"runs": "x"}})
+        mark = self.marker("o/r#6", "e" * 40, "run-" + "4" * 16)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(mark["id"])["state"], "posted")
+        gg.note_run_ends({"kind": "comment", "repo": "o/r", "number": 6, "body": "<!-- review-run=run-" + "8" * 16 + " -->"}, NOW)
+        self.assertEqual(gg.read_json(gg.BASE / gg.RUN_ENDS), {"o/r#6": {"runs": {"run-" + "8" * 16: NOW}}})
 
     def test_a_marker_with_no_end_still_goes_out(self) -> None:
         mark = self.marker("o/r#6", "e" * 40, "run-" + "7" * 16)
