@@ -9435,8 +9435,12 @@ def _linked_trees_strict(gitdir: Path) -> list[Path] | None:
 
 
 def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
-    """True when tree is gone and its linked worktree record under gitdir/worktrees holds no commit that a branch,
-    tag or remote-tracking ref of the repository does not already reach (so `git worktree prune` loses nothing)."""
+    """True when tree is gone and its linked worktree record under gitdir/worktrees is readable and unlocked: every
+    commit it holds is either reached by a branch, tag or remote-tracking ref, or one bundle_unpushed bundles before
+    the repository goes (it reads every record's HEAD and reflogs, local_tips worktree_only), so deleting the
+    repository loses nothing through it. A locked record (its tree may be on a volume not mounted now) keeps it.
+    cmux17, 2026-11-21: the 4.7G hot-verify mirror stayed kept for 1 gone record of an ended step that held a
+    commit of its own, though the bundle would have kept that commit."""
     try:  # gone only when the lookup says so: an unreadable parent could hide a live tree (lexists says False)
         os.lstat(moved_git_path(os.fspath(tree)))
         return False
@@ -9461,13 +9465,7 @@ def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
         tips = local_tips(rec, worktree_only=True)
         if tips is None:
             return False
-        tips = _present_commits(gitdir, tips) if tips else tips
-        if tips is None:
-            return False
-        if not tips:
-            return True
-        left = _git_dir_run(gitdir, "rev-list", *tips, "--not", "--branches", "--tags", "--remotes", timeout=600)
-        return left is not None and not left.strip()
+        return True  # its commits: reachable, or bundled by bundle_unpushed with the repository's own
     return False
 
 
@@ -9555,8 +9553,8 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         # absolute paths; after the rename aside, renamed_gitfiles reads them at the new path.
         outside = [w for w in linked if os.path.realpath(moved_git_path(os.fspath(w))) not in found]
         # A record whose tree is gone keeps nothing but its own HEAD and reflogs, and `git worktree prune` drops it.
-        # When every commit it holds is reachable from a branch, tag or remote-tracking ref, deleting the repository
-        # loses nothing through it: drop it from the judgement. 22 fleet minis kept the 3-7 GiB hot-verify mirror
+        # Its commits are reachable or go to the repository's bundle (bundle_unpushed reads every record): deleting
+        # the repository loses nothing through it, so an unlocked one is dropped from the judgement. 22 fleet minis kept the 3-7 GiB hot-verify mirror
         # (/Users/Shared/cmux-build-fleet/cache/hot-verify) as blocked:bundle-failed on every pass, cmux18 with 73
         # such records from ended steps, all reachable (2026-11-21 fleet audit).
         outside = [w for w in outside if not _gone_record_is_empty(g, w)]
