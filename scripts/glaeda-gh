@@ -5,7 +5,8 @@
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
                                                         reuses the repository before it); --json gives a list
-    A target takes whichever form you typed: OWNER/REPO#N, OWNER/REPO/N, a GitHub URL, or a bare N in the
+    A target takes whichever form you typed, in every subcommand that takes one (status, wait, post, land):
+    OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, a GitHub URL, or a bare N in the
     repository of the directory you are in (it says which repository it read).
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
@@ -37,9 +38,12 @@
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
     glaeda-gh gh ARG...                                 one `gh` call, brokered: served from the cache when it
                                                         can be, refused when it reads local source through the
-                                                        API, otherwise passed to the real gh unchanged; an
-                                                        identical read in the next 60 s gets the same answer
-                                                        (GLAEDA_GH_CACHE_TTL, 0 turns it off)
+                                                        API, otherwise passed to the real gh; an identical
+                                                        read in the next 60 s gets the same answer
+                                                        (GLAEDA_GH_CACHE_TTL, 0 turns it off). An
+                                                        OWNER/REPO#N target -- this tool's own form, which gh
+                                                        reads as a branch name -- becomes the number with
+                                                        --repo, and says so; every other form goes untouched
     glaeda-gh gh --install-shim                         put that in front of `gh` on PATH (--print-shim to look)
     glaeda-gh gh --probe                                whether this glaeda-gh has the broker, for a wrapper
                                                         deciding whether to hand its calls over
@@ -1248,6 +1252,20 @@ def cwd_repo(cwd: str | None = None) -> str | None:
         return None
     match = REMOTE_RE.fullmatch(done.stdout.strip()) if done.returncode == 0 else None
     return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def target_readable(kind: str, text: str) -> bool:
+    """Whether KIND would read TEXT as a target at all, for a refusal deciding what to suggest. No side
+    effects and no `cwd_repo` read: a bare number is a target's shape whether or not an origin answers."""
+    text = text.strip()
+    split = split_kind_prefix(text)
+    if split is not None:
+        if split[0] != kind:
+            return False
+        text = split[1]
+    if kind in ("pr", "run", "comment") and BARE_NUMBER.fullmatch(text):
+        return True
+    return kind in KEY_RES and bool(KEY_RES[kind].fullmatch(text))
 
 
 def parse_key(kind: str, text: str) -> str:
@@ -6890,6 +6908,12 @@ class Daemon:
         if app_mine:
             mine = app_mine
             mode = "normal"
+        elif mode == "stop":
+            # The whole set is eligible for nothing only because it mixes owners: read the owners an App can answer
+            # rather than nothing. The others have one pool (the login) and wait for its reset, as they must.
+            app_mine = self.app_eligible_by_owner(kind, mine, path)
+            if app_mine:
+                mine, mode = app_mine, "normal"
         if (mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped())) and not app_mine:
             # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
@@ -7983,6 +8007,20 @@ class Daemon:
             return []
         return entries
 
+    def app_eligible_by_owner(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
+        """app_entries_eligible asked per owner, unioned in ENTRIES' order. It builds one representative request for
+        the whole set, so a set that mixes owners is eligible for nothing at all (AppPool.owner_of returns None for a
+        cross-owner query): one watch on an account with no App installed made every App-servable watch beside it
+        ineligible too, and under a login stop due() then read none of them. One dev host, 2026-11-21 11Z, watched 18
+        manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
+        groups: dict[str, list[dict]] = {}
+        for e in entries:
+            groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+        if len(groups) < 2:
+            return self.app_entries_eligible(kind, entries, bucket)
+        ok = {e["key"] for g in groups.values() for e in self.app_entries_eligible(kind, g, bucket)}
+        return [e for e in entries if e["key"] in ok]
+
     @property
     def rest_fetch(self) -> dict[str, Callable[[dict], None]]:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
@@ -8009,7 +8047,17 @@ class Daemon:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
-            return alone + [rest[i:i + size] for i in range(0, len(rest), size)]
+            # One owner per query. An App installation answers a read only when the whole query names one owner
+            # (AppPool.owner_of returns None for a cross-owner body), so a batch that mixes owners has no App and
+            # all of it -- the App-servable entries included -- goes on the shared login's 5,000 points an hour
+            # while the role Apps hold 12,500 each. One dev host, 2026-11-21 11Z: 18 manaflow-ai and 14 teamleaderleo
+            # watches interleaved at GQL_BATCH 15, so 108 of the hour's 163 login GraphQL points were spent by
+            # cross-owner batches and only 5 by a manaflow-ai batch an App could take. Grouping costs one query per
+            # owner (a query is a point at most, and an App's costs the login nothing).
+            groups: dict[str, list[dict]] = {}
+            for e in rest:
+                groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+            return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
@@ -10620,6 +10668,19 @@ LAND_SNAPSHOT_SCHEMA = "land-judge-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# A wait parked on the PR's checks is read at full pace again this long before it wakes, so the judgment its own
+# timeout asks for is handed a snapshot instead of paying for a live read. Two constants decided this on their own:
+# a parked entry's unwaited read comes at most every LAND_PEEK_EVERY (600 s), which is strictly looser than the
+# LAND_SNAPSHOT_MAX_AGE (300 s) a snapshot must be inside, so a wait_pr verdict that slept its 1800 s woke with a
+# cache that could not qualify -- snapshot() answered "wait", snapshot_wait() nudged a read and gave it
+# LAND_SNAPSHOT_WAIT, and when that ran out the judgment went live. Measured on this host 2026-11-17..21: the
+# snapshot share of explains fell 94% -> 85% -> 71% -> 56% -> 35% as more lands parked on check waits, and 136 of
+# 232 snapshot waits ended snapshot_missing. An explain costs a median of 4 GitHub calls (p90 24, max 52, 82%
+# REST), and the ones at an unmoved fingerprint cost no less than the rest, so this is where that spend goes.
+# Nothing about the judgment changes: it is asked at the same moment, of the same tool, and every verdict's own
+# wait is still honoured to the second. Only the evidence handed to it is fresh. Inside LAND_SNAPSHOT_MAX_AGE with
+# room for the read to land, and the read is one the daemon's batch was going to make anyway.
+LAND_WAKE_PREFETCH = 180.0
 # Judgments run on the land workers and are handed one only when one is free (LandQueue.judge), least recently judged
 # first (LandQueue.judge_order). huge-blue, 2026-11-18: every due judgment went onto the pool's own queue at once (596
 # lands, 4 workers), hours deep; each update's re-exec (glaeda releases land 10-60 min apart) dropped that queue and
@@ -12573,6 +12634,16 @@ class LandQueue:
             self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=LAND_WORKERS_MAX, thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
 
+    def wake_near(self, e: dict) -> bool:
+        """True while E is parked and its wake is within LAND_WAKE_PREFETCH: its PR is read at full pace for that last
+        stretch, so the judgment its own timeout is about to ask for is handed a rollup snapshot inside
+        LAND_SNAPSHOT_MAX_AGE instead of a cache as old as the wait it slept through (LAND_WAKE_PREFETCH). Decides
+        only which reads the daemon's batch makes first, never when the judgment happens or what it answers."""
+        wake = e.get("wakeAt")
+        if e["state"] != "waiting" or not isinstance(wake, (int, float)) or isinstance(wake, bool):
+            return False
+        return 0.0 <= float(wake) - self.now <= LAND_WAKE_PREFETCH
+
     def keep_watching(self, e: dict) -> None:
         """The PR, its --after PRs and whatever it waits on stay watched and waited, so the daemon reads them at
         full pace: only while E is due (due), or waits on its own push's new head. Otherwise (LAND_PEEK_EVERY) its PR
@@ -12580,7 +12651,7 @@ class LandQueue:
         --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        waited = self.due(e) or w.get("kind") == "head_change"
+        waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])
@@ -16433,7 +16504,12 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         if sha and not str(data.get("headRefOid") or "").startswith(sha):
             return EXIT_OK  # it merged at another head: the commit waited for is not the one that landed, nothing to wait for
         if until != "done":
-            return check_verdict(data, until, now, grace, settle)  # at the head waited for: a runner refusal in its grace still holds
+            # at the head waited for: a finished red still decides, but a check still pending never holds a merged PR
+            # (leo-workspace#7310, 2026-11-21: `wait pr` with no --until saw MERGED at 1398 s and ran to its 1800 s
+            # timeout on one non-required check that was still pending)
+            # (a runner refusal inside its rescue grace is held, not pending: it still holds, and ends with the grace)
+            decided = check_verdict(data, until, now, grace, settle)
+            return EXIT_OK if decided is None and not classify(data, now, grace)["held"] else decided
         # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
         # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
         # still fails; a pending, missing or other-head check no longer holds the wait.
@@ -23089,6 +23165,68 @@ def broker_create_call(args: list[str]) -> bool:
     return method == "POST" and bool(BROKER_CREATE_API.fullmatch(path))
 
 
+# `OWNER/REPO#N` on a brokered `gh` line: the one form this tool prints everywhere and the one real gh has
+# never read. `gh pr comment teamleaderleo/glaeda#2323` is not a number and not a URL, so gh's PR finder
+# falls through to its last case and looks for a *branch* of that name: "no pull requests found for branch
+# \"teamleaderleo/glaeda#2323\"", exit 1, after a round trip. The target is unambiguous -- a git branch name
+# cannot hold a `#` (git check-ref-format forbids it) -- so it is `--repo OWNER/REPO` plus the number, which
+# is what gh does read. Narrower than KEY_RES on purpose: a plain `OWNER/REPO/N` is a shape a branch name can
+# have (`feature/v2/3`), and on this surface the fallthrough it would steal is the branch form, which some
+# caller may rely on. A URL already works in gh and is left alone.
+BROKER_HASH_TARGET_RE = re.compile(rf"({NAME})/({NAME})#(\d+)")
+# A run target is a run id, never a branch, so `/` is unambiguous here as it is for RUN_KEY_RE.
+BROKER_RUN_TARGET_RE = re.compile(rf"({NAME})/({NAME})[#/](\d+)")
+# The three word-one commands whose third word is one PR, issue or run, and the kind prefix each may carry.
+BROKER_TARGET_WORDS = {"pr": ("pr", BROKER_HASH_TARGET_RE), "issue": ("comment", BROKER_HASH_TARGET_RE),
+                       "run": ("run", BROKER_RUN_TARGET_RE)}
+
+
+def broker_canonical_target(args: list[str]) -> list[str]:
+    """ARGS with an `OWNER/REPO#N` target rewritten to the `--repo OWNER/REPO` + `N` gh reads, or ARGS
+    unchanged when it is not that exact shape.
+
+    One normalisation at the broker boundary, so every gh verb that takes a PR, issue or run gets it at once
+    (`comment`, `edit`, `close`, `review`, `merge`, `update-branch`, `view`, `checks`, `rerun`, ...) and the
+    answer cache can key and narrowly stamp a call it previously saw only as an opaque word. It never
+    half-rewrites: anything it cannot canonicalise is returned as typed, for gh to rule on."""
+    words, _, _, values = broker_words(args)
+    if len(words) < 3 or words[0] not in BROKER_TARGET_WORDS:
+        return args
+    kind, pattern = BROKER_TARGET_WORDS[words[0]]
+    # From the third word on, not the third word alone: broker_words knows the flags gh *reads* take, so the
+    # value of a write-only flag it does not know (`--add-label x`) lands among the words, and agents type
+    # flags before the target as often as after. Only the first word that is a target is touched.
+    for typed in words[2:]:
+        target = typed
+        split = split_kind_prefix(target)
+        if split is not None:
+            # `pr:o/r#5` as this tool prints it. A prefix naming another kind is not read as this one, here
+            # as in drop_kind_prefix: `gh pr view run:o/r/123` stays as typed, not pull request 123.
+            if split[0] != kind and not (kind == "comment" and split[0] in ("pr", "comment")):
+                return args
+            target = split[1]
+        match = pattern.fullmatch(target)
+        if match:
+            break
+    else:
+        return args
+    owner, repo, number = match.groups()
+    named = values.get("--repo")
+    if named is not None and named.lower() != f"{owner}/{repo}".lower():
+        return args  # `-R` already names a different repository: ambiguous, so gh decides, not this
+    if sum(1 for a in args if a == typed) != 1:
+        return args  # the same word twice (a value as well as the target): no index to rewrite safely
+    at = args.index(typed)
+    if at > 0 and args[at - 1].startswith("-"):
+        # The word after a flag may be that flag's value rather than the target, and whether it is depends on
+        # the verb (`-b` is `--body` to one gh command and `--branch` to another). Left as typed.
+        return args
+    fixed = [*args[:at], number, *args[at + 1:]] + ([] if named is not None else ["--repo", f"{owner}/{repo}"])
+    print(f"glaeda-gh: read as `gh {' '.join(fixed)}` ({typed} is this tool's own form for the target; gh "
+          f"takes the number with --repo, and reads OWNER/REPO#N as a branch name)", file=sys.stderr)
+    return fixed
+
+
 def broker_merge_handoff(args: list[str]) -> int | None:
     """Hand a merge or a create the gh-quota guard has not judged to the guard (exec, so this returns only on
     failure), or None when the call is neither, or is a create and no guard can be run here."""
@@ -23130,6 +23268,14 @@ def broker_merge_handoff(args: list[str]) -> int | None:
 
 def cmd_gh(args: list[str]) -> int:
     """Stand in front of one `gh` invocation. Fails open: anything unexpected runs the real gh."""
+    # The target comes first, so every path below -- the merge handoff's guard, the answer cache's key and
+    # write scope, and gh itself -- sees one canonical line. Not under CMUX_GH_BROKER_DISABLE: whoever sets
+    # that wants the real gh and the line they typed, unchanged.
+    if os.environ.get("CMUX_GH_BROKER_DISABLE") != "1":
+        try:
+            args = broker_canonical_target(args)
+        except Exception as error:  # noqa: BLE001  a rewrite never fails a call: fail open, as typed
+            broker_note({"route": "error", "error": describe(error), "site": "broker_canonical_target"})
     # Before anything else, CMUX_GH_BROKER_DISABLE included: that switch skips this broker, never land_judge.
     try:
         handed = broker_merge_handoff(args)
@@ -23995,9 +24141,15 @@ def post_item(args: argparse.Namespace) -> dict:
         # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
         # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
         target = drop_kind_prefix(args.target, args.kind, also=("pr", "comment"))
-        m = (PR_RE if args.kind == "review" else ISSUE_RE).fullmatch(target)
-        if not m:
-            raise WatchError(f"post {args.kind} takes OWNER/REPO#N, pr:OWNER/REPO#N or a GitHub URL")
+        # Through the one shared parser, as land_key is: until 2026-11-21 this matched the *strict* PR_RE /
+        # ISSUE_RE, so `post comment o/r/5`, a bare `5` and even `pr:o/r/5` -- a string status, wait and land
+        # all read, and one this tool prints -- refused here. The kind is named one word to the left, so the
+        # separator before the number is whichever the caller typed (see PR_KEY_RE). `post review` keeps the
+        # pr form: PR_KEY_RE has no `/issues/`, and an issue has no reviews.
+        kind = "pr" if args.kind == "review" else "comment"
+        m = KEY_RES[kind].fullmatch(target)
+        if not m and not BARE_NUMBER.fullmatch(target):
+            raise WatchError(f"post {args.kind} takes {KIND_FORMS[kind]}, not {args.target!r}")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
@@ -24011,7 +24163,10 @@ def post_item(args: argparse.Namespace) -> dict:
             item["status"] = key
         if getattr(args, "gate", False) is True:
             item["gate"] = True  # a receipt a merge waits on: sent ahead of the rest (outbox_gate)
-        item.update(repo=f"{m.group(1)}/{m.group(2)}", number=int(m.group(3)))
+        # parse_key resolves a bare number against the repository the caller stands in (or raises, naming the
+        # form to type); a repository that was in the string keeps the case it was typed in, as land_key does.
+        _, owner, repo, number = split_key(parse_key(kind, target))
+        item.update(repo=f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", number=int(number))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
     item["id"] = f"{time.time_ns() // 1_000_000:013d}-{os.getpid()}-{os.urandom(3).hex()}"
@@ -24743,9 +24898,10 @@ class Parser(argparse.ArgumentParser):
     argv: list[str] = []  # main() sets the raw arguments, for `next:` and --json
 
     def error(self, message: str) -> None:  # type: ignore[override]
-        nxt = usage_next(Parser.argv, self.prog)
+        hint, one_target = wait_extra_targets(message)
+        nxt = one_target or usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        spellings = kind_spellings(message)
+        spellings = kind_spellings(message) or hint
         say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
@@ -24754,6 +24910,32 @@ class Parser(argparse.ArgumentParser):
 
 
 KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
+EXTRA_ARGS = re.compile(r"unrecognized arguments: (.+)$")
+TARGET_WORD = re.compile(r"[/#]")  # every repository target carries OWNER/REPO or #N
+
+
+def wait_extra_targets(message: str) -> tuple[str, str]:
+    """What a `wait` given more than one target is told, and the single-target form to run: (hint, next).
+
+    `status` reads several targets in one gather and `wait` waits for one, and argparse's own line for the
+    second target ("unrecognized arguments: o/r#2326") names neither fact, so a lane that wrote
+    `wait pr A B` read a usage error with no form in it -- and a *background* wait that exits 64 at once
+    looks like a wait that waited for nothing (glaeda#2323). ("", "") when this is some other usage error."""
+    found = EXTRA_ARGS.search(message)
+    if not found or Parser.argv[:1] != ["wait"]:
+        return "", ""
+    extra = [w for w in found.group(1).replace(",", " ").split() if TARGET_WORD.search(w)]
+    if not extra or len(extra) != len(found.group(1).replace(",", " ").split()):
+        return "", ""  # an unrecognized flag, or a word that is no target: the usual usage error
+    kind = Parser.argv[1] if len(Parser.argv) > 1 and not Parser.argv[1].startswith("-") else "KIND"
+    kept = [w for w in Parser.argv if w not in extra]  # the call the lane meant, minus the targets past the first
+    form = ["glaeda-gh"] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
+    first = Parser.argv[2] if len(Parser.argv) > 2 and TARGET_WORD.search(Parser.argv[2]) else ""
+    both = ([first] if first else []) + extra
+    hint = (f"`wait` waits for one target, so {', '.join(extra)} "
+            f"{'is' if len(extra) == 1 else 'are'} beyond it: wait for one target per call, or read them all "
+            f"in one gather with `glaeda-gh status {kind} {' '.join(both)}`")
+    return hint, " ".join(form)
 
 
 def kind_spellings(message: str) -> str:
@@ -24786,6 +24968,23 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
         return " ".join(["glaeda-gh"] + fixed)
+    # `wait pr A B`: two targets in one call, which `status pr` takes and `wait` does not. A wait is one key
+    # by construction (one request file, one FIFO, one exit code -- 0/1/2/4 is *the* target's verdict, which
+    # every caller branches on), so this names the two calls that do the job rather than inventing an
+    # all-green-or-any-red rule nobody asked for. Measured 2026-11-21: the refusal was argparse's bare
+    # "unrecognized arguments: o/r#2", which names neither the limit nor the way round it.
+    if len(words) >= 4 and words[0] == "wait" and words[1] in STATUS_KINDS:
+        targets: list[str] = []
+        for word in words[2:]:
+            if word.startswith("-"):
+                break
+            targets.append(word)
+        if len(targets) >= 2 and all(target_readable(words[1], w) for w in targets):
+            rest = words[2 + len(targets):]
+            one = " ".join(["glaeda-gh", "wait", words[1], targets[0], *rest])
+            return (f"wait takes one target, because its exit code is that target's verdict: "
+                    f"`glaeda-gh status {words[1]} {' '.join(targets)}` reads them all in one gather, "
+                    f"or run one wait each (`{one}`)")
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
         return f"glaeda-gh {words[0]} --help"
