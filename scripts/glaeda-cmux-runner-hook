@@ -8549,6 +8549,87 @@ def cap_label_set(receipt: frozenset[str] | None, observed: frozenset[str]) -> f
     return receipt | observed
 
 
+# hq#16544: observed_labels only sees the controller feed's recent history (a fixed window of a few hours), so a
+# runner that has taken no job of a drifted label for a while would fall back to `receipt | nothing` - the
+# understating receipt - which is exactly the stranding hq#16433 is about. So what GitHub was seen to dispatch is
+# remembered per runner, with each label's last sighting, and expires only if GitHub stops dispatching it for
+# OBSERVED_LABEL_TTL_S. A runner's label set changes only by a deliberate --apply, so remembering it for days is
+# sound. It stays a widening of what the gate will *consider*: every consumer tests
+# `set(job["labels"]) <= cap_labels` and take_capacity's admission is untouched, so a remembered label can make a
+# takeable job visible but can never admit a job the runner may not run. The one cost of a label kept too long is
+# that the gate may listen for, or hold its starved reserve for, a job GitHub then declines to hand it: bounded by
+# starved_step's own max_hold_s each time, and ended by the TTL, since a runner relabelled away from a label stops
+# being dispatched it. That is the trade the TTL sets - an idle listen for at most a week against a mini that
+# strands itself for as long as its receipt is wrong.
+OBSERVED_LABEL_SCHEMA = 1
+OBSERVED_LABEL_TTL_S = float(os.environ.get("GLAEDA_RUNNER_OBSERVED_LABEL_TTL_S") or 7 * 86400.0)
+OBSERVED_LABEL_REFRESH_S = 3600.0  # a label already remembered restamps at most this often: one small write an hour
+OBSERVED_LABEL_MAX = 64  # AGENTS.md: a state file stays bounded, whatever a feed says
+OBSERVED_LABEL_MAX_BYTES = 16 * 1024
+
+
+def observed_label_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"observed-labels-{runner_dir.name}.json"
+
+
+def load_observed_labels(path: Path, name: str | None, now: float) -> dict[str, float]:
+    """What this runner was seen to be dispatched, label -> when last seen, as far as the file is still believable:
+    its own runner name (a runner dir re-registered under another name inherits nothing) and inside the TTL.
+    The receipt deliberately does not retire an entry. Any `glaeda-cmux-runner --apply` pass rewrites a receipt
+    (on 2026-11-21 one mini's higher-index instances were rewritten while instances 1 and 2 kept a stale one), so
+    retiring on that would hand the understating receipt back its authority on a routine pass - hq#16544 itself. A
+    real relabel away from a label also stops GitHub dispatching it, so the TTL is what retires it."""
+    if not name:
+        return {}
+    try:
+        raw = read_bounded(path, OBSERVED_LABEL_MAX_BYTES)
+        doc = json.loads(raw.decode("utf-8")) if raw is not None else None
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("schema") != OBSERVED_LABEL_SCHEMA or doc.get("name") != name:
+        return {}
+    seen = doc.get("labels")
+    if not isinstance(seen, dict):
+        return {}
+    floor = now - OBSERVED_LABEL_TTL_S
+    out: dict[str, float] = {}
+    for label, at in seen.items():
+        if isinstance(label, str) and label and isinstance(at, (int, float)) and not isinstance(at, bool) \
+                and at > floor and at <= now + OBSERVED_LABEL_REFRESH_S:
+            out[label] = float(at)
+    return out
+
+
+def merge_observed_labels(remembered: dict[str, float], observed: frozenset[str],
+                          now: float) -> tuple[dict[str, float], bool]:
+    """(what to remember now, whether that is worth a write). A sighting of a label already remembered restamps it
+    at most every OBSERVED_LABEL_REFRESH_S, so a steady runner writes this file about once an hour, not once a
+    look."""
+    merged, write = dict(remembered), False
+    for label in observed:
+        prior = merged.get(label)
+        if prior is None or now - prior >= OBSERVED_LABEL_REFRESH_S:
+            write = True
+        merged[label] = now
+    if len(merged) > OBSERVED_LABEL_MAX:  # the most recently dispatched win; a label pushed out is simply forgotten
+        merged = dict(sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:OBSERVED_LABEL_MAX])
+        write = True
+    if set(merged) != set(remembered):
+        write = True
+    return merged, write
+
+
+def save_observed_labels(path: Path, name: str, labels: dict[str, float]) -> None:
+    """Atomic; a failed write only costs the next look the sighting, so nothing the gate decides changes."""
+    doc = {"schema": OBSERVED_LABEL_SCHEMA, "name": name, "at": gate_stamp(time.time()),
+           "labels": {label: round(at, 3) for label, at in sorted(labels.items())}}
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+        tmp.write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+
 def _feed_time(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -10531,10 +10612,22 @@ class Gate:
                 # `set(job["labels"]) <= self.cap_labels`, so those two could not see a single queued job of a label
                 # they serve: no reserve, no urgent listen, no starved-job answer. What GitHub dispatched is proof.
                 observed = observed_labels(summary, name)
-                self.cap_labels = cap_label_set(receipt, observed)
+                # hq#16544: the feed only holds a few hours, so a runner that has taken no job of a drifted label
+                # for a while would fall back to `receipt | nothing` - the understating receipt - and strand itself
+                # again. So each sighting is remembered (load/merge/save_observed_labels) until the TTL or the next
+                # relabel's receipt retires it, and the gate reasons with the whole remembered set.
+                known = observed
+                if name:
+                    store = observed_label_file(self.state_dir, self.runner_dir)
+                    remembered = load_observed_labels(store, name, now)
+                    merged, write = merge_observed_labels(remembered, observed, now)
+                    if write:
+                        save_observed_labels(store, name, merged)
+                    known = frozenset(merged)
+                self.cap_labels = cap_label_set(receipt, known)
                 # Drift is a receipt understating itself. With no readable receipt there is nothing to disagree with,
                 # so that is not published as drift: it would report the runner's whole label set as a disagreement.
-                drift = sorted(observed - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
+                drift = sorted(known - receipt)[:GATE_LABEL_DRIFT_MAX] if receipt is not None else []
                 if drift != self.cap_label_drift:
                     self.cap_label_drift = drift
                     if drift:
