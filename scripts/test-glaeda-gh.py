@@ -5138,7 +5138,7 @@ class ClientTest(Base):
 
     def test_a_status_sweep_leads_with_the_totals_and_one_target_is_unchanged(self) -> None:
         """A sweep prints one multi-line block per target, so a reader who kept the last N lines cannot even count
-        the blocks (big-red, 2026-11-21: `land status | tail -25` read a fragment as the whole answer). The first
+        the blocks (2026-11-21: `land status | tail -25` read a fragment as the whole answer). The first
         line names how many follow, by outcome. One target still prints exactly what it always has: its block is
         short, and cmd_status's contract is that a single read is byte-for-byte what it was."""
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
@@ -23123,7 +23123,7 @@ class LandTest(Base):
         return out.getvalue().splitlines()
 
     def test_land_status_leads_with_the_totals_so_a_truncated_read_is_visibly_partial(self):
-        """big-red, 2026-11-21: `glaeda-gh land status | tail -25` kept only merged history whose newest row was
+        """2026-11-21: `glaeda-gh land status | tail -25` kept only merged history whose newest row was
         81 h old, out of 141 lines whose top rows were the six PRs enqueued seconds earlier; the reader concluded
         the view omits pending requests and nearly had that non-bug built. The totals are the *first* line, so a
         `head`/`tail` that cuts the top drops the header too and says by its absence that this is a fragment.

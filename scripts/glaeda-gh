@@ -13954,7 +13954,7 @@ def land_status_header(entries: list[dict], target: str | None) -> str:
 
     The point is what its *absence* means. `land status` prints one row per queue entry and runs past a hundred
     lines on a busy host, and agents read it through `| head -N` or `| tail -N`. 2026-11-21: `land status | tail -25`
-    on big-red kept only merged history whose newest row was 81 h old, out of 141 lines whose top rows were the six
+    on one host kept only merged history whose newest row was 81 h old, out of 141 lines whose top rows were the six
     PRs just enqueued -- and the reader concluded the view omits pending requests and nearly had that non-bug fixed.
     A truncated read is now self-evidently partial: `tail -25` loses this line too, so a reader who sees no header
     knows at once they hold a fragment, which no warning note could achieve (the same reader had written the note).
