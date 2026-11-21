@@ -10750,7 +10750,8 @@ LAND_UNREAD_DEADLINE = 6 * 3600.0
 LAND_UNREAD_CODES = frozenset({"unreadable"})
 # An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
 # read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
-# (`explain --cache-only`, no read sent, no broker queue waited on); only a cache miss goes live, on the pass after.
+# (`explain --cache-only`, no read sent, no broker queue waited on, a local read of seconds); only a miss goes live,
+# in the same job.
 # And the same unreadable text (digits aside) LAND_UNREAD_SAME_STOP times in a row at one head stops the entry with
 # that text named to its requester, instead of retrying it for LAND_UNREAD_DEADLINE. gcp-agent-lane-1, 2026-11-21
 # 18:05-20:05Z: 26 of 38 judgments ended "unreadable"/retry, one judgment held its worker 3+ min on one broker read,
@@ -12437,9 +12438,10 @@ class LandQueue:
 
     def due_since(self, e: dict) -> float:
         """When E became due: its wake, else (queued) its last judgment, else when it was queued."""
+        pace = e.get("paceSince")  # paced out and judged only from the caches since: its place from before
         wake = e.get("wakeAt")
         if e["state"] == "waiting" and isinstance(wake, (int, float)) and not isinstance(wake, bool):
-            return float(wake)
+            return min(float(wake), float(pace)) if isinstance(pace, (int, float)) else float(wake)
         at = e.get("dueAt")  # when it was last queued (apply, after_merged, unparked)
         if not isinstance(at, (int, float)) or isinstance(at, bool):
             at = (e.get("explain") or {}).get("at")
@@ -13008,8 +13010,13 @@ class LandQueue:
         spendable = float(seen["remaining"]) - hard_reserve_floor()[pool]
         if spendable < cost:
             return float(seen["reset"]), seen  # spent to the reserve: the next judgment after the reset
-        gap = cost * max(0.0, float(seen["reset"]) - self.now) / spendable
-        return float(w.get(f"{pool}At", float("-inf"))) + gap, seen
+        # From the last judgment's start, so the slot an entry is told to wake for does not move earlier as time
+        # passes (measured from now, the slot crept ahead of every paced entry's wake and an entry already due took
+        # it each time: 10 entries under 4 slots an hour, 6 never judged live in 8 h)
+        at = float(w.get(f"{pool}At", float("-inf")))
+        if at == float("-inf"):
+            return at, seen
+        return at + cost * max(0.0, float(seen["reset"]) - at) / spendable, seen
 
     def window_now(self) -> dict[str, float]:
         """This quota window's record ({"start", "rest", "graphql"}: what its judgments were charged), kept in the land
@@ -13659,6 +13666,13 @@ class LandQueue:
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
         if land_latch_held(e):
             self.reset_judged.append(self.now)  # a place in the stagger (reset_staggered)
+        # A pace slot's cache-only judgment keeps the place the entry had (due_since): its miss's wake at the next slot
+        # would otherwise put it behind every entry judged live meanwhile, and the same few keys took every slot (10
+        # entries under 4 slots an hour: 6 never judged live in 8 h). A live judgment ends it.
+        if isinstance(e.get("cacheOnlyJudge"), float):
+            e.setdefault("paceSince", self.due_since(e))
+        else:
+            e.pop("paceSince", None)
         self.window_charge(e)
         e.pop("staggeredAt", None)
         self.unhold(e)
@@ -13808,7 +13822,9 @@ class LandQueue:
             nxt = float(pace_next) if isinstance(pace_next, (int, float)) else self.now + LAND_RETRY_DEFAULT
             with self.lock:
                 e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now}
-                e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt}
+                seen = (self.reading("graphql") if self.reading is not None else None) or {}
+                e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt,
+                                     "remaining": seen.get("remaining"), "reset": seen.get("reset")}
                 e.setdefault("cappedSince", self.now)
                 self.history(e, "window_capped", pool="graphql", cacheOnly="miss", next=utc_clock(nxt))
             return {"ok": False, "code": "host_cap", "head": sha, "cacheMiss": True,
@@ -14190,6 +14206,12 @@ class LandQueue:
                 else:  # the cache's head was stale: wait for it to show another, then judge there
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+            elif kind == "retry" and answer.get("code") == "host_cap":
+                # the pace's next slot, exactly: backed off like a refusal (to LAND_RETRY_MAX) it woke after that slot
+                # had gone to an entry judged live meanwhile, every slot (10 entries, 4 slots an hour: 6 never judged
+                # live in 8 h)
+                self.wait(e, {"kind": "retry", "why": "the pace's next slot"},
+                          land_seconds(act.get("after_s"), LAND_RETRY_DEFAULT))
             elif kind == "retry":
                 n = int(((e.get("waitBudget") or {}).get("perKind") or {}).get("retry") or 1)
                 after = land_seconds(act.get("after_s"), LAND_RETRY_DEFAULT) * (2 ** max(0, n - 1))
@@ -14813,7 +14835,7 @@ class LandQueue:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
                  stop={"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now})
-        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun"):
+        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160))
         self.save(e)
@@ -15045,8 +15067,9 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
     elif (e.get("windowCapped") or {}) and e["state"] in ("queued", "waiting") \
             and float(e["windowCapped"].get("next") or 0) > now:
         wc = e["windowCapped"]
-        left = f": {wc['remaining']} left, resets {time.strftime('%H:%MZ', time.gmtime(float(wc['reset'])))}" \
-            if isinstance(wc.get("remaining"), int) and isinstance(wc.get("reset"), (int, float)) else ""
+        left = f": {int(wc['remaining'])} left, resets {time.strftime('%H:%MZ', time.gmtime(float(wc['reset'])))}" \
+            if isinstance(wc.get("remaining"), (int, float)) and not isinstance(wc.get("remaining"), bool) \
+            and isinstance(wc.get("reset"), (int, float)) else ""
         bits.append(f"not judged this window: host cap ({wc.get('pool')}{left}; next slot "
                     f"{time.strftime('%H:%M:%SZ', time.gmtime(float(wc['next'])))})")
     elif queue and land_due_now(e, now) and not (w.get("kind") == "quota" and e["state"] == "waiting"):
