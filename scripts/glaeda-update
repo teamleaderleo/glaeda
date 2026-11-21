@@ -1676,6 +1676,8 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="install the ring's release if it is new")
+    ap.add_argument("--now", action="store_true",
+                    help="with --apply: the full update now, not only when due or the channel changed (one host, by hand)")
     ap.add_argument("--status", action="store_true", help="print config and state, contact nothing")
     ap.add_argument("--channel-dir", type=Path, help=argparse.SUPPRESS)  # health check: plan offline
     a = ap.parse_args(argv)
@@ -1711,7 +1713,10 @@ def main(argv: list[str] | None = None) -> int:
             result = update(False, config, channel=channel, candidate_channel=candidate_channel)
         else:
             now = time.time()
-            full, seen, why = probe_gate(config, now, STATE_DIR)
+            if a.now:  # an operator applying on this one host: no wait for the minute probe or APPLY_EVERY_S
+                full, seen, why = True, channel_fingerprint(config["ring"], config.get("source", REPOSITORY)), "asked"
+            else:
+                full, seen, why = probe_gate(config, now, STATE_DIR)
             if not full:
                 return 0  # the channel is as the last full run read it: nothing to log, every minute
             STATE_DIR.mkdir(parents=True, exist_ok=True)

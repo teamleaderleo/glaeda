@@ -281,6 +281,8 @@ jobs:
               Path("scripts/test-glaeda-headless-services.py"),
               Path("scripts/fleet_cas_bundle.py"),
               Path("scripts/test-fleet-cas-bundle.py"),
+              Path("scripts/release_build_cache.py"),
+              Path("scripts/test-release-build-cache.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
               Path("scripts/glaeda-git-mirror"),
@@ -376,6 +378,7 @@ jobs:
           suite python3 scripts/test-glaeda-fleet-cas-prune.py
           suite python3 scripts/test-glaeda-fleet-cas.py
           suite python3 scripts/test-fleet-cas-bundle.py
+          suite python3 scripts/test-release-build-cache.py
           suite bash scripts/test-glaeda-fleet-cas.sh
           suite python3 scripts/test-glaeda-headless-services.py
           suite bash scripts/test-glaeda-fleet-cas-mount.sh

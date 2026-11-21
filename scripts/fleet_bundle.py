@@ -434,15 +434,18 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
         os.close(parent)
 
 
-def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
+def build(root: Path, expected_source: str, target: str, output: Path, binary: Path | None = None) -> dict:
     source = source_identity(root, expected_source)
     toolchain = command(root, ["rustc", "-Vv"]).decode().strip()
     if f"host: {target}" not in toolchain.splitlines() or target not in TARGETS:
         raise BundleError("candidate build requires a supported native target")
-    build_root = root / "target/fleet-candidate-build"
-    command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda", "--target", target, "--target-dir", str(build_root)], capture=False)
+    if binary is None:
+        build_root = root / "target/fleet-candidate-build"
+        command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda", "--target", target, "--target-dir", str(build_root)], capture=False)
+        binary = build_root / target / "release/glaeda"
+    # --binary: release.yml's glaeda, built once per Rust inputs (scripts/release_build_cache.py)
     payload = {name: file_bytes(root / name) for name in FILES}
-    payload["bin/glaeda"] = file_bytes(build_root / target / "release/glaeda")
+    payload["bin/glaeda"] = file_bytes(binary)
     payload["THIRD_PARTY_NOTICES.txt"] = notices(root, target)
     manifest = {
         "schema": SCHEMA, "source": source, "target": target,
@@ -470,6 +473,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build")
     b.add_argument("--output", type=Path, required=True)
+    b.add_argument("--binary", type=Path, help="a glaeda built from this source's Rust inputs, instead of cargo build")
     v = sub.add_parser("verify")
     v.add_argument("archive", type=Path)
     v.add_argument("--sha256", required=True)
@@ -487,7 +491,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "build":
-            result = build(Path(__file__).resolve().parents[1], args.source, args.target, args.output)
+            result = build(Path(__file__).resolve().parents[1], args.source, args.target, args.output, args.binary)
         elif args.command == "inspect":
             result = inspect_generation(args.directory, args.sha256, args.source, args.target)
         elif args.command == "stage":

@@ -34,21 +34,83 @@ jobs:
           fetch-depth: 0  # the hygiene archive's ancestry.txt lists the source's ancestors
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      # Rust binaries are built once per Rust inputs, not once per push: most pushes change only scripts and docs,
+      # and rebuilding glaeda, glaeda-worktree-reclaim and fleet-cas from scratch was ~3.5 of this job's 4-5
+      # minutes (Leo, 2026-11-21: "we should be able to speed these thigns up"). The key hashes each set's
+      # tracked input blobs and rustc; a hit is used only when its cargo dep-info names no checkout file the key
+      # missed (scripts/release_build_cache.py). Only main writes these entries.
+      - name: Rust input keys
+        id: keys
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          echo "glaeda=$(python3 scripts/release_build_cache.py key --set glaeda --target "$TARGET")" >> "$GITHUB_OUTPUT"
+          echo "cas=$(python3 scripts/release_build_cache.py key --set fleet-cas --target "$TARGET")" >> "$GITHUB_OUTPUT"
+      - name: Restore glaeda binaries built from these inputs
+        id: glaeda-bins
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/glaeda
+          key: release-bins-glaeda-${{ matrix.target }}-${{ steps.keys.outputs.glaeda }}
+      - name: Restore fleet-cas binary built from these inputs
+        id: cas-bins
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/fleet-cas
+          key: release-bins-cas-${{ matrix.target }}-${{ steps.keys.outputs.cas }}
+      - name: Use the cached binaries only when their dep-info is covered
+        id: reuse
+        run: |
+          for set in glaeda fleet-cas; do
+            if [ -d "target/release-bins/$set" ] && python3 scripts/release_build_cache.py covered --set "$set" --dir "target/release-bins/$set"; then
+              echo "$set: reusing binaries built from the same Rust inputs" >> "$GITHUB_STEP_SUMMARY"
+            else
+              rm -rf "target/release-bins/$set"
+              echo "build-$set=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+      # A changed set still builds; its dependencies come from a cache keyed on the lock files.
+      - name: Restore cargo dependency cache
+        if: steps.reuse.outputs.build-glaeda == 'true' || steps.reuse.outputs.build-fleet-cas == 'true'
+        id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release-build
+          key: release-deps-${{ matrix.target }}-rust-1.97.1-${{ hashFiles('Cargo.lock', 'tools/fleet-cas-prototype/Cargo.lock') }}
+          restore-keys: |
+            release-deps-${{ matrix.target }}-rust-1.97.1-
+      - name: Build glaeda and glaeda-worktree-reclaim
+        if: steps.reuse.outputs.build-glaeda == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --bin glaeda --bin glaeda-worktree-reclaim --target "$TARGET" --target-dir target/release-build
+          python3 scripts/release_build_cache.py stash --set glaeda --from "target/release-build/$TARGET/release" --out target/release-bins/glaeda
+      - name: Build fleet-cas
+        if: steps.reuse.outputs.build-fleet-cas == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --manifest-path tools/fleet-cas-prototype/Cargo.toml --target "$TARGET" --target-dir target/release-build
+          python3 scripts/release_build_cache.py stash --set fleet-cas --from "target/release-build/$TARGET/release" --out target/release-bins/fleet-cas
       - name: Fleet candidate bundle
         env:
           TARGET: ${{ matrix.target }}
-        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-candidates"
+        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-candidates" --binary target/release-bins/glaeda/glaeda
       - name: Fleet-CAS prebuilt candidate
         env:
           TARGET: ${{ matrix.target }}
-        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-fleet-cas"
+        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-fleet-cas" --binary target/release-bins/fleet-cas/fleet-cas
       - name: Hygiene tools archive
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          cargo build --locked --release --bin glaeda-worktree-reclaim --target "$TARGET"
           python3 scripts/glaeda_release.py hygiene --source "$GITHUB_SHA" --target "$TARGET" \
-            --reclaim "target/$TARGET/release/glaeda-worktree-reclaim" --output release-assets
+            --reclaim target/release-bins/glaeda/glaeda-worktree-reclaim --output release-assets
       - name: Smoke the hygiene archive (promotion's evidence when no canary host can report)
         env:
           TARGET: ${{ matrix.target }}
@@ -68,6 +130,28 @@ jobs:
           path: release-assets/
           if-no-files-found: error
           retention-days: 7
+      - name: Save glaeda binaries
+        if: steps.reuse.outputs.build-glaeda == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/glaeda
+          key: release-bins-glaeda-${{ matrix.target }}-${{ steps.keys.outputs.glaeda }}
+      - name: Save fleet-cas binary
+        if: steps.reuse.outputs.build-fleet-cas == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/fleet-cas
+          key: release-bins-cas-${{ matrix.target }}-${{ steps.keys.outputs.cas }}
+      - name: Save cargo dependency cache
+        if: (steps.reuse.outputs.build-glaeda == 'true' || steps.reuse.outputs.build-fleet-cas == 'true') && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release-build
+          key: release-deps-${{ matrix.target }}-rust-1.97.1-${{ hashFiles('Cargo.lock', 'tools/fleet-cas-prototype/Cargo.lock') }}
 
   publish:
     needs: build
@@ -168,7 +252,13 @@ jobs:
           # created before an older one's and finish later. The tag names its commit (r-DATE-<12 hex>), so
           # ancestry is decided locally and only the chosen release's manifest is downloaded.
           gh release list --limit 1000 --json tagName \
-            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | .tagName' > channels/tags.txt
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | .tagName' > channels/all-tags.txt
+          # Only commits on main and not behind canary can pass the checks below: one rev-list instead of three git
+          # processes for each of ~900 tags (~14 s of this step). The loop still checks each survivor exactly.
+          git rev-list "$main" ${previous:+"^$previous"} > channels/fresh.txt
+          if [ -n "$previous" ]; then echo "$previous" >> channels/fresh.txt; fi
+          awk 'NR==FNR { fresh[substr($1, 1, 12)] = 1; next } { h = $0; sub(/.*-/, "", h); if (h in fresh) print }' \
+            channels/fresh.txt channels/all-tags.txt > channels/tags.txt
           : > channels/candidates.txt
           while read -r tag; do
             source=$(git rev-parse --verify --quiet "${tag##*-}^{commit}" 2>/dev/null) || continue
