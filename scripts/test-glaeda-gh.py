@@ -15015,7 +15015,8 @@ class PostJoinTest(unittest.TestCase):
         d, t = self.daemon(ok, ok, ok, ok)
         for n in range(4):
             self.step(d, NOW + n * gg.POST_SPACING)
-        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "Review (codex): SHIP " + "a" * 40, "one", "two"])
+        # the receipt goes out first (outbox_gate); the prose it would have joined follows on its own
+        self.assertEqual([c[2]["body"] for c in t.calls], ["Review (codex): SHIP " + "a" * 40, "one", "one", "two"])
 
     def test_a_crash_mid_join_releases_the_members(self) -> None:
         a = self.queue("comment", "o/r#7", "--body", "one")
