@@ -4402,6 +4402,10 @@ class Daemon:
         self.land_dirty: set[str] = set()  # event/cache keys retained for LandQueue after due() consumes nudged
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
+        # "pr:owner/repo#N", "sha:owner/repo@SHA", "branch:owner/repo@B" -> when the feed last delivered an event
+        # for it (LAND_FEED_QUIET_MAX's comment), and since when the feed has answered without a gap (None: down)
+        self.feed_marks: dict[str, float] = {}
+        self.feed_live_since: float | None = None
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
@@ -7667,7 +7671,8 @@ class Daemon:
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
-            self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading)
+            self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
+                                        feed_quiet=self.land_feed_quiet)
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -9710,6 +9715,7 @@ class Daemon:
             wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
             self.errors.append(what)
         self.controller_down_until = self.now + wait
+        self.feed_live_since = None  # what the feed misses while out is not known: no PR is quiet until it is back
         if not isinstance(error, NoReceiver):
             # The notice says what the fallback costs, not only that it happened: every run read this host makes until
             # the controller answers again spends the shared REST quota (one account, 5000/h for every lane together)
@@ -9771,6 +9777,7 @@ class Daemon:
         self.controller_cursor, self.controller_seen = None, {}
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
+        self.feed_marks, self.feed_live_since = {}, None
         self.controller_down_until, self.controller_failures = 0.0, 0
         self.controller_missed_deadline = False
         self.controller_status = {"state": "off" if current is None else "starting"}
@@ -9814,12 +9821,18 @@ class Daemon:
             if getattr(self, "controller_feed_error", None) is None:
                 self.controller_failures = 0
                 self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
+            if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
+                    or any(page.get("reset") for page in pages)):
+                self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
             self.controller_ok_at = self.now
             for page in pages:
                 for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
                     repo = str(item.get("repo") or "").lower()
                     if "/" in repo:
                         self.fed_repos[repo] = self.now
+                        self.feed_mark(repo, item)
+            if pages:
+                self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
         if pages or self.on_event_procs:
             # here, before the baseline reads below can return early: the cursor has moved past these pages
             try:
@@ -9858,6 +9871,47 @@ class Daemon:
         if pages and self.now >= self.controller_down_until:  # an on-event lookup above may have taken it out
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
+
+    def feed_mark(self, repo: str, item: dict) -> None:
+        """Note that the feed delivered ITEM (a run, suite or comment of REPO) now, under every PR, head and branch it
+        names: land_feed_quiet's evidence that nothing happened to a PR."""
+        marks = set()
+        if item.get("number") is not None:  # a comment
+            marks.add(f"pr:{repo}#{item.get('number')}")
+        for pr in (item.get("prs") or []) + (item.get("pull_requests") or []) + (item.get("pr_heads") or []):
+            number = pr.get("number") if isinstance(pr, dict) else pr
+            if number is not None:
+                marks.add(f"pr:{repo}#{number}")
+            if isinstance(pr, dict) and pr.get("head_sha"):
+                marks.add(f"sha:{repo}@{str(pr['head_sha']).lower()}")
+        if item.get("head_sha"):
+            marks.add(f"sha:{repo}@{str(item['head_sha']).lower()}")
+        if item.get("head_branch"):
+            marks.add(f"branch:{repo}@{item['head_branch']}")
+        for mark in marks:
+            self.feed_marks[mark] = self.now
+
+    def land_feed_quiet(self, key: str, sha: str, since: float) -> bool:
+        """True when the controller's feed says nothing could have happened to KEY's PR since SINCE: it has answered
+        without a gap since before then (feed_live_since), answers now, covers the repository (fed) and delivered no
+        run, suite or comment for the PR, for SHA or for the branch the cached PR names since then. Anything else
+        (no feed, a gap, an event) is False: the land queue reads as it would with no feed (LAND_FEED_QUIET_MAX)."""
+        if not key.startswith("pr:") or self.feed_live_since is None or self.feed_live_since > since:
+            return False
+        if not self.fed(key):
+            return False
+        try:
+            _, owner, repo, number = split_key(key)
+        except ValueError:
+            return False
+        repo = f"{owner}/{repo}".lower()
+        data = (read_cache(key) or {}).get("data") or {}
+        marks = [f"pr:{repo}#{number}"]
+        for head in {str(sha or "").lower(), str(data.get("headRefOid") or "").lower()} - {""}:
+            marks.append(f"sha:{repo}@{head}")
+        if data.get("headRefName"):
+            marks.append(f"branch:{repo}@{data['headRefName']}")
+        return all(self.feed_marks.get(m, float("-inf")) < since for m in marks)
 
     def on_event_tick(self, pages: list[dict], given: dict[str, list] | None = None, rest_now: bool = False) -> None:
         """Run on-event hooks for the finished runs in these feed pages, and retry the runs still pending.
@@ -10482,7 +10536,27 @@ LAND_REVIEW_WAIT = 3600.0
 # most 6 explains an hour from base churn, not two per base push. Twice LAND_SNAPSHOT_MAX_AGE and under land_judge's
 # RUNNING_WAIT_S (1800 s), so a wait land_judge names still times out on its own clock.
 LAND_VERDICT_KEEP = 600.0
-LAND_STREAK_STOP = 3  # identical refusals in a row (code, head, step) that stop an entry
+# The controller's webhook feed (the deliveries the daemon already follows: workflow runs, check suites and comments,
+# Daemon.read_controller) says when a PR's checks or head could have changed; GitHub is read only when it says they
+# did, or when it cannot say. Retro hq#17174 theme 3, gcp-codex-lane-5 2026-11-21: session:glaeda-land made 5,336
+# gh calls in 15.7 h (3,016 of them land_judge explain's own reads: `pr view` 1,270, check-runs 1,092, run jobs 868)
+# for 528 judgments, 411 of them answers that judged nothing (unreadable 286, quota 83, host_cap 42), and 189 judged
+# unpinned after a quota park because no read had shown the cached head since (head_unpinned). The feed is "quiet"
+# for a PR since T (Daemon.land_feed_quiet) when it has answered without a gap since before T, covers the repository
+# (Daemon.fed), and delivered no run, suite or comment for the PR, its head or its branch since T. While it is:
+# - a cached head read before the latch cleared or the park ended is still the head (fresh_head): a push shows up as
+#   runs for the new head, so no read is waited for and land_judge is pinned (no `pr view` of its own);
+# - an upstream host's copy is not re-read through the broker (refresh_due);
+# - a wait verdict at the head (feedVerdict: a wait_pr that judged something) is the answer a judgment would give
+#   again: neither a could-not-judge retry's wake nor a fingerprint change re-runs land_judge (feed_holds).
+# Each is bounded by LAND_FEED_QUIET_MAX from the read or verdict it trusts: what the feed carries no event for (the
+# base moving under a green head, mergeability, a PR merged or closed) is judged at most this late. A feed that is
+# down, reset, switched or not covering the repository holds nothing: every path reads as before.
+LAND_FEED_QUIET_MAX = 1800.0
+LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
+LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
+LAND_NOT_JUDGED = frozenset({"quota", "unreadable", "host_cap", "explain_failed"})  # answers that judged nothing
+LAND_STREAK_STOP = 3 # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
 # The steps of a could-not-judge answer: a retry, and the mirror fill an unreadable answer names (fetch), whose
 # failures step_refused counts on their own
@@ -11650,7 +11724,10 @@ class LandQueue:
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
-                 reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
+                 reading: Callable[[str], dict | None] | None = land_budget_reading,
+                 feed_quiet: Callable[[str, str, float], bool] | None = None) -> None:
+        # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
+        self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
@@ -12253,6 +12330,11 @@ class LandQueue:
         e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now, dueAt=float(wake)
                  if isinstance(wake, (int, float)) and not isinstance(wake, bool) else self.now)
         self.history(e, "unparked")
+        head = str(e.get("seenHead") or "")
+        if head and self.feed_holds(e, head):
+            # The wait judged before the refusal still stands: a retry the feed's next event for the PR judges (the
+            # retry branch of consider), not a judgment now that reads GitHub to give it again (LAND_FEED_QUIET_MAX)
+            e.update(state="waiting", wait={"kind": "retry", "why": "feed quiet"}, wakeAt=self.now)
         self.save(e)
         return False
 
@@ -12995,6 +13077,8 @@ class LandQueue:
             return
         if kind == "retry":
             if (moved and not running) or woke:
+                if not moved and self.feed_holds(e, head):
+                    return  # the wait judged before this could-not-judge answer stands (LAND_FEED_QUIET_MAX)
                 self.judge(e, head, fp)
             return
         if running:
@@ -13018,8 +13102,8 @@ class LandQueue:
             if w.get("ran") != before:
                 self.save(e)
         if woke or fp != e.get("seen") or reran:
-            if not woke and not reran and self.verdict_holds(e, c, head, fp):
-                return  # land_judge would answer the same wait (LAND_VERDICT_KEEP)
+            if not woke and not reran and (self.verdict_holds(e, c, head, fp) or self.feed_holds(e, head)):
+                return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
@@ -13098,6 +13182,36 @@ class LandQueue:
                   f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
         return True
 
+    def note_feed_verdict(self, e: dict, answer: dict, act: dict, head: str, started: Any) -> None:
+        """Keep the last verdict that judged something (not LAND_NOT_JUDGED, not a quota refusal) when it is a wait at a
+        full head (feedVerdict, at the judgment's start): what feed_holds holds. Any other verdict drops it."""
+        code = str(answer.get("code") or "")
+        if code in LAND_NOT_JUDGED or LAND_QUOTA_REFUSAL.search(str(answer.get("reason") or "")):
+            return  # judged nothing: the verdict before it still stands
+        at = started if isinstance(started, (int, float)) and not isinstance(started, bool) else self.now
+        if not answer.get("ok") and act.get("kind") in LAND_WAIT_KINDS and SHA40.fullmatch(head or ""):
+            e["feedVerdict"] = {"head": head, "at": at, "code": code, "kind": act.get("kind")}
+        else:
+            e.pop("feedVerdict", None)
+
+    def feed_holds(self, e: dict, head: str) -> bool:
+        """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
+        for the PR, its head or its branch since that judgment started (feed_quiet), within LAND_FEED_QUIET_MAX of it:
+        land_judge, asked again, reads GitHub to give the same wait. Noted once per verdict (history "feed_quiet")."""
+        v = e.get("feedVerdict") or {}
+        at = v.get("at")
+        if not head or v.get("head") != head or not isinstance(at, (int, float)) or isinstance(at, bool) \
+                or self.now - at >= LAND_FEED_QUIET_MAX:
+            return False
+        if not self.feed_quiet(e["key"], head, at):
+            return False
+        if not v.get("noted"):  # counted once per verdict held, not per pass
+            v["noted"] = True
+            self.count("feed_held")
+            self.history(e, "feed_quiet", head=head[:12], code=v.get("code"), age=round(self.now - at))
+            self.save(e)
+        return True
+
     def verdict_holds(self, e: dict, c: dict | None, head: str, fp: str) -> bool:
         """True while E's last verdict, a wait_pr at HEAD, still stands (LAND_VERDICT_KEEP): judged within the bound, at
         this head, on the check fingerprint the cache shows now, with no run of checks between (wait_running drops
@@ -13130,6 +13244,11 @@ class LandQueue:
             return False
         if not self.reads_upstream():
             return False  # a host with its own login: the nudge (and the stale valve) refresh it
+        if self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
+            if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
+                e["feedNoRefresh"] = at
+                self.count("feed_norefresh")
+            return False  # nothing reached the PR since that copy was read: reading it again reads the same
         if len(self.jobs) >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at)}
@@ -13251,6 +13370,16 @@ class LandQueue:
 
         if read_since(c):
             e.pop("staleHead", None)
+            return sha
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if reads and self.now - max(reads) < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], sha, max(reads)):
+            # no push since that read: a push brings runs for the new head (LAND_FEED_QUIET_MAX's comment)
+            e.pop("staleHead", None)
+            if e.get("feedFresh") != sha:
+                e["feedFresh"] = sha
+                self.history(e, "feed_fresh", head=sha[:12], age=round(self.now - max(reads)))
+            self.count("feed_fresh")
             return sha
         w = e.get("staleHead") or {}
         if w.get("sha") != sha:
@@ -13527,6 +13656,7 @@ class LandQueue:
                             "checks": checks}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None)
+            self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
