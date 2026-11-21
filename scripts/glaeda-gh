@@ -264,8 +264,9 @@ when this file changes, so an update takes effect without a restart.
   --after and --notify) and the daemon lands it: it asks `land-judge explain R N --sha HEAD --json` at the head the
   cache shows, and takes the step the answer's "action" names, from an allowlist, as argv lists, every `gh` through
   the gh-quota shim (~/.local/lib/gh-quota/bin/gh; without it nothing is merged): a pinned squash merge, a pinned
-  update-branch, `gh run rerun ID --failed`, a base change, `router-review R N --post` once per head, or a wait on
-  the PR, a run or a review comment. After a push-making step it judges nothing until the cache shows the new head
+  update-branch, `gh run rerun ID --failed`, a base change, `router-review R N --post` once per head (only while
+  the auto_reviews switch reads on: AUTOMATION_AUTO_REVIEWS, else hq main's automation.json, else off; off, it stops
+  on land-judge's refusal naming that command), or a wait on the PR, a run or a review comment. After a push-making step it judges nothing until the cache shows the new head
   (a head read before the step is never pinned). It is judged only when its PR's cache entry, a wait, a wake-at or a
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
   (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land_judge names
@@ -9770,6 +9771,96 @@ def land_router_review(config: dict) -> tuple[Path | None, list[Path]]:
     return (Path(on_path) if on_path else found), tried + ([] if found else [Path("$PATH/router-review")])
 
 
+# The fleet's on/off switch per kind of automation (cmuxterm-hq tools/fleet-reconcilers/automation_switch.py, read
+# here the same way, inline). Leo, 2026-11-21 05:33Z: "we dont need the auto reviews"; 05:34Z: "we dont need automatic
+# reviews anywhere from our codexes"; 05:35Z: "this should be easier to toggle on/off". The land queue starts its
+# router-review --post (do_review, review_hold_claim) only while auto_reviews reads on. Where a switch's state comes
+# from, first match wins: env AUTOMATION_<NAME> ("on"/"off", optionally " until=<ISO>", after which it reads the
+# opposite); then automation.json <name> {"state", "until"} on hq main, read from the wt mirror (the freshest of
+# AUTOMATION_HQ_REFS, cached AUTOMATION_CACHE_S); then AUTOMATION_DEFAULTS. Anything unreadable reads as the default.
+AUTOMATION_HQ_MIRROR = Path.home() / "Projects/.wt-mirrors/manaflow-ai/cmuxterm-hq.git"
+AUTOMATION_HQ_REFS = ("refs/remotes/origin/main", "refs/hq-tools/main", "refs/heads/main")
+AUTOMATION_HQ_FILE = "tools/fleet-reconcilers/automation.json"
+AUTOMATION_DEFAULTS = {"auto_reviews": "off"}  # off since Leo's 2026-11-21 05:33Z line
+AUTOMATION_READ_DEADLINE = 5.0
+AUTOMATION_CACHE_S = 60.0
+AUTO_REVIEWS_OFF = "automatic reviews are off (automation_switch auto_reviews)"
+_automation_cache: tuple[float, dict] | None = None
+_automation_lock = threading.Lock()
+
+
+def automation_parse(value: Any, now: dt.datetime | None = None) -> str | None:
+    """'on' or 'off' from "off", "off until=2026-11-22T00:00Z" or an automation.json entry {"state", "until"}; None
+    when it does not read. Past its until it reads the opposite state."""
+    if isinstance(value, dict):
+        state, until = str(value.get("state") or "").strip().lower(), str(value.get("until") or "").strip()
+    elif isinstance(value, str) and value.strip():
+        head, _, rest = value.strip().partition(" ")
+        rest = rest.strip()
+        state, until = head.lower(), rest[len("until="):] if rest.lower().startswith("until=") else ""
+        if rest and not until:
+            return None
+    else:
+        return None
+    if state not in ("on", "off"):
+        return None
+    if until:
+        try:
+            when = dt.datetime.fromisoformat(until.upper().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        when = when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
+        if (now or dt.datetime.now(dt.timezone.utc)) >= when:
+            return "off" if state == "on" else "on"
+    return state
+
+
+def automation_file() -> dict:
+    """automation.json at the freshest hq main ref of the wt mirror, {} when it cannot be read; cached
+    AUTOMATION_CACHE_S, so a land tick never spawns git per PR."""
+    global _automation_cache
+    with _automation_lock:
+        if _automation_cache and time.monotonic() - _automation_cache[0] < AUTOMATION_CACHE_S:
+            return _automation_cache[1]
+        data: Any = {}
+        try:
+            git = ["git", "--git-dir", os.fspath(AUTOMATION_HQ_MIRROR)]
+            refs = subprocess.run(git + ["for-each-ref", "--sort=-committerdate", "--count=1",
+                                         "--format=%(refname)", *AUTOMATION_HQ_REFS],
+                                  capture_output=True, text=True, timeout=AUTOMATION_READ_DEADLINE,
+                                  stdin=subprocess.DEVNULL)
+            ref = (refs.stdout or "").strip()
+            if refs.returncode == 0 and ref:
+                got = subprocess.run(git + ["show", f"{ref}:{AUTOMATION_HQ_FILE}"], capture_output=True, text=True,
+                                     timeout=AUTOMATION_READ_DEADLINE, stdin=subprocess.DEVNULL)
+                if got.returncode == 0:
+                    data = json.loads(got.stdout or "")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        _automation_cache = (time.monotonic(), data)
+        return data
+
+
+def automation_switch(name: str, env: Any = None, now: dt.datetime | None = None) -> tuple[str, str]:
+    """(state, source) of switch NAME: 'on'/'off', from 'env', 'file' or 'default'."""
+    env = os.environ if env is None else env
+    got = automation_parse(env.get("AUTOMATION_" + name.upper().replace("-", "_")), now)
+    if got:
+        return got, "env"
+    got = automation_parse(automation_file().get(name), now)
+    if got:
+        return got, "file"
+    return AUTOMATION_DEFAULTS.get(name, "on"), "default"
+
+
+def automation_on(name: str) -> bool:
+    try:
+        return automation_switch(name)[0] == "on"
+    except Exception:  # noqa: BLE001 - any failure reads as the default
+        return AUTOMATION_DEFAULTS.get(name, "on") == "on"
+
+
 # The startup check's second half: land-judge found is in a git checkout (on a lane VM, ~/Projects/leo-workspace)
 # that may sit far behind main when nothing deploys it. gcp-codex-lane-12, 2026-11-17: its checkout sat at
 # leo-workspace#5512 while main moved on, and its old land_judge could not read main's TWINS (after #5580), so every
@@ -13312,9 +13403,16 @@ class LandQueue:
         """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
         at the head confirming that claim, and the queue reviews once per head: a claim written or changed after the
         head's review was never confirmed, and the entry stopped (cmux#45558, 2026-11-17). Reviews again once per
-        (head, claim lines); True when it did, False to let the stop stand (no claim, the body unread, or reviewed)."""
+        (head, claim lines); True when it did, False to let the stop stand (no claim, the body unread, or reviewed).
+        With auto_reviews off (AUTO_REVIEWS_OFF) it reads nothing and starts nothing: the stop stands, as if no claim
+        asked for a review; a person's `router-review R N --post` and a land again still confirm a claim."""
         gh = self.gh()
         if gh is None or not SHA40.fullmatch(head or ""):
+            return False
+        if not automation_on("auto_reviews"):
+            log({"event": "land-review-off", "key": e["key"], "head": head[:12], "why": AUTO_REVIEWS_OFF})
+            with self.lock:
+                self.history(e, "auto_reviews_off", head=head[:12], step="hold_claim_review")
             return False
         got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "body", "--jq", ".body"],
                         LAND_HOLD_BODY_DEADLINE, e)
@@ -13331,10 +13429,21 @@ class LandQueue:
 
     def do_review(self, e: dict, head: str, answer: dict, key: str = "") -> None:
         """router-review R N --post, at most once per head (claimed before it starts), detached; then wait for its
-        receipt comment. KEY (default the head) is what counts as reviewed: review_hold_claim's adds the claim."""
+        receipt comment. KEY (default the head) is what counts as reviewed: review_hold_claim's adds the claim.
+        With auto_reviews off (AUTO_REVIEWS_OFF) it starts nothing and waits on nothing: it stops the entry on
+        land_judge's own refusal (its code, its review command as the next step), as a stop step would, so a person's
+        `router-review R N --post` and a land again take it from there. The SHIP cmux main needs is land_judge's."""
         repo, number = e["repo"], str(e["number"])
         key = key or head
+        off = key not in (e.get("reviewed") or []) and not automation_on("auto_reviews")
         with self.lock:
+            if off:
+                log({"event": "land-review-off", "key": e["key"], "head": head[:12], "why": AUTO_REVIEWS_OFF})
+                self.history(e, "auto_reviews_off", head=head[:12], step="review")
+                self.stop(e, str(answer.get("code") or "review"),
+                          f"{AUTO_REVIEWS_OFF}; land-judge: {land_trim(answer.get('reason')) or 'a review at the head'}",
+                          f"router-review {repo} {number} --post, then glaeda-gh land {repo}#{number}")
+                return
             if key in e.setdefault("reviewed", []):
                 self.history(e, "review_already_run", head=head[:12])
             elif self.gh() is None:

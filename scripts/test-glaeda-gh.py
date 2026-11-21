@@ -672,6 +672,17 @@ class Base(unittest.TestCase):
         execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
         execv.start()
         self.addCleanup(execv.stop)
+        # The auto_reviews switch: on for every test unless it says otherwise (the land tests that start a review
+        # predate it), and never the host's hq mirror (AutoReviewsSwitchTest turns it off).
+        switch = mock.patch.dict(os.environ, {"AUTOMATION_AUTO_REVIEWS": "on"})
+        switch.start()
+        self.addCleanup(switch.stop)
+        mirror = mock.patch.object(gg, "AUTOMATION_HQ_MIRROR", Path(self.tmp.name) / "no-hq-mirror.git")
+        mirror.start()
+        self.addCleanup(mirror.stop)
+        cache = mock.patch.object(gg, "_automation_cache", None)
+        cache.start()
+        self.addCleanup(cache.stop)
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.UPSTREAM_DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
@@ -18209,6 +18220,70 @@ class ScarceWaitedFirstTest(Base):
         self.assertEqual(due[1:], [f"pr:o/r#{n}" for n in (8, 6, 5, 4, 3, 2, 1)], "the rest: oldest deferral first")
 
 
+class AutoReviewsSwitchTest(Base):
+    """The auto_reviews switch read inline (cmuxterm-hq automation_switch.py): env, then hq main's automation.json in
+    the wt mirror, then the default off (Leo, 2026-11-21 05:35Z: "this should be easier to toggle on/off")."""
+
+    NOW_T = gg.dt.datetime(2026, 11, 21, 6, 0, tzinfo=gg.dt.timezone.utc)
+
+    def mirror(self, doc: Any, ref: str = "refs/remotes/origin/main") -> None:
+        work = Path(self.tmp.name) / "hq-work"
+        (work / "tools/fleet-reconcilers").mkdir(parents=True)
+        (work / gg.AUTOMATION_HQ_FILE).write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+        git = ["git", "-C", os.fspath(work)]
+        for argv in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "x"]):
+            subprocess.run(git + argv, check=True, env=env, capture_output=True)
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(work), os.fspath(gg.AUTOMATION_HQ_MIRROR)],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "--git-dir", os.fspath(gg.AUTOMATION_HQ_MIRROR), "update-ref", ref, "HEAD"],
+                       check=True, capture_output=True)
+        gg._automation_cache = None
+
+    def test_parse(self):
+        p = lambda v: gg.automation_parse(v, self.NOW_T)  # noqa: E731
+        self.assertEqual([p("on"), p("OFF"), p(" off ")], ["on", "off", "off"])
+        self.assertEqual(p("off until=2026-11-21T05:00:00Z"), "on")  # the pause ended
+        self.assertEqual(p("off until=2026-11-22T00:00Z"), "off")
+        self.assertEqual(p({"state": "on", "until": "2026-11-21T05:00:00Z"}), "off")
+        self.assertEqual(p({"state": "off", "until": None}), "off")
+        for bad in ("", "yes", "off later", "off until=soon", {"state": "maybe"}, 1, None):
+            self.assertIsNone(p(bad), bad)
+
+    def test_env_then_file_then_default_off(self):
+        self.assertEqual(gg.automation_switch("auto_reviews", {}), ("off", "default"))  # no mirror: default
+        self.assertEqual(gg.automation_switch("auto_reviews", {"AUTOMATION_AUTO_REVIEWS": "junk"}), ("off", "default"))
+        self.mirror({"auto_reviews": {"state": "on", "until": None}})
+        self.assertEqual(gg.automation_switch("auto_reviews", {}), ("on", "file"))
+        self.assertEqual(gg.automation_switch("auto_reviews", {"AUTOMATION_AUTO_REVIEWS": "off"}), ("off", "env"))
+        os.environ.pop("AUTOMATION_AUTO_REVIEWS")
+        self.assertTrue(gg.automation_on("auto_reviews"))
+
+    def test_the_file_read_is_cached(self):
+        self.mirror({"auto_reviews": {"state": "on"}})
+        self.assertEqual(gg.automation_file(), {"auto_reviews": {"state": "on"}})
+        with mock.patch.object(gg.subprocess, "run", side_effect=AssertionError("read again")):
+            self.assertEqual(gg.automation_file(), {"auto_reviews": {"state": "on"}})
+            with mock.patch.object(gg.time, "monotonic", return_value=time.monotonic() + gg.AUTOMATION_CACHE_S + 1), \
+                    self.assertRaises(AssertionError):
+                gg.automation_file()
+
+    def test_any_failure_reads_as_the_default(self):
+        self.mirror("{not json")
+        self.assertEqual(gg.automation_switch("auto_reviews", {}), ("off", "default"))
+        gg._automation_cache = None
+        with mock.patch.object(gg.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 5)):
+            self.assertEqual(gg.automation_file(), {})
+        gg._automation_cache = None
+        with mock.patch.object(gg, "automation_switch", side_effect=RuntimeError("boom")):
+            self.assertFalse(gg.automation_on("auto_reviews"))
+
+    def test_the_freshest_main_ref_is_read(self):
+        self.mirror({"auto_reviews": {"state": "on"}}, ref="refs/hq-tools/main")
+        self.assertEqual(gg.automation_switch("auto_reviews", {}), ("on", "file"))
+
+
 class LandSnapshotTest(Base):
     """glaeda-gh land reads check state from the daemon's PR read, not a read per queued PR (cosmic-gray, 2026-11-17:
     session glaeda-land was the shared login's top caller, 606 REST in an hour, mostly `commits/SHA/check-runs` reads
@@ -24262,6 +24337,47 @@ class LandTest(Base):
         with mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")):
             e = self.tick()
         self.assertEqual(e["stop"]["code"], "no_shim")
+
+    def test_auto_reviews_off_starts_no_review_and_waits_on_none(self):
+        # Leo, 2026-11-21 05:34Z: "we dont need automatic reviews anywhere from our codexes"
+        os.environ["AUTOMATION_AUTO_REVIEWS"] = "off"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}, reason="land-judge: refused: no SHIP at x"))
+        out = io.StringIO()
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")), \
+                contextlib.redirect_stdout(out):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("wait"), e.get("reviewed") or []),
+                         ("stopped", "no_ship", None, []))
+        self.assertIn(gg.AUTO_REVIEWS_OFF, e["stop"]["reason"])
+        self.assertIn("no SHIP at x", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], "router-review o/r 1 --post, then glaeda-gh land o/r#1")
+        self.assertIn("auto_reviews_off", [h["event"] for h in e["history"]])
+        self.assertNotIn("review", [h.get("kind") for h in e["history"] if h["event"] == "step"])
+        self.assertIn("automatic reviews are off (automation_switch auto_reviews)", out.getvalue())
+        # switched back on, a land again starts the review as before
+        os.environ["AUTOMATION_AUTO_REVIEWS"] = "on"
+        self.land()
+        self.w.answers.append(refusal("no_ship", LA, {"kind": "review"}))
+        with mock.patch.object(gg.subprocess, "Popen", return_value=mock.Mock()) as popen:
+            e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], popen.call_count), ("waiting", "comment", 1))
+
+    def test_auto_reviews_off_lets_a_hold_claim_stop_stand_unread(self):
+        os.environ["AUTOMATION_AUTO_REVIEWS"] = "off"
+        self.w.body = "Fixes the pane.\n\nChat-hold: speed\n"
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("chat_hold", LA, {"kind": "stop", "stop": "chat_hold"}))
+        reads = len(self.w.calls)
+        with mock.patch.object(gg.subprocess, "Popen", side_effect=AssertionError("ran router-review")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e.get("reviewed") or []), ("stopped", "chat_hold", []))
+        self.assertNotIn("hold_claim_review", [h["event"] for h in e["history"]])
+        self.assertIn("auto_reviews_off", [h["event"] for h in e["history"]])
+        self.assertFalse([c for c in self.w.calls[reads:] if c[1:3] == ["pr", "view"] and "body" in c])
 
     def test_reexec_waits_for_a_running_land_step(self):
         gg.land_dir().mkdir(parents=True)
