@@ -26414,6 +26414,32 @@ class AppPoolTest(Base):
         self.assertEqual(self.pool.status()["graphqlPoints"], 7)
         self.assertEqual(self.pool.status()["graphqlSeen"]["remaining"], 100)
 
+    def test_a_spent_app_pool_asks_the_spare_app_before_the_login(self) -> None:
+        spare_token = "ghs_" + "s" * 36
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: spare_token, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        spare_calls: list[str] = []
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] == f"Bearer {spare_token}":
+                spare_calls.append(url)
+                return 200, {"x-ratelimit-limit": "12500", "x-ratelimit-remaining": "12000",
+                             "x-ratelimit-reset": str(int(NOW + 1800))}, b'{"spare": true}'
+            return inner(method, url, headers, body)
+
+        self.daemon.transport = transport
+        self.app_answers.append((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message":"API rate limit exceeded"}'))
+        status, _, doc = self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
+        self.assertEqual((status, doc), (200, {"spare": True}))
+        self.assertEqual(self.gh.calls, [], "the login never saw it")
+        self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/2")
+        self.assertEqual(len(spare_calls), 2, "the spent pool rests, so the next read goes straight to the spare")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(self.pool.status()["spares"][0]["role"], "quota-goblin")
+
     def test_no_app_on_this_host_keeps_the_login_and_asks_again_only_after_a_rest(self) -> None:
         self.ready = False
         self.daemon.request("GET", "/repos/manaflow-ai/cmux/pulls/1")
