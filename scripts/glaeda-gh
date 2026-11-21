@@ -12634,7 +12634,8 @@ class LandQueue:
             return
         if running:
             if woke:  # a check that never finishes (a status never posted, no runner): land_judge says what now
-                self.judge(e, head, fp)
+                if not self.wait_idle_keeps(e, c, head, fp):
+                    self.judge(e, head, fp)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             elif w.get("rerun"):
@@ -12653,6 +12654,8 @@ class LandQueue:
             if w.get("ran") != before:
                 self.save(e)
         if woke or fp != e.get("seen") or reran:
+            if not reran and self.wait_idle_keeps(e, c, head, fp):
+                return  # nothing the wait was judged on moved (LAND_WAIT_IDLE_KEEP)
             if not woke and not reran and self.verdict_holds(e, c, head, fp):
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
