@@ -15907,6 +15907,70 @@ class PostBodyGuardTest(unittest.TestCase):
                                                         "--base", "b", "--body-file", "F"])
 
 
+class AWriteGithubRefusedNamesWhatItRefusedTest(unittest.TestCase):
+    """A queued write that GitHub refuses records one line, and that line is all its caller ever sees: the item is
+    moved to posted/ and the caller reads it back with `post status ID`. Two shapes said nothing usable.
+
+    2026-11-21, measured on this host: `post pr manaflow-ai/glaeda ...` (glaeda is teamleaderleo/glaeda) recorded
+    `failed: HTTP 422: Validation Failed (invalid)`, and `post comment manaflow-ai/glaeda#2395` recorded
+    `failed: HTTP 404: Not Found`. Neither names the repository, which is the one word that was wrong, and `(invalid)`
+    is GitHub's `code` with its `resource` and `field` dropped -- so the write looked like a bad body or a bad head.
+    Five more calls went into finding out, which is the cost this measures."""
+
+    PR_422 = {"message": "Validation Failed",
+              "errors": [{"resource": "PullRequest", "field": "head", "code": "invalid"}]}
+
+    def test_a_validation_error_with_no_message_still_names_its_resource_and_field(self) -> None:
+        line = gg.write_failure({"kind": "pr", "repo": "o/r", "head": "b", "base": "main"}, 422, self.PR_422)
+        self.assertIn("PullRequest.head", line, "GitHub's resource and field, not just its code")
+        self.assertIn("invalid", line)
+        self.assertIn("Validation Failed", line)
+
+    def test_githubs_own_message_is_preferred_where_it_has_one(self) -> None:
+        doc = {"message": "Validation Failed", "errors": [{"resource": "PullRequest", "code": "custom",
+                                                           "message": "No commits between main and b"}]}
+        line = gg.write_failure({"kind": "pr", "repo": "o/r", "head": "b", "base": "main"}, 422, doc)
+        self.assertIn("No commits between main and b", line)
+        self.assertNotIn("custom", line, "the code adds nothing once GitHub has written the sentence")
+
+    def test_a_404_on_a_write_names_the_repository_and_the_number_it_could_not_reach(self) -> None:
+        # Not Found on a write is one of two things and the item knows both: the repo (wrong owner, renamed, no
+        # access) or the number. Bare "HTTP 404: Not Found" leaves the caller to guess which.
+        line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 2395}, 404,
+                                {"message": "Not Found"})
+        self.assertIn("manaflow-ai/glaeda", line)
+        self.assertIn("2395", line)
+
+    def test_a_repository_of_that_name_known_here_under_another_owner_is_named(self) -> None:
+        # The owner is the word a caller gets wrong, and this host already knows the right one: broker-repos.json
+        # maps the slugs it has checkouts for. A hint, not a refusal: the write was already tried.
+        known = {"teamleaderleo/glaeda": "/home/x/glaeda", "manaflow-ai/cmux": "/home/x/cmux"}
+        line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 2395}, 404,
+                                {"message": "Not Found"}, known=known)
+        self.assertIn("teamleaderleo/glaeda", line, "the slug this host does have a checkout of")
+
+    def test_a_repository_name_known_nowhere_here_adds_no_guess(self) -> None:
+        line = gg.write_failure({"kind": "comment", "repo": "o/nothing-like-this", "number": 5}, 404,
+                                {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertNotIn("glaeda", line, "a name that matches nothing is not guessed at")
+
+    def test_the_repo_it_did_reach_is_not_second_guessed(self) -> None:
+        # The same repository name under the owner that was asked for: nothing to suggest, and suggesting it would
+        # read as "you typed the wrong owner" when the owner was right.
+        line = gg.write_failure({"kind": "comment", "repo": "teamleaderleo/glaeda", "number": 5}, 404,
+                                {"message": "Not Found"}, known={"teamleaderleo/glaeda": "/home/x/glaeda"})
+        self.assertNotIn("known here as", line)
+
+    def test_every_line_is_one_line(self) -> None:
+        # post_finish records it as the item's "error" and `post status` prints it as the last word on the write; a
+        # newline in it breaks every reader that takes the last line.
+        for status, doc in ((422, self.PR_422), (404, {"message": "Not Found"}), (403, {"message": "Forbidden"})):
+            line = gg.write_failure({"kind": "comment", "repo": "manaflow-ai/glaeda", "number": 1}, status, doc,
+                                    known={"teamleaderleo/glaeda": "/x"})
+            self.assertNotIn("\n", line, line)
+            self.assertTrue(line.startswith(f"HTTP {status}"), line)
+
+
 class RiskReceiptPostTest(unittest.TestCase):
     """A delivered exact-head review wakes cmux's existing risk grader, without replaying content."""
 
