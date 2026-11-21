@@ -4117,6 +4117,7 @@ class Daemon:
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
+        self.land_dirty: set[str] = set()  # event/cache keys retained for LandQueue after due() consumes nudged
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
@@ -4800,7 +4801,7 @@ class Daemon:
             # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
             # goes first instead (nudged), and the alarm stands.
             if data.get("key"):
-                self.nudged.add(str(data["key"]))
+                self.land_nudge(str(data["key"]))
             return level, text, {**data, "valve": "one_key", "freshest": int(fresh)}
         up = self.now - (self.started_tick if self.started_tick is not None else self.now)
         if up < STALE_DATA_AFTER:
@@ -7319,6 +7320,11 @@ class Daemon:
         q.reap()
         return bool(q.jobs)
 
+    def land_nudge(self, key: str) -> None:
+        """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
+        self.nudged.add(key)
+        self.land_dirty.add(key)
+
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
         an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
@@ -7328,8 +7334,8 @@ class Daemon:
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
-            self.land_queue = LandQueue(nudge=self.nudged.add, notice=self.write_notice, reading=self.land_reading)
-        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now)
+            self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading)
+        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=self.land_dirty)
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
 
@@ -9635,7 +9641,7 @@ class Daemon:
             if e["key"].startswith("head:"):
                 _, owner, repo, sha = split_key(e["key"])
                 if (f"{owner}/{repo}".lower(), "sha:" + sha) in touched:
-                    self.nudged.add(e["key"])  # a check event on this commit: its rollup changed
+                    self.land_nudge(e["key"])  # a check event on this commit: its rollup changed
                 continue
             data = (e["cache"] or {}).get("data") or {}
             if not e["key"].startswith("pr:") or not data:
@@ -9645,7 +9651,7 @@ class Daemon:
             if data.get("headRefName"):
                 marks.add("branch:" + str(data["headRefName"]))  # a push: runs for a head GitHub has not shown yet
             if any((f"{owner}/{repo}", m) in touched for m in marks):
-                self.nudged.add(e["key"])
+                self.land_nudge(e["key"])
 
     def merge_comments(self, entries: list[dict], page: dict) -> None:
         """Add new, edited and deleted comments on watched issues to their cached comment list. The
@@ -10266,6 +10272,9 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
+# deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
+LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
 # A due entry the login's latch skipped through this many latch windows (each a hold of the latch: LandQueue.hold)
 # tells its requester once, naming the latch and its end; from its second window it goes at the latch's clear without
 # the reset spread (land_latch_spread). huge-blue, 2026-11-18 17:18-19:53Z: 22 lands past their wake for 2-4 h
@@ -11051,6 +11060,9 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.cache_seen: dict[str, str] = {}
+        self.changed_entries: set[str] = set()
+        self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
         self.nudge = nudge or (lambda key: None)
         self.notice = notice or (lambda kind, level, text, data: None)
@@ -11247,16 +11259,26 @@ class LandQueue:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]))
         self.entries[key] = e
         self.save(e)
+        self.changed_entries.add(key)
 
     # -- the tick
 
-    def tick(self, now: float | None = None) -> None:
+    def tick(self, now: float | None = None, dirty: set[str] | None = None) -> None:
         self.now = time.time() if now is None else now
+        dirty_keys = set(dirty or ())
+        if dirty is not None:
+            dirty.clear()
+        recovery = self.now >= self.recovery_at
+        if recovery:
+            self.recovery_at = self.now + LAND_RECOVERY_SWEEP
         executor = land_executor(self.config())
         if executor is not None:
             self.forward_tick(executor)
             return
+        prior_states = {key: entry.get("state") for key, entry in self.entries.items()}
         self.ingest()
+        dirty_keys |= self.changed_entries
+        self.changed_entries.clear()
         self.reap()
         if self.refuse():
             return
@@ -11295,6 +11317,16 @@ class LandQueue:
                     continue  # the latch just ended: this entry's place in the reset spread is still ahead
                 with self.lock:
                     if self.parked(e):
+                        continue
+                    cache_fp = land_fingerprint(self.cache_of(key))
+                    changed = cache_fp != self.cache_seen.get(key)
+                    self.cache_seen[key] = cache_fp
+                    wait_kind = (e.get("wait") or {}).get("kind")
+                    active = recovery or self.due(e) or key in dirty_keys \
+                        or (e.get("state") == "waiting_after" and prior_states.get(key) == "waiting_after") \
+                        or wait_kind in ("run", "comment", "repin") or (e.get("wait") or {}).get("rerun") or changed
+                    if not active:
+                        self.keep_watching(e)
                         continue
                     if e.get("latchHeld"):
                         # no mark holds it this pass (re-read above, never the until it stored): due now, and its

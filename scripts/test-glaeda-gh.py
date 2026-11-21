@@ -20791,6 +20791,40 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def test_an_unchanged_wait_skips_land_consider_until_recovery(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.tick(30)
+        self.assertEqual(calls, [])
+        self.q.recovery_at = self.t
+        self.tick(1)
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_dirty_land_key_wakes_its_entry_before_the_recovery_sweep(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                               "timeout_s": 900}))
+        self.tick()
+        calls = []
+        consider = self.q.consider
+        self.q.consider = lambda entry: (calls.append(entry["key"]), consider(entry))[1]
+        self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP
+        self.tick(1)
+        self.assertEqual(calls, [])
+        dirty = {self.KEY}
+        self.q.tick(self.t + 1, dirty=dirty)
+        self.assertEqual(calls, [self.KEY])
+        self.assertEqual(len(self.w.explains()), 1)
+
     def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
         # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
         # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.
