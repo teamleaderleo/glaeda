@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import math
+import random
 import os
 import re
 import shlex
@@ -10643,9 +10644,15 @@ class FileAndPidWaitTest(unittest.TestCase):
                 # Every kind carries the deadline, not just the helper that formats it: a mutation
                 # dropping the `(at ...)` clause from the line left the suite green while
                 # `deadline_clock`'s own assertions above still passed.
-                self.assertRegex(line, r"giving up after 60s \(at \d\d:\d\d:\d\dZ\)")
+                # --timeout is "no change for S" (Leo: "if it's too short, it's like bullshit because it just
+                # instantly flails over"): the line says the deadline moves, and names the ceiling it cannot pass.
+                self.assertRegex(line, r"giving up after 60s with no change \(at \d\d:\d\d:\d\dZ unless it "
+                                       r"changes; ceiling \d\d:\d\d:\d\dZ\)")
         self.assertNotIn(" at ", gg.waiting_line("pid 7", "it exits", None, True, 60).split(" (at ")[0],
                          "a wait with no sha claimed one")
+        # `wait until` has nothing to watch change: its line keeps the plain total bound
+        self.assertRegex(gg.waiting_line("until 14:40Z", "14:40Z", None, True, 60, leash=False),
+                         r"giving up after 60s \(at \d\d:\d\d:\d\dZ\)$")
 
     def test_the_line_is_printed_before_the_wait_can_finish(self) -> None:
         """Before, not after: a line printed on the way out would say nothing about a wait that
@@ -31038,6 +31045,174 @@ class AFlagsCaseConventionTest(unittest.TestCase):
         self.assertEqual(gg.parser().parse_args(joined).body, "--bodyFile")
         past = ["log", "search", "o/r", "pat", "--", "--maxAge"]
         self.assertEqual(gg.flag_spelling_synonym(list(past)), (past, []))
+
+
+class WaitLeashReplayTest(Base):
+    """Leo, 2026-11-21: "the leash thing, right? Like you have a timeout or whatever on things. And if it's too
+    short, it's like bullshit because it just instantly flails over when it dies. But you can do better."
+
+    No history on hand had a wait that timed out while what it watched was still changing, so this is the harness
+    the before/after numbers come from: a deterministic replay of PRs whose checks start and finish a few minutes
+    apart (10-90 min of CI in all), read by the daemon every 60 s, each driven through the one decider (wait_step)
+    the client and the daemon share. An agent that gets `timeout` runs the same wait again (its `next:`), until an
+    answer. "Before" is the old total bound, which req["max"] = req["timeout"] reproduces exactly (the deadline is
+    then began + timeout whatever moves); "after" is the default --max. And a target that is stuck stays bounded:
+    stuck from the start it ends at S in both, stuck after some progress it ends S after its last change."""
+
+    READ_EVERY = 60
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.t0 = float(int(time.time()))
+
+    @staticmethod
+    def stamp(t: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def scenarios(self) -> list[list[tuple[float, float]]]:
+        """Each PR: its checks' (start, finish) offsets in seconds. No gap between two changes is over 5 minutes:
+        these are targets that progress slowly, never ones that went quiet."""
+        rng, out = random.Random(2391), []
+        for _ in range(24):
+            total = rng.randint(10, 90) * 60
+            events = sorted({0, total} | {rng.randrange(60, total, 60) for _ in range(total // 240)})
+            for a, b in zip(events, events[1:]):  # fill a gap over 5 minutes with a change, as a slow run has
+                events += list(range(a + 300, b, 300))
+            events = sorted(set(events))
+            checks, pending = [], []
+            for at in events[:-1]:
+                if pending and rng.random() < 0.5:
+                    start = pending.pop(0)
+                    checks.append((start, at))
+                else:
+                    pending.append(at)
+            checks += [(start, total) for start in pending] or [(0, total)]
+            out.append(checks)
+        return out
+
+    def data(self, number: int, checks: list[tuple[float, float]], t: float, stuck: bool = False) -> dict:
+        nodes, done = [], True
+        for i, (start, end) in enumerate(checks):
+            node = check_run(f"c{i}", "QUEUED", None)
+            if t - self.t0 >= start:
+                node = {**check_run(f"c{i}", "IN_PROGRESS", None), "startedAt": self.stamp(self.t0 + start)}
+            if t - self.t0 >= end and not stuck:
+                node = {**check_run(f"c{i}"), "startedAt": self.stamp(self.t0 + start),
+                        "completedAt": self.stamp(self.t0 + end)}
+            done = done and node["status"] == "COMPLETED"
+            nodes.append(node)
+        return gg.parse_pr(pr_node(number, rollup="SUCCESS" if done else "PENDING", checks=nodes))
+
+    def drive(self, number: int, checks: list[tuple[float, float]], timeout: float, before: bool,
+              stuck_after: float | None = None, give_up: float = 6 * 3600) -> dict:
+        """Waits on PR NUMBER until it is green, re-waiting on each timeout as `next:` says: how many waits it took,
+        how many of them timed out, how each ended, and when the answer came (seconds from the first wait)."""
+        key = f"pr:o/r#{number}"
+        waits, ends, t = 0, [], self.t0
+        while t - self.t0 < give_up:
+            req = gg.wait_request("pr", f"o/r#{number}", "green", timeout, False, True, None, True, gg.RESCUE_GRACE)
+            req["began"] = t
+            if before:
+                req["max"] = req["timeout"]  # the old rule: --timeout is the total
+            waits += 1
+            while True:
+                t += self.READ_EVERY
+                frozen = stuck_after is not None and t - self.t0 >= stuck_after
+                at = min(t, self.t0 + stuck_after) if frozen else t
+                gg.write_json(gg.cache_dir() / gg.file_name(key),
+                              {"key": key, "fetchedAt": t, "dataAt": t, "error": None,
+                               "data": self.data(number, checks, at, stuck=frozen and stuck_after == 0)})
+                step = gg.wait_step(req, t)
+                if step is None:
+                    continue
+                code, text = step
+                out = json.loads(text)
+                ends.append({"code": code, "ended_by": out.get("ended_by"), "waited_s": out.get("waited_s"),
+                             "changes": out.get("progress_changes")})
+                break
+            if code != gg.EXIT_TIMEOUT:
+                return {"waits": waits, "ends": ends, "answer_s": t - self.t0, "code": code}
+        return {"waits": waits, "ends": ends, "answer_s": None, "code": gg.EXIT_TIMEOUT}
+
+    def replay(self, timeout: float, before: bool) -> dict:
+        prs = [self.drive(9000 + i, c, timeout, before) for i, c in enumerate(self.scenarios())]
+        moving = [e for p in prs for e in p["ends"] if e["code"] == gg.EXIT_TIMEOUT and e["changes"]]
+        return {"prs": len(prs), "waits": sum(p["waits"] for p in prs),
+                "rewaits": sum(p["waits"] - 1 for p in prs),
+                "timeouts_while_changing": len(moving),
+                "ceilings": sum(1 for e in moving if e["ended_by"] == "ceiling"),
+                "answered": sum(1 for p in prs if p["code"] == gg.EXIT_OK),
+                "answer_s": sorted(p["answer_s"] for p in prs if p["answer_s"] is not None)}
+
+    def test_a_slowly_progressing_pr_is_answered_by_one_wait_not_re_waits(self) -> None:
+        report = {}
+        for timeout in (600, 1800, 3600):
+            old, new = self.replay(timeout, before=True), self.replay(timeout, before=False)
+            report[timeout] = {"before": {k: v for k, v in old.items() if k != "answer_s"},
+                               "after": {k: v for k, v in new.items() if k != "answer_s"}}
+            with self.subTest(timeout=timeout):
+                self.assertEqual(old["answered"], old["prs"])
+                self.assertEqual(new["answered"], new["prs"])
+                self.assertEqual(old["answer_s"], new["answer_s"], "the answer comes when CI does, either way")
+                # the only timeouts left on a target that changes every few minutes are its --max (4x S)
+                self.assertEqual(new["timeouts_while_changing"], new["ceilings"])
+                self.assertLess(new["rewaits"], old["rewaits"] or 1)
+                if timeout == 600:
+                    self.assertGreater(old["timeouts_while_changing"], 0, "the harness reproduces the complaint")
+        if os.environ.get("GLAEDA_LEASH_REPLAY"):
+            print(json.dumps(report, indent=1), file=sys.stderr)
+
+    def test_a_stuck_target_still_ends_at_its_timeout(self) -> None:
+        """Stuck from the start: nothing ever changes, so the wait ends at S, before and after alike. Stuck after
+        twenty minutes of progress: it ends S after the last change, and says when that was."""
+        checks = [(0, 600), (120, 1200), (300, 99999)]
+        for before in (True, False):
+            with self.subTest(before=before):
+                got = self.drive(9100, checks, 600, before, stuck_after=0, give_up=1)
+                self.assertEqual([(e["code"], e["ended_by"], e["waited_s"]) for e in got["ends"]],
+                                 [(gg.EXIT_TIMEOUT, "no-progress", 600)])
+        got = self.drive(9101, checks, 600, False, stuck_after=1200, give_up=1)
+        end = got["ends"][0]
+        self.assertEqual((end["code"], end["ended_by"]), (gg.EXIT_TIMEOUT, "no-progress"))
+        self.assertEqual(end["waited_s"], 1200 + 600, "S of no change after its last change, not S in all")
+
+    def test_next_names_max_only_when_it_is_not_the_default(self) -> None:
+        req = gg.wait_request("pr", "o/r#7", "green", 600, False, False, None, True, gg.RESCUE_GRACE)
+        self.assertEqual(gg.wait_command(req), "glaeda-gh wait pr o/r#7 --timeout 600")
+        req = gg.wait_request("pr", "o/r#7", "green", 600, False, False, None, True, gg.RESCUE_GRACE, ceiling=900)
+        self.assertEqual(gg.wait_command(req), "glaeda-gh wait pr o/r#7 --timeout 600 --max 900")
+
+    def test_a_land_entry_moves_on_its_steps_not_on_its_timestamps(self) -> None:
+        entry = {"state": "waiting", "step": "ci", "checkedAt": 1, "nested": {"updatedAt": 2, "n": 1}}
+        self.assertEqual(gg.land_progress(entry), gg.land_progress({**entry, "checkedAt": 9, "nested": {"updatedAt": 5,
+                                                                                                      "n": 1}}))
+        self.assertNotEqual(gg.land_progress(entry), gg.land_progress({**entry, "step": "merge"}))
+
+    def test_a_local_leash_moves_its_deadline_on_a_change_and_not_past_its_ceiling(self) -> None:
+        clock = [100.0]
+        with mock.patch.object(gg.time, "monotonic", side_effect=lambda: clock[0]):
+            leash = gg.Leash(10, 25)
+            self.assertFalse(leash.see("a"), "the first look is where it starts")
+            clock[0] = 108.0
+            self.assertTrue(leash.see("b"))
+            self.assertEqual(leash.deadline(), 118.0)
+            clock[0] = 120.0
+            self.assertLessEqual(leash.left(), 0)
+            self.assertEqual(leash.fields()["ended_by"], "no-progress")
+            clock[0] = 100.0
+            leash = gg.Leash(10, 25)
+            for t in range(101, 130):
+                clock[0] = float(t)
+                leash.see(t)
+            self.assertEqual(leash.deadline(), 125.0)
+            self.assertEqual(leash.ended_by(), "ceiling")
+
+    def test_ceiling_ends_a_target_that_never_stops_changing(self) -> None:
+        """Changing every minute forever: --max is what ends it, and the outcome says so."""
+        checks = [(i * 60, 10 ** 6) for i in range(400)]
+        got = self.drive(9200, checks, 600, False, give_up=1)
+        end = got["ends"][0]
+        self.assertEqual((end["code"], end["ended_by"], end["waited_s"]), (gg.EXIT_TIMEOUT, "ceiling", 2400))
 
 if __name__ == "__main__":
     unittest.main()
