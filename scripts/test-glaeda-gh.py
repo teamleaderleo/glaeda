@@ -4537,6 +4537,25 @@ class ClientTest(Base):
         self.assertEqual(self.wait("pr", "o/r#4", until="done", fill=(mixed, {}), timeout=5)[0], 1,
                          "a finished red fails at once beside a running check")
 
+    def test_a_merged_pr_at_another_head_exits_merged_at_once_under_every_until(self) -> None:
+        """hq#16384, 2026-11-21: `--until required --sha 6ca0a8fd` kept waiting 2400 s on a PR merged at head cbad338ab7."""
+        node = pr_node(1, state="MERGED", checks=[check_run("a", "IN_PROGRESS", None)])
+        node["mergeCommit"] = {"oid": "f" * 40}
+        merged = gg.parse_pr(node)
+        for until in ("green", "done", "required", "merged"):
+            code, text = self.wait("pr", "o/r#1", until=until, fill=(merged, {}), sha="6" * 40, timeout=5)
+            self.assertEqual(code, 0, (until, text))
+            self.assertIn("result: merged", text)
+            self.assertIn("f" * 10, text)
+            self.assertNotIn("glaeda-gh wait pr", text)
+
+    def test_a_timeout_on_a_finished_pr_never_suggests_waiting_again(self) -> None:
+        for state in ("MERGED", "CLOSED"):
+            data = gg.parse_pr(pr_node(1, state=state))
+            req = {"key": "pr:o/r#1", "kind": "pr", "until": "green", "sha": "a" * 40, "timeout": 5, "began": time.time()}
+            out = gg.wait_outcome(req, gg.EXIT_TIMEOUT, {"data": data}, 5)
+            self.assertNotIn("glaeda-gh wait", out["next"])
+
     def test_wait_ignores_cache_from_before_it_began(self) -> None:
         old_green = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")]))
         self.put("pr:o/r#1", old_green, at=time.time() - 30)

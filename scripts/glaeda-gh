@@ -222,7 +222,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
-4 when the PR conflicts with its base, 6 when no check or status ever reported on the PR's head
+4 when the PR conflicts with its base, 0 with "result: merged" (and the merge commit) as soon as the PR is MERGED,
+whatever --until says or head --sha names (a closed unmerged PR exits 1 at once), 6 when no check or status ever reported on the PR's head
 (--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass),
 7 (inconclusive) when --until done is left with only checks queued with no runner past 30 min, or the
 deadline passes on a read that never came back whole. Done and green never exit 0 while any check
@@ -1006,7 +1007,7 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
 # NUM is the alias's PR-number variable: isRequired needs it
-PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
+PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
@@ -3492,6 +3493,7 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
     mergeable = {True: "MERGEABLE", False: "CONFLICTING"}.get(pull.get("mergeable"), "UNKNOWN")
     return {"number": pull.get("number"), "url": pull.get("html_url"), "title": pull.get("title"), "state": state,
             "isDraft": bool(pull.get("draft")), "merged": bool(pull.get("merged")), "mergedAt": pull.get("merged_at"),
+            "mergeCommit": {"oid": pull.get("merge_commit_sha")} if pull.get("merged") else None,
             "mergeable": mergeable, "mergeStateStatus": upper(pull.get("mergeable_state")) or "UNKNOWN",
             "headRefOid": head.get("sha"), "headRefName": head.get("ref"),
             "baseRefName": (pull.get("base") or {}).get("ref"), "reviewDecision": review,
@@ -3680,7 +3682,7 @@ def parse_pr(node: dict) -> dict:
         "requiredNames": sorted(name for name in required if name),  # what the base requires (check_verdict)
         "number": node.get("number"), "url": node.get("url"), "title": node.get("title"),
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
-        "mergedAt": node.get("mergedAt"), "mergeable": node.get("mergeable"),
+        "mergedAt": node.get("mergedAt"), "mergeCommit": node.get("mergeCommit"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
@@ -15791,7 +15793,13 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return EXIT_FAIL
     if until == "merged":
         return EXIT_OK if data.get("state") == "MERGED" else None
-    if until == "done" and data.get("state") == "MERGED":
+    if data.get("state") == "MERGED":
+        # A merged PR is final whatever --until says: it is never waited on (hq#16384, 2026-11-21: `--until required
+        # --sha 6ca0a8fd` kept waiting 2400 s on a PR that had merged at head cbad338ab7, which could never match).
+        if sha and not str(data.get("headRefOid") or "").startswith(sha):
+            return EXIT_OK  # it merged at another head: the commit waited for is not the one that landed, nothing to wait for
+        if until != "done":
+            return check_verdict(data, until, now, grace, settle)  # at the head waited for: a runner refusal in its grace still holds
         # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
         # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
         # still fails; a pending, missing or other-head check no longer holds the wait.
@@ -16133,6 +16141,11 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     data = (entry or {}).get("data") or {}
     if result == EXIT_OK:
         return ok_fields()
+    if result in (EXIT_TIMEOUT, EXIT_INCONCLUSIVE) and kind == "pr" and data.get("state") in ("MERGED", "CLOSED"):
+        # a PR that finished is never waited on again (a timeout cannot come from one, but the line must not say so)
+        return fail_fields("timeout" if result == EXIT_TIMEOUT else "inconclusive",
+                           f"waited {waited} s for {name}, which is {data.get('state')}",
+                           f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
         state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
         deadline = utc_clock(float(req["began"]) + float(req["timeout"]))
@@ -16608,7 +16621,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             if kind == "run":
                 raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never "
                                  "changes, and its run-name does not name that full commit as the one it tested")
-            if not exact:
+            if not exact and not final:
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
                                  f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
                                  "GitHub has not seen yet")
@@ -16638,7 +16651,8 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
             req.pop("runsUnread", None)
             req.pop("runsUnfinished", None)
     if result is not None:
-        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
+        merged = kind == "pr" and data.get("state") == "MERGED" and result == EXIT_OK
+        outcome_name = {EXIT_OK: "merged" if merged else "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
                         EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
         if kind == "pr" and result == EXIT_NOTHING:
@@ -16651,8 +16665,14 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                              "merge or rebase onto the base and push")
         elif kind == "pr" and data.get("state") == "CLOSED":
             extra["note"] = "PR was closed without being merged"
-        elif kind == "pr" and until == "done" and data.get("state") == "MERGED":
-            extra["note"] = "PR was merged: done, whatever its checks still show"
+        elif kind == "pr" and data.get("state") == "MERGED":
+            merge_sha = str((data.get("mergeCommit") or {}).get("oid") or "")
+            extra["note"] = ("PR was merged" + (f" at {merge_sha[:10]}" if merge_sha else "") + (
+                f" (head {str(data.get('headRefOid') or '')[:10]}, not {sha[:10]})"
+                if sha and not str(data.get("headRefOid") or "").startswith(sha) else "")
+                + ": done, whatever its checks still show")
+            if merge_sha:
+                extra["merge_sha"] = merge_sha
         if unconfirmed and refused is not None:
             extra["note"] = f"finish not confirmed by a GitHub read: {refused}"
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
