@@ -850,6 +850,43 @@ class HeadRunOrderTest(unittest.TestCase):
                            {"run": 920, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}]])
         self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
 
+    def test_a_failed_run_stores_its_job_step_count_once(self) -> None:
+        """land-judge judges a stored red as a live one (runner_refused: a failed job with no step run is the runner's
+        refusal): each failure row's identity gets `steps`, read once per job by node id; a read that fails leaves
+        it absent (unknown, never 0)."""
+        runs: dict = {}
+        order: dict = {}
+        failed: dict = {}
+        nodes = [{**self.node("web / a", 10, "t0", "t1", "FAILURE"), "id": "CR_10"},
+                 {**self.node("web / b", 11, "t0", "t1", "FAILURE"), "id": "CR_11"},
+                 {**self.node("web / c", 12, "t0", "t1"), "id": "CR_12"}]
+        gg.fold_contexts(nodes, runs, {}, {}, order=order, failed=failed)
+        self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
+        asked: list = []
+
+        def graphql(query: str, variables: dict) -> tuple:
+            asked.append(variables["ids"])
+            return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
+                                       {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
+
+        fake = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+                                     graphql=graphql)
+        data = gg.head_data("a" * 40, runs, {}, {}, order)
+        gg.Daemon.head_steps(fake, data, failed)
+        rows = {r[0]: r for rs in data["runs"].values() for r in rs}
+        self.assertEqual((rows[10][5]["steps"], rows[11][5]["steps"]), (0, 2))
+        self.assertNotIn("steps", rows[12][5])
+        gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
+        self.assertEqual(asked, [["CR_10", "CR_11"]])
+        down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+                                     graphql=lambda q, v: (None, "graphql: down"))
+        again = gg.head_data("a" * 40, runs, {}, {}, order)
+        again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
+                         for k, rs in again["runs"].items()}
+        gg.Daemon.head_steps(down, again, failed)
+        self.assertTrue(all("steps" not in r[5] for rs in again["runs"].values() for r in rs))
+        self.assertIn("id databaseId", gg.HEAD_CONTEXTS)  # the read asks for the node id
+
     def test_rest_nodes_keep_them_too_and_no_order_writes_none(self) -> None:
         nodes = gg.rest_contexts({"check_runs": [{"id": 7, "name": "web / react-apps-base-check", "status": "completed",
                                                   "conclusion": "success", "started_at": "2026-11-20T03:00:00Z",
@@ -4899,6 +4936,39 @@ class ClientTest(Base):
         self.assertIn(".out.state", gg.WAIT_FILES)
         self.assertIn('$out.state', gg.BLOCKER)
 
+    def test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty(self) -> None:
+        """A key the daemon has not read when status's wait ends gets one direct read (as wait's starved branch),
+        then status answers from the cache; a refused read (quota, upstream) leaves the old "no data yet" (3)."""
+        reads: list[dict] = []
+
+        def fill(req: dict) -> None:
+            reads.append(req)
+            self.put(req["key"], gg.parse_pr(pr_node(7, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=fill), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#7"])
+        self.assertEqual(json.loads(out.getvalue())["data"]["checkState"], "SUCCESS")
+        # a key whose cache already answers is never read again, and a refusal is not an answer
+        reads.clear()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=lambda req: reads.append(req) or gg.DIRECT_QUOTA), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_status("pr", "o/r#7", False, True, first_wait=0), 0)
+            self.assertEqual(reads, [])
+            self.assertEqual(gg.cmd_status("pr", "o/r#8", False, True, first_wait=0), gg.EXIT_DOWN)
+        self.assertEqual([r["key"] for r in reads], ["pr:o/r#8"])
+
     def test_status_says_not_found_and_could_not_judge_apart(self) -> None:
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
@@ -5284,7 +5354,9 @@ class ClientTest(Base):
 
     def status(self, *args, **kwargs) -> tuple[int, str]:
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # these tests are about the daemon's cache: a refused direct read keeps them off GitHub (the fallback is
+        # test_status_reads_a_key_nobody_watches_directly_once_when_the_wait_ends_empty)
+        with contextlib.redirect_stdout(out), mock.patch.object(gg, "direct_read", return_value=gg.DIRECT_QUOTA):
             code = gg.cmd_status(*args, first_wait=0, **kwargs)
         return code, out.getvalue()
 
@@ -5368,6 +5440,8 @@ class ClientTest(Base):
         for row in rows.values():  # no row is the all-blank row that started this
             self.assertFalse(row.endswith("\t\t\t"), row)
         # and the reason plus its next step, per unanswered row, on fd 2 (say_waiting), not mixed into the table
+        # (the direct-read fallback's own two lines about #3 are not part of that contract)
+        said = [line for line in said if "directly once" not in line and "direct read failed" not in line]
         self.assertEqual(len(said), 2, said)
         self.assertIn("o/r#3: the daemon has not read it from GitHub yet", said[0])
         self.assertIn("next: glaeda-gh wait pr o/r#3 --timeout 600", said[0])
@@ -6287,6 +6361,56 @@ class BudgetOutputTest(Base):
             self.assertIn("perMinute", last)
         finally:
             lock.close()
+
+    def budget_text(self) -> str:
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(False)
+            return out.getvalue()
+        finally:
+            lock.close()
+
+    def test_a_second_live_graphql_counter_is_named_beside_the_reading(self) -> None:
+        """2026-11-21: `budget` said GraphQL 0 left resetting 11:38Z while GET /rate_limit said 4751 left resetting
+        12:02Z. Both were true -- one token's GraphQL is answered from two counters with their own windows and
+        /rate_limit reports only one -- but `budget` named only the poorest, so the pair read as two tools
+        disagreeing, and four correctly parked waits were stopped as "stale". Name every live counter."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 600, "seenAt": NOW - 10},
+            "graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 600, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4751, "reset": NOW + 2040, "seenAt": NOW - 10}]})
+        text = self.budget_text()
+        self.assertIn("graphql  0/5000 left", text)  # the reading stays the counter that refuses a read
+        line = next(ln for ln in text.splitlines() if "counters (the poorest" in ln)
+        self.assertIn("GraphQL counters", line)  # not "core", which is REST's name for them
+        self.assertIn("0/5000 until", line)
+        self.assertIn("4751/5000 until", line)
+        self.assertIn("the one a read is refused against", line)
+
+    def test_one_live_graphql_counter_prints_no_split_line(self) -> None:
+        """Nothing to disambiguate when the bucket has a single live counter, including a second whose window ended."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 12, "reset": NOW + 600, "seenAt": NOW - 10},
+            "graphqlCounters": [{"limit": 5000, "remaining": 12, "reset": NOW + 600, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4900, "reset": NOW - 30, "seenAt": NOW - 900}]})
+        text = self.budget_text()
+        self.assertIn("graphql  12/5000 left", text)
+        self.assertNotIn("counters (the poorest", text)
+
+    def test_rest_counters_keep_their_core_label(self) -> None:
+        """The REST line this change generalised still reads as it did."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "rest": {"limit": 5000, "remaining": 120, "reset": NOW + 600, "seenAt": NOW - 10},
+            "restCounters": [{"limit": 5000, "remaining": 120, "reset": NOW + 600, "seenAt": NOW - 10},
+                             {"limit": 5000, "remaining": 4000, "reset": NOW + 2040, "seenAt": NOW - 10}]})
+        line = next(ln for ln in self.budget_text().splitlines() if "counters (the poorest" in ln)
+        self.assertIn("core counters", line)
+        self.assertIn("120/5000 until", line)
+        self.assertIn("4000/5000 until", line)
 
 
 class FleetBudgetTest(Base):
@@ -14841,6 +14965,37 @@ class PostTest(unittest.TestCase):
             code = gg.cmd_post_status(item["id"], 2, False)
         self.assertEqual((code, out.getvalue()), (0, "posted-url\n"))
 
+    def test_a_read_request_gives_the_outbox_its_turn_once_spacing_passed(self) -> None:
+        """huge-blue 2026-11-21: posts went out once per ~95 s pass, because the REST loop never asked the outbox.
+        Every read request now does (post_due), on the outbox's clock, and the outbox's own requests never recurse."""
+        first = self.queue("comment", "o/r#7", "--body", "one")
+        second = self.queue("comment", "o/r#8", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "u1"}), (200, {}, {"n": 1}), (201, {}, {"html_url": "u2"}),
+                           (200, {}, {"n": 2}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+        d.now = NOW + gg.POST_SPACING - 1  # within the spacing: the read goes alone
+        d.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET"])
+        self.assertEqual(gg.post_state(second["id"])["state"], "queued")
+        d.now = NOW + gg.POST_SPACING  # the spacing passed mid read phase: the write goes first
+        d.request("GET", "/repos/o/r/pulls/2")
+        self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "POST", "GET"])
+        self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+        self.assertEqual(d.now, NOW + gg.POST_SPACING)  # the read keeps its own clock
+
+    def test_a_read_request_keeps_the_outbox_holds(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        d, t = self.daemon((200, {}, {}), (200, {}, {}))
+        d.clock_real = False
+        d.now = NOW
+        d.post_hold = NOW + 600  # a secondary-limit hold on the outbox
+        d.request("GET", "/repos/o/r/pulls/1")
+        d.now = NOW + gg.POST_SPACING * 2
+        d.request("GET", "/repos/o/r/pulls/2")
+        self.assertEqual([c[0] for c in t.calls], ["GET", "GET"])
+
     def test_tick_posts_first_and_reports_the_outbox(self) -> None:
         self.queue("comment", "o/r#7", "--body", "x")
         self.queue("comment", "o/r#8", "--body", "y")
@@ -21064,6 +21219,26 @@ class LandTest(Base):
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
         self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
 
+    def test_a_queued_prs_head_is_registered_for_land_judge_when_queued_and_when_it_moves(self):
+        heads: list[str] = []
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                              nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
+                              config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
+                              behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
+                              snapshot_of=self.snaps.get, head_watch=heads.append)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}"])
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}"])  # renewed only every LAND_TOUCH
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the head moved: a new key, at once
+        self.tick()
+        self.assertEqual(heads, [f"head:o/r@{LA}", f"head:o/r@{LB}"])
+        self.tick(gg.LAND_TOUCH + 1)
+        self.assertEqual(heads[-1], f"head:o/r@{LB}")
+        self.assertEqual(len(heads), 3)
+
     def test_tip_merge_update_branch_head_race_then_merge(self):
         self.pr(LA)
         self.land()
@@ -22259,6 +22434,20 @@ class LandTest(Base):
         # A git that cannot answer refuses nothing: an unread HEAD is not a wrong one.
         with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/other"):
             self.assertEqual(gg.land_pin_is_another_checkouts_head("o/r", LA, lambda a: None), "")
+    def test_sha_pin_follows_the_head_its_own_update_branch_made(self):
+        # air-blue, 2026-11-21: hq#14568 pinned at eed0ffdf; land-judge named update_branch, the queue sent it, and
+        # the base merge it made (d4fe4462) stopped the same land head_moved. The pin moves to the head this queue's
+        # own update made; any other head still stops it.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB, parent=LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the merge it made
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assert_merged_at(LB)
 
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
@@ -23096,6 +23285,49 @@ class LandTest(Base):
             [h for h in e["history"] if h["event"] == "judged"][1:])]
         self.assertEqual(waits, [60, 120, 240, 480, 960])
         self.assertIn("refused 6 times in a row", self.w.sent()[-1][-1])
+
+    def test_alternating_merge_refusals_at_one_head_do_not_reset_each_others_count(self):
+        """A non-transient refusal at a head that has not moved is no progress whatever its words, so the count is
+        per head. efficiency-standing-lane, 2026-11-21: teamleaderleo/glaeda#2320 took 13 merge calls, each after its
+        own full judgment, over 2h20m at 5f640aea6348 -- the designed bound is 6. "... add the `--auto` flag." (11)
+        alternated with "GraphQL: Pull Request has merge conflicts (mergePullRequest)" (2), and each conflict
+        refusal restarted the --auto count: n read 1,2, 1, 1,2,3, 1, 1,2,3,4,5,6."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        said = ("land-judge (pass): ok: may merge at " + LA + "\nTo have the pull request merged after all the "
+                "requirements have been met, add the `--auto` flag.",
+                "land-judge (pass): ok: may merge at " + LA + "\nGraphQL: Pull Request is not mergeable "
+                "(mergePullRequest)")
+        e = {}
+        for i in range(gg.LAND_STEP_STOP + 4):
+            self.w.gh_err["merge"] = said[0] if i % 3 else said[1]
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        merges = len(self.w.gh_calls("pr", "merge"))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        self.assertEqual(merges, gg.LAND_STEP_STOP)  # not one per wording: the head never moved
+        self.assertEqual(len(self.w.explains()), gg.LAND_STEP_STOP)  # nor one judgment per wording
+
+    def test_a_streak_stop_that_names_no_step_still_names_one(self):
+        """A stop with an empty `next:` ends nobody's hold -- glaeda#2320's sat that way 95 min. The refusal names
+        no step this queue runs, so the stop names the step a person can take: read what GitHub still requires,
+        clear it, re-land pinned. Never --admin (routing around a refused merge is forbidden) and never --auto."""
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge (pass): ok: may merge at " + LA + "\nTo have the pull request merged "
+                                  "after all the requirements have been met, add the `--auto` flag.")
+        e = self.run_hour(lambda: ok_answer(LA))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_refused"))
+        nxt = e["stop"].get("next") or ""
+        self.assertTrue(nxt.strip(), e["stop"])
+        self.assertIn("glaeda-gh land o/r#1 --match-head-commit", nxt)
+        self.assertIn("glaeda-gh status pr o/r#1", nxt)
+        for forbidden in ("--admin", "--auto"):
+            self.assertNotIn(forbidden, nxt.replace("never --admin", ""))
 
     def test_a_new_head_starts_the_count_again(self):
         self.pr(LA)
@@ -25359,7 +25591,8 @@ class LandTest(Base):
         calls: list[tuple[str, bool, bool]] = []
 
         def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
-            calls.append((key, waited, once))
+            if not key.startswith("head:"):  # a queued PR's head for land-judge's checks read (watch_head)
+                calls.append((key, waited, once))
         p = mock.patch.object(gg, "register", register)
         p.start()
         self.addCleanup(p.stop)
@@ -28543,6 +28776,69 @@ class ShorthandFlagTest(unittest.TestCase):
                 self.assertEqual((args.until, err), (word, ""))
         self.assertIn("invalid choice", self.refused(["wait", "pr", "o/r#1", "--until", "nope"]))
 
+    # Leo, 2026-11-20: "Like we need a bunch of synonyms for code for you guys where it just goes \"eh close
+    # enough\" and works". `--until checks-done` ended two background merge waits on 2026-11-21.
+    UNTIL_WORDS = {
+        "checks-done": "done", "checks": "done", "complete": "done", "completed": "done", "finished": "done",
+        "all-done": "done", "settled": "done", "checks_done": "done", "DONE": "done",
+        "pass": "green", "passed": "green", "passing": "green", "success": "green", "succeeded": "green",
+        "ok": "green", "all-green": "green", "Green": "green",
+        "req": "required", "required-checks": "required", "must": "required",
+        "merge": "merged", "landed": "merged", "land": "merged",
+        # typos: one edit (a swap counts one), two in a long word, a prefix of 3 letters or more
+        "dnoe": "done", "grren": "green", "mereged": "merged", "requird": "required", "chekcs-done": "done",
+        "finshed": "done", "sucess": "green", "fin": "done", "merg": "merged",
+    }
+
+    def test_each_until_synonym_runs_its_choice(self):
+        for word, meant in self.UNTIL_WORDS.items():
+            for argv in (["wait", "pr", "o/r#1", "--until", word, "--timeout", "60"],
+                         ["wait", "pr", "o/r#1", f"--until={word}"]):
+                with self.subTest(argv=argv):
+                    args, err = self.parse(argv)
+                    self.assertEqual(args.until, meant)
+                    self.assertEqual(err.count("\n"), 1, err)
+                    self.assertIn(f"glaeda-gh: --until `{word}` ran as `{meant}`", err)
+
+    def test_other_choice_arguments_take_synonyms(self):
+        for argv, field, meant in (
+                (["post", "review", "o/r#1", "--event", "lgtm"], "event", "approve"),
+                (["post", "review", "o/r#1", "--event", "request_changes"], "event", "request-changes"),
+                (["post", "review", "o/r#1", "--event", "aprove"], "event", "approve"),
+                (["post", "commnet", "o/r#1"], "kind", "comment"),
+                (["search", "prs", "x", "--state", "merge"], "state", "merged"),
+                (["search", "prs", "x", "--state", "any"], "state", "all"),
+                (["log", "search", "o/r", "pat", "--seg", "mian"], "seg", "main"),
+                (["on-event", "replya"], "action", "replay"),
+                (["status", "rn", "o/r/5"], "kind", "run")):
+            with self.subTest(argv=argv):
+                args, err = self.parse(argv)
+                self.assertEqual(getattr(args, field), meant)
+                self.assertIn(f"ran as `{meant}`", err)
+
+    def test_choice_as_close_to_two_is_refused_with_the_choices(self):
+        err = self.refused(["wait", "pi", "o/r#1"])  # one edit from pr and from pid
+        self.assertIn("invalid choice: 'pi'", err)
+        self.assertIn("as close to pr as to pid", err)
+        self.assertIn("'until'", err)  # the choices are listed
+        self.assertNotIn("ran as", err)
+
+    def test_far_or_target_shaped_choice_is_still_refused(self):
+        for argv in (["wait", "pr", "o/r#1", "--until", "nope"],
+                     ["wait", "pr", "o/r#1", "--until", "banana"],
+                     ["post", "review", "o/r#1", "--event", "maybe"]):
+            with self.subTest(argv=argv):
+                err = self.refused(argv)
+                self.assertIn("invalid choice", err)
+                self.assertNotIn("ran as", err)
+
+    def test_close_choice_unit(self):
+        self.assertEqual(gg.close_choice("checks-done", ("green", "done", "required", "merged")), ("done", []))
+        self.assertEqual(gg.close_choice("pi", gg.WAIT_KINDS), ("", ["pr", "pid"]))
+        self.assertEqual(gg.close_choice("o/r#5", gg.WAIT_KINDS), ("", []))
+        self.assertEqual(gg.typo_distance("dnoe", "done"), 1)
+        self.assertEqual(gg.typo_distance("nope", "done"), 2)
+
     def test_log_job_flag_is_the_job_id(self):
         for kind in ("errors", "job"):
             for argv in (["log", kind, "o/r", "--job", "136749709509"],
@@ -29588,6 +29884,191 @@ class BrokeredGhTakesTheToolsOwnFormTest(unittest.TestCase):
                     self.assertEqual(gg.broker_canonical_target(list(args)), args)
                 self.assertEqual(noise.getvalue(), "")
 
+class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
+    """Leo's rule for this class of mistake: "we need a bunch of synonyms for code for you guys where it just
+    goes 'eh close enough' and works" / "Mistakes should also be auto fixed and ran properly, a lot of these
+    are pretty mechanical." Measured 2026-11-21: `glaeda-gh comment manaflow-ai/cmux#1` was argparse's
+    "invalid choice: 'comment'" and `next: glaeda-gh --help` -- the caller had named the right concept and
+    missed only that it lives under `post`."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_the_table_is_walked_off_the_parser_so_it_cannot_drift(self) -> None:
+        """No hand-written list: the commands and their words are read off `parser()` itself, both spellings
+        argparse has for a dispatch word (a nested subparser under `log`, a first positional's `choices`
+        under `post`), so a command added or renamed upstream is in the table the same day."""
+        tops, table = gg.nesting_table()
+        top = gg.parser()
+        named = {a.dest: a for a in top._actions}
+        self.assertEqual(tops, frozenset(gg.first_slot_words(top)), "the top level is the parser's own")
+        self.assertIn("post", tops)
+        for word, parents in table.items():
+            for parent in parents:
+                self.assertIn(word, gg.first_slot_words(gg.child_parser(top, parent)),
+                              f"{parent} {word} must be a word the parser itself takes")
+        # the two spellings, each found: `log job` nests a parser, `post comment` is a positional's choice
+        self.assertIn("log", table["job"])
+        self.assertIn("post", table["comment"])
+        self.assertIsNot(gg.child_parser(top, "log"), gg.child_parser(gg.child_parser(top, "log"), "job"))
+        self.assertIs(gg.child_parser(top, "post"), gg.child_parser(gg.child_parser(top, "post"), "comment"))
+        self.assertTrue(named, "parser() still builds")
+
+    def test_a_word_exactly_one_command_takes_routes_to_that_command(self) -> None:
+        for typed, canonical in (
+                (["review", "o/r#1"], ["post", "review", "o/r#1"]),
+                (["job", "o/r", "123"], ["log", "job", "o/r", "123"]),
+                (["errors", "o/r", "123"], ["log", "errors", "o/r", "123"]),
+                (["flaky", "o/r"], ["log", "flaky", "o/r"]),
+                (["replay", "--run-file", "/tmp/x"], ["on-event", "replay", "--run-file", "/tmp/x"]),
+                (["file", "/tmp/x", "--exists"], ["wait", "file", "/tmp/x", "--exists"]),
+                (["prs", "some query"], ["search", "prs", "some query"]),
+                (["both", "some query"], ["search", "both", "some query"]),
+                (["pid", "4242"], ["wait", "pid", "4242"])):
+            self.err.truncate(0), self.err.seek(0)
+            self.assertEqual(gg.nesting_synonym(list(typed)), (canonical, []))
+            said = self.err.getvalue()
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + canonical)}`", said)
+            self.assertIn(f"`{typed[0]}` is a word of `{canonical[0]}`", said)
+
+    def test_a_word_several_commands_take_is_refused_naming_every_one(self) -> None:
+        """`comment` is a real three-way collision in this tree: a word of `status` (a read), of `wait` (a
+        read that blocks) and of `post` (a write on a public thread). Guessing for the caller would guess
+        between reading and writing, so it refuses and names all three, each as a line that runs."""
+        for word in ("comment", "pr", "run"):
+            fixed, refusal = gg.nesting_synonym([word, "o/r#1"])
+            self.assertEqual(fixed, [word, "o/r#1"], "argv is never half-rewritten when it refuses")
+            self.assertGreater(len(refusal), 2, f"{word} has more than one real parent")
+            parents = sorted(gg.nesting_table()[1][word])
+            self.assertIn(f"`{word}` is a word of {len(parents)} commands", refusal[0])
+            for parent in parents:
+                self.assertIn(f"{parent} {word}", refusal[0])
+                self.assertIn(f"next: glaeda-gh {parent} {word} o/r#1", refusal)
+        comment = gg.nesting_synonym(["comment", "manaflow-ai/cmux#1"])[1]
+        self.assertEqual(sorted(comment[1:]), ["next: glaeda-gh post comment manaflow-ai/cmux#1",
+                                               "next: glaeda-gh status comment manaflow-ai/cmux#1",
+                                               "next: glaeda-gh wait comment manaflow-ai/cmux#1"])
+
+    def test_the_refusal_is_the_whole_call_and_nothing_runs(self) -> None:
+        """The exit code a usage error already has, and no request queued: an ambiguous write must not post."""
+        with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
+            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1"]), 64)
+        self.assertIn("not a command of its own", self.err.getvalue())
+
+    def test_the_callers_own_flags_narrow_an_ambiguous_word_to_one_command(self) -> None:
+        """The one narrowing done is evidence the caller typed, read off the parsers: `--body` is an option of
+        `post` and of neither `status` nor `wait`, so `comment ... --body` is `post comment`. `--json`, which
+        all three have, narrows nothing and still refuses."""
+        self.assertEqual(gg.nesting_synonym(["comment", "o/r#1", "--body", "hi"]),
+                         (["post", "comment", "o/r#1", "--body", "hi"], []))
+        self.assertEqual(gg.nesting_synonym(["comment", "o/r#1", "--body-file", "-"]),
+                         (["post", "comment", "o/r#1", "--body-file", "-"], []))
+        self.assertEqual(gg.nesting_synonym(["pr", "o/r", "--title", "t", "--head", "h"])[0][:2], ["post", "pr"])
+        self.assertEqual(gg.nesting_synonym(["run", "o/r/12", "--jobs", "--timeout", "60"])[0][:2], ["wait", "run"])
+        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--json"])
+        self.assertEqual(fixed, ["comment", "o/r#1", "--json"])
+        self.assertTrue(refusal, "a flag every candidate has is no evidence: it still refuses")
+        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--nonsense"])
+        self.assertTrue(refusal, "a flag no candidate has does not get to pick the command either")
+
+    def test_every_spelling_that_works_today_is_left_exactly_as_typed(self) -> None:
+        for typed in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1", "--timeout", "60"],
+                      ["post", "comment", "o/r#1", "--body", "hi"], ["log", "job", "o/r", "1"],
+                      ["search", "prs", "repo:o/r"], ["land", "o/r#1"], ["on-event", "status"],
+                      ["gh", "pr", "view", "1"], ["coord-alert", "x"], ["wait-resume", "x"],
+                      ["--help"], ["-h"], [], ["o/r#1"], ["nonsense", "x"], ["checks", "o/r", "a" * 40]):
+            self.assertEqual(gg.nesting_synonym(list(typed)), (list(typed), []), typed)
+            self.assertEqual(gg.flag_spelling_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a canonical call says nothing on stderr")
+
+
+class AFlagsCaseConventionTest(unittest.TestCase):
+    """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
+    spelling two real options would both answer to is refused rather than picked."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_a_flag_in_another_case_convention_is_read_as_this_tools_spelling(self) -> None:
+        for typed, canonical in (
+                (["post", "comment", "o/r#1", "--bodyFile", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--body_file", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--BODY-FILE", "/p"], "--body-file"),
+                (["post", "comment", "o/r#1", "--statusKey", "k"], "--status-key"),
+                (["post", "comment", "o/r#1", "--status_key", "k"], "--status-key"),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--maxAge", "5"], "--max-age"),
+                (["wait", "pr", "o/r#1", "--rescue_grace", "5"], "--rescue-grace"),
+                (["log", "search", "o/r", "pat", "--Conclusion", "any"], "--conclusion")):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.flag_spelling_synonym(list(typed))
+            self.assertEqual(refusal, [])
+            self.assertIn(canonical, fixed)
+            self.assertNotIn(typed[-2], fixed)
+            self.assertIn(f"`{typed[-2]}` is `{canonical}`", self.err.getvalue())
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + fixed)}`", self.err.getvalue())
+            self.assertEqual(gg.parser().parse_args(fixed).__dict__["command"], typed[0])
+        joined = gg.flag_spelling_synonym(["post", "comment", "o/r#1", "--bodyFile=/p"])
+        self.assertEqual(joined[0][-1], "--body-file=/p", "the --flag=value form keeps its value")
+
+    def test_body_and_body_file_are_never_aliased_to_each_other(self) -> None:
+        """`post --body` is inline text and `post --body-file` is a path. They are two options, one letter
+        apart in normalised form, and nothing here may move a caller from one to the other: only an *exact*
+        match after lowercasing and dropping `-`/`_` decides, never a prefix and never a substring."""
+        for typed in (["post", "comment", "o/r#1", "--body", "hi"],
+                      ["post", "comment", "o/r#1", "--body-file", "/p"],
+                      ["post", "comment", "o/r#1", "--body", "--body-file"],
+                      ["post", "comment", "o/r#1", "--body-file", "-", "--json"]):
+            self.assertEqual(gg.flag_spelling_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "the canonical spellings say nothing")
+        # `--file` is not `--body-file`: no option normalises to `file`, so it is left for argparse as today
+        self.assertEqual(gg.flag_spelling_synonym(["post", "comment", "o/r#1", "--file", "/p"]),
+                         (["post", "comment", "o/r#1", "--file", "/p"], []))
+        for short in ("--file", "--bod", "--b", "--bodyf", "--fileBody", "--body-files"):
+            fixed, refusal = gg.flag_spelling_synonym(["post", "comment", "o/r#1", short, "/p"])
+            self.assertEqual((fixed, refusal), (["post", "comment", "o/r#1", short, "/p"], []), short)
+        # and the two options still mean exactly what they mean today
+        inline = gg.parser().parse_args(["post", "comment", "o/r#1", "--body", "hi"])
+        self.assertEqual((inline.body, inline.body_file), ("hi", None))
+        path = gg.parser().parse_args(["post", "comment", "o/r#1", "--body-file", "/p"])
+        self.assertEqual((path.body, path.body_file), (None, "/p"))
+
+    def test_a_spelling_two_real_options_answer_to_is_refused_naming_both(self) -> None:
+        """The collision this must never resolve silently. The real `post` has no two options that normalise
+        alike, so the refusal path is driven with a small synthetic option set in which `--body-file` and
+        `--bodyfile` both exist: `--bodyFile` is then how *both* are spelled, and the caller is asked which,
+        with a line per option that runs. Nothing is rewritten."""
+        options = {"--body": True, "--body-file": True, "--bodyfile": True, "--json": False}
+        typed = ["post", "comment", "o/r#1", "--bodyFile", "/p", "--json"]
+        with mock.patch.object(gg, "flag_options", return_value=options):
+            fixed, refusal = gg.flag_spelling_synonym(list(typed))
+        self.assertEqual(fixed, typed, "argv is never half-rewritten when it refuses")
+        self.assertIn("`--bodyFile` is how 2 different options of this command are spelled", refusal[0])
+        for option in ("--body-file", "--bodyfile"):
+            self.assertIn(option, refusal[0])
+            self.assertIn(f"next: glaeda-gh post comment o/r#1 {option} /p --json", refusal)
+        self.assertNotIn("--body ", refusal[0] + " ", "an option that normalises differently is not named")
+        with mock.patch.object(gg, "flag_options", return_value=options):
+            self.assertEqual(gg.main(typed), 64)
+        self.assertIn("different options of this command are spelled", self.err.getvalue())
+
+    def test_a_flags_value_is_data_and_never_read_as_a_spelling(self) -> None:
+        """The word after an option that takes a value is a body, a path or a regular expression. Even when it
+        looks like one of this tool's flags in another case, it is left exactly as the caller typed it."""
+        typed = ["post", "comment", "o/r#1", "--body", "--bodyFile", "--json"]
+        self.assertEqual(gg.flag_spelling_synonym(list(typed)), (typed, []))
+        # argparse itself refuses an option-looking value in a separate word, so the form that reaches it is
+        # --body=VALUE: the value is still data, and still untouched here.
+        joined = ["post", "comment", "o/r#1", "--body=--bodyFile", "--json"]
+        self.assertEqual(gg.flag_spelling_synonym(list(joined)), (joined, []))
+        self.assertEqual(gg.parser().parse_args(joined).body, "--bodyFile")
+        past = ["log", "search", "o/r", "pat", "--", "--maxAge"]
+        self.assertEqual(gg.flag_spelling_synonym(list(past)), (past, []))
 
 if __name__ == "__main__":
     unittest.main()
