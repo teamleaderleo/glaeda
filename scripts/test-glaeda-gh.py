@@ -20956,6 +20956,40 @@ class LandTest(Base):
         self.assertEqual(calls, [self.KEY])
         self.assertEqual(len(self.w.explains()), 1)
 
+    def test_a_direct_readers_cache_write_wakes_a_quiet_land(self):
+        self.daemon.land_queue = self.q
+        self.daemon.clock_real = False
+        self.daemon.now = self.t
+        self.q.cache_of = gg.read_cache
+        self.land()
+        self.daemon.store(self.KEY, None, data=land_pr(LA), dataAt=self.t)
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+        writer = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)
+        writer.now = self.t + 1
+        writer.store(self.KEY, None, data=land_pr(LA, state="MERGED"), dataAt=writer.now)
+        self.daemon.now = self.t + 2
+        self.daemon.land_tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_a_changed_wait_retries_when_the_quota_window_has_room(self):
+        self.pr(LA)
+        self.land()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 900}
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(self.q, "window_room", return_value=False):
+            self.q.tick(self.t + 1, dirty={self.KEY})
+        self.assertEqual(len(self.w.explains()), 1)
+        self.q.tick(self.t + 2, dirty=set())
+        self.assert_merged_at(LA)
+
     def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
         # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
         # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.

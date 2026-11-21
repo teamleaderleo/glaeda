@@ -7401,6 +7401,13 @@ class Daemon:
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading)
         dirty, self.land_dirty = self.land_dirty, set()
+        # A direct reader can update the shared cache in another process. Consume its key before reading
+        # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
+        for marker in (land_dir() / "changed").glob("*.json"):
+            key = read_json(marker)
+            if isinstance(key, str) and key in self.land_queue.entries:
+                dirty.add(key)
+            marker.unlink(missing_ok=True)
         self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
@@ -8014,9 +8021,12 @@ class Daemon:
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
             write_json(cache, entry)
-        if (self.land_queue is not None and key in self.land_queue.entries and "data" in fields
-                and land_fingerprint(base) != land_fingerprint(entry)):
-            self.land_dirty.add(key)
+        if key.startswith("pr:") and "data" in fields:
+            if self.land_queue is not None:
+                if key in self.land_queue.entries and land_fingerprint(base) != land_fingerprint(entry):
+                    self.land_dirty.add(key)
+            elif (LandQueue.entries_dir() / file_name(key)).is_file() and land_fingerprint(base) != land_fingerprint(entry):
+                write_json(land_dir() / "changed" / file_name(key), key)
         if fields.get("dataAt") is not None and not fields.get("error"):
             self.note_read(key)
 
@@ -11425,10 +11435,8 @@ class LandQueue:
                         self.unhold(e)
                         self.save(e)
                     self.keep_watching(e)
-                    gated = self.pass_gated
+                    self.changed_entries.discard(key)
                     self.consider(e)
-                    if self.pass_gated == gated:
-                        self.changed_entries.discard(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
         self.log_pool()
@@ -12237,6 +12245,7 @@ class LandQueue:
         """Whether this entry is judged now: only when something could have changed land_judge's answer."""
         c = self.cache_of(e["key"])
         if self.refresh_due(e, c):
+            self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
@@ -12551,6 +12560,9 @@ class LandQueue:
         again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
         most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
         snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
+        # Keep the event until we can submit the judgment. Workers, readiness and quota windows may
+        # recover before either another event arrives or the recovery sweep runs.
+        self.changed_entries.add(e["key"])
         if self.reset_staggered(e):
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
@@ -12598,6 +12610,7 @@ class LandQueue:
         e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
+        self.changed_entries.discard(e["key"])
         return True
 
     # -- a job: one judgment and the step it names (a worker thread)
