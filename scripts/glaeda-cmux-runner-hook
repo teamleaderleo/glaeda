@@ -8523,6 +8523,32 @@ def runner_labels(state_dir: Path, name: str | None) -> frozenset[str] | None:
     return None
 
 
+def observed_labels(summary: dict[str, Any] | None, name: str | None) -> frozenset[str]:
+    """The labels of jobs the feed (load_cap_summary) shows GitHub dispatched to this runner. GitHub hands a job only
+    to a runner whose labels cover all of its runs-on, so every one of these is a label GitHub holds for it: a lower
+    bound on the real set, whatever the install receipt says (hq#16433). Empty when the feed cannot say; a queued job
+    has no runner yet, so only a job it was actually given counts."""
+    if not isinstance(summary, dict) or not name:
+        return frozenset()
+    out: set[str] = set()
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or job.get("runner") != name:
+            continue
+        labels = job.get("labels")
+        if isinstance(labels, list) and labels and all(isinstance(label, str) for label in labels):
+            out.update(labels)
+    return frozenset(out)
+
+
+def cap_label_set(receipt: frozenset[str] | None, observed: frozenset[str]) -> frozenset[str] | None:
+    """The labels the gate reasons with: the receipt's raised by what GitHub has dispatched (hq#16433). A union, never
+    a narrowing, so a receipt label with no job keeps its place; None stays None with nothing observed, which leaves a
+    runner with no receipt and no dispatch exactly where it is today (the feed reads cannot say)."""
+    if receipt is None:
+        return observed or None
+    return receipt | observed
+
+
 def _feed_time(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -8553,7 +8579,8 @@ def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
         urgent = any(HOST_LOAD_CAP_URGENT.search(str(job.get(key) or "")) for key in ("workflow", "head_branch"))
         job_id = job.get("id")
         jobs.append({"labels": sorted(labels), "status": status, "created": _feed_time(job.get("created_at")),
-                     "host": runner_host(job.get("runner")), "urgent": urgent,
+                     "host": runner_host(job.get("runner")),
+                     "runner": job.get("runner") if isinstance(job.get("runner"), str) else None, "urgent": urgent,
                      "id": job_id if isinstance(job_id, int) and not isinstance(job_id, bool) else None,
                      "name": job.get("name") if isinstance(job.get("name"), str) else ""})
     return {"at": now, "delivery": _feed_time(doc.get("receiver_last_delivery")), "jobs": jobs}
@@ -10195,6 +10222,7 @@ class Gate:
         self.cap_why: str | None = None
         self.cap_summary: dict[str, Any] | None = None
         self.cap_labels: frozenset[str] | None = None
+        self.cap_label_drift: list[str] = []  # labels GitHub dispatched here that the receipt does not list
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
         self.reserve_demand_at: float | None = None  # RESERVE_ON_DEMAND: when the feed last showed a job for it
@@ -10471,7 +10499,9 @@ class Gate:
 
         def look() -> None:
             try:
-                self.cap_labels = runner_labels(self.state_dir, runner_config(self.runner_dir)[0])
+                name = runner_config(self.runner_dir)[0]
+                receipt = runner_labels(self.state_dir, name)
+                self.cap_labels = receipt  # the receipt alone until the feed is read, as before
                 path, now = self.state_dir / HOST_LOAD_CAP_FEED_FILE, time.time()
                 summary = None
                 with contextlib.suppress(OSError, ValueError, RecursionError):
@@ -10488,6 +10518,19 @@ class Gate:
                             tmp.write_text(json.dumps(summary, separators=(",", ":")))
                             os.replace(tmp, path)
                 self.cap_summary = summary
+                # hq#16433: the receipt holds the labels this host asked GitHub for, not the ones GitHub kept, and it
+                # stamps "GitHub labels could not be read; re-registering with the supplied token" when it could not
+                # confirm them. cmux-austin-mini-0-glaeda-1 and cmux-austin-mini-1-glaeda-1 read side-light while
+                # GitHub dispatched side-std jobs to both, and every feed read here filters the queue with
+                # `set(job["labels"]) <= self.cap_labels`, so those two could not see a single queued job of a label
+                # they serve: no reserve, no urgent listen, no starved-job answer. What GitHub dispatched is proof.
+                observed = observed_labels(summary, name)
+                self.cap_labels = cap_label_set(receipt, observed)
+                drift = sorted(observed - (receipt or frozenset()))
+                if drift != self.cap_label_drift:
+                    self.cap_label_drift = drift
+                    if drift:
+                        gate_log("GitHub dispatches labels this runner's receipt does not list: " + ", ".join(drift))
             except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                 self.cap_summary = None
                 gate_log(f"the host load cap's feed look failed ({type(error).__name__}); not holding for it")
@@ -11855,8 +11898,11 @@ class Gate:
             return
         if line != self.state_line:
             self.state_line, self.state_since = line, wall
-        doc = {"schema": GATE_STATE_SCHEMA, "pid": os.getpid(), "runner_dir": os.fspath(self.runner_dir),
-               "line": line, "since": gate_stamp(self.state_since), "at": gate_stamp(wall)}
+        doc: dict[str, Any] = {"schema": GATE_STATE_SCHEMA, "pid": os.getpid(),
+                               "runner_dir": os.fspath(self.runner_dir), "line": line,
+                               "since": gate_stamp(self.state_since), "at": gate_stamp(wall)}
+        if self.cap_label_drift:  # hq#16433: what GitHub dispatches here that the receipt does not list
+            doc["label_drift"] = list(self.cap_label_drift)
         path = gate_state_file(self.state_dir, self.runner_dir)
         with contextlib.suppress(OSError):
             path.parent.mkdir(parents=True, exist_ok=True)

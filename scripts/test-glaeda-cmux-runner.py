@@ -9049,6 +9049,49 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIsNone(hook.head_fit_units(dict(summary, jobs=[]), side, now, need), "an empty queue too")
 
 
+    SIDE_LIGHT = "glaeda-side-light-xcode-26.6"
+
+    def receipt(self, labels: list[str]) -> None:
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": labels}}))
+
+    def test_a_label_github_dispatches_here_joins_a_set_its_receipt_understates(self) -> None:
+        # hq#16433: receipt.json records the labels the host asked GitHub for, not the ones GitHub kept, and stamps
+        # "GitHub labels could not be read; re-registering with the supplied token" when it could not confirm them.
+        # 2026-11-21: cmux-austin-mini-0-glaeda-1 and cmux-austin-mini-1-glaeda-1 listed only side-light while GitHub
+        # dispatched side-std jobs to both. Every read here filters the queue with set(job["labels"]) <= cap_labels,
+        # so neither gate could see one queued job of a label it demonstrably serves: no on-demand reserve, no urgent
+        # listen, no starved-job answer. A job GitHub handed it is proof it carries that job's labels.
+        self.receipt(["glaeda-mini", self.SIDE_LIGHT])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
+        self.poll()
+        self.assertIn(self.LABEL, self.gate.cap_labels, "GitHub gave it this job, so it carries the label")
+        self.assertIn(self.SIDE_LIGHT, self.gate.cap_labels, "a union never drops a receipt label")
+        self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "the disagreement is published, not swallowed")
+
+    def test_with_no_job_of_its_own_the_label_set_stays_the_receipts(self) -> None:
+        # The other half of the rule: no observed dispatch changes nothing, so a runner the feed says nothing about
+        # keeps exactly today's behaviour. A job on a sibling runner of the same host is not this runner's evidence.
+        self.receipt(["glaeda-mini", self.LABEL])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-3", labels=["glaeda-gui-xcode-26.6"]),
+                     self.job("queued")]
+        self.poll()
+        self.assertEqual(self.gate.cap_labels, frozenset({"glaeda-mini", self.LABEL}))
+        self.assertEqual(self.gate.cap_label_drift, [])
+
+    def test_the_label_set_is_a_union_never_a_narrowing(self) -> None:
+        self.assertIsNone(hook.cap_label_set(None, frozenset()), "no receipt and no dispatch: the reads cannot say")
+        self.assertEqual(hook.cap_label_set(None, frozenset({"a"})), frozenset({"a"}), "dispatch alone still counts")
+        self.assertEqual(hook.cap_label_set(frozenset({"a"}), frozenset({"b"})), frozenset({"a", "b"}))
+        self.assertEqual(hook.cap_label_set(frozenset({"a"}), frozenset()), frozenset({"a"}),
+                         "a receipt label with no job keeps its place")
+        summary = {"jobs": [{"labels": ["x"], "runner": "cmux21-glaeda-2"}, {"labels": ["y"], "runner": None},
+                            {"labels": ["z"], "runner": "cmux21-glaeda-3"}]}
+        self.assertEqual(hook.observed_labels(summary, "cmux21-glaeda-2"), frozenset({"x"}),
+                         "a queued job has no runner, and a sibling's job is not this runner's evidence")
+        self.assertEqual(hook.observed_labels(summary, None), frozenset())
+
+
 class StarvedReserveTest(unittest.TestCase):
     """cmux#45614 (STARVED_RESERVE): on 2026-11-17 cmux NEXT DEV's DMG build (glaeda-std-xcode-26.6, a compile: 5
     units) queued 23 min with no std runner listening anywhere. Every std mini had 3 or 4 of 14 units free and the side
@@ -14145,6 +14188,20 @@ class GateTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as again:
             gate.step()  # still held: the same reason is not logged again
         self.assertEqual(again.getvalue(), "")
+
+    def test_the_gate_state_carries_the_labels_github_dispatches_past_the_receipt(self) -> None:
+        # hq#16433: a reader of gate-<runner>.json must be able to see that the receipt and GitHub disagree about this
+        # runner's labels, rather than trusting the receipt the way a fleet-wide side-std count did on 2026-11-21.
+        gate, _ = self.gate(["held"] * 3)
+        gate.child = None
+        state = hook.gate_state_file(self.state, self.runner)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gate.step()
+            self.assertNotIn("label_drift", json.loads(state.read_text()), "no disagreement: no line")
+            gate.cap_label_drift = ["glaeda-side-std-xcode-26.6"]
+            gate.state_written -= hook.GATE_STATE_EVERY_S
+            gate.step()
+        self.assertEqual(json.loads(state.read_text())["label_drift"], ["glaeda-side-std-xcode-26.6"])
 
     def test_the_gate_state_is_rewritten_while_it_holds_and_keeps_its_since(self) -> None:
         gate, _ = self.gate(["held"] * 3)
