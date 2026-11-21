@@ -22203,6 +22203,21 @@ class LandTest(Base):
         self.assertNotIn("pinSha", e)
         self.assert_merged_at(LB)
 
+    def test_sha_pin_follows_the_head_its_own_update_branch_made(self):
+        # air-blue, 2026-11-21: hq#14568 pinned at eed0ffdf; land-judge named update_branch, the queue sent it, and
+        # the base merge it made (d4fe4462) stopped the same land head_moved. The pin moves to the head this queue's
+        # own update made; any other head still stops it.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assert_merged_at(LB)
+
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
         self.assertEqual((args.wait, args.sha), (1400, LA))
