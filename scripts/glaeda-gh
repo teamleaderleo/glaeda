@@ -17501,7 +17501,9 @@ while :; do
     if [ -n "$state" ] && [ "$state" = "$last" ]; then
       : # the state it printed last time, to the character: say nothing until something changes
     elif [ -z "$sayer" ] || ! kill -0 "$sayer" 2>/dev/null; then
-      last=$state
+      [ -n "$state" ] && last=$state  # an empty read is a read that did not happen, not a new state: keeping the
+      # last state it printed is what stops the same paragraph coming back after one poll found the file missing
+      # or half-written (docs/handbook/missing-read-counted-as-a-value.md)
       printf '%s\n' "glaeda-gh: still waiting on $GLAEDA_WAIT_KEY: $((${GLAEDA_WAIT_ELAPSED:-0} + SECONDS))s of ${GLAEDA_WAIT_TIMEOUT}s, deadline $GLAEDA_WAIT_DEADLINE${state:+; $state}" 1>&2 2>/dev/null 3<&- &
       sayer=$!
     fi
