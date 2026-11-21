@@ -875,6 +875,19 @@ JOIN_MENTION = re.compile(r"(?<![\w.`])@[A-Za-z0-9][\w-]*")  # an @mention: a bo
 # busiest threads in that hour.
 POST_STATUS_MAX = 6 * 3600
 STATUS_KEY = re.compile(r"[\w.:=@/-]{1,120}")
+# A review-running marker (leo-workspace tools/review_running.py) still queued once its own run has ended is retired as
+# superseded, never sent: its run's verdict or done line (`<!-- review-run=<run> -->`, or a comment keyed
+# `review-run=<run>`) is queued or was posted on the thread. Sent after that end, it would hold the head's merge for
+# nothing (review_running._runs counts only an end that comes after the marker). Receipts go out first (outbox_gate), so
+# on huge-blue 2026-11-21 15:4xZ about 206 markers sat behind them. Nothing else retires one: another run's receipt at
+# the same head leaves that run's own hold standing (cmux#31529's second review), and an old marker whose run never
+# ended still starts review_running.slow()'s SHIP clock once posted (review_model). A queued end counts even if its own
+# post later fails: the run has ended either way. RUN_ENDS records, per thread, the runs the outbox posted an end for
+# (kept RUN_ENDS_KEEP).
+REVIEW_MARK = re.compile(r"^<!-- review-running sha=([0-9a-f]{40}) at=(\S+) run=(run-[0-9a-f]{16}) by=([\w -]*) -->", re.I)
+RUN_END = re.compile(r"<!-- review-run=(run-[0-9a-f]{16}) -->")
+RUN_ENDS = "run-ends.json"
+RUN_ENDS_KEEP = 24 * 3600
 POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox posted there
 POST_SUBJECTS = "subjects.json"  # thread -> its GraphQL node id (an issue's or PR's id never changes)
 POST_EDITS = "edited.json"  # the comments the outbox edited in place: only their edits count as said again
@@ -907,6 +920,62 @@ def outbox_gate(item: Any) -> bool:
     body = str(item.get("body") or "")
     first = next((line for line in body.splitlines() if line.strip()), "").strip()
     return item.get("kind") == "comment" and bool(RISK_RECEIPT.match(first))
+
+
+def thread_of(item: Any) -> str:
+    return f"{str(item.get('repo') or '').lower()}#{item.get('number')}" if isinstance(item, dict) else ""
+
+
+def run_end_of(item: Any) -> str | None:
+    """The review run this queued or posted comment ends (superseded_by): its done line, or its run's status key."""
+    if not isinstance(item, dict) or item.get("kind") != "comment":
+        return None
+    body = str(item.get("body") or "")
+    if REVIEW_MARK.match(body):
+        return None  # a marker ends nothing, even with its run's status key
+    ended = RUN_END.search(body) or RUN_END.search(f"<!-- {item.get('status') or ''} -->")
+    return ended.group(1) if ended else None
+
+
+def superseded_by(item: Any, queue: list[tuple[Path, Any]], ended: dict) -> str | None:
+    """Why a queued review-running marker need not go out (REVIEW_MARK's notes), or None: it must."""
+    if not isinstance(item, dict) or item.get("kind") != "comment":
+        return None
+    mark = REVIEW_MARK.match(str(item.get("body") or ""))
+    if not mark:
+        return None
+    run, thread = mark.group(3), thread_of(item)
+    record = ended.get(thread)
+    runs = record.get("runs") if isinstance(record, dict) else None
+    if isinstance(runs, dict) and run in runs:
+        return f"its run {run} already posted its verdict or done line on {thread}"
+    for _, other in queue:
+        if other is not item and thread_of(other) == thread and run_end_of(other) == run:
+            return f"its run {run} has its verdict or done line queued ({other.get('id')})"
+    return None
+
+
+def note_run_ends(item: Any, at: float) -> None:
+    """Record the run a posted comment ends (run_end_of) for superseded_by, pruned past RUN_ENDS_KEEP."""
+    run = run_end_of(item)
+    if not run:
+        return
+    path = BASE / RUN_ENDS
+    doc = read_json(path)
+    doc = doc if isinstance(doc, dict) else {}
+    record = doc.get(thread_of(item))
+    runs = record.get("runs") if isinstance(record, dict) else None
+    doc[thread_of(item)] = {"runs": {**(runs if isinstance(runs, dict) else {}), run: at}}
+    cut = at - RUN_ENDS_KEEP
+    for thread in list(doc):
+        runs = doc[thread].get("runs") if isinstance(doc[thread], dict) else None
+        runs = {r: t for r, t in (runs if isinstance(runs, dict) else {}).items()
+                if isinstance(t, (int, float)) and t > cut}
+        if runs:
+            doc[thread] = {"runs": runs}
+        else:
+            doc.pop(thread)
+    write_json(path, doc)
 
 
 def outbox_queue() -> list[tuple[Path, Any]]:
@@ -5926,7 +5995,7 @@ class Daemon:
             return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
             return
-        for path, item in outbox_queue():
+        for path, item in self.retire_superseded(outbox_queue()):
             if not isinstance(item, dict) or item.get("id") != path.stem:
                 with contextlib.suppress(OSError):
                     if self.now - path.stat().st_mtime > POST_UNREADABLE:
@@ -5965,6 +6034,24 @@ class Daemon:
         if self.writing or clock - self.post_tried < POST_SPACING:
             return
         self.post_between()
+
+    def retire_superseded(self, queue: list[tuple[Path, Any]]) -> list[tuple[Path, Any]]:
+        """The queue less every review-running marker superseded_by retires, over the whole queue: receipts sort
+        first, so a send loop that stops at its one write would never reach the markers behind them. A retirement
+        is no request: it costs no turn."""
+        marks = [(p, i) for p, i in queue if isinstance(i, dict) and i.get("id") == p.stem
+                 and REVIEW_MARK.match(str(i.get("body") or ""))]
+        if not marks:
+            return queue
+        ended = read_json(BASE / RUN_ENDS)
+        ended = ended if isinstance(ended, dict) else {}
+        gone: set[Path] = set()
+        for path, item in marks:
+            why = superseded_by(item, queue, ended)
+            if why:
+                self.post_finish(path, item, superseded=why)
+                gone.add(path)
+        return [(p, i) for p, i in queue if p not in gone]
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""
@@ -6389,10 +6476,15 @@ class Daemon:
         write_json(path, item)
 
     def post_finish(self, path: Path, item: dict, url: str | None = None, number: Any = None,
-                    note: str | None = None, error: str | None = None) -> None:
+                    note: str | None = None, error: str | None = None, superseded: str | None = None) -> None:
+        """SUPERSEDED: the write was retired unsent, for that recorded reason (superseded_by); never deleted silently."""
         done = {k: v for k, v in item.items() if k not in {"body", "ownBody", "notBefore", "holdUntil"}}
-        done.update({"state": "failed" if error else "posted", "url": url, "number": number, "note": note,
-                     "error": error, "finishedAt": self.now})
+        state = "superseded" if superseded else "failed" if error else "posted"
+        done.update({"state": state, "url": url, "number": number if not superseded else item.get("number"),
+                     "note": superseded or note, "error": error, "finishedAt": self.now})
+        if state == "posted":
+            with contextlib.suppress(Exception):
+                note_run_ends(item, self.now)
         write_json(posted_dir() / path.name, done)
         path.unlink(missing_ok=True)
         for member in item.get("group") or []:  # one comment for all of them: each caller gets its URL
@@ -6402,9 +6494,11 @@ class Daemon:
                 self.post_finish(mpath, other, url=url, number=number, error=error,
                                  note=f"posted in one comment with {len(item['group'])} other queued comment"
                                       f"{'s' if len(item['group']) > 1 else ''} for this thread")
-        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write
-            gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
-        log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error})
+        with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write (none: unsent)
+            if not superseded:
+                gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
+        log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error,
+             **({"why": superseded} if superseded else {})})
 
     # -- the outbox's comments: joined per thread, over the richer bucket, a writer's status edited in place
 
@@ -24658,6 +24752,8 @@ def post_line(state: dict) -> str:
         return (state.get("url") or "posted") + (f" ({state['note']})" if state.get("note") else "")
     if state["state"] == "failed":
         return f"failed: {state.get('error')}"
+    if state["state"] == "superseded":
+        return f"superseded, not sent: {state.get('note')}"
     parts = [f"queued as {state['id']}", f"{state.get('ahead', 0)} ahead"]
     if state.get("holdUntil") and state["holdUntil"] > time.time():
         parts.append(f"GitHub holds writes for {span(state['holdUntil'] - time.time())}")
@@ -24771,11 +24867,13 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
         print(state.get("url") or "posted")
         if state.get("note"):
             print(f"glaeda-gh: {state['note']}", file=sys.stderr)
+    elif state["state"] == "superseded":
+        print(f"glaeda-gh: {post_line(state)}", file=sys.stderr)  # stdout stays a URL or nothing
     else:
         print(post_line(state))
     if state["state"] == "queued" and queued and wait <= 0:
         print(f"glaeda-gh: the daemon posts it and keeps the result: glaeda-gh post status {post_id}", file=sys.stderr)
-    return 0 if state["state"] == "posted" else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
+    return 0 if state["state"] in {"posted", "superseded"} else 1 if state["state"] == "failed" else 2 if wait > 0 else 0
 
 
 # ---------------------------------------------------------------- log job: a finished job's log, read once per host
