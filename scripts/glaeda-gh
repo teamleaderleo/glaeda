@@ -10283,7 +10283,7 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 # head lets the next such refusal count as before (stateOpen).
 # A draft PR is a permanent refusal, not a streak: GitHub answers every mergePullRequest on it "Pull Request is still
 # a draft", so the backoff spent LAND_STEP_STOP merge calls (~31 min) on an answer the first one already gave, and the
-# stop named no step. big-red/efficiency-standing-lane, 2026-11-21: leo-workspace#7087 was pushed as a draft by the
+# stop named no step. efficiency-standing-lane, 2026-11-21: leo-workspace#7087 was pushed as a draft by the
 # PreCompact checkpoint hook (tools/wip_checkpoint.py opens one), and `land` reported merge_refused after six identical
 # refusals with the GraphQL pool at its floor. Stopping at the first one names `gh pr ready`, the step that clears it.
 # Nothing here marks a PR ready: that is a state change on someone's PR (a teammate's included), so it stays the
