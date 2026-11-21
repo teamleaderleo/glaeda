@@ -592,6 +592,10 @@ TICK_BUDGET = 90  # seconds a tick may spend starting requests
 # each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
 # longer than what a tick had left after the reads ahead of it never stored anything, try after try.
 RESUME_MAX = 300.0
+REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
+# past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
+# (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
+# 325 waited PRs sat 3 h unread; the stale valve restarted the daemon every 30 min to no effect)
 REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
 # tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
 # (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
@@ -7563,8 +7567,13 @@ class Daemon:
             confirms = [e for e in over_rest if self.wait_confirms(e)]
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
         plain_until = time.monotonic() + REST_PLAIN_BUDGET
+        head_until = time.monotonic() + REST_HEAD_BUDGET
         try:
             for i, e in enumerate(over_rest):
+                if e["key"].startswith("head:") and time.monotonic() >= head_until and not self.head_unanswered(e) \
+                        and any(x["key"].startswith(("pr:", "run:")) and self.waited(x) for x in over_rest[i + 1:]):
+                    self.defer([e])  # the heads' share is spent and a waited PR or run is still unread: it reads now
+                    continue
                 if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e)
                                                             or self.head_unanswered(e)):
                     self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order

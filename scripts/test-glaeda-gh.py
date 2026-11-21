@@ -7619,6 +7619,48 @@ class TickBudgetTest(Base):
         self.assertEqual(valved["valve"], "held")  # the valve does not restart for it
         self.assertIsNone(self.daemon.valve_due)
 
+    def test_waited_heads_leave_the_rest_of_a_tick_to_the_waited_prs(self) -> None:
+        """huge-blue 2026-11-21: a dozen waited heads (land judgments, ~5 requests each over a slow REST) ranked ahead of
+        every waited PR and filled each 90 s tick, so waited PRs sat hours unread. Past REST_HEAD_BUDGET the waited heads
+        are deferred while a waited PR is still to read; with no waited PR left they are read to the end."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        shas = [f"{n:040x}" for n in range(1, 5)]
+        for sha in shas:  # answered once, long ago: due again, and waited (so unlike an unanswered head, not exempt)
+            key = f"head:o/r@{sha}"
+            gg.register(key, consumer="merge-hold", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 9500, "dataAt": NOW - 9500,
+                                                               "error": None, "data": {"checks": []}})
+        gg.register("pr:o/r#9", waited=True)  # read more lately than the heads: ranked behind them, as on huge-blue
+        for n, at in ((9, 8000), (8, 7000)):  # (the oldest, #9, leads the tick: starved_lead; #8 is behind the heads)
+            gg.register(f"pr:o/r#{n}", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(f"pr:o/r#{n}"), {
+                "key": f"pr:o/r#{n}", "fetchedAt": NOW - at, "dataAt": NOW - at, "error": None, "data": {"state": "OPEN"}})
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertIn("pr:o/r#8", read, "the waited PR is read though waited heads ranked ahead of it")
+        self.assertLess(len([k for k in read if k.startswith("head:")]), len(shas), "the waited heads were cut short")
+
+    def test_waited_heads_are_read_in_full_when_no_waited_pr_is_left(self) -> None:
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        shas = [f"{n:040x}" for n in range(1, 5)]
+        for sha in shas:  # answered once, long ago: due again, and waited (so unlike an unanswered head, not exempt)
+            key = f"head:o/r@{sha}"
+            gg.register(key, consumer="merge-hold", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 9500, "dataAt": NOW - 9500,
+                                                               "error": None, "data": {"checks": []}})
+        gg.register("pr:o/r#9")
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertEqual(len([k for k in read if k.startswith("head:")]), len(shas))
+
     def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
         """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
         and an asked head with no answer, or a wait's key, is still read."""
