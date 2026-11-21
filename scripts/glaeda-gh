@@ -416,7 +416,8 @@ SPEND_RECENT = 600  # seconds: the window an alarm names the top routes of, and 
 # leo-workspace tools/coord_inbox.py, delivered to the coordinator through acpmux) and written as a notice line
 # (~/.local/state/notices/glaeda-gh.jsonl, the schema of cmuxterm-hq tools/fleet-reconcilers/notices.py), at most
 # once per ALARM_EVERY for one alarm unless it gets worse. Policy "alarms" ({"pool": bool, "share": bool,
-# "restLeft": N, "paceShare": 0..1, 0 for off}) turns each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
+# "consumerShare": {"fraction": 0..1, "minCalls": N}, "restLeft": N, "paceShare": 0..1, 0 for off}) turns
+# each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
 ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/bin/tell-coordinator")
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
@@ -430,6 +431,8 @@ ALARM_FIRE_WITHIN = 600.0  # a pool projected empty within this, or under the RE
 # 5000 is 42 a minute. On 2026-11-10 (11:23Z) the pool drained at 158 a minute and the alarm said so only once it
 # projected dry 25 minutes out; at half the limit there is still an hour's room to find the caller.
 ALARM_PACE_SHARE = 0.5
+CONSUMER_SHARE_FRACTION = 0.20
+CONSUMER_SHARE_MIN_CALLS = 100
 # Who spent the pool on this host, for the alarm to name: leo-workspace tools/gh_quota.py `usage --json`, which counts
 # every caller on the login here (the gh shim's sessions and tools, this daemon, the lane-gh broker's VMs). This
 # daemon's own routes are a fraction of it (11:23Z: about 13 a minute of the 158).
@@ -1264,6 +1267,30 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
     rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
     return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source", "host") if k in r} for r in rows[:SPENDERS_TOP]],
             sum(r["rest"] for r in rows))
+
+
+def consumer_share_alarm(rows: list[dict], policy: dict) -> tuple[str, str, dict] | None:
+    """Page when one observed caller exceeds the configured share of either account pool."""
+    fraction = float(policy.get("fraction", CONSUMER_SHARE_FRACTION))
+    minimum = int(policy.get("minCalls", CONSUMER_SHARE_MIN_CALLS))
+    alarms = []
+    for pool, label in (("rest", "REST"), ("graphql", "GraphQL")):
+        for row in rows:
+            calls = row.get(pool)
+            if isinstance(calls, int) and not isinstance(calls, bool) and calls >= minimum and calls > fraction * 5000:
+                caller = f"{row.get('host')}:{row.get('caller')}" if row.get("host") else str(row.get("caller") or "?")
+                alarms.append((calls, pool, label, caller))
+    if not alarms:
+        return None
+    alarms.sort(reverse=True)
+    calls, pool, label, caller = alarms[0]
+    details = "; ".join(f"{name}={value}" for value, _pool, _label, name in alarms[:5])
+    text = (f"WARN glaeda-gh on {policy_host()}: {caller} consumed {calls}/5000 {label} in the last hour, "
+            f"over the {fraction:.0%} consumer-share threshold. Top flagged consumers: {details}.")
+    return "warn", text, {"pool": pool, "caller": caller, "calls": calls, "limit": 5000,
+                           "fraction": fraction, "minCalls": minimum, "alarms": [
+                               {"pool": p, "caller": n, "calls": c, "limit": 5000, "fraction": fraction}
+                               for c, p, _l, n in alarms]}
 
 
 def share_slow(shed: dict | None, spenders: list[dict]) -> dict | None:
@@ -3963,8 +3990,11 @@ def daemon_policy() -> dict:
         floors[bucket] = (f if f > raised else raised + (f - r), raised)
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
+    consumer = alarms.get("consumerShare") if isinstance(alarms.get("consumerShare"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
+                       "consumerShare": {"fraction": float(_bounded(consumer.get("fraction"), CONSUMER_SHARE_FRACTION, 0.01, 1.0)),
+                                         "minCalls": int(_bounded(consumer.get("minCalls"), CONSUMER_SHARE_MIN_CALLS, 1, 5000))},
                        "stale": alarms.get("stale") is not False, "staleRestart": alarms.get("staleRestart") is not False,
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
                        "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
@@ -4102,6 +4132,7 @@ class Daemon:
         self.named_dirty = False
         self.share_pace_at = float("-inf")  # the last share-pace log line (share_alarm)
         self.share_over_at = float("-inf")  # the last share-over log line (share_alarm: past the cap, the pool fine)
+        self.consumer_share_at = float("-inf")  # last fleet consumer-share read, bounded to one alarm window
         self.token_source = token
         self.token: str | None = None
         doc = read_json(BASE / "budget.json")
@@ -4842,6 +4873,13 @@ class Daemon:
             share = self.share_alarm(self.rest_cap(), rows)
             if share is not None:
                 firing["share"] = share
+        consumer_policy = policy.get("consumerShare") or {}
+        if isinstance(consumer_policy, dict) and self.now - self.consumer_share_at >= ALARM_EVERY:
+            self.consumer_share_at = self.now
+            spenders, _ = host_spenders()
+            consumer = consumer_share_alarm(spenders, consumer_policy)
+            if consumer is not None:
+                firing["consumer-share"] = consumer
         self.stale_now = self.stale_verdict()
         if policy.get("stale", True):
             stale = self.stale_valve(self.stale_now, policy)
@@ -17835,13 +17873,12 @@ def view_lines(view: dict) -> list[str]:
     for gap in (view.get("gaps") or [])[:10]:
         out.append(f"not seen: {gap}")
     for pool, label in (("rest", "REST"), ("graphql", "GraphQL")):
-        rows = []
-        for key in ("sessions", "lane_vm_sessions"):
-            rows.extend(r for r in (view.get(key) or []) if isinstance(r, dict) and isinstance(r.get(pool), int))
+        rows = [r for r in (view.get("sessions") or [])
+                if isinstance(r, dict) and isinstance(r.get(pool), int)]
         rows.sort(key=lambda r: (-r[pool], str(r.get("caller") or "?"), str(r.get("host") or "?")))
         total = sum(r[pool] for r in rows)
-        top = ", ".join(f"{r.get('caller', '?')}={r[pool]}" for r in rows[:5]) or "none"
-        out.append(f"ledger {label}: {total} observed; top consumers {top}")
+        top = ", ".join(f"{r.get('host', '?')}:{r.get('caller', '?')}={r[pool]}" for r in rows[:5]) or "none"
+        out.append(f"ledger {label}: {total} listed session spend; top consumers {top}")
     return out
 
 
@@ -17927,7 +17964,7 @@ def sweep_lines(doc: dict) -> list[str]:
                     rows.append({"caller": f"{host}:{caller.get('caller', '?')}", pool: caller[pool]})
         rows.sort(key=lambda r: (-r[pool], r["caller"]))
         top = ", ".join(f"{r['caller']}={r[pool]}" for r in rows[:5]) or "none"
-        out.append(f"ledger {label}: {sum(r[pool] for r in rows)} observed; top consumers {top}")
+        out.append(f"ledger {label}: {sum(r[pool] for r in rows)} listed host spend; top consumers {top}")
     return out
 
 

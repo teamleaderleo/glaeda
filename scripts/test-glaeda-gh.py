@@ -6117,8 +6117,8 @@ class FleetBudgetTest(Base):
         self.assertRegex(text, r"top sessions and callers \(1 of 40\)")
         self.assertRegex(text, r"broker:gcp-agent-lane-4/ws-check +REST +778")
         self.assertRegex(text, r"session:glaeda-land +REST +583")
-        self.assertIn("ledger REST: 1361 observed; top consumers broker:gcp-agent-lane-4/ws-check=778, session:glaeda-land=583", text)
-        self.assertIn("ledger GraphQL: 360 observed; top consumers session:glaeda-land=360, broker:gcp-agent-lane-4/ws-check=0", text)
+        self.assertIn("ledger REST: 778 listed session spend; top consumers huge-blue:broker:gcp-agent-lane-4/ws-check=778", text)
+        self.assertIn("ledger GraphQL: 0 listed session spend; top consumers huge-blue:broker:gcp-agent-lane-4/ws-check=0", text)
         self.assertIn("not seen: other-host: census has no gh_spend", text)
         self.assertIn("  quiet-host: no census reached the view; reports: its NOW census carries gh_spend", text)
         self.assertIn("hard reserve: 500 REST, 500 GraphQL", text)
@@ -14970,6 +14970,17 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.now = at
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": remaining, "reset": reset, "seenAt": at}}
 
+    def test_consumer_share_alarm_pages_with_pool_and_caller(self) -> None:
+        self.policy(consumerShare={"fraction": 0.2, "minCalls": 100})
+        with mock.patch.object(gg, "host_spenders", return_value=([
+                {"host": "cosmic-gray", "caller": "session:janitor", "rest": 1200, "graphql": 10},
+                {"host": "huge-blue", "caller": "session:nightly", "rest": 200, "graphql": 1300}], 1500)):
+            self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("huge-blue:session:nightly consumed 1300/5000 GraphQL", told[0])
+        self.assertIn("20% consumer-share threshold", told[0])
+
     def test_the_pool_alarm_fires_on_a_drain_that_runs_dry_before_the_reset(self) -> None:
         self.policy(pool=True)
         reset = NOW + 3000
@@ -15922,10 +15933,12 @@ class SpendAlarmTest(AlarmBase):
             setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
         on = {"stale": True, "staleRestart": True}
         self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5,
+                                                        "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000,
                                                            "paceShare": 0.25}}))
         self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25,
+                                                        "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         # the stale alarm and its valve each turn off (alarms.stale was dropped by the parser, so it never could)
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"stale": False, "staleRestart": False}}))
