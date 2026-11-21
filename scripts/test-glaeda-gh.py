@@ -24231,6 +24231,20 @@ class LandTest(Base):
         self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
         self.assert_merged_at(LB)
 
+    def test_a_stale_cache_does_not_stop_a_correctly_pinned_land(self):
+        """The other side of the same read: judge() compares --sha with the head fresh_head hands it, so a cache left
+        behind by a force-push could stop a land pinned to the live head with head_moved, naming a commit GitHub had
+        already moved off. Settled against ls-remote, a caller's pin is judged against GitHub, not against the cache."""
+        self.nudge_reads = False
+        self.w.set_pr(self.KEY, land_pr(LA, checks=[("ci", "IN_PROGRESS", None)]), self.t - 2700)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)  # pinned to the head GitHub has
+        self.github_head[self.KEY] = LB
+        e = self.tick(1)
+        self.assertIsNone(e.get("stop"))  # never stopped head_moved against the dead cached head
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assert_merged_at(LB)
+
     def test_an_unsettled_running_head_waits_the_retry_not_the_hour(self):
         """No read of ours confirms the head and no ls-remote settles it (no git, or the remote refused): the running
         wait is LAND_RETRY_DEFAULT, so an unconfirmed pin is looked at again in two minutes. LAND_WAIT_DEFAULT belongs
