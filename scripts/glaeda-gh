@@ -17026,12 +17026,22 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     # the one that just did not. Same exit code and the same "timeout" in --json as any other expired wait, so no
     # consumer has to learn a new one; only PRs, because a run's finish can still arrive over the build
     # controller's feed, which costs no quota at all.
-    blocked = blocked_now(kind, now) if result is None and not usable and kind == "pr" else None
+    deadline = began + float(req["timeout"])
+    # Cached data this wait can use is no reason to sit out the hold either (glaeda#2311, 2026-11-21: a wait holding
+    # one fresh read of "18 passed, 1 pending" spent its remaining 28 min on a bucket whose reset was 15 min past its
+    # deadline). What settles it is whether the data in hand can still rule with no further read: every transition
+    # time alone can make -- a head's settle window, a runner refusal's rescue grace, a done wait's straggler cut --
+    # turns on `now`, so the same verdict asked at the deadline is the one this wait would reach there. Still None
+    # there means only a read could decide it, and no read comes before the deadline.
+    stuck = result is None and kind == "pr" and (
+        not usable or verdict(kind, data, until, sha, (entry or {}).get("jobs"), deadline, grace,
+                              f"{owner}/{repo}", settle) is None)
+    blocked = blocked_now(kind, now) if stuck else None
     if blocked and blocked.get("exhausted") and blocked["reset"] is not None \
-            and blocked["reset"] >= began + float(req["timeout"]):
+            and blocked["reset"] >= deadline:
         extra = {"result": "timeout", "waited_s": waited,
                  "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
-                         f"deadline ({utc_clock(began + float(req['timeout']))}): waiting the rest of it reads "
+                         f"deadline ({utc_clock(deadline)}): waiting the rest of it reads "
                          "nothing"}
         extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
                                            f"{blocked['text']}", blocked_next(req, blocked)))

@@ -27701,6 +27701,48 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIn("glaeda-gh wait until " + gg.utc_clock(gg.read_blocked("pr")["reset"]), text)
         self.assertNotIn("\nnext: " + gg.wait_command(req) + "\n", text)
 
+    def cached(self, data: dict, at: float | None = None) -> None:
+        """One read of o/r#7208 in the cache, as the daemon leaves it, fresh enough for this wait to use."""
+        at = time.time() if at is None else at
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#7208"),
+                      {"key": "pr:o/r#7208", "fetchedAt": at, "dataAt": at, "data": data, "error": None})
+
+    def pending(self, **extra) -> dict:
+        """The head this wait names, with one check still running: usable data that rules on nothing."""
+        node = {**pr_node(7208, rollup="PENDING", checks=[check_run("a", status="IN_PROGRESS", conclusion=None)]),
+                "headRefOid": "7" * 40}
+        return {**gg.parse_pr(node), **extra}
+
+    def test_fresh_data_that_rules_on_nothing_ends_at_an_unreachable_reset_too(self) -> None:
+        """glaeda#2311, 2026-11-21: the wait held one read of "18 passed, 1 pending" taken after it began, so
+        `usable` was true and the early exit was skipped -- it then spent its remaining 28 min on a bucket whose
+        reset was 15 min past its deadline. Data only ends the hold early when it can still decide."""
+        self.records()
+        req = self.request(timeout=self.RESET - 600)
+        self.cached(self.pending())
+        done = gg.wait_step(req, time.time())
+        self.assertIsNotNone(done, "cached data that decides nothing is as blind as none at all")
+        code, text = done
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        self.assertIn("past this wait's deadline", text)
+
+    def test_data_that_will_decide_by_the_deadline_is_waited_out(self) -> None:
+        """A head whose settle window closes before the deadline ends EXIT_NOTHING with no further read, so the
+        quota stopping is no reason to drop it: the verdict is asked at the deadline, not only at now."""
+        self.records()
+        now = time.time()
+        req = self.request(timeout=self.RESET - 600, began=now)
+        node = {**pr_node(7208, rollup=None, checks=[]), "headRefOid": "7" * 40}
+        data = {**gg.parse_pr(node), "headSeenAt": now}
+        self.cached(data, at=now)
+        self.assertLess(gg.SETTLE_GRACE, self.RESET - 600, "the settle window has to close inside this wait")
+        deadline = req["began"] + float(req["timeout"])
+        self.assertIsNone(gg.verdict("pr", data, "green", "7" * 40, None, now, gg.RESCUE_GRACE, "o/r"),
+                          "nothing to rule on yet: the head is still settling")
+        self.assertEqual(gg.verdict("pr", data, "green", "7" * 40, None, deadline, gg.RESCUE_GRACE, "o/r"),
+                         gg.EXIT_NOTHING, "and at the deadline it rules, with no read in between")
+        self.assertIsNone(gg.wait_step(req, now), "it can still rule on what it holds: it must not give up")
+
     def test_a_reset_before_the_deadline_keeps_waiting_so_the_read_resumes(self) -> None:
         self.records()
         self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET + 600), time.time()),
