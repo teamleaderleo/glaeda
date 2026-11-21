@@ -28037,18 +28037,26 @@ class WaitBlockedByQuotaTest(Base):
     RESET = 1200.0  # seconds from NOW: past a 600 s wait's deadline, inside a 1800 s one's
 
     def records(self, *, mode: str = "stop", remaining: int = 0, reset: float | None = None,
-                bucket: str = "graphql", upstream: bool = False) -> None:
-        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped."""
+                bucket: str = "graphql", upstream: bool = False, fed: bool | None = None,
+                capped: bool = False, hold: float | None = None, rest: dict | None = None) -> None:
+        """daemon.json and budget.json as the daemon writes them each tick, with BUCKET stopped. FED is the
+        controller's feed as Daemon.fed reads it: None publishes no feed at all (an older daemon), True a fresh feed
+        that delivered an event for o/r, False a fresh feed that has delivered nothing for it."""
         gg.BASE.mkdir(parents=True, exist_ok=True)
         status = {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT,
                   "modes": {"rest": "normal", "graphql": "normal", bucket: mode},
-                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": False}}
+                  "paths": {"pr": "graphql", "run": "rest"}, "restShare": {"capped": capped}}
         if upstream:
             status["upstream"] = {"ok": True}
+        if hold is not None:
+            status["secondaryHold"] = {"until": time.time() + hold, "strikes": 2}
+        if fed is not None:
+            status["controller"] = {"state": "ok", "okAt": time.time() - 1,
+                                    "fedRepos": {"o/r": time.time() - 5} if fed else {}}
         gg.write_json(gg.BASE / "daemon.json", status)
-        gg.write_json(gg.BASE / "budget.json",
-                      {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
-                                "reset": (time.time() + self.RESET) if reset is None else reset}})
+        budget = {bucket: {"remaining": remaining, "limit": 5000, "seenAt": time.time(),
+                           "reset": (time.time() + self.RESET) if reset is None else reset}}
+        gg.write_json(gg.BASE / "budget.json", {**budget, **(rest or {})})
 
     def request(self, timeout: float = 1800.0, began: float | None = None) -> dict:
         req = gg.wait_request("pr", "o/r#7208", "green", timeout, False, False, "7" * 40, True, gg.RESCUE_GRACE)
@@ -28172,12 +28180,71 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET + 600), time.time()),
                           "reads resume well inside this wait: it must carry on, not give up")
 
-    def test_a_blocked_run_wait_is_left_alone(self) -> None:
+    def run_request(self, timeout: float | None = None) -> dict:
+        req = gg.wait_request("run", "o/r/12345", "done", self.RESET - 600 if timeout is None else timeout,
+                              False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = time.time()
+        return req
+
+    def test_a_blocked_run_wait_the_feed_covers_is_left_alone(self) -> None:
         """A run's finish still arrives over the build controller's feed, which costs no quota, so a stopped bucket
-        is no reason to end a run wait early."""
+        is no reason to end a run wait early -- while the feed does cover its repository."""
+        self.records(bucket="rest", mode="stop", fed=True)
+        self.assertTrue(gg.feed_covers("run:o/r/12345"))
+        self.assertIsNone(gg.wait_step(self.run_request(), time.time()))
+        # and an older daemon, which publishes no feed at all, is read the same way: never give up on a guess
         self.records(bucket="rest", mode="stop")
-        req = gg.wait_request("run", "o/r/12345", "done", self.RESET - 600, False, False, None, True, gg.RESCUE_GRACE)
-        self.assertIsNone(gg.wait_step(req, time.time()))
+        self.assertTrue(gg.feed_covers("run:o/r/12345"))
+        self.assertIsNone(gg.wait_step(self.run_request(), time.time()))
+
+    def test_a_blocked_run_wait_the_feed_does_not_cover_ends_at_the_unreachable_reset(self) -> None:
+        """The pr path's comparison, on the run path: the exemption is the feed, so it holds only where the feed is.
+        Measured 2026-11-21 on this host: `wait run manaflow-ai/cmuxterm-hq/44907253327` sat out its timeout against
+        a stopped bucket and refused with a reset in the past."""
+        self.records(bucket="rest", mode="stop", fed=False)
+        self.assertFalse(gg.feed_covers("run:o/r/12345"))
+        req = self.run_request()
+        done = gg.wait_step(req, time.time())
+        self.assertIsNotNone(done, "no read before the deadline and no feed to carry the finish")
+        code, text = done
+        self.assertEqual(code, gg.EXIT_TIMEOUT, "the same exit code as any expired wait")
+        self.assertIn("past this wait's deadline", text)
+        self.assertIn("REST", text)
+        self.assertIn("glaeda-gh wait until " + gg.utc_clock(gg.read_blocked("run")["reset"]), text)
+        self.assertNotIn("\nnext: " + gg.wait_command(req) + "\n", text)
+        # a feed that went quiet (okAt older than CONTROLLER_FRESH) covers nothing either
+        self.records(bucket="rest", mode="stop", fed=True)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        status["controller"]["okAt"] = time.time() - gg.CONTROLLER_FRESH - 1
+        gg.write_json(gg.BASE / "daemon.json", status)
+        self.assertFalse(gg.feed_covers("run:o/r/12345"))
+
+    def test_a_reset_inside_the_deadline_keeps_an_uncovered_run_wait_going(self) -> None:
+        self.records(bucket="rest", mode="stop", fed=False)
+        self.assertIsNone(gg.wait_step(self.run_request(timeout=self.RESET + 600), time.time()),
+                          "reads resume well inside this wait: it must carry on, not give up")
+
+    # The bucket named is the one that has to come back, not the one the reads are routed over.
+
+    def test_a_spent_rest_share_names_graphqls_reset_and_not_rests(self) -> None:
+        """Measured on this host 2026-11-21 13:17Z: a `wait run` refusal said "this daemon has stopped its REST
+        reads ... still shows headroom (3573 of 5000 left, resets 13:27:38Z), so this is not the shared quota
+        running out", and then offered 13:27:38Z as the wait that ends. REST was not what held the reads: the
+        daemon's own REST share was spent (restShare cap 0, capped) and GraphQL was out, 0 of 5000, resetting
+        13:38:35Z -- eleven minutes later. Nothing changes at the time the refusal named."""
+        self.records(bucket="graphql", mode="stop", remaining=0, capped=True,
+                     rest={"rest": {"remaining": 3573, "limit": 5000, "seenAt": time.time(),
+                                    "reset": time.time() + 120}})
+        blocked = gg.read_blocked("run")
+        self.assertEqual((blocked["routed"], blocked["bucket"]), ("rest", "graphql"),
+                         "a run is read over REST, and GraphQL is what has to come back")
+        self.assertTrue(blocked["exhausted"])
+        self.assertEqual(blocked["reset"], gg.read_json(gg.BASE / "budget.json")["graphql"]["reset"])
+        self.assertIn("GraphQL quota for this login is spent (0 of 5000 left", blocked["text"])
+        self.assertIn("REST share", blocked["text"], "and why REST's own headroom is no answer")
+        self.assertNotIn("3573", blocked["text"], "REST's headroom was never what this wait was waiting for")
+        self.assertIn(gg.utc_clock(blocked["reset"]), gg.blocked_start_line("run:o/r/12345", "run"))
+        self.assertNotIn(gg.utc_clock(time.time() + 120), gg.blocked_next(self.run_request(), blocked))
 
     # (c): a stop the bucket's own reading does not back is said as itself, never as the quota running out.
 
@@ -28185,10 +28252,36 @@ class WaitBlockedByQuotaTest(Base):
         self.records(remaining=4800)
         blocked = gg.read_blocked("pr")
         self.assertFalse(blocked["exhausted"])
+        self.assertIsNone(blocked["reset"], "its quota reset frees nothing: it is not what stopped the reads")
+        nxt = gg.blocked_next(self.request(), blocked)
+        self.assertNotIn("wait until quota", nxt, "nothing ran out: that wait would wait for an end that never came")
+        self.assertTrue(nxt.startswith("glaeda-gh budget"), nxt)
+        self.assertIn("&& " + gg.wait_command(self.request()), nxt)
+        self.assertNotIn(gg.utc_clock(time.time() + self.RESET), gg.blocked_start_line("pr:o/r#7208", "pr") or "",
+                         "a reset that frees nothing is never offered as the deadline")
         self.assertIn("still shows headroom", blocked["text"])
         self.assertNotIn("spent", blocked["text"])
-        # and it never ends a wait early: that belongs to the lane fixing the refusal itself
+        # and it never ends a wait early: with no time at which these reads resume there is none to compare to a
+        # deadline, and the wait may yet be served the moment the daemon reads again.
         self.assertIsNone(gg.wait_step(self.request(timeout=self.RESET - 600), time.time()))
+
+    def test_a_back_off_github_ordered_names_its_own_end_and_not_a_quota_reset(self) -> None:
+        """A secondary 403 holds both buckets until Daemon.secondary_until, with the quota untouched: the reason is
+        the hold and the deadline is its own `until`, never a quota reset that has nothing to do with it."""
+        self.records(remaining=4800, hold=300.0)
+        blocked = gg.read_blocked("pr")
+        self.assertFalse(blocked["exhausted"])
+        self.assertAlmostEqual(blocked["reset"], time.time() + 300, delta=5)
+        self.assertIn("GitHub told this daemon to back off", blocked["text"])
+        self.assertIn("the shared GraphQL quota is not what stopped it", blocked["text"])
+        self.assertIn("glaeda-gh wait until " + gg.utc_clock(blocked["reset"]),
+                      gg.blocked_next(self.request(), blocked))
+        # and a hold whose end a wait cannot reach ends that wait now, like any other unreachable reset
+        self.records(remaining=4800, hold=self.RESET)
+        code, text = gg.wait_step(self.request(timeout=self.RESET - 600), time.time())
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        self.assertIn("back off", text)
+        self.assertIn("past this wait's deadline", text)
 
     def test_a_host_reading_through_another_daemon_names_no_bucket_of_its_own(self) -> None:
         self.records(upstream=True)

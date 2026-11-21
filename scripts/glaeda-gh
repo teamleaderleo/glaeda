@@ -7517,7 +7517,11 @@ class Daemon:
         status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
                   "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
-                  "controller": {**self.controller_status, "runs": len(self.controller_filled)},
+                  # `fedRepos` and `okAt` are Daemon.fed's own two inputs, published so a client can tell whether a
+                  # run's finish still arrives over the feed when its read bucket has stopped (feed_covers).
+                  "controller": {**self.controller_status, "runs": len(self.controller_filled),
+                                 "fedRepos": {r: round(t, 3) for r, t in self.fed_repos.items()},
+                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
@@ -16687,10 +16691,13 @@ def read_blocked(kind: str, now: float | None = None) -> dict | None:
     no GitHub call, no quota spent. None when a route is open (state (a) above), or when there is no daemon record
     to read, or on a host whose reads go through another host's daemon (it has no bucket of its own to name).
 
-    Else {"bucket", "label", "reset", "remaining", "limit", "exhausted", "text"}: `reset` is when reads can resume
-    (None when the reading names none) and `exhausted` is whether the bucket's own reading backs the stop. False
-    there is state (c): the stop is real and worth saying, its cause is not the shared quota running out, and the
-    text must not claim it is."""
+    Else {"bucket", "label", "routed", "reset", "remaining", "limit", "exhausted", "text"}: `bucket` is what has to
+    come back before anything is read for KIND and `routed` the bucket its reads go over now -- the same except when
+    a spent REST share leaves a REST-routed kind waiting on GraphQL. `reset` is when reads really resume, and only
+    then: None when no reading or hold names such a time, because a refusal that offers a reset which frees nothing
+    sends its reader to a moment at which nothing changes (docs/handbook/refusal-next-step-cannot-end-the-hold.md).
+    `exhausted` is whether `bucket`'s own reading backs the stop. False there is state (c): the stop is real and
+    worth saying, its cause is not the shared quota running out, and the text must not claim it is."""
     now = time.time() if now is None else now
     status = read_json(BASE / "daemon.json")
     if not isinstance(status, dict) or not isinstance(status.get("modes"), dict):
@@ -16705,9 +16712,20 @@ def read_blocked(kind: str, now: float | None = None) -> dict | None:
         return None
     # The bucket KIND is routed over has stopped. Daemon.route() already moves a kind off a stopped bucket when the
     # other one can take its reads, so a kind still routed over a stopped bucket has no second route this tick.
-    if modes.get(bucket) != "stop" and not (bucket == "rest" and share.get("capped") is True
-                                            and modes.get("graphql") == "stop"):
+    routed = bucket  # the bucket KIND's reads go over right now
+    # REST not stopped, but this daemon's own REST share spent while GraphQL is stopped: the route KIND sits on
+    # carries nothing, and what frees its reads is GraphQL's reset, not REST's.
+    shared_out = (modes.get(routed) != "stop" and routed == "rest" and share.get("capped") is True
+                  and modes.get("graphql") == "stop")
+    if modes.get(routed) != "stop" and not shared_out:
         return None
+    if shared_out:
+        # Measured on this host 2026-11-21: `wait run manaflow-ai/cmuxterm-hq/44907253327` refused with REST's
+        # headroom (3573 of 5000) and REST's reset (13:27:38Z), while what held the reads was GraphQL at 0 of 5000
+        # resetting 13:38:35Z -- eleven minutes later, and nothing changes at 13:27:38Z. A reset that frees nothing
+        # is worse than none: `wait until 13:27:38Z && <the same wait>` reads nothing either. Name the bucket that
+        # has to come back, and say the share as well, since that is why REST's own headroom is no answer.
+        bucket = "graphql"
     seen = read_json(BASE / "budget.json") or {}
     seen = seen.get(bucket) if isinstance(seen.get(bucket), dict) else {}
     whole = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None  # noqa: E731
@@ -16720,15 +16738,32 @@ def read_blocked(kind: str, now: float | None = None) -> dict | None:
     left = (f"{remaining} of {limit} left" if remaining is not None and limit is not None else
             f"{remaining} left" if remaining is not None else "its last reading is unknown")
     when = f", resets {utc_clock(reset)}" if reset is not None else " (its reading names no reset)"
+    # A stop GitHub itself ordered (a secondary 403 holds both buckets, Daemon.secondary_until) is not the quota
+    # running out and its own `until` is what ends it: that is the next step, not a quota reset it has nothing to do
+    # with. Every branch below leaves `reset` set only when it is really when these reads resume, because that is the
+    # only kind of time a refusal may offer as a deadline.
+    hold = status.get("secondaryHold") if isinstance(status.get("secondaryHold"), dict) else {}
+    until = hold.get("until")
+    until = float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now else None
+    share_spent = (f"; this daemon's own REST share, which a {kind} is read over, is spent, so its REST reads "
+                   "carry none of them either") if shared_out else ""
     if exhausted:
         text = (f"the shared {label} quota for this login is spent ({left}, under the {reserve} this daemon keeps "
                 f"back for lands{when}): nothing is read for a {kind} until then, so the same wait again reads "
-                "nothing either")
+                f"nothing either{share_spent}")
+    elif until is not None:
+        reset = until
+        text = (f"GitHub told this daemon to back off, so nothing is read for a {kind} before {utc_clock(until)}; "
+                f"the shared {label} quota is not what stopped it ({left}){share_spent}")
     else:
+        # State (c): the bucket's own reading backs no stop and no hold says when it ends, so its quota reset frees
+        # nothing and must not be offered -- a reader sent to a time at which nothing changes waits it out twice.
+        reset = None
         text = (f"this daemon has stopped its {label} reads, so nothing is read for a {kind} now; its own last "
-                f"{label} reading still shows headroom ({left}{when}), so this is not the shared quota running out")
-    return {"bucket": bucket, "label": label, "reset": reset, "remaining": remaining, "limit": limit,
-            "exhausted": exhausted, "text": text}
+                f"{label} reading still shows headroom ({left}), so this is not the shared quota running out and "
+                f"no quota reset ends it: `glaeda-gh budget` says what the daemon is doing{share_spent}")
+    return {"bucket": bucket, "label": label, "routed": routed, "reset": reset, "remaining": remaining,
+            "limit": limit, "exhausted": exhausted, "text": text}
 
 
 _blocked_memo: dict[tuple, dict | None] = {}
@@ -16777,7 +16812,49 @@ def blocked_next(req: dict, blocked: dict) -> str:
     if isinstance(reset, (int, float)) and not isinstance(reset, bool):
         return (f"glaeda-gh wait until {utc_clock(reset)} "
                 f"--timeout {max(1, int(reset - time.time()) + WAIT_UNTIL_SLACK)} && {again}")
+    if not blocked.get("exhausted"):
+        # State (c): no quota ran out, so `wait until quota` would wait for the end of something that never began.
+        # What can end this is the daemon itself, so the step is to look at it (`restart` refuses when restarting
+        # would not fix it, and says what would).
+        return f"glaeda-gh budget && glaeda-gh restart && {again}"
     return f"glaeda-gh wait until quota --timeout {float(req['timeout']):g} && {again}"
+
+
+def feed_covers(key: str, now: float | None = None) -> bool:
+    """Whether the build controller's change feed covers KEY's repository now, from the two facts Daemon.fed itself
+    uses (published in daemon.json's `controller`): the feed answered within CONTROLLER_FRESH and delivered an event
+    for that repository within FED_REPO_KEEP. Such a run's finish arrives over the feed, which costs no quota, so a
+    stopped read bucket does not mean nothing can be learned about it. Unknown counts as covered: an older daemon
+    publishes neither field, and the one thing a wait must not do on a guess is give up early."""
+    now = time.time() if now is None else now
+    status = read_json(BASE / "daemon.json")
+    feed = status.get("controller") if isinstance(status, dict) and isinstance(status.get("controller"), dict) else None
+    if feed is None or "fedRepos" not in feed:
+        return True
+    ok_at = feed.get("okAt")
+    if not isinstance(ok_at, (int, float)) or isinstance(ok_at, bool) or now - ok_at > CONTROLLER_FRESH:
+        return False
+    _, owner, repo, _ = split_key(key)
+    fed = feed.get("fedRepos") if isinstance(feed.get("fedRepos"), dict) else {}
+    at = fed.get(f"{owner}/{repo}".lower())
+    return isinstance(at, (int, float)) and not isinstance(at, bool) and now - at <= FED_REPO_KEEP
+
+
+def blocked_before_deadline(kind: str, key: str, deadline: float, now: float) -> dict | None:
+    """The blocked record when nothing will be read for KEY before DEADLINE, so every second of the wait left would
+    be spent the way its first ones were -- on nothing -- else None. The caller returns now and names the wait that
+    ends instead of the one that just did not.
+
+    One rule for every kind, because the reason is one: no read comes, and the time that would free them is past
+    this wait's own end. A run is the single exception, and only where it is true: while the controller's feed
+    covers its repository its finish still arrives over the feed, costing no quota (feed_covers)."""
+    blocked = blocked_now(kind, now)
+    if blocked is None or blocked["reset"] is None or blocked["reset"] < deadline:
+        return None  # readable again inside this wait, or held by something no reset ends (then there is no deadline
+        # to compare: that stop is the refusal's own fault to fix, and read_blocked says so rather than guessing)
+    if kind == "run" and feed_covers(key, now):
+        return None
+    return blocked
 
 
 def blocked_start_line(key: str, kind: str) -> str | None:
@@ -17392,8 +17469,10 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     # Nothing can be read for this kind until a reset that is past this wait's own deadline, so every second left
     # would be spent the way the first ones were: on nothing. Return now and name the wait that ends instead of
     # the one that just did not. Same exit code and the same "timeout" in --json as any other expired wait, so no
-    # consumer has to learn a new one; only PRs, because a run's finish can still arrive over the build
-    # controller's feed, which costs no quota at all.
+    # consumer has to learn a new one. Every kind, by the same comparison (blocked_before_deadline): a run only when
+    # the build controller's feed does not cover its repository, because a covered run's finish still arrives over
+    # the feed, costing no quota at all. Measured 2026-11-21: a `wait run` on an uncovered repository held its whole
+    # timeout against a bucket whose reset was past the end of it, and its refusal named a reset in the past.
     deadline = began + float(req["timeout"])
     # Cached data this wait can use is no reason to sit out the hold either (glaeda#2311, 2026-11-21: a wait holding
     # one fresh read of "18 passed, 1 pending" spent its remaining 28 min on a bucket whose reset was 15 min past its
@@ -17401,12 +17480,11 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
     # time alone can make -- a head's settle window, a runner refusal's rescue grace, a done wait's straggler cut --
     # turns on `now`, so the same verdict asked at the deadline is the one this wait would reach there. Still None
     # there means only a read could decide it, and no read comes before the deadline.
-    stuck = result is None and kind == "pr" and (
+    stuck = result is None and (
         not usable or verdict(kind, data, until, sha, (entry or {}).get("jobs"), deadline, grace,
                               f"{owner}/{repo}", settle) is None)
-    blocked = blocked_now(kind, now) if stuck else None
-    if blocked and blocked.get("exhausted") and blocked["reset"] is not None \
-            and blocked["reset"] >= deadline:
+    blocked = blocked_before_deadline(kind, key, deadline, now) if stuck else None
+    if blocked:
         extra = {"result": "timeout", "waited_s": waited,
                  "note": f"{blocked['text']}, and its reset ({utc_clock(blocked['reset'])}) is past this wait's "
                          f"deadline ({utc_clock(deadline)}): waiting the rest of it reads "
@@ -17710,9 +17788,11 @@ def poll_wait(req: dict) -> int:
                 req["directAt"] = time.time()
                 req["diagnosed"] = True
                 blocked = blocked_now(req["kind"])
-                if blocked is not None and blocked.get("exhausted"):
+                if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
                     # The files already say why, and a direct read over that bucket is refused before it is sent:
-                    # say the bucket and the reset rather than spend a call to be told the same thing.
+                    # say the bucket and the reset rather than spend a call to be told the same thing. Only when the
+                    # spent bucket is the one this read would go over: a kind the daemon's own spent REST share holds
+                    # waits on GraphQL, and yet one direct read over REST's untouched headroom can still answer.
                     say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
                                 f"{int(starved)}s (its heartbeat is fresh, its data is not), because "
                                 f"{blocked['text']}.")
