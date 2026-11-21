@@ -5987,6 +5987,7 @@ class FleetBudgetTest(Base):
         # The account's last route is one free GET /rate_limit here (free_account_reading). No test reaches GitHub, so
         # it is refused by default and a case that wants it passes its own `free=`.
         self.free_error = "no login on this host (test)"
+        self.real_free = gg.free_account_reading  # the case that measures the read itself calls this one
         free = mock.patch.object(gg, "free_account_reading", side_effect=lambda now, make=None: {
             "error": self.free_error})
         free.start()
@@ -6090,6 +6091,179 @@ class FleetBudgetTest(Base):
         self.assertIn("GraphQL unknown", text)
         self.assertIn("no lane-gh here; read each host instead", text)
         self.assertIn("(0 of 3 hosts read; unread: here, far, down; a lower bound)", text)
+
+    # ---- a bucket no daemon holds: the free third route, and what is said when even that cannot answer ----
+
+    def no_graphql(self, now: float) -> dict:
+        """The measured shape: this host's daemon holds a fresh REST reading and no GraphQL one, the one reachable
+        peer the same, and a third host cannot be reached at all. A daemon refreshes its GraphQL reading only when it
+        sends a GraphQL query, while every REST answer carries its own headers."""
+        reports = self.reports(now)
+        reports["far"]["budget"].pop("graphql")
+        return reports
+
+    def swept(self, reports: dict, now: float, free: dict | None = None) -> dict:
+        return gg.fleet_budget(now, fetch=lambda h, local: reports.get(h) or {"error": "unreachable (exit 4: x)"},
+                               view=lambda: {"ok": False, "error": "no lane-gh here"},
+                               free=None if free is None else (lambda clock: free))
+
+    def test_a_bucket_no_host_holds_is_read_here_for_free(self) -> None:
+        """GET /rate_limit reports every bucket at once and counts against no primary limit, so a bucket no daemon on
+        the fleet has a fresh reading of is still readable -- and `budget` answered "unknown" for the one bucket every
+        PR state read spends while that read was free to make."""
+        now = time.time()
+        free = {"readings": {"graphql": {"remaining": 2670, "limit": 5000, "reset": now + 1980, "seenAt": now},
+                             "rest": {"remaining": 4999, "limit": 5000, "reset": now + 1980, "seenAt": now}}}
+        doc = self.swept(self.no_graphql(now), now, free)
+        gql = doc["account"]["graphql"]
+        self.assertEqual((gql["remaining"], gql["route"], gql["host"]), (2670, "direct", "here"))
+        self.assertEqual(doc["freeRead"], {"at": now, "buckets": ["graphql"]})
+        self.assertEqual(doc["accountGaps"], {})  # nothing is left unread, so nothing to explain
+        # only the bucket that had no reading is taken from the free answer: REST keeps the host reading and its age
+        self.assertEqual((doc["account"]["rest"]["remaining"], doc["account"]["rest"]["route"]), (12, "peer"))
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("GraphQL 2670/5000 left", text)
+        self.assertIn("read here by a free GET /rate_limit 0s ago", text)  # which route answered, and how old
+        self.assertIn("REST 12/5000 left", text)
+        self.assertIn("read by far 30s ago", text)
+
+    def test_a_bucket_that_cannot_be_read_names_who_was_asked_and_the_one_next_step(self) -> None:
+        """Never a bare "unknown": an operator who cannot see the GraphQL bucket cannot tell a lander's 1800 s of "no
+        data yet" from a slow run. A reachability failure and a never-collected reading are different conditions and
+        must read differently (docs/handbook/missing-read-counted-as-a-value.md)."""
+        now = time.time()
+        doc = self.swept(self.no_graphql(now), now)  # the default free read is refused in setUp
+        self.assertNotIn("graphql", doc["account"])
+        gaps = doc["accountGaps"]["graphql"]
+        self.assertIn("unreachable", gaps["down"])
+        self.assertIn("answered; its daemon has taken no GraphQL reading", gaps["here"])
+        self.assertIn("answered; its daemon has taken no GraphQL reading", gaps["far"])
+        self.assertEqual(doc["freeRead"], {"error": self.free_error})
+        said = gg.account_unknown("graphql", doc)
+        self.assertIn("2 of 3 hosts answered, none with a live reading", said)
+        self.assertIn("down: unreachable", said)
+        self.assertIn(self.free_error, said)
+        self.assertIn("next: fix that read -- it is the only route left", said)
+        self.assertIn("/rate_limit --jq .resources.graphql", said)
+        self.assertIn("which spends nothing", said)
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn(said, text)
+        self.assertNotIn("GraphQL unknown (no reachable host's daemon has a fresh reading)", text)  # the bare answer
+        # a host whose window has ended and a host whose reading is too old read as themselves, not as "unreachable"
+        reports = self.no_graphql(now)
+        reports["here"]["budget"]["graphql"] = {"remaining": 9, "limit": 5000, "reset": now - 5, "seenAt": now - 10}
+        reports["far"]["budget"]["graphql"] = {"remaining": 9, "limit": 5000, "reset": now + 900,
+                                              "seenAt": now - gg.FLEET_READING_MAX_AGE - 1}
+        gaps = self.swept(reports, now + 2 * gg.FLEET_BUDGET_TTL)["accountGaps"]["graphql"]
+        self.assertIn("its GraphQL window reset", gaps["here"])
+        self.assertRegex(gaps["far"], r"its GraphQL reading is \d+s old, over the 900s")
+        # and when no host answers at all, that is said as itself rather than as hosts with no reading
+        doc = self.swept({}, now + 4 * gg.FLEET_BUDGET_TTL)
+        self.assertIn("no host answered (3 asked)", gg.account_unknown("graphql", doc))
+
+    def test_a_bucket_marked_spent_is_still_read_and_both_are_printed(self) -> None:
+        """A gh-quota mark that a bucket is spent is not an answer to what is left in it or when it comes back: the
+        mark is this host's own hold, the reading is the account's. `budget` printed only the mark, so the window that
+        three 1800 s waits were waiting on was not in its output at all."""
+        now = time.time()
+        (self.home / "state").mkdir()
+        (self.home / "state" / "graphql-exhausted.json").write_text(json.dumps({"until": now + 2000, "at": now - 10}))
+        free = {"readings": {"graphql": {"remaining": 0, "limit": 5000, "reset": now + 2000, "seenAt": now}}}
+        doc = self.swept(self.no_graphql(now), now, free)
+        self.assertEqual(doc["account"]["graphql"]["remaining"], 0)
+        text = "\n".join(gg.fleet_lines(doc))
+        self.assertIn("GraphQL 0/5000 left", text)
+        self.assertIn("gh-quota's mark here says spent until", text)
+
+    def test_the_free_read_is_the_login_and_charges_no_minute(self) -> None:
+        """The free read is the shared login's count and nothing else: Daemon.request offers a call to an App pool
+        only when it is not free, so an App pool's headroom can never come back as the login's. It must also not write
+        rest-spend.json from the copy it loaded at construction, which would overwrite the minutes the daemon has
+        counted since (review of glaeda#1942)."""
+        now, charged, read = time.time(), [], []
+
+        class FakeDaemon:
+            rate_limit_at = 0.0
+            errors: list[str] = []
+            budget = {"graphql": {"remaining": 10, "limit": 5000, "reset": now + 60, "seenAt": now - 4000}}
+
+            def charge_rest(self, minute, n):  # the real one writes rest-spend.json
+                charged.append((minute, n))
+
+            def read_rate_limit(self):
+                read.append((self.now, self.tick_deadline))
+                self.charge_rest(1, 1)  # whatever the real read does, this copy must not write
+                self.rate_limit_at = self.now
+                self.budget = {"rest": {"remaining": 4458, "limit": 5000, "reset": self.now + 1500, "seenAt": self.now},
+                               "graphql": {"remaining": 2670, "limit": 5000, "reset": self.now + 1980,
+                                           "seenAt": self.now}}
+
+        with mock.patch.object(gg, "upstream_command", return_value=None):
+            answer = self.real_free(now, make=FakeDaemon)
+        self.assertEqual(charged, [])  # the session's own free read never charges the daemon's ledger
+        self.assertEqual(sorted(answer["readings"]), ["graphql", "rest"])
+        self.assertEqual(answer["readings"]["graphql"]["remaining"], 2670)
+        self.assertEqual(read[0][0], now)  # and it is bounded, so `budget` cannot hang on it
+        self.assertAlmostEqual(read[0][1] - time.monotonic(), gg.FREE_READ_BUDGET, delta=1.0)
+
+        class Stale(FakeDaemon):
+            def read_rate_limit(self):  # /rate_limit did not answer: the pre-loaded budget.json is not a reading
+                self.errors = ["rate_limit: 502 from GitHub"]
+
+        with mock.patch.object(gg, "upstream_command", return_value=None):
+            self.assertEqual(self.real_free(now, make=Stale), {"error": "502 from GitHub"})
+        # a host with no login of its own says so, and `budget` names the host that holds one as the next step
+        with mock.patch.object(gg, "upstream_command", return_value=["ssh", "far", "glaeda-gh"]):
+            answer = self.real_free(now, make=FakeDaemon)
+        self.assertIn("reads GitHub through its upstream", answer["error"])
+        doc = self.swept(self.no_graphql(now), now, answer)
+        self.assertIn("next: ask a host that holds the login", gg.account_unknown("graphql", doc))
+
+    def test_account_bucket_is_what_the_wait_side_asks(self) -> None:
+        """The one function a caller needs to name the bucket a read spends and when it resets, so a stale wait can
+        say "GraphQL 0/5000 until 10:38Z" instead of naming the invocation that just failed. It answers from the kept
+        sweep, so a poll may call it and it spends no quota in any case."""
+        now, swept = time.time(), []
+        reports = self.no_graphql(now)
+        free = {"readings": {"graphql": {"remaining": 0, "limit": 5000, "reset": now + 1980, "seenAt": now - 19}}}
+
+        def fetch(host: str, local: bool) -> dict:
+            swept.append(host)
+            return reports.get(host) or {"error": "unreachable (exit 4: x)"}
+
+        with mock.patch.object(gg, "fetch_host", fetch), \
+                mock.patch.object(gg, "spend_view", lambda: {"ok": False, "error": "no lane-gh here"}), \
+                mock.patch.object(gg, "free_account_reading", lambda clock, make=None: free):
+            got = gg.account_bucket("graphql", now)
+            again = gg.account_bucket("graphql", now + 1)  # the kept sweep, not a second one
+        self.assertEqual((got["remaining"], got["limit"], got["ageS"]), (0, 5000, 19.0))
+        self.assertTrue(got["spent"])
+        self.assertEqual((got["route"], got["host"], got["hardReserve"]), ("direct", "here", 500))
+        self.assertIn("GraphQL 0/5000 left", got["says"])
+        self.assertEqual(again["remaining"], 0)
+        self.assertEqual(len(swept), 3)  # one sweep for both asks
+        # and when the bucket cannot be read it carries the same sentence `budget` prints, never a made-up number
+        with mock.patch.object(gg, "fetch_host", fetch), \
+                mock.patch.object(gg, "spend_view", lambda: {"ok": False, "error": "no lane-gh here"}):
+            got = gg.account_bucket("graphql", now + 2 * gg.FLEET_BUDGET_TTL)
+        self.assertNotIn("remaining", got)
+        self.assertIn("hosts answered, none with a live reading", got["unknown"])
+
+    def test_a_kept_answer_whose_window_has_ended_says_that(self) -> None:
+        """budget_served drops a reading whose window has reset since the sweep. The host answers it carries are about
+        a window that is over, so replaying them would name hosts that have nothing to do with the current one; the
+        next step is bounded by the TTL after which a new sweep is taken (docs/handbook/wait-that-cannot-end.md)."""
+        now = time.time()
+        free = {"readings": {"graphql": {"remaining": 2670, "limit": 5000, "reset": now + 10, "seenAt": now}}}
+        self.swept(self.no_graphql(now), now, free)
+        doc = self.swept(self.no_graphql(now), now + 20, free)  # within the TTL: the kept answer, window now over
+        self.assertEqual(doc["at"], now)
+        self.assertEqual(doc["accountDropped"], ["graphql"])
+        self.assertNotIn("graphql", doc["account"])
+        said = gg.account_unknown("graphql", doc)
+        self.assertIn("the kept reading's window has reset since it was read", said)
+        self.assertIn(f"past the {gg.FLEET_BUDGET_TTL:g}s an answer is kept", said)
+        self.assertIn(said, "\n".join(gg.fleet_lines(doc)))
 
     def test_a_lane_vm_no_read_host_carries_is_read_itself_and_summed_once(self) -> None:
         """The coordinator, 2026-11-20: "budget can't read lane VMs ('no broker:VM row'), so the biggest spender is
