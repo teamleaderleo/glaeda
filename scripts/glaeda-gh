@@ -10531,6 +10531,18 @@ LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
 # requester's call.
 LAND_STEP_DRAFT = re.compile(r"\bPull Request is still a draft\b|\bpull request is in draft state\b"
                              r"|\bdraft pull requests? (?:cannot|can not|can't) be merged\b", re.I)
+# A merge conflict between a PR's base and its head is permanent at that head too, the same way: GitHub decides it
+# from the two trees, so the same update-branch (or merge) at the same head cannot answer anything else, and only a
+# push that resolves it can. efficiency-standing-lane, 2026-11-21: `land status` on big-red held four rows stopped
+# update_branch_refused on {"message":"merge conflict between base and head"} (HTTP 422), each after 6 identical
+# update-branch calls at one head -- 48 of the host's 57 conflict refusals that day were the 2nd through 6th of a
+# streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
+# sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
+# names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases or pushes anything:
+# that is a write on someone's branch, so it stays the requester's call, as the draft case stays theirs.
+LAND_STEP_CONFLICT = re.compile(r"\bmerge conflict between base and head\b"
+                                r"|\b(?:pull request|PR) has merge conflicts\b"
+                                r"|\bmerge conflicts? must be resolved\b", re.I)
 LAND_STEP_CLOSED = re.compile(r"\bPR #?\d+ is closed\b|\bpull request (?:#?\d+ )?(?:is|was) (?:closed|already merged)\b"
                               r"|\bwas already merged\b|\bpull request is not open\b|\bPR is (?:closed|not open)\b",
                               re.I)
@@ -13567,6 +13579,19 @@ class LandQueue:
             self.stop(e, f"{kind}_draft", f"the {kind} at {head[:12]} was refused while the PR is a draft: "
                       f"{land_trim(land_tail(out), 200)}",
                       f"gh pr ready {number} -R {repo}, then glaeda-gh land {name}")
+            return None
+        if LAND_STEP_CONFLICT.search(out) and not land_step_named(out):
+            # Permanent at this head (LAND_STEP_CONFLICT's comment): one refusal, and the stop names the one step.
+            # A conflict refusal that names a step this queue runs (an update-branch that could still merge the base
+            # in, a wait) keeps its old path: the named step is taken, as before.
+            self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
+            name = key_name(e["key"])
+            repo, _, number = name.partition("#")
+            self.stop(e, f"{kind}_conflict", f"the {kind} at {head[:12]} was refused for a merge conflict between the "
+                      f"base and the head: {land_trim(land_tail(out), 200)}",
+                      f"resolve the conflict: rebase the PR's branch onto its base (gh pr checkout {number} -R {repo}; "
+                      f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
+                      f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>")
             return None
         if LAND_STEP_CLOSED.search(out) and e.get("stateOpen") != head:
             # GitHub says the PR is closed: no refusal counted, its state read before anything else (state_first).
