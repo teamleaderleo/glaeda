@@ -10343,6 +10343,13 @@ LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's war
 # own update-branch, so it sat out LAND_HEAD_TIMEOUT and judged unpinned; cmux#44209's held 02:24Z data for hours.
 LAND_REFRESH_AFTER = float(UPSTREAM_DIRECT_AFTER)
 LAND_REFRESH_EVERY = float(STALE_DATA_AFTER)
+# A refresh holds a land worker for its whole read (direct_read, up to its 60 s bound), so one that keeps failing is
+# spaced out (refresh_spaced): its pace (a pin wait's and a queued entry's LAND_REFRESH_AFTER, a wait's
+# LAND_REFRESH_EVERY) doubles per failed refresh in a row, up to this; one that answers resets it. gcp-agent-lane-1,
+# 2026-11-21 19:22-20:31Z: cmuxterm-hq#17119's pin wait re-submitted a refresh every NUDGE_MIN while the upstream gave
+# no answer within 60 s, 35 refreshes in 70 min, all failed; one of the 4 workers was always on it while 33 lands sat
+# "due since ...: every worker busy" for up to 2.5 h.
+LAND_REFRESH_BACKOFF_MAX = 1800.0
 
 
 def land_judge(config: dict) -> tuple[Path | None, list[Path]]:
@@ -13327,9 +13334,11 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
+            elif len(self.jobs) < self.workers() and self.refresh_spaced(e, LAND_REFRESH_AFTER):
+                # no free worker, or the last refresh failed too recently (refresh_spaced): read on a later pass
                 w["readAt"] = self.now
-                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
+                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
+                                "fails": int((e.get("refresh") or {}).get("fails") or 0)}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
@@ -13386,17 +13395,28 @@ class LandQueue:
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
         urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
-        last = (e.get("refresh") or {}).get("at")
-        if isinstance(last, (int, float)) and self.now - last < (LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY):
+        if not self.refresh_spaced(e, LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY):
             return False
         if not self.reads_upstream():
             return False  # a host with its own login: the nudge (and the stale valve) refresh it
         if len(self.jobs) >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
-        e["refresh"] = {"at": self.now, "age": round(self.now - at)}
+        e["refresh"] = {"at": self.now, "age": round(self.now - at),
+                        "fails": int((e.get("refresh") or {}).get("fails") or 0)}
         self.save(e)
         self.submit(e["key"], self.refresh_job, e["key"])
         return True
+
+    def refresh_spaced(self, e: dict, every: float) -> bool:
+        """Whether E's last refresh through the upstream started long enough ago for another: EVERY after one that
+        answered, doubled per failed refresh in a row up to LAND_REFRESH_BACKOFF_MAX (see there), so a PR the upstream
+        cannot read stops holding a land worker every pass."""
+        r = e.get("refresh") or {}
+        last = r.get("at")
+        if not isinstance(last, (int, float)) or isinstance(last, bool):
+            return True
+        fails = min(int(r.get("fails") or 0), 16)
+        return self.now - last >= min(every * 2 ** fails, max(every, LAND_REFRESH_BACKOFF_MAX))
 
     def refresh_job(self, key: str) -> None:
         error = self.refresh(key)
@@ -13404,7 +13424,9 @@ class LandQueue:
             e = self.entries.get(key)
             if e is None:
                 return
-            e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
+            prev = e.get("refresh") or {}
+            e["refresh"] = {**prev, "error": land_trim(error, 160) if error else None,
+                            "fails": int(prev.get("fails") or 0) + 1 if error else 0}
             log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error})
             self.save(e)
 

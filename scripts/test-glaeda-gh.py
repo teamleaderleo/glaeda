@@ -21578,7 +21578,9 @@ class LandTest(Base):
         self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
         self.w.view_err = "gh: rest: HTTP 403 read Apps busy"
         self.tick()
-        for _ in range(60):
+        # 50 x 100 s: under the 8 unreadable state reads in a row that stop it (about 5,800 s in, now that its failed
+        # refreshes back off and no longer skip a pass every 600 s; 6,000 s before)
+        for _ in range(50):
             e = self.tick(100)
         self.assertEqual(e["state"], "waiting")
         self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)  # never sent again while unreadable
@@ -25556,6 +25558,34 @@ class LandTest(Base):
         self.tick(1)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual(self.w.refreshed, [self.KEY])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assert_merged_at(LB)
+
+    def test_a_pinned_land_whose_refresh_keeps_failing_backs_off(self):
+        """gcp-agent-lane-1, 2026-11-21: cmuxterm-hq#17119's pin wait re-submitted a refresh every NUDGE_MIN while the
+        upstream gave no answer, 35 failed refreshes in 70 min, so one of the 4 land workers was always on it. A refresh
+        that failed waits LAND_REFRESH_AFTER, doubled per failure in a row, before the next; one that answers resets
+        it."""
+        self.upstream = True
+        self.fresh_head = None  # every refresh fails
+        self.pr(LA)
+        self.land_pinned(LB)
+        e = self.tick(1)
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual(e["refresh"]["fails"], 1)
+        for _ in range(int(2 * gg.LAND_REFRESH_AFTER // gg.NUDGE_MIN) - 1):  # under 2x LAND_REFRESH_AFTER
+            self.tick(gg.NUDGE_MIN)
+        self.assertEqual(self.w.refreshed, [self.KEY], "a failed refresh is not re-sent every NUDGE_MIN")
+        e = self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(self.w.refreshed, [self.KEY] * 2)
+        self.assertEqual(e["refresh"]["fails"], 2)
+        self.tick(2 * gg.LAND_REFRESH_AFTER)
+        self.assertEqual(len(self.w.refreshed), 2, "the second failure doubles the pace again")
+        self.fresh_head = LB
+        e = self.tick(2 * gg.LAND_REFRESH_AFTER + 1)
+        self.assertEqual(len(self.w.refreshed), 3)
+        self.assertEqual(e["refresh"]["fails"], 0)
         self.w.answers.append(ok_answer(LB))
         self.tick(1)
         self.assert_merged_at(LB)
