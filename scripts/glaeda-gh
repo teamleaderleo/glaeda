@@ -7861,7 +7861,7 @@ class Daemon:
         """app_entries_eligible asked per owner, unioned in ENTRIES' order. It builds one representative request for
         the whole set, so a set that mixes owners is eligible for nothing at all (AppPool.owner_of returns None for a
         cross-owner query): one watch on an account with no App installed made every App-servable watch beside it
-        ineligible too, and under a login stop due() then read none of them. big-red 2026-11-21 11Z watched 18
+        ineligible too, and under a login stop due() then read none of them. One dev host, 2026-11-21 11Z, watched 18
         manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
         groups: dict[str, list[dict]] = {}
         for e in entries:
@@ -7900,7 +7900,7 @@ class Daemon:
             # One owner per query. An App installation answers a read only when the whole query names one owner
             # (AppPool.owner_of returns None for a cross-owner body), so a batch that mixes owners has no App and
             # all of it -- the App-servable entries included -- goes on the shared login's 5,000 points an hour
-            # while the role Apps hold 12,500 each. big-red 2026-11-21 11Z: 18 manaflow-ai and 14 teamleaderleo
+            # while the role Apps hold 12,500 each. One dev host, 2026-11-21 11Z: 18 manaflow-ai and 14 teamleaderleo
             # watches interleaved at GQL_BATCH 15, so 108 of the hour's 163 login GraphQL points were spent by
             # cross-owner batches and only 5 by a manaflow-ai batch an App could take. Grouping costs one query per
             # owner (a query is a point at most, and an App's costs the login nothing).

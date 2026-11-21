@@ -27313,7 +27313,7 @@ class AppPoolTest(Base):
     def test_a_mixed_owner_set_below_the_reserve_reads_the_app_owners_instead_of_nothing(self) -> None:
         """One watch on an account with no App installed (teamleaderleo) made every App-servable watch beside it
         ineligible too, because eligibility builds one query for the whole set and AppPool.owner_of refuses a
-        cross-owner query: under a login stop the daemon then read none of them. big-red 2026-11-21 11Z watched 18
+        cross-owner query: under a login stop the daemon then read none of them. One dev host, 2026-11-21 11Z, watched 18
         manaflow-ai and 14 teamleaderleo keys, so no PR set was ever eligible."""
         self.daemon.budget = {
             "rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][1] - 1, "reset": NOW + 900},
@@ -27331,7 +27331,7 @@ class AppPoolTest(Base):
 
     def test_a_graphql_batch_never_mixes_owners_so_the_app_can_take_it(self) -> None:
         """A batch that mixes owners has no App and all of it goes on the login's 5,000 points an hour while the role
-        Apps hold 12,500 each: 108 of big-red's 163 login GraphQL points in the 2026-11-21 11Z hour were spent by
+        Apps hold 12,500 each: 108 of one dev host's 163 login GraphQL points in the 2026-11-21 11Z hour were spent by
         cross-owner batches."""
         keys = [f"pr:manaflow-ai/cmux#{i}" if i % 2 else f"pr:teamleaderleo/glaeda#{i}" for i in range(1, 13)]
         entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
