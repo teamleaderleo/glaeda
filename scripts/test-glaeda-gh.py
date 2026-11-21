@@ -24048,6 +24048,75 @@ class LandTest(Base):
         self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
         self.assert_merged_at(LB)
 
+    # -- land --match-head-commit SHA against a cache that still shows the head before it (huge-blue, 2026-11-21)
+
+    def land_pinned(self, pin: str) -> None:
+        gg.land_request("land", "o/r#1", [], "host/lane", pin=pin)
+
+    def test_a_pinned_land_never_judges_the_cached_head_before_the_pin(self):
+        """leo-workspace#7221, 2026-11-21 10:56Z: 53fa5568 pushed, `land --match-head-commit 53fa5568` stopped within a
+        minute on "conflict" at 0eb40dbac8fb, the cache's 5-minute-old head, which had a real conflict. A pinned land
+        reads the PR first and judges the pinned head, never the cached one it was not asked about."""
+        self.pr(LA)
+        self.github_head[self.KEY] = LB  # pushed: the cache still says LA
+        self.land_pinned(LB[:8])
+        self.assertEqual(json.loads(next(gg.LandQueue.requests_dir().glob("*.json")).read_text())["pin"], LB[:8])
+        e = self.tick(1)  # the nudge's read shows LB: nothing judged at LA (its conflict would have stopped it)
+        self.assertEqual(self.w.explains(), [])
+        self.assertIn(self.KEY, self.w.nudged)
+        self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
+        self.assertNotEqual(e["state"], "stopped")
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(1)
+        self.assertIn("pin_seen", [h.get("event") for h in e["history"]])
+        self.assertNotIn("pin", e)
+        self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
+        self.assert_merged_at(LB)
+
+    def test_a_pinned_land_waits_for_a_read_with_no_judgment(self):
+        """No read answers the nudge yet: the entry waits (re-nudged every NUDGE_MIN), judging nothing; the read that
+        shows the pinned head is judged."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        e = self.tick(1)
+        for _ in range(int(gg.NUDGE_MIN * 2) + 1):
+            e = self.tick(1)
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual(e["state"], "queued")
+        self.assertGreaterEqual(self.w.nudged.count(self.KEY), 3)
+        self.assertLessEqual(self.w.nudged.count(self.KEY), 4)
+        self.pr(LB)
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assert_merged_at(LB)
+
+    def test_a_pinned_land_stops_when_a_fresh_read_shows_another_head(self):
+        """A read made since the request shows a head that is not the pin: it refuses, as the CLI's pin check does,
+        and names the head to pin instead. Nothing is judged."""
+        self.pr(LA)
+        self.github_head[self.KEY] = LC
+        self.land_pinned(LB)
+        self.tick(1)  # the nudge's read shows LC
+        e = self.tick(1)
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--match-head-commit {LC}", e["stop"]["next"])
+
+    def test_a_pinned_land_on_an_upstream_host_refreshes_the_pr(self):
+        """A host that reads PRs through an upstream: the read is a refresh through it (the broker's quota-aware path),
+        not a nudge, and the pinned head it shows is judged."""
+        self.upstream = True
+        self.fresh_head = LB
+        self.pr(LA)
+        self.land_pinned(LB)
+        self.tick(1)
+        self.assertEqual(self.w.explains(), [])
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assert_merged_at(LB)
+
     def test_a_cached_head_no_read_confirms_is_judged_unpinned(self):
         """No read since the latch cleared (the nudge goes unanswered): after LAND_FRESH_WAIT land_judge is asked with
         no --sha and reads the head itself, never the cache's old one."""
