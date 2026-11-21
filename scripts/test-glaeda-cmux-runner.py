@@ -9036,11 +9036,16 @@ class HostLoadCapTest(unittest.TestCase):
 
     def poll(self) -> str | None:
         """Three looks: two reads make a mean, the first over the cap starts the feed read (waited for), the last
-        decides with it."""
+        decides with it. The last look is waited for too, after the decision it returns: cap_look() starts nothing
+        while the previous cap_thread is alive (glaeda#2386), so a look left running here swallows whatever the body
+        calls next - its own load_capped(), or the one it makes after patching what the look reads. Waiting here, not
+        in each body, is what keeps a body that forgets from failing only under load."""
         for _ in range(2):
             self.gate.load_capped()
             self.join()
-        return self.gate.load_capped()
+        why = self.gate.load_capped()
+        self.join()
+        return why
 
     def join(self) -> None:
         # A loaded CI runner can take past 5 s here (glaeda#2108 and #2110, 3 of 4 runs): the next look then judged
