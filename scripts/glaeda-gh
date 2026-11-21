@@ -19035,6 +19035,8 @@ def hhmm(epoch: Any) -> str:
 
 
 POOL_NAMES = {"rest": "REST", "graphql": "GraphQL"}
+# Where settle_counters keeps each bucket's live counters; rest_counters(budget, key) reads them.
+COUNTER_KEYS = {"rest": "restCounters", "graphql": "graphqlCounters"}
 
 
 def view_lines(view: dict) -> list[str]:
@@ -19271,9 +19273,17 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
-            counters = [c for c in rest_counters(budget) if c["reset"] > time.time()] if bucket == "rest" else []
+            # Both buckets answer from two counters with their own windows (settle_counters), and GET /rate_limit
+            # reports only one of them, so a reader who cross-checks this line against /rate_limit can see a rich
+            # counter while the one their reads actually spend is at zero -- 2026-11-21: `budget` said GraphQL 0 left
+            # resetting 11:38Z while /rate_limit said 4751 left resetting 12:02Z, and four parked waits were stopped
+            # as "stale" on the strength of it. Both were true. Name every live counter for GraphQL too, so the split
+            # is visible here instead of looking like a disagreement between two tools.
+            counters = [c for c in rest_counters(budget, COUNTER_KEYS[bucket]) if c["reset"] > time.time()]
             if len(counters) > 1:
-                print("         core counters (the poorest is the one above): " + "; ".join(
+                label = "core" if bucket == "rest" else POOL_NAMES[bucket]
+                print(f"         {label} counters (the poorest is the one above, and the one a read is refused "
+                      f"against): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
                     f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
         paths, reads = status.get("paths"), status.get("reads")

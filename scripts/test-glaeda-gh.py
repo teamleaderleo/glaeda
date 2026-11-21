@@ -6182,6 +6182,56 @@ class BudgetOutputTest(Base):
         finally:
             lock.close()
 
+    def budget_text(self) -> str:
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(False)
+            return out.getvalue()
+        finally:
+            lock.close()
+
+    def test_a_second_live_graphql_counter_is_named_beside_the_reading(self) -> None:
+        """2026-11-21: `budget` said GraphQL 0 left resetting 11:38Z while GET /rate_limit said 4751 left resetting
+        12:02Z. Both were true -- one token's GraphQL is answered from two counters with their own windows and
+        /rate_limit reports only one -- but `budget` named only the poorest, so the pair read as two tools
+        disagreeing, and four correctly parked waits were stopped as "stale". Name every live counter."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 600, "seenAt": NOW - 10},
+            "graphqlCounters": [{"limit": 5000, "remaining": 0, "reset": NOW + 600, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4751, "reset": NOW + 2040, "seenAt": NOW - 10}]})
+        text = self.budget_text()
+        self.assertIn("graphql  0/5000 left", text)  # the reading stays the counter that refuses a read
+        line = next(ln for ln in text.splitlines() if "counters (the poorest" in ln)
+        self.assertIn("GraphQL counters", line)  # not "core", which is REST's name for them
+        self.assertIn("0/5000 until", line)
+        self.assertIn("4751/5000 until", line)
+        self.assertIn("the one a read is refused against", line)
+
+    def test_one_live_graphql_counter_prints_no_split_line(self) -> None:
+        """Nothing to disambiguate when the bucket has a single live counter, including a second whose window ended."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": 12, "reset": NOW + 600, "seenAt": NOW - 10},
+            "graphqlCounters": [{"limit": 5000, "remaining": 12, "reset": NOW + 600, "seenAt": NOW - 10},
+                                {"limit": 5000, "remaining": 4900, "reset": NOW - 30, "seenAt": NOW - 900}]})
+        text = self.budget_text()
+        self.assertIn("graphql  12/5000 left", text)
+        self.assertNotIn("counters (the poorest", text)
+
+    def test_rest_counters_keep_their_core_label(self) -> None:
+        """The REST line this change generalised still reads as it did."""
+        gg.write_json(gg.BASE / "budget.json", {
+            "rest": {"limit": 5000, "remaining": 120, "reset": NOW + 600, "seenAt": NOW - 10},
+            "restCounters": [{"limit": 5000, "remaining": 120, "reset": NOW + 600, "seenAt": NOW - 10},
+                             {"limit": 5000, "remaining": 4000, "reset": NOW + 2040, "seenAt": NOW - 10}]})
+        line = next(ln for ln in self.budget_text().splitlines() if "counters (the poorest" in ln)
+        self.assertIn("core counters", line)
+        self.assertIn("120/5000 until", line)
+        self.assertIn("4000/5000 until", line)
+
 
 class FleetBudgetTest(Base):
     """`budget` across hosts: who spent the shared login's quota this hour, per host and caller (fleet_budget)."""
