@@ -7345,7 +7345,8 @@ class Daemon:
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
         self.upstream_refuse_posts()
-        entries = self.watches()
+        with self.phase("watches"):
+            entries = self.watches()
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
         for e in entries:
@@ -7373,7 +7374,8 @@ class Daemon:
             for part in ([e for e in due if not e["key"].startswith("head:")],
                          [e for e in due if e["key"].startswith("head:")]):
                 if part:
-                    self.upstream_read(ask, part)
+                    with self.phase("read upstream"):
+                        self.upstream_read(ask, part)
                     if self.upstream_status.get("state") == "failing":
                         failed = failed or self.upstream_status
             if failed is not None:
@@ -11269,19 +11271,27 @@ class LandQueue:
         self.pass_latched = 0
         self.pass_staggered = 0
         self.pass_capped = 0
-        for key in sorted(self.entries, key=self.judge_order):
+        # The rows this pass can judge, named before it prunes or re-arms anything, so a re-armed entry is judged from
+        # the next pass as it always was. judge_order reads a cache file per row it sorts: a finished row (LAND_DONE
+        # for up to LAND_KEEP, 7 days) or one a worker already holds would pay for that read and then be skipped on
+        # the first lines of the body. gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished, sorted every
+        # TICK (2s) -- 72,900 cache file reads per 600s window at 0.30 ms each, and the daemon's own row read "ticks
+        # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
+        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]
+        for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
-                if e["state"] in LAND_DONE:
-                    if self.now - float(e.get("updated") or 0) > LAND_KEEP:
-                        (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
-                        del self.entries[key]
-                    elif e["state"] == "stopped" and key not in self.jobs:
-                        with self.lock:
-                            self.rearm(e)  # judged from the next pass
-                    continue
-                if key in self.jobs:
-                    continue
+                if self.now - float(e.get("updated") or 0) > LAND_KEEP:
+                    (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
+                    del self.entries[key]
+                elif e["state"] == "stopped" and key not in self.jobs:
+                    with self.lock:
+                        self.rearm(e)  # judged from the next pass
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        for key in sorted(live, key=self.judge_order):
+            try:
+                e = self.entries[key]
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
                     with self.lock:

@@ -1838,6 +1838,16 @@ class UpstreamTest(Base):
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
 
+    def test_an_upstream_ticks_phases_are_timed_so_the_row_says_where_they_went(self) -> None:
+        """An upstream host's tick returns before every phase a login host wraps, so progress() measured only the
+        three in finish_tick and "most in <phase>" named the biggest of those. gcp-agent-lane-11, 2026-11-21: six
+        daemons said "ticks spent 22.2s, most in land (21.9s)" with 2.2% of the window measured, and the sentence
+        sent a diagnosis at the land queue while the reads it names happen in upstream_read, untimed."""
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 30, "error": None}
+        self.daemon.tick(now=NOW)
+        self.assertLessEqual({"watches", "read upstream"}, set(self.daemon.progress()["spentS"]))
+
     def test_a_failed_pr_read_is_not_called_ok_by_the_head_read_after_it(self) -> None:
         """glaeda#1949: the PR and run read failed, the head read in the same tick succeeded, and upstream_status
         ended "ok". The stale alarm holds only for an "ok" upstream, so it stayed quiet through a real outage."""
@@ -20647,6 +20657,32 @@ class LandTest(Base):
         pool = self.pooled(1)  # the restart
         self.tick()
         self.assertEqual(pool.keys(), ["pr:o/r#5"])
+
+    def test_a_finished_land_costs_the_pass_no_cache_read(self):
+        """judge_order reads a cache file per row it sorts, so a pass sorts only the rows it can judge.
+
+        gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished (LAND_DONE rows stay for LAND_KEEP, 7 days)
+        and sorted every TICK -- 72,900 cache file reads per 600 s window at 0.30 ms each, which is the whole of the
+        21.9 s the daemon's row charged to "land". The finished rows are still pruned and re-armed, off the sort."""
+        self.five_snapped()
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        done = {f"pr:o/r#{n}" for n in (1, 2, 3)}
+        for key in done:
+            e = self.q.entries[key]
+            e["state"], e["updated"] = "merged", self.t
+            self.q.save(e)
+        reads: list[str] = []
+        real = self.q.cache_of
+        self.q.cache_of = lambda key: (reads.append(key), real(key))[1]
+        self.tick()
+        self.assertEqual([k for k in reads if k in done], [])
+        self.assertEqual(set(self.q.entries) & done, done)  # kept on disk until LAND_KEEP, as before
+        # and a finished row past LAND_KEEP is still pruned, though no pass sorted it (save stamps updated: age it
+        # by ticking, never by writing a time save would overwrite)
+        self.tick(gg.LAND_KEEP + 1)
+        self.assertEqual(set(self.q.entries) & done, set())
 
     def test_a_clean_green_pr_takes_the_next_worker_first(self):
         self.five_snapped()
