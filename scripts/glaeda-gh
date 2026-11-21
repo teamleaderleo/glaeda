@@ -2545,6 +2545,11 @@ def gh_token() -> str:
 # the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
 # not charged to restShare and their rate headers are not the login's budget: daemon.json appPool says what they spent.
 APP_POOL_ROLE = "ci-watch"
+# Spare App pools (Leo, 2026-11-20: the login's GraphQL was spent, "0 left", while one App pool served every read): a
+# read goes to the first pool of the chain that holds a token, covers the route and is not resting, so a second App
+# (its role in machines/gh-app-roles.json, its token pushed by the key home) is another 12,500 an hour. Comma list of
+# roles after the primary; GLAEDA_GH_APP_SPARES="" turns the spares off.
+APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", "quota-goblin") or "").replace(" ", "").split(",") if r)
 APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config/gh-app-tokens")
 APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
 APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
@@ -2633,6 +2638,18 @@ class AppPool:
         self.graphql_points = 0
         self.graphql_seen: dict | None = None
         self.source = ""  # "key" (the App's key is here) or "pushed" (a read-only token the key home pushed)
+        self.spares: list[AppPool] = []  # pools tried after this one's (never nested: a spare has none)
+
+    def with_spares(self, roles: "tuple[str, ...] | list[str]") -> "AppPool":
+        self.spares = [AppPool(role=r, clock=self.clock) for r in roles if r != self.role]
+        return self
+
+    def pick(self, owner: str, scope: str) -> "AppPool | None":
+        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE."""
+        for pool in [self, *self.spares]:
+            if pool.covers(scope) and pool.token(owner):
+                return pool
+        return None
 
     def held_here(self) -> bool:
         """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
@@ -2778,7 +2795,8 @@ class AppPool:
         return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
                 "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
-                "graphqlSeen": self.graphql_seen}
+                "graphqlSeen": self.graphql_seen,
+                **({"spares": [p.status() for p in self.spares]} if self.spares else {})}
 
     def graphql_answered(self, rate: dict, points: int) -> None:
         """Keep an App GraphQL answer in the App pool; it must never become the login's budget or pacing data."""
@@ -4091,7 +4109,9 @@ class Daemon:
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
-        self.app_pool: AppPool | None = AppPool(clock=lambda: self.clock()) if app_pool == "auto" else app_pool
+        self.app_pool: AppPool | None = (
+            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES) if app_pool == "auto" else app_pool)
+        self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
@@ -5369,8 +5389,11 @@ class Daemon:
                  and not self.writing else None)
         route = route_of(method, path)
         scope = pool.scope(owner, method, path, body) if owner else ""
-        app_token = pool.token(owner) if owner and pool.covers(scope) else None
+        chosen = pool.pick(owner, scope) if owner else None
+        app_token = chosen.token(owner) if chosen else None
         if app_token:
+            pool = chosen
+            self.last_app_pool = chosen
             self.last_request_source = "app"
             headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
                        "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
@@ -5407,6 +5430,9 @@ class Daemon:
                 self.sent.append((self.now, "app"))
                 return status, h, doc
             log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
+            if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
+                # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
+                return self.request(method, path, body, etag, free, content)
             # refused: the same read goes on the login at once, as it would have without the App
             self.last_request_source = "login"
             if self.mode(bucket) == "stop" and self.clock() >= self.secondary_until:
@@ -7682,7 +7708,7 @@ class Daemon:
         if owner is None:
             return []
         scope = pool.scope(owner, method, path, body)
-        if pool.token(owner) is None or not pool.covers(scope):
+        if pool.pick(owner, scope) is None:
             return []
         return entries
 
@@ -8029,8 +8055,8 @@ class Daemon:
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
         if self.last_request_source == "app":
             # The App has its own GraphQL bucket. Do not let its rateLimit answer stop or pace the login.
-            if self.app_pool is not None:
-                self.app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
+            if self.last_app_pool is not None:
+                self.last_app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
             self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
             self.note_spend("graphql", self.gql_reason, 1, points)
@@ -18273,7 +18299,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                   f"{hour.get('kept', 0)} completed-attempt job lists answered from disk (no request)"
                   + (f", {hour['app']} REST on the {APP_POOL_ROLE} App (not the login)" if hour.get("app") else ""))
         pool = status.get("appPool")
-        if isinstance(pool, dict):
+        for pool in ([pool, *(pool.get("spares") or [])] if isinstance(pool, dict) else []):
             seen = pool.get("seen") if isinstance(pool.get("seen"), dict) else {}
             print(f"{pool.get('role', APP_POOL_ROLE)} App pool: {pool.get('served', 0)} reads served, "
                   f"{pool.get('fellBack', 0)} sent again on the login"
