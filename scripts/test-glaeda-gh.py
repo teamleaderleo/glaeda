@@ -7,6 +7,7 @@ import base64
 import collections
 import contextlib
 import copy
+import datetime as dt
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -158,6 +159,81 @@ def graphql_requests(query: str, lists: dict[str, int] | None = None) -> int:
 def graphql_cost(query: str, lists: dict[str, int] | None = None) -> int:
     """GitHub's points for QUERY: its requests over 100, rounded, and at least 1."""
     return max(1, round(graphql_requests(query, lists) / 100))
+
+
+class InheritedRedTest(unittest.TestCase):
+    """A red the base also has (next-autoland's base-red set) is named inherited, apart from the PR's own reds, so
+    an agent does not push or re-run for it (hq bottleneck doc 2026-11-21: 2,427 heads re-pushed for base reds)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="glaeda-gh-test-base-reds-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patcher = mock.patch.object(gg, "BASE", Path(self.dir))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = time.time()
+        self.reads = []
+
+    def report(self, reds, age=60):
+        at = dt.datetime.fromtimestamp(self.now - age, dt.timezone.utc).isoformat()
+
+        def reader(repo, ref, path):
+            self.reads.append((repo, ref, path))
+            return {"at": at, "base_reds": reds}
+        return reader
+
+    def data(self, base="feat-cmux-next"):
+        def run(name, conclusion, workflow="cmux-next"):
+            return {**check_run(name, conclusion=conclusion),
+                    "checkSuite": {"workflowRun": {"databaseId": 7, "event": "pull_request",
+                                                   "workflow": {"name": workflow, "databaseId": 1}}}}
+        node = pr_node(1, rollup="FAILURE", checks=[run("cmux-next checks", "FAILURE"), run("lint", "FAILURE"),
+                                                     run("web", "CANCELLED"), run("ok", "SUCCESS")])
+        node["url"] = "https://github.com/manaflow-ai/cmux/pull/1"
+        node["baseRefName"] = base
+        return gg.parse_pr(node)
+
+    def test_a_red_in_the_base_set_is_inherited_and_the_rest_stay_own(self):
+        reds = gg.base_reds("manaflow-ai/cmux", "feat-cmux-next", self.now,
+                            reader=self.report(["cmux-next / cmux-next checks \u203a Crash safety", "cmux-next / web"]))
+        data = self.data()
+        failed = gg.classify(data, self.now)["failed"]
+        own, inherited = gg.split_inherited(data, failed, self.now, reds)
+        self.assertEqual([gg.label(c) for c in inherited], ["cmux-next / cmux-next checks"])
+        # a cancelled check is never a base red, even when its name is in the set
+        self.assertEqual(sorted(gg.label(c) for c in own), ["cmux-next / lint", "cmux-next / web"])
+
+    def test_the_summary_lists_inherited_reds_with_do_nothing_advice(self):
+        reader = self.report(["cmux-next / cmux-next checks", "cmux-next / lint"])
+        with mock.patch.object(gg, "read_base_reds_report", reader):
+            data = self.data()
+            data["checks"] = [c for c in data["checks"] if c.get("name") != "web"]
+            text = gg.summary("pr:manaflow-ai/cmux#1", {"data": data})
+        self.assertIn("inherited from feat-cmux-next: ", text)
+        self.assertIn("Do not push, re-run or chase it", text)
+        self.assertIn("every red here is inherited", text)
+        self.assertNotIn("  failed: cmux-next / lint", text)
+
+    def test_one_read_per_ttl_and_a_stale_report_marks_nothing(self):
+        reader = self.report(["cmux-next / lint"], age=gg.BASE_REDS_MAX_AGE + 60)
+        self.assertIsNone(gg.base_reds("manaflow-ai/cmux", "feat-cmux-next", self.now, reader=reader))
+        self.assertIsNone(gg.base_reds("manaflow-ai/cmux", "feat-cmux-next", self.now + 10, reader=reader))
+        self.assertEqual(len(self.reads), 1)
+        fresh = self.report(["cmux-next / lint"])
+        got = gg.base_reds("manaflow-ai/cmux", "feat-cmux-next", self.now + gg.BASE_REDS_TTL + 1, reader=fresh)
+        self.assertEqual(got, frozenset({"cmux-next / lint"}))
+
+    def test_no_source_for_the_base_or_an_unread_report_marks_nothing(self):
+        self.assertIsNone(gg.base_reds("manaflow-ai/cmux", "main", self.now, reader=self.report(["x"])))
+        self.assertIsNone(gg.base_reds("o/r", "feat-cmux-next", self.now, reader=self.report(["x"])))
+        self.assertEqual(self.reads, [])
+        self.assertIsNone(gg.base_reds("manaflow-ai/cmux", "feat-cmux-next", self.now, reader=lambda *a: None))
+
+    def test_the_field_view_has_own_and_inherited(self):
+        with mock.patch.object(gg, "read_base_reds_report", self.report(["cmux-next / lint"])):
+            view = gg.status_view("pr:manaflow-ai/cmux#1", {"data": self.data()})
+        self.assertEqual(gg.field_text(view["checks"]["inherited"]), "lint")
+        self.assertIn("cmux-next checks", gg.field_text(view["checks"]["own"]))
 
 
 class AgentSummaryTest(unittest.TestCase):
@@ -4855,7 +4931,7 @@ class ClientTest(Base):
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1)))
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
             self.status("pr", "o/r#1", False, False, fields=["hed"])
-        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, passed"):
+        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, inherited, own, passed"):
             self.status("pr", "o/r#1", False, False, fields=["checks.red"])
         # a PR with no data yet refuses the typo too, rather than printing an empty column
         with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):

@@ -991,7 +991,7 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
-headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
+headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
@@ -3407,7 +3407,8 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
     return {"number": pull.get("number"), "url": pull.get("html_url"), "title": pull.get("title"), "state": state,
             "isDraft": bool(pull.get("draft")), "merged": bool(pull.get("merged")), "mergedAt": pull.get("merged_at"),
             "mergeable": mergeable, "mergeStateStatus": upper(pull.get("mergeable_state")) or "UNKNOWN",
-            "headRefOid": head.get("sha"), "headRefName": head.get("ref"), "reviewDecision": review,
+            "headRefOid": head.get("sha"), "headRefName": head.get("ref"),
+            "baseRefName": (pull.get("base") or {}).get("ref"), "reviewDecision": review,
             "updatedAt": pull.get("updated_at"),
             "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": sorted(required)}, "rules": {"nodes": []}},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]}}
@@ -3595,7 +3596,7 @@ def parse_pr(node: dict) -> dict:
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
-        "headRefName": node.get("headRefName"),
+        "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
@@ -15554,6 +15555,80 @@ def label(c: dict) -> str:
     return f"{c['workflow']} / {c.get('name')}" if c.get("workflow") else str(c.get("name"))
 
 
+# A red the PR's base also has is not the PR's to fix. cmuxterm-hq docs/ci/bottleneck-and-skip-candidates-2026-11-21.md:
+# over 11-13..19, 3,765 PR heads were red only because of the base (25% of PR runner-minutes, 35% on 11-16/17), and
+# 2,427 of them were pushed again, each push running the whole suite again. Leo, 2026-11-21: "we need to be hitting a
+# 10x improvement in not running useless jobs". So `status pr` names those reds inherited and says do nothing.
+# The set is the lander's own: next-autoland's `base_reds` (the reds it excuses when it lands a PR), read from its
+# pass report on the cmuxterm-hq reconciler-state branch, so an agent reads what the lander decides, not a second
+# guess. One REST read per BASE_REDS_TTL per host (BASE/base-reds.json); a report older than BASE_REDS_MAX_AGE is no
+# evidence (next-autoland's own rule for base-red-watch's file), and an unread one marks nothing. land-judge still
+# judges each red at the merge (the shared classifier, per step and per test): this only stops the re-push.
+BASE_REDS_SOURCES = {("manaflow-ai/cmux", "feat-cmux-next"):
+                     ("manaflow-ai/cmuxterm-hq", "reconciler-state/next-autoland", "report.json")}
+BASE_REDS_TTL = 300
+BASE_REDS_MAX_AGE = 1800
+BASE_REDS_READ_S = 15
+INHERITED_ADVICE = ("red on the base too (next-autoland's base-red set): not yours. Do not push, re-run or chase it; "
+                    "the base's fix or revert clears it, and land-judge excuses it at the merge")
+
+
+def read_base_reds_report(repo: str, ref: str, path: str) -> dict | None:
+    """REPO's PATH at REF (the lander's pass report) as JSON, or None when it cannot be read in BASE_REDS_READ_S."""
+    try:
+        done = subprocess.run(["gh", "api", f"repos/{repo}/contents/{path}?ref={ref}",
+                               "-H", "Accept: application/vnd.github.raw"],
+                              capture_output=True, text=True, timeout=BASE_REDS_READ_S)
+        doc = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def base_reds(repo: str, base: str | None, now: float | None = None, reader=None) -> frozenset[str] | None:
+    """The checks red on BASE of REPO now, as the lander reads them ("workflow / job", or "workflow / job > step"),
+    or None: no source for that base, the report unread, or older than BASE_REDS_MAX_AGE."""
+    source = BASE_REDS_SOURCES.get((repo, base or ""))
+    if not source:
+        return None
+    now = time.time() if now is None else now
+    path = BASE / "base-reds.json"
+    kept = read_json(path)
+    kept = kept if isinstance(kept, dict) else {}
+    key = f"{repo}:{base}"
+    entry = kept.get(key)
+    if not isinstance(entry, dict) or not (0 <= now - float(entry.get("readAt") or 0) < BASE_REDS_TTL):
+        doc = (reader or read_base_reds_report)(*source)
+        entry = {"readAt": now, "at": (doc or {}).get("at"), "reds": (doc or {}).get("base_reds")}
+        kept[key] = entry
+        try:
+            write_json(path, kept)
+        except OSError:
+            pass  # an unwritable cache only costs the next caller its own read
+    at = iso_epoch(entry.get("at")) if entry.get("at") else None
+    reds = entry.get("reds")
+    if at is None or now - at > BASE_REDS_MAX_AGE or not isinstance(reds, list):
+        return None
+    return frozenset(str(r) for r in reds)
+
+
+def inherited(c: dict, reds: frozenset[str] | None) -> bool:
+    """A failed (not cancelled or timed out) check whose job, or one of its steps, is in the base-red set REDS."""
+    if not reds or (c.get("conclusion") or "").upper() != "FAILURE":
+        return False
+    name = label(c)
+    return name in reds or any(r.startswith(f"{name} \u203a ") for r in reds)
+
+
+def split_inherited(data: dict, failed: list[dict], now: float | None = None,
+                    reds: frozenset[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """FAILED as (own, inherited) for the PR DATA: inherited when its base's red set has it (base_reds)."""
+    if reds is None and failed:
+        reds = base_reds(pr_repo(data), data.get("baseRefName"), now)
+    own = [c for c in failed if not inherited(c, reds)]
+    return own, [c for c in failed if inherited(c, reds)]
+
+
 def steps_note(c: dict) -> str:
     names = c.get("failedSteps") or []
     if not names:
@@ -15637,13 +15712,20 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             cut = straggler_cut(data, now)
             lines += straggler_lines(cut if cut is not None else data, now)
         # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
-        bad = sorted(groups["failed"], key=lambda c: (marked and not c.get("required"),
-                                                      str(c.get("conclusion") or "").lower() == "cancelled"))
+        own_failed, inherited_failed = split_inherited(data, groups["failed"], now)
+        bad = sorted(own_failed, key=lambda c: (marked and not c.get("required"),
+                                                str(c.get("conclusion") or "").lower() == "cancelled"))
         for c in bad[:shown_failed]:
             optional = " (not required)" if marked and not c.get("required") else ""
             lines.append(f"  {outcome(c.get('conclusion'))}: {label(c)}{steps_note(c)}{optional}  {c.get('url') or ''}".rstrip())
         if len(bad) > shown_failed:
             lines.append(f"  ... {len(bad) - shown_failed} more failed (--json lists them)")
+        if inherited_failed:
+            names = ", ".join(label(c) for c in inherited_failed[:shown_failed])
+            more = f" +{len(inherited_failed) - shown_failed}" if len(inherited_failed) > shown_failed else ""
+            lines.append(f"  inherited from {data.get('baseRefName')}: {names}{more}: {INHERITED_ADVICE}")
+            if not own_failed:
+                lines.append("  every red here is inherited: nothing to do on this PR for them")
         for c in groups["held"][:shown_failed]:
             refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
@@ -15868,8 +15950,10 @@ def status_view(key: str, entry: dict | None, grace: float = RESCUE_GRACE) -> di
         groups = classify(data, time.time(), grace)
         checks = data.get("checks") or []
         result = check_verdict(data, "done", time.time(), grace) if checks else None
+        own, inherited_failed = split_inherited(data, groups["failed"])
         view["checks"] = {"state": checks_state(data, result),
-                          **groups, "total": len(checks), "required": [c for c in checks if c.get("required")]}
+                          **groups, "own": own, "inherited": inherited_failed,
+                          "total": len(checks), "required": [c for c in checks if c.get("required")]}
     elif kind == "run":
         view["head"] = data.get("head_sha")
     return view
