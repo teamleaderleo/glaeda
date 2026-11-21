@@ -21419,16 +21419,20 @@ class LogScanTest(Base):
         self.rec(4, run=9, name="unittest", minutes_ago=28)
         self.ctl_logs[2] = (200, self.FAIL_LOG)
         self.ctl_logs[4] = (200, self.QUIET_LOG)
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
+        # The progress line goes through `say_waiting`, which writes fd 2 and not `sys.stderr`, so it is read
+        # through that seam (diagnostics_in), never through a patched stream.
+        said = io.StringIO()
+        with self.diagnostics_in(said):
             code, text = self.run_cmd(gg.cmd_log_errors, "o/r", 9, as_json=True, rest=self.no_rest)
         doc = json.loads(text)
         self.assertEqual((code, doc["run"]), (0, 9))
         # Newest job first, the order the history is scanned in; the green job of the same run is no failure,
         # so it is never read.
         self.assertEqual([j["job"] for j in doc["jobs"]], [4, 2])
-        self.assertEqual({j["job"]: j["total"] for j in doc["jobs"]}, {4: 1, 2: 6})
-        self.assertIn("run 9", err.getvalue())
+        # Each job's own lines: job 2's six error lines, and job 4's quiet log falling back to its step's last
+        # two lines (test_errors_of_a_step_with_no_error_line_shows_its_last_lines).
+        self.assertEqual({j["job"]: j["total"] for j in doc["jobs"]}, {4: 2, 2: 6})
+        self.assertIn("9 is run 9 of o/r, not a job: reading its 2 failed job(s)", said.getvalue())
 
     def test_errors_of_a_number_that_is_no_job_and_no_run_names_both_readings(self) -> None:
         """The refusal has to say which of the two it looked for, or the reader retries the same number."""
