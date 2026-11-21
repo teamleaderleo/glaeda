@@ -15496,10 +15496,11 @@ class SpendAlarmTest(AlarmBase):
                          {"kind": "pr", "age": 700, "key": "pr:o/r#5", "ticks": 2})
         self.assertTrue(self.daemon.valve_due["cause"].startswith("stalled: no pr read stored"))
         told = self.told_lines()
-        self.assertEqual(len(told), 2, "the valve acting is said at once, within the hour of the first WARN")
-        self.assertIn("restarting itself now (stale valve: 2 ticks in a row)", told[1])
-        self.assertNotIn(gg.STALE_RESTART_ADVICE, told[1])
-        self.assertEqual(self.notice_lines()[-1]["data"]["valve"], "restarting")
+        self.assertEqual(len(told), 1, "the restart belongs to the open stale incident")
+        notice = self.notice_lines()[-1]
+        self.assertEqual(notice["kind"], "stale-restart")
+        self.assertEqual(notice["data"]["severity"], "info")
+        self.assertEqual(notice["data"]["valve"], "restarting")
         record = self.daemon.restart_self()
         self.assertIsNone(self.daemon.valve_due)
         self.assertEqual(gg.read_json(gg.BASE / "restart.json"), record)
@@ -15795,7 +15796,7 @@ class SpendAlarmTest(AlarmBase):
             self.daemon.check_alarms()
         self.assertIsNotNone(self.daemon.valve_due, "an hours-old key is a read loop that cannot reach it")
         self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
-        self.assertIn("restarting itself now", self.told_lines()[-1])
+        self.assertIn("restarting itself now", self.notice_lines()[-1]["text"])
 
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
@@ -24769,7 +24770,7 @@ class RefreshStallTest(AlarmBase):
         self.daemon.check_alarms()
         self.assertEqual(self.daemon.valve_due, {"kind": "pr", "age": 700, "key": "newest", "ticks": 2,
                                                    "cause": "stalled: no pr read stored in the last 600s"})
-        self.assertIn("restarting itself now", self.told_lines()[-1])
+        self.assertIn("restarting itself now", self.notice_lines()[-1]["text"])
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.daemon.restart_self()
         self.assertIn("no PR refreshed (stall_alarm)", out.getvalue())
