@@ -22636,6 +22636,27 @@ class LandTest(Base):
         # each refusal is counted as itself: the last one (read Apps busy) is a first, not an eighth
         self.assertEqual((e["stepFail"]["class"], e["stepFail"]["count"]), (gg.land_step_class(said[1]), 1))
 
+    def test_a_draft_pr_stops_at_the_first_refusal_and_names_gh_pr_ready(self):
+        """A draft is permanent until someone marks it ready, so one refusal is the whole answer. 2026-11-21,
+        leo-workspace#7087 (opened as a draft by the PreCompact checkpoint hook): six identical "Pull Request is
+        still a draft" merge calls over ~31 min, with the GraphQL pool at its floor, and a stop naming no step."""
+        for said in ("GraphQL: Pull Request is still a draft (mergePullRequest)",
+                     "pull request is in draft state", "Draft pull requests cannot be merged"):
+            self.assertTrue(gg.LAND_STEP_DRAFT.search(said), said)
+        for said in ("GraphQL: Pull Request is not mergeable (mergePullRequest)", "the PR is a draft review"):
+            self.assertIsNone(gg.LAND_STEP_DRAFT.search(said), said)
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request is still a draft (mergePullRequest)"
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_draft"), e.get("stop"))
+        self.assertEqual(e["stop"]["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+        self.assertIn("still a draft", e["stop"]["reason"])
+        self.assertNotIn("stepFail", e)  # no streak to count: nothing waits, nothing retries
+        self.assertIn("stopped: merge_draft", self.w.sent()[-1][-1])
+
     def test_a_requester_on_another_host_is_not_named_to_the_broker(self):
         # The broker takes only a session on the calling VM; with none named it tells the VM's lane.
         self.broker = True
