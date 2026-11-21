@@ -22813,6 +22813,28 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 2)
         self.assert_merged_at(LB)
 
+    def test_quota_refusal_parks_the_whole_queue_until_the_named_reset(self):
+        """A dry login pauses every land, so each queued PR does not retry into the same spent pool."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M:%S", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                      reason=f"quota: not judged, retry after {at}Z (reset)"))
+        self.tick()
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")
+        self.assertEqual(self.q.queue_quota_until, said)
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE)["until"], said)
+        reads = self.reads()
+        self.tick(300)
+        self.assertEqual(self.reads(), reads)
+        self.assertEqual(self.q.entries[key2]["state"], "queued")
+
     def test_a_merge_the_shim_refuses_for_quota_parks_without_a_pr_view(self):
         self.pr(LA)
         self.land()
@@ -23162,7 +23184,9 @@ class LandTest(Base):
             self.tick(5)
         waits = {n: (self.q.entries[f"pr:o/r#{n}"].get("wait") or {}).get("kind") for n in heads}
         return {"judged": len(judged), "perEntry": max(sum(1 for _, m in judged if m == n) for n in heads),
-                "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300)}
+                "waits": waits, "first5": sum(1 for at, _ in judged if at < start + 300),
+                "queueUntil": self.q.queue_quota_until,
+                "queued": sum(1 for n in heads if self.q.entries[f"pr:o/r#{n}"]["state"] == "queued")}
 
     def test_the_host_cap_keeps_a_windows_judgments_under_its_share_and_judges_a_merge_ready_entry_first(self):
         """gcp-agent-lane-1, 2026-11-20: the land queue sent 135 calls in the ten minutes after the 01:38Z reset with 31
@@ -23299,16 +23323,16 @@ class LandTest(Base):
         login until 23:38Z"), 40 of them re-judging an entry already "unreadable" at an unchanged head; session
         glaeda-land spent 568 REST, about 9 a judgment (each `pr view`, check-runs and runs read before the refused
         GraphQL read). LAND_QUOTA_REFUSAL read only merge_hold's own "quota: not judged", so these took the
-        "unreadable" retry every LAND_RETRY_DEFAULT (120 s) until the reset. Now such a judgment parks the entry until
-        the reset its words name, as a "quota" answer does: one judgment per entry per window, however many are
-        queued."""
+        "unreadable" retry every LAND_RETRY_DEFAULT (120 s) until the reset. Now the first such refusal parks the
+        whole queue until the reset its words name."""
         k, minutes = 40, 20
         p = self.quota_unreadable_profile(k, minutes, until=self.t + 45 * 60)
         if os.environ.get("LAND_RESET_PROFILE"):
             print("\nPROFILE " + json.dumps(p | {"waits": sorted(set(p["waits"].values()), key=str)}))
-        self.assertEqual(p["perEntry"], 1, p)
-        self.assertEqual(p["judged"], k, p)
-        self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+        self.assertEqual((p["perEntry"], p["judged"], p["first5"]), (1, 1, 1), p)
+        self.assertEqual(set(p["waits"].values()), {"quota", None}, p)
+        self.assertEqual(p["queued"], k - 1, p)
+        self.assertTrue(0 <= p["queueUntil"] - (NOW + 45 * 60) <= 60, p)
 
     def test_an_unreadable_judgment_in_the_brokers_rate_limited_words_is_parked_too(self):
         """lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z: "unreadable" in the broker's words ("gh api graphql
@@ -23318,7 +23342,7 @@ class LandTest(Base):
                  "gh api graphql failed: until {stamp}Z (reset); not sent, retry after {stamp}Z; reason: [RATE_LIMITED] "
                  "GitHub's GraphQL limit. Retry once GitHub answers")
         p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
-        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
+        self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota", None}), p)
 
     def test_an_unreadable_judgment_this_hosts_own_guards_refused_is_parked_not_counted(self):
         """gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553 and #12558 stopped retry_deadline after about 6 h of
@@ -23335,7 +23359,8 @@ class LandTest(Base):
             with self.subTest(words=words[:60]):
                 p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
                 self.assertLessEqual(p["perEntry"], 3, p)  # LAND_QUOTA_BACKOFF doubling, not the 120 s retry (10)
-                self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+                self.assertTrue(set(p["waits"].values()) <= {"quota", None}, p)
+                self.assertIn("quota", p["waits"].values(), p)
                 self.tearDown_entries()
 
     def tearDown_entries(self) -> None:

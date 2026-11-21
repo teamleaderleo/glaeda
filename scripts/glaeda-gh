@@ -282,8 +282,9 @@ when this file changes, so an update takes effect without a restart.
   which `land status` prints) and `land` refuses to queue (land_judge_missing). router-review is routerReview, else
   the first of ~/.local/bin, the ws-sync deploy's tools/ and the leo-workspace checkout's tools/, else PATH. On a lane VM (an upstream host) the
   worker reads a landing PR itself through the broker when the upstream's copy is over LAND_REFRESH_AFTER old.
-  A quota refusal (land_judge's, or the shim's on the merge) parks the PR until the reset it names plus a 0-120 s
-  per-caller jitter, with no read, judge, watch or nudge before it (`land status`: "parked until HH:MMZ (quota)");
+  A quota refusal (land_judge's, or the shim's on the merge) parks the whole host queue until the reset it names;
+  the refusing PR also keeps its 0-120 s per-caller wake, with no read, judge, watch or nudge before it (`land status`:
+  "parked until HH:MMZ (quota)");
   one that names no time backs off 5, 10, 20 ... at most 60 min. While the login's latch mark holds
   (rest-exhausted.json / graphql-exhausted.json under $GH_QUOTA_STATE, lw#5626) no entry is judged at all.
   A host whose land.json names an "executor" (a program taking one JSON line on stdin, answering one, e.g.
@@ -9722,6 +9723,7 @@ LAND_JUDGE_PATHS = (LAND_JUDGE, Path.home() / "Projects/leo-workspace/tools/land
 # 2026-11-17: cmux#44604 stopped after 8 of them).
 LAND_REFUSED_FILE = "refused.json"
 LAND_LATCH_FILE = "latch.json"  # the login's latch mark the queue last saw holding (land_latch), for `land status`
+LAND_QUOTA_FILE = "quota.json"  # host-wide land pause after a quota refusal, for restart-safe queue parking
 LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's warning, while it holds
 # On an upstream host (a lane VM: no login, its PR data is the controller's copy), the land worker's nudge reaches
 # nothing: upstream_tick asks the upstream every UPSTREAM_EVERY and takes whatever copy it has. When that copy of a
@@ -11097,6 +11099,11 @@ class LandQueue:
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.now = time.time()
+        quota = read_json(land_dir() / LAND_QUOTA_FILE)
+        self.queue_quota_until = (float(quota.get("until")) if isinstance(quota, dict)
+                                  and isinstance(quota.get("until"), (int, float))
+                                  and not isinstance(quota.get("until"), bool) else 0.0)
+        self.queue_quota_reason = str(quota.get("reason") or "") if isinstance(quota, dict) else ""
         self.load()
 
     # -- files
@@ -11260,6 +11267,8 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        if self.queue_quota_parked():
+            return
         latch = self.latch_held()
         ended = land_latch_spread(self.now) if latch is None else None
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
@@ -11271,6 +11280,8 @@ class LandQueue:
         self.pass_capped = 0
         for key in sorted(self.entries, key=self.judge_order):
             try:
+                if self.queue_quota_parked():
+                    break  # a worker parked the host while this pass was submitting judgments
                 e = self.entries[key]
                 if e["state"] in LAND_DONE:
                     if self.now - float(e.get("updated") or 0) > LAND_KEEP:
@@ -11565,6 +11576,32 @@ class LandQueue:
         self.save(e)
         return False
 
+    def queue_quota_parked(self) -> bool:
+        """Whether a quota refusal has paused this host's whole land queue until its reset."""
+        with self.lock:
+            if self.queue_quota_until > self.now:
+                return True
+            if self.queue_quota_until:
+                self.queue_quota_until = 0.0
+                self.queue_quota_reason = ""
+                (land_dir() / LAND_QUOTA_FILE).unlink(missing_ok=True)
+            return False
+
+    def park_queue_quota(self, until: float, text: str) -> None:
+        """Pause every queued land until UNTIL, retaining a later existing hold across restarts."""
+        if not isinstance(until, (int, float)) or isinstance(until, bool):
+            return
+        until = float(until)
+        if until <= self.now:
+            return
+        with self.lock:
+            if self.queue_quota_until >= until and self.queue_quota_until > self.now:
+                return  # a later refusal must never shorten the host-wide hold
+            self.queue_quota_until = max(self.queue_quota_until, until)
+            self.queue_quota_reason = land_trim(text, 300)
+            write_json(land_dir() / LAND_QUOTA_FILE,
+                       {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
+
     def park_quota(self, e: dict, text: str) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
         LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
@@ -11578,6 +11615,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
+        self.park_queue_quota(said if said is not None else wake, text)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
@@ -12595,6 +12633,12 @@ class LandQueue:
     def judge_and_take(self, key: str, sha: str) -> None:
         with self.lock:
             e = self.entries[key]
+            if self.queue_quota_parked():
+                if e["state"] == "judging":
+                    e.pop("judging", None)
+                    e.update(state="queued", wait=None, wakeAt=None)
+                    self.save(e)
+                return
             self.check(e)
             judging = e.pop("judging", None) or {}
             counts = judging.get("counts", True)
