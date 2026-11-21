@@ -1082,7 +1082,11 @@ class ControllerTest(Base):
         self.gh.jobs[21] = [job("build")]
         gg.register(gg.parse_key("run", "o/r/21"))
         self.ctl.down = gg.ControllerTimeout("controller: TimeoutError")
-        self.daemon.tick(NOW)
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            self.daemon.tick(NOW)
+        # said at the time, with the mechanism and the price, not only in the aggregate a later reader may not look at
+        self.assertIn("spends the shared REST quota", said.getvalue())
         hours = self.daemon.controller_fallback.get("hours") or {}
         counts = next(iter(hours.values()), {})
         self.assertEqual(counts.get("deadline"), 1)  # the missed deadline
@@ -1094,8 +1098,11 @@ class ControllerTest(Base):
         self.assertEqual(other.controller_fallback, self.daemon.controller_fallback)
         before = json.dumps(other.controller_fallback, sort_keys=True)
         self.ctl.down = gg.WatchError("controller: URLError")
-        other.tick(NOW)
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            other.tick(NOW)
         self.assertEqual(json.dumps(other.controller_fallback, sort_keys=True), before)
+        self.assertNotIn("spends the shared REST quota", said.getvalue())  # a claim only a deadline earns
 
     def test_tracked_run_costs_no_quota(self) -> None:
         self.ctl.runs[21] = ctl_run(21, "in_progress")

@@ -9540,8 +9540,14 @@ class Daemon:
             self.errors.append(what)
         self.controller_down_until = self.now + wait
         if not isinstance(error, NoReceiver):
+            # The notice says what the fallback costs, not only that it happened: every run read this host makes until
+            # the controller answers again spends the shared REST quota (one account, 5000/h for every lane together)
+            # that the controller served for free. A reader told only "REST serves runs" has to know that to see the
+            # price, and a notice whose mechanism the reader has to re-derive gets re-derived wrong.
+            cost = ("REST serves runs, and each one spends the shared REST quota the controller served free"
+                    if self.controller_missed_deadline else "REST serves runs")
             self.refresh_note("controller", what, getattr(self.controller, "base", None) or "controller",
-                              f"REST serves runs; the controller is asked again at {utc_clock(self.now + wait)}")
+                              f"{cost}; the controller is asked again at {utc_clock(self.now + wait)}")
         self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
                                   "token": bool(getattr(self.controller, "token", None))}
 
