@@ -5984,6 +5984,13 @@ class FleetBudgetTest(Base):
         host = mock.patch.object(gg, "policy_host", return_value="here")
         host.start()
         self.addCleanup(host.stop)
+        # The account's last route is one free GET /rate_limit here (free_account_reading). No test reaches GitHub, so
+        # it is refused by default and a case that wants it passes its own `free=`.
+        self.free_error = "no login on this host (test)"
+        free = mock.patch.object(gg, "free_account_reading", side_effect=lambda now, make=None: {
+            "error": self.free_error})
+        free.start()
+        self.addCleanup(free.stop)
 
     def tearDown(self) -> None:
         gg.FLEET_BUDGET_TTL, gg.FLEET_HOST_TIMEOUT, gg.REACH_CMD, gg.LANE_GH_CMD = self.saved_fleet

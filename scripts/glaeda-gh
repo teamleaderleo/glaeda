@@ -18072,12 +18072,44 @@ def summarize_host(report: dict, now: float) -> dict:
     return out
 
 
-def account_reading(hosts: dict, now: float) -> dict:
+# A bucket with no fresh reading on any host is still readable, for free: GET /rate_limit reports every resource
+# family at once and counts against no primary limit (the daemon's own counter calls those "rate_limit reads (free)",
+# and `GET /rate_limit` sits at "REST 0 of 30" in its spend table). So the account's answer has three routes, tried in
+# this order: this host's own daemon reading, then the freshest peer's, then one free read here.
+#
+# Measured on one host 2026-11-21, 25 minutes apart: `budget` printed "GraphQL unknown (no reachable host's daemon has
+# a fresh reading)" both times while REST answered to the call (4458/5000, then 4822/5000), with two of five hosts
+# "unreachable (no answer in 25s)". A daemon's GraphQL reading only refreshes when it sends a GraphQL query or
+# /rate_limit answers, while every REST answer carries its own headers -- so an idle or REST-leaning daemon has a
+# fresh REST reading and no GraphQL one, and the fleet's GraphQL answer went unknown while the number was free to
+# obtain. GraphQL is the bucket every PR state read spends (`reading: PRs over GraphQL, ... comments over GraphQL`),
+# so it is the one number a lander needs and the one `budget` was least likely to hold: in that same window three
+# `wait pr` calls each burned a full 1800 s timeout on "no data yet" with the shared login's GraphQL bucket at 0 and
+# ~3,300 REST calls left, and nothing an operator could run would have said so.
+#
+# docs/handbook/measurement-unknown-when-shared-quota-spent.md decides the shape: a measurement on a shared quota has
+# a second source that does not share it, and says which one answered and how old it is. Here the second source costs
+# no quota at all, so it is the last route rather than a carried reading, and a bucket that still cannot be read says
+# who was asked, what each answered and the one next step -- never a bare "unknown".
+FREE_READ_BUDGET = 10.0  # one free GET /rate_limit here must not hold `budget` longer than this
+ACCOUNT_ROUTES = ("local", "peer", "direct")  # in preference order; every reading carries the one that answered
+
+
+def account_reading(hosts: dict, now: float, me: str | None = None) -> dict:
     """The login's REST and GraphQL as the freshest live reading any host's daemon took (each host's "rest" is already
-    the poorest core counter it sees), with the host that read it."""
+    the poorest core counter it sees), with the host that read it and the route that answered -- "local" for this
+    host's own daemon, "peer" for another's. An unreachable host is skipped, so it can never by itself make a bucket
+    unknown; neither route reads GitHub, and the free direct read (free_account_reading) is the third route, taken by
+    host_sweep when this returns nothing for a bucket.
+
+    Freshest wins rather than local first, and a tie goes to local. Every host reads the same shared pool, so the
+    freshest reading is the truest one, and `budget` prints the host and the age either way. Preferring local would
+    report a 600 s-old reading here (4000 REST left) over a peer's 30 s-old one (12 left) -- and sweep_tally's
+    unattributed gap is "limit - remaining" of this very reading, so an old one understates the account's spend as
+    well as overstating what a lander may take."""
     out: dict[str, dict] = {}
     for bucket in ("rest", "graphql"):
-        best = None
+        live: list[dict] = []
         for name, h in hosts.items():
             r = (h.get("readings") or {}).get(bucket) if h.get("ok") else None
             try:
@@ -18087,10 +18119,66 @@ def account_reading(hosts: dict, now: float) -> dict:
                 continue
             if reset <= now or now - seen > FLEET_READING_MAX_AGE:
                 continue
-            if best is None or seen > best["seenAt"]:
-                best = {**r, "host": name}
+            live.append({**r, "host": name, "route": "local" if name == me else "peer"})
+        best = max(live, key=lambda r: (r["seenAt"], r["route"] == "local"), default=None)
         if best is not None:
             out[bucket] = best
+    return out
+
+
+def free_account_reading(now: float, make: Callable[[], Any] | None = None) -> dict:
+    """GitHub's own count of every bucket from one GET /rate_limit here. That read counts against no primary limit, so
+    it is the route that answers when no daemon on the fleet holds a fresh reading, and asking it costs a lander
+    nothing. The shared login's count only: Daemon.request offers a call to an App pool only when it is not free, so
+    an App pool's headroom can never be read back as the login's. {"readings": {bucket: reading}} or {"error": why};
+    this never raises, because reporting the budget must not fail on the read that would have filled it in."""
+    if upstream_command() is not None:
+        return {"error": "this host reads GitHub through its upstream (upstream.json) and has no login to ask"}
+    try:
+        daemon = (make or (lambda: Daemon(controller=None, upstream=None)))()
+    except Exception as failure:  # noqa: BLE001  a free reading is never the command failing
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    # A session's own free read, not the daemon's polling: it must never write rest-spend.json from the copy it read
+    # at construction, which would overwrite the minutes the daemon has counted since (review of glaeda#1942).
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]
+    daemon.now = now
+    daemon.tick_deadline = time.monotonic() + FREE_READ_BUDGET
+    try:
+        daemon.read_rate_limit()
+    except OutOfTime:
+        return {"error": f"no answer within {FREE_READ_BUDGET:g}s"}
+    except Exception as failure:  # noqa: BLE001
+        return {"error": f"{describe(failure)} at {error_site(failure)}"}
+    if daemon.rate_limit_at < now:  # read_rate_limit stamps this only when /rate_limit answered
+        why = next((e for e in reversed(daemon.errors) if e.startswith("rate_limit: ")), None)
+        return {"error": why[len("rate_limit: "):] if why else "/rate_limit gave no reading"}
+    # budget.json was loaded at construction, so only a bucket this answer refreshed is reported: its seenAt is NOW.
+    out = {b: {**r, "seenAt": now} for b in ("rest", "graphql")
+           if isinstance(r := daemon.budget.get(b), dict) and isinstance(r.get("remaining"), int)
+           and float(r.get("seenAt") or 0) >= now}
+    return {"readings": out} if out else {"error": "/rate_limit named no core or graphql resource"}
+
+
+def reading_gaps(hosts: dict, bucket: str, now: float) -> dict:
+    """Why each host holds no live BUCKET reading: its own error when it did not answer, else what its daemon's
+    reading was. A host that could not be reached and a host whose daemon has simply never taken a reading of that
+    bucket are different conditions, and `budget` must not print one of them for the other."""
+    out: dict[str, str] = {}
+    name_of = POOL_NAMES.get(bucket, bucket)
+    for host, h in hosts.items():
+        if not h.get("ok"):
+            out[host] = h.get("error") or "unreachable"
+            continue
+        r = (h.get("readings") or {}).get(bucket)
+        if not isinstance(r, dict) or not isinstance(r.get("remaining"), int):
+            out[host] = f"answered; its daemon has taken no {name_of} reading (it sends no {name_of} request)"
+        elif float(r.get("reset") or 0) <= now:
+            out[host] = f"answered; its {name_of} window reset {hhmm(r.get('reset'))} and nothing read it since"
+        elif now - float(r.get("seenAt") or 0) > FLEET_READING_MAX_AGE:
+            out[host] = (f"answered; its {name_of} reading is {int(now - float(r['seenAt']))}s old, over the "
+                         f"{FLEET_READING_MAX_AGE:g}s an account reading may be")
+        else:
+            out[host] = f"answered; live {name_of} reading"
     return out
 
 
@@ -18174,7 +18262,8 @@ def sweep_rows(names: list[str], me: str, clock: float, fetch: Callable[[str, bo
     return rows
 
 
-def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
+def host_sweep(clock: float, fetch: Callable[[str, bool], dict],
+               free: Callable[[float], dict] | None = None) -> dict:
     """spend_view's stand-in: every host at once, one fetch each, joined within FLEET_HOST_TIMEOUT. Then each lane VM
     no read host's broker:VM rows carry is read itself (its own gh-quota log names every call it sent through its
     broker), so a VM whose broker host is unread or idle is a row of its own, not "no broker:VM row". The coordinator,
@@ -18187,7 +18276,9 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     rows = sweep_rows(hosts, me, clock, fetch)
     if rows[me].get("ok") and UPSTREAM_CONFIG.exists():  # no login here: every call went through a broker
         rows[me]["brokerClient"] = True
-    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock), "exhausted": exhausted_marks(clock)}
+    doc: dict[str, Any] = {"hosts": rows, "account": account_reading(rows, clock, me),
+                           "exhausted": exhausted_marks(clock)}
+    fill_account(doc, rows, clock, me, free)
     vms = fleet_lane_vms()
     carried = set(sweep_tally(doc, [])["laneVms"]["brokered"]) | set(rows)
     missing = [vm for vm in vms if vm not in carried]
@@ -18198,6 +18289,60 @@ def host_sweep(clock: float, fetch: Callable[[str, bool], dict]) -> dict:
     doc["laneVmRows"] = vm_rows
     doc["total"] = sweep_tally(doc, vms)
     return doc
+
+
+def fill_account(doc: dict, rows: dict, clock: float, me: str, free: Callable[[float], dict] | None = None) -> None:
+    """The third route, and what to say when none of them answered. Any bucket account_reading left without a live
+    reading is read here for free (one GET /rate_limit answers both at once, so this costs one bounded read per sweep
+    at most, kept FLEET_BUDGET_TTL with the rest of the answer), and every bucket still unread records who was asked
+    and what each answered (accountGaps) so `budget` prints that instead of a bare "unknown". A gh-quota mark that a
+    bucket is spent is not an answer to what is left in it: a marked bucket is read too, and both are printed."""
+    missing = [b for b in ("rest", "graphql") if b not in doc["account"]]
+    if missing:
+        answer = (free or free_account_reading)(clock)
+        doc["freeRead"] = {"error": answer["error"]} if answer.get("error") else {"at": clock, "buckets": missing}
+        for bucket in missing:
+            r = (answer.get("readings") or {}).get(bucket)
+            if isinstance(r, dict) and float(r.get("reset") or 0) > clock:
+                doc["account"][bucket] = {**r, "host": me, "route": "direct"}
+    doc["accountGaps"] = {b: reading_gaps(rows, b, clock) for b in ("rest", "graphql") if b not in doc["account"]}
+
+
+def account_unknown(bucket: str, doc: dict) -> str:
+    """Why a bucket has no number, which hosts were asked, what each answered, and the one next step. Never a bare
+    "unknown": an operator who cannot see the GraphQL bucket cannot tell a lander's 1800 s of "no data yet" from a
+    slow run (docs/handbook/missing-read-counted-as-a-value.md: a thing whose read did not happen is unknown, and
+    says so)."""
+    gaps = (doc.get("accountGaps") or {}).get(bucket) or {}
+    free = (doc.get("freeRead") or {}).get("error")
+    answered = [h for h, why in gaps.items() if why.startswith("answered")]
+    if bucket in (doc.get("accountDropped") or ()):  # kept from a sweep whose window has since ended (budget_served)
+        return (f"unknown: the kept reading's window has reset since it was read; next: run `glaeda-gh budget` again, "
+                f"past the {FLEET_BUDGET_TTL:g}s an answer is kept for every session")
+    lead = (f"unknown: no host answered ({len(gaps)} asked)" if gaps and not answered
+            else f"unknown: {len(answered)} of {len(gaps)} hosts answered, none with a live reading" if gaps
+            else "unknown: no host reading was collected")
+    if free:
+        step = ("ask a host that holds the login (`glaeda-gh budget` there)"
+                if "upstream" in free else
+                f"fix that read -- it is the only route left: `glaeda-gh gh api /rate_limit --jq .resources.{bucket}` "
+                f"here, which spends nothing")
+    else:
+        step = f"`glaeda-gh gh api /rate_limit --jq .resources.{bucket}` here, which spends nothing"
+    where = "; ".join(f"{host}: {why}" for host, why in gaps.items())
+    route = f"the free GET /rate_limit here: {free}" if free else "the free GET /rate_limit here was not tried"
+    return f"{lead}" + (f" ({where})" if where else "") + f"; {route}; next: {step}"
+
+
+def account_line(bucket: str, reading: dict, marks: dict) -> str:
+    """One bucket's number with the route that answered it and how old it is, as `budget` has always shown REST."""
+    route = reading.get("route")
+    by = (f"read here by a free GET /rate_limit {age(reading.get('seenAt'))}" if route == "direct"
+          else f"read by {reading.get('host')} {age(reading.get('seenAt'))}")
+    mark = marks.get(bucket)
+    spent = f"; gh-quota's mark here says spent until {hhmm(mark.get('until'))}" if isinstance(mark, dict) else ""
+    return (f"{POOL_NAMES[bucket]} {reading.get('remaining')}/{reading.get('limit')} left, resets "
+            f"{hhmm(reading.get('reset'))} ({by}){spent}")
 
 
 def fleet_lane_vms() -> list[str]:
@@ -18281,7 +18426,7 @@ def sweep_tally(doc: dict, lane_vms: list[str]) -> dict:
 
 
 def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | None = None,
-                 view: Callable[[], dict] | None = None) -> dict:
+                 view: Callable[[], dict] | None = None, free: Callable[[float], dict] | None = None) -> dict:
     """Who spent the login's quota this hour, per host and session, with the account's reading and the hard reserve:
     the FLEET_BUDGET_FILE answer when it is under FLEET_BUDGET_TTL old, else spend_view, else one read per host (all
     at once). One reader at a time under a lock, so sessions asking together share one read."""
@@ -18303,7 +18448,7 @@ def fleet_budget(now: float | None = None, fetch: Callable[[str, bool], dict] | 
         if seen.get("ok"):
             doc.update(source="spend_view", view=seen["data"])
         else:
-            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch))
+            doc.update(source="hosts", spendView=seen.get("error"), **host_sweep(clock, fetch, free))
         # when the read ended, by the wall clock read then (router review of glaeda#2252, F2: a start time plus a
         # monotonic length put it past the real end after a backward clock step)
         doc["keptFrom"] = FLEET_BUDGET_CLOCK()
@@ -18323,7 +18468,10 @@ def budget_served(doc: dict, clock: float) -> dict:
     if not reset and not ended:
         return doc
     out = {**doc, "account": {b: r for b, r in account.items() if b not in reset},
-           "exhausted": {b: m for b, m in marks.items() if b not in ended}}
+           "exhausted": {b: m for b, m in marks.items() if b not in ended},
+           # named, so `budget` says the kept answer's window has ended rather than reporting the sweep's host
+           # answers, which were about a window that is over (account_unknown)
+           "accountDropped": sorted(reset)}
     total = doc.get("total")
     if reset and isinstance(total, dict) and isinstance(total.get("unattributed"), dict):
         out["total"] = {**total, "unattributed": {b: None if b in reset else g
@@ -18398,12 +18546,11 @@ def sweep_lines(doc: dict) -> list[str]:
     for bucket in ("rest", "graphql"):
         r = account.get(bucket)
         if r:
-            parts.append(f"{POOL_NAMES[bucket]} {r.get('remaining')}/{r.get('limit')} left, resets "
-                         f"{hhmm(r.get('reset'))} (read by {r.get('host')} {age(r.get('seenAt'))})")
+            parts.append(account_line(bucket, r, marks))
         elif marks.get(bucket):
             parts.append(f"{POOL_NAMES[bucket]} spent until {hhmm(marks[bucket].get('until'))} (gh-quota's mark here)")
         else:
-            parts.append(f"{POOL_NAMES[bucket]} unknown (no reachable host's daemon has a fresh reading)")
+            parts.append(f"{POOL_NAMES[bucket]} {account_unknown(bucket, doc)}")
     out = ["account (the shared login, every host): " + "; ".join(parts),
            f"{doc.get('spendView') or 'lane-gh spend_view unavailable'}; read each host instead",
            "who spent it, last hour, per host and caller (REST counted; 304s and cache, mirror or glaeda answers are "
@@ -18492,6 +18639,32 @@ def fleet_lines(doc: dict) -> list[str]:
     out.append(f"(read {age(doc.get('at'))}; kept {FLEET_BUDGET_TTL:g} s for every session; --local for this host's "
                f"daemon only)")
     return out
+
+
+def account_bucket(bucket: str, now: float | None = None) -> dict:
+    """The shared login's reading for one bucket ("rest" or "graphql") as `budget` reports it, for any caller that
+    needs to name the bucket a read spends and when it resets. The wait side's stale trigger is the caller this is
+    for: it prints "the daemon has not refreshed <ref> for 1800s" and then names the identical failed invocation as
+    the next step, because it has no bucket reading to name. Answers from fleet_budget's kept sweep (one sweep per
+    FLEET_BUDGET_TTL shared by every session on the host, whose last route is a free GET /rate_limit), so a poll may
+    call it and it spends no quota in any case.
+
+    {"bucket", "remaining", "limit", "reset", "seenAt", "ageS", "host", "route", "spent", "hardReserve", "says"} when
+    the bucket could be read, else {"bucket", "unknown"} carrying the same sentence `budget` prints -- who was asked,
+    what each answered and the one next step. "mark" is gh-quota's own hold on this host when it has one."""
+    clock = time.time() if now is None else now
+    doc = fleet_budget(clock)
+    reserve = (doc.get("hardReserve") or {}).get(bucket)
+    out = {"bucket": bucket, "mark": (doc.get("exhausted") or {}).get(bucket), "hardReserve": reserve}
+    r = (doc.get("account") or {}).get(bucket)
+    if not isinstance(r, dict):
+        return {**out, "unknown": account_unknown(bucket, doc)}
+    seen = float(r.get("seenAt") or clock)
+    left = r.get("remaining")
+    return {**out, "remaining": left, "limit": r.get("limit"), "reset": r.get("reset"), "seenAt": seen,
+            "ageS": max(0.0, round(clock - seen, 1)), "host": r.get("host"), "route": r.get("route"),
+            "spent": isinstance(left, int) and left <= 0,
+            "says": account_line(bucket, r, doc.get("exhausted") or {})}
 
 
 def cmd_budget(as_json: bool, fleet: bool = False) -> int:
