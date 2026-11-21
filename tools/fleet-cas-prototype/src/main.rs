@@ -1738,7 +1738,7 @@ fn app(store: Arc<Store>, monitor: Arc<Monitor>) -> axum::Router {
 
 /// What `GET /stats` serves: this process's role and configuration, and its
 /// request counters over 5 min, 1 h and 24 h windows kept across restarts
-/// (`window.rs`). The scraper's contract (leo-workspace NOW):
+/// (`window.rs`). The fleet status scraper reads
 /// `windows["1h"].kv_hit_rate` and `windows["1h"].requests`, `uptime_s`,
 /// `writers`.
 struct Monitor {

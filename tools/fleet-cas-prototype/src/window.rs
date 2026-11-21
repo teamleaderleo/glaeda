@@ -1,7 +1,7 @@
 //! Request counters over time windows, kept across restarts, and the JSON
 //! that `GET /stats` serves.
 //!
-//! Why: the fleet store on cmux-lawrence was down ~21 h (2026-11-20/21) and
+//! Why: the fleet store was down ~21 h (2026-11-20/21) and
 //! nothing said so. Its counters lived only in the process (`stats.json`,
 //! reset at every start) and nothing on the network could read them, so a
 //! dead store looked like ordinary compiles on the nodes. Now the store keeps

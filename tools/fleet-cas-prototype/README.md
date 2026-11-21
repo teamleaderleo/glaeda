@@ -40,7 +40,7 @@ rates are null with no lookups), `lifetime` and the raw `counters` of
 restart keeps them; the raw counters restart at 0 (`instance` changes). On
 2026-11-20/21 the store was down ~21 h and nothing on the network could say
 so: no answer from `/stats` is a down store, and a low 1 h `kv_hit_rate`
-over enough `requests` is a cold or broken one (leo-workspace NOW scrapes
+over enough `requests` is a cold or broken one (the fleet status scraper reads
 it and pushes an alarm).
 
 One binary plays two roles:
