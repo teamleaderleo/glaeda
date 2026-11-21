@@ -11350,6 +11350,24 @@ def land_day(at: float) -> str:
 LAND_USER_ID = re.compile(r"\b(user(?:\s+id)?)\s+\d{3,}\b", re.I)
 
 
+# A word every shell hands on as typed: shlex's own safe set, plus `#` anywhere but the first character.
+TYPED_WORD_PLAIN = re.compile(r"[\w@%+=:,./-][\w@%+=:,./#-]*")
+
+
+def typed_line(words: Any) -> str:
+    """WORDS as a command line that can be typed or pasted back, each word quoted only where it has to be.
+
+    Every `read as`, `ran as` and `next:` line this tool prints is an argv rendered back as text, and a reader
+    (a person or an agent) runs what it says. A plain `" ".join` loses the word boundaries: `--body "two words"`
+    comes back as `--body two words`, which the shell splits into two arguments and argparse then refuses as an
+    unrecognized one, so the printed repair does not run while the call it was read from would have. shlex.quote
+    An ordinary word is left untouched, so this changes only the lines that carried a value needing quotes.
+    shlex.quote alone would also quote `o/r#1`, this tool's own target form and the one every printed line and
+    its tests already carry: a `#` is a comment only at the start of a word, so it stays bare past the first
+    character and TYPED_WORD_PLAIN says so."""
+    return " ".join(w if TYPED_WORD_PLAIN.fullmatch(w) else shlex.quote(w) for w in (str(x) for x in words))
+
+
 def land_redact(text: Any) -> str:
     """TEXT with GitHub's numeric user id dropped (LAND_USER_ID)."""
     return LAND_USER_ID.sub(r"\1 <redacted>", str(text or ""))
@@ -23974,7 +23992,7 @@ def broker_canonical_target(args: list[str]) -> list[str]:
         # the verb (`-b` is `--body` to one gh command and `--branch` to another). Left as typed.
         return args
     fixed = [*args[:at], number, *args[at + 1:]] + ([] if named is not None else ["--repo", f"{owner}/{repo}"])
-    print(f"glaeda-gh: read as `gh {' '.join(fixed)}` ({typed} is this tool's own form for the target; gh "
+    print(f"glaeda-gh: read as `gh {typed_line(fixed)}` ({typed} is this tool's own form for the target; gh "
           f"takes the number with --repo, and reads OWNER/REPO#N as a branch name)", file=sys.stderr)
     return fixed
 
@@ -24657,7 +24675,7 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         run_bounded(["systemctl", "--user", "reset-failed", SYSTEMD_UNIT], SUBPROCESS_DEADLINE)
         argv = ["systemctl", "--user", "restart" if hung else "start", SYSTEMD_UNIT]
         result = run_bounded(argv, SUBPROCESS_DEADLINE)
-        return result.returncode == 0, " ".join(argv)
+        return result.returncode == 0, typed_line(argv)
     domain = launchd_domain()
     if domain is None:
         # booting a copy out, or loading one, on a guess about the login session could leave no daemon at all
@@ -24695,11 +24713,11 @@ def restart_service(hung: bool) -> tuple[bool, str]:
     argv = ["launchctl", "kickstart"] + (["-k"] if hung else []) + [target]
     result = run_bounded(argv, SUBPROCESS_DEADLINE)
     if result.returncode == 0:
-        return True, dropped + " ".join(argv)
+        return True, dropped + typed_line(argv)
     # 5 (launchd reported "spawn failed") or 113 (not loaded): unload and load it, once, here
     plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
     loaded = reload_job(target, domain, plist)
-    how = f"{dropped}{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
+    how = f"{dropped}{typed_line(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
     return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
 
 
@@ -25776,8 +25794,8 @@ def wait_extra_targets(message: str) -> tuple[str, str]:
     both = ([first] if first else []) + extra
     hint = (f"`wait` waits for one target, so {', '.join(extra)} "
             f"{'is' if len(extra) == 1 else 'are'} beyond it: wait for one target per call, or read them all "
-            f"in one gather with `glaeda-gh status {kind} {' '.join(both)}`")
-    return hint, " ".join(form)
+            f"in one gather with `glaeda-gh status {kind} {typed_line(both)}`")
+    return hint, typed_line(form)
 
 
 def kind_spellings(message: str) -> str:
@@ -25809,7 +25827,7 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         fixed = [words[0], words[1], f"{words[2]}#{words[3].lstrip('#')}"] + words[4:]
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
-        return " ".join(["glaeda-gh"] + fixed)
+        return typed_line(["glaeda-gh"] + fixed)
     # `wait pr A B`: two targets in one call, which `status pr` takes and `wait` does not. A wait is one key
     # by construction (one request file, one FIFO, one exit code -- 0/1/2/4 is *the* target's verdict, which
     # every caller branches on), so this names the two calls that do the job rather than inventing an
@@ -25823,9 +25841,9 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
             targets.append(word)
         if len(targets) >= 2 and all(target_readable(words[1], w) for w in targets):
             rest = words[2 + len(targets):]
-            one = " ".join(["glaeda-gh", "wait", words[1], targets[0], *rest])
+            one = typed_line(["glaeda-gh", "wait", words[1], targets[0], *rest])
             return (f"wait takes one target, because its exit code is that target's verdict: "
-                    f"`glaeda-gh status {words[1]} {' '.join(targets)}` reads them all in one gather, "
+                    f"`glaeda-gh status {words[1]} {typed_line(targets)}` reads them all in one gather, "
                     f"or run one wait each (`{one}`)")
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
@@ -25955,12 +25973,12 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     cmd, first = raw[0], raw[1]
     joined = join_repo_and_number(raw)
     if joined:
-        return joined, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + joined)}`"
+        return joined, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + joined)}`"
     if cmd == "land":
         if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
-            return [cmd] + raw[2:], f"glaeda-gh: ran as `{' '.join(['glaeda-gh', cmd] + raw[2:])}`"
+            return [cmd] + raw[2:], f"glaeda-gh: ran as `{typed_line(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
-    ran_as = f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + raw)}`" if wait_joined else ""
+    ran_as = f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + raw)}`" if wait_joined else ""
     if first.startswith("-") or first in WAIT_KINDS:
         return raw, ran_as
     # `wait pr:o/r#5` -- this tool's own notation for a target, copied out of a line it printed -- is
@@ -25969,12 +25987,12 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     if prefixed and prefixed[0] in (WAIT_KINDS if cmd == "wait" else STATUS_KINDS):
         kind, rest = prefixed
         fixed = [cmd, kind, rest] + raw[2:]
-        return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
+        return fixed, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + fixed)}`"
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
     if not kind:
         return raw, ran_as
     fixed = [cmd, kind] + raw[1:]
-    return fixed, f"glaeda-gh: ran as `{' '.join(['glaeda-gh'] + fixed)}`"
+    return fixed, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + fixed)}`"
 
 
 class ShorthandFlag(argparse.Action):
@@ -26207,7 +26225,7 @@ def log_job_synonym(raw: list[str]) -> list[str]:
         and not given else None
     if one:
         fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
-        print(f"glaeda-gh: read as `{' '.join(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        print(f"glaeda-gh: read as `{typed_line(fixed)}` (the job id goes in its own word)", file=sys.stderr)
         return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw
@@ -26222,7 +26240,7 @@ def log_job_synonym(raw: list[str]) -> list[str]:
             if not job.isdigit():
                 return raw
             fixed = ["log", "job", raw[1], job] + rest
-            print(f"glaeda-gh: read as `{' '.join(fixed)}` (log OWNER/REPO --job ID is `log job OWNER/REPO ID`)",
+            print(f"glaeda-gh: read as `{typed_line(fixed)}` (log OWNER/REPO --job ID is `log job OWNER/REPO ID`)",
                   file=sys.stderr)
             return fixed
     return raw
@@ -26259,7 +26277,7 @@ def search_synonym(raw: list[str]) -> list[str]:
         fixed.insert(1, "both")
         said.append("a search with no kind word searches both issues and pull requests")
     if said:
-        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed
 
 
@@ -26278,7 +26296,7 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
         if any(re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", w) for w in raw[1:i]):
             return raw  # the target is already there: --notify names something else, odd as it looks
         fixed = raw[:i] + [after] + ["--notify"] + raw[i + 2:]
-        print(f"glaeda-gh: read as `{' '.join(fixed)}` (--notify takes HOST/SESSION, not the PR; with no "
+        print(f"glaeda-gh: read as `{typed_line(fixed)}` (--notify takes HOST/SESSION, not the PR; with no "
               f"value it names this session)", file=sys.stderr)
         return fixed
     return raw
@@ -26392,10 +26410,10 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
                    f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
                    f"you meant decides whether this reads or writes: it is not guessed"]
-        refusal += [f"next: {' '.join(['glaeda-gh', p, word] + raw[1:])}" for p in parents]
+        refusal += [f"next: {typed_line(['glaeda-gh', p, word] + raw[1:])}" for p in parents]
         return raw, refusal
     fixed = [parents[0], word] + raw[1:]
-    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` "
+    print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` "
           f"(`{word}` is a word of `{parents[0]}`, not a command of its own)", file=sys.stderr)
     return fixed, []
 
@@ -26519,7 +26537,7 @@ def doubled_kind_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         return raw, []
     without_second = [w for i, w in enumerate(raw) if i != second]
     if one == two:
-        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + without_second)}` (`{one}` is one word of "
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + without_second)}` (`{one}` is one word of "
               f"`{raw[0]}`, typed twice)", file=sys.stderr)
         return without_second, []
     readings = {one: without_second, two: [w for i, w in enumerate(raw) if i != first]}
@@ -26541,14 +26559,14 @@ def doubled_kind_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             evidence.append(f"`{name}` is {' or '.join(sorted(scope))}'s")
     if len(narrowed) == 1:
         kept = next(iter(narrowed))
-        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + readings[kept])}` (`{one} {two}` is two words "
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + readings[kept])}` (`{one} {two}` is two words "
               f"of `{raw[0]}`, and {'; '.join(evidence)})", file=sys.stderr)
         return readings[kept], []
     told = f", and the flags typed scope to neither: {'; '.join(evidence)}" if not narrowed else ""
     refusal = [f"glaeda-gh: `{one} {two}` is two words of `{raw[0]}`, which takes one: `{raw[0]} {one}` and "
                f"`{raw[0]} {two}` are both calls that run and they do not do the same thing, so neither "
                f"word is dropped for you{told}"]
-    refusal += [f"next: {' '.join(['glaeda-gh'] + own_kinds_flags(reading, kind, by_option, options))}"
+    refusal += [f"next: {typed_line(['glaeda-gh'] + own_kinds_flags(reading, kind, by_option, options))}"
                 for kind, reading in readings.items()]
     return raw, refusal
 
@@ -26614,7 +26632,7 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             return raw, [
                 f"glaeda-gh: `{name}` is how {len(matches)} different options of this command are spelled "
                 f"({', '.join(matches)}), and they do not mean the same thing: it is not guessed",
-                *(f"next: {' '.join(['glaeda-gh'] + fixed[:i] + [m + (joined + value)] + fixed[i + 1:])}"
+                *(f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [m + (joined + value)] + fixed[i + 1:])}"
                   for m in matches)]
         if len(matches) == 1:
             fixed[i] = matches[0] + joined + value
@@ -26623,7 +26641,7 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             continue
         i += 1  # no option of this command spells that way: argparse refuses it, with its own abbreviations
     if said:
-        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
 def main(argv: list[str] | None = None) -> int:
