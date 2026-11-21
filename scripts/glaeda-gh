@@ -15225,18 +15225,20 @@ def incident_recovered(step: dict, what: str) -> str:
             f"{int(num(inc.get('repeats')))} repeat(s) held back).")
 
 
-def incident_send(text: str, level: str, source_key: str) -> None:
+def incident_send(text: str, level: str, source_key: str, to: str = "", cls: str = "") -> None:
     """An incident's alert by the sender-side ledger: tell-coordinator (coord_inbox) with --source-key SOURCE_KEY,
     which sends a key once and folds a tool's fyi into its digest. Never coord_alert (forum-surge-inbox, 2026-11-20:
     straggler_notice must stop calling coord_alert_spawn, whose acpmux and lane-gh routes start a coordinator prompt per
     host): on a host without tell-coordinator (a lane VM) the incident stays in the ledger (incidents.jsonl, the
-    notice line), which the forum adapter and NOW read. In the background; logged, never raised."""
+    notice line), which the forum adapter and NOW read. TO (HOST/NAME) sends it to that session instead of the
+    coordinator, and CLS is its --class (fyi wakes nobody). In the background; logged, never raised."""
     if ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK):
+        route = (["--to", to] if to else []) + (["--class", cls] if cls else [])
         try:
-            subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, "--source-key",
+            subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
                               source_key, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
-            log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "text": text})
+            log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "to": to or None, "text": text})
             return
         except OSError as error:
             log({"event": "alert-ledger-only", "why": describe(error), "sourceKey": source_key, "text": text})
@@ -15306,17 +15308,115 @@ def straggler_notice(key: str, data: dict, now: float, bound: float = STRAGGLER_
                 noticed.pop(key.partition(":")[2], None)
             steps = {}
         for key, step in steps.items():
-            inc = step["incident"]
+            inc, label = step["incident"], key.partition(":")[2]
             if step["event"] == "recover":
-                incident_send(incident_recovered(step, f"no watched head has a straggler on runner label "
-                                                       f"{key.partition(':')[2]}"), "info", f"{inc['id']}:recover")
-            elif step["send"] and key in due:
-                incident_send(due[key] + "." + incident_said(step), "warn",
-                              f"{inc['id']}:{step['event']}:{inc['sends']}")
+                straggler_fleet_send(label, "recover", "info", incident_recovered(
+                    step, f"no watched head has a straggler on runner label {label}"), now)
+            elif key in due and (step["send"] or now - num(inc.get("opened")) >= STRAGGLER_FLEET_FALLBACK):
+                level = "fire" if inc.get("level") == "fire" else "warn"
+                straggler_fleet_send(label, "open", level, due[key] + "." + incident_said(step), now,
+                                     now - num(inc.get("opened")))
         seen = {label: heads for label, heads in seen.items() if heads}
         with contextlib.suppress(OSError, ValueError, TypeError):
             write_json(BASE / STRAGGLER_SEEN, {"seen": seen, "noticed": {
                 k: v for k, v in noticed.items() if now - v < 2 * STRAGGLER_NOTICE_EVERY}})
+
+
+# Fleet-once: a runner label with no runner is a fleet-wide fact, so one host says it, to its owner. 2026-11-20/21:
+# "N job(s) on runner label X queued with no runner past 30 min" reached claude-sr2-coord from about 12 hosts, one per
+# host, for the same labels: each host's incident ledger is local, and its key (the incident id, stamped with that
+# host's own open time) differed per host, so neither coord_inbox's sender ledger nor acpmux's prompt id could fold
+# them (cmuxterm-hq docs/handbook/per-host-dedup-still-floods-a-shared-owner.md: a local lock is no global dedup).
+# Leo, 2026-11-21: "if you're recieving too many messages you can think of better solutions". The election needs no
+# shared store, so it holds on Macs and lane VMs alike: the fleet reporter (the host of the registry's
+# coordinators.fleet, else coordinators.current; GLAEDA_GH_FLEET_REPORTER overrides) sends a label's incident; every
+# other host keeps it in its own notice line and incident ledger and sends only when its incident has stayed open
+# STRAGGLER_FLEET_FALLBACK (the reporter may not watch a head on that label). Every send, reporter's or fallback's,
+# carries the fleet key stragglers:LABEL:EVENT:<6 h bucket> as --source-key, the same on every host, so coord_inbox
+# and acpmux's prompt id fold the fallbacks at the destination too; and a host sends a key at most once per
+# STRAGGLER_FLEET_EVERY (FLEET_SENT). It goes to NOW's owner of STRAGGLER_AREA (now.json area_owners, the freshest
+# owner seen within AREA_OWNER_FRESH, as leo-workspace tools/overload_inbox.py routes), else coordinators.fleet, as
+# class fyi. A FIRE skips the election and the window and goes at once, class block.
+STRAGGLER_FLEET_EVERY = 6 * 3600
+STRAGGLER_FLEET_FALLBACK = 2 * 3600
+STRAGGLER_AREA = "ci-fleet"
+FLEET_SENT = "stragglers-fleet-sent.json"  # under BASE: {"LABEL:EVENT": when this host last sent it}
+NOW_JSON = Path(os.environ.get("GLAEDA_GH_NOW_JSON") or Path.home() / ".cache/now/last-now-json")
+AREA_OWNER_FRESH = 3 * 3600
+
+
+def registry_coordinator(role: str) -> str:
+    """The fleet registry's coordinators.ROLE (HOST/SESSION), or ""."""
+    for doc in fleet_registries():
+        coords = doc.get("coordinators")
+        name = coords.get(role) if isinstance(coords, dict) else None
+        if isinstance(name, str) and "/" in name:
+            return name
+    return ""
+
+
+def fleet_reporter() -> str:
+    """The one host that sends a fleet-wide fact: GLAEDA_GH_FLEET_REPORTER, else the host of the registry's
+    coordinators.fleet, else of coordinators.current; "" when none is known (then every host is its own reporter)."""
+    env = (os.environ.get("GLAEDA_GH_FLEET_REPORTER") or "").strip().lower()
+    if env:
+        return env
+    for role in ("fleet", "current"):
+        name = registry_coordinator(role)
+        if name:
+            return name.split("/", 1)[0].lower()
+    return ""
+
+
+def area_owner(area: str, now: float) -> str:
+    """NOW's live owner of AREA as HOST/NAME (now.json area_owners: the owner seen most recently, within
+    AREA_OWNER_FRESH), else the registry's coordinators.fleet, else "" (tell-coordinator's own default)."""
+    doc = read_json(NOW_JSON)
+    rows = ((doc.get("area_owners") or {}).get("rows") if isinstance(doc, dict) else None) or []
+    best: tuple[float, str] = (0.0, "")
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("area") != area:
+            continue
+        for owner in row.get("owners") or []:
+            try:
+                seen = dt.datetime.fromisoformat(str(owner["last_seen"]).replace("Z", "+00:00")).timestamp()
+                name = f"{owner['host']}/{owner['name']}"
+            except (KeyError, TypeError, ValueError):
+                continue
+            if now - seen <= AREA_OWNER_FRESH and (seen, name) > best:
+                best = (seen, name)
+    return best[1] or registry_coordinator("fleet")
+
+
+def straggler_fleet_send(label: str, event: str, level: str, text: str, now: float, age: float = 0.0) -> str:
+    """LABEL's straggler incident EVENT ("open" or "recover"), open AGE seconds on this host, sent fleet-once (see
+    above): "sent", or why it was held ("not-reporter", "window"). Every decision is logged; the notice line and
+    incident ledger already hold it."""
+    me, reporter, fire = policy_host(), fleet_reporter(), level == "fire"
+    record = f"{label}:{event}"
+    with bounded_lock(BASE / f"{FLEET_SENT}.lock") as held:
+        doc = read_json(BASE / FLEET_SENT) if held else {}
+        sent = {k: num(v) for k, v in (doc if isinstance(doc, dict) else {}).items()
+                if now - num(v) < 2 * STRAGGLER_FLEET_EVERY}
+        why = ""
+        if not fire and reporter and me != reporter and event == "recover" and f"{label}:open" not in sent:
+            why = "not-reporter"  # a recovery comes from whoever said the incident
+        elif not fire and reporter and me != reporter and event == "open" and age < STRAGGLER_FLEET_FALLBACK:
+            why = "not-reporter"  # the reporter says it; this host only if its incident outlasts the fallback
+        elif not fire and now - sent.get(record, -math.inf) < STRAGGLER_FLEET_EVERY:
+            why = "window"
+        if why:
+            log({"event": "alert-fleet-held", "why": why, "label": label, "incident": event, "reporter": reporter,
+                 "text": text})
+            return why
+        sent[record] = now
+        if held:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                write_json(BASE / FLEET_SENT, sent)
+    bucket = int(now // STRAGGLER_FLEET_EVERY)
+    incident_send(text, level, f"stragglers:{label}:{'fire' if fire else event}:{bucket}",
+                  to=area_owner(STRAGGLER_AREA, now), cls="block" if fire else "fyi")
+    return "sent"
 
 
 # What ends such a job, said in the wait's line and the notice. 2026-11-17 (job 134322701364): a job rerun is refused

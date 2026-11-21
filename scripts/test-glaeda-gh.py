@@ -25278,6 +25278,13 @@ class StragglerTest(unittest.TestCase):
         gg.NOTICES_DIR = Path(self.tmp.name) / "notices"
         self.now = float(int(time.time()))
         self.calls: list[str] = []
+        # this host is the fleet reporter, with no NOW and no registry (FleetOnceStragglerTest varies these)
+        for name, value in (("NOW_JSON", Path(self.tmp.name) / "no-now.json"), ("fleet_registries", lambda: [])):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, value)
+        env = mock.patch.dict(os.environ, {"GLAEDA_GH_FLEET_REPORTER": gg.policy_host()})
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self) -> None:
         gg.BASE, gg.NOTICES_DIR = self.saved
@@ -25480,7 +25487,8 @@ class StragglerTest(unittest.TestCase):
                 gg.straggler_pass("pr:o/r#45147", data, self.now + hour * gg.STRAGGLER_NOTICE_EVERY, get)
             sent = lines()
             self.assertEqual(len(sent), 2, sent)
-            self.assertTrue(all("--severity warn --source-key stragglers:" in s and ":open:1 WARN" in s for s in sent))
+            self.assertTrue(all(re.search(r"--severity warn --class fyi --source-key stragglers:[\w-]+:open:\d+ WARN", s)
+                                for s in sent), sent)
             # the head's stragglers end; a pass with nothing queued, then the hour seen keeps and the close window
             done = self.now + 4 * gg.STRAGGLER_NOTICE_EVERY
             quiet = gg.parse_pr(pr_node(45147))
@@ -25506,7 +25514,7 @@ class StragglerTest(unittest.TestCase):
 
     def test_one_notice_per_label_over_every_head(self) -> None:
         sent: list[tuple[str, str, str]] = []
-        spawn = mock.patch.object(gg, "incident_send", side_effect=lambda *a: sent.append(a))
+        spawn = mock.patch.object(gg, "incident_send", side_effect=lambda *a, **k: sent.append(a))
         spawn.start()
         self.addCleanup(spawn.stop)
         direct = mock.patch.object(gg, "coord_alert_spawn")
@@ -25554,6 +25562,92 @@ class StragglerTest(unittest.TestCase):
         ledger = [json.loads(x) for x in (gg.BASE / gg.INCIDENT_LEDGER).read_text().splitlines()]
         self.assertEqual(sorted((x["thread"], x["event"]) for x in ledger),
                          [("overflow-16vcpu-linux", "open"), ("overflow-8vcpu-linux", "open")])
+
+
+class FleetOnceStragglerTest(unittest.TestCase):
+    """2026-11-20/21: "N job(s) on runner label X queued with no runner past 30 min" reached claude-sr2-coord from about
+    12 hosts, one per host, for the same labels. A label with no runner is a fleet-wide fact: one host (the fleet
+    reporter) sends it, once per label per 6 h, to NOW's ci-fleet owner as an fyi; the others keep it locally and send
+    only past the fallback, under the same fleet key; a FIRE still goes from any host."""
+
+    HEAD, STRAGGLERS, head, tearDown = (StragglerTest.HEAD, StragglerTest.STRAGGLERS, StragglerTest.head,
+                                        StragglerTest.tearDown)
+
+    def setUp(self) -> None:
+        StragglerTest.setUp(self)
+        self.root = Path(self.tmp.name)
+        self.sent: list[tuple[str, tuple, dict]] = []
+        self.host = "mac-a"
+        for name, value in (("policy_host", lambda: self.host),
+                            ("incident_send", lambda *a, **k: self.sent.append((self.host, a, k)))):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, value)
+        os.environ["GLAEDA_GH_FLEET_REPORTER"] = "mac-a"
+        stamp = lambda ago: gg.utc_stamp(self.now - ago)  # noqa: E731
+        gg.NOW_JSON.write_text(json.dumps({"area_owners": {"rows": [
+            {"area": "ci-fleet", "owners": [
+                {"host": "huge-blue", "name": "fleet-old", "last_seen": stamp(4 * 3600)},  # past AREA_OWNER_FRESH
+                {"host": "gcp-agent-lane-2", "name": "runner-pool", "last_seen": stamp(600)},
+                {"host": "cosmic-gray", "name": "fleet-lane", "last_seen": stamp(60)}]},
+            {"area": "web", "owners": [{"host": "x", "name": "web-owner", "last_seen": stamp(1)}]}]}}))
+
+    def on(self, host: str, at: float, number: int = 45147) -> None:
+        """One straggler pass on HOST (its own state dirs) at AT."""
+        self.host = host
+        gg.BASE, gg.NOTICES_DIR = self.root / host / "gh", self.root / host / "notices"
+        data, get = self.head(number=number)
+        gg.straggler_pass(f"pr:o/r#{number}", data, at, get)
+
+    def labels_sent(self) -> list[tuple[str, str]]:
+        return sorted((host, a[2].split(":")[1]) for host, a, _ in self.sent)
+
+    def test_two_hosts_seeing_the_same_label_send_it_once(self) -> None:
+        for hour in range(3):  # both hosts watch heads on the same two short labels for three hours
+            for host, number in (("mac-a", 45147), ("mac-b", 44602)):
+                self.on(host, self.now + hour * gg.STRAGGLER_NOTICE_EVERY, number)
+        self.assertEqual(self.labels_sent(), [("mac-a", "overflow-16vcpu-linux"), ("mac-a", "overflow-8vcpu-linux")])
+        # nothing is lost: the host that held its send still has the notice line and the incident in its own ledger
+        for host in ("mac-a", "mac-b"):
+            notices = (self.root / host / "notices" / "glaeda-gh.jsonl").read_text().splitlines()
+            self.assertTrue(any("queued with no runner past 30 min" in n for n in notices), host)
+            ledger = (self.root / host / "gh" / gg.INCIDENT_LEDGER).read_text()
+            self.assertIn('"event": "open"', ledger)
+
+    def test_the_send_goes_to_the_ci_fleet_owner_as_an_fyi(self) -> None:
+        self.on("mac-a", self.now)  # the first pass reads the jobs' labels
+        self.on("mac-a", self.now + gg.STRAGGLER_NOTICE_EVERY)
+        self.assertEqual(len(self.sent), 2, self.sent)
+        for _, (text, level, key), kwargs in self.sent:
+            self.assertEqual(kwargs, {"to": "cosmic-gray/fleet-lane", "cls": "fyi"})
+            self.assertEqual(level, "warn")
+            self.assertRegex(key, r"^stragglers:[\w-]+:open:\d+$")
+            self.assertIn("queued with no runner past 30 min", text)
+        # with no fresh ci-fleet owner in NOW, the registry's fleet coordinator
+        gg.NOW_JSON.unlink()
+        gg.fleet_registries = lambda: [{"coordinators": {"fleet": "cosmic-gray/claude-sr2-coord-old"}}]
+        self.assertEqual(gg.area_owner("ci-fleet", self.now), "cosmic-gray/claude-sr2-coord-old")
+
+    def test_a_non_reporter_sends_only_past_the_fallback_under_the_same_fleet_key(self) -> None:
+        # the reporter watches no head on these labels; mac-b's incident outlasts the fallback and it says it once
+        hours = int(gg.STRAGGLER_FLEET_FALLBACK // gg.STRAGGLER_NOTICE_EVERY) + 3
+        for hour in range(hours):
+            self.on("mac-b", self.now + hour * gg.STRAGGLER_NOTICE_EVERY)
+        self.assertEqual(self.labels_sent(), [("mac-b", "overflow-16vcpu-linux"), ("mac-b", "overflow-8vcpu-linux")])
+        bucket = int((self.now + 3 * gg.STRAGGLER_NOTICE_EVERY) // gg.STRAGGLER_FLEET_EVERY)
+        # hour 1 opened the incident; hour 3 is the first pass past the fallback: the key any host uses in that bucket
+        self.assertEqual({a[2] for _, a, _ in self.sent}, {f"stragglers:{label}:open:{bucket}"
+                                                         for label in ("overflow-8vcpu-linux", "overflow-16vcpu-linux")})
+
+    def test_a_fire_still_goes_from_any_host(self) -> None:
+        gg.BASE = self.root / "mac-b" / "gh"
+        self.host = "mac-b"
+        got = [gg.straggler_fleet_send("overflow-8vcpu-linux", "open", "fire", "FIRE x", self.now) for _ in range(2)]
+        self.assertEqual(got, ["sent", "sent"])
+        self.assertEqual(gg.straggler_fleet_send("overflow-8vcpu-linux", "open", "warn", "WARN x", self.now),
+                         "not-reporter")
+        self.assertEqual([(a[1], k["cls"], k["to"]) for _, a, k in self.sent],
+                         [("fire", "block", "cosmic-gray/fleet-lane")] * 2)
+        self.assertTrue(all(a[2].startswith("stragglers:overflow-8vcpu-linux:fire:") for _, a, _ in self.sent))
 
 
 class AlertToolMissingTest(unittest.TestCase):
