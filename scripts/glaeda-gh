@@ -1226,6 +1226,20 @@ def cwd_repo(cwd: str | None = None) -> str | None:
     return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
+def target_readable(kind: str, text: str) -> bool:
+    """Whether KIND would read TEXT as a target at all, for a refusal deciding what to suggest. No side
+    effects and no `cwd_repo` read: a bare number is a target's shape whether or not an origin answers."""
+    text = text.strip()
+    split = split_kind_prefix(text)
+    if split is not None:
+        if split[0] != kind:
+            return False
+        text = split[1]
+    if kind in ("pr", "run", "comment") and BARE_NUMBER.fullmatch(text):
+        return True
+    return kind in KEY_RES and bool(KEY_RES[kind].fullmatch(text))
+
+
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
     shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
@@ -24646,6 +24660,23 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
         return " ".join(["glaeda-gh"] + fixed)
+    # `wait pr A B`: two targets in one call, which `status pr` takes and `wait` does not. A wait is one key
+    # by construction (one request file, one FIFO, one exit code -- 0/1/2/4 is *the* target's verdict, which
+    # every caller branches on), so this names the two calls that do the job rather than inventing an
+    # all-green-or-any-red rule nobody asked for. Measured 2026-11-21: the refusal was argparse's bare
+    # "unrecognized arguments: o/r#2", which names neither the limit nor the way round it.
+    if len(words) >= 4 and words[0] == "wait" and words[1] in STATUS_KINDS:
+        targets: list[str] = []
+        for word in words[2:]:
+            if word.startswith("-"):
+                break
+            targets.append(word)
+        if len(targets) >= 2 and all(target_readable(words[1], w) for w in targets):
+            rest = words[2 + len(targets):]
+            one = " ".join(["glaeda-gh", "wait", words[1], targets[0], *rest])
+            return (f"wait takes one target, because its exit code is that target's verdict: "
+                    f"`glaeda-gh status {words[1]} {' '.join(targets)}` reads them all in one gather, "
+                    f"or run one wait each (`{one}`)")
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
         return f"glaeda-gh {words[0]} --help"
