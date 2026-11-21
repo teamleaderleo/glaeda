@@ -20312,6 +20312,40 @@ class StaleDataTest(Base):
         self.daemon.serve_waits()
         self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists())
 
+    def test_a_pr_wait_the_feed_shows_quiet_is_not_handed_back(self) -> None:
+        """wait_feed_quiet: an old copy the feed shows nothing reached since it was read is current, so the wait stays
+        on the blocker instead of reading its PR again through the broker; an event (or a copy past
+        LAND_FEED_QUIET_MAX) hands it back as before."""
+        rid, _ = self.starved_request()
+        read_at = time.time() - gg.STALE_DATA_AFTER - 300
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=read_at)
+        asked = []
+        quiet = [True]
+
+        def feed_quiet(key, sha, since):
+            asked.append((key, since))
+            return quiet[0]
+
+        self.daemon.land_feed_quiet = feed_quiet
+        self.daemon.now = time.time()
+        self.daemon.serve_waits()
+        self.daemon.serve_waits()
+        self.assertTrue((gg.waits_dir() / f"{rid}.fifo").exists(), "a wait on a quiet PR was handed back")
+        self.assertEqual(asked[0][0], "pr:o/r#9")
+        self.assertAlmostEqual(asked[0][1], read_at, delta=1)
+        self.assertEqual(self.daemon.feed_unstarved, 1, "counted once per copy kept, not per pass")
+        quiet[0] = False  # the feed delivered something for the PR
+        self.daemon.serve_waits()
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists())
+
+    def test_a_pr_copy_past_the_feed_bound_is_handed_back(self) -> None:
+        rid, _ = self.starved_request()  # read 3000 s ago, past LAND_FEED_QUIET_MAX
+        self.daemon.land_feed_quiet = lambda key, sha, since: True
+        self.daemon.now = time.time()
+        self.daemon.serve_waits()
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists())
+        self.assertEqual(self.daemon.feed_unstarved, 0)
+
     def test_a_handed_back_request_past_its_deadline_is_dropped(self) -> None:
         rid, _ = self.starved_request()
         self.daemon.serve_waits()

@@ -4514,6 +4514,7 @@ class Daemon:
         # for it (LAND_FEED_QUIET_MAX's comment), and since when the feed has answered without a gap (None: down)
         self.feed_marks: dict[str, float] = {}
         self.feed_live_since: float | None = None
+        self.feed_unstarved = 0  # PR waits not handed back as starved: the feed showed their copy current
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
@@ -7755,7 +7756,8 @@ class Daemon:
                   "newestData": dict(self.newest_data),
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
-                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER, "stale": self.stale_record(),
+                  "staleWaited": dict(self.stale_waited), "feedUnstarved": self.feed_unstarved,
+                  "staleAfter": STALE_DATA_AFTER, "stale": self.stale_record(),
                   "staleWhy": self.stale_why(), "progress": self.progress(), "staleCause": self.stale_causes(),
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
@@ -8123,7 +8125,10 @@ class Daemon:
                 explained = self.stale_explained(req.get("kind"))
                 if explained == "upstream" and direct_command() is not None:
                     explained = None
-                starved = None if explained else wait_starved(req, read_cache(req["key"]), now)
+                cached = read_cache(req["key"])
+                starved = None if explained else wait_starved(req, cached, now)
+                if starved is not None and self.wait_feed_quiet(req, cached, now):
+                    starved = None  # nothing reached the PR since its copy: a direct read reads the same
                 if starved is not None:
                     # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
                     # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
@@ -10071,6 +10076,22 @@ class Daemon:
             marks.add(f"branch:{repo}@{item['head_branch']}")
         for mark in marks:
             self.feed_marks[mark] = self.now
+
+    def wait_feed_quiet(self, req: dict, cached: dict | None, now: float) -> bool:
+        """A PR wait's copy that only looks starved: the feed shows nothing reached the PR, its head or its branch since
+        the copy was read (land_feed_quiet), within LAND_FEED_QUIET_MAX of that read. Each lane VM handed such waits
+        back every UPSTREAM_DIRECT_AFTER (120 s) to read their PR through the broker themselves; huge-blue,
+        2026-11-21 20:10-20:40Z: 2,435 of glaeda-upstream's 5,949 GETs were TTL re-reads of a path the same VM had read
+        about 118 s before, while the broker's uncached GETs took 11-25 s at p50 and a land's owner_check 135-224 s.
+        Counted once per copy kept (feedUnstarved in daemon.json)."""
+        at = (cached or {}).get("dataAt")
+        if req.get("kind") != "pr" or not isinstance(at, (int, float)) or isinstance(at, bool) \
+                or not 0 <= now - at < LAND_FEED_QUIET_MAX or not self.land_feed_quiet(req["key"], "", at):
+            return False
+        if req.get("feedUnstarved") != at:
+            req["feedUnstarved"] = at
+            self.feed_unstarved += 1
+        return True
 
     def land_feed_quiet(self, key: str, sha: str, since: float) -> bool:
         """True when the controller's feed says nothing could have happened to KEY's PR since SINCE: it has answered
