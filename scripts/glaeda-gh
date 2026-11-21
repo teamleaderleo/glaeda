@@ -14262,10 +14262,20 @@ class LandQueue:
     def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
         """Under the lock, for each judged answer (LAND_UNREAD_SAME_STOP's comment): an "unreadable" one counts its
         text in a row at HEAD and sends the next judgment to the caches first (unreadCacheFirst); the run's
-        LAND_UNREAD_SAME_STOP-th stops E naming the read, and True. A cache-only answer keeps the run as it is; any
-        other answer ends it."""
+        LAND_UNREAD_SAME_STOP-th stops E naming the read, and True. A cache-only answer, and an answer that judged
+        nothing about the PR (LAND_NOT_JUDGED: host_cap, quota, explain_failed), keep the run as it is; any other
+        answer ends it."""
         code = str(answer.get("code") or "")
         if answer.get("cacheOnly"):
+            return False
+        if code in LAND_NOT_JUDGED and code not in LAND_UNREAD_CODES:
+            # The host's state between two reads of the PR, not a read that worked: the login was paced out of a pool
+            # (host_cap), its quota was spent (quota), or land_judge itself could not run (explain_failed). Ending the
+            # run there put the stop out of reach exactly where reads fail most: big-red, 2026-11-21, 82 host_cap
+            # judgments beside 31 unreadable ones; manaflow-ai/cmux#46507 at 5a37519ddc7f answered unreadable at
+            # 23:44:03Z and 23:50:00Z with three host_cap answers between 22:24Z and 23:02Z, and its run read 2, not
+            # 5, while the same webview read had failed since 22:24Z. park_quota says it for the streak already ("the
+            # login's state, not the PR's: no step, no streak"); this run counts reads, so it says the same.
             return False
         if code not in LAND_UNREAD_CODES:
             e.pop("unreadRun", None)

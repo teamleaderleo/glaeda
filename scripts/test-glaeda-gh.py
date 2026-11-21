@@ -25752,6 +25752,56 @@ class LandTest(Base):
         self.assertEqual(sum(1 for c in explains if "--cache-only" in c), gg.LAND_UNREAD_SAME_STOP - 1)
         self.assertEqual(sum(1 for c in explains if "--cache-only" not in c), gg.LAND_UNREAD_SAME_STOP)
 
+    def entry_judging(self, head: str) -> dict:
+        """This queue's entry for KEY, pinned at HEAD and mid-judgment: what a judged answer is handed (judge_and_take)
+        without a fake land_judge answer queued for it."""
+        self.land()
+        # One answer for the tick that creates the entry: the queue's own pace refusal, which takes no step.
+        self.w.answers.append(refusal("host_cap", head, {"kind": "retry", "after_s": gg.LAND_RETRY_DEFAULT},
+                                      reason="not judged this window: host cap (graphql)"))
+        e = self.tick(1)
+        e.update(state="judging", head=head, seenHead=head, wait=None, wakeAt=None)
+        e.pop("judging", None)
+        self.q.save(e)
+        return e
+
+    def test_a_host_cap_answer_between_two_reads_does_not_clear_the_unread_run(self):
+        """A pace the login hit is not a read of the PR: it leaves the run of identical read failures where it was, so
+        the stop that names the broken read stays in reach. big-red, 2026-11-21: 82 host_cap judgments beside 31
+        unreadable ones; manaflow-ai/cmux#46507 at 5a37519ddc7f answered unreadable at 23:44:03Z and 23:50:00Z with
+        three host_cap answers between 22:24Z and 23:02Z, and its run read 2 of LAND_UNREAD_SAME_STOP while the one
+        webview read had failed since 22:24Z."""
+        self.pr(LA)
+        e = self.entry_judging(LA)
+        why = "land-judge: unreadable: KeyError: 'statusCheckRollup' in read_checks"
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": gg.LAND_RETRY_DEFAULT}, reason=why)[1]
+        capped = refusal("host_cap", LA, {"kind": "retry", "after_s": gg.LAND_RETRY_DEFAULT},
+                         reason="not judged this window: host cap (graphql)")[1]
+        self.assertFalse(self.q.unread_repeated(e, unread, LA))
+        self.assertEqual(e["unreadRun"]["count"], 1)
+        for _ in range(3):
+            self.assertFalse(self.q.unread_repeated(e, capped, LA))
+            self.assertEqual(e["unreadRun"]["count"], 1)  # the host's own pace cleared nothing
+        self.assertFalse(self.q.unread_repeated(e, unread, LA))
+        self.assertEqual(e["unreadRun"]["count"], 2)
+        self.assertTrue(self.q.unread_repeated(e, unread, LA))  # the LAND_UNREAD_SAME_STOP-th read stops it
+        self.assertEqual(e["stop"]["code"], "unreadable_repeated")
+        self.assertIn("KeyError: 'statusCheckRollup'", e["stop"]["reason"])
+
+    def test_an_answer_that_read_the_pr_still_ends_the_unread_run(self):
+        """The rule is narrow: only an answer that judged nothing (LAND_NOT_JUDGED) keeps the run. A read that worked
+        and refused on the PR's own state ends it, as before, so an intermittent read never reaches the stop."""
+        self.pr(LA)
+        e = self.entry_judging(LA)
+        why = "land-judge: unreadable: KeyError: 'statusCheckRollup' in read_checks"
+        unread = refusal("unreadable", LA, {"kind": "retry", "after_s": gg.LAND_RETRY_DEFAULT}, reason=why)[1]
+        red = refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red"}, reason="its own red")[1]
+        self.assertFalse(self.q.unread_repeated(e, unread, LA))
+        self.assertFalse(self.q.unread_repeated(e, red, LA))
+        self.assertIsNone(e.get("unreadRun"))
+        self.assertFalse(self.q.unread_repeated(e, unread, LA))
+        self.assertEqual(e["unreadRun"]["count"], 1)
+
     def test_a_transient_unreadable_is_retried_not_stopped_and_a_cache_hit_sends_no_read(self):
         """A read the broker queued or timed out is not the same failure each time: it retries as before. Its next
         judgment goes to this host's caches first (read-with-one-quota-route.md), and a cache "ok" merges with no
