@@ -25217,6 +25217,169 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+# The words every command takes in its first command slot, read off the parser itself so this table cannot
+# drift from the commands that exist. Two spellings of the same thing in argparse: `log` nests real
+# subparsers (`log job`), while `status`, `wait`, `post` and `search` spell their one dispatch word as the
+# `choices` of a first positional (`post comment`). Both are a word the caller must put *after* a command,
+# and getting that nesting wrong is the mistake this routes.
+_NESTING: tuple[frozenset[str], dict[str, list[str]]] | None = None
+
+
+def first_slot_words(p: argparse.ArgumentParser) -> list[str]:
+    """Every word P takes in its first command slot: a nested subparser's names, or the choices of its first
+    positional. The first such slot only -- a later positional (`log search PATTERN`) is data, not a word."""
+    for action in p._actions:  # noqa: SLF001  argparse has no public reader for this
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return [name for name in action.choices if isinstance(name, str)]
+        if not action.option_strings and action.choices:
+            return [c for c in action.choices if isinstance(c, str)]
+    return []
+
+
+def child_parser(parent: argparse.ArgumentParser, word: str) -> argparse.ArgumentParser:
+    """The parser that owns the options of `PARENT WORD`: the nested subparser when there is one, else PARENT
+    itself (a `choices` word is parsed by its own parent)."""
+    for action in parent._actions:  # noqa: SLF001
+        if isinstance(action, argparse._SubParsersAction) and word in action.choices:  # noqa: SLF001
+            return action.choices[word]
+    return parent
+
+
+def nesting_table() -> tuple[frozenset[str], dict[str, list[str]]]:
+    """(the top-level commands, each deeper word -> the commands that take it), walked off `parser()` once.
+    Built lazily and kept: only a call whose first word is no command pays for it."""
+    global _NESTING
+    if _NESTING is None:
+        top: dict[str, argparse.ArgumentParser] = {}
+        for action in parser()._actions:  # noqa: SLF001
+            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+                top = {name: sub for name, sub in action.choices.items() if isinstance(name, str)}
+                break
+        table: dict[str, list[str]] = {}
+        for name, sub in top.items():
+            for word in first_slot_words(sub):
+                table.setdefault(word, []).append(name)
+        _NESTING = (frozenset(top), table)
+    return _NESTING
+
+
+def normalized_flag(word: str) -> str:
+    """WORD as a spelling-insensitive key: lowercased with every `-` and `_` dropped, so `--body-file`,
+    `--body_file` and `--bodyFile` are one key and `--body` stays a different one."""
+    return word.lower().replace("-", "").replace("_", "")
+
+
+def parser_options(p: argparse.ArgumentParser) -> dict[str, bool]:
+    """P's long options -> whether each takes a value, for reading a flag's spelling and skipping its value."""
+    out: dict[str, bool] = {}
+    for action in p._actions:  # noqa: SLF001
+        for option in action.option_strings:
+            if option.startswith("--"):
+                out[option] = action.nargs != 0
+    return out
+
+
+def flag_options(raw: list[str]) -> dict[str, bool]:
+    """The long options the command in RAW accepts, the top-level ones included."""
+    tops, _ = nesting_table()
+    top = parser()
+    options = parser_options(top)
+    if not raw or raw[0] not in tops:
+        return options
+    node = child_parser(top, raw[0])
+    options.update(parser_options(node))
+    deeper = [w for w in raw[1:] if not w.startswith("-")]
+    if deeper:
+        nested = child_parser(node, deeper[0])
+        if nested is not node:
+            options.update(parser_options(nested))
+    return options
+
+
+def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
+
+    `glaeda-gh comment o/r#1` named the right concept and missed only that it lives under `post`; measured
+    2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
+    one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
+
+    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
+    would pick between reading and writing. The refusal names every command that takes the word, each as a
+    line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, table = nesting_table()
+    word = raw[0]
+    if word in tops or word not in table:
+        return raw, []  # a real command, or no command's word at all: argparse rules on it as it always has
+    parents = sorted(table[word])
+    typed = {normalized_flag(w.split("=", 1)[0]) for w in raw[1:] if w.startswith("--") and w != "--"}
+    if len(parents) > 1 and typed:
+        fits = [p for p in parents
+                if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
+        if len(fits) == 1:
+            parents = fits
+    if len(parents) > 1:
+        refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
+                   f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
+                   f"you meant decides whether this reads or writes: it is not guessed"]
+        refusal += [f"next: {' '.join(['glaeda-gh', p, word] + raw[1:])}" for p in parents]
+        return raw, refusal
+    fixed = [parents[0], word] + raw[1:]
+    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` "
+          f"(`{word}` is a word of `{parents[0]}`, not a command of its own)", file=sys.stderr)
+    return fixed, []
+
+
+def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A long flag typed in another of its own case conventions, as this tool spells it: (argv, refusal lines).
+
+    snake_case, camelCase and kebab-case of one of this command's options all name that option
+    (`--body_file`, `--bodyFile`, `--body-file`), said on stderr so the next call is typed the canonical way.
+    Only an *exact* match after normalising decides: nothing is matched by prefix or by substring, so
+    `--file` is left for argparse, never read as `--body-file`, and `--body` and `--body-file` stay the two
+    separate options they are. A spelling two real options would both answer to is refused, naming both."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    options = flag_options(raw)
+    by_key: dict[str, list[str]] = {}
+    for option in options:
+        by_key.setdefault(normalized_flag(option), []).append(option)
+    fixed: list[str] = list(raw)
+    said: list[str] = []
+    i = 0
+    while i < len(fixed):
+        word = fixed[i]
+        if word == "--":
+            break  # nothing past a bare -- is this tool's own flag
+        if not word.startswith("--"):
+            i += 1
+            continue
+        name, joined, value = word.partition("=")
+        if name in options:
+            # Canonical already. A flag that takes its value in the next word consumes it: that word is data
+            # (a body, a regular expression, a path) and no spelling of this tool's flags.
+            i += 2 if options[name] and not joined else 1
+            continue
+        matches = sorted(set(by_key.get(normalized_flag(name), [])))
+        if len(matches) > 1:
+            return raw, [
+                f"glaeda-gh: `{name}` is how {len(matches)} different options of this command are spelled "
+                f"({', '.join(matches)}), and they do not mean the same thing: it is not guessed",
+                *(f"next: {' '.join(['glaeda-gh'] + fixed[:i] + [m + (joined + value)] + fixed[i + 1:])}"
+                  for m in matches)]
+        if len(matches) == 1:
+            fixed[i] = matches[0] + joined + value
+            said.append(f"`{name}` is `{matches[0]}`")
+            i += 2 if options[matches[0]] and not joined else 1
+            continue
+        i += 1  # no option of this command spells that way: argparse refuses it, with its own abbreviations
+    if said:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
@@ -25250,6 +25413,13 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
+    for rewriter in (nesting_synonym, flag_spelling_synonym):
+        # The nesting first, then the flags: which options a command has depends on which command it is.
+        raw, refusal = rewriter(raw)
+        if refusal:
+            for line in refusal:
+                print(line, file=sys.stderr)
+            return 64
     raw, inferred = infer_kind(raw)
     if inferred:
         print(inferred, file=sys.stderr)
