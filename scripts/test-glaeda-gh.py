@@ -23078,6 +23078,124 @@ class LandTest(Base):
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
 
+    def test_a_refusal_naming_no_reset_parks_only_its_entry_never_the_queue(self):
+        """gcp lane, 2026-11-21 07:44Z: an "unreadable" judgment whose secondary-limit words were cut before their time
+        ("until 07:5 ...") took its entry's 9th backoff, 3600 s, and park_quota parked the whole host's queue on it until
+        08:44Z, though the limit ended about 07:52Z: 40 lands sat "every worker busy" for an hour. A backoff that is the
+        entry's own parks only that entry; the next one is judged on the same pass."""
+        key2 = "pr:o/r#2"
+        for n in range(1, 10):
+            with self.subTest(n=n):
+                self.tearDown_entries()
+                (gg.land_dir() / "window.json").unlink(missing_ok=True)  # each n its own host-cap window
+                self.t += 3600
+                self.q = self.queue()
+                self.pr(LA)
+                self.land()
+                self.pr(LB, key=key2)
+                self.land("o/r#2")
+                self.q.now = self.t
+                self.q.ingest()
+                self.q.entries[self.KEY]["quotaRefusals"] = n - 1
+                self.w.answers.append(refusal("unreadable", LA, None, reason=(
+                    "merge-hold: refused o/r 1: its head could not be read: no fresh head-matching PR answer: "
+                    "gh-quota: refused: cache-only: not held in this host's caches within 900 s (GET pr view)")))
+                self.w.answers.append(ok_answer(LB))
+                self.w.answers[-1][1]["action"].update(number=2)
+                self.tick()
+                e = self.q.entries[self.KEY]
+                self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["said"]), ("waiting", "quota", False))
+                self.assertEqual(self.q.queue_quota_until, 0.0)
+                self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+                self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged on the same pass
+
+    def test_a_merged_pr_leaves_the_queue_while_the_whole_queue_is_parked(self):
+        """gcp lane, 2026-11-21: hq#16308 merged and stayed listed for hours: a parked queue looked at no entry, and
+        the cache that said MERGED was read only by consider. A merged PR now leaves at the next tick, parked or not,
+        and a closed one too, both from the daemon's cache file alone (no read, no worker)."""
+        key2, key3 = "pr:o/r#2", "pr:o/r#3"
+        for key, head, n in ((self.KEY, LA, 1), (key2, LB, 2), (key3, LC, 3)):
+            self.pr(head, key=key)
+            self.land(f"o/r#{n}")
+        self.q.now = self.t
+        self.q.ingest()
+        self.q.park_queue_quota(self.t + 1800, "quota: not judged, retry after 09:00Z (reset)")
+        self.tick()
+        reads = self.reads()
+        self.w.set_pr(key2, land_pr(LB, state="MERGED"), self.t)
+        self.w.set_pr(key3, land_pr(LC, state="CLOSED"), self.t)
+        self.tick()
+        self.assertEqual(self.q.entries[key2]["state"], "merged")
+        self.assertEqual((self.q.entries[key3]["state"], self.q.entries[key3]["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(self.q.entries[self.KEY]["state"], "queued")
+        self.assertEqual(self.reads()[:2], reads[:2])  # no judgment, no gh call
+        self.assertGreater(self.q.queue_quota_until, self.t)
+
+    def test_a_closed_copy_older_than_the_request_does_not_stop_it(self):
+        """A CLOSED read from before the land was asked for may predate a reopen: only a copy read since stops it."""
+        self.w.set_pr(self.KEY, land_pr(LA, state="CLOSED"), self.t - 600)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        self.q.park_queue_quota(self.t + 1800, "quota")
+        self.tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "queued")
+
+    def test_a_merged_pr_leaves_the_queue_while_every_worker_is_busy_or_its_entry_is_parked(self):
+        """A full pool (refresh_due waits for a free worker) and an entry parked on its own backoff both still let a
+        merged PR leave at the next look."""
+        key2 = "pr:o/r#2"
+        self.upstream = True
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        self.q.now = self.t
+        self.q.ingest()
+        e1, e2 = self.q.entries[self.KEY], self.q.entries[key2]
+        e2.update(state="waiting", wait={"kind": "quota", "until": self.t + 3600, "said": False},
+                  wakeAt=self.t + 3600)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 10 * gg.LAND_REFRESH_AFTER  # a stale copy: a refresh is due
+        busy = {f"pr:o/r#{n}": mock.Mock(done=lambda: False) for n in range(100, 100 + self.q.workers())}
+        with mock.patch.dict(self.q.jobs, busy):
+            self.w.cache[self.KEY]["data"]["state"] = "MERGED"
+            self.w.set_pr(key2, land_pr(LB, state="MERGED"), self.t)
+            self.tick()
+        self.assertEqual((e1["state"], e2["state"]), ("merged", "merged"))
+        self.assertEqual(self.w.explains(), [])
+
+    def test_status_names_the_queue_park_not_every_worker_busy(self):
+        """gcp lane, 2026-11-21: `land status` printed "due since 07:43Z: every worker busy" on 40 lines while the
+        host-wide quota park held them, and named the park nowhere."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        e["dueLate"] = {"since": self.t - 3600, "busy": 4}
+        self.q.park_queue_quota(self.t + 1800, "quota: GraphQL spent until 09:00Z")
+        queue = gg.land_queue_parked(self.t)
+        self.assertEqual(queue["until"], self.t + 1800)
+        line = gg.land_line(e, self.t, latch=None, queue=queue)
+        self.assertIn(f"held: the land queue is parked until {gg.utc_clock(self.t + 1800)} (quota)", line)
+        self.assertNotIn("every worker busy", line)
+        self.assertIn("every worker busy", gg.land_line(e, self.t, latch=None))  # no park: as before
+        self.assertIsNone(gg.land_queue_parked(self.t + 1801))
+
+    def test_a_parked_queue_still_logs_its_pool_line(self):
+        """While parked the tick returned before log_pool: 06:51Z to 08:44Z had two land-pool lines, none naming why."""
+        self.pr(LA)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        self.q.park_queue_quota(self.t + 1800, "quota: GraphQL spent")
+        self.q.pool_logged = float("-inf")
+        with mock.patch.object(gg, "log") as logged:
+            self.tick()
+        pools = [c.args[0] for c in logged.call_args_list if c.args and c.args[0].get("event") == "land-pool"]
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0]["queueParked"]["until"], gg.utc_clock(self.t + 1800 - 2))
+
     def test_a_merge_the_shim_refuses_for_quota_parks_without_a_pr_view(self):
         self.pr(LA)
         self.land()

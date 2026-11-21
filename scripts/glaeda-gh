@@ -11378,6 +11378,12 @@ class LandQueue:
         if self.refuse():
             return
         if self.queue_quota_parked():
+            # Nothing is judged, read or watched until the named reset, but a PR the cache shows ended still leaves
+            # the queue, and the pool line still says where the queue is (land-pool "queueParked").
+            self.retire_ended()
+            self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
+            self.pass_latched = self.pass_staggered = self.pass_capped = 0
+            self.log_pool()
             return
         latch = self.latch_held()
         ended = land_latch_spread(self.now) if latch is None else None
@@ -11426,6 +11432,9 @@ class LandQueue:
                 if self.queue_quota_parked():
                     break  # a worker parked the host while this pass was submitting judgments
                 e = self.entries[key]
+                with self.lock:
+                    if self.retire_from_cache(e):
+                        continue  # ended: no hold, park or worker needed to say so
                 if latch is not None and not self.latch_free(e):
                     self.pass_latched += 1
                     with self.lock:
@@ -11710,6 +11719,30 @@ class LandQueue:
         self.save(e)
         return False
 
+    def retire_from_cache(self, e: dict) -> bool:
+        """Under the lock. End E when the daemon's copy of its PR reads MERGED (a merge never reverts: any copy), or
+        CLOSED in a copy read since E was queued (an older one may predate a reopen). A cache file read, no GitHub
+        call, so every look at an entry takes it -- a parked queue, a held latch, a parked entry or a full pool too.
+        gcp lane, 2026-11-21: hq#16308 merged and stayed listed for hours behind a host-wide quota park."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "")
+        if state == "CLOSED":
+            at = c.get("dataAt")
+            if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
+                return False
+        return self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
+                          "the cache shows it")
+
+    def retire_ended(self) -> None:
+        """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
+        for key in [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]:
+            try:
+                with self.lock:
+                    self.retire_from_cache(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
     def queue_quota_parked(self) -> bool:
         """Whether a quota refusal has paused this host's whole land queue until its reset."""
         with self.lock:
@@ -11749,7 +11782,12 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        self.park_queue_quota(said if said is not None else wake, text)
+        if said is not None:
+            # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
+            # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
+            # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
+            # until 08:44Z though the limit it hit ended about 07:52Z -- 40 lands "every worker busy" for an hour.
+            self.park_queue_quota(said, text)
         self.history(e, "parked", until=utc_clock(wake), said=utc_clock(said) if said is not None else None, n=n)
         self.check(e)
         e.setdefault("parkedSince", self.now)  # held from here to the next judgment (LAND_WAIT_HELD)
@@ -12084,6 +12122,8 @@ class LandQueue:
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
              "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
+             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_trim(self.queue_quota_reason, 160)}
+             if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
 
@@ -12255,6 +12295,8 @@ class LandQueue:
     def consider(self, e: dict) -> None:
         """Whether this entry is judged now: only when something could have changed land_judge's answer."""
         c = self.cache_of(e["key"])
+        if self.retire_from_cache(e):
+            return  # before refresh_due: an ended PR never waits for a free worker to leave the queue
         if self.refresh_due(e, c):
             self.changed_entries.add(e["key"])
             return  # judged on the fresh copy, next tick
@@ -13752,8 +13794,19 @@ def land_latch_held(e: dict) -> bool:
 LAND_LATCH_READ = object()  # land_line's default: read the login's latch now (land_latch)
 
 
-def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
-    """E's status line. LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
+def land_queue_parked(now: float) -> dict | None:
+    """The host-wide quota park (LandQueue.park_queue_quota: land/quota.json) while it holds, else None."""
+    doc = read_json(land_dir() / LAND_QUOTA_FILE)
+    until = (doc or {}).get("until") if isinstance(doc, dict) else None
+    if not isinstance(until, (int, float)) or isinstance(until, bool) or until <= now:
+        return None
+    return {"until": float(until), "reason": str(doc.get("reason") or "")}
+
+
+def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | None = None) -> str:
+    """E's status line. QUEUE is the host-wide quota park (land_queue_parked) when one holds: a due entry names it,
+    never a stale "every worker busy" (gcp lane, 2026-11-21: 40 lines said every worker busy while the park, which
+    status never named, held the queue for an hour). LATCH is the login's latch now ((pool, until) or None; read here by default): an entry the
     latch held (latchHeld) says so only while a mark holds, and names the mark's until as read now, never the one it
     stored. gcp-agent-lane-1 2026-11-19 11:18Z: with no mark on disk, 12 entries printed "held by the login latch until
     11:43Z", each its own stored until."""
@@ -13784,6 +13837,8 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ) -> str:
             and float(e["windowCapped"].get("next") or 0) > now:
         bits.append(f"not judged this window: host cap ({e['windowCapped'].get('pool')}; next window "
                     f"{time.strftime('%H:%MZ', time.gmtime(float(e['windowCapped']['next'])))})")
+    elif queue and e["state"] in ("queued", "waiting") and not (w.get("kind") == "quota" and e["state"] == "waiting"):
+        bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
         bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
     if e.get("after") and e["state"] == "waiting_after":
@@ -13817,7 +13872,7 @@ def land_status_doc(target: str | None) -> dict:
     refused = read_json(land_dir() / LAND_REFUSED_FILE)
     stale = read_json(land_dir() / LAND_STALE_CHECKOUT_FILE)
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
-            else None, "stale": stale if land_stale_fresh(stale, time.time()) else None,
+            else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries)}
 
 
@@ -13913,8 +13968,15 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if latch:
         print(f"glaeda land: parked until {time.strftime('%H:%MZ', time.gmtime(latch[1]))} (quota): the login's "
               f"{'REST' if latch[0] == 'rest' else 'GraphQL'} latch holds; no entry is judged before it")
+    queue = doc.get("queueParked") if isinstance(doc.get("queueParked"), dict) else None
+    if queue and float(queue.get("until") or 0) <= now:
+        queue = None
+    if queue:
+        print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
+              f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
+              f"{land_trim(queue.get('reason'), 200)}")
     for e in entries:
-        print(land_line(e, now, latch))
+        print(land_line(e, now, latch, queue))
         if target:
             for h in e.get("history") or []:
                 extra = " ".join(f"{k}={v}" for k, v in h.items() if k not in ("at", "event"))
