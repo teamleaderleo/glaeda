@@ -5424,7 +5424,7 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def cargo_target_dir(path: Path) -> bool:
+def worker_cargo_target(path: Path) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
     real directory (not a symlink) that holds no version control of its own."""
     try:
@@ -5442,7 +5442,7 @@ def worker_build_output(fam: Family, path: Path) -> bool:
     """Whether PATH is a Cargo target directory directly in the hq worker's cache on a pressure pass that frees it
     (PRESSURE_WORKER_BUILD_OUTPUT): neither the worker being loaded (retired_only) nor a git search keeps it."""
     return (PRESSURE_WORKER_BUILD_OUTPUT and fam.id in WORKER_CACHE_FAMILY_IDS and path.parent == fam.root
-            and cargo_target_dir(path))
+            and worker_cargo_target(path))
 
 
 CMUX_DEBUG_APP_PREFIX = "com.cmuxterm.app.debug."  # a tagged DEV build's bundle id, never a release app's
