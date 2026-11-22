@@ -22111,6 +22111,9 @@ class LandWorld:
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
+        # `gh api PATH --jq ...` reads by path prefix: what the jq answers (None: the read fails). Unset: exit 0, no
+        # output, which no reader can use (a run read before a rerun: rerun as before)
+        self.api: dict[str, str | None] = {}
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
         # as lane-gh prints it: the broker's whole envelope, indented over many lines
         self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
@@ -22158,6 +22161,11 @@ class LandWorld:
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
                 return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
+            if words[:1] == ["api"] and len(words) > 1:
+                for prefix, out in self.api.items():
+                    if words[1].startswith(prefix):
+                        return subprocess.CompletedProcess(argv, 1 if out is None else 0, f"{out or ''}\n",
+                                                           "HTTP 502" if out is None else "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
@@ -23160,6 +23168,83 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def stale_api(self, run: int, files: list[str], ahead: int = 3, event: str = "pull_request") -> None:
+        """RUN's merge was built on main at BASE_THEN; main is AHEAD commits past it now, changing FILES."""
+        self.w.api[f"repos/o/r/actions/runs/{run}"] = json.dumps(
+            {"id": run, "event": event, "created_at": "2026-11-22T00:05:00Z",
+             "pull_requests": [{"base": {"ref": "main"}}]})
+        self.w.api["repos/o/r/commits?"] = "b" * 40
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = json.dumps(
+            {"status": "ahead", "ahead_by": ahead, "files": files})
+
+    def test_a_rerun_of_a_merge_the_base_fixed_since_is_a_pinned_base_merge_instead(self):
+        # cmux run 44964926915 attempt 3 (2026-11-22 02:42Z) replayed a 00:05Z merge without base fix 27647ffd3ae
+        # (scripts/ci/api_call_log/env.sh) and failed again: only a new head gets a new merge commit.
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.stale_api(5, ["scripts/ci/api_call_log/env.sh"])
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.assertEqual(e["reruns"], {f"{LA}|5": 1})  # counted against LAND_RERUN_CAP as the rerun was
+        stale = [h for h in e["history"] if h["event"] == "stale_replay"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("scripts/ci/api_call_log/env.sh", stale[0]["why"])
+
+    def assert_rerun_as_before(self) -> None:
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"]])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "stale_replay"], [])
+
+    def test_a_fresh_run_is_rerun_as_before(self):
+        self.stale_api(5, ["src/a.ts"])  # the base moved, off the CI paths and under STALE_REPLAY_BEHIND
+        self.assert_rerun_as_before()
+
+    def test_a_push_run_is_rerun_as_before(self):
+        self.stale_api(5, [".github/workflows/ci.yml"], event="push")
+        self.assert_rerun_as_before()
+
+    def test_an_unread_run_is_rerun_as_before(self):
+        self.w.api["repos/o/r/actions/runs/5"] = None
+        self.assert_rerun_as_before()
+
+    def test_an_unread_compare_is_rerun_as_before(self):
+        self.stale_api(5, ["scripts/ci/x.sh"])
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = None
+        self.assert_rerun_as_before()
+
+    def test_stale_replay_why_is_cmuxterm_hq_stale_replay(self):
+        run = {"id": 9, "event": "pull_request", "created_at": "2026-11-22T00:05:00Z",
+               "pull_requests": [{"base": {"ref": "main"}}]}
+        then = lambda ref, at: "c" * 40
+
+        def cmp(status: str = "ahead", ahead: int = 3, files: tuple = ()) -> Any:
+            return lambda that, ref: {"status": status, "ahead_by": ahead, "files": list(files)}
+
+        self.assertIn("51 commits behind main", gg.stale_replay_why(run, then, cmp(ahead=51)))
+        self.assertIn(".github/workflows/a.yml", gg.stale_replay_why(run, then, cmp(files=(".github/workflows/a.yml",))))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(ahead=50, files=("src/a.ts",))), "")
+        self.assertIn("src/a.ts", gg.stale_replay_why(run, then, cmp(files=("src/a.ts",)), patterns=("src/*",)))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(status="diverged", ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "event": "push"}, then, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99)), "")
+        self.assertIn("main", gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99), default_base="main"))
+        self.assertEqual(gg.stale_replay_why(run, lambda ref, at: None, cmp(ahead=99)), "")
+
+        def boom(*_: Any) -> Any:
+            raise RuntimeError("HTTP 502")
+
+        self.assertEqual(gg.stale_replay_why(run, boom, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why(run, then, boom), "")
+
     # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
     # job failed a test on a local port; a hand rerun was the step.
     RUN = 44118660533
@@ -23207,6 +23292,20 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_an_unrelated_red_on_a_merge_the_base_fixed_since_is_a_pinned_base_merge_once(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.stale_api(self.RUN, ["scripts/ci/api_call_log/env.sh"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["unrelatedReruns"]),
+                         ("waiting", "head_change", [f"{LA}|{self.RUN}"]))
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "stale_replay"], ["stale_replay"])
 
     def test_the_same_red_after_its_one_rerun_stops_own_red_even_after_a_restart(self):
         self.unrelated_world(["webviews/src/a.ts"])
