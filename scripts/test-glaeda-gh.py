@@ -5492,6 +5492,21 @@ class ClientTest(Base):
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
 
+    def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
+        """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
+        --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
+        here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
+        sha = "a" * 40
+        by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
+        for word in ("--pin", "--pinned", "--match-head-commit"):
+            args = gg.parser().parse_args(["land", "o/r#1", word, sha])
+            self.assertEqual(args.sha, sha, word)
+            self.assertEqual(vars(args), vars(by_sha), word)
+        for kind, target in (("pr", "o/r#1"), ("run", "o/r/12")):
+            waited = gg.parser().parse_args(["wait", kind, target, "--pin", sha])
+            self.assertEqual(waited.sha, sha)
+            self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
+
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
         --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
@@ -10639,6 +10654,125 @@ class RerunWaitTest(Base):
         self.assertEqual(code, gg.EXIT_FAIL)
 
 
+class WaitPrNotMergedTest(Base):
+    """manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr
+    manaflow-ai/cmux#50409` (no --until) ended at 14:51Z with "result: success, ended_by: success" on green checks;
+    the PR was still OPEN and merged at 15:23:12Z. The agent reported "merged" and its coordinator spent a 90-minute
+    deploy wait on a PR that was not in. A green wait on an open PR now says green and not merged, and names
+    `--until merged`; a wait with no --until on a PR glaeda land has a request for waits for the merge."""
+
+    KEY = "pr:o/r#1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.get = lambda repo, queries: {q: {"workflow_runs": [], "total_count": 0} for q in queries}
+
+    def put(self, state: str = "OPEN", rollup: str = "SUCCESS", conclusion: str = "SUCCESS") -> None:
+        data = gg.parse_pr(pr_node(1, state=state, rollup=rollup, checks=[check_run("a", conclusion=conclusion)]))
+        if state == "MERGED":
+            data["mergeCommit"] = {"oid": "c8572b091e4b" + "0" * 28}
+        now = time.time()
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "fetchedAt": now, "dataAt": now, "data": data, "error": None})
+
+    def land(self, state: str, **fields: Any) -> None:
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "repo": "o/r", "number": 1, "state": state, **fields})
+
+    def request(self, until: str | None, as_json: bool = False) -> dict:
+        if until is None:
+            until, chosen = gg.wait_until_chosen("pr", self.KEY, None)
+            req = gg.wait_request("pr", "o/r#1", until, 600, False, as_json, None, True, gg.RESCUE_GRACE,
+                                  chosen=chosen)
+        else:  # the same request an explicit --until always made
+            req = gg.wait_request("pr", "o/r#1", until, 600, False, as_json, None, True, gg.RESCUE_GRACE)
+        req["began"] = time.time() - 5
+        return req
+
+    def test_green_on_an_open_pr_says_green_not_merged_and_names_the_merged_wait(self) -> None:
+        self.put()
+        code, text = gg.wait_step(self.request("green"), time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)  # exit 0 stays: every existing caller reads green as 0
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        self.assertNotIn("result: success", text)
+        self.assertNotIn("ended_by: success", text)
+        self.assertEqual(text.rstrip("\n").splitlines()[-1], "next: glaeda-gh wait pr o/r#1 --until merged")
+
+    def test_done_and_required_on_an_open_pr_say_not_merged_too(self) -> None:
+        self.put()
+        for until in ("done", "required"):
+            code, text = gg.wait_step(self.request(until), time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_OK, text)
+            self.assertIn("PR still OPEN, not merged", text, until)
+            self.assertNotIn("result: success", text, until)
+            self.assertIn("next: glaeda-gh wait pr o/r#1 --until merged", text, until)
+
+    def test_json_keeps_its_result_and_says_merged_false(self) -> None:
+        self.put()
+        code, text = gg.wait_step(self.request("green", as_json=True), time.time(), self.get)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["result"]), (gg.EXIT_OK, "success"))  # the --json contract callers parse
+        self.assertIs(doc["merged"], False)
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#1 --until merged")
+
+    def test_until_merged_never_ends_on_checks_alone(self) -> None:
+        req = self.request("merged")
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get), "a merged wait ended on green checks")
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+        self.assertIn("c8572b091e", text)
+
+    def test_a_cli_wait_with_no_until_parses_as_unset(self) -> None:
+        self.assertIsNone(gg.parser().parse_args(["wait", "pr", "o/r#1"]).until)
+        self.assertEqual(gg.parser().parse_args(["wait", "pr", "o/r#1", "--green"]).until, "green")
+
+    def test_no_until_and_no_land_request_is_green(self) -> None:
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+        self.land("merged")
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+        self.land("stopped")
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+
+    def test_an_explicit_until_is_never_changed(self) -> None:
+        self.land("waiting")
+        for until in ("green", "done", "required", "merged"):
+            self.assertEqual(gg.wait_until_chosen("pr", self.KEY, until), (until, None))
+
+    def test_no_until_with_a_land_request_waits_for_the_merge_and_says_so(self) -> None:
+        for state in ("queued", "waiting", "judging", "acting", "waiting_after", "forwarded"):
+            self.land(state)
+            until, chosen = gg.wait_until_chosen("pr", self.KEY, None)
+            self.assertEqual(until, "merged", state)
+            self.assertIn("glaeda land", chosen["why"])
+            self.assertIn(state, chosen["why"])
+        self.land("waiting")
+        req = self.request(None)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get), "the land's wait ended on green checks")
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+        self.assertIn("until: merged (chosen: a land request", text)
+
+    def test_the_lands_own_stop_ends_its_merged_wait_on_the_checks(self) -> None:
+        self.land("waiting")
+        req = self.request(None)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get))
+        self.land("stopped", stop={"code": "review_required", "reason": "needs an approving review", "next": "x"})
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)  # what the same wait with no land would have said: green, exit 0
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        self.assertIn("land: the land request stopped (review_required: needs an approving review)", text)
+        self.put(rollup="FAILURE", conclusion="FAILURE")
+        req = self.request(None)  # no land request any more: green, so a red fails as before
+        self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+
 class WaitSubscriptionTest(Base):
     """2026-10-21, app-efficiency: 89 `glaeda-gh wait` processes held 1.6 GB on cosmic-gray, a whole
     interpreter per waiter re-reading the cache every 3 s. A `wait pr|run` is now a request the daemon
@@ -10681,7 +10815,7 @@ class WaitSubscriptionTest(Base):
         self.daemon.serve_waits()
         self.assertEqual(self.woken(reader), "0\n")
         out = (gg.waits_dir() / f"{rid}.out").read_text()
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a decided request stayed")
 
     def test_a_red_or_a_timeout_says_what_cmd_wait_says(self) -> None:
@@ -10788,7 +10922,7 @@ class WaitSubscriptionTest(Base):
                 child.kill()
                 child.wait()
         self.assertEqual(child.returncode, 0, out + err)
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
 
     def test_an_older_daemon_gets_the_polling_wait(self) -> None:
@@ -11399,6 +11533,61 @@ class FileAndPidWaitTest(unittest.TestCase):
         for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_word_for_a_command_runs_as_that_command(self) -> None:
+        """`pr-state o/r#1 o/r#2` (called so on gcp-agent-lane-2, 2026-11-21, and refused with the bare list of
+        commands) runs `status o/r#1 o/r#2`, and a case, a prefix or a typo of a command runs as it too."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for given, want in (("pr-state", "status"), ("pr_state", "status"), ("state", "status"),
+                                ("STATUS", "status"), ("stat", "status"), ("statsu", "status"),
+                                ("quota", "budget"), ("runner", "runners")):
+                self.assertEqual(gg.command_spelling_synonym([given, "o/r#1"]), ([want, "o/r#1"], []),
+                                 f"{given} -> {want}")
+        self.assertEqual(err.getvalue().count("read as"), 8)
+        self.assertIn("is no command", err.getvalue())
+        # The rewrite parses, and the kind a bare target implies is still inferred from it afterwards.
+        fixed, said = gg.infer_kind(gg.command_spelling_synonym(["pr-state", "o/r#1"])[0])
+        self.assertEqual(fixed[:2], ["status", "pr"])
+        self.assertTrue(said)
+        self.assertEqual(gg.parser().parse_args(fixed).command, "status")
+
+    def test_a_command_a_nesting_word_and_a_stranger_are_all_left_alone(self) -> None:
+        """A real command is never rewritten; a word nesting_synonym owns stays its; a word near nothing keeps
+        argparse's own refusal, with the commands in it."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for same in (["status", "pr", "o/r#1"], ["land", "o/r#1"], ["--help"], [],
+                         ["gh", "pr", "view", "1"], ["comment", "o/r#1"], ["job", "o/r", "7"],
+                         ["frobnicate", "o/r#1"], ["xyzzy"]):
+                self.assertEqual(gg.command_spelling_synonym(list(same)), (same, []), " ".join(same))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_only_the_first_word_is_read_as_a_command(self) -> None:
+        """`wait run o/r/1` keeps its kind: `run` is a prefix of `runners`, and a word after the command is a
+        kind or a target, never a command (which is why this is not in Parser._get_value)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["wait", "run", "o/r/1"]),
+                             (["wait", "run", "o/r/1"], []))
+            self.assertEqual(gg.parser().parse_args(["wait", "run", "o/r/1"]).kind, "run")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_word_as_close_to_two_commands_refuses_naming_both(self) -> None:
+        """Nothing is guessed between two commands: the refusal names each as a line that runs. No two real
+        commands are one edit apart, so the pair comes from a patched command set."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["seach", "cmux next"]),  # one edit from `search`
+                             (["search", "cmux next"], []))
+        self.assertEqual(err.getvalue().count("read as"), 1)
+        tops, table = gg.nesting_table()
+        with mock.patch.object(gg, "nesting_table", lambda: (frozenset({"read", "real"}), table)):
+            fixed, refusal = gg.command_spelling_synonym(["reat", "o/r#1"])
+        self.assertEqual(fixed, ["reat", "o/r#1"])
+        self.assertIn("is no command", refusal[0])
+        self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
+        self.assertIn("read", tops)  # the real table is untouched by the patch above
 
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
@@ -24394,6 +24583,34 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def test_sha_pin_follows_the_base_merge_land_judge_made_in_the_merge_step(self):
+        # teamleaderleo/glaeda#2499, 2026-11-22: judged ok at 52240119, the pinned merge (the gh shim runs land_judge
+        # again) merged main into the PR and was refused checks_running, the lander bot's 7044843d appeared, and the
+        # land stopped head_moved. The step's refusal is now read like a judgment's: the pin follows that merge.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = (self.judge_merged_base(LA)[1]["reason"]
+                                  + f"; next: glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 900")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIn("update_by_judge", [h["event"] for h in e["history"]])
+        self.w.gh_rc["merge"] = 0
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[("ci", "IN_PROGRESS", "")]), self.t + 5)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]  # the bot's merge: the pin, then main
+        e = self.tick(10)
+        self.assertNotEqual(e["state"], "stopped")
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_WAIT_DEFAULT + 120, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assertEqual([m[-1] for m in self.w.gh_calls("pr", "merge")], [LA, LB])  # refused at the pin, then merged
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
     def test_a_judgment_that_names_another_head_or_no_base_merge_records_no_update(self):
         e = {"key": self.KEY, "history": []}
         with self.q.lock:
@@ -33138,6 +33355,38 @@ class AppPoolTest(Base):
         self.assertEqual([(l["cause"], l["pools"]) for l in lines],
                          [("pool-resting", {"ci-watch": "pool-resting", "land-judge": "no-token"})])
 
+    def test_a_content_read_names_the_outbox_not_a_route_cause(self) -> None:
+        """A content=True read skips the pool by design: its line says outbox, not owner-without-app."""
+        query = {"query": "query($o:String!,$r:String!,$n:Int!){x}", "variables": {"o": "o", "r": "r", "n": 1}}
+        lines = self.fallbacks((("GET", "/repos/o/r/pulls/1"), {"content": True}),
+                               (("POST", "/graphql", query), {"content": True}))
+        self.assertEqual([l["cause"] for l in lines], ["outbox", "outbox"])
+        self.assertEqual(self.app_calls, [])
+
+    def test_passed_over_asks_each_role_s_files_once_per_ttl(self) -> None:
+        asked: list[str] = []
+        spare = gg.AppPool(role="land-judge", mint=lambda owner: None, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: asked.append("land-judge") or False, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        self.ready = False
+        lines = self.fallbacks(*[(("GET", f"/repos/manaflow-ai/cmux/pulls/{n}"), {}) for n in range(1, 6)])
+        self.assertEqual([l["cause"] for l in lines], ["no-token"] * 5)
+        self.assertEqual(asked, ["land-judge"], "one directory scan for five reads, not five")
+        self.daemon.now += gg.APP_POOL_TTL + 1
+        self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/6"), {}))
+        self.assertEqual(asked, ["land-judge", "land-judge"], "and again once the TTL has passed")
+
+    def test_an_expired_node_bench_is_dropped_at_the_next_bench(self) -> None:
+        self.pool.bench_nodes(["manaflow-ai/cmux#3"], NOW + 600)
+        self.daemon.now = NOW + 601
+        body = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}",
+                "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 3}}
+        with mock.patch.object(gg, "graphql_body_nodes", side_effect=AssertionError("parsed")):
+            self.assertIs(self.pool.pick("manaflow-ai", "graphql:manaflow-ai:cmux", body), self.pool,
+                          "an expired node bench costs a read no parse")
+        self.pool.bench_nodes(["manaflow-ai/cmux#4"], NOW + 1200)
+        self.assertEqual([k for k in self.pool.unreadable if k.startswith("node:")], ["node:manaflow-ai/cmux#4"])
+
 
 class AppPoolHostTest(unittest.TestCase):
     """The default pool finds the App and gh_app_token.py on the host by itself: no agent sets anything."""
@@ -33256,6 +33505,27 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertEqual(pool.passed_over("manaflow-ai", scope),
                          ("no-token", dict.fromkeys(["land-judge", "glaeda", "ci-watch", "quota-goblin"], "no-token")))
 
+    def test_a_pushed_only_host_reads_an_owner_only_a_later_role_holds(self) -> None:
+        """A host with pushed tokens and no helper or config: land-judge, first in the chain, holds none for
+        teamleaderleo, ci-watch does. The owner is the chain's, so its reads go on ci-watch, not the login."""
+        gg.PACE_CLI = Path(self.tmp.name) / "missing/gh"
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        for role, owner in (("land-judge", "manaflow-ai"), ("ci-watch", "teamleaderleo")):
+            path = gg.app_pool_pushed_path(role, owner)
+            path.write_text(json.dumps({"app_id": 1, "owner": owner, "token": APP_TOKEN, "expires_at": at}))
+            path.chmod(0o600)
+        chain = gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(",")))
+        pool = gg.AppPool(role=chain[0]).with_spares(chain[1:])
+        self.assertEqual(pool.owner_why("GET", "/repos/teamleaderleo/glaeda/pulls/1"), ("teamleaderleo", ""))
+        scope = pool.scope("teamleaderleo", "GET", "/repos/teamleaderleo/glaeda/pulls/1")
+        chosen = pool.pick("teamleaderleo", scope)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.role, "ci-watch")
+        self.assertEqual(pool.owner_of("GET", "/repos/manaflow-ai/cmux/pulls/1"), "manaflow-ai")
+        self.assertEqual(pool.pick("manaflow-ai", pool.scope("manaflow-ai", "GET", "/repos/manaflow-ai/cmux/pulls/1")),
+                         pool, "the first role still serves the owner it holds")
+        self.assertEqual(pool.owner_why("GET", "/repos/nobody/x/pulls/1"), (None, "owner-without-app"))
+
 
 class AppPoolChainTest(unittest.TestCase):
     """The order a read asks the Apps in (app_pool_chain) and its off switch, GLAEDA_GH_APP_SPARES."""
@@ -33321,7 +33591,8 @@ class ShorthandFlagTest(unittest.TestCase):
 
     def test_wait_until_forms_unchanged(self):
         args, err = self.parse(["wait", "pr", "o/r#1"])
-        self.assertEqual((args.until, err), ("green", ""))
+        # unset, so main can tell "no --until" (green, or merged for a PR glaeda land holds: wait_until_chosen)
+        self.assertEqual((args.until, err), (None, ""))
         for word in ("green", "done", "required", "merged"):
             with self.subTest(word=word):
                 args, err = self.parse(["wait", "pr", "o/r#1", "--until", word])
