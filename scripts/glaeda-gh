@@ -8446,7 +8446,9 @@ class Daemon:
                                       "missing": entry.get("missing") is True,
                                       # provenance: a controller-only finish stays unconfirmed downstream too
                                       "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
-                                      "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
+                                      "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None,
+                                      # the same view in the entry, for a wait client here (wait_starved): None clears
+                                      "upstreamFeed": self.upstream_feed.get(e["key"])}
             if error and entry.get("errorFrom") == UPSTREAM_OUTAGE:
                 # the upstream's own upstream was down: cleared as this host's is, back to its last real read
                 read_at = entry.get("readAt")
@@ -19904,6 +19906,12 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     if now - float(req.get("directAt") or float("-inf")) < bound:
         return None
     seen = (entry or {}).get("dataAt")
+    view = (entry or {}).get("upstreamFeed")
+    if not never_read and isinstance(view, dict) and upstream_feed_quiet(view, "", float(seen), now):
+        # The upstream's feed saw nothing for this PR since its copy and answered after it (feed_view): the copy is
+        # current, however old. Before, every wait on a lane VM re-read its PR directly every UPSTREAM_DIRECT_AFTER
+        # (huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of 11,257 glaeda-upstream GETs a path that VM had read before).
+        return None
     age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
     return age_s if age_s > bound else None
 

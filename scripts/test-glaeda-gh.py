@@ -2488,6 +2488,31 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
         self.assertFalse(self.daemon.land_feed_quiet(key, "", since), "the feed was not live before the copy")
 
+    def test_a_wait_here_reads_directly_only_when_the_upstreams_feed_does_not_vouch_for_its_copy(self) -> None:
+        """wait_starved: a lane VM's wait re-read its PR through the broker every UPSTREAM_DIRECT_AFTER, its copy's
+        dataAt being the upstream's (old while the PR is quiet). huge-blue, 2026-11-22 01:45-02:45Z: 9,125 of
+        11,257 glaeda-upstream GETs a path that VM had read before. A fresh feed view in the entry rules instead."""
+        key, sha = "pr:o/r#7", "a" * 40
+        gg.register(key)
+        since = NOW - 3000
+        view = {"liveSince": NOW - 7200, "at": NOW - 2, "eventAt": None, "head": sha}
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since, "feed": view}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["upstreamFeed"], {**view, "answeredAt": NOW})
+        req = {"key": key, "kind": "pr", "began": NOW - 600}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 1), "the feed vouches for the copy")
+            stale = NOW + gg.UPSTREAM_FEED_FRESH + 1
+            self.assertIsNotNone(gg.wait_starved(req, entry, stale), "a view this host stopped renewing")
+            moved = {**entry, "upstreamFeed": {**entry["upstreamFeed"], "eventAt": since + 60}}
+            self.assertIsNotNone(gg.wait_starved(req, moved, NOW + 1), "an event after the copy")
+            self.assertIsNotNone(gg.wait_starved(req, {**entry, "upstreamFeed": None}, NOW + 1), "no view")
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since}  # an upstream that stops giving one
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
+
     def test_read_answers_a_prs_feed_view(self) -> None:
         sha = "a" * 40
         self.daemon.store("pr:o/r#7", None, data={"number": 7, "headRefOid": sha}, dataAt=NOW)
