@@ -22697,7 +22697,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "block", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -24749,9 +24750,14 @@ class LandTest(Base):
         self.land("o/r#2", requester="host/two")
         self.land(after=["o/r#2"], requester="host/one")
         self.stop_o_r_2("BLOCK one")
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
         self.tick()
         self.tick(600)
-        to_one = lambda: [m for m in self.w.sent() if m[3] == "host/one"]
+        self.assertFalse([m for m in self.w.sent() if m[3] == "host/one"])  # a wait behind a stop wakes no one
+        to_one = lambda: [d for d in logs if d.get("event") == "land-notice-quiet" and d["to"] == "host/one"]
         self.assertEqual(len(to_one()), 1)
         self.stop_o_r_2("BLOCK two")  # landed again, and stopped again: a new stop
         self.land("o/r#2", requester="host/two")
@@ -27869,13 +27875,15 @@ class LandTest(Base):
         self.tick(30)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
-        sent = self.w.sent()
-        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        # "nothing to do" is a log line, never a wake (LandQueue.notify)
+        self.assertEqual(self.w.sent(), [])
+        sent = [(d["to"], d["message"]) for d in logs if d.get("event") == "land-notice-quiet"]
+        self.assertEqual(sorted(s[0] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        # The line quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
         self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
                             and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
-        self.assertEqual(len(self.w.sent()), 3, "told once")
+        self.assertEqual(len([d for d in logs if d.get("event") == "land-notice-quiet"]), 3, "said once")
         # The next clear: at once, past no spread, oldest wake first
         self.retries(3)
         self.tick(reset2 + 1 - self.t)
