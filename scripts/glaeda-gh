@@ -25679,7 +25679,11 @@ def cmd_restart(force: bool = False) -> int:
         lag = daemon_stale() if running else None
         # A fresh heartbeat is not health: the data it vouches for must be fresh too (STALE_DATA_AFTER)
         starved = daemon_starved() if running and lag is None else None
-        if starved is not None and starved["quota"] and not force:
+        # "Held" is not forever (STALE_HELD_MAX): past it, whatever explains the old data, a plain restart restarts.
+        # 2026-11-21: NOW showed "waited PR data 371 min old (stale)" while `restart` declined on a held verdict
+        # (restart false: a quota stop, then "reading the backlog it left") and every session paid a --force call.
+        overheld = starved is not None and starved["quota"] and starved["age"] > STALE_HELD_MAX
+        if starved is not None and starved["quota"] and not overheld and not force:
             print(f"glaeda-gh: the daemon is running, but its {starved['kind']} data for waits is "
                   f"{int(starved['age'])}s old because {starved['why']}. "
                   "A restart would not read any sooner; a wait reads its own target once (direct_read).")
@@ -25698,6 +25702,9 @@ def cmd_restart(force: bool = False) -> int:
         if starved is not None:
             slowed = f" The quota slows it ({starved['why']}), which alone should not leave it this old." \
                 if starved.get("why") else " Nothing recorded explains it."
+            if overheld:
+                slowed = (f" It has been held past {STALE_HELD_MAX}s ({starved.get('why') or starved.get('cause')}), "
+                          "which is starvation, not pacing.")
             if starved.get("cause"):
                 slowed += f" The daemon's reads: {starved['cause']}."
             slowed += f" Before it restarts, for the record: {STALE_DUMP_ADVICE}."

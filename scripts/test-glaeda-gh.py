@@ -8749,6 +8749,39 @@ class RestartTest(Base):
         self.assertEqual((code, self.calls), (0, []), text)
         self.assertIn("quota is spent", text)
 
+    def test_quota_starvation_past_the_held_bound_is_restarted(self) -> None:
+        """2026-11-21: NOW read "waited PR data 371 min old (stale)" and `restart` declined (quota held), leaving the
+        old daemon until a --force. Past STALE_HELD_MAX a plain restart restarts, whatever explains the age."""
+        self.fresh({"pr": gg.STALE_HELD_MAX + 60.0}, modes={"rest": "lean", "graphql": "stop"}, capped=True)
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+        self.assertIn(f"held past {gg.STALE_HELD_MAX}s", text)
+
+    def test_a_held_verdict_past_the_held_bound_is_restarted(self) -> None:
+        """The daemon's own verdict (daemon.json "stale", restart false) as this host showed it 2026-11-22 00:24Z:
+        pr data 9049 s old, held because the quota held the reads and the daemon was reading the backlog."""
+        self.fresh({"pr": 9049.0})
+        status = gg.read_json(gg.BASE / "daemon.json")
+        status["stale"] = {"state": "stale", "kind": "pr", "age": 9049, "restart": False, "at": time.time(),
+                           "reason": "held past 3600s (the quota held these reads until 79s ago and the daemon is "
+                                     "reading the backlog it left, waited data first)"}
+        gg.write_json(gg.BASE / "daemon.json", status)
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+        self.assertIn("restarting it", text)
+
+    def test_a_held_verdict_under_the_held_bound_is_left_alone(self) -> None:
+        self.fresh({"pr": 1200.0})
+        status = gg.read_json(gg.BASE / "daemon.json")
+        status["stale"] = {"state": "held", "kind": "pr", "age": 1200, "restart": False, "at": time.time(),
+                           "reason": "GitHub's quota is spent (GraphQL stopped, REST at its share)"}
+        gg.write_json(gg.BASE / "daemon.json", status)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("would not read any sooner", text)
+
 class LaunchdRestartTest(unittest.TestCase):
     # tests that drive the system-daemon probe through their own launchctl fake; the rest have no system daemon
     REAL_SYSTEM_PROBE = {"test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy",
