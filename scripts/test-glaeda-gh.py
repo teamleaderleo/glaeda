@@ -25468,6 +25468,20 @@ class LandTest(Base):
                          (self.KEY, "ok", "merge", LA[:12]))
         self.assertIsInstance(judged[0]["took_s"], float)
         self.assertGreaterEqual(judged[0]["took_s"], 0.0)
+        self.assertIsNone(judged[0]["from"])  # its first judgment ended no wait
+
+    def test_a_judgment_logs_the_wait_it_ended(self):
+        # "woke" alone did not say which wait's timer ran (queue host, 2026-11-22: 42 checks_running rows why=woke).
+        self.pr(LA)
+        self.w.answers.append(self.queued_wait(timeout=120))
+        self.land()
+        self.tick()
+        self.w.answers.append(self.queued_wait(timeout=120))
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick(121)
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual([(j["why"], j["from"]) for j in judged], [("woke", "pr:checks_running")], lines)
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
@@ -26586,9 +26600,11 @@ class LandTest(Base):
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
                         'request-branch","status":"422"}')
 
-    def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md") -> tuple[str, str]:
+    def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md",
+                     main_path: str = "") -> tuple[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
-        line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. (head, base)."""
+        line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. With MAIN_PATH,
+        main appends to that file instead, so git merges the two cleanly. (head, base)."""
         origin = Path(self.tmp.name) / "origin"
         env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
@@ -26612,8 +26628,10 @@ class LandTest(Base):
         git("commit", "-qam", "the lane appends")
         head = git("rev-parse", "HEAD")
         git("checkout", "-q", "main")
-        with open(origin / path, "a") as f:
+        (origin / (main_path or path)).parent.mkdir(parents=True, exist_ok=True)
+        with open(origin / (main_path or path), "a") as f:
             f.write("- 11:05Z another PR's line, landed first\n")
+        git("add", "-A")
         git("commit", "-qam", "main appends")
         base = git("rev-parse", "HEAD")
         url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
@@ -26623,9 +26641,13 @@ class LandTest(Base):
         self.origin_git = git
         return head, base
 
-    def union_conflict_tick(self, head: str) -> dict:
+    def union_conflict_tick(self, head: str, owners: frozenset = frozenset({"o"})) -> dict:
         """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
-        conflict, as it does whatever .gitattributes says."""
+        conflict, as it does whatever .gitattributes says. OWNERS stands in for LAND_MERGE_OWNERS (the test repo is
+        o/r)."""
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", owners)
+        patch.start()
+        self.addCleanup(patch.stop)
         data = {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}
         self.w.set_pr(self.KEY, data, self.t)
         gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
@@ -26712,6 +26734,9 @@ class LandTest(Base):
 
     def stacked_tick(self, head: str) -> dict:
         """#1 landed pinned at HEAD, onto stack/a, and land_judge refused it stacked_base naming the retarget."""
+        owners = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))  # the test repo is o/r
+        owners.start()
+        self.addCleanup(owners.stop)
         self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "stack/b", "baseRefName": "stack/a"}, self.t)
         gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
         self.w.answers.append(refusal("stacked_base", head, {"kind": "retarget", "base": "main"},
@@ -26781,6 +26806,16 @@ class LandTest(Base):
         self.assertEqual([h["event"] for h in e["history"] if h["event"].startswith("stacked_rebase")],
                          ["stacked_rebase_failed"])
 
+    def test_a_stacked_pr_of_an_owner_this_queue_never_pushes_to_is_only_retargeted(self):
+        sha = self.stacked_origin()
+        with mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"manaflow-ai"})):
+            self.w.set_pr(self.KEY, {**land_pr(sha["b"]), "headRefName": "stack/b", "baseRefName": "stack/a"}, self.t)
+            gg.land_request("land", "o/r#1", [], "host/lane", sha=sha["b"])
+            self.w.answers.append(refusal("stacked_base", sha["b"], {"kind": "retarget", "base": "main"}))
+            self.tick()
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])
+        self.assertEqual(len(self.retargets()), 1)
+
     def test_retarget_goes_through_rest_not_gh_pr_edit_on_a_host(self):
         """gh 2.45's `pr edit` reads classic project cards first and GitHub refuses that read."""
         self.assertEqual(gg.land_retarget_args("o/r", "3", "main", False)[:4], ["api", "-X", "PATCH",
@@ -26800,11 +26835,42 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
 
-    def test_a_conflict_outside_union_files_still_stops_and_pushes_nothing(self):
+    def test_a_stale_422_that_git_merges_cleanly_is_merged_here_and_the_pinned_land_goes_on(self):
+        """2026-11-22: within 90 minutes glaeda land stopped cmux#50065, #50046, #50102, #44645, #50128, #50387 and
+        hq#18393 on update_branch_conflict, and #50046 and hq#18393 then merged cleanly with a plain local
+        `git merge origin/<base>`. GitHub's 422 is often wrong: with no merge=union path anywhere, the queue makes
+        the merge git makes, pushes it as a plain merge commit (no force-push), and the land goes on pinned."""
+        head, base = self.union_origin(attrs="", main_path="docs/other.md")
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("merge-base", "--is-ancestor", head, merged), "")  # a fast-forward of head
+        self.assertEqual(self.origin_git("show", f"{merged}:docs/other.md"), "- 11:05Z another PR's line, landed first")
+        self.assertIn("git merges the two cleanly", self.origin_git("log", "-1", "--format=%B", merged))
+        self.assertEqual([h["merge"] for h in e["history"] if h["event"] == "union_merged"], [merged[:12]])
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+        self.assert_merged_at(merged)
+
+    def test_a_base_merge_is_pushed_only_to_a_repository_of_the_owners(self):
+        """Never a write on a branch outside manaflow-ai and teamleaderleo: o/r is neither, so it stops, unpushed."""
+        self.assertEqual(gg.LAND_MERGE_OWNERS, frozenset({"manaflow-ai", "teamleaderleo"}))
+        head, _ = self.union_origin(attrs="", main_path="docs/other.md")
+        e = self.union_conflict_tick(head, owners=gg.LAND_MERGE_OWNERS)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("o/r is not a repository of manaflow-ai, teamleaderleo", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+
+    def test_a_true_conflict_still_stops_names_its_files_and_pushes_nothing(self):
         head, _ = self.union_origin(attrs="docs/*.md merge=union\n")
         e = self.union_conflict_tick(head)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
-        self.assertIn("not merge=union in main's .gitattributes: goals/x.md", e["stop"]["reason"])
+        self.assertIn("a true conflict in 1 file(s): goals/x.md", e["stop"]["reason"])
         self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
         self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
         # once per head: the same refusal again at this head stops at once, with no second merge attempt
@@ -29032,6 +29098,31 @@ class LandTest(Base):
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(1)
         self.assertEqual(len(self.w.judgments()), 3)
+
+    def test_a_checks_running_waits_timer_is_held_while_the_feed_is_quiet(self):
+        """Queue host, 2026-11-22: 42 of 141 checks_running judgments were the wait's own timer answering
+        checks_running again. With no event for the PR since the verdict the timer asks nothing; the next event
+        judges at once, LAND_FEED_QUIET_MAX bounds the hold, and any other wait's timeout judges as always."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        for _ in range(5):
+            e = self.tick(121)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertIn("feed_quiet", [h.get("event") for h in e["history"]])
+        events.append(self.t)
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(gg.LAND_FEED_QUIET_MAX)  # the bound: judged
+        self.assertEqual(len(self.w.judgments()), 3)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(121)  # not a checks_running wait: its timeout judges
+        self.assertEqual(len(self.w.judgments()), 4)
 
     def test_a_feed_held_wait_is_judged_past_the_bound(self):
         self.feed()

@@ -12731,6 +12731,13 @@ LAND_VERDICT_KEEP = 600.0
 # base moving under a green head, mergeability, a PR merged or closed) is judged at most this late. A feed that is
 # down, reset, switched or not covering the repository holds nothing: every path reads as before.
 LAND_FEED_QUIET_MAX = 1800.0
+# The wait verdicts whose own timeout does not re-run land_judge either while the feed is quiet since them: what they
+# wait for (checks finishing at the head) reaches the feed as a run or suite event, which is judged at once. Queue
+# host, 2026-11-22 17:35-18:25Z: 42 of 141 checks_running judgments were a wait_pr's timer (why=woke) answering
+# checks_running again, a share of the 13,770 worker-seconds that code held. Still bounded by LAND_FEED_QUIET_MAX from
+# the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
+# never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
+LAND_TIMER_HELD = frozenset({"checks_running"})
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -13125,9 +13132,9 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
 # names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases a conflict away or
 # force-pushes over one: that is a write on someone's branch, so it stays the requester's call, as the draft case
-# stays theirs. The pushes are LAND_UNION's (the base merge update-branch would have made, when only merge=union paths
-# conflict) and LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged, which
-# changes no line of the PR's own diff).
+# stays theirs. The pushes are LAND_UNION's (the base merge update-branch would have made, when git merges the base
+# into the head cleanly) and LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
+# which changes no line of the PR's own diff).
 # A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
 # update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
 # append-only file (goals/*.md, docs/handbook/*.md, REPAIR.md in cmuxterm-hq) stops on update_branch_conflict
@@ -13140,7 +13147,18 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # clean. Then the merge commit (first parent the head, second the base) is pushed to the PR's branch -- the same
 # commit update-branch would have made, a fast-forward GitHub refuses if the branch moved -- and the land goes on as
 # after an update-branch (pin_follow). Any other conflict stops as below, its reason saying why it was not merged.
+# GitHub's 422 is often wrong outright, union or not: 2026-11-22, within 90 minutes the queue stopped manaflow-ai/cmux
+# #50065, #50046, #50102, #44645, #50128, #50387 and cmuxterm-hq#18393 on update_branch_conflict, and #50046 and
+# hq#18393 then merged cleanly with a plain local `git merge origin/<base>`. Leo's ask: "on `update_branch_conflict`,
+# have land try a local merge of origin/<base> into the head in a scratch worktree from its mirror". So the merge is
+# no longer limited to merge=union paths: whenever the merge honoring the base's .gitattributes is clean (whether or
+# not the attribute-free one conflicts), it is pushed as above; only a true conflict stops, and the stop names the
+# conflicting files. The merge runs in this queue's own bare mirror with `git merge-tree --write-tree` (a worktree-free
+# scratch merge: nothing checked out, nothing to clean up). Only a PR whose branch lives on the base repository
+# (forks never: union_plan reads the branch from github.com/<base repo> and requires it at the judged head) of an
+# owner in LAND_MERGE_OWNERS is pushed to; a plain merge commit, fast-forward only, never a force-push.
 LAND_UNION_URL = "https://github.com/{repo}.git"
+LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
 # A stacked PR whose base PR merged is retargeted by this queue onto that PR's own base (land_judge's stacked_base
 # step, `retarget`). When the base PR squash-merged, its commits are not on the new base, so the PR, still holding
@@ -16184,6 +16202,9 @@ class LandQueue:
         if woke or fp != e.get("seen") or reran:
             if not woke and not reran and (self.verdict_holds(e, c, head, fp) or self.feed_holds(e, head)):
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
+            if woke and not reran and (e.get("feedVerdict") or {}).get("code") in LAND_TIMER_HELD \
+                    and self.feed_holds(e, head):
+                return  # the wait's timer, with no check event since the verdict: the same answer (LAND_TIMER_HELD)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke, why="woke" if woke else ("reran" if reran else "fp_moved"))
@@ -16790,7 +16811,11 @@ class LandQueue:
             held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
-                          "why": why if why in LAND_JUDGE_WHY else "fp_moved"})
+                          "why": why if why in LAND_JUDGE_WHY else "fp_moved",
+                          # the wait this judgment ended (its kind, and the verdict that set it): "woke" alone does
+                          # not say which wait's timer ran
+                          "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
+                                                               str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
@@ -17044,7 +17069,7 @@ class LandQueue:
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
             log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
                  "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
-                 "why": why or None})
+                 "why": why or None, "from": judging.get("from") or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
@@ -17674,6 +17699,8 @@ class LandQueue:
             return "failed", f"the PR's branch {branch!r}, base {old!r} or new base {base!r} is not a plain branch name"
         if old == base:
             return "none", f"its base already is {base}"
+        if repo.split("/", 1)[0].lower() not in LAND_MERGE_OWNERS:
+            return "none", f"{repo} is not of an owner this queue pushes to (LAND_MERGE_OWNERS): only the base changes"
         gh = self.gh()
         if gh is None:
             return "failed", "no gh-quota shim to read the base PR through"
@@ -17806,10 +17833,13 @@ class LandQueue:
                          extra)
 
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
-        """(merge commit, the PR's branch, base sha, "") when HEAD's conflict with its base is in merge=union paths
-        only and the merge honoring the base's .gitattributes is clean, else ("", "", "", why not). Writes only into
-        this host's own union mirror (LAND_UNION's comment); sends nothing to the PR."""
+        """(merge commit, the PR's branch, base sha, "") when git's merge of the base into HEAD, honoring the base's
+        .gitattributes, is clean, else ("", "", "", why not; a true conflict names its files). Writes only into this
+        host's own union mirror (LAND_UNION's comment); sends nothing to the PR."""
         repo = e["repo"]
+        if repo.partition("/")[0].lower() not in LAND_MERGE_OWNERS:
+            return "", "", "", (f"{repo} is not a repository of {', '.join(sorted(LAND_MERGE_OWNERS))}: this queue "
+                                "pushes a base merge only to their own branches")
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
         if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
@@ -17848,30 +17878,28 @@ class LandQueue:
         empty = self.union_git(gitdir, "hash-object", "-t", "tree", "-w", "--stdin")  # stdin is /dev/null: the empty tree
         if empty.returncode != 0 or not SHA40.fullmatch((empty.stdout or "").strip()):
             return "", "", "", f"no empty tree in {gitdir}: {land_trim(empty.stderr, 160)}"
-        # What GitHub saw: the merge with no attributes. Its conflicted paths are the ones that must all be union.
+        # What GitHub saw: the merge with no attributes. Its conflicted paths (none when GitHub's 422 was simply wrong)
+        # go into the commit message and the history; they no longer decide anything (LAND_UNION's comment).
         bare = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
                               base_sha, attrs=empty.stdout.strip())
-        if bare.returncode == 0:
-            return "", "", "", "the merge with no attributes is clean here, so the conflict is not one union settles"
-        if bare.returncode != 1:
+        if bare.returncode not in (0, 1):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(bare.stderr or ''), 160)}"
-        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p]  # -z: tree, then NUL-ended paths, unquoted
-        if not paths:
-            return "", "", "", "git merge-tree named no conflicted path"
-        attr = self.union_git(gitdir, "check-attr", "-z", "merge", "--", *paths, attrs=base_sha)
-        words = (attr.stdout or "").split("\0")  # -z: path NUL attribute NUL value NUL, per path
-        union = {words[i] for i in range(0, len(words) - 2, 3) if words[i + 1] == "merge" and words[i + 2] == "union"}
-        other = [p for p in paths if p not in union]
-        if attr.returncode != 0 or other:
-            return "", "", "", (f"{len(other)} conflicted path(s) are not merge=union in {base}'s .gitattributes: "
-                                f"{land_trim(', '.join(other), 160)}")
-        merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--no-messages", head, base_sha, attrs=base_sha)
-        tree = (merged.stdout or "").split("\0", 1)[0].split("\n", 1)[0].strip()
+        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p] if bare.returncode == 1 else []
+        merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
+                                base_sha, attrs=base_sha)
+        words = (merged.stdout or "").split("\0")  # -z: tree, then NUL-ended conflicted paths, unquoted
+        tree = words[0].strip()
+        if merged.returncode == 1:
+            files = [p for p in words[1:] if p]
+            e["unionMerge"].update(conflicts=files[:20])
+            return "", "", "", (f"a true conflict in {len(files)} file(s): {land_trim(', '.join(files), 200)} "
+                                f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
-            return "", "", "", f"the merge honoring {base}'s .gitattributes still conflicts: {land_trim(merged.stdout, 160)}"
-        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a conflict in "
-               f"merge=union paths only ({land_trim(', '.join(paths), 300)}); merged here honoring {base}'s "
-               ".gitattributes.")
+            return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a merge conflict; "
+               + (f"git's merge conflicted only in paths {base}'s .gitattributes settles "
+                  f"({land_trim(', '.join(paths), 300)}), merged here honoring them."
+                  if paths else "git merges the two cleanly, so it was merged here."))
         commit = self.union_git(gitdir, "-c", "user.name=glaeda-land", "-c", "user.email=glaeda-land@users.noreply."
                                 "github.com", "commit-tree", tree, "-p", head, "-p", base_sha, "-m", msg)
         sha = (commit.stdout or "").strip()
@@ -17881,8 +17909,8 @@ class LandQueue:
         return sha, branch, base_sha, ""
 
     def union_merge(self, e: dict, head: str) -> None:
-        """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when every conflicted path
-        is merge=union, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
+        """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
+        into HEAD cleanly, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
@@ -17920,7 +17948,7 @@ class LandQueue:
                 return
             if got.returncode != 0:
                 e.pop("updateSent", None)
-                why = f"the push of the union merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+                why = f"the push of the base merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
                 self.history(e, "union_merge_skipped", head=head[:12], why=why)
                 self.conflict_stop(e, "update_branch", head, said, why)
                 return
@@ -18053,8 +18081,8 @@ class LandQueue:
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
             if kind == "update_branch" and (e.get("unionMerge") or {}).get("head") != head:
-                # GitHub's update-branch ignores .gitattributes: a conflict only in merge=union files is merged here
-                # (LAND_UNION's comment), once per head; anything else stops as below.
+                # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
+                # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
                 e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
                 self.save(e)
                 return "union_merge"
