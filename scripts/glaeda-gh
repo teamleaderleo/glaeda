@@ -21077,7 +21077,12 @@ def wait_progress_print(kind: str, entry: dict | None) -> str | None:
         mark = [[c.get("id"), c.get("updatedAt") or c.get("createdAt")]
                 for c in data.get("comments") or [] if isinstance(c, dict)]
     else:
-        mark = [data.get(k) for k in ("state", "headRefOid", "mergeable", "checkState")] + [
+        # Not "mergeable": GitHub recomputes it after every push to the base (UNKNOWN, then MERGEABLE or CONFLICTING;
+        # REST's null reads as UNKNOWN), so on a busy base it flipped every few minutes and each flip moved the
+        # no-change deadline: cosmic-gray, 2026-11-22, `wait pr ... --until merged --timeout 5400` trees lived 3-4.5 h
+        # on PRs whose checks had long finished, out to their 4x ceiling. A conflict still ends a wait (wait_step);
+        # only the base moving is no longer the PR moving.
+        mark = [data.get(k) for k in ("state", "headRefOid", "checkState")] + [
             [c.get("name"), c.get("status"), c.get("conclusion"), c.get("startedAt"), c.get("completedAt")]
             for c in data.get("checks") or [] if isinstance(c, dict)]
     return hashlib.sha256(json.dumps(mark, sort_keys=True, default=str).encode()).hexdigest()[:16]

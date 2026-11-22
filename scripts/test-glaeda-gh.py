@@ -10791,6 +10791,57 @@ class WaitSubscriptionTest(Base):
         self.assertIn("result: success", out)
         self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
 
+    def test_a_wait_tree_on_a_pr_that_never_merges_is_gone_soon_after_its_timeout(self) -> None:
+        """cosmic-gray, 2026-11-22: `glaeda-gh wait pr ... --until merged --timeout 5400 | tail -15` trees (the agent's
+        bash, the blocker, tail) lived 3-4.5 h. A PR that sits open with nothing moving ends the whole tree at
+        --timeout (3 s here) plus a tick: bash, blocker and tail all gone within 10 s of the wait starting. The clock
+        starts when the waiter has become the blocker: compiling this 30k-line script on a starved 2-core VM alone
+        took 9-14 s (load 31, 2026-11-22), which is no part of the wait's bound."""
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        env = dict(os.environ, GLAEDA_GH_DIR=os.fspath(gg.BASE))
+        cmd = f"{shlex.quote(sys.executable)} {shlex.quote(os.fspath(ROOT / 'scripts' / 'glaeda-gh'))} " \
+              "wait pr o/r#1 --until merged --timeout 3 2>&1 | tail -5"
+        tree = subprocess.Popen(["/bin/bash", "-c", cmd], env=env, stdout=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            started = None
+            deadline = time.monotonic() + 120
+            while tree.poll() is None and time.monotonic() < deadline:
+                if started is None and any(p.suffix == ".fifo" for p in gg.waits_dir().glob("*.fifo")):
+                    started = time.monotonic()  # the request is written: the wait's clock runs from here
+                    deadline = started + 10
+                with contextlib.suppress(Exception):
+                    self.daemon.serve_waits()  # the daemon's tick, as often as a fast one
+                time.sleep(0.25)
+            self.assertIsNotNone(started, "the wait never wrote its request")
+            self.assertIsNotNone(tree.poll(), "the wait tree outlived --timeout 3 by 7 s")
+            left = subprocess.run(["ps", "-A", "-o", "pid=,sess="], capture_output=True, text=True).stdout
+            self.assertEqual([ln for ln in left.splitlines() if ln.split()[1:] == [str(tree.pid)]], [],
+                             "a process of the wait tree is still running")
+            out = tree.stdout.read()
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(tree.pid, signal.SIGKILL)
+            tree.wait()
+            tree.stdout.close()
+        self.assertIn("no change", out)
+        self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
+
+    def test_the_base_moving_is_not_the_pr_moving(self) -> None:
+        """mergeable flips UNKNOWN/MERGEABLE/CONFLICTING with every push to the base; that must not move a wait's
+        no-change deadline (it kept `--until merged --timeout 5400` waits alive to their 4x ceiling)."""
+        def entry(mergeable: str, conclusion: str = "SUCCESS") -> dict:
+            data = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a", conclusion=conclusion)]))
+            return {"data": {**data, "mergeable": mergeable}}
+        base = gg.wait_progress_print("pr", entry("MERGEABLE"))
+        self.assertEqual(gg.wait_progress_print("pr", entry("UNKNOWN")), base)
+        self.assertEqual(gg.wait_progress_print("pr", entry("CONFLICTING")), base)
+        self.assertNotEqual(gg.wait_progress_print("pr", entry("MERGEABLE", "FAILURE")), base)
+        req = {"began": 1000.0, "timeout": 60}
+        gg.wait_progress_mark(req, base, 1000.0)
+        self.assertFalse(gg.wait_progress_mark(req, gg.wait_progress_print("pr", entry("UNKNOWN")), 1030.0))
+        self.assertEqual(gg.wait_deadline(req), 1060.0)
+
     def test_an_older_daemon_gets_the_polling_wait(self) -> None:
         gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30})  # no "waits"
         with mock.patch.object(gg, "cmd_wait", return_value=7) as polling, mock.patch.object(gg.os, "execv") as execv:
