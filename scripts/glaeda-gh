@@ -12939,7 +12939,16 @@ LAND_WINDOW_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
-LAND_LATE_WHY_EVERY = 60.0  # a due-late row's reason is rewritten at most this often (note_late)
+LAND_LATE_WHY_EVERY = 60.0
+# A forwarded row (a lane VM's hand-off, an executor's forward, an overflow to a peer) is terminal here: the far host
+# judges it and tells the requester. When the far host never does, nothing here looked again and nobody was told:
+# efficiency-scout, 2026-11-22, cmuxterm-hq#16865 forwarded 433 min with no verdict and its owner not told; this lane
+# VM held 71 forwards older than 30 min, 63 of them with no copy of the PR left to say whether it ever ended. Past
+# LAND_FORWARD_QUIET with no ending the PR is read once (the daemon's one-off read), and unless that read shows it
+# merged or closed the requester is told once per hand-off: where it went, how long ago, and what to run.
+LAND_FORWARD_QUIET = LAND_DUE_LATE
+LAND_FORWARD_READ_WAIT = 300.0  # how long the told-once waits on that one read before telling with no read
+LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a deploy over 73 old forwards: 10 passes)  # a due-late row's reason is rewritten at most this often (note_late)
 # A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
 # ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
 # slot held past it is seen where it is held, not only as a due count growing behind it. A lane VM,
@@ -13889,6 +13898,7 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.forward_reads = 0  # forwards_unjudged's one-off reads this pass
         self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
         # checks before land-judge's first judgment asks; a test's WATCH alone records neither.
@@ -14150,6 +14160,7 @@ class LandQueue:
         recovery = self.now >= self.recovery_at
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
+        self.forwards_unjudged()
         executor = land_executor(self.config())
         if executor is not None:
             self.forward_tick(executor)
@@ -14469,7 +14480,8 @@ class LandQueue:
                                 rows.append((key, gen, req))  # the next peer may take it
                             continue
                         waited = round(self.now - self.due_since(e))
-                        e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                        e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name,
+                                 forwardedAt=self.now)
                         e.pop("dueLate", None)
                         self.history(e, "overflowed", to=name, request=req["id"], waited=waited)
                         self.save(e)
@@ -14527,7 +14539,8 @@ class LandQueue:
                 if not e or e["state"] in LAND_DONE or int(e.get("gen") or 0) != gen:
                     continue
                 if req["id"] in accepted:
-                    e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                    e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name,
+                             forwardedAt=self.now)
                     self.history(e, "handed_off", to=name, request=req["id"])
                     self.save(e)
                 elif req["id"] in refused:
@@ -14693,6 +14706,75 @@ class LandQueue:
         self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
                   f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
         return True
+
+    def forwards_unjudged(self) -> None:
+        """Every forwarded row LAND_FORWARD_QUIET past its forward with no ending on record: its PR is read once, and
+        unless a copy read since the forward shows it merged or closed, its requester is told once per forward
+        (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
+        self.forward_reads = 0
+        for key in [k for k, e in self.entries.items() if e.get("state") == LAND_FORWARDED and k not in self.jobs]:
+            try:
+                with self.lock:
+                    self.forward_unjudged(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def forwarded_at(self, e: dict) -> float:
+        """When E was forwarded: its hand-off's time, its forward's stamp, or its last forwarding history event."""
+        for at in ((e.get("handedOff") or {}).get("at"), e.get("forwardedAt")):
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
+                return float(at)
+        for h in reversed(e.get("history") or []):
+            if h.get("event") in ("handed_off", "overflowed", "handed_off_before"):
+                return float(h.get("at") or 0)
+        return 0.0
+
+    def forward_unjudged(self, e: dict) -> None:
+        """Under the lock. forwards_unjudged for one row."""
+        since = self.forwarded_at(e)
+        if not since or self.now - since < LAND_FORWARD_QUIET:
+            return
+        quiet = e.get("forwardQuiet") or {}
+        if float(quiet.get("since") or 0) == since:
+            return  # this forward was told (or seen ended) once
+        key = e["key"]
+        c = self.cache_of(key) or {}
+        data = c.get("data") or {}
+        at = c.get("dataAt")
+        read = isinstance(at, (int, float)) and not isinstance(at, bool) and at >= since
+        state = str(data.get("state") or "")
+        if state == "MERGED" or (state == "CLOSED" and read):
+            e["forwardQuiet"] = {"since": since, "at": self.now, "ended": state}
+            self.save(e)
+            return
+        if not read or float(at) < since + LAND_FORWARD_QUIET:
+            peeked = self.peeked.get(key)
+            if peeked is None or peeked < since + LAND_FORWARD_QUIET:
+                if self.forward_reads >= LAND_FORWARD_READS:
+                    return  # the next pass asks
+                self.forward_reads += 1
+                self.peeked[key] = self.now
+                with contextlib.suppress(OSError, WatchError):
+                    self.peek(key)
+                return
+            if self.now - peeked < LAND_FORWARD_READ_WAIT:
+                return  # the one read is asked; tell once it lands, or once its wait is out
+        to = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
+        head = str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "")
+        live = str(data.get("headRefOid") or "").lower()
+        mins = round((self.now - since) / 60)
+        seen = (f"the PR still reads open at {live[:12]}" if read and state == "OPEN" and live
+                else "no read of the PR here says it ended")
+        nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
+        e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read)}
+        self.history(e, "forward_quiet", to=to, head=head[:12], waited=round(self.now - since), read=bool(read))
+        self.save(e)
+        log({"event": "land-forward-quiet", "key": key, "to": to, "head": head, "waited": round(self.now - since),
+             "read": bool(read), "state": state or None})
+        self.notify(e, e.get("requester") or "",
+                    f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago"
+                    + (f" at {head[:12]}" if head else "") + f" and no verdict has come back ({seen}); "
+                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}")
 
     def retire_ended(self) -> None:
         """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
