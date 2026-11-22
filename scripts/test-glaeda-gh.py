@@ -11548,8 +11548,20 @@ class FileAndPidWaitTest(unittest.TestCase):
                                                  "--max", "9"]), ["log", "errors", "o/r", "7", "--max", "9"])
             self.assertEqual(gg.parser().parse_args(gg.log_job_synonym(["log", "job", "o/r/7"])).job, 7)
         self.assertEqual(err.getvalue().count("read as"), 3)
-        for same in (["log", "job", "o/r", "7"], ["log", "job", "o/r/7", "8"], ["log", "search", "o/r/7"]):
+        for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r/7"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_run_in_the_target_word_and_a_job_id_both_given(self) -> None:
+        """`log errors OWNER/REPO/RUN_ID --job JOB_ID` (called so 2026-11-22; refused because the repository word
+        held three segments) reads the given job id, in that repository: the run in the word only said where it is."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]),
+                             ["log", "errors", "o/r", "--job", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "job", "o/r/5", "7"]), ["log", "job", "o/r", "7"])
+            args = gg.parser().parse_args(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]))
+        self.assertEqual((args.repo, args.job), ("o/r", 7))
+        self.assertIn("5 in o/r/5 only says which run it is in", err.getvalue())
 
     def test_log_repo_job_flag_reads_as_log_job(self) -> None:
         """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
@@ -25474,7 +25486,66 @@ class LandTest(Base):
             e = self.tick()
         self.assertEqual((e["state"], e["streak"], e["waitRefused"]["count"], len(self.w.explains())),
                          ("waiting", None, 4, 4))
-        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # each change is the wait making progress
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # a check appearing is the wait making progress
+
+    def webview_wait(self, head: str = LA, timeout: int = 900) -> tuple[int, dict]:
+        """land_judge's "webview" refusal, whose step is a wait on the checks (LAND_FALLBACK) and whose reason names
+        the PR's own reds."""
+        nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
+        return refusal("webview", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
+                       nxt=nxt, reason="land-judge: refused: its per-test webview verdict names its own reds "
+                                       "(react-apps-base-check failed); fix them, or rerun if one is a flake")
+
+    def test_a_check_read_differently_is_not_the_wait_making_progress(self):
+        """A wait's stuck bound counts the checks it waits on, not every check's conclusion (LAND_WAIT_STUCK). Queue
+        host, 2026-11-22: cmux#48267's reads 500 s apart changed 50 of their 223 checks, each a completed check whose
+        workflow one read gave as its run's name and the next as its workflow's, and cmux#49430 read 175 of its 208
+        checks under GitHub's rate limit; every flip reset movedAt."""
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(self.webview_wait())
+        e = self.tick()
+        moved = e["waitRefused"]["movedAt"]
+        self.assertEqual(moved, self.t)
+        for checks in ([("ci", "COMPLETED", "SUCCESS")],  # a check page the read could not finish: one check less
+                       [("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "NEUTRAL")],  # read differently
+                       [("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS")]):
+            self.pr(LA, checks=checks)
+            self.w.answers.append(self.webview_wait())
+            e = self.tick(700)
+            self.assertEqual(e["waitRefused"]["movedAt"], moved, checks)
+        self.assertGreaterEqual(e["waitRefused"]["count"], 4)  # each was judged again: only the bound is unmoved
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS"), ("y", "QUEUED", None)])
+        self.w.answers.append(self.webview_wait())
+        e = self.tick(1000)  # past the wait's own timeout, which judges it again
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # a check started: the wait moved
+
+    def test_a_wait_on_checks_that_never_move_stops_and_tells_its_requester(self):
+        """cmux#49430, 2026-11-22: a "webview" refusal naming the PR's own reds took 51 waits in 9.8 h at one head,
+        every one logged idle 0 while no check at that head was unfinished at all, because its check fingerprint
+        flipped between two values in reads 60 s apart. 5 such rows were judged 52 times in 24 h past the 4 h bound
+        they should have stopped at, 4 of them with no stop at all."""
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE"), ("x", "COMPLETED", "SUCCESS")])
+        self.land()
+        end = self.t + gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT
+        flip = 0
+        e: dict = {}
+        while self.t < end:
+            flip += 1
+            self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE"),
+                                ("x", "COMPLETED", "SUCCESS" if flip % 2 else "NEUTRAL")])
+            while len(self.w.answers) < 2:
+                self.w.answers.append(self.webview_wait())
+            e = self.tick(300)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"), e.get("stop"))
+        self.assertIn("none the cache shows", e["stop"]["reason"])
+        self.assertIn("react-apps-base-check", e["stop"]["reason"])  # the requester is told what to fix
+        self.assertEqual(len(self.w.sent()), 1, self.w.sent())
+        # stopped on its own bound, not one flip later: nothing it waits for moved since its first refusal
+        waited = e["stop"]["at"] - e["waitRefused"]["since"]
+        self.assertLess(waited, gg.LAND_WAIT_STUCK + 600, waited)
 
     def queued_wait(self, head: str = LA, timeout: int = 1800) -> tuple[int, dict]:
         nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
@@ -26465,6 +26536,63 @@ class LandTest(Base):
         doc = json.loads(out.getvalue())
         self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
         self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
+
+    def test_a_pin_this_queue_already_followed_forward_leaves_the_live_row_alone(self):
+        """A land the queue already followed forward is answered with the pin the row holds, never re-pinned backwards.
+        efficiency-standing-lane, 2026-11-22: glaeda#2542 was queued pinned 27b86dab, followed to 3ec2af7c by
+        repin_own_update at 20:00Z, and the head was ed96f931 when a re-pin at 3ec2af7c reached the queue at 20:06Z,
+        which parked the row in pin_wait for a head that was already gone. NOW counts that class (land-re-pin-loop,
+        14 that day): the agent watching from outside sees a head that is not its pin, re-pins by hand, and by then
+        the hand-written pin is the stale one."""
+        entry = {"key": self.KEY, "state": "waiting", "pinSha": LB, "requester": "host/lane",
+                 "history": [{"event": "repin_own_update", "head": LB[:12], "pin": LA[:12]}]}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), entry)
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("the live row is not re-queued")):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(rc, gg.EXIT_OK)  # not a refusal: the row is live and pinned ahead of this request
+        self.assertIn(f"the row holds {LB[:12]}", said[0])
+        self.assertIn("park it (pin_wait), so nothing was changed", said[0])
+        self.assertIn(f"next: glaeda-gh wait pr o/r#1 --until merged --sha {LB} --timeout 1800", said[0])
+        # The row itself is untouched: same state, same pin, no history written by the request.
+        self.assertEqual(gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY)), entry)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("the live row is not re-queued")), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, LA)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_OK, True, "land_pin_followed", self.KEY))
+        self.assertEqual((doc["pin"], doc["was"]), (LB, LA))
+
+    def test_only_this_requester_s_own_live_followed_row_answers_a_pin(self):
+        """What the check does *not* read as a follow: a finished row, an unpinned one, one still pinned where the
+        caller pinned, another session's row, and a history with no follow away from this pin. Each of those is queued
+        exactly as it always was, since only the queue's own recorded follow proves the caller's pin is the stale one."""
+        follow = {"event": "repin_own_update", "head": LB[:12], "pin": LA[:12]}
+        live = {"state": "waiting", "pinSha": LB, "requester": "host/lane", "history": [follow]}
+        self.assertEqual(gg.land_pin_already_followed(live, LA, "host/lane"), LB)
+        for event in gg.LAND_PIN_FOLLOW_EVENTS:  # every follow event records the pin it moved away from
+            for field in ("pin", "was"):
+                self.assertEqual(gg.land_pin_already_followed(
+                    {**live, "history": [{"event": event, field: LA[:12]}]}, LA, "host/lane"), LB, (event, field))
+        for entry, why in ((None, "no row at all"),
+                           ({}, "an empty row"),
+                           ({**live, "state": "merged"}, "a merged row"),
+                           ({**live, "state": "stopped"}, "a stopped row"),
+                           ({**live, "pinSha": ""}, "an unpinned row"),
+                           ({**live, "pinSha": "nope"}, "a pin that is no sha"),
+                           ({**live, "pinSha": LA}, "a row still pinned where the caller pinned"),
+                           ({**live, "requester": "other/lane"}, "another session's row"),
+                           ({**live, "history": []}, "no history"),
+                           ({**live, "history": [{"event": "queued", "pin": LA[:12]}]}, "no follow event"),
+                           ({**live, "history": [{**follow, "pin": LC[:12]}]}, "a follow away from another pin")):
+            self.assertEqual(gg.land_pin_already_followed(entry, LA, "host/lane"), "", why)
+        self.assertEqual(gg.land_pin_already_followed(live, "", "host/lane"), "", "an unpinned request")
 
     def test_a_draft_read_that_is_stale_or_shadowed_by_a_write_refuses_nothing(self):
         """A refusal built from a read that may no longer hold is never final: it is queued as before, and the
@@ -35136,6 +35264,44 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         """body_guard_args must name the call, or the guard judges an issue body by another write's rules."""
         said = gg.body_guard_args({"kind": "issue", "repo": "o/r", "title": "T", "body": "B"}, "/tmp/b.md")
         self.assertEqual(said, ["issue", "create", "-R", "o/r", "--title", "T", "--body-file", "/tmp/b.md"])
+
+    def test_an_issue_target_that_names_a_number_is_a_comment_on_it(self) -> None:
+        """No issue is created at a number, so `post issue o/r#5 --body B` can only mean a comment on issue 5.
+        Measured 2026-11-22 on this lane: `post issue manaflow-ai/cmuxterm-hq#15832 --body-file -` was refused
+        ("post issue takes OWNER/REPO ..."), and the row it carried cost a second call under `post comment`."""
+        for target in ("o/r#5", "o/r/5", "comment:o/r#5", "https://github.com/o/r/issues/5", "5"):
+            with self.subTest(target):
+                queued: list[dict] = []
+                with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                        mock.patch.object(gg, "cmd_gh", lambda gh: self.fail("a comment was made in one call")), \
+                        mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                        mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                        mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                        mock.patch.object(gg, "daemon_running", lambda *a, **k: True), \
+                        mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                        mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                        mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gg.main(["post", "issue", target, "--body", "B"]), 0)
+                self.assertEqual([(i["kind"], i["repo"], i["number"]) for i in queued], [("comment", "o/r", 5)])
+                self.assertIn("which exists: this is a comment on it", err.getvalue())
+                self.assertIn("a new issue takes OWNER/REPO and --title", err.getvalue())
+
+    def test_a_repository_target_still_files_a_new_issue_and_a_title_with_a_number_refuses(self) -> None:
+        """The number is the whole signal, and only without --title: `post issue o/r --title T` is untouched,
+        and a title *with* a number is the one ambiguous call, so it refuses naming both writes."""
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r"), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue(""), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r#15832"), "15832")
+        self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B"]),
+                         ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B"])
+        lines: list[str] = []
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda text, *a, **k: lines.append(str(text))):
+            self.assertEqual(gg.main(["post", "issue", "o/r#5", "--title", "T", "--body", "B"]), 64)  # a refusal
+        said = "\n".join(lines)
+        self.assertIn("drop --title to comment on it", said)
+        self.assertIn("pass OWNER/REPO to file a new issue", said)
 
     def test_a_merge_is_named_not_made(self) -> None:
         """The one write still printed, and why: a merge is pinned to a head sha this parser does not take."""
