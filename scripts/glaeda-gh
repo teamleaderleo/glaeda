@@ -13661,16 +13661,33 @@ BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: land_judge could not
 # read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
 # mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
-# the fetch by hand. land_judge (mirror_fetch_argv) now names it {"kind": "fetch", "argv": [...]}, one of two shapes,
-# which this queue checks again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
+# the fetch by hand. A fetch step is {"kind": "fetch", "argv": [...]}, one of two shapes, which this queue checks
+# again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
 # - git --git-dir MIRROR.git fetch [LAND_FETCH_OPTIONS] origin REFSPEC..., MIRROR's origin being the PR's repository
 #   on github.com (LAND_FETCH_ORIGIN), run with the bare env (this host's own git login);
 # - lane-gh fetch OWNER/REPO --dir MIRROR.git [--branch B]..., OWNER/REPO the PR's (a broker read: land_lane).
 # Any other argv stops the entry as policy and runs nothing. A fetch that fails is a refused step (step_refused): it
 # backs off, and the LAND_STEP_STOP-th identical failure stops the entry and tells the requester.
+# The git form runs through git-fetch-once (LAND_FETCH_ONCE: one fetch per repository at a time, the guarded path of
+# hq docs/handbook/retry-repeats-a-deterministic-failure.md), its own bounds inside LAND_FETCH_DEADLINE.
+# land_judge's mirror fill (HeadNotInMirror, gh_mirror_reads.Unreadable: "...; fill it: git --git-dir M.git fetch
+# origin +refs/pull/N/head:..." or "lane-gh fetch R --dir M.git --branch pull/N/head") comes as a "command" step, so
+# the queue stopped on it. manaflow-ai/cmuxterm-hq#19115, 2026-11-22: a land stopped on that command on the executor
+# host and a person ran the printed fetch and queued it again ("The lander should run the fill it names itself (one
+# bounded fetch through git-fetch-once) and retry once, stopping only if the fetch fails."). land_command_fetch reads
+# such a command as this fetch step (from "command"): one fill per head (LAND_FILL_ONCE), then one judgment again; a
+# fill that fails, or a second fill asked at a head already filled, stops naming the fetch's error or the refusal.
 LAND_FETCH_DEADLINE = 300.0
 LAND_FETCH_CONFIG_DEADLINE = 10.0  # git config --get remote.origin.url
-LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head"})
+# gh_mirror_reads.MIRROR_FETCH_FLAGS (the flags its fill names) and this queue's own: none reads or runs anything else
+LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head", "--no-show-forced-updates",
+                                "--no-write-commit-graph", "--no-auto-gc"})
+LAND_FETCH_ONCE = Path.home() / ".local/bin/git-fetch-once"  # land.json "gitFetchOnce"; else PATH's; else plain git
+# git-fetch-once's own bounds (its waiting for another fetch of the mirror, the fetch, the refetch that heals a store),
+# summing under LAND_FETCH_DEADLINE so it ends its own git child before the queue's timeout would orphan it
+LAND_FETCH_ONCE_ENV = {"GIT_FETCH_ONCE_WAIT_S": "45", "GIT_FETCH_ONCE_TIMEOUT_S": "120",
+                       "GIT_FETCH_ONCE_REFETCH_TIMEOUT_S": "120"}
+LAND_FILL_ONCE = "fillAt"  # the entry's {"head", "at"} of the last fill land_command_fetch ran
 LAND_FETCH_REFSPEC = re.compile(r"\+?refs/(?:heads|pull)/[\w./-]+:refs/remotes/origin/[\w./-]+|[0-9a-f]{40}|\w[\w./-]*")
 LAND_FETCH_BRANCH = re.compile(r"\w[\w./-]*")
 LAND_FETCH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
@@ -14143,7 +14160,26 @@ def land_action(answer: dict, head: str) -> dict:
     act = answer.get("action")
     if not (isinstance(act, dict) and act.get("kind") in LAND_KINDS):
         act = land_fallback(answer, head)
-    return land_command_wait(act, answer, head) if act.get("kind") == "command" else act
+    if act.get("kind") != "command":
+        return act
+    return land_command_fetch(act, answer) or land_command_wait(act, answer, head)
+
+
+def land_command_fetch(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is land_judge's mirror fill (LAND_FETCH_DEADLINE's comment): one of the fetch step's two
+    shapes for the answer's repository, as that fetch step (from "command"); else None."""
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    text = str(act.get("text") or "").strip() or str(answer.get("next") or "").strip()
+    if not repo or not text.startswith(("git --git-dir ", "lane-gh fetch ")):
+        return None
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return None
+    if land_fetch_shape(argv, repo)[2]:
+        return None
+    return {"v": 1, **{k: act[k] for k in ("repo", "number", "head") if k in act}, "kind": "fetch", "argv": argv,
+            "from": "command"}
 
 
 def land_command_wait(act: dict, answer: dict, head: str) -> dict:
@@ -17947,6 +17983,15 @@ class LandQueue:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
         that is not one of the two shapes, for this PR's repository and an existing mirror, stops as policy."""
         repo, argv = e["repo"], act.get("argv")
+        fill = act.get("from") == "command"  # land_judge's mirror fill, named as a command (land_command_fetch)
+        filled = e.get(LAND_FILL_ONCE) or {}
+        if fill and head and filled.get("head") == head:
+            # One fill per head, then one judgment: a mirror still unread after its fill is not a fill to repeat
+            with self.lock:
+                self.stop(e, "fill_unread", f"filled the mirror once at {head[:12]} ({land_trim(argv, 200)}) and "
+                          f"land_judge still could not read it: {land_reason(answer.get('reason'))}",
+                          land_trim(answer.get("next")))
+            return
         form, mirror, why = land_fetch_shape(argv, repo)
         if not why and not os.path.isdir(mirror):
             why = f"the fetch step's mirror {mirror} is not a directory on this host"
@@ -17962,13 +18007,18 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "policy", land_trim(why), land_trim(answer.get("next")))
             return
+        extra = None
         if form == "git":  # this host's own git login reads github.com: the bare env
-            run, step_env = [git, *argv[1:]], None
+            once = self.fetch_once()
+            if once:  # git --git-dir M fetch ARGS as git-fetch-once -C M ARGS: the guarded fetch, bounded
+                run, step_env, extra = [once, "-C", argv[2], *argv[4:]], None, LAND_FETCH_ONCE_ENV
+            else:
+                run, step_env = [git, *argv[1:]], None
         else:  # a broker read: the requester's lane only names it in the broker's audit log (land_lane)
             run, step_env = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), *argv[1:]], e
         with self.lock:
-            self.claim(e, "fetch", argv=list(argv), form=form)
-        got = self.call(run, LAND_FETCH_DEADLINE, step_env)
+            self.claim(e, "fetch", argv=list(argv), form=form, **({"fill": True} if fill else {}))
+        got = self.call(run, LAND_FETCH_DEADLINE, step_env, extra)
         named = None
         with self.lock:
             self.finish(e, got)
@@ -17976,11 +18026,27 @@ class LandQueue:
             if got.returncode == 0:
                 e.pop("stepFail", None)
                 e.pop("stepTransient", None)
+                if fill:
+                    e[LAND_FILL_ONCE] = {"head": head, "at": self.now}
                 self.wait(e, {"kind": "retry", "why": "filled the mirror land_judge could not read"}, NUDGE_MIN * 3)
+            elif fill and not LAND_STEP_QUOTA.search(said := f"{got.stderr or ''}\n{got.stdout or ''}"):
+                # the fill land_judge named failed: stopped at once, the fetch's own error named (a spent quota parks)
+                self.stop(e, "fill_failed", f"the mirror fill land_judge named failed (exit {got.returncode}): "
+                          f"{land_trim(land_tail(said), 300)}", shlex.join(argv))
             else:
                 named = self.step_refused(e, "fetch", head, got)
         if named == "update_branch":
             self.update_branch(e, head)
+
+    def fetch_once(self) -> str:
+        """git-fetch-once to run a git-form fetch step through: land.json's gitFetchOnce, LAND_FETCH_ONCE, PATH's; ""
+        when this host has none (the step runs plain git, as before)."""
+        given = self.config().get("gitFetchOnce")
+        if isinstance(given, str):  # "" turns it off
+            return os.path.expanduser(given)
+        if os.access(LAND_FETCH_ONCE, os.X_OK):
+            return LAND_FETCH_ONCE.as_posix()
+        return shutil.which("git-fetch-once") or ""
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update

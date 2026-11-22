@@ -13465,6 +13465,10 @@ def _background_argv(argv: list[str]) -> list[str]:
 
 
 CENSUS_SCOPE_CHECK_S = 1.0  # how long a scoped launch may take to fail before the plain launch is used instead
+# A slice stops starting walks at CENSUS_BUDGET_S, and its last du is cut at CENSUS_DU_TIMEOUT_S; the scope's own
+# RuntimeMaxSec is the hard bound past both, so a slice stuck outside those checks (a hung stat, a sudo prompt)
+# is killed by systemd instead of holding the census lock forever. Progress is saved every CENSUS_SAVE_EVERY_S.
+CENSUS_SCOPE_MAX_S = CENSUS_BUDGET_S + CENSUS_DU_TIMEOUT_S + 60
 
 
 def census_scope_argv(argv: list[str]) -> list[str] | None:
@@ -13474,13 +13478,15 @@ def census_scope_argv(argv: list[str]) -> list[str] | None:
     exits, and start_new_session leaves the child in that cgroup: the census slice died seconds after the
     glaeda-disk-pressure.service pass that started it, before its first save. fs-agent-lane-2, 2026-11-22: census.json
     started 2026-11-21 16:12Z still had pending ["/"] and no rows after a day of hourly slices, so 204G of the 224G
-    used read "unwalked (no volume census yet)". A scope is its own cgroup, so the slice outlives the unit."""
+    used read "unwalked (no volume census yet)". A scope is its own cgroup, so the slice outlives the unit, and its
+    RuntimeMaxSec (CENSUS_SCOPE_MAX_S) bounds it once it no longer dies with the unit."""
     if DARWIN or not os.environ.get("INVOCATION_ID"):
         return None
     run = shutil.which("systemd-run")
     if not run:
         return None
-    return [run, *(["--user"] if os.getuid() else []), "--scope", "--quiet", "--collect", "--", *argv]
+    return [run, *(["--user"] if os.getuid() else []), "--scope", "--quiet", "--collect",
+            f"--property=RuntimeMaxSec={int(CENSUS_SCOPE_MAX_S)}", "--", *argv]
 
 
 def launch_background_census() -> bool:
