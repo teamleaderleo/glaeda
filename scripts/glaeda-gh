@@ -4695,6 +4695,21 @@ def parse_pr(node: dict) -> dict:
         else:
             superseded.append(check)
     checks = [check for _, check in latest.values()]
+    # A concurrency group shared across workflows cancels one workflow's job for another's: manaflow-ai/cmux#50693 at
+    # f4620c79 (2026-11-22), "pr-red-checks / comment" ran in three workflow runs on the head; the "CI" one (run
+    # 45046534087) was cancelled at 16:56:14Z and another workflow's started 16:56:32Z and passed, yet status counted
+    # the cancel as failed and `wait pr --sha` exited 1. A cancelled check run is superseded by a same-named one of
+    # another workflow that started at or after it and passed; a real failure, or a cancel with no such twin, counts.
+    passed_at: dict[str, list[str]] = {}
+    for c in checks:
+        if c.get("workflow") and c.get("startedAt") and (c.get("conclusion") or "").upper() in {"SUCCESS", "NEUTRAL"}:
+            passed_at.setdefault(str(c.get("name")), []).append(str(c["startedAt"]))
+    def cancelled_by_twin(c: dict) -> bool:
+        started = c.get("startedAt")
+        return (bool(c.get("workflow") and started) and (c.get("conclusion") or "").upper() == "CANCELLED"
+                and any(at >= str(started) for at in passed_at.get(str(c.get("name")), [])))
+    superseded.extend(c for c in checks if cancelled_by_twin(c))
+    checks = [c for c in checks if not cancelled_by_twin(c)]
     # only the ones that would have counted against the PR are worth keeping. One that ran nothing (GitHub
     # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no

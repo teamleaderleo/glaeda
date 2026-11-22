@@ -5634,6 +5634,50 @@ class ClientTest(Base):
         alone = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=old))
         self.assertEqual(gg.verdict("pr", alone, "green"), 1)
 
+    def test_a_cancel_from_a_concurrency_group_shared_across_workflows_is_superseded(self) -> None:
+        """manaflow-ai/cmux#50693 at f4620c79 (2026-11-22): "pr-red-checks / comment" ran in three workflow runs; the
+        CI one was cancelled at 16:56:14Z, the others passed at 16:56:09Z and 16:56:32Z. Status said "1 failed" and
+        `wait pr --sha` exited 1 on the cancel. A same-named job of another workflow that started at or after it and
+        passed supersedes the cancel; a real failure, or a cancel with no later passing twin, still counts."""
+        name = "pr-red-checks / comment"
+
+        def job(workflow: str, run: int, conclusion: str, started: str) -> dict:
+            return {**check_run(name, conclusion=conclusion), "databaseId": run * 10,
+                    "startedAt": f"2026-11-22T16:56:{started}Z", "completedAt": f"2026-11-22T16:57:{started}Z",
+                    "checkSuite": {"conclusion": conclusion, "workflowRun": {
+                        "databaseId": run, "workflow": {"name": workflow, "databaseId": run + 1000}}}}
+        cancelled = job("CI", 45046534087, "CANCELLED", "14")
+        early, late = job("PR red checks", 45046534001, "SUCCESS", "09"), job("PR comment", 45046534200, "SUCCESS", "32")
+        other = check_run("build")
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[cancelled, early, late, other]))
+        self.assertEqual(sorted((c["workflow"] or "", c["conclusion"]) for c in data["checks"]),
+                         [("", "SUCCESS"), ("PR comment", "SUCCESS"), ("PR red checks", "SUCCESS")])
+        self.assertEqual([(c["workflow"], c["conclusion"]) for c in data["superseded"]], [("CI", "CANCELLED")])
+        self.assertEqual(gg.verdict("pr", data, "green"), 0)
+        self.assertEqual(gg.check_verdict(data, "done"), 0)
+        text = gg.summary("pr:o/r#1", {"data": data}, verbose=True)
+        self.assertIn("0 failed", text)
+        self.assertIn(f"superseded: CI / {name} cancelled", text)
+        # Past 100 checks the rollup's FAILURE is that cancel alone: green, by the superseded reasoning.
+        counts = {"runs": {"SUCCESS": 3, "CANCELLED": 1}, "statuses": {}}
+        self.assertEqual(gg.check_verdict({**data, "checksTruncated": True, "checkState": "FAILURE",
+                                           "checkCounts": counts}, "done"), 0)
+        # Land's own-red lookup no longer finds the cancel among the checks.
+        self.assertEqual(gg.land_own_red({"reason": f"not excused: '{name}'"}, {}, data["checks"], True)[1], None)
+        # Only an earlier passing twin: the cancel still counts.
+        alone = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[cancelled, early]))
+        self.assertEqual(gg.verdict("pr", alone, "green"), 1)
+        self.assertEqual(alone["superseded"], [])
+        # A real failure is never superseded by a twin in another workflow.
+        for red in ("FAILURE", "TIMED_OUT", "STARTUP_FAILURE"):
+            failed = job("CI", 45046534087, red, "14")
+            self.assertEqual(gg.verdict("pr", gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[failed, late])), "green"),
+                             1, red)
+        # A skipped twin is not a pass of the job.
+        skipped = job("PR comment", 45046534200, "SKIPPED", "32")
+        self.assertEqual(gg.verdict("pr", gg.parse_pr(pr_node(4, rollup="FAILURE", checks=[cancelled, skipped])),
+                                    "green"), 1)
+
     def test_a_skipped_twin_in_the_same_run_is_not_a_failed_attempt(self) -> None:
         # manaflow-ai/cmux run 40341221417 (PR #25393): "cmux-next Release compile (Xcode 26)" has two jobs in
         # one run. The real one (121636522702, blacksmith macOS) was queued; its twin (121636524434, ubuntu)
