@@ -2572,6 +2572,29 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
 
+    def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
+        """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
+        feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
+        key = "pr:o/r#7"
+        gg.register(key)
+        data = self.pr_data()
+        sha = str(data["headRefOid"]).lower()
+        self.daemon.store(key, None, data=data, dataAt=NOW - 200)  # the wait's own read
+        view = {"liveSince": NOW - 7200, "at": NOW - 2, "eventAt": None, "head": sha}
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": view}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["dataAt"], NOW - 200, "the newer copy stays")
+        self.assertEqual(entry["upstreamFeed"], {**view, "answeredAt": NOW})
+        req = {"key": key, "kind": "pr", "began": NOW - 600, "directAt": NOW - 200}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 30), "the feed vouches for the newer copy")
+            self.assertIsNotNone(gg.wait_starved(req, {**entry, "upstreamFeed": None}, NOW + 30), "no view")
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": {**view, "head": "b" * 40}}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "a view of another head does not cover it")
+
     def test_read_answers_a_prs_feed_view(self) -> None:
         sha = "a" * 40
         self.daemon.store("pr:o/r#7", None, data={"number": 7, "headRefOid": sha}, dataAt=NOW)
@@ -20972,6 +20995,34 @@ class UpstreamDirectAfterTest(unittest.TestCase):
                 self.assertIsNone(gg.wait_starved({**req, "directAt": now - 30}, old, now), "one own read per bound")
                 gg.write_json(config, {"command": ["/usr/local/bin/other-upstream"]})
                 self.assertIsNone(gg.wait_starved(req, old, now), "no own read there: the old bound")
+
+    def test_direct_reads_that_find_nothing_new_space_out(self) -> None:
+        """A wait on cmux#50040 (all checks done, --max 4800) re-read its PR through the broker every 120 s for the
+        whole wait. Each read in a row that finds nothing new doubles the gap, up to DIRECT_QUIET_MAX; a change
+        starts it over."""
+        bound = float(gg.UPSTREAM_DIRECT_AFTER)
+        req: dict = {}
+        self.assertEqual(gg.direct_gap(req, bound), bound)
+        gg.note_direct_quiet(req, "a", "a", None)
+        self.assertEqual(gg.direct_gap(req, bound), 2 * bound)
+        gg.note_direct_quiet(req, "a", "a", "no answer within 30s")
+        self.assertEqual(req["directQuiet"], 1, "a failed read changes nothing")
+        for _ in range(10):
+            gg.note_direct_quiet(req, "a", "a", None)
+        self.assertEqual(gg.direct_gap(req, bound), gg.DIRECT_QUIET_MAX)
+        self.assertEqual(gg.direct_gap(req, gg.STALE_DATA_AFTER), gg.STALE_DATA_AFTER, "never under the bound")
+        gg.note_direct_quiet(req, "a", "b", None)
+        self.assertNotIn("directQuiet", req, "a change starts it over")
+        gg.note_direct_quiet(req, None, "b", None)
+        self.assertNotIn("directQuiet", req, "a first read is not quiet")
+        now = time.time()
+        old = {"dataAt": now - bound - 10}
+        base = {"began": now - 3000, "directAt": now - bound - 5}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNotNone(gg.wait_starved(base, old, now))
+            self.assertIsNone(gg.wait_starved({**base, "directQuiet": 1}, old, now), "the gap doubled")
+            self.assertIsNotNone(gg.wait_starved({**base, "directQuiet": 1, "directAt": now - 2 * bound - 5}, old, now))
 
 
 class StaleDataTest(Base):

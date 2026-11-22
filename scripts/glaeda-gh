@@ -769,6 +769,12 @@ UNREAD_LEAD_AFTER = 60.0  # a PR or run never read, watched this long, gets the 
 # within WAITED_FRESH even under its GraphQL reserve, and this host asks it every UPSTREAM_EVERY, so its copy is at
 # most about 70 s old while the broker keeps up; 600 s left lane waits on data the broker had not refreshed.
 UPSTREAM_DIRECT_AFTER = 120
+# A starved wait's direct reads that find nothing new (wait_progress_print the same before and after) space out: each
+# one doubles the gap to the next, from the bound up to DIRECT_QUIET_MAX, and a read that finds a change starts it
+# over (direct_gap). The broker host's copy still reaches the wait every UPSTREAM_EVERY in between. huge-blue's broker,
+# 2026-11-22 08:14-09:14Z: 7,888 glaeda-upstream GETs, 80% a path read before (pulls/N 4,010 of 4,837), and one wait
+# on gcp-codex-lane-5 (cmux#50040, all checks done, --max 4800) re-read its PR every 120 s for the whole wait.
+DIRECT_QUIET_MAX = 600.0
 # After the quota stops explaining old waited data (staleExplainedAt), the daemon has this long to read the backlog
 # before the data counts as starved. huge-blue, 2026-11-11 to 11-15: the shared GraphQL pool sat under the reserve
 # for 10 to 20 minutes before each hourly reset (the alarm rightly "held"), and on the first tick after the reset, at
@@ -8652,6 +8658,7 @@ class Daemon:
             mine = (e["cache"] or {}).get("dataAt")
             if data is not None and isinstance(at, (int, float)) and isinstance(mine, (int, float)) and at < mine:
                 self.upstream_outage_over(e)
+                self.keep_feed_view(e)
                 continue  # a wait's own read here (direct_read) is newer: the upstream's older one never replaces it
             fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
                                       "missing": entry.get("missing") is True,
@@ -8684,6 +8691,26 @@ class Daemon:
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
                     fields["jobsAt"] = min(self.now, float(jobs_at))
             self.store(e["key"], e["cache"], **fields)
+
+    def keep_feed_view(self, e: dict) -> None:
+        """The upstream's feed view of a PR whose copy here is newer (a wait's direct read), written on the entry as
+        upstreamFeed with nothing else changed, when the view is of the head this copy names: wait_starved rules on
+        the entry, and without it every wait that read its PR once re-read it every UPSTREAM_DIRECT_AFTER however
+        quiet the feed said the PR was. A view of another head, or none, clears it."""
+        cache = cache_dir() / file_name(e["key"])
+        with bounded_lock(cache_dir() / ".write.lock") as held:
+            if not held:
+                return
+            current = read_json(cache)
+            if not isinstance(current, dict):
+                return
+            view = self.upstream_feed.get(e["key"])
+            data = current.get("data") if isinstance(current.get("data"), dict) else {}
+            head = str(data.get("headRefOid") or "").lower()
+            if not (isinstance(view, dict) and head and str(view.get("head") or "").lower() == head):
+                view = None
+            if current.get("upstreamFeed") != view:
+                write_json(cache, {**current, "upstreamFeed": view})
 
     def upstream_outage_over(self, e: dict) -> None:
         """A key the upstream answered with nothing to store no longer names an outage this host stored on it
@@ -21116,6 +21143,25 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
 WAIT_DIAGNOSE_AFTER = 120
 
 
+def direct_gap(req: dict, bound: float) -> float:
+    """How long after its last direct read (directAt) a wait may read its target directly again: BOUND, doubled for
+    each read in a row that found nothing new (directQuiet), at most DIRECT_QUIET_MAX (never under BOUND)."""
+    quiet = req.get("directQuiet")
+    quiet = quiet if isinstance(quiet, int) and not isinstance(quiet, bool) and quiet > 0 else 0
+    return max(bound, min(DIRECT_QUIET_MAX, bound * 2 ** min(quiet, 16)))
+
+
+def note_direct_quiet(req: dict, before: str | None, after: str | None, error: str | None) -> None:
+    """After a wait's direct read: one more in a row that found nothing new (the same wait_progress_print as before
+    it), or back to none when it found a change. A failed read changes nothing."""
+    if error:
+        return
+    if before is not None and after == before:
+        req["directQuiet"] = int(req.get("directQuiet") or 0) + 1
+    else:
+        req.pop("directQuiet", None)
+
+
 def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
     """How old the data a wait is blocked on is, when it is starved: the wait has run STALE_DATA_AFTER and nothing was
     read for its target in that long (since the wait began, for a target never read), and no direct read was tried
@@ -21132,7 +21178,7 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
         bound = WAIT_DIAGNOSE_AFTER
     if now - began < bound:
         return None
-    if now - float(req.get("directAt") or float("-inf")) < bound:
+    if now - float(req.get("directAt") or float("-inf")) < direct_gap(req, bound):
         return None
     seen = (entry or {}).get("dataAt")
     view = (entry or {}).get("upstreamFeed")
@@ -21337,7 +21383,9 @@ def poll_wait(req: dict) -> int:
                     say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
                                 f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub "
                                 "directly once.")
+                    before = wait_progress_print(req["kind"], read_cache(req["key"]))
                     error = direct_read(req)
+                    note_direct_quiet(req, before, wait_progress_print(req["kind"], read_cache(req["key"])), error)
                     say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
                                 + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) or upstream_command() is not None
                                    else "\nnext: glaeda-gh restart"))
