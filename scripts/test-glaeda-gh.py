@@ -3574,6 +3574,53 @@ class BalanceTest(Base):
         self.assertNotIn("checksPageError", data)
         self.assertEqual(len(self.gh.gql_calls()), 1)
 
+    def red_page(self, number: int, red_at: int) -> list[dict]:
+        """150 contexts, none required, the rollup FAILURE from one red status at RED_AT, its counts over every page."""
+        checks: list[dict] = [workflow_check(f"job-{i}", 5) for i in range(149)]
+        checks.insert(red_at, status_context("deploy/preview", "FAILURE"))
+        first = pr_node(number, rollup="FAILURE", checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts.update(totalCount=len(checks), pageInfo={"hasNextPage": True, "endCursor": "100"},
+                        checkRunCountsByState=[{"state": "SUCCESS", "count": 149}],
+                        statusContextCountsByState=[{"state": "FAILURE", "count": 1}])
+        first["baseRef"] = {"branchProtectionRule": None, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", number)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        return checks
+
+    def test_a_red_rollup_whose_red_is_past_the_first_page_is_paged_and_named(self) -> None:
+        """A cmux PR, 2026-11-22: the first page's checks all passed, GitHub's rollup was FAILURE, and a wait ended
+        "0 check(s) failed" with a next step pointing at a list it never printed. The counts say a red sits past the
+        page, so the read pages on (a base that requires nothing included) and the verdict names it."""
+        self.red_page(12, red_at=130)
+        gg.register("pr:o/r#12")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#12")["data"]
+        self.assertEqual(len(data["checks"]), 150)
+        self.assertNotIn("checksPageError", data)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+        self.assertEqual(gg.verdict("pr", data, "done"), gg.EXIT_FAIL)
+        self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["deploy/preview"])
+
+    def test_a_red_rollup_whose_red_is_on_the_first_page_is_not_paged(self) -> None:
+        self.red_page(13, red_at=40)
+        gg.register("pr:o/r#13")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#13")["data"]
+        self.assertEqual(len(data["checks"]), 100)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+
+    def test_a_truncated_red_with_no_failed_check_read_names_no_list_above(self) -> None:
+        """When a red past the pages read is still unnamed (pages held, an older cache), the wait says the rollup's
+        red sits past the checks read and sends to status, not to "the failed checks listed above"."""
+        data = {**gg.parse_pr(pr_node(14, rollup="FAILURE", checks=[check_run("a")])), "checksTruncated": True}
+        req = {"key": "pr:o/r#14", "kind": "pr", "until": "done", "sha": "a" * 40, "timeout": 5, "began": time.time()}
+        out = gg.wait_outcome(req, gg.EXIT_FAIL, {"data": data}, 5)
+        self.assertNotIn("listed above", out["next"])
+        self.assertIn("glaeda-gh status pr o/r#14", out["next"])
+        self.assertIn("past the 1 checks read", out["reason"])
+
     def test_status_pr_check_pages_stop_at_their_hourly_share(self) -> None:
         """Past PR_PAGES_POINTS_PER_HOUR the follow-up pages stop, and the PR reads pending, never green."""
         checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
@@ -20462,6 +20509,7 @@ class StaleDataTest(Base):
         self.assertEqual(code, gg.EXIT_OK, said.getvalue() + out.getvalue())
         self.assertIn("WARNING: the daemon has not refreshed o/r#9", said.getvalue())
         self.assertIn("direct read answered", said.getvalue())
+        self.assertNotIn("glaeda-gh restart", said.getvalue())  # a read that answered needs no restart
         self.assertIn("MERGED", out.getvalue())
         self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
 
