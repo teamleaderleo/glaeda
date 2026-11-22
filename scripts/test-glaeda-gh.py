@@ -28735,7 +28735,8 @@ class LandTest(Base):
         def serve(cmd: list[str], req: dict, deadline: float) -> dict:
             asked.append((cmd[1], req))
             if req["op"] == "room":
-                return {"ok": True, "room": room[cmd[1]], "host": cmd[1]}
+                return {"ok": True, "room": room[cmd[1]], "host": cmd[1],
+                        "readable": {o: "" for o in req.get("owners") or []}}
             return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
         self.q.forward = serve
 
@@ -28814,6 +28815,85 @@ class LandTest(Base):
         with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), contextlib.redirect_stdout(out):
             gg.cmd_land_serve(json.dumps({"op": "room"}))
         self.assertEqual(json.loads(out.getvalue())["room"], 0)
+
+    def test_overflow_goes_only_to_a_peer_that_reads_the_rows_owner_off_the_login(self):
+        """2026-11-22: a peer with no landing-role App credential took overflowed rows and judged them on the shared
+        login (3,480 REST calls/h). The room ask names the rows' owners; a peer that cannot read an owner off the login
+        (or names none, an older glaeda-gh) is offered none of its rows, which go to the next peer that can."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "no-app-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "old-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "app-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[tuple[str, dict]] = []
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append((cmd[1], req))
+            if req["op"] == "room":
+                said = {"no-app-peer": {o: "no landing-role App pool has a credential on this host"
+                                        for o in req.get("owners") or []},
+                        "old-peer": None, "app-peer": {o: "" for o in req.get("owners") or []}}[cmd[1]]
+                return {"ok": True, "room": 5, "host": cmd[1], **({} if said is None else {"readable": said})}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        rooms = [(h, q.get("owners")) for h, q in asked if q["op"] == "room"]
+        self.assertEqual(rooms, [("no-app-peer", ["o"]), ("old-peer", ["o"]), ("app-peer", ["o"])])
+        sent = [(h, [r["target"] for r in q["requests"]]) for h, q in asked if q["op"] == "batch"]
+        self.assertEqual(sent, [("app-peer", ["o/r#11"])])
+        self.assertTrue(all(r.get("overflow") for h, q in asked if q["op"] == "batch" for r in q["requests"]))
+        self.assertEqual(self.q.entries[key]["forwardedTo"], "app-peer")
+        why = [x for x in logs if x.get("event") == "land-overflow-unreadable"]
+        self.assertEqual([x["peer"] for x in why], ["no-app-peer", "old-peer"])
+        self.assertIn("no landing-role App pool", why[0]["owners"]["o"])
+
+    def test_land_serve_refuses_an_overflowed_row_it_would_judge_on_the_login(self):
+        """The peer's end: its room answer says which owners it reads off the login (the latch-free check), and its
+        batch refuses an overflowed row for any other owner, naming why; an executor handoff (no overflow tag) is
+        taken as before."""
+        self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
+
+        def ready(argv, timeout, env):
+            if argv[0] == "/fake/ready":
+                return subprocess.CompletedProcess(argv, 0 if argv[-1] == "o" else 1, "", "gh-app-token: not ready "
+                                                   f"for {argv[-1]}: no App pool here serves {argv[-1]}\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        queue = gg.LandQueue(run=ready, config=self.w.config, inline=True, broker_client=lambda: False)
+        self.assertEqual(gg.land_overflow_readable(["O", "p", "o"], queue), {"o": "", "p": "no App pool here serves p"})
+        self.assertEqual(gg.land_overflow_readable(None, queue), {})
+
+        real = gg.LandQueue.owner_latch_free
+
+        def answer_of(q, owner: str, quiet: bool = False) -> tuple[bool, str]:  # a fresh serve's queue asks as QUEUE
+            return real(queue, owner, quiet)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={**self.w.config, "landJudge": self.w.mh}), \
+                mock.patch.object(gg.LandQueue, "owner_latch_free", answer_of), \
+                mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "land_room", lambda doc, now: 2), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "room", "owners": ["o", "p"]})), 0)
+        self.assertEqual(json.loads(out.getvalue())["readable"], {"o": "", "p": "no App pool here serves p"})
+        out = io.StringIO()
+        reqs = [{"op": "land", "target": "o/r#1", "id": "ovf-1", "overflow": True},
+                {"op": "land", "target": "p/r#2", "id": "ovf-2", "overflow": True},
+                {"op": "land", "target": "p/r#3", "id": "exec-3"}]
+        with mock.patch.object(gg, "land_config", return_value={**self.w.config, "landJudge": self.w.mh}), \
+                mock.patch.object(gg.LandQueue, "owner_latch_free", answer_of), \
+                mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "batch", "requests": reqs})), 0)
+        answer = json.loads(out.getvalue())
+        self.assertEqual(sorted(answer["accepted"]), ["exec-3", "ovf-1"])
+        self.assertEqual([r["id"] for r in answer["refused"]], ["ovf-2"])
+        self.assertIn("on the login: no App pool here serves p", answer["refused"][0]["why"])
 
     def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
         """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an

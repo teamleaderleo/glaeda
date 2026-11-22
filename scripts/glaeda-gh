@@ -11898,7 +11898,14 @@ def land_executor(config: dict | None = None) -> list[str] | None:
 # room only from its own last land-pool line (LAND_POOL_FILE, at most LAND_ROOM_FRESH old), never more than its idle
 # workers less the rows already due there, and none at its own load line, so two hosts never pass rows back and forth
 # (a host with an executor serves nothing).
+# A peer takes only rows it reads off the login. 2026-11-22: a peer with no landing-role App credential until 13:16Z
+# took overflowed rows and judged them all on the shared login (3,480 REST calls/h, ~70% of its 5000/h; ~87/h once its
+# tokens came). So the room ask names the owners of the rows on offer, the peer answers which of them its latch-free
+# check (LandQueue.owner_latch_free) passes, and the sender offers it only those; a row the peer cannot read off the
+# login stays for the next peer or here, logged land-overflow-unreadable with the peer's reason. The peer's batch
+# refuses an overflowed row (LAND_OVERFLOW_TAG) for such an owner too, so an older sender cannot hand it one.
 LAND_OVERFLOW_KEY = "overflow"
+LAND_OVERFLOW_TAG = "overflow"  # an overflowed row's request says so: the peer's batch checks its owner
 LAND_OVERFLOW_AFTER = 600.0
 LAND_OVERFLOW_EVERY = 120.0  # at most one overflow pass this often
 LAND_POOL_FILE = "pool.json"  # the last land-pool line, for `land serve`'s room answer
@@ -11928,6 +11935,27 @@ def land_room(pool: Any, now: float) -> int:
         return max(0, int(pool.get("workers") or 0) - int(pool.get("busy") or 0) - int(pool.get("due") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def land_owner_of(target: str) -> str:
+    """The owner of a land target ("OWNER/REPO#N"), lower case; "" for none."""
+    owner, slash, _ = str(target or "").partition("/")
+    return owner.lower() if slash else ""
+
+
+def land_overflow_readable(owners: Any, queue: Any = None) -> dict[str, str]:
+    """For a peer's overflow (LAND_OVERFLOW_KEY's comment): each of OWNERS (at most LAND_FORWARD_BATCH) to "" when
+    this host's land queue reads its repos off the login's latch (QUEUE, a LandQueue, asked quietly), else why not."""
+    if not isinstance(owners, list) or not owners:
+        return {}
+    q = queue if queue is not None else LandQueue(config=land_config())
+    out: dict[str, str] = {}
+    for owner in owners[:LAND_FORWARD_BATCH]:
+        name = str(owner or "").lower()
+        if name and name not in out and re.fullmatch(r"[a-z0-9._-]{1,100}", name):
+            free, why = q.owner_latch_free(name, quiet=True)
+            out[name] = "" if free else (why or "the latch-free check gave no reason")
+    return out
 
 
 def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
@@ -14385,8 +14413,8 @@ class LandQueue:
                 return
             self.overflow_after = self.now + LAND_OVERFLOW_EVERY
             self.overflowing = set(keys)
-            rows = [(key, int(self.entries[key].get("gen") or 0), self.handoff_request(key, self.entries[key]))
-                    for key in keys]
+            rows = [(key, int(self.entries[key].get("gen") or 0),
+                     {**self.handoff_request(key, self.entries[key]), LAND_OVERFLOW_TAG: True}) for key in keys]
         if self.inline:
             self.overflow_send(peers, rows)
         else:
@@ -14402,18 +14430,36 @@ class LandQueue:
                     break
                 name = land_forward_name(command)
                 try:
-                    answer = self.forward(command, {"op": "room"}, LAND_FORWARD_DEADLINE)
+                    owners = sorted({land_owner_of(r["target"]) for _, _, r in rows})
+                    answer = self.forward(command, {"op": "room", "owners": owners}, LAND_FORWARD_DEADLINE)
                     room = answer.get("room") if answer.get("ok") else 0
                     room = room if isinstance(room, int) and not isinstance(room, bool) else 0
                     if room <= 0:
                         log({"event": "land-overflow-full", "peer": name, "pending": len(rows)})
                         continue
-                    sent, rows = rows[:room], rows[room:]
+                    # only rows whose owner the peer reads off the login (LAND_OVERFLOW_KEY's comment); a peer that
+                    # names none (an older glaeda-gh) takes none
+                    said = answer.get("readable")
+                    said = said if isinstance(said, dict) else {}
+                    unreadable = {o: str(said[o]) if o in said else f"{name} did not say it reads {o} off the login"
+                                  for o in owners if said.get(o) != ""}
+                    if unreadable:
+                        log({"event": "land-overflow-unreadable", "peer": name, "owners": unreadable,
+                             "kept": sum(1 for _, _, r in rows if land_owner_of(r["target"]) in unreadable)})
+                    offer = [r for r in rows if land_owner_of(r[2]["target"]) not in unreadable]
+                    kept = [r for r in rows if land_owner_of(r[2]["target"]) in unreadable]
+                    if not offer:
+                        continue
+                    sent, rows = offer[:room], offer[room:] + kept
                     answer = self.forward(command, {"op": "batch", "requests": [r for _, _, r in sent],
                                                     "from": policy_host()}, LAND_FORWARD_DEADLINE)
                     if not answer.get("ok"):
                         raise WatchError(land_trim(answer.get("reason") or answer.get("code"), 200))
                     accepted = {str(a) for a in answer.get("accepted") or []}
+                    refused = [r for r in answer.get("refused") or [] if isinstance(r, dict)]
+                    if refused:
+                        log({"event": "land-overflow-refused", "peer": name, "refused": len(refused),
+                             "why": land_trim(str(refused[0].get("why") or ""), 300)})
                 except Exception as error:  # noqa: BLE001  a peer that is down or refuses: the rows stay here
                     log({"event": "land-overflow-failed", "peer": name, "error": land_trim(
                         str(error) if isinstance(error, WatchError) else describe(error), 300)})
@@ -15033,12 +15079,17 @@ class LandQueue:
         E's owner. huge-blue, 2026-11-18 15:24Z: GraphQL latched, workers busy=0, 382 open lands, nothing judged,
         though land_judge reads manaflow-ai through the lander App pools (gh_app_token.hop_dir). Asked once per owner
         per LAND_LATCH_FREE_EVERY; a missing tool, an error or a timeout is "no" (held, as before)."""
-        owner = str(e.get("repo") or "").split("/")[0].lower()
+        return self.owner_latch_free(str(e.get("repo") or "").split("/")[0])[0]
+
+    def owner_latch_free(self, owner: str, quiet: bool = False) -> tuple[bool, str]:
+        """(whether OWNER's reads have a source the login's latch does not hold, why not): latch_free for an owner,
+        which `land serve` also asks for a peer's overflow (land_overflow_readable). QUIET logs no change."""
+        owner = owner.lower()
         if not owner:
-            return False
+            return False, "no owner"
         seen = self.latch_free_seen.get(owner)
         if seen is not None and self.now - seen[0] < LAND_LATCH_FREE_EVERY:
-            return seen[1]
+            return seen[1], seen[2]
         argv = self.latch_free_argv(owner)
         free, why = False, "no latch-free check on this host (land.json latchFreeCommand, or gh_app_token.py " \
             "beside land-judge)"
@@ -15056,11 +15107,11 @@ class LandQueue:
             got = self.call(argv, LAND_LATCH_FREE_DEADLINE)
             free = got.returncode == 0
             why = "" if free else latch_free_reason(got)
-        if seen is None or seen[1] != free:
+        if not quiet and (seen is None or seen[1] != free):
             log({"event": "land-latch-free" if free else "land-latch-holds", "owner": owner,
                  **({} if free else {"why": why})})
         self.latch_free_seen[owner] = (self.now, free, why)
-        return free
+        return free, why
 
     def latch_free_why(self, e: dict) -> str:
         """Why E's owner has no source the latch does not hold, as the latch-free check last said (latch_free)."""
@@ -18832,8 +18883,9 @@ def cmd_land_serve(text: str) -> int:
     if op == "room":
         # A peer's overflow asks before it sends (land_overflow): never room while the daemon is down
         running = daemon_running()
-        print(json.dumps({"ok": True, "host": policy_host(), "running": running,
-                          "room": land_room(read_json(land_dir() / LAND_POOL_FILE), time.time()) if running else 0},
+        room = land_room(read_json(land_dir() / LAND_POOL_FILE), time.time()) if running else 0
+        print(json.dumps({"ok": True, "host": policy_host(), "running": running, "room": room,
+                          "readable": land_overflow_readable(req.get("owners")) if room > 0 else {}},
                          sort_keys=True))
         return EXIT_OK
     if op == "status":
@@ -18867,7 +18919,16 @@ def cmd_land_serve(text: str) -> int:
             return EXIT_FAIL
     if op == "batch":
         accepted, refused = [], []
-        for item in (req.get("requests") or [])[:LAND_FORWARD_BATCH]:
+        items = (req.get("requests") or [])[:LAND_FORWARD_BATCH]
+        # an overflowed row whose owner this host would judge on the login is refused (LAND_OVERFLOW_KEY's comment)
+        unreadable = land_overflow_readable(sorted({land_owner_of(str(i.get("target") or "")) for i in items
+                                                    if isinstance(i, dict) and i.get(LAND_OVERFLOW_TAG)}))
+        for item in items:
+            owner = land_owner_of(str(item.get("target") or "")) if isinstance(item, dict) else ""
+            if isinstance(item, dict) and item.get(LAND_OVERFLOW_TAG) and unreadable.get(owner, "no owner") != "":
+                refused.append({"id": item.get("id"), "why": f"{policy_host()} would judge {owner or '?'} on the "
+                                f"login: {unreadable.get(owner) or 'not a pull request'}"})
+                continue
             rid, why = land_serve_one(item)
             if rid is None:
                 refused.append({"id": (item or {}).get("id") if isinstance(item, dict) else None, "why": why})
