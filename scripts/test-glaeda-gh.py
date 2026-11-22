@@ -26105,6 +26105,77 @@ class LandTest(Base):
         self.assertEqual(self.q.unjudgeable_here(e, {"code": "ci", "reason": "x"}, {}, LA), "")
         self.assertEqual(self.q.unjudgeable_here(e, {"code": "unreadable", "cacheOnly": True}, {}, LA), "")
 
+    def unreadable_lands(self, n: int) -> None:
+        """PRs o/r#1..#N each queued and judged once, every judgment a read that timed out (UNREAD)."""
+        for i in range(1, n + 1):
+            self.pr(LA, key=f"pr:o/r#{i}")
+            self.land(f"o/r#{i}")
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+            self.tick()
+
+    def test_a_lane_vm_that_cannot_read_github_hands_the_next_due_land_off_before_judging_it(self):
+        # Leo, 2026-11-22: "it's just that you guys seem to be timing out on stuff". gcp-agent-lane-6: cmux#47213,
+        # hq#14403 and hq#15043 sat 6+ h on reads that timed out; a hand-off after a judgment still took 30-90 min.
+        # Three of this host's last live judgments read nothing (timed out): the next due PR goes with no explain.
+        self.broker = True
+        self.unreadable_lands(gg.LAND_EARLY_HANDOFF_BAD)
+        self.assertEqual((len(self.w.explains()), len(self.handoffs())), (3, 3))
+        key = "pr:o/r#4"
+        self.pr(LA, key=key)
+        self.land("o/r#4")
+        self.tick()
+        e = self.q.entries[key]
+        self.assertEqual((len(self.w.explains()), len(self.handoffs())), (3, 4))
+        self.assertEqual(json.loads(self.handoffs()[-1][4])["sha"], LA)
+        self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
+        [early] = [h for h in e["history"] if h.get("event") == "handoff_early"]
+        self.assertEqual(early["why"], "handed off early: 3 of the last 3 judgments here could not read GitHub")
+        self.assertFalse(any(h.get("event") in ("judged", "due_late") for h in e["history"]), e["history"])
+        # past the window the answers are old: the next PR is judged here first
+        self.t += gg.LAND_EARLY_HANDOFF_WINDOW + 1
+        self.pr(LA, key="pr:o/r#5")
+        self.land("o/r#5")
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        self.tick()
+        self.assertEqual((len(self.w.explains()), len(self.handoffs())), (4, 5))
+
+    def test_the_broker_host_never_hands_off_early_however_many_reads_fail(self):
+        self.unreadable_lands(gg.LAND_EARLY_HANDOFF_BAD)
+        self.pr(LA, key="pr:o/r#4")
+        self.land("o/r#4")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual((len(self.w.explains()), self.handoffs()), (4, []))
+        self.assertNotIn("handoff_early", [h.get("event") for h in self.q.entries["pr:o/r#4"]["history"]])
+
+    def test_a_lane_vms_judgment_times_out_at_the_client_deadline_and_is_handed_off(self):
+        # A lane VM's explain is cut at LAND_EXPLAIN_DEADLINE_CLIENT, not 1500 s: its timeout is explain_failed,
+        # which hands the PR to the broker host (LAND_HANDOFF_UNREAD). The broker host keeps the long deadline.
+        for broker, deadline in ((True, gg.LAND_EXPLAIN_DEADLINE_CLIENT), (False, gg.LAND_EXPLAIN_DEADLINE)):
+            with self.subTest(broker=broker):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                given: list[float] = []
+                real = self.w.run
+
+                def run(argv: list[str], timeout: float, env: dict, real: Any = real) -> Any:
+                    if argv[1:3] == [self.w.mh, "explain"]:
+                        given.append(timeout)
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    return real(argv, timeout, env)
+
+                self.w.run = run
+                self.q = self.queue()
+                self.broker = broker
+                self.pr(LA)
+                self.land()
+                e = self.tick()
+                self.assertEqual(given, [deadline])
+                self.assertEqual(e["explain"]["code"], "explain_failed")
+                self.assertEqual((e["state"] == "forwarded", len(self.handoffs())), (broker, int(broker)))
+        self.broker = False
+        self.assertEqual(gg.LAND_EXPLAIN_DEADLINE_CLIENT, 300.0)
+
     def test_a_refused_hand_off_backs_off_then_stops_and_says_so(self):
         self.broker = True
         self.pr(LA)

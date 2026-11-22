@@ -11829,6 +11829,9 @@ def land_load_per_core(cores: int | None = None) -> float | None:
 
 
 LAND_EXPLAIN_DEADLINE = 1500.0  # land_judge's own CHECK_BUDGET_S is 1470 s
+# On a broker client (a lane VM) a judgment past this is a read that is not coming: it ends explain_failed, which
+# hands the PR to the broker host (LAND_HANDOFF_UNREAD) after 5 min instead of 25 (LAND_EARLY_HANDOFF's comment).
+LAND_EXPLAIN_DEADLINE_CLIENT = 300.0
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
@@ -11950,6 +11953,15 @@ LAND_UNREAD_CODES = frozenset({"unreadable"})
 # webview_unreadable is land_judge's stop after three live webview reads timed out, the same slow read
 # (gcp-agent-lane-10, 2026-11-22: cmux#48009, #49213, #48839 stopped on it, each read "took over 40 s").
 LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unreadable"})
+# And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
+# waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
+# live judgments within LAND_EARLY_HANDOFF_WINDOW read nothing for a transient reason (LAND_HANDOFF_UNREAD,
+# LAND_UNREAD_TRANSIENT). Leo, 2026-11-22: "it's just that you guys seem to be timing out on stuff". gcp-agent-lane-6,
+# 2026-11-22: cmux#47213, hq#14403 and hq#15043 sat 6+ h in this queue on reads that timed out, and a hand-off after a
+# judgment still took 30-90 min (the judgment up to LAND_EXPLAIN_DEADLINE, due_late 30-58 min, host_cap 30-60 min).
+LAND_EARLY_HANDOFF_BAD = 3
+LAND_EARLY_HANDOFF_OF = 5
+LAND_EARLY_HANDOFF_WINDOW = 900.0
 # An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
 # read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
 # (`explain --cache-only`, no read sent, no broker queue waited on, a local read of seconds); only a miss goes live,
@@ -13339,6 +13351,7 @@ class LandQueue:
         self.local = threading.local()  # .gen: the request generation the worker's job started under
         self.entries: dict[str, dict] = {}
         self.jobs: dict[str, Any] = {}
+        self.live_reads: list[tuple[float, bool]] = []  # this host's last live judgments: (at, read nothing) (early_hand_off)
         self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         self.touched: dict[str, float] = {}
@@ -15358,6 +15371,8 @@ class LandQueue:
         # Keep the event until we can submit the judgment. Workers, readiness and quota windows may
         # recover before either another event arrives or the recovery sweep runs.
         self.changed_entries.add(e["key"])
+        if self.early_hand_off(e, sha, fp):
+            return True
         if self.reset_staggered(e):
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
@@ -15532,7 +15547,8 @@ class LandQueue:
         with self.lock:
             self.count("snapshot" if extra else "live")
         for n, run_argv in enumerate(tries):
-            got = self.call(run_argv, LAND_EXPLAIN_DEADLINE, extra=extra)
+            got = self.call(run_argv, LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE,
+                            extra=extra)
             answer = None
             for line in reversed((got.stdout or "").strip().splitlines()):
                 with contextlib.suppress(ValueError):
@@ -15583,12 +15599,15 @@ class LandQueue:
         if e["state"] == "cancelled" or (gen is not None and int(e.get("gen") or 0) != gen):
             raise LandCancelled(e["key"])
 
-    def job(self, key: str, sha: str, gen: int = 0) -> None:
-        """One judgment and the step it names. A `land cancel` or a newer `land` that arrives meanwhile wins
-        (LandCancelled): the job ends, and a requeued entry is considered afresh on the next tick. A step already
-        sent (claimed) runs to its end; what it did shows in the cache."""
+    def job(self, key: str, sha: str, gen: int = 0, early: bool = False) -> None:
+        """One judgment and the step it names (EARLY: the hand-off early_hand_off named instead). A `land cancel` or a
+        newer `land` that arrives meanwhile wins (LandCancelled): the job ends, and a requeued entry is considered
+        afresh on the next tick. A step already sent (claimed) runs to its end; what it did shows in the cache."""
         self.local.gen = gen
         try:
+            if early:
+                self.hand_off(self.entries[key], sha)
+                return
             self.judge_and_take(key, sha)
         except LandCancelled:
             with self.lock:
@@ -15662,6 +15681,10 @@ class LandQueue:
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
+                bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
+                    and bool(LAND_UNREAD_TRANSIENT.search(reason))
+                self.live_reads = (self.live_reads + [(self.now, bad)])[-LAND_EARLY_HANDOFF_OF:]
             hand = self.unjudgeable_here(e, answer, act, head)
             if hand:
                 e["handoffDue"] = {"kind": "judgment", "head": head, "why": hand, "reason": "unreadable here"}
@@ -15717,6 +15740,29 @@ class LandQueue:
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
             return ""
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
+
+    def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
+        """E is due a judgment: on a broker client that could not read GitHub in most of its last live judgments
+        (LAND_EARLY_HANDOFF's comment), hand it at its full head to the broker host's land queue now, on a job of its
+        own, with no judgment here and no wait for a worker or a pace slot; True when that job was started."""
+        if not self.broker_client() or e.get("state") == LAND_FORWARDED:
+            return False
+        recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
+        if sum(recent) < LAND_EARLY_HANDOFF_BAD:
+            return False
+        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")).lower()
+        if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
+            return False
+        why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
+        self.history(e, "handoff_early", head=head[:12], why=why)
+        e["handoffDue"] = {"kind": "judgment", "head": head, "why": why, "reason": why}
+        e.update(state="judging", seen=fp)
+        e.pop("dueLate", None)
+        e.pop("dueAt", None)
+        self.save(e)
+        self.submit(e["key"], self.job, e["key"], head, int(e.get("gen") or 0), True)
+        self.changed_entries.discard(e["key"])
+        return True
 
     def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
         """Under the lock, for each judged answer (LAND_UNREAD_SAME_STOP's comment): an "unreadable" one counts its
