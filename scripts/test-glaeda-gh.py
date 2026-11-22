@@ -27413,6 +27413,42 @@ class LandTest(Base):
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
 
+    def test_a_prs_own_ci_job_rate_limit_parks_only_its_entry_and_never_halves_the_pool(self):
+        """cmux-cp-1, 2026-11-22 17:42-21:00Z: 10 of 11 host-wide parks were land_judge's "base_red_excuse.py job
+        rate-limited at HEAD" (one PR's CI job printed only its repo installation's API refusal), worded as a quota
+        refusal with a reset. Each stopped every land 2-4 min and halved the pool, though no pool this host reads was
+        spent. That PR waits for the time it names; the next PR is judged on the same pass; the pool keeps its size."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        retry = self.t + 1500
+        at = time.strftime("%H:%M", time.gmtime(retry))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 1500}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: base_red_excuse.py job "
+            f"rate-limited at {LA} (exit 1): job-rate-limited: run 45060196034; job 130862862041; no attempt before "
+            f"{at}Z. Rerun run 45060196034 (job 130862862041) no sooner than {at}Z; the repo installation's API limit "
+            "refused only that hand-off job")))
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        refused_before = self.q.quota_refused
+        self.tick()
+        e = self.q.entries[self.KEY]
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"].get("own")), ("waiting", "quota", True))
+        self.assertEqual(e["wakeAt"], said + gg.land_jitter(self.KEY, said))
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        self.assertEqual(self.q.quota_refused, refused_before)  # adapt_pool does not halve on it
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged on the same pass
+
+    def test_the_job_quota_words_are_land_judges_own(self):
+        """LAND_JOB_QUOTA matches land_judge's fixed lead only, not a reset that merely mentions a job."""
+        self.assertTrue(gg.LAND_JOB_QUOTA.search("base_red_excuse.py job rate-limited at 908aa0087803ab6f006c9a77fb"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("quota: not judged, retry after 09:00Z (reset): GraphQL spent"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("base_red_excuse.py was rate-limited at 908aa0087803"))
+
     def test_a_refusal_naming_no_reset_parks_only_its_entry_never_the_queue(self):
         """gcp lane, 2026-11-21 07:44Z: an "unreadable" judgment whose secondary-limit words were cut before their time
         ("until 07:5 ...") took its entry's 9th backoff, 3600 s, and park_quota parked the whole host's queue on it until
