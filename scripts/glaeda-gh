@@ -11769,6 +11769,9 @@ LAND_EXPLAIN_DEADLINE = 1500.0  # land_judge's own CHECK_BUDGET_S is 1470 s
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
+# The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
+# an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
+LAND_NOTICE_CLASS = "block"
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
@@ -13741,7 +13744,7 @@ class LandQueue:
                         f"glaeda land: {self.url(e)} has been due since {utc_clock(mark['dueSince'])} and not judged: "
                         f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch has held through {n} "
                         f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
-                        f"to do. Its reads have no source here but the login: {self.latch_free_why(e)}")
+                        f"to do. Its reads have no source here but the login: {self.latch_free_why(e)}", wake=False)
         self.save(e)
 
     def unhold(self, e: dict) -> None:
@@ -14904,7 +14907,7 @@ class LandQueue:
                         f"glaeda land: {self.url(e)} waits: {key_name(a)}, which it lands after, stopped "
                         f"({st.get('code') or 'stopped'}); this land stays queued behind it until "
                         f"{utc_clock(self.now + LAND_AFTER_STOPPED_WAIT)}. next: glaeda-gh land {key_name(a)} once "
-                        "its stop is cleared, or merge it; this one follows")
+                        "its stop is cleared, or merge it; this one follows", wake=False)
             return False
         if self.now - float(mark.get("since") or self.now) < LAND_AFTER_STOPPED_WAIT:
             return False
@@ -16186,7 +16189,7 @@ class LandQueue:
                 self.history(e, "handed_off", to=host, head=head[:12], why=reason)
                 self.save(e)
                 self.notify(e, requester, f"glaeda land: {self.url(e)} handed to {host}: {what}; {host}'s land queue judges it (land_judge) and merges it, or says why not "
-                            f"(glaeda-gh land status there)")
+                            f"(glaeda-gh land status there)", wake=False)
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
             last = e.get("handoffFail") or {}
@@ -16468,10 +16471,21 @@ class LandQueue:
             return
         self.notify(e, e.get("requester") or "", msg)
 
-    def notify(self, e: dict, to: str, message: str) -> None:
+    def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
-        a stop."""
+        a stop.
+
+        A land tells its requester only what the requester acts on (LAND_NOTICE_CLASS): it merged, it stopped (a
+        conflict, a red, a refusal naming its step), or a judge's escalation. Those go as class `block`, so an idle
+        lane wakes at once instead of at its inbox's next FYI flush. Every other word (WAKE False: handed to the
+        broker host, still waiting behind a stopped land, held by the login's latch) is a line in the log and the
+        entry's history, read with `land status`, and sends nothing: each was a turn of an idle lane that read it
+        and said "nothing to do". gcp-agent-lane-10, 2026-11-21 11Z-2026-11-22 07Z: 87 idle wakes carried only
+        land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone."""
         to = land_notify_target(e, to)
+        if not wake:
+            log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
+            return
         if not to:
             # Nobody to tell (no --notify, no session in the queuing environment): still never silent.
             log({"event": "land-unnotified", "key": e["key"], "queuedBy": e.get("queuedBy"), "message": message})
@@ -16486,7 +16500,7 @@ class LandQueue:
         title = land_trim(message, 200)
         severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--title", title, message]
+                "--class", LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
             got = self.call(argv, LAND_NOTIFY_DEADLINE)
