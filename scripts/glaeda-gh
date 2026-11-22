@@ -3746,6 +3746,22 @@ def timed_out(error: BaseException) -> bool:
     return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
 
 
+def transport_reason(error: BaseException) -> str:
+    """A transport failure's type and the OS's own words for it, never the URL or a value: "URLError
+    (ConnectionRefusedError: [Errno 111] Connection refused)". The type alone ("controller: URLError", huge-blue 04:26-06:00Z
+    2026-11-22, nine state events) could not tell a refused connection from a DNS miss or a reset (failure-drops-its-reason)."""
+    name = type(error).__name__
+    inner = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else error
+    if isinstance(inner, BaseException):
+        words = getattr(inner, "strerror", None)
+        errno_ = getattr(inner, "errno", None)
+        said = (f"[Errno {errno_}] {words}" if isinstance(errno_, int) else str(words)) if isinstance(words, str) else ""
+        if inner is error:
+            return f"{name} ({said})" if said else name
+        return f"{name} ({type(inner).__name__}: {said})" if said else f"{name} ({type(inner).__name__})"
+    return name
+
+
 class Controller:
     """The build controller's GitHub events (cmuxterm-hq#675) over the tailnet: no GitHub quota.
     Without a token it answers for public repositories only."""
@@ -3792,8 +3808,8 @@ class Controller:
             raise WatchError(f"controller HTTP {error.code}") from None
         except (OSError, HTTPException, ValueError) as error:
             if timed_out(error):
-                raise ControllerTimeout(f"controller: {type(error).__name__}") from None
-            raise WatchError(f"controller: {type(error).__name__}") from None
+                raise ControllerTimeout(f"controller: {transport_reason(error)}") from None
+            raise WatchError(f"controller: {transport_reason(error)}") from None
         if not isinstance(doc, dict):
             raise WatchError("controller: not a JSON object")
         return doc

@@ -1998,6 +1998,25 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 3 * gg.TICK)
         self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), NOW + 3 * gg.TICK), "the feed is out")
 
+    def test_a_controller_transport_failure_names_its_reason(self) -> None:
+        """transport_reason: "controller: URLError" alone could not tell a refused connection from a DNS miss."""
+        import urllib.error
+        ctl = gg.Controller("http://controller.invalid", None)
+        for raised, said in [
+                (urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+                 "controller: URLError (ConnectionRefusedError: [Errno 111] Connection refused)"),
+                (urllib.error.URLError(OSError("no strerror")), "controller: URLError (OSError)"),
+                (urllib.error.URLError("unknown url type"), "controller: URLError"),
+                (ConnectionResetError(104, "Connection reset by peer"),
+                 "controller: ConnectionResetError ([Errno 104] Connection reset by peer)")]:
+            def boom(*_a, raised=raised, **_k):
+                raise raised
+            with mock.patch.object(gg.CONTROLLER_OPENER, "open", boom):
+                with self.assertRaises(gg.WatchError) as caught:
+                    ctl.get("/v1/github/events")
+            self.assertEqual(str(caught.exception), said)
+            self.assertNotIn("controller.invalid", str(caught.exception))
+
     def test_a_long_tick_reads_the_feed_between_its_reads_so_the_view_stays_fresh(self) -> None:
         """feed_due / feed_between_reads, asked before every read request: a tick that runs past CONTROLLER_FRESH (a
         read backlog: ~600 s on the broker host, hq#17503) still keeps the view a downstream rules with fresh; the
