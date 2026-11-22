@@ -8156,6 +8156,22 @@ class TickBudgetTest(Base):
         self.assertEqual(status["fetched"]["pr"], 20)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_the_oldest_waited_pr_is_read_first_whichever_repo_it_is_in(self) -> None:
+        # A broker host, 2026-11-22: 1,206 waited PRs against 200-280 reads a window; the oldest waited key of a small
+        # repo sat 411th because batched() read repo by repo, every chunk of the larger repo first: 15,400 s stale.
+        keys = [f"pr:o/big#{n}" for n in range(1, 13)] + ["pr:o/small#1"]
+        for i, key in enumerate(keys):
+            parsed = gg.parse_key("pr", key.split(":", 1)[1])
+            age = 5000 if key == "pr:o/small#1" else 700 + i  # the small repo's PR has the oldest data
+            gg.write_json(gg.cache_dir() / gg.file_name(parsed), {"key": parsed, "fetchedAt": NOW - age,
+                          "dataAt": NOW - age, "data": gg.parse_pr(pr_node(i + 1)), "error": None})
+            gg.register(parsed, waited=True)
+            owner, repo = key.split(":", 1)[1].split("#")[0].split("/")
+            self.gh.prs[(owner, repo, int(key.rsplit("#", 1)[1]))] = pr_node(int(key.rsplit("#", 1)[1]))
+        self.spend_budget_after(1)  # one query: the first chunk only
+        self.daemon.tick(NOW)
+        self.assertGreaterEqual(gg.read_cache("pr:o/small#1")["dataAt"], NOW, "the oldest waited data goes first")
+
     def test_failed_steps_left_unread_put_their_pr_first_next_tick(self) -> None:
         failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}
         self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="FAILURE", checks=[failed])
@@ -17628,13 +17644,14 @@ class SpendAlarmTest(AlarmBase):
         self.assertIn("pr:o/r#5", self.daemon.nudged)  # its read goes first instead
         verdict = self.daemon.stale_valve(("warn", "x", {"kind": "pr", "key": "pr:o/r#5"}), self.daemon.policy["alarms"])
         self.assertEqual((verdict[2]["valve"], verdict[2]["freshest"]), ("one_key", 30))
-        # nothing read anywhere (every waited key old): that is a stuck daemon, and the valve still acts
+        # nothing read anywhere (every waited key old) and none stored: that is a stuck daemon, and the valve still acts
         self.daemon.fresh_waited = {"pr": float(gg.STALE_DATA_AFTER + 1)}
+        self.daemon.read_done = {**self.daemon.read_done, "pr": []}
         self.daemon.now += gg.TICK
         self.daemon.check_alarms()
         self.assertIsNotNone(self.daemon.valve_due)
 
-    def test_the_valve_restarts_for_one_stale_key_the_nudge_did_not_clear_past_two_hours(self) -> None:
+    def test_the_valve_leaves_one_stale_key_the_nudge_did_not_clear_to_the_read_order(self) -> None:
         # huge-blue, 2026-11-20 03:2xZ, 04:2xZ, 05:2xZ: one PR's data 6751 to 10446 s old, "backlog" (other keys read),
         # the valve answering one_key every tick, and a person running `glaeda-gh restart` each time
         self.policy()
@@ -17645,9 +17662,24 @@ class SpendAlarmTest(AlarmBase):
         for i in range(2):
             self.daemon.now = NOW + i * gg.TICK
             self.daemon.check_alarms()
-        self.assertIsNotNone(self.daemon.valve_due, "an hours-old key is a read loop that cannot reach it")
-        self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
-        self.assertIn("restarting itself now", self.told_lines()[-1])
+        self.assertIsNone(self.daemon.valve_due, "a backlog is drained by the read order, not by a restart")
+        self.assertIn("pr:o/r#5", self.daemon.nudged)
+
+    def test_the_valve_never_restarts_a_backlog_however_old_the_key(self) -> None:
+        # The same host: four valve restarts in four hours for a "backlog" verdict; a restart cannot drain a backlog and
+        # drops the defer order, so the next window read 35 PRs against 282.
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        stale = ("fire", "x", {"kind": "pr", "key": "pr:o/r#5", "age": gg.STALE_ONE_KEY_MAX + 9000, "cause": "backlog"})
+        self.daemon.stale_streak = gg.STALE_VALVE_TICKS
+        verdict = self.daemon.stale_valve(stale, self.daemon.policy["alarms"])
+        self.assertIsNone(self.daemon.valve_due)
+        self.assertEqual(verdict[2]["valve"], "backlog")
+        self.assertIn("pr:o/r#5", self.daemon.nudged)
+        self.daemon.stale_streak = gg.STALE_VALVE_TICKS
+        stale[2]["cause"] = "stalled"
+        self.daemon.stale_valve(stale, self.daemon.policy["alarms"])
+        self.assertIsNotNone(self.daemon.valve_due, "a stall is still the valve's")
 
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
