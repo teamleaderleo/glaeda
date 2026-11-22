@@ -1374,6 +1374,52 @@ def target_readable(kind: str, text: str) -> bool:
     return kind in KEY_RES and bool(KEY_RES[kind].fullmatch(text))
 
 
+def local_branch(name: str, cwd: str | None = None) -> bool:
+    """Whether NAME is a branch of the checkout the caller ran in (its own or a remote-tracking one). One local git
+    call, on a refusal path only: it is what makes a slash-bearing branch name (`feat/x`, which reads exactly like
+    OWNER/REPO) safe to answer as a branch."""
+    # for-each-ref takes patterns: an empty name, or one holding a glob character, would match every branch there
+    # is and read as a branch of any name (an empty target did, 2026-11-22).
+    if not name or any(c in name for c in "*?[]~^: \t\\") or name.startswith("/") or name.endswith("/"):
+        return False
+    try:
+        done = subprocess.run(["git", "-C", cwd or ".", "for-each-ref", "--count=1", "--format=%(refname:short)",
+                               f"refs/heads/{name}", f"refs/remotes/origin/{name}"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and bool(done.stdout.strip())
+
+
+def branch_target_step(kind: str, text: str, cwd: str | None = None) -> str:
+    """The one command that turns a branch name into the target `status`, `wait` and `land` take, when TEXT names a
+    branch rather than a PR, else "". `OWNER/REPO@BRANCH` says the repository itself; a bare word is a branch only
+    when the checkout the caller stands in has one by that name, and then the repository is its origin.
+
+    A PR is the thing an agent has in hand least often: what it has is the branch it just pushed. `glaeda-gh status
+    pr --head BRANCH` and `status run --branch main` are both unrecognized arguments (two refused calls in this
+    lane, 2026-11-21), and the refusal for a branch typed as a target said only what a target must look like, which
+    does not say how to get from the branch to the number. `--field target` prints `pr:owner/repo#5`, the spelling
+    this tool's own targets take, so the printed step's output is the next call's argument."""
+    if kind not in ("pr", "comment") or not text or "#" in text or "://" in text or text.startswith("-"):
+        return ""
+    repo, branch = "", text
+    if "@" in text:
+        left, branch = text.rsplit("@", 1)
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", left):
+            return ""
+        repo = left
+    if not branch or BARE_NUMBER.fullmatch(branch) or "@" in branch or SHA40.fullmatch(branch):
+        return ""  # `o/r@<40 hex>` is a head, which `parse_key("head", ...)` takes as it stands
+    if not repo:
+        if not local_branch(branch, cwd):
+            return ""
+        repo = cwd_repo(cwd) or ""
+    if not repo:
+        return ""
+    return f"glaeda-gh search prs --repo {repo} head:{branch} --state open --field target,state"
+
+
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
     shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
@@ -1392,6 +1438,10 @@ def parse_key(kind: str, text: str) -> str:
     if not match:
         form = {"pr": "OWNER/REPO#N or a pull request URL", "run": "OWNER/REPO/RUN_ID or a run URL",
                 "comment": "OWNER/REPO#N or an issue or pull request URL"}.get(kind, "pr, run or comment")
+        step = branch_target_step(kind, text)
+        if step:
+            raise WatchError(f"{text!r} is a branch, and {kind} takes {form}: that number is one search away; "
+                             f"next: {step}")
         raise WatchError(f"{kind} must be {form}, not {text!r}")
     owner, repo, number = match.groups()
     if kind == "head":
