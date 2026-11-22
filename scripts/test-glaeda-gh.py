@@ -35123,5 +35123,40 @@ class InCallRaceTest(Base):
         self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertIs(self.daemon.in_call, other)
 
+class InheritedChildrenTest(unittest.TestCase):
+    """gcp-agent-lane-2, 2026-11-22: 117 zombies under one serve pid, children of an image before its os.execv."""
+
+    def test_a_child_with_no_popen_is_adopted_reaped_and_gone(self) -> None:
+        # posix_spawn: a child no Popen tracks, as one an earlier image started is after the exec
+        pid = os.posix_spawn("/bin/sh", ["/bin/sh", "-c", "exit 0"], dict(os.environ))
+        try:
+            kids = gg.own_children()
+            self.assertIn(pid, kids)
+            inherited = gg.InheritedChildren({pid})
+            deadline = time.monotonic() + 10
+            while inherited.pids and time.monotonic() < deadline:
+                inherited.reap()
+                time.sleep(0.05)
+            self.assertEqual(inherited.pids, set())
+            with self.assertRaises(ChildProcessError):  # reaped: no zombie is left to wait for
+                os.waitpid(pid, os.WNOHANG)
+        finally:
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+
+    def test_a_running_child_stays_until_it_ends_and_a_stranger_is_dropped(self) -> None:
+        proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30"])
+        try:
+            inherited = gg.InheritedChildren({proc.pid, 1})  # pid 1 is no child of ours
+            self.assertEqual(inherited.reap(), 0)
+            self.assertEqual(inherited.pids, {proc.pid})
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_ps_itself_is_not_a_child(self) -> None:
+        self.assertEqual(gg.own_children(), set())
+
+
 if __name__ == "__main__":
     unittest.main()

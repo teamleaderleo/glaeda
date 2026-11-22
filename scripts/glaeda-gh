@@ -19194,7 +19194,55 @@ def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: floa
     return "defer"
 
 
+def own_children() -> set[int]:
+    """The pids whose parent is this process, by one `ps` (Linux and macOS alike), less ps itself. Empty when ps
+    can't be read: then nothing is adopted, as before."""
+    me = os.getpid()
+    try:
+        with subprocess.Popen(["ps", "-A", "-o", "pid=,ppid="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace") as proc:
+            out, _ = proc.communicate(timeout=10)
+            ps_pid = proc.pid
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    kids = set()
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit() and int(f[1]) == me and int(f[0]) != ps_pid:
+            kids.add(int(f[0]))
+    return kids
+
+
+class InheritedChildren:
+    """Children a previous image of this pid started before it re-executed (serve's os.execv: an update, the stale
+    valve, a replaced lock). Their Popen objects died with that image, so nothing waits for them and each one that
+    ends stays a zombie for the daemon's life: gcp-agent-lane-2, 2026-11-22, 117 `[python3] <defunct>` under one
+    serve pid after 7.5 h, born in bursts right before each exec (46 at 11:48:11, exec at 11:48:15). Taken at
+    serve's start, before this image starts any child, the set holds only those; reap() waits for each with
+    WNOHANG every tick and drops it once reaped. No other pid is waited for, so this image's Popens are untouched."""
+
+    def __init__(self, pids: set[int]):
+        self.pids = set(pids)
+
+    def reap(self) -> int:
+        reaped = 0
+        for pid in list(self.pids):
+            try:
+                got, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                self.pids.discard(pid)  # not ours after all (or already waited): forget it
+                continue
+            except OSError:
+                continue
+            if got == pid:
+                self.pids.discard(pid)
+                reaped += 1
+        return reaped
+
+
 def serve(foreground_ok: bool = False) -> int:
+    # First, before any child of this image exists: every child now is the previous image's (see InheritedChildren)
+    inherited = InheritedChildren(own_children())
     lock = hold_daemon_lock()
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
@@ -19207,7 +19255,7 @@ def serve(foreground_ok: bool = False) -> int:
     stamp = me.stat().st_mtime
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid()})
+    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": len(inherited.pids)} if inherited.pids else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -19231,6 +19279,11 @@ def serve(foreground_ok: bool = False) -> int:
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
         time.sleep(TICK)
         watchdog.beat()
+        if inherited.pids:
+            with contextlib.suppress(Exception):  # noqa: BLE001  never a reason to stop serving
+                reaped = inherited.reap()
+                if reaped:
+                    log({"event": "reaped-inherited", "children": reaped, "left": len(inherited.pids)})
         try:
             if daemon.valve_due is not None:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
