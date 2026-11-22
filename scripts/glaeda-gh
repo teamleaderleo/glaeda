@@ -568,6 +568,13 @@ GQL_DOWN_BACKOFF = 60
 GQL_DOWN_MAX = 600
 # GitHub failed the query (a 5xx, or no answer): split and retry, then REST. A 504 or a timeout is SLOW instead.
 GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
+# A 502 or 503 that came only after this long is GitHub giving up on a query past its time budget, not GraphQL down:
+# it is the batch's doing, so it shrinks the batch like a 504 (SLOW) and counts nothing toward GQL_DOWN_AFTER. The
+# broker host, 2026-11-22 04:08Z, the ci-watch App reading cmux PRs (each ~61 KB of checks) with the daemon's own
+# pr_query: 1 PR 4.0 and 5.8 s, 2 PRs 3.1 and 2.4 s, 4 PRs HTTP 502 after 14.1 and 10.9 s, 8 PRs HTTP 502 after 12.2
+# and 15.7 s. The batch sat at 8, every query 502'd, the 502s took GraphQL "down" and every PR went to REST one at a
+# time: 143 PR reads stored in 600 s against ~1,000 waited PRs, waited data 17,794 s old.
+GQL_SLOW_5XX_AFTER = 8.0
 GQL_NO_ANSWER = re.compile(r"request failed: (?!TimeoutError)")  # GQL_DOWN with no answer: REST reads it, unsplit
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
@@ -9168,12 +9175,17 @@ class Daemon:
 
     def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
         """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
+        began = time.monotonic()
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
             message = f"graphql: {describe(error)}"
             self.note_gql_health(message)
             return None, message
+        took = time.monotonic() - began
+        if status in (502, 503) and took >= GQL_SLOW_5XX_AFTER:
+            # past GitHub's time budget (GQL_SLOW_5XX_AFTER): SLOW, so batched() shrinks and splits; not GQL_DOWN
+            return None, f"graphql: timed out (GitHub answered {status} after {took:.1f}s)"
         self.note_gql_health(f"graphql: HTTP {status}" if status >= 500 else None)
         rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
