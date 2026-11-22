@@ -32310,6 +32310,18 @@ def bare_wait_count(word: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    for rewriter in (nesting_synonym, command_spelling_synonym):
+        # The command word first, before anything else reads it. Every rewriter below gates on an exact
+        # command word (`search`, `log`, `land`), so a near spelling of it skipped them all and the call was
+        # refused on its shape instead: 2026-11-22 `glaeda-gh logs job manaflow-ai/cmux/137389338821` had
+        # `logs` corrected to `log` and then died on "one of the arguments JOB_ID|RUN_ID --job is required",
+        # because the one-word target rewrite had already run and seen `logs`. The nesting before the
+        # spelling, as it is below: a word a command owns is that command's.
+        raw, refusal = rewriter(raw)
+        if refusal:
+            for line in refusal:
+                print(line, file=sys.stderr)
+            return 64
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
         # A form this subcommand cannot serve names the one that works, rather than reaching gh's REST search.
         print(f"glaeda-gh: {SEARCH_UNSERVED[raw[1].lower()]}", file=sys.stderr)
@@ -32341,13 +32353,12 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym,
-                     flag_spelling_synonym, bare_wait_synonym):
-        # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
-        # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
-        # sits between them: it only looks at a call that already leads with a real command, which is what the
-        # two before it have just made sure of, and it reads flags only by name. `bare_wait_synonym` last: it
-        # reads flags in canonical spelling, which the one before it has just produced.
+    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, bare_wait_synonym):
+        # The nesting and the command's own spelling ran at the top (a word a command owns is that command's,
+        # and which options a command has depends on which command it is); the flags come after them.
+        # `doubled_kind_synonym` first here: it only looks at a call that already leads with a real command,
+        # which is what the two at the top have made sure of, and it reads flags only by name.
+        # `bare_wait_synonym` last: it reads flags in canonical spelling, which the one before it produces.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
