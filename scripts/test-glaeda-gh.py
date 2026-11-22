@@ -23236,6 +23236,35 @@ class LandTest(Base):
         events = [h.get("event") for h in self.q.entries[other]["history"]]
         self.assertEqual((events.count("snapshot_wait"), events.count("snapshot_missing")), (1, 1))
 
+    def test_run_out_snapshot_waits_hold_no_place_while_a_worker_is_free(self):
+        """huge-blue, 2026-11-22 06:59-09:50Z: 43 rows held snapshotWait, 14 of them hours old and no longer judged,
+        so the waits filled every place ahead of the workers with 2 of 12 busy, and each row whose snapshot was not
+        ready read "every worker busy"."""
+        pool = self.pooled(2)
+        for n in range(1, 4):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"  # no snapshot: each judgment waits for the daemon's read first
+        for n in (1, 2, 3):
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len([e for e in self.q.entries.values() if e.get("snapshotWait")]), 3)
+        stale = self.q.entries
+        for n in (1, 2, 3):  # three rows left with a wait hours old that the pass no longer judges
+            stale[f"pr:o/r#{n}"]["snapshotWait"] = {"sha": LA, "since": self.t - 3 * 3600}
+        self.pr(LA, key="pr:o/r#9")
+        self.w.cache["pr:o/r#9"]["fp"] = "F"
+        self.land("o/r#9")
+        consider = self.q.consider
+        with mock.patch.object(self.q, "consider", lambda e: None if e["key"] != "pr:o/r#9" else consider(e)):
+            self.tick()
+        e = self.q.entries["pr:o/r#9"]
+        self.assertTrue(e.get("snapshotWait"), "a new wait starts: run-out waits hold no place with workers free")
+        self.assertIn("pr:o/r#9", self.w.nudged)
+        self.assertEqual(self.q.snapshot_places(True), 1)
+        self.assertEqual(self.q.snapshot_places(False), 4)  # every worker busy: each wait keeps its place, as before
+        self.assertEqual(len(pool.handed), 0)
+
     def test_no_wait_for_a_partial_snapshot_an_upstream_host_or_a_rest_read(self):
         for setup in ("partial", "upstream", "rest"):
             with self.subTest(setup):

@@ -15396,6 +15396,20 @@ class LandQueue:
             return None, "partial"
         return {**snap, "dataAt": at}, ""
 
+    def snapshot_places(self, free: bool) -> int:
+        """How many places ahead of the workers the snapshot waits hold (judge's room). While every worker is busy, each
+        wait does, run out or not: a run-out one is judged on the next worker that frees (snapshot_wait). With a worker
+        FREE, only a wait still inside LAND_SNAPSHOT_WAIT does: a run-out row that reaches judge is judged live at once
+        and needs no place, and one the pass no longer reaches (not due, a stale head, the pace) held its place for
+        hours. huge-blue, 2026-11-22 06:59-09:50Z: 43 rows held snapshotWait, 14 of them 1.5-2.7 h old, so jobs and
+        waits read 24 of 24 places with 2 of 12 workers busy, and every row whose snapshot was not ready was gated
+        "every worker busy" (glaeda#36, hq#17575, hq#18023 and hq#18005 from 07:07Z)."""
+        if not free:
+            return len(self.snapshot_waiting)
+        return sum(1 for k in self.snapshot_waiting
+                   if self.now - float(((self.entries.get(k) or {}).get("snapshotWait") or {}).get("since") or 0)
+                   < LAND_SNAPSHOT_WAIT)
+
     def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
         """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
         that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
@@ -15520,7 +15534,7 @@ class LandQueue:
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = len(self.jobs) < workers
-        room = len(self.jobs) + len(self.snapshot_waiting) < workers * (1 + LAND_SNAPSHOT_AHEAD)
+        room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD)
         if not free and not room and not e.get("snapshotWait"):
             self.gated(e)
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
@@ -15535,8 +15549,12 @@ class LandQueue:
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
-            if not free or self.snapshot(e["key"], sha)[1] == "wait":
+            if not free:
                 self.gated(e)
+                return False
+            if self.snapshot(e["key"], sha)[1] == "wait":
+                # a worker is free: what holds it is the cap on snapshot waits ahead of the workers, not the workers
+                self.gated(e, "the snapshot reads ahead of the workers are full")
                 return False
         elif self.snapshot_wait(e, sha, free):
             self.note_late(e, "waiting for the daemon's snapshot of its head")
