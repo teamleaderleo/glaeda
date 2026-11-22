@@ -12590,6 +12590,45 @@ class GateTest(unittest.TestCase):
             ps.side_effect = subprocess.TimeoutExpired("ps", 30)
             self.assertIsNone(self.short(gate), "no process table: the one-job peak alone")
 
+    def test_the_runner_jobs_hold_logs_its_start_and_end_and_has_an_off_switch(self) -> None:
+        """RUNNER_JOBS_HOLD: one countable line when a hold starts (free, need, reserve, jobs in flight) and one when it
+        ends; GLAEDA_RUNNER_JOBS_HOLD_OFF=1 or capacity/runner-jobs-hold.off turns it back into reclaim-and-listen."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        capacity = self.tmp / "capacity"
+        capacity.mkdir()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity)
+        free = {"gib": 25.0}
+        table = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3", self.runner.name)
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        notes: list[str] = []
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.object(hook, "gate_log", side_effect=notes.append), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "still held")
+            starts = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD start")]
+            self.assertEqual(starts, ["RUNNER_JOBS_HOLD start free_gib=25.0 need_gib=25.9 reserve_gib=10 "
+                                      "jobs_in_flight=2"], "one start line per hold, not one per look")
+            free["gib"] = 26.0
+            self.assertIsNone(gate.low_disk())
+            ends = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD end")]
+            self.assertEqual(len(ends), 1, notes)
+            self.assertIn("free_gib=26.0", ends[0])
+            free["gib"] = 25.0
+            (capacity / hook.RUNNER_JOBS_HOLD_OFF_FILE).touch()
+            self.assertIsNone(gate.low_disk(), "the live off switch: reclaim and listen")
+            self.assertIn("RUNNER_JOBS_DISK", gate.disk_short[0] if gate.disk_short else "")
+            (capacity / hook.RUNNER_JOBS_HOLD_OFF_FILE).unlink()
+            with mock.patch.dict(os.environ, {hook.RUNNER_JOBS_HOLD_OFF_ENV: "1"}):
+                self.assertIsNone(gate.low_disk(), "the environment off switch")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "switch gone: held again")
+
     def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
         """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with
         nothing running take at most two jobs together (10 + 5.3 x 2 = 20.6 fits, 10 + 5.3 x 3 = 25.9 does not)."""

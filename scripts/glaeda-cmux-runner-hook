@@ -1359,6 +1359,12 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # RUNNER_JOBS_HOLD (hq#19208, 2026-11-22): this reading holds again. Listening through it, the minis wrote themselves
 # down to 1.3 GiB with 7 jobs running (cmux22, 19:16Z) and jobs failed with ENOSPC: failed, not slower. The line is the
 # measured p95 per job above, less what the running jobs already wrote (RUNNER_JOB_WRITTEN), no hand-set number.
+# Off switch (the default change's): RUNNER_JOBS_HOLD_OFF_ENV=1 in the runner's environment, or a RUNNER_JOBS_HOLD_OFF_FILE
+# in the capacity ledger (touch it on the mini, live), turns the hold back into reclaim-and-listen (RUNNER_JOBS_DISK)
+# without removing the measurement file. Each hold logs one countable line when it starts and one when it ends:
+# "RUNNER_JOBS_HOLD start free_gib=F need_gib=N reserve_gib=10 jobs_in_flight=J" and "RUNNER_JOBS_HOLD end ...".
+RUNNER_JOBS_HOLD_OFF_ENV = "GLAEDA_RUNNER_JOBS_HOLD_OFF"
+RUNNER_JOBS_HOLD_OFF_FILE = "runner-jobs-hold.off"
 RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
 RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
 RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
@@ -2657,6 +2663,15 @@ SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
 MEMORY_FREE_KEY = "kern.memorystatus_level"  # Darwin: the percentage of RAM free (memory_pressure's last line)
 HOST_MEM_FREE_ENV = "GLAEDA_HOST_MEM_FREE_PCT"  # tests: the free percentage instead of kern.memorystatus_level
+
+
+def runner_jobs_hold_off(capacity_dir: Path | None = None) -> str | None:
+    """Why RUNNER_JOBS_HOLD is off on this mini (its off switch), or None."""
+    if (os.environ.get(RUNNER_JOBS_HOLD_OFF_ENV) or "").strip() == "1":
+        return f"{RUNNER_JOBS_HOLD_OFF_ENV}=1"
+    if capacity_dir is not None and (capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE).exists():
+        return f"{capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE} exists"
+    return None
 
 
 def sim_off(capacity_dir: Path | None = None) -> str | None:
@@ -10828,6 +10843,8 @@ class Gate:
         # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
         self.disk_short: tuple[str, float] | None = None
         self.disk_held: str | None = None  # RUNNER_JOBS_HOLD: the numbers behind the last look's hold, or None
+        self.disk_jobs_in_flight: int | None = None  # RUNNER_JOBS_DISK: the last process-table count, for the log
+        self.disk_hold_started: float | None = None  # RUNNER_JOBS_HOLD: monotonic start of the hold in force
         # SUITE_FIRST_HOLD: the fleet disk wait last seen (its id), when this gate's hold for it began (wall clock;
         # None while not holding) and the free GiB the wait wants while held, which low_disk's reclaim aims at too
         self.suite_wait: str | None = None
@@ -11660,10 +11677,22 @@ class Gate:
             # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
             crowded = self.runner_jobs_short(path)
             self.disk_held = None
-            if crowded and not scope.small:
+            hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
+            now = time.monotonic()
+            if hold != (self.disk_hold_started is not None):
+                free = free_or_none(path)
+                numbers = (f"free_gib={free if free is None else round(free, 1)} "
+                           f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
+                           f"jobs_in_flight={self.disk_jobs_in_flight}")
+                if hold:
+                    gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
+                    self.disk_hold_started = now
+                else:
+                    gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
+                    self.disk_hold_started = None
+            if hold and crowded:
                 self.disk_short, self.disk_held = None, crowded[0]
                 self.evict_in_background(path, max(floor, crowded[1], aim))
-                now = time.monotonic()
                 if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
                     gate_log(f"disk: {crowded[0]} (RUNNER_JOBS_HOLD)")
                     self.disk_warned_at = now
@@ -11763,6 +11792,7 @@ class Gate:
         written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
                             for name, pid in running), 1)
         in_flight = len(running) + listening
+        self.disk_jobs_in_flight = in_flight
         why = runner_jobs_refusal(free, in_flight, per, source, written)
         return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
 
