@@ -12159,6 +12159,14 @@ LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
 LAND_SERVE_OPS = ("land", "withdraw", "status", "batch", "room")
 LAND_FORWARDED = "forwarded"
+# A request `land serve` gets on a host that forwards its own lands is handed on to that host's executor, once
+# (the request then carries LAND_SERVE_RELAY_KEY, and a host that gets one relayed never relays it again, so two hosts
+# still never pass a PR back and forth). It was refused not_executor: 2026-11-22, after huge-blue's lands moved to
+# cmux-cp-1, every lane VM's hand-off of a PR it could not judge (the broker asks the broker host's `land serve`) was
+# refused, and leo-workspace#8504 sat 100 min with nothing able to take it. "room" and "batch" (a peer's overflow)
+# stay refused: a host with an executor takes no overflow.
+LAND_SERVE_RELAYED = frozenset({"land", "withdraw", "status"})
+LAND_SERVE_RELAY_KEY = "relayedBy"
 LAND_REQUESTER_SHAPE = re.compile(r"[^\s\x00-\x1f]{1,200}")  # acpmux send takes it as one argv word
 LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
 LAND_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
@@ -19756,6 +19764,16 @@ def cmd_land_serve(text: str) -> int:
                                                                         f"of {', '.join(LAND_SERVE_OPS)}"}))
         return EXIT_FAIL
     executor = land_executor()
+    if executor is not None and req["op"] in LAND_SERVE_RELAYED and not req.get(LAND_SERVE_RELAY_KEY):
+        # LAND_SERVE_RELAYED's comment: handed on to this host's executor, once
+        try:
+            answer = land_forward(executor, {**req, LAND_SERVE_RELAY_KEY: policy_host()})
+        except WatchError as error:
+            print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands "
+                              f"to {land_forward_name(executor)}, which did not take this one: {error}"}))
+            return EXIT_FAIL
+        print(json.dumps(answer, sort_keys=True))
+        return EXIT_OK if answer.get("ok") else EXIT_FAIL
     if executor is not None:
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
                           f"{land_forward_name(executor)} (land.json executor); it serves none"}))
@@ -27742,13 +27760,18 @@ def gh_cache_writes() -> dict[str, float]:
 GH_RERUN_API_RE = re.compile(r"^/?repos/[^/]+/[^/]+/actions/runs/\d+/rerun(?:-failed-jobs)?/?$")
 
 
+def is_run_rerun(words: list[str]) -> bool:
+    """Either spelling of a rerun: `gh run rerun N` or a POST to its API path."""
+    return (words[:2] == ["run", "rerun"]
+            or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+
+
 def note_run_rerun(repo: str | None, scopes: list[str] | None, words: list[str], now: float) -> None:
     """A brokered `gh run rerun N` (or its API POST) on a run this host caches: stamp the entry rerunAt, so a wait
     and `Daemon.due` treat its cached finish as attempt-unknown until GitHub is read again (run_unconfirmed).
     Stamped when the write starts and again when it ends (gh_cache_write), so a read while it was in flight does not
     count; a rerun that fails costs one more read, never a wrong answer."""
-    rerun = (words[:2] == ["run", "rerun"]
-             or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+    rerun = is_run_rerun(words)
     run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
     if not rerun or not repo or not run_id:
         return
@@ -28073,6 +28096,25 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
+def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int) -> str | None:
+    """What to say when a brokered `gh run rerun` exits non-zero, else None.
+
+    GitHub refuses a rerun outright for a run it will not retry ("run N cannot be rerun; This workflow run cannot be
+    retried": the run is too old, its workflow file moved, or its attempts are used up), and gh names nothing that
+    does work. 2026-11-22 an hq run was refused that way after a cancelled job, and the refusal read as "the rerun
+    did nothing": the caller waited again on a red that a newer run had already replaced. Name the two steps that
+    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does."""
+    if rc == 0 or not is_run_rerun(words):
+        return None
+    run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
+    named = f"{repo}/{run_id}" if repo and run_id else (repo or "that run")
+    where = f" -R {repo}" if repo else ""
+    return (f"glaeda-gh: that rerun did not take (gh exited {rc}): a run GitHub will not retry (too old, its "
+            f"workflow file moved, every attempt used) needs a new run, not a rerun. "
+            f"next: glaeda-gh status run {named} --jobs # a newer run may already stand in for it; else push the "
+            f"head again, or `gh workflow run WORKFLOW --ref BRANCH{where}`")
+
+
 def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
                    scopes: list[str] | None = None, words: list[str] | None = None) -> int:
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
@@ -28080,6 +28122,9 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
     try:
         rc, _out, _err = gh_cache_child(real, args, False, None)
         ran.append(rc)
+        said = rerun_next_step(repo, scopes, words or [], rc)
+        if said:
+            print(said, file=sys.stderr)
     finally:
         if ran:
             with contextlib.suppress(Exception):
@@ -30082,6 +30127,22 @@ def broker_post(item: dict) -> int:
     return 0
 
 
+def post_issue_names_an_existing_issue(target: str) -> str:
+    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+
+    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    that issue: the caller had the number from a wait or land line, not from this parser's help. Until
+    2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
+    cost the refusal plus the same call typed again under another kind.
+    """
+    text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
+    found = KEY_RES["comment"].fullmatch(text)
+    if found:
+        return found.group(3)
+    bare = BARE_NUMBER.fullmatch(text)
+    return bare.group(1) if bare else ""
+
+
 def post_one_call_kind(kind: str) -> str | None:
     """The canonical kind of a write `post` makes in one call, or None for one it queues."""
     word = (kind or "").strip().lower().replace("_", "-")
@@ -31535,13 +31596,22 @@ LOG_JOB_ONE_WORD = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)/(?:ac
 def log_job_synonym(raw: list[str]) -> list[str]:
     """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that. So is
     `log job|errors OWNER/REPO/ID` or a job's URL in one word (the shape `status run` and a failed check print;
-    2026-11-21 it cost a usage error)."""
+    2026-11-21 it cost a usage error). A target word carrying a run id alongside an id given positionally or with
+    `--job` keeps the given id and drops the run from the word, instead of being refused on the repository."""
     given = [w for w in raw[3:4] if w.isdigit()] + [w for w in raw[3:] if w.startswith("--job")]  # an id already
     one = LOG_JOB_ONE_WORD.fullmatch(raw[2]) if len(raw) >= 3 and raw[:2] in (["log", "job"], ["log", "errors"]) \
-        and not given else None
-    if one:
+        else None
+    if one and not given:
         fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
         print(f"glaeda-gh: read as `{typed_line(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        return fixed
+    if one:
+        # Both at once: the run in the target word (the shape `status run` prints) and the id of the job inside it
+        # (`log errors OWNER/REPO/RUN_ID --job JOB_ID`, called so 2026-11-22 and refused on the repository word).
+        # The explicitly given id is the one asked for; the number in the target word only named where it came from.
+        fixed = raw[:2] + [one.group(1)] + raw[3:]
+        print(f"glaeda-gh: read as `{typed_line(fixed)}` (the id given is the one read; {one.group(2)} in "
+              f"{raw[2]} only says which run it is in)", file=sys.stderr)
         return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw
@@ -32203,6 +32273,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.target:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
+            if one == "issue":
+                numbered = post_issue_names_an_existing_issue(args.target)
+                if numbered and args.title:
+                    raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
+                                     f"to comment on it, or pass OWNER/REPO to file a new issue")
+                if numbered:
+                    print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
+                          f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
+                    args.kind, one = "comment", "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:
