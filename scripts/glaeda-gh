@@ -11855,6 +11855,14 @@ LAND_SLOT_HELD = 1800.0
 # night). Such entries also sort behind every other due entry (judge_order), so the rest of the workers go to lands
 # that can move. A re-read past the share waits for one of them to end (gated, "re-reads hold their share").
 LAND_REREAD_SHARE = 0.5
+# The bound on one entry's hold: an entry whose jobs held workers LAND_HOLD_MAX in total within one LAND_HOLD_WINDOW
+# (counted from its first job in the window), and whose last answer still judged nothing (LAND_NOT_JUDGED), takes no
+# worker again until that window ends. Each judgment is bounded on its own (LAND_EXPLAIN_DEADLINE), but a slow read
+# answered "unreadable" then a 2-minute retry gave the same entry its worker back over and over: one PR held a worker
+# for 45 of 60 min that night and for hours in all. Logged once per window ("land-hold-capped"), and named in its
+# history and status line. A judgment that judges something (any other code) is never held by it.
+LAND_HOLD_MAX = 1200.0
+LAND_HOLD_WINDOW = 3600.0
 LAND_TEXT = 400  # a reason or step kept in an entry or a message, at most
 LAND_STOP_CLASSES = {"block": "block", "held": "hold", "chat_hold": "chat_hold", "classic_frozen": "classic_frozen",
                      "language_boundary": "language_boundary", "react_port": "react_port", "teammate": "teammate",
@@ -13654,6 +13662,8 @@ class LandQueue:
             if fut is None or fut.done():
                 del self.jobs[key]
                 started = self.job_started.pop(key, None)
+                if started is not None:
+                    self.count_hold(key, started[0])
                 if key in self.slot_held_logged:
                     self.slot_held_logged.discard(key)
                     log({"event": "land-slot-freed", "key": key, "job": started[1] if started else None,
@@ -13682,6 +13692,40 @@ class LandQueue:
             return None
         at, key, job = min(live)
         return {"pr": key_name(key), "job": job, "heldS": int(self.now - at)}
+
+    def count_hold(self, key: str, started: float) -> None:
+        """Adds a finished job's time on its worker to its entry's holdWindow (LAND_HOLD_MAX)."""
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            w = e.get("holdWindow") or {}
+            if not isinstance(w.get("since"), (int, float)) or self.now - float(w["since"]) >= LAND_HOLD_WINDOW:
+                w = {"since": started, "heldS": 0.0}
+            w["heldS"] = round(float(w.get("heldS") or 0.0) + max(0.0, self.now - started), 1)
+            e["holdWindow"] = w
+            self.save(e)
+
+    def hold_spent(self, e: dict) -> bool:
+        """True while E has held workers LAND_HOLD_MAX within its LAND_HOLD_WINDOW and its last answer judged nothing:
+        it waits for the window to end (logged once per window, land-hold-capped)."""
+        w = e.get("holdWindow") or {}
+        since = w.get("since")
+        if not isinstance(since, (int, float)) or self.now - float(since) >= LAND_HOLD_WINDOW:
+            return False
+        if float(w.get("heldS") or 0.0) < LAND_HOLD_MAX:
+            return False
+        if str((e.get("explain") or {}).get("code") or "") not in LAND_NOT_JUDGED:
+            return False
+        if not w.get("capped"):
+            w["capped"] = self.now
+            until = float(since) + LAND_HOLD_WINDOW
+            self.history(e, "hold_capped", heldS=round(float(w["heldS"])), until=utc_clock(until))
+            log({"event": "land-hold-capped", "key": e["key"], "heldS": round(float(w["heldS"])),
+                 "windowS": LAND_HOLD_WINDOW, "until": utc_clock(until),
+                 "code": (e.get("explain") or {}).get("code")})
+            self.save(e)
+        return True
 
     def reread(self, e: dict) -> bool:
         """True when E's last answer judged nothing (LAND_UNREAD_CODES) at the head the cache still shows: judging it
@@ -14717,6 +14761,9 @@ class LandQueue:
             return False
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
+            return False
+        if self.hold_spent(e):
+            self.gated(e, "held its workers LAND_HOLD_MAX this window judging nothing")  # LAND_HOLD_MAX
             return False
         if not self.reread_room(e):
             self.gated(e, "re-reads of unreadable PRs hold their share of the workers")  # LAND_REREAD_SHARE
@@ -15927,7 +15974,8 @@ class LandQueue:
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
-        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince"):
+        for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
+                     "holdWindow"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
@@ -16199,6 +16247,11 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         (e.get("action") or {}).get("claimedAt") if e["state"] == "acting" else None
     if isinstance(took, (int, float)) and not isinstance(took, bool) and now - took >= LAND_SLOT_HELD:
         bits.append(f"holding a worker since {utc_clock(float(took))} (LAND_SLOT_HELD)")
+    hw = e.get("holdWindow") or {}
+    if hw.get("capped") and isinstance(hw.get("since"), (int, float)) and now - float(hw["since"]) < LAND_HOLD_WINDOW \
+            and e["state"] in ("queued", "waiting"):
+        bits.append(f"held workers {int(float(hw.get('heldS') or 0) // 60)} min judging nothing: no worker until "
+                    f"{utc_clock(float(hw['since']) + LAND_HOLD_WINDOW)} (LAND_HOLD_MAX)")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
     la = e.get("lastAction") or {}

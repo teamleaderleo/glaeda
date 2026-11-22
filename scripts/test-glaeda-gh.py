@@ -27588,6 +27588,44 @@ class LandTest(Base):
         self.assertEqual([(r["key"], r["job"]) for r in freed], [(key, "job")])
         self.assertNotIn(key, self.q.job_started)
 
+    def test_an_entry_that_held_its_workers_the_bound_judging_nothing_waits_out_its_window(self):
+        """LAND_HOLD_MAX: an entry whose jobs held workers that long in one LAND_HOLD_WINDOW, its last answer still
+        "unreadable", takes no worker until the window ends (logged once, named in its history and status), then is
+        judged again; an entry whose answer judged something is never held by it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        key = self.stuck(11, 600)
+        e = self.q.entries[key]
+        e["holdWindow"] = {"since": self.t - 600, "heldS": gg.LAND_HOLD_MAX}
+        self.retries(1)
+        self.tick(30)
+        self.assertEqual(self.explained(), [])
+        e = self.q.entries[key]
+        self.assertEqual([h["event"] for h in e["history"]].count("hold_capped"), 1)
+        self.assertIn("judging nothing: no worker until", gg.land_line(e, self.t))
+        self.tick(30)
+        self.assertEqual(len([r for r in logs if r.get("event") == "land-hold-capped"]), 1)
+        self.tick(gg.LAND_HOLD_WINDOW - 600)
+        self.assertEqual(self.explained(), ["11"])
+        other = self.stuck(12, 600)
+        self.q.entries[other]["explain"]["code"] = "checks_pending"
+        self.q.entries[other]["holdWindow"] = {"since": self.t - 60, "heldS": gg.LAND_HOLD_MAX * 2}
+        self.assertFalse(self.q.hold_spent(self.q.entries[other]))
+
+    def test_a_finished_job_adds_its_time_to_its_entrys_hold_window(self):
+        key = self.stuck(11, 600)
+        self.q.now = self.t
+        self.q.count_hold(key, self.t - 300)
+        self.assertEqual(self.q.entries[key]["holdWindow"], {"since": self.t - 300, "heldS": 300.0})
+        self.q.now = self.t + 100
+        self.q.count_hold(key, self.t)
+        self.assertEqual(self.q.entries[key]["holdWindow"]["heldS"], 400.0)
+        self.q.now = self.t + gg.LAND_HOLD_WINDOW
+        self.q.count_hold(key, self.q.now - 50)
+        self.assertEqual(self.q.entries[key]["holdWindow"], {"since": self.q.now - 50, "heldS": 50.0})
+
     def test_a_stopped_predecessor_merged_by_hand_is_still_read_for_its_follower(self):
         """Review: an --after PR whose own entry stopped is read by nothing else once only due entries hold watches; its
         follower must still read it (one peek per LAND_PEEK_EVERY), or a hand merge never shows and the follower stops
