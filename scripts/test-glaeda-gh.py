@@ -29955,6 +29955,39 @@ class LandTest(Base):
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
 
+    def test_a_restarted_queue_keeps_its_pool_size(self):
+        """hq#18502: huge-blue re-execs its daemon every 10-30 min. 2026-11-22, land.json's "workers" removed at 12:28Z:
+        the pool grew 16 -> 20 -> 25, a re-exec at 12:39Z put it back at 16 (land_worker_ceiling), under the fixed 32,
+        and the override went back. A new queue starts at the size the last one's pool line said, at once (not at its
+        next land-pool line), bounded by the memory ceiling; a stale or missing line starts from the cores."""
+        q = self.q
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            q.now, q.pass_gated = self.t, 9
+            for _ in range(6):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+            grown = q.workers()
+            self.assertGreater(grown, 4)
+            self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE)["workers"], grown)
+            q.jobs.clear()
+            with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                self.assertEqual(self.queue().workers(), grown)  # the re-exec keeps it
+            with mock.patch.object(gg, "land_mem_available_mb", return_value=4 * 1024):  # 8 workers' worth
+                with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                    self.assertEqual(self.queue().workers(), 8)  # never over the memory ceiling
+            with mock.patch.object(gg.time, "time", return_value=q.now + gg.LAND_ROOM_FRESH + 1):
+                self.assertEqual(self.queue().workers(), 4)  # a stale line: the cores (8 in setUp)
+            (gg.land_dir() / gg.LAND_POOL_FILE).unlink()
+            self.assertEqual(self.queue().workers(), 4)
+            # an operator's fixed size is where the pool goes on from once it is taken out
+            self.w.config["workers"] = 32
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            del self.w.config["workers"]
+            self.assertEqual(q.workers(), 32)
+
     def test_the_pool_ceiling_is_the_hosts_memory_not_its_cores(self):
         self.assertEqual(gg.land_pool_max(40 * 1024), 80)
         self.assertEqual(gg.land_pool_max(100), 4)  # never under the core-based start (8 cores in setUp)

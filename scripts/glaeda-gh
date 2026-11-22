@@ -12183,7 +12183,7 @@ def land_worker_ceiling(cores: int | None = None) -> int:
 
 
 # The pool grows to what the queue needs and GitHub answers, never to a count set by hand (LandQueue.adapt_pool). It
-# starts at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
+# starts where the daemon before it left off (land_pool_start), else at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
 # (gated) grows by LAND_POOL_GROW (at least one worker), and a quota refusal since the last step (park_quota,
 # park_queue_quota) halves it, as TCP's congestion window does. A judgment is land_judge waiting on GitHub, not on the
 # host: huge-blue, 2026-11-22 09:58Z, 17 land_judge/classifier processes held 1,109 MB (about 65 MB each) at 0.1-11%
@@ -12218,6 +12218,24 @@ def land_pool_max(mem_mb: int | None = None) -> int:
     if mem is None:
         return floor
     return max(floor, int(mem) // 2 // LAND_JUDGE_MEM_MB)
+
+
+def land_pool_start(pool: Any, now: float, ceiling: int | None = None) -> float:
+    """Where a new daemon's adaptive pool starts: the size its last land-pool line POOL (LAND_POOL_FILE) said, when
+    that line is at most LAND_ROOM_FRESH old, never over the memory ceiling (land_pool_max); else land_worker_ceiling.
+    A re-exec keeps the size the pool grew (or halved) to. huge-blue re-execs its daemon every 10-30 min (glaeda
+    updates): 2026-11-22, with land.json's "workers" removed at 12:28Z, the pool grew 16 -> 20 -> 25, a re-exec at
+    12:39Z put it back at 16, under the fixed 32 it replaced, and the override went back (hq#18502)."""
+    start = float(land_worker_ceiling())
+    if not isinstance(pool, dict):
+        return start
+    stamps = [float(v) for v in (pool.get("at"), pool.get("sizeAt"))
+              if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    size = pool.get("workers")
+    if (not stamps or now - max(stamps) > LAND_ROOM_FRESH or not isinstance(size, int) or isinstance(size, bool)
+            or size < 1):
+        return start
+    return float(min(size, land_pool_max() if ceiling is None else ceiling))
 
 
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
@@ -13838,7 +13856,8 @@ class LandQueue:
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
-        self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
+        # the adaptive pool's size (adapt_pool), unless land.json sets one: where the last daemon left it (land_pool_start)
+        self.pool_size = land_pool_start(read_json(land_dir() / LAND_POOL_FILE), time.time())
         self.pool_adapted = 0.0  # when adapt_pool last stepped
         self.quota_refused = float("-inf")  # the last quota refusal (park_quota, park_queue_quota): adapt_pool halves
         self.now = time.time()
@@ -15029,11 +15048,13 @@ class LandQueue:
     def adapt_pool(self) -> None:
         """Every LAND_POOL_ADAPT_S, step the adaptive pool (the comment above LAND_POOL_ADAPT_S): halve it after a
         quota refusal, else grow it while it is full and due rows waited for a worker this pass; logged as land-pool-
-        size when it moves. land.json "workers" fixes it instead."""
+        size when it moves, and kept in LAND_POOL_FILE at once, so a daemon started next takes it (land_pool_start).
+        land.json "workers" fixes it instead, and the adaptive size follows it: one taken out goes on from there."""
         if self.now - self.pool_adapted < LAND_POOL_ADAPT_S:
             return
         last, self.pool_adapted = self.pool_adapted, self.now
         if self.config().get("workers") is not None:
+            self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
         if self.quota_refused > last:
@@ -15045,6 +15066,10 @@ class LandQueue:
         if int(size) != int(self.pool_size):
             log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
                  "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
+            line = read_json(land_dir() / LAND_POOL_FILE)
+            with contextlib.suppress(OSError):  # the pool line says the new size now, not at its next LAND_POOL_LOG_EVERY
+                write_json(land_dir() / LAND_POOL_FILE, {**(line if isinstance(line, dict) else {}),
+                                                         "workers": max(1, int(size)), "sizeAt": self.now})
         self.pool_size = size
 
     def login_workers(self) -> int:
