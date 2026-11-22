@@ -30690,7 +30690,7 @@ class LandLocalFirstTest(LandForwardTest):
         self.ready_owners = {"o"}
         self.q = self.local_first(executors=[self.A, self.B])
         self.pr(LA)
-        self.land(requester="cosmic/coord")
+        self.land(requester="mac/coord")
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.tick()
@@ -30704,25 +30704,25 @@ class LandLocalFirstTest(LandForwardTest):
         self.q = self.local_first(executors=[self.A, self.B])
         self.pr(LA)
         self.pr(LA, key="pr:p/r#2")
-        self.land(requester="cosmic/coord")
-        gg.land_request("land", "p/r#2", [], "cosmic/coord", sha=LA)
+        self.land(requester="mac/coord")
+        gg.land_request("land", "p/r#2", [], "mac/coord", sha=LA)
         self.tick()
         self.assertEqual(self.batches(), [("peer-a", ["land:p/r#2"])])
         sent = [r for h, q in self.asked if q["op"] == "batch" for r in q["requests"]][0]
-        self.assertEqual((sent["requester"], sent["sha"]), ("cosmic/coord", LA))  # requester and pin kept
+        self.assertEqual((sent["requester"], sent["sha"]), ("mac/coord", LA))  # requester and pin kept
         self.assertEqual(self.requests_left(), [])
         self.assertIn(self.KEY, self.q.entries)  # o/r#1 judged here
         self.assertNotIn("pr:p/r#2", self.q.entries)
         # a first fallback with no room: the next one takes it
         self.room["peer-a"] = 0
-        gg.land_request("land", "p/r#3", [], "cosmic/coord")
+        gg.land_request("land", "p/r#3", [], "mac/coord")
         self.tick(gg.LAND_FORWARD_RETRY)
         self.assertEqual(self.batches()[-1], ("peer-b", ["land:p/r#3"]))
 
     def test_an_open_entry_with_no_app_source_is_handed_on_keeping_its_request_id(self):
         self.q = self.local_first(executors=[self.A, self.B])
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
-        self.land(requester="cosmic/coord")
+        self.land(requester="mac/coord")
         self.ready_owners = {"o"}  # judged here first, then its App source goes away
         self.tick()
         self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
@@ -30733,7 +30733,7 @@ class LandLocalFirstTest(LandForwardTest):
         self.assertEqual((e["state"], e["forwardedTo"]), ("forwarded", "peer-a"))
         self.assertEqual([r["id"] for _, q in self.asked if q["op"] == "batch" for r in q["requests"]], [rid])
         # a cancel of it follows it there, and there alone
-        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "cosmic/coord")
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "mac/coord")
         self.tick(2)
         self.assertEqual(self.batches()[-1], ("peer-a", ["withdraw:o/r#1"]))
         self.assertEqual(self.requests_left(), [])
@@ -30741,7 +30741,7 @@ class LandLocalFirstTest(LandForwardTest):
     def test_with_the_first_fallback_down_the_outbox_keeps_the_row_and_the_next_gets_it(self):
         self.q = self.local_first(executors=[self.A, self.B])
         self.down = {"peer-a", "peer-b"}
-        self.land("o/r#1", requester="cosmic/coord")
+        self.land("o/r#1", requester="mac/coord")
         self.tick()
         self.assertEqual(self.requests_left(), ["o/r#1"])  # kept: nothing took it
         self.assertEqual(self.w.notices[-1][0], "land-forward-failed")
@@ -30758,7 +30758,7 @@ class LandLocalFirstTest(LandForwardTest):
     def test_a_cancel_of_a_row_held_nowhere_here_goes_to_every_fallback(self):
         self.q = self.local_first(executors=[self.A, self.B])
         self.down = {"peer-b"}
-        gg.land_request(gg.LAND_WITHDRAW, "p/r#2", [], "cosmic/coord")
+        gg.land_request(gg.LAND_WITHDRAW, "p/r#2", [], "mac/coord")
         self.tick()
         self.assertEqual(self.batches(), [("peer-a", ["withdraw:p/r#2"])])
         self.assertEqual(self.requests_left(), ["p/r#2"])  # peer-b has not had it yet
@@ -30770,7 +30770,7 @@ class LandLocalFirstTest(LandForwardTest):
     def test_the_legacy_executor_key_still_forwards_with_no_app_source(self):
         self.q = self.local_first(executor=list(self.EXEC))
         self.pr(LA)
-        self.land("o/r#1", requester="cosmic/coord")
+        self.land("o/r#1", requester="mac/coord")
         self.tick()
         self.assertEqual(self.batches(), [("big-exec", ["land:o/r#1"])])
         self.assertEqual([h for h, q in self.asked if q["op"] == "room"], [])  # the only fallback: never asked
@@ -30778,7 +30778,7 @@ class LandLocalFirstTest(LandForwardTest):
         # with an App source the same host now judges in its own queue
         self.ready_owners = {"o"}
         self.q = self.local_first(executor=list(self.EXEC))
-        self.land("o/r#3", requester="cosmic/coord")
+        self.land("o/r#3", requester="mac/coord")
         self.tick()
         self.assertEqual(len(self.batches()), 1)
         self.assertIn("pr:o/r#3", self.q.entries)
@@ -30791,7 +30791,7 @@ class LandLocalFirstTest(LandForwardTest):
             def done(self) -> bool:
                 return False
         self.q.jobs["pr:o/r#99"] = Busy()
-        self.land("o/r#1", requester="cosmic/coord")
+        self.land("o/r#1", requester="mac/coord")
         self.tick()
         self.assertEqual(self.batches(), [])
         self.tick(gg.LAND_OVERFLOW_AFTER + 1)
@@ -30807,10 +30807,10 @@ class LandLocalFirstTest(LandForwardTest):
         with mock.patch.object(gg, "land_config", return_value=self.w.config), \
                 mock.patch.object(gg, "land_forward", side_effect=fwd), \
                 mock.patch.object(gg, "daemon_running", return_value=False), \
-                mock.patch.object(gg, "policy_host", return_value="cosmic"):
+                mock.patch.object(gg, "policy_host", return_value="mac"):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                gg.main(["land", "o/r#1", "--notify", "cosmic/coord"])
-                gg.main(["land", "p/r#2", "--notify", "cosmic/coord"])
+                gg.main(["land", "o/r#1", "--notify", "mac/coord"])
+                gg.main(["land", "p/r#2", "--notify", "mac/coord"])
         self.assertEqual(self.requests_left(), ["o/r#1"])  # queued here for this host's daemon
         self.assertEqual([h for h, r in self.asked if r["op"] == "room"], ["peer-a"])
         self.assertEqual([(h, r["target"]) for h, r in self.asked if r["op"] == "land"], [("peer-b", "p/r#2")])
