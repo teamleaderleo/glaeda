@@ -9152,6 +9152,30 @@ class HostLoadCapTest(unittest.TestCase):
         with mock.patch.object(hook, "load_cap_fetch", return_value=None):
             self.assertIsNone(self.poll(), "an unreachable controller holds nothing")
 
+    def test_the_signing_listener_is_never_held_off_by_load(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-21 20:50-21:07Z gate log: load 1.5 to 3 per core from the
+        ultra1-guest PR worker while another host (cmux15) takes the label's jobs. The signing listener
+        (--trusted-next-signing) logged "the host is over its load cap ... while another host's listener takes
+        glaeda-trusted-next-signing jobs" and "the mini is saturated" and stopped, again and again. It must listen; a
+        side runner beside it is still held (the PR work yields, not the signer); memory pressure still holds it."""
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        scope = hook.RunnerScope(trusted_signing=True)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1):
+            self.assertIsNotNone(self.poll(), "a side runner is held for another host's listener")
+            self.assertIsNotNone(self.gate.saturated(), "and for the overloaded mini")
+            self.gate.cap_samples.clear()
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.poll(), "the signing listener keeps listening over the load cap")
+                self.assertIsNone(self.gate.saturated(), "and through CPU saturation and overload")
+            with mock.patch.object(hook, "runner_scope", return_value=scope), \
+                    mock.patch.object(hook, "memory_pressure_level", return_value=2):
+                self.assertIsNotNone(self.gate.saturated(), "memory pressure is the host's own limit: it holds")
+
     def test_exempt_runners_and_the_off_switch(self) -> None:
         self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
         self.assertIsNotNone(self.poll())
@@ -14092,6 +14116,23 @@ class GateTest(unittest.TestCase):
                           " --min-free-gib 30 --sim-runner --test-keychain --recycle-testmanagerd --capacity-units 10"
                           " --compile-slots 2 --canonical-roots 2 --instance 13\n")
         return self.full_gate(capacity)
+
+    def test_the_signing_listener_listens_on_a_mini_whose_units_are_all_taken(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-22 00:01-00:45Z gate log: "stopping the idle listener: all 30
+        capacity units on this mini are taken", five times, while PR jobs held every unit. The signing listener
+        listens anyway (its job waits at admission and drains the mini, SIGNING_DRAIN); a side runner beside it is
+        still held, and memory, disk and the fleet's holds still apply."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(30)
+        script.write_text(base + " --instance 0\n")
+        held = self.full_gate(capacity).full()
+        self.assertIn("all 30 capacity units on this mini are taken", held or "", "an ordinary runner is held")
+        script.write_text(base + " --instance 0 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
+        self.assertIsNone(self.full_gate(capacity).full(fresh=True))
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)

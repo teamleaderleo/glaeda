@@ -1283,6 +1283,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "294cc6b9d0d352fd5ff470c8e8bcb28fde12c53838471f63b428d174ef98ab39",
     "8bce5d1aa8bdd50fed4beccaec8a0575e009b47401581eec4e881ac84b0e5386",
     "48b23dd17ecd56bc3c4299d45e6f4707833172754e753c700a9604765ef9c802",
+    "5fc3a989d6c9cadbca9042a6be9156a8d481a9226cf2796426c315bd21231d90",
+    "6618e949f0603be97f0595bfffa55d419a4e6d8e8a53063efb0eb0f8ebccbf31",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -13859,8 +13861,9 @@ ACPMUX_SUPERVISED_REL = ".acpmux-supervised"
 OWNED_ELSEWHERE_REASONS = 6
 
 
-def _last_json_row(path: Path, kind: str, tail_bytes: int = 1 << 20) -> dict | None:
-    """The last row of KIND in a JSON-lines log, read from its last TAIL_BYTES only (the log grows for weeks)."""
+def _last_json_row(path: Path, kind: str, tail_bytes: int = 1 << 20, accept=None) -> dict | None:
+    """The last row of KIND in a JSON-lines log (that ACCEPT, given, says yes to), read from its last TAIL_BYTES only
+    (the log grows for weeks)."""
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -13875,9 +13878,26 @@ def _last_json_row(path: Path, kind: str, tail_bytes: int = 1 << 20) -> dict | N
             row = json.loads(line)
         except ValueError:
             continue
-        if isinstance(row, dict):
+        if isinstance(row, dict) and (accept is None or accept(row)):
             return row
     return None
+
+
+def worktree_reclaim_pass_line(log: Path) -> str | None:
+    """worktree_reclaim's last pass for the report. A pass skipped for the cleaner lock did not run: it is said so,
+    with its holder, beside the last pass that did run, never as "freed 0 GB (locked)" (2026-11-21, a build host: that
+    line stood for hours while 801 pressure passes skipped behind disk_hygiene's full run and / reached 100%)."""
+    last = _last_json_row(log, "summary")
+    if not last:
+        return None
+    if not last.get("skipped"):
+        return (f"  worktree_reclaim's last pass: {last.get('mode', '?')} at {last.get('at', '?')}, freed "
+                f"{last.get('freed_gb', 0)} GB")
+    why = last.get("why") or f"skipped: {last['skipped']}"
+    ran = _last_json_row(log, "summary", accept=lambda row: not row.get("skipped"))
+    since = (f"; the last pass that ran: {ran.get('mode', '?')} at {ran.get('at', '?')}, freed {ran.get('freed_gb', 0)} GB"
+             if ran else "; no pass that ran in the log's last 1 MiB")
+    return f"  worktree_reclaim's last attempt: {last.get('mode', '?')} at {last.get('at', '?')} did not run ({why}){since}"
 
 
 def checkout_keep_lines(now: float) -> list[str]:
@@ -13940,10 +13960,8 @@ def owned_elsewhere_lines(now: float | None = None) -> list[str]:
     now = time.time() if now is None else now
     out = ["\nowned elsewhere (report only: glaeda-disk never deletes in these, nor starts their tools)"]
     out += checkout_keep_lines(now)
-    last = _last_json_row((HOME / WORKTREE_RECLAIM_STATE_REL) / "log.jsonl", "summary")
-    if last:
-        out.append(f"  worktree_reclaim's last pass: {last.get('mode', '?')} at {last.get('at', '?')}, freed "
-                   f"{last.get('freed_gb', 0)} GB" + (f" ({last['skipped']})" if last.get("skipped") else ""))
+    if (line := worktree_reclaim_pass_line((HOME / WORKTREE_RECLAIM_STATE_REL) / "log.jsonl")):
+        out.append(line)
     if acpmux_home().is_dir() and _within(os.path.realpath(acpmux_home()), os.path.realpath(HOME)):
         out += acpmux_store_lines()
     if (HOME / WORKTREE_RECLAIM_TOOL_REL).is_file():
