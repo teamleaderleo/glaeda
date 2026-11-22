@@ -22886,7 +22886,8 @@ class LandWorld:
             return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=timeout,
                                   env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
-                                       "GIT_CONFIG_NOSYSTEM": "1"})
+                                       "GIT_CONFIG_NOSYSTEM": "1",
+                                       **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
@@ -26556,6 +26557,135 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
+
+    def stacked_origin(self, squash: bool = True, conflict: bool = False) -> dict[str, str]:
+        """A real origin for o/r (LAND_UNION_URL pointed at it), as manaflow-ai/cmux-quillet-look stood on 2026-11-22:
+        #2 (stack/a onto main) merged, squashed unless SQUASH is False (a merge commit); #1 (stack/b) still onto
+        stack/a with one commit of its own; refs/pull/2/head kept as GitHub keeps it. CONFLICT: main changed #1's
+        line too after #2 merged. The shas by name: main, a (#2's head), b (#1's head)."""
+        origin = Path(self.tmp.name) / "stacked-origin"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str, **more: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(origin), *args], check=True, capture_output=True,
+                                  text=True, env={**env, **more}).stdout.strip()
+        origin.mkdir()
+        git("init", "-q", "-b", "main")
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "uploadpack.allowAnySHA1InWant", "true")
+        git("config", "receive.denyCurrentBranch", "ignore")
+        (origin / "a.txt").write_text("one\n")
+        (origin / "b.txt").write_text("one\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("checkout", "-qb", "stack/a")
+        (origin / "a.txt").write_text("one\ntwo\n")
+        git("commit", "-qam", "#2's change")
+        a = git("rev-parse", "HEAD")
+        git("update-ref", "refs/pull/2/head", a)
+        git("checkout", "-qb", "stack/b")
+        (origin / "b.txt").write_text("one\nthe lane's line\n")
+        git("commit", "-qam", "#1's own change", GIT_AUTHOR_NAME="Lane Author", GIT_AUTHOR_EMAIL="lane@x",
+            GIT_AUTHOR_DATE="1700000000 +0000")
+        b = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        if squash:
+            git("merge", "-q", "--squash", "stack/a")
+            git("commit", "-qm", "#2's change (#2)")
+        else:
+            git("merge", "-q", "--no-ff", "-m", "Merge #2", "stack/a")
+        if conflict:
+            (origin / "b.txt").write_text("one\nmain's own line\n")
+            git("commit", "-qam", "main changes b.txt")
+        main = git("rev-parse", "HEAD")
+        url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
+        url.start()
+        self.addCleanup(url.stop)
+        self.w.real_git = True
+        self.origin_git = git
+        self.w.api["repos/o/r/pulls?head=o:stack%2Fa"] = json.dumps(
+            [{"number": 2, "merged_at": "2026-11-22T18:00:00Z", "sha": a}])
+        return {"main": main, "a": a, "b": b}
+
+    def stacked_tick(self, head: str) -> dict:
+        """#1 landed pinned at HEAD, onto stack/a, and land_judge refused it stacked_base naming the retarget."""
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "stack/b", "baseRefName": "stack/a"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("stacked_base", head, {"kind": "retarget", "base": "main"},
+                                      "gh pr edit 1 -R o/r --base main"))
+        return self.tick()
+
+    def retargets(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls() if c[:4] == ["api", "-X", "PATCH", "repos/o/r/pulls/1"]
+                or c[:2] == ["pr", "edit"]]
+
+    def test_a_stacked_pr_whose_base_squash_merged_is_rebased_off_it_then_retargeted(self):
+        """manaflow-ai/cmux-quillet-look#3, 2026-11-22 18:05Z: #2 (its base's PR) squash-merged; the land stopped
+        "stacked_base: 3 identical refusals in a row" (each `gh pr edit --base` refused for classic projects), and
+        retargeted by hand it read CONFLICTING until a person rebased it --onto main off #2's head. The queue now
+        rebases its own commit off #2's head, pushes it leased at the judged head, retargets it through REST, and the
+        pin follows the head it made."""
+        sha = self.stacked_origin()
+        e = self.stacked_tick(sha["b"])
+        new = self.origin_git("rev-parse", "refs/heads/stack/b")
+        self.assertNotEqual(new, sha["b"], e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", new).split()[1:], [sha["main"]])
+        self.assertEqual(self.origin_git("diff", "--name-only", sha["main"], new), "b.txt")  # its own diff only
+        self.assertEqual(self.origin_git("show", f"{new}:b.txt"), "one\nthe lane's line")
+        self.assertEqual(self.origin_git("log", "-1", "--format=%an <%ae> %at %s", new),
+                         "Lane Author <lane@x> 1700000000 #1's own change")
+        self.assertEqual(self.retargets(), [["api", "-X", "PATCH", "repos/o/r/pulls/1", "-f", "base=main", "--jq",
+                                             ".base.ref"]])
+        done = [h for h in e["history"] if h["event"] == "stacked_rebased"]
+        self.assertEqual([(h["head"], h["rebased"], h["after"], h["pull"], h["commits"]) for h in done],
+                         [(sha["b"][:12], new[:12], sha["a"][:12], 2, 1)])
+        self.assertEqual(e["pinSha"], new)
+        self.assertIn(f"{sha['b'][:12]} -> {new[:12]}", e["stackedRebase"])
+        # GitHub shows it onto main at the new head: judged ok and merged pinned, the merge notice saying the rebase
+        self.w.set_pr(self.KEY, {**land_pr(new), "headRefName": "stack/b", "baseRefName": "main"}, self.t)
+        self.w.answers.append(ok_answer(new))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(new)
+        said = " ".join(" ".join(c) for c in self.w.sent())
+        self.assertIn("rebased its 1 own commit after #2's head", said)
+
+    def test_a_stacked_pr_whose_base_merged_with_a_merge_commit_is_only_retargeted(self):
+        sha = self.stacked_origin(squash=False)
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
+        self.assertEqual(len(self.retargets()), 1, e.get("stop"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "stacked_rebased"], [])
+        self.assertEqual(e["pinSha"], sha["b"])
+
+    def test_a_stacked_rebase_that_conflicts_stops_pushes_nothing_and_names_the_hand_step(self):
+        sha = self.stacked_origin(conflict=True)
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retarget_conflict"))
+        self.assertIn(f"conflicts at {sha['b'][:12]} in b.txt", e["stop"]["reason"])
+        self.assertIn("git rebase --onto origin/main <the base PR's last head>", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])
+        self.assertEqual(self.retargets(), [])  # the base is not changed either
+
+    def test_a_stacked_rebase_whose_read_fails_is_a_refused_step_not_a_bare_retarget(self):
+        """A failure decides nothing: the base is not changed (which would leave it conflicting with no stacked_base
+        refusal to come back to), the step backs off and the next judgment names it again."""
+        sha = self.stacked_origin()
+        self.w.api["repos/o/r/pulls?head=o:stack%2Fa"] = None
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual(self.retargets(), [])
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"].startswith("stacked_rebase")],
+                         ["stacked_rebase_failed"])
+
+    def test_retarget_goes_through_rest_not_gh_pr_edit_on_a_host(self):
+        """gh 2.45's `pr edit` reads classic project cards first and GitHub refuses that read."""
+        self.assertEqual(gg.land_retarget_args("o/r", "3", "main", False)[:4], ["api", "-X", "PATCH",
+                                                                                "repos/o/r/pulls/3"])
+        self.assertEqual(gg.land_retarget_args("o/r", "3", "main", True), ["pr", "edit", "3", "-R", "o/r", "--base",
+                                                                           "main"])
 
     def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
         """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
