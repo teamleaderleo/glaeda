@@ -2667,6 +2667,64 @@ def graphql_login() -> str:
     return found.group(1) if found else "default"
 
 
+# GitHub quotes the token's numeric account id in its own quota refusal ("API rate limit already exceeded for user
+# ID NNNN"), and quotes the caller's address when the call carried no token ("API rate limit exceeded for 203.0.113.9").
+# Both are personal data, and every line this tool prints is pasted into PR bodies, issue comments and ledger rows by
+# the agents that read it: on 2026-11-22 `status pr` printed "checks INCONCLUSIVE (partial: 80 of 219 read; check
+# pages held: graphql: last real attempt: API rate limit already exceeded for user ID NNNNNNNN...)". A downstream
+# guard (leo-workspace tools/public_body_guard.py) refuses the id in a body, but scrubbing after the fact is the
+# wrong layer: the refusal must never carry the id. gh_said is the one place GitHub's own words become text this
+# tool prints, stores or logs, so the id is dropped where it arrives and nowhere else -- what a reader needs in
+# order to act is *whose* bucket is spent (so whose work pauses or moves), which is a login, never an id. The
+# actionable words -- which limit, and the reset -- are kept.
+GH_SAID_MAX = 200  # the length every message site already cut GitHub's sentence to
+GH_USER_ID = re.compile(r"\b(users?)(?:\s+id)?\s+\d{3,}\b", re.I)
+# An App's own bucket: no login holds it, and the id names an installation, so the phrase names the holder instead.
+GH_INSTALL_ID = re.compile(r"\b(installations?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_CALLER_IP = re.compile(r"\bfor (?:IP\s+)?(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]*::[0-9a-f:]*[0-9a-f])\b", re.I)
+
+
+def gh_quota_holder() -> str:
+    """The login whose per-user quota a refusal names: the github.com login this host's token belongs to
+    (graphql_login), else "" when no login can be read here. Never raises, never an id."""
+    login = graphql_login()
+    return login if login and login != "default" else ""
+
+
+GH_NO_HOLDER = "(this host's gh login)"  # neutral, and still a per-user bucket: not the repository's, not an App's
+
+
+def gh_quota_label() -> str:
+    """What stands where GitHub wrote an account id: the holder's login, else GH_NO_HOLDER. Read only when a
+    message carries an id (gh_sanitize substitutes through this), so a clean message costs nothing."""
+    return gh_quota_holder() or GH_NO_HOLDER
+
+
+def gh_sanitize(text: Any) -> str:
+    """TEXT with GitHub's personal identifiers replaced by the holder they stand for (GH_USER_ID's comment).
+
+    A numeric user id becomes the login whose bucket it is, and -- when this host cannot read a login -- the neutral
+    "this host's gh login", which still says the spent bucket is a per-user one rather than the repository's or an
+    App's. A login is written bare, never "@login": an @name in a PR or issue body notifies that account."""
+    out = GH_USER_ID.sub(lambda m: f"{m.group(1)} {gh_quota_label()}", str(text or ""))
+    out = GH_INSTALL_ID.sub(r"\1 (an App of this repository's owner)", out)
+    return GH_CALLER_IP.sub("for an unauthenticated caller", out)
+
+
+def gh_said(error: Any, limit: int | None = GH_SAID_MAX, default: str = "") -> str:
+    """GitHub's own words from ERROR as a line this tool may print, store or log (gh_sanitize), cut to LIMIT.
+
+    ERROR is an error node or a response body (its "message", else its "type"), or a string already read out of one;
+    DEFAULT stands in when GitHub said nothing. LIMIT None keeps the whole sentence (the caller trims it).
+    Every site that reads a "message" out of GitHub's answer goes through here -- test-glaeda-gh asserts it."""
+    if isinstance(error, dict):
+        text = error.get("message") or error.get("type") or ""
+    else:
+        text = error if isinstance(error, str) else "" if error is None else str(error)
+    out = gh_sanitize(text).strip() or default
+    return out if limit is None or len(out) <= limit else out[:limit]
+
+
 def graphql_slot_wanted(want: Path) -> bool:
     """Whether a priority taker (the daemon) waits for a slot now: its want mark is GRAPHQL_SLOT_WANT_FRESH fresh."""
     try:
@@ -3137,7 +3195,7 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
     for e in errors:
         if not isinstance(e, dict) or protection_forbidden(e):
             continue
-        text = str(e.get("type") or "") + " " + str(e.get("message") or "")
+        text = gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""), limit=None)
         if not app_graphql_refused(text):
             continue
         org = APP_POOL_IP_ALLOW_LIST.search(text)
@@ -5277,7 +5335,7 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
         if not isinstance(e, dict):
             continue
         if e.get("message"):  # GitHub wrote the sentence; its code adds nothing to it
-            parts.append(str(e["message"]))
+            parts.append(gh_said(e["message"], limit=None))
             continue
         where = ".".join(str(e[k]) for k in ("resource", "field") if e.get(k))
         code = str(e.get("code") or "")
@@ -6733,10 +6791,11 @@ class Daemon:
                 doc = None
             if isinstance(doc, dict):
                 errors = doc.get("errors")
-                error_text = " ".join(str(e.get("type") or "") + " " + str(e.get("message") or "")
+                error_text = " ".join(gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""),
+                                               limit=None)
                                       for e in errors if isinstance(e, dict) and not protection_forbidden(e)
                                       ) if isinstance(errors, list) else ""
-                message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
+                message = " ".join(filter(None, (gh_said(doc.get("message"), limit=None), error_text)))
             else:
                 message = ""
             errors = doc.get("errors") if isinstance(doc, dict) else None
@@ -6842,7 +6901,7 @@ class Daemon:
             doc = json.loads(raw) if raw else None
         except ValueError:
             doc = None
-        message = str(doc.get("message") or "") if isinstance(doc, dict) else ""
+        message = gh_said(doc.get("message"), limit=None) if isinstance(doc, dict) else ""
         limited = bucket == "graphql" and isinstance(doc, dict) and any(
             isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in doc.get("errors") or [])
         if status in {403, 429} and ((SECONDARY.search(message) and not (content and CONTENT_ONLY.search(message))) or (
@@ -7638,7 +7697,7 @@ class Daemon:
         """GitHub's own failure answered as HTTP 200 (an internal error, a timeout): retried like a 5xx. A refusal
         that names the request (NOT_FOUND, FORBIDDEN, a validation error) still fails the write."""
         return bool(errors) and not any(e.get("type") in GQL_REFUSALS for e in errors) and all(
-            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(str(e.get("message") or ""))
+            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(gh_said(e.get("message"), limit=None))
             for e in errors)
 
     def rest_out(self, status: int, h: dict, text: str) -> bool:
@@ -7706,7 +7765,7 @@ class Daemon:
                 if (status >= 500 or not isinstance(doc, dict) or not doc.get("errors")
                         or self.gql_transient([e for e in doc["errors"] if isinstance(e, dict)])):
                     return self.post_retry(path, item, f"graphql subject: HTTP {status}")
-                message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "")[:200]
+                message = gh_said(((doc.get("errors") or [{}])[0] or {}).get("message"))
                 return self.post_finish(path, item, error=f"graphql: {message or 'no such issue or pull request'}")
             subject = subjects[thread] = node["id"]
             write_json(BASE / POST_SUBJECTS, dict(list(subjects.items())[-2000:]))
@@ -7764,7 +7823,7 @@ class Daemon:
             self.note_status({**item, "status": None}, None, None, None)  # deleted: post it as a new comment
             write_json(path, item)
             return None
-        said = "; ".join(str(e.get("message") or e.get("type")) for e in errors) or str(doc.get("message") or "")
+        said = "; ".join(gh_said(e, limit=None) for e in errors) or gh_said(doc.get("message"), limit=None)
         return self.post_finish(path, item, error=f"graphql: HTTP {status}: {said}"[:300])
 
     def post_prune(self) -> None:
@@ -9765,7 +9824,7 @@ class Daemon:
             return error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):  # GitHub reports a timeout as 200 with data null
-            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            message = "graphql: " + gh_said(doc["errors"][0], default="no message")
             self.fail(entries, message)
             return message
         problems: dict[str, dict] = {}
@@ -9774,7 +9833,7 @@ class Daemon:
             path = err.get("path") or [""]
             problems[str(path[0])] = err
             if err.get("type") == RESOURCE_LIMITS:
-                limits.setdefault(str(path[0]), str(err.get("message") or RESOURCE_LIMITS)[:200])
+                limits.setdefault(str(path[0]), gh_said(err.get("message"), default=RESOURCE_LIMITS))
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
         if kind == "pr":
             for err in doc.get("errors") or []:
@@ -9846,7 +9905,7 @@ class Daemon:
             err = problems.get(f"{alias}{i}") or {}
             what = "pull request" if kind == "pr" else "issue or pull request"
             # only GitHub saying NOT_FOUND for this alias means it does not exist (or is not visible)
-            self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
+            self.store(e["key"], e["cache"], error=gh_said(err.get("message"), default=f"no data for this {what}"),
                        missing=err.get("type") == "NOT_FOUND")
 
     def unchanged_paged(self, e: dict, node: dict) -> bool:
@@ -10227,7 +10286,7 @@ class Daemon:
             return [], error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):
-            return [], "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            return [], "graphql: " + gh_said(doc["errors"][0], default="no message")
         failed = {str((err.get("path") or [""])[0]) for err in doc.get("errors") or [] if isinstance(err, dict)}
         changed = []
         for i, e in enumerate(entries):
@@ -10255,7 +10314,7 @@ class Daemon:
             return error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):
-            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            message = "graphql: " + gh_said(doc["errors"][0], default="no message")
             self.fail(entries, message)
             for e in entries:
                 self.refund(e["key"])
@@ -10280,7 +10339,7 @@ class Daemon:
                 failed = [err for err in doc.get("errors") or [] if (err.get("path") or [None])[0] == f"m{i}"]
                 if failed:
                     self.store(e["key"], e["cache"],
-                               error="graphql: " + str(failed[0].get("message") or "check-of-record read failed")[:200])
+                               error="graphql: " + gh_said(failed[0].get("message"), default="check-of-record read failed"))
                     self.refund(e["key"])
                     continue
                 # A commit the fork does not have yet (sync-main pushes there within a minute) adds nothing, as does a
@@ -10366,8 +10425,8 @@ class Daemon:
                 break
             found = (doc.get("data") or {}).get("suiteRuns")
             errors = [e for e in doc.get("errors") or [] if isinstance(e, dict)]
-            message = "graphql: last real attempt: " + str(
-                (errors[0] if errors else {}).get("message") or "a suite could not be read")[:200]
+            message = "graphql: last real attempt: " + gh_said(
+                (errors[0] if errors else {}).get("message"), default="a suite could not be read")
             # a nested error names its suite by path (["suiteRuns", i, ...]); one with no such path names them all
             hit: set[int] = set()
             for e in errors:
@@ -10419,7 +10478,8 @@ class Daemon:
                     return error or "graphql: no response"
                 rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
                 if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
-                    return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
+                    return "graphql: " + gh_said(((more.get("errors") or [{}])[0] or {}).get("message"),
+                                                default="no further page")
                 contexts = rollup.get("contexts") or {}
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
@@ -10598,13 +10658,14 @@ class Daemon:
         data = doc.get("data") or {}
         problems = {str((err.get("path") or [""])[0]): err for err in doc.get("errors") or [] if isinstance(err, dict)}
         if not data and problems:  # the whole query failed (a schema change, say): say what GitHub said
-            message = "graphql: " + str(next(iter(problems.values())).get("message"))[:200]
+            message = "graphql: " + gh_said(next(iter(problems.values())).get("message"), default="no message")
             self.fail(entries, message)
             return message
         for i, e in enumerate(entries):
             node = data.get(f"w{i}")
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
-                message = "graphql: " + str((problems.get(f"w{i}") or {}).get("message") or "no workflow run at this URL")[:200]
+                message = "graphql: " + gh_said((problems.get(f"w{i}") or {}).get("message"),
+                                                default="no workflow run at this URL")
                 problem = problems.get(f"w{i}") or {}
                 # null with no problem of its own, or NOT_FOUND: GraphQL cannot see it (a timeout or a 5xx says nothing)
                 if (not problem or problem.get("type") == "NOT_FOUND") \
@@ -13776,8 +13837,9 @@ def typed_line(words: Any) -> str:
 
 
 def land_redact(text: Any) -> str:
-    """TEXT with GitHub's numeric user id dropped (LAND_USER_ID)."""
-    return LAND_USER_ID.sub(r"\1 <redacted>", str(text or ""))
+    """TEXT with GitHub's account id replaced by the login whose bucket it is (gh_sanitize), the one substitution
+    every printed and stored GitHub message goes through."""
+    return gh_sanitize(text)
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
@@ -21725,7 +21787,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         # A partial rollup (check pages held, a context GitHub could not read) says so on the checks line: its
         # PENDING is the unread pages', and a required name not shown is unread, not missing (cmux#43194).
         partial = (f" (partial: {len(checks)} of {data.get('checksTotal') or '?'} read; "
-                   f"check pages held: {data['checksPageError']})") if data.get("checksPageError") else ""
+                   f"check pages held: {gh_said(data['checksPageError'], limit=None)})"
+                   ) if data.get("checksPageError") else ""
         if checks:
             # the headline is this tool's own reading, the one `wait` decides by; GitHub's rollup also
             # counts superseded attempts and checks that are not required
@@ -22369,7 +22432,7 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            "none (merge or rebase onto the base and push; checks run after that push)")
     if result == EXIT_INCONCLUSIVE:
         if data.get("checksPageError") or req.get("runsUnread"):
-            why = data.get("checksPageError") or "its Actions runs could not be read"
+            why = gh_said(data.get("checksPageError"), limit=None) or "its Actions runs could not be read"
             blocked = blocked_now(kind)
             return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
                                blocked_next(req, blocked) if blocked else wait_command(req))
@@ -23046,7 +23109,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
                                            f"{blocked['text']}", blocked_next(req, blocked)))
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
-    unread = (data or {}).get("checksPageError") or (
+    unread = gh_said((data or {}).get("checksPageError"), limit=None) or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
     if now >= deadline and kind == "pr" and until in ("done", "green") and data and unread:
         # the deadline passed on a read that never came back whole: not a pass and not a plain timeout
