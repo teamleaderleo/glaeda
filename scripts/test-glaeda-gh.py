@@ -29167,7 +29167,7 @@ class LandTest(Base):
         return self.tick(1)
 
     def test_a_copy_showing_the_head_the_last_stop_replaced_never_stops_the_repin(self):
-        """gcp-agent-lane-8, 2026-11-22 23:10Z: hq#18191 stopped "the head is 383d1cd9dfe7 (the broker read it from
+        """a lane host, 2026-11-22 23:10Z: hq#18191 stopped "the head is 383d1cd9dfe7 (the broker read it from
         GitHub), not the --sha 5bd7077339bc"; re-pinned at 383d1cd9dfe7, pin_wait stopped it 33 s later "the head is
         5bd7077339bc" on a copy older than that stop's own read. That copy never stops the re-pin: pin_wait keeps
         reading, and the read that shows the pin is judged and merged."""

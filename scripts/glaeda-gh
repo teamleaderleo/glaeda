@@ -12124,7 +12124,7 @@ def land_update_branch_args(repo: str, number: str, head: str, needs: list[str],
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
 # A head_moved stop names the live head it read (its next step is `--sha LIVE`), so it also says the pin it stopped was
 # replaced. A row then re-pinned at LIVE whose copy still shows that replaced head is reading something older than the
-# stop's own read, not a new push: gcp-agent-lane-8, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
+# stop's own read, not a new push: a lane host, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
 # "the head is 383d1cd9dfe7 (the broker read it from GitHub)"; re-pinned at 383d1cd9dfe7 33 s later, pin_wait stopped
 # it "the head is 5bd7077339bc, not the --sha 383d1cd9dfe7" on the cache's copy (vouched fresh by an updatedAt probe,
 # not a head read), and the requester re-queued the same pin by hand, after which it was seen at once. Within this
