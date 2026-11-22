@@ -12666,6 +12666,19 @@ LAND_EXPLAIN_DEADLINE = 1500.0  # land_judge's own CHECK_BUDGET_S is 1470 s
 # On a broker client (a lane VM) a judgment past this is a read that is not coming: it ends explain_failed, which
 # hands the PR to the broker host (LAND_HANDOFF_UNREAD) after 5 min instead of 25 (LAND_EARLY_HANDOFF's comment).
 LAND_EXPLAIN_DEADLINE_CLIENT = 300.0
+# An explain budget in seconds (RFD 0042 cut 5). On a host that judges for itself, a judgment's first try gets
+# LAND_EXPLAIN_BUDGET, given to land_judge as its caller's deadline (GH_MERGE_DEADLINE, epoch seconds: explain judges
+# the pinned `gh pr merge`, so its check_budget is what is left of it less its 30 s merge reserve), and the worker's own
+# bound is that plus LAND_EXPLAIN_BUDGET_GRACE. A judgment that runs out answers land_judge's own out_of_time refusal
+# ("unreadable", a retry whose words say "deadline", so LAND_UNREAD_SAME_STOP never counts it), or explain_failed at the
+# worker's bound: either is a retry the queue already takes. The next judgment at that head gets today's whole
+# LAND_EXPLAIN_DEADLINE (explainCut), so a PR whose judgment really needs longer still lands, one full try later.
+# Queue host, 2026-11-22 17:35-18:25Z, 567 judgments: p95 293-526 s per answer (ok 419, red_not_excused 526,
+# cancelled 660), while one stuck read held a worker up to 1,500 s. A broker client keeps LAND_EXPLAIN_DEADLINE_CLIENT.
+LAND_EXPLAIN_BUDGET = 600.0
+LAND_EXPLAIN_BUDGET_GRACE = 60.0
+LAND_MERGE_DEADLINE_ENV = "GH_MERGE_DEADLINE"  # leo-workspace gh_quota.MERGE_DEADLINE_ENV
+LAND_EXPLAIN_CUT = re.compile(r"did not finish within its caller's deadline \(GH_MERGE_DEADLINE")
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
@@ -16885,11 +16898,18 @@ class LandQueue:
                                   "head": sha, "dataAt": snap["dataAt"], "readAt": snap.get("readAt"),
                                   "rollup": snap.get("rollup")})
                 extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
+        client = self.broker_client()
         with self.lock:
             self.count("snapshot" if extra else "live")
+            # LAND_EXPLAIN_BUDGET's comment: a first try is budgeted; the one after a cut at this head is whole
+            budgeted = not client and e.pop("explainCut", None) != sha
         for n, run_argv in enumerate(tries):
-            got = self.call(run_argv, LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE,
-                            extra=extra)
+            env = extra
+            bound = LAND_EXPLAIN_DEADLINE_CLIENT if client else LAND_EXPLAIN_DEADLINE
+            if budgeted:
+                env = {**extra, LAND_MERGE_DEADLINE_ENV: f"{time.time() + LAND_EXPLAIN_BUDGET:.3f}"}
+                bound = LAND_EXPLAIN_BUDGET + LAND_EXPLAIN_BUDGET_GRACE
+            got = self.call(run_argv, bound, extra=env)
             answer = None
             for line in reversed((got.stdout or "").strip().splitlines()):
                 with contextlib.suppress(ValueError):
@@ -16897,6 +16917,11 @@ class LandQueue:
                     if isinstance(doc, dict):
                         answer = doc
                         break
+            if budgeted and (got.returncode == 124 or (answer is not None and answer.get("ok") is not True
+                                                       and LAND_EXPLAIN_CUT.search(str(answer.get("reason") or "")))):
+                with self.lock:
+                    e["explainCut"] = sha  # its next judgment at this head gets the whole LAND_EXPLAIN_DEADLINE
+                    self.count("explain_cut")
             if answer is None or got.returncode not in (0, 1, 3):
                 why = land_reason(got.stderr or got.stdout or f"exit {got.returncode}")
                 return {"ok": False, "code": "explain_failed",

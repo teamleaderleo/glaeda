@@ -26887,8 +26887,10 @@ class LandTest(Base):
 
     def test_a_lane_vms_judgment_times_out_at_the_client_deadline_and_is_handed_off(self):
         # A lane VM's explain is cut at LAND_EXPLAIN_DEADLINE_CLIENT, not 1500 s: its timeout is explain_failed,
-        # which hands the PR to the broker host (LAND_HANDOFF_UNREAD). The broker host keeps the long deadline.
-        for broker, deadline in ((True, gg.LAND_EXPLAIN_DEADLINE_CLIENT), (False, gg.LAND_EXPLAIN_DEADLINE)):
+        # which hands the PR to the broker host (LAND_HANDOFF_UNREAD). The broker host's first try is budgeted
+        # (LAND_EXPLAIN_BUDGET plus its grace; the try after a cut gets the whole deadline: test_a_judgment_is_budgeted_...).
+        for broker, deadline in ((True, gg.LAND_EXPLAIN_DEADLINE_CLIENT),
+                                 (False, gg.LAND_EXPLAIN_BUDGET + gg.LAND_EXPLAIN_BUDGET_GRACE)):
             with self.subTest(broker=broker):
                 shutil.rmtree(gg.land_dir(), ignore_errors=True)
                 self.w = LandWorld(self.tmp.name)
@@ -26912,6 +26914,93 @@ class LandTest(Base):
                 self.assertEqual((e["state"] == "forwarded", len(self.handoffs())), (broker, int(broker)))
         self.broker = False
         self.assertEqual(gg.LAND_EXPLAIN_DEADLINE_CLIENT, 300.0)
+
+    def budget_world(self) -> None:
+        """Record (the worker's bound, GH_MERGE_DEADLINE less the wall clock, or None) of each live explain."""
+        self.bounds: list[tuple[float, float | None]] = []
+        real = self.w.run
+
+        def run(argv: list[str], timeout: float, env: dict, real: Any = real) -> Any:
+            if argv[1:3] == [self.w.mh, "explain"] and "--cache-only" not in argv:
+                at = env.get(gg.LAND_MERGE_DEADLINE_ENV)
+                self.bounds.append((timeout, None if at is None else round(float(at) - time.time())))
+            return real(argv, timeout, env)
+
+        self.w.run = run
+        self.q = self.queue()
+
+    CUT = ("land-judge: refused: the merge check did not finish within its caller's deadline (GH_MERGE_DEADLINE: 570 "
+           "s for the check, 30 s kept for the merge itself), so nothing was merged (the merge check's 570 s were "
+           "spent; a read, run or pause was cut short at the deadline). Merge again: the next check reads afresh")
+
+    def test_a_judgment_is_budgeted_and_the_try_after_a_cut_gets_the_whole_deadline(self):
+        # RFD 0042 cut 5: a judgment holds a worker LAND_EXPLAIN_BUDGET (plus grace), not 1,500 s. land_judge's own
+        # out_of_time answer ("unreadable", its words say "deadline") is a retry; the next judgment at that head runs
+        # with today's whole LAND_EXPLAIN_DEADLINE, so a PR whose judgment needs longer still merges.
+        self.budget_world()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}, reason=self.CUT))
+        e = self.tick()
+        budget = (gg.LAND_EXPLAIN_BUDGET + gg.LAND_EXPLAIN_BUDGET_GRACE, round(gg.LAND_EXPLAIN_BUDGET))
+        self.assertEqual(self.bounds, [budget])
+        self.assertEqual((e["state"], e["explainCut"]), ("waiting", LA))
+        self.assertIsNone(e.get("streak"))  # a cut is no strike, and its words never count toward the unread stop
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_RETRY_MAX)
+        self.assertEqual(self.bounds, [budget, (gg.LAND_EXPLAIN_DEADLINE, None)])  # the whole bound, no deadline
+        self.assertEqual(e["state"], "merged", e.get("history"))
+        self.assertNotIn("explainCut", e)
+
+    def test_a_worker_timeout_under_the_budget_also_earns_the_whole_deadline_next(self):
+        # land_judge that does not answer by the worker's bound (no out_of_time line at all) is explain_failed, a
+        # retry; the next try is whole too, and a judgment after a full one is budgeted again.
+        self.budget_world()
+        real = self.w.run
+        timeouts = [True]
+
+        def run(argv: list[str], timeout: float, env: dict) -> Any:
+            got = real(argv, timeout, env)
+            if argv[1:3] == [self.w.mh, "explain"] and timeouts and timeouts.pop():
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return got
+
+        self.w.run = run
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))  # taken by the timed-out call, never read
+        e = self.tick()
+        self.assertEqual((e["explain"]["code"], e["explainCut"]), ("explain_failed", LA))
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}, reason="could not be read"))
+        e = self.tick(gg.LAND_RETRY_MAX)
+        self.assertNotIn("explainCut", e)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_RETRY_MAX)
+        budget = (gg.LAND_EXPLAIN_BUDGET + gg.LAND_EXPLAIN_BUDGET_GRACE, round(gg.LAND_EXPLAIN_BUDGET))
+        self.assertEqual(self.bounds, [budget, (gg.LAND_EXPLAIN_DEADLINE, None), budget])
+        self.assertEqual(e["state"], "merged", e.get("history"))
+
+    def test_an_answer_in_the_budget_and_a_lane_vms_judgment_are_as_before(self):
+        # A judgment that answers inside the budget leaves no mark; a broker client gets no deadline from the queue
+        # (LAND_EXPLAIN_DEADLINE_CLIENT, its skip-local-explain default untouched).
+        self.budget_world()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}, reason="could not be read"))
+        e = self.tick()
+        self.assertNotIn("explainCut", e)
+        self.assertEqual(len(self.bounds), 1)
+        self.assertIsNotNone(self.bounds[0][1])
+        self.broker = True
+        self.bounds.clear()
+        self.q = self.queue()
+        self.pr(LA, key="pr:o/r#4")
+        self.land("o/r#4")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.bounds, [(gg.LAND_EXPLAIN_DEADLINE_CLIENT, None)])
+        self.broker = False
 
     def test_a_refused_hand_off_backs_off_then_stops_and_says_so(self):
         self.broker = True
