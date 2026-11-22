@@ -22772,6 +22772,9 @@ class LandTest(Base):
         super().setUp()
         self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
+        retry = mock.patch.object(gg, "LAND_NOTIFY_RETRY_S", 0.0)  # a refused notice's resends, never a real sleep
+        retry.start()
+        self.addCleanup(retry.stop)
         # The CLI (`glaeda-gh land`) resolves land-judge from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
         paths = mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),))
@@ -24344,6 +24347,61 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def judge_merged_base(self, head: str) -> tuple[int, dict]:
+        """land_judge's stale_main_update answer: it sent update_branch pinned to HEAD in the judgment itself."""
+        return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": 600},
+                       reason=f"land-judge: refused: checks still running at {head}: main ({'e' * 12}) was merged "
+                              f"into the PR: since {'a' * 12}, the main its checks tested at most, it changed 1 file "
+                              f"the PR changes too (x.py), and the checks run again on the merged tree. Merge once "
+                              f"they finish; land_judge never merges past the classifier.")
+
+    def test_sha_pin_follows_the_base_merge_land_judge_itself_made(self):
+        # teamleaderleo/glaeda#2495, 2026-11-22: pinned at 5bc3ba9e; a judgment answered checks_running after merging
+        # main into the PR itself (stale_main_update), the lander bot's 0b53d1a3 (first parent 5bc3ba9e) appeared 31 s
+        # later, and the cache look stopped the land head_moved; hq#18096 the same at f2a95491 -> 1b282104. The queue
+        # now records that update as its own, so the pin follows the merge, which is judged in full and merged.
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                        override={"reason": "red on main too", "receipt": "main run 1 job 2"})
+        self.w.answers.append(self.judge_merged_base(LA))
+        e = self.tick()
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIn("update_by_judge", [h["event"] for h in e["history"]])
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[("ci", "IN_PROGRESS", "")]), self.t + 5)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]  # the bot's merge: the pin, then main
+        e = self.tick(10)
+        self.assertNotEqual(e["state"], "stopped")  # the cache look no longer stops it (stop_moved_pin)
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assertEqual(e["override"]["reason"], "red on main too")  # the request's override rides on
+        self.assert_merged_at(LB)
+        self.assertEqual(self.w.explains()[-1][-3:], ["--sha", LB, "--json"])  # judged again at the new head
+
+    def test_sha_pin_after_land_judge_merged_the_base_still_stops_on_someone_elses_push(self):
+        # The judgment's update is recorded at the pin, so only a head whose parents include the pin follows it.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(self.judge_merged_base(LA))
+        self.tick()
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"].update(headParents=[LC], headParent=LC)  # a push on top of something else
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_WAIT_DEFAULT + 60, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_judgment_that_names_another_head_or_no_base_merge_records_no_update(self):
+        e = {"key": self.KEY, "history": []}
+        with self.q.lock:
+            self.q.note_judge_update(e, self.judge_merged_base(LA)[1], LB)  # merged at another head than judged
+            self.q.note_judge_update(e, refusal("checks_running", LA, None,
+                                                reason=f"land-judge: refused: checks still running at {LA}: ci")[1], LA)
+        self.assertNotIn("updateSent", e)
+
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
         self.assertEqual((args.wait, args.sha), (1400, LA))
@@ -25076,6 +25134,21 @@ class LandTest(Base):
         nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
                        nxt=nxt, reason=f"land-judge: refused: checks still running at {head[:8]}")
+
+    def test_each_judgment_logs_its_wall_time(self):
+        # The entry pops judging after each judgment, so nothing else on the land host says how long one took.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.land()
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick()
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual(len(judged), 1, lines)
+        self.assertEqual((judged[0]["key"], judged[0]["code"], judged[0]["step"], judged[0]["head"]),
+                         (self.KEY, "ok", "merge", LA[:12]))
+        self.assertIsInstance(judged[0]["took_s"], float)
+        self.assertGreaterEqual(judged[0]["took_s"], 0.0)
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
@@ -26701,6 +26774,57 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual(e["state"], "stopped")
         self.assertEqual(self.w.notices[-1][0], "land-notify-failed")
+
+    def test_a_refused_notice_is_sent_again_and_one_that_goes_through_is_not_a_failure(self):
+        # 57 of 58 land-notify-failed on one lane VM, 2026-11-21/22, were one refused send ("acpmux: runtime: empty
+        # prompt") and nothing more: the lane never heard its land had ended.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def flaky(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                if len(tries) == 1:
+                    return subprocess.CompletedProcess(argv, 1, "", "acpmux: runtime: empty prompt")
+            return real(argv, timeout, env)
+        self.q.run = flaky
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(tries[0], tries[1])
+        self.assertNotIn("land-notify-failed", [n[0] for n in self.w.notices])
+        retried = [ln for ln in lines if ln.get("event") == "land-notify-retried"]
+        self.assertEqual([(r["tries"], r["why"]) for r in retried], [(2, "acpmux: runtime: empty prompt")])
+
+    def test_a_notice_refused_every_time_is_one_failure_after_its_tries(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def failing(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "no such session")
+            return real(argv, timeout, env)
+        self.q.run = failing
+        self.tick()
+        self.assertEqual(len(tries), gg.LAND_NOTIFY_TRIES)
+        self.assertEqual([n[0] for n in self.w.notices].count("land-notify-failed"), 1)
+
+    def test_a_requester_named_none_is_nobody(self):
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gg.land_requester_from("none"), ("", ""))
+            self.assertEqual(gg.land_requester_from("None"), ("", ""))
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "none"}, clear=True):
+            self.assertEqual(gg.land_requester_from(None), ("", ""))
+        # An entry an older daemon stored as HOST/none falls to the queuing session, or to nobody (land-unnotified).
+        self.assertEqual(gg.land_notify_target({"queuedBy": "tool:ssh-from-x"}, "hostx/none"), "")
 
     def test_cli_land_status_and_cancel(self):
         with mock.patch.object(gg, "daemon_running", return_value=True), \
