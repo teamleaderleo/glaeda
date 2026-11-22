@@ -30423,6 +30423,24 @@ class AppPoolTest(Base):
             self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
         self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
 
+    def test_with_the_login_graphql_stopped_app_prs_still_go_on_the_app_graphql(self) -> None:
+        """2026-11-22 03:26Z, one host: the login's GraphQL stopped, route() sent every PR over REST, one read each, and
+        29 PRs were stored in 600 s while the App's GraphQL sat unspent. The App's PRs go to its GraphQL in batches;
+        another owner's stay on REST."""
+        app = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": None, "touched": NOW} for i in range(1, 4)]
+        other = [{"key": "pr:o/r#1", "cache": None, "touched": NOW}]
+        due = {"pr": app + other, "comment": [], "run": [], "head": []}
+        over = {"pr": "rest", "comment": "rest", "run": "rest", "head": "rest"}
+        with mock.patch.object(self.daemon, "mode", lambda bucket: "stop" if bucket == "graphql" else "normal"):
+            self.assertEqual(self.daemon.app_graphql_share(due, over), {"pr": app})
+            self.assertEqual(self.daemon.app_graphql_share(due, {**over, "pr": "graphql"}), {}, "GraphQL already")
+        with mock.patch.object(self.daemon, "mode", lambda bucket: "normal"):
+            self.assertEqual(self.daemon.app_graphql_share(due, over), {}, "REST by choice, not by the login's low")
+        sent: list[list[str]] = []
+        with mock.patch.object(self.daemon, "mode", lambda bucket: "stop" if bucket == "graphql" else "normal"):
+            left = self.daemon.batched("pr", app, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual((sent, left), ([[e["key"] for e in app]], []), "the login's stop does not hold the App")
+
     def test_the_login_pace_never_defers_a_batch_the_app_answers(self) -> None:
         """2026-11-22, one host: the PR batches all went on the App, but the login's head and check-page queries filled
         the minute's 40 points, and 1,242 PR reads sat deferred behind "42 of 40 points this minute"."""

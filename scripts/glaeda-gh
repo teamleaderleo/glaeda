@@ -7942,6 +7942,12 @@ class Daemon:
         # had its turn: a round robin over the kinds with something due.
         if self.gql_paced is not None and len(self.gql_log) > sent:
             self.gql_first = (kinds.index(self.gql_paced) + (1 if paced_sent else 0)) % len(kinds)
+        for kind, picked in self.app_graphql_share(due, over).items():
+            keys = {e["key"] for e in picked}
+            due[kind] = [e for e in due[kind] if e["key"] not in keys]
+            with self.phase(f"read {kind}"):
+                spilled += self.batched(kind, picked, self.graphql_fetch[kind])
+            self.post_between()
         over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
         # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary
         # hold stops REST too, so the REST loop below defers them instead.
@@ -8760,6 +8766,22 @@ class Daemon:
         if pool.pick(owner, scope) is None:
             return []
         return entries
+
+    def app_graphql_share(self, due: dict[str, list[dict]], over: dict[str, str]) -> dict[str, list[dict]]:
+        """{kind: the due entries an App answers over GraphQL} of the PR and comment reads route() sent to REST because
+        the login's GraphQL is low or stopped. route() weighs only the login's counters, but an App's GraphQL is its own
+        12,500 points an hour, and batched() lets its chunks past the login's stop and pace: ten PRs a query instead of
+        a REST read each. One host, 2026-11-22 03:26Z: the login's GraphQL stopped, every PR went over REST, and the
+        tick's 260 s of REST stored 29 PRs in 600 s while the App's GraphQL sat more than 95% unspent."""
+        if self.mode("graphql") == "normal" or self.gql_down():
+            return {}
+        share = {}
+        for kind in ("pr", "comment"):
+            if over.get(kind) == "rest" and due.get(kind):
+                picked = self.app_eligible_by_owner(kind, due[kind], "graphql")
+                if picked:
+                    share[kind] = picked
+        return share
 
     def app_eligible_by_owner(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
         """app_entries_eligible asked per owner, unioned in ENTRIES' order. It builds one representative request for
