@@ -4878,5 +4878,16 @@ class RemoteStatusTests(unittest.TestCase):
         self.assertTrue(command.endswith("; exit 0"))
 
 
+class StartDrainTest(unittest.TestCase):
+    def test_the_drain_keeps_its_stdin_so_the_waiter_lives_until_closed(self) -> None:
+        # The library's `exec </dev/null` (no KEEP_STDIN) ended host_drain's perl at once: the waiter entry vanished
+        # and an AWS onboard --wait sat at a host lock that never freed (aws-m4pro-2 and -7, 2026-11-22).
+        with mock.patch.object(mf.subprocess, "Popen") as popen:
+            mf.start_drain({"hosts": {"aws-m4pro-2": {}}}, "aws-m4pro-2")
+        command = popen.call_args.args[0][-1]
+        self.assertIn("KEEP_STDIN=1", command)
+        self.assertIn("host_drain", command)
+
+
 if __name__ == "__main__":
     unittest.main()
