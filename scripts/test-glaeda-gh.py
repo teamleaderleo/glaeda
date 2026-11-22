@@ -24344,6 +24344,107 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    # A base merge somebody else made (glaeda#2490, hq#17948, 2026-11-22: cmux-agents-lander[bot]'s "Merge branch
+    # 'main' into ..." on a pinned head stopped the land head_moved, and each owner re-pinned by hand).
+    LD = "d" * 40
+    PIN_DIFF = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -10,3 +10,4 @@ def f():\n x\n+y\n z"}
+
+    def base_merged(self, head: str = LB, parents: list | None = None, now: Any = "same", was: Any = "same",
+                    mb: str = "") -> None:
+        """The cache shows HEAD, a merge whose parents are PARENTS ([pin, base commit]), and the compares answer."""
+        self.pr(head, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=parents or [LA, self.LD], headParent=(parents or [LA])[0],
+                                              baseRefName="main")
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}  # base lines above it moved it
+        now = {"mb": mb or self.LD, "files": [moved]} if now == "same" else now
+        was = {"mb": "e" * 40, "files": [self.PIN_DIFF]} if was == "same" else was
+        self.w.api[f"repos/o/r/compare/main...{head}"] = None if now is None else json.dumps(now)
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = None if was is None else json.dumps(was)
+
+    def pinned_and_waiting(self) -> dict:
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"]), ("waiting", LA))
+        return e
+
+    def compares(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if "/compare/" in c[1]]
+
+    def test_the_pin_follows_a_base_merge_nobody_in_this_queue_made(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual([(h["was"], h["head"], h["base"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12], self.LD[:12])])
+        self.assertEqual(len(self.compares()), 2)  # once per head
+        self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
+        self.assert_merged_at(LB)
+
+    def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
+        # pin_wait's stop (a read since the request shows another head) defers to the same check
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        self.assertNotEqual(self.tick(1)["state"], "stopped")  # a read since the request is nudged for first
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assert_merged_at(LB)
+
+    def test_a_merge_that_changes_the_prs_own_diff_still_stops_head_moved(self):
+        # an evil merge (a conflict resolution, or a change made in the merge commit) is not only a base merge
+        self.pinned_and_waiting()
+        evil = {**self.PIN_DIFF, "d": "@@ -14,3 +14,5 @@ def f():\n w\n+y\n+backdoor()\n z"}
+        self.base_merged(now={"mb": self.LD, "files": [evil]})
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("more than a base merge", e["stop"]["reason"])
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_merge_of_a_commit_not_on_the_base_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_merged(mb=LC)  # where HEAD meets main is not its second parent: another branch was merged
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("not a merge of main", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_base_merge_whose_compare_cannot_be_read_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_merged(was=None)
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("failed", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
+        self.pinned_and_waiting()
+        self.base_merged(parents=[LC, self.LD])
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.compares(), [])
+
+    def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
+        same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
+        moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
+        why = gg.land_base_merge_why
+        self.assertEqual(why(LA, LB, LC, "main", {"files": [same]}, {"mb": LC, "files": [moved]}), "")
+        self.assertIn("not a merge of main", why(LA, LB, LC, "main", {"files": [same]}, {"mb": LA, "files": [same]}))
+        self.assertIn("in b.py", why(LA, LB, LC, "main", {"files": [same]},
+                                     {"mb": LC, "files": [same, {**same, "f": "b.py"}]}))
+        self.assertIn("no patch", why(LA, LB, LC, "main", {"files": [{**same, "d": None}]},
+                                      {"mb": LC, "files": [same]}))
+        many = [{**same, "f": f"f{i}"} for i in range(gg.LAND_COMPARE_FILES_MAX)]
+        self.assertIn("or more", why(LA, LB, LC, "main", {"files": many}, {"mb": LC, "files": many}))
+        self.assertEqual(gg.land_base_merge_parent(LA[:12], LB, {"headRefOid": LB, "headParents": [LA, LC]}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LC, LA]}), "")
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA]}), "")
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LC, "headParents": [LA, LC]}), "")
+
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
         self.assertEqual((args.wait, args.sha), (1400, LA))

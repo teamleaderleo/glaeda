@@ -14643,6 +14643,8 @@ class LandQueue:
             return False
         if e.get("updateSent") or e.get("preStepHead") or e.get("pinFollow"):
             return False  # this queue moved the head itself: pin_follow decides on the first parent
+        if land_base_merge_parent(pin, head, data):
+            return False  # maybe only a base merge on the pin: judge's worker reads whether it is (base_merge_check)
         since = float(e.get("pinSince") or e.get("created") or 0)
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
@@ -15800,6 +15802,8 @@ class LandQueue:
         if head and reads and max(reads) >= since:
             # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
             e.pop("pinWait", None)
+            if land_base_merge_parent(pin, head, c.get("data") or {}):
+                return False  # maybe only a base merge on the pin: judge's worker reads whether it is
             self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
@@ -16121,6 +16125,56 @@ class LandQueue:
         self.save(e)
         return None
 
+    def base_merge_due(self, e: dict, head: str) -> bool:
+        """Under the lock, from judge. True when HEAD, which no update of this queue's made, may be only a base merge on
+        E's pin (land_base_merge_parent): the judgment goes ahead, and its worker reads first whether it is
+        (base_merge_check), which repins or stops it. False: judge stops it head_moved, as before."""
+        pin = str(e.get("pinSha") or "")
+        parent = land_base_merge_parent(pin, head, (self.cache_of(e["key"]) or {}).get("data") or {})
+        if not parent:
+            e.pop("baseMergeCheck", None)
+            return False
+        e["baseMergeCheck"] = {"head": head, "pin": pin, "parent": parent}
+        return True
+
+    def base_merge_check(self, e: dict, check: dict) -> bool:
+        """On a worker, before the judgment: whether CHECK's head is only a base merge on its pin, from two compare
+        reads through the gh-quota shim (LAND_BASE_MERGE_JQ's comment). True: the pin moved to it (repin_base_merge)
+        and the judgment goes ahead there. False: E stopped head_moved with why, as it would have before; a read
+        that fails is no proof, so it stops too."""
+        head, pin, parent = str(check["head"]), str(check.get("pin") or ""), str(check.get("parent") or "")
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        base = str(data.get("baseRefName") or "")
+        gh = self.gh()
+        docs: list[dict] = []
+        why = "" if gh and base else "no gh-quota shim or base branch to read it with"
+        for path in ([f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{head}",
+                      f"repos/{e['repo']}/compare/{parent}...{pin}"] if not why else []):
+            got = self.call([gh, "api", path, "--jq", LAND_BASE_MERGE_JQ], LAND_GH_DEADLINE)
+            try:
+                doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                doc = None
+            if not isinstance(doc, dict):
+                why = f"the read of {path} failed (exit {got.returncode}), so it is not shown to be only a base merge"
+                break
+            docs.append(doc)
+        if not why:
+            why = land_base_merge_why(pin, head, parent, base, docs[1], docs[0])
+        with self.lock:
+            self.check(e)
+            if why:
+                self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for "
+                          f"(no update_branch of this queue's made it, and {why})",
+                          f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+                return False
+            e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
+            e["updatedHead"] = head
+            e.pop("pinWait", None)
+            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
+            self.save(e)
+            return True
+
     def fresh_head(self, e: dict, sha: str, free: bool = True) -> str | None:
         """SHA when a judgement may pin it, "" when land_judge must read the head itself, None while E waits (nudged)
         for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
@@ -16200,7 +16254,8 @@ class LandQueue:
             self.note_late(e, "waiting for the daemon's read of its head")
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
-        if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)):
+        if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
+                and not self.base_merge_due(e, sha):
             self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for "
                       f"({own})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
@@ -16456,8 +16511,11 @@ class LandQueue:
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
             counts = counts and not e.pop("stepQuotaParked", False)
+            check = e.pop("baseMergeCheck", None)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
+        if isinstance(check, dict) and check.get("head") == sha and not self.base_merge_check(e, check):
+            return  # not only a base merge on the pin: stopped head_moved, as before
         answer = self.explain(e, sha)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, land_judge read the head itself
         head = str(answer.get("head") or sha or "").lower()
@@ -18061,6 +18119,71 @@ def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
     # moved), so without them a read that said no parent at all would read as a parent that matched.
     return (bool(pin) and bool(parent) and not land_head_moved(pin, parent)
             and bool(sent) and not land_head_moved(pin, sent))
+
+
+# A base merge somebody else made on a pinned head: glaeda#2490 pinned at 8509ca2a, then 6b829d52 ("Merge branch 'main'
+# into handoff-stale-head", cmux-agents-lander[bot]); hq#17948 pinned at 3fac927a, then 266db162 (parents 3fac927a and
+# f69625e7, the same bot). huge-blue, 2026-11-22 11:16Z and 11:58Z: both stopped head_moved, "no update_branch of this
+# queue's was sent at the pinned head", and each owner re-pinned by hand and lost the row's place. A base merge comes
+# from many hands that share one App identity (the lane-gh broker's update_branch, other hosts' queues, reconcilers,
+# the Update branch button), so no one of them can be made to tell this queue; the pin follows any head that is only
+# a base merge on it, by the rule ship_carry.py (leo-workspace) carries a SHIP over: two parents, the first the pin,
+# the second on the base branch, and the PR's own diff on its new merge base is the pin's diff, every file and every
+# added and removed line in order (hunk positions and context may move with the base). Two compare reads, once per
+# head, on a worker: GitHub's compare of BASE...HEAD (its merge base must be the second parent: that proves it is on
+# the base, and its files are HEAD's own diff) and of PARENT...PIN (the pin's own diff on its old merge base).
+# land_judge still judges the new head in full, CI included, before the pinned merge.
+LAND_BASE_MERGE_JQ = ("{mb: .merge_base_commit.sha, files: [.files[]? | {f: .filename, s: .status, "
+                      "p: .previous_filename, d: .patch}]}")
+LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: a list that long may be cut short
+
+
+def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
+    """HEAD's second parent when DATA (the cache's read of the PR) says HEAD is a two-parent merge whose first parent
+    is PIN: a head that may be only a base merge on the pin (land_base_merge_why decides), else ""."""
+    head = str(head or "").lower()
+    if not pin or not SHA40.fullmatch(head) or str((data or {}).get("headRefOid") or "").lower() != head:
+        return ""
+    parents = (data or {}).get("headParents")
+    if not isinstance(parents, list) or len(parents) != 2:
+        return ""
+    first, second = (str(p or "").lower() for p in parents)
+    if not SHA40.fullmatch(first) or land_head_moved(pin, first) or not SHA40.fullmatch(second):
+        return ""
+    return second
+
+
+def land_diff_lines(patch: str) -> tuple[str, ...]:
+    """A file's added and removed lines, in order, from a compare's unified patch: what a base merge must not change.
+    Hunk headers and context lines are dropped, since base lines above or around a hunk move them."""
+    return tuple(line for line in str(patch or "").split("\n") if line[:1] in ("+", "-"))
+
+
+def land_base_merge_why(pin: str, head: str, parent: str, base: str, was: dict, now: dict) -> str:
+    """"" when HEAD is only a base merge on PIN (LAND_BASE_MERGE_JQ's comment), else why not, for head_moved's stop.
+    NOW is the compare BASE...HEAD and WAS the compare PARENT...PIN, each as LAND_BASE_MERGE_JQ shapes it."""
+    mb = str((now or {}).get("mb") or "").lower()
+    if mb != parent:
+        return (f"its second parent {parent[:12]} is not where it meets {base} (merge base {mb[:12] or 'unread'}): "
+                f"not a merge of {base}")
+    sides = []
+    for doc in (was, now):
+        files = (doc or {}).get("files")
+        if not isinstance(files, list) or len(files) >= LAND_COMPARE_FILES_MAX:
+            return (f"its compare lists {LAND_COMPARE_FILES_MAX} files or more, so it is not shown to be only a "
+                    "base merge")
+        side = {}
+        for f in files:
+            if not isinstance(f, dict) or not isinstance(f.get("d"), str):
+                name = (f or {}).get("f") if isinstance(f, dict) else "?"
+                return f"{name} shows no patch (binary or too large), so it is not shown to be only a base merge"
+            side[str(f.get("f") or "")] = (str(f.get("s") or ""), str(f.get("p") or ""), land_diff_lines(f["d"]))
+        sides.append(side)
+    if sides[0] != sides[1]:
+        name = sorted(n for n in set(sides[0]) | set(sides[1]) if sides[0].get(n) != sides[1].get(n))[0]
+        return (f"its diff against {base} differs from the pin {pin[:12]}'s in {name}: more than a base merge "
+                f"({parent[:12]})")
+    return ""
 
 
 def land_request_lane(req: dict) -> tuple[str, str] | None:
