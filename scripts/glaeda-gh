@@ -12614,6 +12614,16 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A judgment that merged the base into the PR itself: land_judge's stale_main_update and stale_ci_update (leo-workspace
+# tools/land_judge/engine.py) send update_branch pinned to the judged head inside the judgment and answer the running
+# checks' wait at that head ("checks still running at HEAD: main (TIP) was merged into the PR: ..."). The queue never
+# sent it, so nothing recorded it (updateSent), and the head the merge made stopped the pinned land head_moved:
+# teamleaderleo/glaeda#2495 (pinned 5bc3ba9e, base merge 0b53d1a3 by the lander bot at 12:03:42Z, 31 s after a
+# judgment) and manaflow-ai/cmuxterm-hq#18096 (pinned f2a95491, 1b282104 at 12:53:30Z, 21 s after one), 2026-11-22; each
+# re-queued by hand. note_judge_update records it as this queue's own (updateSent at HEAD), so follow_own_update's
+# parent check moves the pin to that merge and judges it in full, and any other head still stops head_moved.
+LAND_JUDGE_BASE_MERGED = re.compile(r"checks still running at ([0-9a-f]{40}): (?:the base )?\S+ \([0-9a-f]{7,40}\) "
+                                    r"was merged into the PR\b")
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
@@ -16373,6 +16383,7 @@ class LandQueue:
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
+            self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
@@ -16422,6 +16433,19 @@ class LandQueue:
                 return
             self.save(e)
         self.take(e, act, answer)
+
+    def note_judge_update(self, e: dict, answer: dict, head: str) -> None:
+        """Under the lock: when the judgment of E at HEAD merged the base into the PR itself (LAND_JUDGE_BASE_MERGED,
+        sent pinned to HEAD), record it as this queue's own update at HEAD (updateSent), as update_branch does when it
+        sends one. The merge it makes then follows the pin (follow_own_update: its parents include HEAD) instead of
+        stopping head_moved, and no second update is sent at HEAD (LAND_UPDATE_ONCE)."""
+        m = LAND_JUDGE_BASE_MERGED.search(str(answer.get("reason") or ""))
+        if not m or m.group(1) != head or not SHA40.fullmatch(head or ""):
+            return
+        if str((e.get("updateSent") or {}).get("head") or "").lower() == head:
+            return
+        e["updateSent"] = {"head": head, "at": self.now, "by": "land_judge"}
+        self.history(e, "update_by_judge", head=head[:12])
 
     def unjudgeable_here(self, e: dict, answer: dict, act: dict, head: str) -> str:
         """Under the lock: why this lane VM should hand E at HEAD to the broker host's land queue instead of judging it
