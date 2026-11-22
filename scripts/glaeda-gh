@@ -3136,8 +3136,11 @@ class AppPool:
 # itself, in process: gcp-agent-lane-1 measured direct reads at p50 0.46 s against 2.44 s through the broker, and
 # a tick that spent 643 s of a 600 s window waiting on the upstream. Leo: "why the f*** are you centralizing on
 # f***ing huge blue anyway". Everything the token cannot read (heads, comments, a refused route, a repo the broker
-# mints nothing for) still goes upstream, and every write still goes through the broker. upstream.json
-# "readToken": [...] names the program (`ARGV OWNER/REPO {}` answering {token, expires_at}); false turns it off.
+# mints nothing for) still goes upstream, and every write still goes through the broker. lane-gh has no command that
+# hands the token out: its `get` mints it (when lane-gh sends this VM's reads direct: its direct-reads.json or
+# LANE_GH_DIRECT_READS, the switch glaeda follows as is) and keeps it, so glaeda primes it with one small `get` of the
+# repo and reads the kept file. upstream.json "readToken": [...] names another program instead (`ARGV OWNER/REPO {}`
+# answering {token, expires_at}); false turns it off.
 # Kept where lane-gh's own direct reads keep it (leo-workspace#7651: TOKEN_DIR/OWNER__REPO.json, 0600, {token,
 # expires_at, refresh_before_s}), never in BASE (the cache holds no token): one broker mint per repo, shared by this
 # host's processes (the daemon, a wait's or a land's direct read, and lane-gh's own GETs). A file others can read is
@@ -3148,12 +3151,13 @@ READ_TOKEN_REST = 900.0  # a repo the broker minted nothing for is not asked aga
 READ_TOKEN_DEADLINE = 30.0  # one mint through the broker
 READ_DIRECT_BUDGET = 60.0  # a tick's direct reads together; what is left goes upstream
 READ_DIRECT_KINDS = ("pr", "run")
+READ_TOKEN_PRIME = '{"path": "pulls", "query": {"per_page": 1}}'  # the smallest read lane-gh sends direct
 READ_TOKEN_REPO = re.compile(r"^/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]+)(?:/|\?|$)")
 
 
 def read_token_command() -> list[str] | None:
     """The program that mints this host's read token, or None: upstream.json "readToken" (a list, or false for
-    none), else `lane-gh call read_token` of the lane-gh whose `glaeda-read` is the upstream."""
+    none), else `lane-gh call get` (the prime) of the lane-gh whose `glaeda-read` is the upstream."""
     doc = read_json(UPSTREAM_CONFIG)
     if not isinstance(doc, dict):
         return None
@@ -3164,16 +3168,39 @@ def read_token_command() -> list[str] | None:
         return given
     command = upstream_command()
     if command is not None and len(command) == 2 and Path(command[0]).name == "lane-gh" and command[1] == "glaeda-read":
-        return [command[0], "call", "read_token"]
+        return [command[0], "call", "get"]
     return None
 
 
-def read_token_mint(command: list[str], repo: str) -> tuple[str, float] | None:
-    """(token, expires epoch) from one run of COMMAND for REPO, or None. The token is never logged."""
+def read_token_kept(repo: str) -> tuple[str, float] | None:
+    """REPO's token as lane-gh (or this file) kept it, and the time to mint again (expires_at less its
+    refresh_before_s), or None. A file others can read is never used."""
+    path = READ_TOKEN_DIR / (repo.lower().replace("/", "__") + ".json")
     try:
-        result = run_bounded([program_path(command[0]), *command[1:], repo, "{}"], READ_TOKEN_DEADLINE)
+        if path.stat().st_mode & 0o077:
+            return None
+    except OSError:
+        return None
+    doc = read_json(path)
+    if not isinstance(doc, dict) or not TOKEN_RE.fullmatch(str(doc.get("token") or "")):
+        return None
+    expires = iso_epoch(str(doc.get("expires_at") or ""))
+    margin = doc.get("refresh_before_s")
+    margin = float(margin) if isinstance(margin, (int, float)) and margin >= 0 else READ_TOKEN_MIN_LEFT
+    return (str(doc["token"]), expires - margin) if expires is not None else None
+
+
+def read_token_mint(command: list[str], repo: str) -> tuple[str, float] | None:
+    """(token, the time to mint again) from one run of COMMAND for REPO, or None. `lane-gh call get` is the prime: its
+    answer (the repo's newest PR) is dropped and the token is the one lane-gh kept. The token is never logged."""
+    prime = len(command) >= 3 and Path(command[0]).name == "lane-gh" and command[1:3] == ["call", "get"]
+    try:
+        result = run_bounded([program_path(command[0]), *command[1:], repo, READ_TOKEN_PRIME if prime else "{}"],
+                             READ_TOKEN_DEADLINE)
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if prime:
+        return read_token_kept(repo) if result.returncode == 0 else None
     try:
         doc = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
     except ValueError:
@@ -3185,7 +3212,7 @@ def read_token_mint(command: list[str], repo: str) -> tuple[str, float] | None:
     token, expires = str(doc.get("token") or ""), iso_epoch(str(doc.get("expires_at") or ""))
     if not TOKEN_RE.fullmatch(token) or expires is None:
         return None
-    return token, expires
+    return token, expires - READ_TOKEN_MIN_LEFT
 
 
 class ReadTokenPool(AppPool):
@@ -3209,30 +3236,14 @@ class ReadTokenPool(AppPool):
     def kept_path(repo: str) -> Path:
         return READ_TOKEN_DIR / (repo.lower().replace("/", "__") + ".json")
 
-    def held(self, repo: str) -> tuple[str, float] | None:
-        """REPO's kept token and the time to mint again (expires_at less its refresh margin), or None."""
-        path = self.kept_path(repo)
-        try:
-            if path.stat().st_mode & 0o077:
-                return None
-        except OSError:
-            return None
-        doc = read_json(path)
-        if not isinstance(doc, dict) or not TOKEN_RE.fullmatch(str(doc.get("token") or "")):
-            return None
-        expires = iso_epoch(str(doc.get("expires_at") or ""))
-        margin = doc.get("refresh_before_s")
-        margin = float(margin) if isinstance(margin, (int, float)) and margin >= 0 else READ_TOKEN_MIN_LEFT
-        return (str(doc["token"]), expires - margin) if expires is not None else None
-
     def keep(self, repo: str, pair: tuple[str, float] | None) -> None:
         path = self.kept_path(repo)
         with contextlib.suppress(OSError):
             if pair is None:
                 path.unlink(missing_ok=True)
             else:
-                write_json(path, {"token": pair[0], "refresh_before_s": int(READ_TOKEN_MIN_LEFT),
-                                  "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(pair[1]))})
+                write_json(path, {"token": pair[0], "refresh_before_s": int(READ_TOKEN_MIN_LEFT), "expires_at":
+                                  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(pair[1] + READ_TOKEN_MIN_LEFT))})
 
     def token(self, owner: str) -> str | None:
         now = self.clock()
@@ -3241,17 +3252,18 @@ class ReadTokenPool(AppPool):
         held = self.tokens.get(owner)
         if held and held[1] > now:
             return held[0]
-        kept = self.held(owner)
+        kept = read_token_kept(owner)
         if kept is not None and kept[1] > now:
             self.tokens[owner] = kept
             return kept[0]
         pair = self.mint_pair(owner)
-        if pair is None or pair[1] - READ_TOKEN_MIN_LEFT <= now:
+        if pair is None or pair[1] <= now:
             self.why = f"the broker minted no read token for {owner}"
             self.rest_until[owner] = now + READ_TOKEN_REST
             return None
-        self.tokens[owner] = (pair[0], pair[1] - READ_TOKEN_MIN_LEFT)
-        self.keep(owner, pair)
+        self.tokens[owner] = pair
+        if (read_token_kept(owner) or ("",))[0] != pair[0]:  # lane-gh's prime kept it already
+            self.keep(owner, pair)
         return pair[0]
 
     def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:

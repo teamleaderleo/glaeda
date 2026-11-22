@@ -31663,6 +31663,27 @@ class LaneReadTokenTest(UpstreamTest):
     def upstream_keys(self) -> list[str]:
         return sorted(k["key"] for r in self.asked for k in r["keys"])
 
+    def test_the_lane_gh_prime_is_one_small_get_and_the_token_is_the_one_lane_gh_kept(self) -> None:
+        bin_dir = Path(tempfile.mkdtemp(prefix="glaeda-fake-lane-gh-"))
+        self.addCleanup(shutil.rmtree, bin_dir, True)
+        script, argv = bin_dir / "lane-gh", bin_dir / "argv"
+        expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        kept = {"token": self.READ, "expires_at": expires, "refresh_before_s": 300, "app": "lanes-read"}
+        script.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                          f"open({str(argv)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+                          f"path = {str(gg.READ_TOKEN_DIR / 'o__r.json')!r}\n"
+                          f"fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
+                          f"os.write(fd, json.dumps({kept!r}).encode())\n"
+                          "print(json.dumps({'ok': True, 'status': 200, 'data': [], 'direct': True}))\n")
+        script.chmod(0o755)
+        got = gg.read_token_mint([str(script), "call", "get"], "o/r")
+        self.assertEqual(got[0], self.READ)
+        self.assertAlmostEqual(got[1], gg.iso_epoch(expires) - 300, delta=1)
+        self.assertEqual(json.loads(argv.read_text()), ["call", "get", "o/r", gg.READ_TOKEN_PRIME])
+        pool = gg.ReadTokenPool([str(script), "call", "get"])
+        self.assertEqual(pool.token("o/r"), self.READ)  # read from the kept file, not rewritten
+        self.assertEqual(json.loads((gg.READ_TOKEN_DIR / "o__r.json").read_text())["app"], "lanes-read")
+
     def test_a_token_lane_gh_kept_is_used_and_one_others_can_read_is_not(self) -> None:
         kept = gg.READ_TOKEN_DIR / "o__r.json"  # as lane-gh's direct GET writes it (leo-workspace#7651)
         doc = {"token": self.READ, "app": "lanes-read", "refresh_before_s": 300,
@@ -31723,7 +31744,7 @@ class LaneReadTokenTest(UpstreamTest):
         config = gg.BASE / "upstream-test.json"
         with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
             gg.write_json(config, {"command": ["/x/lane-gh", "glaeda-read"]})
-            self.assertEqual(gg.read_token_command(), ["/x/lane-gh", "call", "read_token"])
+            self.assertEqual(gg.read_token_command(), ["/x/lane-gh", "call", "get"])
             gg.write_json(config, {"command": ["/x/lane-gh", "glaeda-read"], "readToken": False})
             self.assertIsNone(gg.read_token_command())
             gg.write_json(config, {"command": ["other"], "readToken": ["mint-it"]})
