@@ -779,9 +779,12 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 18)
+        self.assertEqual(len(signing), 19)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
+        # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
+        self.assertIn("sign-live-code-variant", signing)
+        self.assertNotIn("build-live-code-variant", signing)
         # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
         # here like its push; its payload names the same ref
         dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
@@ -797,7 +800,7 @@ class HookTest(unittest.TestCase):
                           {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
                           {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
                           {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
-                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          {"job": "build-nightly-app"}, {"job": "build-live-code-variant"}, {"job": "decide"}, {"job": None},
                           *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
                                                                           "merge_group")]):
             with self.subTest(dispatch=overrides):
@@ -4042,6 +4045,43 @@ class HookTest(unittest.TestCase):
         full = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
         self.assertEqual(full.returncode, 1, full.stdout)
         self.assertIn("refused: capacity: 4 of 14 units free, fast-tier (isolated) needs 5", full.stdout)
+
+    def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
+        """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
+        caught the fast tier with 4 of 14 free while its admission asked for its own p90 (8) and was refused after 60
+        s (job 137053521754 on cmux14, 2026-11-22). On a plain side runner of a needs host it is admitted by class."""
+        self.fleet()
+        doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
+               .strftime("%Y-%m-%dT%H:%M:%SZ"), "window": {"from": "2026-11-01", "to": "2026-11-14"},
+               "min_samples": 20, "jobs": {"cmux-next.yml/fast-tier": {
+                   "n": 50, "cores_p50": 4.0, "cores_p90": 8.0, "mem_peak_mib_p90": 500, "mem_peak_mib_max": 500,
+                   "wall_s_p50": 60, "wall_s_p90": 120}},
+               "classes": {"isolated": {"n": 50, "cores_p50": 3.0, "cores_p90": 6.0, "mem_peak_mib_p90": 500,
+                                        "mem_peak_mib_max": 500, "wall_s_p50": 60, "wall_s_p90": 120}}}
+        needs = self.dir / "needs.json"
+        needs.write_text(json.dumps(doc))
+        env = {**self.FAST_TIER, hook.HOST_CORES_ENV: "14", hook.HOST_MEM_ENV: str(48 * 1024),
+               hook.JOB_NEEDS_ENV: os.fspath(needs)}
+        self.take_units(10)  # 4 of 14 free, as on cmux14
+        try:
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("admitted at its class's need", side.stdout)
+            self.assertIn("holding 3/14 units for fast-tier (isolated", side.stdout)
+        finally:
+            self.finish("s2")
+
+    def test_only_a_plain_side_runner_admits_the_fast_tier_by_class(self) -> None:
+        base = dict(capacity_units=14, instance=2, canonical_roots=2, fast_runner=False, gui_runner=False,
+                    session_runner=False, dev_compile_runner=False, dedicated_admit=None, nightly_runner=False,
+                    gateway_runner=False, sim_runner=False, small_runner=False)
+        self.assertTrue(hook.plain_side_runner(argparse.Namespace(**base)))
+        for change in ({"capacity_units": 0}, {"instance": 1}, {"fast_runner": True}, {"gui_runner": True},
+                       {"session_runner": True}, {"dev_compile_runner": True}, {"dedicated_admit": Path("x")},
+                       {"nightly_runner": True}, {"gateway_runner": True}, {"sim_runner": True},
+                       {"small_runner": True}):
+            with self.subTest(change=change):
+                self.assertFalse(hook.plain_side_runner(argparse.Namespace(**{**base, **change})))
 
     def test_the_fast_runner_refuses_every_other_job(self) -> None:
         """The fast runner keeps listening on a full mini (it needs no general units), so another job that
@@ -12622,7 +12662,8 @@ class GateTest(unittest.TestCase):
 
     def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
-        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=10 * 1024**3)), \
+        # 16 GiB: short of one job's 20 GiB peak, over the full-disk line (FLEET_PAUSE_FULL, 15.3 GiB)
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=16 * 1024**3)), \
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             gate, stops = self.gate([None] * 3, busy=[True])
             gate.worker_pids = lambda: [4242]
@@ -13304,11 +13345,11 @@ class GateTest(unittest.TestCase):
 
     def test_a_short_disk_starts_reclaim_at_once_and_starts_the_listener_within_seconds(self) -> None:
         """DISK_RECLAIM_NOW (Leo, 2026-11-18: disk floors never refuse or pause work, they trigger reclaim and wait
-        seconds). An idle pool runner at 15 GiB free (one job's peak is 20) starts a floor eviction on its first look,
+        seconds). An idle pool runner at 16 GiB free (one job's peak is 20; over FLEET_PAUSE_FULL's 15.3) starts a floor eviction on its first look,
         waits at most DISK_RECLAIM_WAIT_S for room while it runs, and starts its listener whether or not room came."""
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        free, clock, logs, procs, started = {"gib": 15.0}, {"t": 1000.0}, [], [], []
+        free, clock, logs, procs, started = {"gib": 16.0}, {"t": 1000.0}, [], [], []
 
         def popen(argv: list[str], **_: object) -> mock.Mock:
             proc = mock.Mock(argv=argv)
@@ -13345,7 +13386,7 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.disk_short, "the wait is spent once")
             # room arrives during the wait: it starts as soon as it is there
             gate.child, gate.evicting, gate.disk_evicted_at = None, None, -hook.GATE_DISK_REPASS_S
-            free["gib"] = 15.0
+            free["gib"] = 16.0
             started.clear()
 
             def roomy_sleep(seconds: float) -> None:
@@ -13403,14 +13444,57 @@ class GateTest(unittest.TestCase):
             holds = [line for line in logs if "DISK_FULL_NO_LISTEN" in line]
             self.assertEqual(len(holds), 1, f"the hold is logged once, not every poll: {logs}")
             self.assertTrue(holds[0].startswith("holding the listener off: disk full"), holds)
-            # the pass ends having freed room above the hard floor (still under one job's peak): it listens
+            # the pass ends having freed room above the full-disk line (15.3 GiB, FLEET_PAUSE_FULL; still under one
+            # job's peak): it listens
             procs[0].poll.return_value = 0
-            free["gib"] = 15.0
+            free["gib"] = 16.0
             for _ in range(hook.GATE_CONFIRM + 1):
                 self.assertIsNone(gate.poll())
                 clock["t"] += hook.GATE_POLL_S
             self.assertTrue(started, "above the hard floor a short disk only warns: the listener starts")
             self.assertTrue(any("listening anyway" in line for line in logs), logs)
+
+    def test_a_disk_the_build_fleet_pauses_for_takes_no_runner_job_until_one_fits(self) -> None:
+        """FLEET_PAUSE_FULL (2026-11-22 09:53Z: a build Mac at 12.3 GiB free held 5 runner jobs while the fleet worker
+        beside them sat at claim_paused disk; every runner lost its connection mid-job). Full is the hard floor plus one
+        runner job's measured p95 (10 + 5.3 = 15.3 GiB), the line the fleet pauses by: an idle pool listener under it
+        holds with reclaim aimed at its floor, and listens again once free disk is back over it. A job running beside
+        it is never stopped: its look only reports the hold, which stops the listener at that job's end."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        disk = self.tmp / "runner-job-disk.json"
+        disk.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 5.3}))
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 12.3}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertEqual(hook.full_disk_gib(), 15.3)
+            full = "disk full: under 15.3 GiB, where no job of this runner fits; reclaiming (DISK_FULL_NO_LISTEN)"
+            self.assertEqual(gate.low_disk(), full, "above the hard floor, under the fleet's pause line: held")
+            self.assertEqual(cleanup.call_args.args[1], 30.0, "reclaim aims at the runner's floor")
+            free["gib"] = 15.2
+            self.assertEqual(gate.low_disk(), full)
+            free["gib"] = 15.4
+            self.assertIsNone(gate.low_disk(), "back over the line: it listens (a short disk only warns)")
+            self.assertIn("DISK_SHORT_RECLAIM", gate.disk_short[0] if gate.disk_short else "")
+            # no readable p95: the hard floor alone, as before
+            disk.write_text("{}")
+            free["gib"] = 12.3
+            self.assertEqual(hook.full_disk_gib(), hook.RUNNER_JOBS_FLOOR_GIB)
+            self.assertIsNone(gate.low_disk(), "with no measured job the line is the hard floor")
+        # a small runner's own 8 GiB peak still caps the line
+        small = self.runner.parent / "actions-runner-glaeda-9"
+        write_hook(small, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --small-runner\n")
+        disk.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 5.3}))
+        small_gate = hook.Gate(small, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free["gib"] = 12.3
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(small_gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIsNone(small_gate.low_disk(), "a small runner's jobs fit at 12.3 GiB")
 
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
@@ -14190,6 +14274,48 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
         self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
         self.assertIsNone(self.full_gate(capacity).full(fresh=True))
+
+    def test_the_signing_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
+        """SIGNER_FIRST, replaying cmux15's 2026-11-22 06:12-07:18Z gate log: "stopping the idle listener: a fleet
+        build holds the host lock" on both signing runners every 5 minutes, then 60 s offline. The holder was
+        disk-pressure.sh's cap-only pass (an exclusive host.lock for about 6 s). The signing listener stands down only
+        once a hold has lasted SIGNER_LOCK_SETTLE_S; an ordinary runner still stops at once."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(0)
+        held = "a fleet build holds the host lock"
+        script.write_text(base + " --instance 0\n")
+        self.assertEqual(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                                   capacity_dir=capacity).claimed(), None, "no hold yet")
+        fd = self.hold(fcntl.LOCK_EX)
+        self.assertEqual(self.full_gate(capacity).claimed(), held, "an ordinary runner stops at once")
+        script.write_text(base + " --instance 0 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        gate = self.full_gate(capacity)
+        clock = [1000.0]
+        with mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            for step in (0.0, 5.0, 6.0):  # the 6 s probe, polled while it holds
+                clock[0] = 1000.0 + step
+                self.assertIsNone(gate.claimed(), f"{step} s into a short hold")
+                self.assertIsNone(gate.confirmed(), "the fresh reading right before a stop agrees")
+            fcntl.flock(fd, fcntl.LOCK_UN)  # the probe lets go: the clock restarts
+            clock[0] = 1010.0
+            self.assertIsNone(gate.claimed())
+            self.assertIsNone(gate.lock_held_since)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a build that stays
+            for step in (0.0, 4.0, 8.0, 12.0, 16.0, hook.SIGNER_LOCK_SETTLE_S - 1):
+                clock[0] = 2000.0 + step
+                self.assertIsNone(gate.claimed())
+            clock[0] = 2000.0 + hook.SIGNER_LOCK_SETTLE_S
+            self.assertEqual(gate.claimed(), held, "a hold that lasts does stop the signer")
+            self.assertEqual(gate.confirmed(), held)
+            # a stale clock: seen held, then the listener ran a job and was not asked for a while
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            gate.lock_held_since, gate.lock_held_seen = 3000.0, 3005.0
+            clock[0] = 3600.0
+            self.assertIsNone(gate.claimed(), "the next short hold starts its own clock")
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)
