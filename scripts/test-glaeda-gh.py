@@ -34844,5 +34844,65 @@ class InCallRaceTest(Base):
         self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertIs(self.daemon.in_call, other)
 
+
+ADOPT_SCRIPT = r"""
+import importlib.machinery, importlib.util, os, subprocess, sys
+loader = importlib.machinery.SourceFileLoader("gg_adopt", sys.argv[1])
+spec = importlib.util.spec_from_loader("gg_adopt", loader)
+gg = importlib.util.module_from_spec(spec)
+loader.exec_module(gg)
+inherited = int(sys.argv[2])
+os.waitid(os.P_PID, inherited, os.WEXITED | os.WNOWAIT)  # it ended and is a zombie nobody here waits on
+adopted = gg.adopt_children()
+mine = subprocess.Popen(["sh", "-c", "exit 7"])  # started after adoption: its status stays its own
+os.waitid(os.P_PID, mine.pid, os.WEXITED | os.WNOWAIT)
+reaped = gg.reap_children()
+try:
+    os.kill(inherited, 0)
+    gone = False
+except ProcessLookupError:
+    gone = True
+print(adopted, reaped, gone, mine.wait(), sorted(gg.ADOPTED))
+"""
+
+
+class ChildReapTest(unittest.TestCase):
+    """A re-exec keeps the pid and its children but drops the Popens that would have waited on them (2026-11-22:
+    18 <defunct> [python3] children of cosmic-gray's serve). serve adopts them at start and reaps them each tick;
+    fire-and-forget children are tracked by spawn_detached."""
+
+    def test_a_child_handed_down_by_an_exec_is_reaped_without_taking_another_childs_status(self) -> None:
+        # bash starts `true` in the background, then execs Python in the same pid: the shape of serve's os.execv.
+        out = subprocess.run(["/bin/bash", "-c", 'true & exec "$0" -I -c "$1" "$2" "$!"', sys.executable,
+                              ADOPT_SCRIPT, os.fspath(ROOT / "scripts" / "glaeda-gh")],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.split(), ["1", "1", "True", "7", "[]"])
+
+    def test_a_detached_child_is_reaped_once_it_ends(self) -> None:
+        proc = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            self.assertIn(proc, gg.DETACHED)
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+            self.assertGreaterEqual(gg.reap_children(), 1)
+            self.assertNotIn(proc, gg.DETACHED)
+            self.assertEqual(proc.returncode, 0)
+        finally:
+            with contextlib.suppress(ValueError):
+                gg.DETACHED.remove(proc)
+            proc.wait()
+
+    def test_a_live_detached_child_is_kept(self) -> None:
+        proc = gg.spawn_detached([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+        try:
+            gg.reap_children()
+            self.assertIn(proc, gg.DETACHED)
+        finally:
+            proc.stdin.close()
+            proc.wait()
+            gg.reap_children()
+        self.assertNotIn(proc, gg.DETACHED)
+
+
 if __name__ == "__main__":
     unittest.main()
