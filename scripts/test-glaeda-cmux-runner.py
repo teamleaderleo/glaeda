@@ -1391,7 +1391,18 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hook.job_tier(**{**dev, "job": "release-compile"}), hook.TIER_NIGHTLY)
         daily = {**dev, "event_name": "workflow_dispatch",
                  "event": {"repository": CMUX, "inputs": {"dev_daily": "true"}}}
-        self.assertEqual(hook.job_tier(**daily), hook.TIER_DEV)
+        # DELIVERY_COMPILE_FIRST: delivery compiles (the DEV daily's, the promote compile) rank nightly, so the nightly
+        # slot takes them (DEV daily run 44941204257 waited 76 min on the side label); a push's DEV compile stays DEV
+        self.assertEqual(hook.job_tier(**daily), hook.TIER_NIGHTLY)
+        self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**daily)), "the nightly slot takes the DEV daily compile")
+        self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**{**dev, "job": "release-compile"})))
+        self.assertIsNotNone(hook.nightly_slot_refusal(hook.job_tier(**dev)), "a push's DEV compile is no delivery")
+        for overrides in ({"event": {"repository": CMUX, "inputs": {"dev_daily": "false"}}},
+                          {"event": {"repository": CMUX}}, {"ref": "refs/heads/main"},
+                          {"workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/main"},
+                          {"job": "release-compile"}, {"job": "swift-test"}, {"repository": "other/cmux"}):
+            with self.subTest(daily=overrides):
+                self.assertNotEqual(hook.job_tier(**{**daily, **overrides}), hook.TIER_NIGHTLY)
         self.assertEqual(hook.job_tier(**{**dev, "job": "swift-test"}), "")
         self.assertEqual(hook.job_tier(**{**dev, "event_name": "pull_request"}), "")
         # FEED_TREE: a feat-cmux-next push's cmux-tui tree build feeds that push's nightly, so it ranks with the DEV
@@ -9039,11 +9050,16 @@ class HostLoadCapTest(unittest.TestCase):
 
     def poll(self) -> str | None:
         """Three looks: two reads make a mean, the first over the cap starts the feed read (waited for), the last
-        decides with it."""
+        decides with it. The last look is waited for too, after the decision it returns: cap_look() starts nothing
+        while the previous cap_thread is alive (glaeda#2386), so a look left running here swallows whatever the body
+        calls next - its own load_capped(), or the one it makes after patching what the look reads. Waiting here, not
+        in each body, is what keeps a body that forgets from failing only under load."""
         for _ in range(2):
             self.gate.load_capped()
             self.join()
-        return self.gate.load_capped()
+        why = self.gate.load_capped()
+        self.join()
+        return why
 
     def join(self) -> None:
         # A loaded CI runner can take past 5 s here (glaeda#2108 and #2110, 3 of 4 runs): the next look then judged
@@ -9138,6 +9154,30 @@ class HostLoadCapTest(unittest.TestCase):
         self.gate.cap_samples.clear()
         with mock.patch.object(hook, "load_cap_fetch", return_value=None):
             self.assertIsNone(self.poll(), "an unreachable controller holds nothing")
+
+    def test_the_signing_listener_is_never_held_off_by_load(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-21 20:50-21:07Z gate log: load 1.5 to 3 per core from the
+        ultra1-guest PR worker while another host (cmux15) takes the label's jobs. The signing listener
+        (--trusted-next-signing) logged "the host is over its load cap ... while another host's listener takes
+        glaeda-trusted-next-signing jobs" and "the mini is saturated" and stopped, again and again. It must listen; a
+        side runner beside it is still held (the PR work yields, not the signer); memory pressure still holds it."""
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        scope = hook.RunnerScope(trusted_signing=True)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1):
+            self.assertIsNotNone(self.poll(), "a side runner is held for another host's listener")
+            self.assertIsNotNone(self.gate.saturated(), "and for the overloaded mini")
+            self.gate.cap_samples.clear()
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.poll(), "the signing listener keeps listening over the load cap")
+                self.assertIsNone(self.gate.saturated(), "and through CPU saturation and overload")
+            with mock.patch.object(hook, "runner_scope", return_value=scope), \
+                    mock.patch.object(hook, "memory_pressure_level", return_value=2):
+                self.assertIsNotNone(self.gate.saturated(), "memory pressure is the host's own limit: it holds")
 
     def test_exempt_runners_and_the_off_switch(self) -> None:
         self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
@@ -9362,7 +9402,6 @@ class HostLoadCapTest(unittest.TestCase):
         self.receipt(["glaeda-mini", self.SIDE_LIGHT])
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
-        self.join()  # poll's last look is still reading; the next one would be skipped as one already runs
         self.assertIn(self.LABEL, self.gate.cap_labels, "the union holds before the next look")
         reading, seen = threading.Event(), []
 
@@ -9388,7 +9427,6 @@ class HostLoadCapTest(unittest.TestCase):
         self.receipt(["glaeda-mini", self.SIDE_LIGHT])
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
-        self.join()  # poll's last look is still reading; the next one would be skipped as one already runs
         self.assertIn(self.LABEL, self.gate.cap_labels, "the dispatch is seen while the feed still shows it")
         store = hook.observed_label_file(self.state, self.runner)
         self.assertTrue(store.exists(), "the sighting is written down, not only held in this process")
@@ -9457,9 +9495,31 @@ class HostLoadCapTest(unittest.TestCase):
         (self.state / "instance-2" / "receipt.json").write_text("{ not json")
         self.jobs = [self.job("completed", runner="cmux21-glaeda-2"), self.job("queued")]
         self.poll()
-        self.join()  # the same lingering look: read what the last one published, not what the one before it did
         self.assertEqual(self.gate.cap_labels, frozenset({self.LABEL}), "the dispatches still stand on their own")
         self.assertEqual(self.gate.cap_label_drift, [], "an absent receipt is not a receipt that understates itself")
+
+    def test_poll_leaves_no_look_running_for_the_next_call_to_coalesce_into(self) -> None:
+        # glaeda#2386: cap_look() starts nothing while the previous cap_thread is alive, so a body that calls
+        # load_capped() (or patches what the look reads and then calls it) straight after poll() can have that call
+        # swallowed by poll's own leftover look and never see the read it is testing. Three bodies here read gate
+        # state right after poll() and would have to remember the join themselves. The helper ends its last look
+        # instead, so no body can forget it.
+        reads = []
+
+        def slow(now: float) -> dict | None:
+            reads.append(now)
+            time.sleep(0.25)  # long enough that a look still running at the return is not a timing accident
+            return self.fetch(now)
+
+        with mock.patch.object(hook, "load_cap_fetch", side_effect=slow):
+            self.poll()
+        # The read count first: "no look is running" is also true when no look ever started, so without this the
+        # assertion below would pass vacuously the day a change stops poll() deciding from a feed read at all.
+        # Two, not three: the first load_capped() has a single load sample, so mean_load_per_core returns None and
+        # it returns before cap_look(). Reads happen on looks 2 and 3.
+        self.assertEqual(len(reads), 2, "poll() no longer reads the feed; this test would pass for the wrong reason")
+        self.assertFalse(self.gate.cap_thread is not None and self.gate.cap_thread.is_alive(),
+                         "poll left a look running: the next call coalesces into it and does nothing")
 
 
 class StarvedReserveTest(unittest.TestCase):
@@ -14059,6 +14119,23 @@ class GateTest(unittest.TestCase):
                           " --min-free-gib 30 --sim-runner --test-keychain --recycle-testmanagerd --capacity-units 10"
                           " --compile-slots 2 --canonical-roots 2 --instance 13\n")
         return self.full_gate(capacity)
+
+    def test_the_signing_listener_listens_on_a_mini_whose_units_are_all_taken(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-22 00:01-00:45Z gate log: "stopping the idle listener: all 30
+        capacity units on this mini are taken", five times, while PR jobs held every unit. The signing listener
+        listens anyway (its job waits at admission and drains the mini, SIGNING_DRAIN); a side runner beside it is
+        still held, and memory, disk and the fleet's holds still apply."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(30)
+        script.write_text(base + " --instance 0\n")
+        held = self.full_gate(capacity).full()
+        self.assertIn("all 30 capacity units on this mini are taken", held or "", "an ordinary runner is held")
+        script.write_text(base + " --instance 0 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
+        self.assertIsNone(self.full_gate(capacity).full(fresh=True))
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)

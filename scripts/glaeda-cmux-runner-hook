@@ -3287,12 +3287,12 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # nightly app build queued behind PR jobs: "BUT WTF COULD POSSIBLY BE MORE IMPORTANT ON OUR FUCKING MINIS".
 #   - NIGHTLY: every nightly.yml job of manaflow-ai/cmux on a nightly-next or main push, schedule or dispatch (NEXT and
 #     classic nightly: build-nightly-app, promote, the sign, notarize and verify jobs), every job of main's dispatch
-#     of cmux-next-dev-daily.yml (the DEV feed's sign, verify and tip DMG: DEV_DAILY_FEED), and the Release compile
-#     on a feat-cmux-next push that gates nightly-next's promotion. A waiting nightly job is admitted next, ahead of every
+#     of cmux-next-dev-daily.yml (the DEV feed's sign, verify and tip DMG: DEV_DAILY_FEED), the Release compile
+#     on a feat-cmux-next push that gates nightly-next's promotion, and the DEV daily's compile (DELIVERY_COMPILE_FIRST). A waiting nightly job is admitted next, ahead of every
 #     other waiter however long it has waited; no admission of any other tier takes a unit while one waits here; and
 #     it keeps no idle runner's reserve (GUI_RESERVE, FRESH_RESERVE_TOKEN).
 #   - DEV: the other feed compiles the freshness slot admits (dev_compile_refusal: a feat-cmux-next push's DEV
-#     compile, a DEV daily's), and a feat-cmux-next push's cmux-tui tree build (FEED_TREE). Ahead of PR and side
+#     compile), and a feat-cmux-next push's cmux-tui tree build (FEED_TREE). Ahead of PR and side
 #     jobs, except one that has waited FEED_JUMP_S: that keeps its arrival order against feed builds, so a stream of
 #     them cannot starve it.
 #   - STACK: a manaflow-ai/cmux pull request job whose PR carries the `stack-blocker` label (STACK_BLOCKER_LABEL): a
@@ -3334,6 +3334,20 @@ NIGHTLY_VERIFY_REF = "refs/heads/main"
 # Only the schedule: a dispatch may pick its own build and harness, so it keeps the ordinary tier (review of #1747).
 NIGHTLY_VERIFY_EVENTS = ("schedule",)
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
+# DELIVERY_COMPILE_FIRST: the compiles that build a feed's app rank with the nightly jobs (TIER_NIGHTLY), so the nightly
+# slot admits them and they wait first in line: nightly.yml's own jobs, the promote compile above, and the DEV daily's
+# compile (cmux-next.yml cmux-scheme-compile, a feat-cmux-next workflow_dispatch with dev_daily=true, which
+# dev_compile_refusal already vets). The DEV daily compile ranked TIER_DEV, so the nightly slot label refused it and
+# cmux's placement could send it only to the DEV slot or the side label: DEV daily run 44941204257 (2026-11-21) waited
+# 76 min in glaeda-side-std-xcode-26.6's queue behind about 130 PR jobs, was refused there for units, and its re-run
+# (job 136980872425) queued on the same label again (cmux#49405). Leo: "Nightlies come first on the fleet". A
+# feat-cmux-next push's DEV compile is no delivery (it publishes nothing) and keeps TIER_DEV.
+
+
+def delivery_compile(event_name: str | None, job: str | None) -> bool:
+    """Whether a feed compile dev_compile_refusal admitted delivers a build (DELIVERY_COMPILE_FIRST): a feat-cmux-next
+    push's promote compile, or a DEV daily dispatch's compile. Pure; the caller has already vetted the job."""
+    return (job == PROMOTE_COMPILE and event_name == "push") or event_name == "workflow_dispatch"
 TIER_NIGHTLY, TIER_DEV, TIER_STACK = "nightly", "dev", "stack"
 FEED_JUMP_S = 20 * 60.0
 # claude-sr2, 2026-10-29, after cmux#26809's swift test sat 45+ min queued behind ordinary PR swift tests while about
@@ -3389,6 +3403,7 @@ def nightly_slot_refusal(tier: str) -> str | None:
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
             "main's nightly-next canary and launch smoke, the Release compile that gates nightly-next's promotion, "
+            "the DEV daily's compile, "
             f"and the release and pin builds: {release_pin_note()}) and a same-repository pull request labelled "
             f"{STACK_BLOCKER_LABEL}")
 
@@ -3499,7 +3514,7 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
     if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
         return ""
     if dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None:
-        return TIER_NIGHTLY if job == PROMOTE_COMPILE and event_name == "push" else TIER_DEV
+        return TIER_NIGHTLY if delivery_compile(event_name, job) else TIER_DEV
     if feed_tree_build(event_name, ref, repository, event, workflow_ref, job):
         return TIER_DEV
     if release_pin_build(event_name, ref, repository, event, workflow_ref, job):
@@ -8530,6 +8545,16 @@ HOST_LOAD_CAP_CONTROLLER_CONFIG = ".local/share/cmux-fleet-client/client.json"  
 HOST_LOAD_CAP_URGENT = re.compile(r"(?i)nightly|promot")  # in a workflow or branch name: the urgent class
 LOAD_CAPPED = "the host is over its load cap"
 
+# SIGNER_FIRST (Leo: "Nightlies come first on the fleet."): the trusted signing runner (--trusted-next-signing, the
+# listener of glaeda-trusted-next-signing) is never held off by host load, neither the load cap above nor the CPU and
+# overload holds in Gate.saturated. On 2026-11-21 21:00Z ultra1 (30 cores, the fastest signer) stopped its idle signing
+# listener again and again ("the host is over its load cap ... while another host's listener takes
+# glaeda-trusted-next-signing jobs", "the mini is saturated") because the ultra1-guest PR worker and the xl runners kept
+# the load at 45-73. cmux15 alone signed, 3 min slower, and the nightly feed stood 168 min behind the newest landing.
+# Load on a signing host is lower-priority work (PR CI) by definition: a nightly signing job drains the mini
+# (SIGNING_DRAIN) and the work beside it yields at its own admission; the signer never stands down for it. Memory
+# pressure, disk, the fleet's reservations and a drain still hold it: those are the host's limits, not other work's.
+
 
 def host_load_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> float:
     """The cap in load1 per core, 0 for off: CMUX_CI_HOST_LOAD_CAP when set ("off" or 0 is off; an invalid value
@@ -10782,7 +10807,8 @@ class Gate:
         another host's listener keeps up with its label, or None. Only defers: the moment no other listener keeps
         up (a job waits HOST_LOAD_CAP_GRACE_S, an urgent or pinned job queues, or the feed cannot say) it listens."""
         scope = runner_scope(self.runner_dir)
-        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or scope.dedicated
+        exempt = (scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or scope.dedicated
+                  or scope.trusted_signing)  # SIGNER_FIRST
         if exempt:
             return self.cap_release(None)
         self.cpu_holds()  # refreshes self.cap with the other settings, at most every GATE_SETTINGS_EVERY_S
@@ -11077,7 +11103,8 @@ class Gate:
         about no CPU, and the build they submit runs wherever the controller has room."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        exempt = scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway
+        exempt = (scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway
+                  or scope.trusted_signing)  # SIGNER_FIRST
         cpu_hold = not exempt and self.cpu_holds()
         overload = None if exempt else self.overload  # cpu_holds() above refreshed it
         if not cpu_hold and overload is None:
@@ -11590,7 +11617,12 @@ class Gate:
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
         scope = runner_scope(self.runner_dir)
-        if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
+        if scope.nightly or scope.trusted_signing:
+            # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini. SIGNER_FIRST: so does the
+            # trusted signing runner. Its job waits at admission as a nightly waiter (FEED_FIRST), and from then on no
+            # new PR or side job takes a unit (SIGNING_DRAIN): the units are reserved at admission, the running jobs
+            # finish, none is killed. ultra1, 2026-11-22 00:01-00:45Z: "all 30 capacity units on this mini are taken"
+            # stopped the idle signing listener five times while PR jobs filled the units.
             self.full_why = None
             return None
         own = max(self.fit_units, listen_fit_units(self.runner_dir))
