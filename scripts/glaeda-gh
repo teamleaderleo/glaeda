@@ -19294,7 +19294,8 @@ def _direct_read(req: dict) -> str | None:
     # overwrite the minutes the daemon counted since (review of glaeda#1942).
     daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]
     daemon.now = time.time()
-    daemon.tick_deadline = time.monotonic() + DIRECT_READ_BUDGET
+    budget = float(req.get("budget") or DIRECT_READ_BUDGET)
+    daemon.tick_deadline = time.monotonic() + budget
     entry = {"key": key, "jobs": bool(req.get("jobs")), "cache": read_cache(key), "touched": daemon.now,
              "waitedAt": daemon.now, "waitBegan": float(req["began"]), "readers": [], "reader": "", "consumers": {}}
     if broker is not None:
@@ -19311,7 +19312,7 @@ def _direct_read(req: dict) -> str | None:
                 daemon.fetch_run(entry)
                 error = None
     except OutOfTime:
-        return f"no answer within {DIRECT_READ_BUDGET}s"
+        return f"no answer within {budget:g}s"
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
     finally:
@@ -20066,18 +20067,51 @@ def pr_rollup_head(repo: str, number: int, sha: str, now: float) -> tuple[dict |
             "age": round(max(0.0, now - at), 1), "rollup": rollup}, ""
 
 
+# `checks --pr N` when this host holds no read of PR N at all: one direct read of it here (direct_read: on a lane VM
+# `lane-gh call get`, which reads GitHub with the VM's own read-only token where hq#17426 gives it one, else the
+# broker), bounded by CHECKS_PR_DIRECT_BUDGET, then the rollup route again. A failed one is not tried again for the
+# same PR for CHECKS_PR_DIRECT_BACKOFF (a stalled upstream would cost every caller the budget, every call); the
+# watch registered beside it lets the daemon's own read land the first answer after the upstream recovers.
+CHECKS_PR_DIRECT_BUDGET = 20.0
+CHECKS_PR_DIRECT_BACKOFF = 120.0
+CHECKS_PR_DIRECT_FAILS = "checks-pr-direct.json"  # {key: the time a direct read of it last failed}
+
+
+def checks_pr_direct(key: str, now: float) -> str | None:
+    """One bounded direct read of the PR KEY for `checks --pr`, unless one failed within CHECKS_PR_DIRECT_BACKOFF or
+    the bucket it would go over is spent. None when it stored a read, else why not (said in `unread`)."""
+    path = BASE / CHECKS_PR_DIRECT_FAILS
+    fails = read_json(path) or {}
+    last = fails.get(key) if isinstance(fails, dict) else None
+    if isinstance(last, (int, float)) and not isinstance(last, bool) and 0 <= now - last < CHECKS_PR_DIRECT_BACKOFF:
+        return f"its direct read failed {int(now - last)}s ago"
+    blocked = blocked_now("pr")
+    if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
+        return f"no direct read: {blocked['text']}"
+    error = direct_read({"key": key, "kind": "pr", "jobs": False, "began": now, "budget": CHECKS_PR_DIRECT_BUDGET})
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        kept = {k: v for k, v in (fails if isinstance(fails, dict) else {}).items()
+                if isinstance(v, (int, float)) and 0 <= now - v < CHECKS_PR_DIRECT_BACKOFF and k != key}
+        if error:
+            kept[key] = now
+        write_json(path, kept)
+    return f"its direct read failed: {error}" if error else None
+
+
 def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool,
                pr: int | None = None) -> int:
     """Every check of each commit, from the daemon's cache. The daemon reads each head once for all
     sessions, within the consumer's hourly budget; a head it may not read is served stale or reported
     unread, and this command never reads GitHub itself. With PR, a head the store has no entry for is
     served from that PR's cached rollup when it is of this head and all green (pr_rollup_head); each
-    head names its route (head or pr-rollup)."""
+    head names its route (head or pr-rollup). PR N is registered for the daemon's read as well, and a PR this host
+    holds no read of gets one bounded direct read (checks_pr_direct) before the head is called unread."""
     if not CONSUMER_RE.fullmatch(consumer or ""):
         raise WatchError("--consumer must be a short name (letters, digits, . _ -), e.g. autoland")
     keys = {}
     for sha in shas:
         keys[sha.lower()] = parse_key("head", f"{repo}@{sha}")
+    pr_key = parse_key("pr", f"{repo}#{pr}") if pr is not None else None
     began, start = time.time(), time.monotonic()
     touched = -TOUCH_EVERY
     down, down_since = DownWait(), None
@@ -20097,6 +20131,8 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if now - touched >= TOUCH_EVERY:
             for key in keys.values():
                 register(key, consumer=consumer)
+            if pr_key is not None:  # one look: dropped once the daemon has read it, unless asked again
+                register(pr_key, once=True)
             touched = now
         served, missing = {}, []
         for sha, key in keys.items():
@@ -20128,6 +20164,11 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         else:
             why = "budget spent" if spent else "not read yet"
             second, why_not = pr_rollup_head(repo, pr, sha, time.time()) if pr is not None else (None, "")
+            if pr_key is not None and second is None and not (read_cache(pr_key) or {}).get("data"):
+                direct_why = checks_pr_direct(pr_key, time.time())
+                second, why_not = pr_rollup_head(repo, pr, sha, time.time())
+                if direct_why and second is None:
+                    why_not = f"{why_not}; {direct_why}"
             if second is not None:
                 heads[sha] = second
             else:

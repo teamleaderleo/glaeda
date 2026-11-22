@@ -9930,6 +9930,56 @@ class HeadChecksTest(Base):
             self.assertIn(why, doc["unread"][SHA_A])
 
 
+    def no_pr_read_fixture(self) -> str:
+        """A running daemon with no entry for any head and no read of PR o/r#7 at all; returns the PR's key."""
+        self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP)
+        key = gg.parse_key("pr", "o/r#7")
+        (gg.cache_dir() / gg.file_name(key)).unlink()
+        return key
+
+    def test_pr_rollup_with_no_pr_read_registers_it_and_reads_it_directly_once(self) -> None:
+        key = self.no_pr_read_fixture()
+        asked = []
+
+        def read(req):  # the direct read stores the PR's read as the daemon would
+            asked.append(req)
+            self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP, age=1.0)
+        with mock.patch.object(gg, "direct_read", side_effect=read):
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertEqual((code, doc["unread"], doc["heads"][SHA_A]["route"]), (gg.EXIT_OK, {}, "pr-rollup"))
+        self.assertEqual([(r["key"], r["kind"], r["budget"]) for r in asked], [(key, "pr", gg.CHECKS_PR_DIRECT_BUDGET)])
+        watch = gg.read_json(gg.watch_dir() / gg.file_name(key))
+        self.assertIsInstance((watch or {}).get("since"), float)  # the daemon reads it too, as a one-look watch
+        # a PR read already held: no direct read, whatever its head
+        self.pr_rollup_fixture(SHA_B, self.GREEN_ROLLUP)
+        with mock.patch.object(gg, "direct_read", side_effect=AssertionError("read again")):
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertIn("cached head is " + SHA_B[:12], doc["unread"][SHA_A])
+
+    def test_pr_rollup_direct_read_that_fails_is_said_and_not_retried_within_the_backoff(self) -> None:
+        key = self.no_pr_read_fixture()
+        with mock.patch.object(gg, "direct_read", return_value="no answer within 20s") as read:
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+            self.assertEqual((code, doc["heads"]), (gg.EXIT_PARTIAL, {}))
+            self.assertEqual(doc["unread"][SHA_A], "not read yet; no cached read of #7; "
+                                                   "its direct read failed: no answer within 20s")
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+            self.assertEqual(read.call_count, 1)
+            self.assertRegex(doc["unread"][SHA_A], r"its direct read failed \d+s ago$")
+        # past the backoff it is tried again
+        gg.write_json(gg.BASE / gg.CHECKS_PR_DIRECT_FAILS, {key: time.time() - gg.CHECKS_PR_DIRECT_BACKOFF - 1})
+        with mock.patch.object(gg, "direct_read", return_value="boom") as read:
+            self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertEqual(read.call_count, 1)
+        # a spent bucket is not spent on again
+        spent = {"exhausted": True, "routed": "graphql", "bucket": "graphql", "text": "GraphQL is spent until 01:00Z"}
+        gg.write_json(gg.BASE / gg.CHECKS_PR_DIRECT_FAILS, {})
+        with mock.patch.object(gg, "blocked_now", return_value=spent), \
+                mock.patch.object(gg, "direct_read", side_effect=AssertionError("read a spent bucket")):
+            code, doc = self.run_checks("o/r", [SHA_A], "session-1", 120, 0, True, pr=7)
+        self.assertIn("no direct read: GraphQL is spent until 01:00Z", doc["unread"][SHA_A])
+
+
 def cli_run(ghdir: Path, *args, stderr=None, shell_prefix=()) -> tuple[subprocess.CompletedProcess, float]:
     """The real CLI in a subprocess, because fd 2 is the thing under test here.
 
