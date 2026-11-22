@@ -24728,6 +24728,32 @@ class LandTest(Base):
         self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LA, "", git))
         self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, "", LB, git))
         self.assertIsNone(gg.land_pin_behind_refusal("o/r", 1, LA, LB, lambda rest: None))
+
+    def test_a_pin_typed_out_from_an_abbreviated_head_is_refused_by_name(self):
+        """Measured twice on 2026-11-21: a pin was written by taking the 10-hex head a command had printed and
+        filling the rest in, `71b0560d5f` + zeros for a head that really ends `ffc48103c984e90c77ec6672abaeac5`.
+        The request was accepted and answered "requested; the daemon takes it next tick", and the row could then
+        only wait out a head that does not exist. No commit of the repository has that sha, but nothing local can
+        say so cheaply. What can: a 40-hex pin that shares a long prefix with the cached head and then differs is
+        not two commits that happen to collide (12 hex is one chance in 2^48), it is an abbreviation someone
+        finished by hand."""
+        invented = LB[:12] + "0" * 28
+        said = gg.land_pin_extends_head_refusal("o/r", 1, invented, LB)
+        self.assertIsNotNone(said)
+        why, nxt = said
+        self.assertIn(f"--match-head-commit {invented[:12]}", why)
+        self.assertIn(LB[:12], why, "the head this host last read is named")
+        self.assertEqual(nxt, f"glaeda-gh land o/r#1 --match-head-commit {LB}")
+        # Nothing else is refused: the pin is the head, a pin of a commit the cache has not seen (the normal
+        # pinned land, whose sha shares no prefix), a short pin the caller never extended, or no cached head.
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, LB, LB))
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, LA, LB))
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, LB[:12], LB))
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, invented, ""))
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, "", LB))
+        # The bound on the claim: a shared prefix shorter than the one a human reads off a line proves nothing.
+        self.assertIsNone(gg.land_pin_extends_head_refusal("o/r", 1, LB[:4] + "0" * 36, LB))
+
         # The cached head it judges against: only an open PR read inside the bound says one.
         now = time.time()
         self.store_pr(land_pr(LB), at=now)
@@ -24740,6 +24766,25 @@ class LandTest(Base):
             self.assertEqual(gg.land_cached_head(self.KEY, gg.LAND_PIN_BEHIND_AGE), "", why)
         (gg.cache_dir() / gg.file_name(self.KEY)).unlink()
         self.assertEqual(gg.land_cached_head(self.KEY, gg.LAND_PIN_BEHIND_AGE), "", "no read at all")
+
+    def test_land_refuses_a_pin_that_extends_the_cached_head_by_hand(self):
+        """The request answers it, like the ancestor case: nothing queued, nothing read from GitHub, and the step
+        is the same command with the whole head. A row pinned to a sha no commit has waits out a head that cannot
+        come, which is the slowest way for a typed-out abbreviation to be found."""
+        invented = LB[:12] + "0" * 28
+        self.pr(LB)
+        self.store_pr(land_pr(LB))
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, invented)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"]), (gg.EXIT_FAIL, False, "land_pin_invented"))
+        self.assertIn(LB, doc["next"])
+        self.assertIn("land_pin_invented", gg.LAND_REQUEST_REFUSED)
 
     def test_land_refuses_a_pin_behind_the_head_and_names_the_head_to_pin(self):
         """The request answers it: nothing is queued, nothing is read from GitHub, and the step is the same command
