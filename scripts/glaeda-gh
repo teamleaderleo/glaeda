@@ -11676,7 +11676,7 @@ LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's -
 LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
 LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
-LAND_SERVE_OPS = ("land", "withdraw", "status", "batch")
+LAND_SERVE_OPS = ("land", "withdraw", "status", "batch", "room")
 LAND_FORWARDED = "forwarded"
 LAND_REQUESTER_SHAPE = re.compile(r"[^\s\x00-\x1f]{1,200}")  # acpmux send takes it as one argv word
 LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
@@ -11689,6 +11689,54 @@ def land_executor(config: dict | None = None) -> list[str] | None:
     if isinstance(command, list) and command and all(isinstance(a, str) and a for a in command):
         return command
     return None
+
+
+# Land overflow: more than one host takes a busy host's lands. huge-blue, 2026-11-22 07:59Z: 888 open, 624 due late (the
+# oldest 8.9 h), 1-3 of 12 workers busy, held by its own load line (1.0/core, mostly the lane-gh broker, acpmux and
+# reviews, not land work), while air-blue's queue (5 workers) and cmux16's (6) had 0 due late. Leo: "if huge-blue is
+# so weak and liable to falling over, then don't put so much reliance on it." land.json's "overflow" names peer land
+# hosts, each as a program like "executor" (`["reach", "air-blue", ".local/bin/glaeda-gh", "land", "serve"]`). A due
+# row this host's own gates (workers, load line) have held LAND_OVERFLOW_AFTER past its due time goes to the first
+# peer whose `land serve` "room" answer has room, at most that many, as an executor handoff does (requester, lane,
+# override and request id kept; the peer's queue judges it with its own reads and login and tells the requester).
+# Here it is left "forwarded", naming the peer. A row held by the login's latch, parked on quota or landing --after
+# another stays here: the peer would read on the same login, and a chain keeps its order on one host. A peer answers
+# room only from its own last land-pool line (LAND_POOL_FILE, at most LAND_ROOM_FRESH old), never more than its idle
+# workers less the rows already due there, and none at its own load line, so two hosts never pass rows back and forth
+# (a host with an executor serves nothing).
+LAND_OVERFLOW_KEY = "overflow"
+LAND_OVERFLOW_AFTER = 600.0
+LAND_OVERFLOW_EVERY = 120.0  # at most one overflow pass this often
+LAND_POOL_FILE = "pool.json"  # the last land-pool line, for `land serve`'s room answer
+LAND_ROOM_FRESH = 2 * 300.0  # 2 x LAND_POOL_LOG_EVERY
+
+
+def land_overflow(config: dict | None = None) -> list[list[str]]:
+    """land.json's "overflow" peers (each a program, as "executor"), in the order they are asked; [] for none."""
+    peers = (land_config() if config is None else config).get(LAND_OVERFLOW_KEY)
+    if not isinstance(peers, list):
+        return []
+    return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)]
+
+
+def land_room(pool: Any, now: float) -> int:
+    """How many more lands this host's queue takes from a peer now, from its last land-pool line POOL: its idle
+    workers less the rows already due here; 0 when the line is older than LAND_ROOM_FRESH, the load is at its line,
+    or the login's latch or a quota park holds the queue."""
+    if not isinstance(pool, dict):
+        return 0
+    at = pool.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or now - float(at) > LAND_ROOM_FRESH:
+        return 0
+    load = pool.get("loadPerCore")
+    if isinstance(load, (int, float)) and not isinstance(load, bool) and load >= LAND_LOAD_LINE:
+        return 0
+    if pool.get("latch") or pool.get("queueParked"):
+        return 0
+    try:
+        return max(0, int(pool.get("workers") or 0) - int(pool.get("busy") or 0) - int(pool.get("due") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
@@ -13228,6 +13276,9 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
+        self.overflow_thread: threading.Thread | None = None
+        self.overflow_after = float("-inf")
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -13516,7 +13567,8 @@ class LandQueue:
         # the first lines of the body. gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished, sorted every
         # TICK (2s) -- 72,900 cache file reads per 600s window at 0.30 ms each, and the daemon's own row read "ticks
         # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
-        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]
+        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs
+                and k not in self.overflowing]
         for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
@@ -13543,6 +13595,9 @@ class LandQueue:
                 else:
                     awake.append(key)
             live = awake
+        if latch is None:
+            self.overflow_tick(live)
+            live = [k for k in live if k not in self.overflowing]
         order = sorted(live, key=self.judge_order)
         # Only the first LAND_WATCH_AHEAD per worker of the due entries, in the order workers take them, are read at
         # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
@@ -13640,16 +13695,7 @@ class LandQueue:
             for key, e in sorted(self.entries.items(), key=lambda kv: float(kv[1].get("created") or 0)):
                 if e["state"] in LAND_DONE or key in self.jobs or len(batch) >= LAND_FORWARD_BATCH:
                     continue
-                rid = str(e.get("requestId") or "")
-                batch.append({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
-                              f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
-                              "after": [key_name(a) for a in e.get("after") or []],
-                              "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
-                              "queuedBy": e.get("queuedBy") or "", "handoff": True}
-                             # an entry from before the lane was recorded names none there: its requester's
-                             # PARENT/CHILD would read as a session on the executor's host
-                             | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                             | ({"override": e["override"]} if e.get("override") else {}))
+                batch.append(self.handoff_request(key, e))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -13669,6 +13715,103 @@ class LandQueue:
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
+
+    @staticmethod
+    def handoff_request(key: str, e: dict) -> dict:
+        """E as one `land serve` request that hands it to another host's queue (an executor's, or a peer's overflow):
+        its request id, requester, lane, --after and override kept, so a resend is applied once."""
+        rid = str(e.get("requestId") or "")
+        return ({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
+                 f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
+                 "after": [key_name(a) for a in e.get("after") or []],
+                 "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
+                 "queuedBy": e.get("queuedBy") or "", "handoff": True}
+                # an entry from before the lane was recorded names none there: its requester's
+                # PARENT/CHILD would read as a session on the executor's host
+                | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
+                | ({"override": e["override"]} if e.get("override") else {}))
+
+    # -- overflow to peer land hosts (land_overflow): this host judges, and hands its late rows on
+
+    def overflow_due(self, live: list[str]) -> list[str]:
+        """Under the lock. The rows of LIVE a peer may take, oldest due first: due here LAND_OVERFLOW_AFTER past their
+        due time, with no --after, latch hold or quota park (LAND_OVERFLOW_KEY's comment)."""
+        rows = []
+        for key in live:
+            e = self.entries.get(key)
+            if not e or e["state"] in LAND_DONE or key in self.jobs or not self.due(e):
+                continue
+            if e.get("after") or e.get("latchHeld") or (e.get("wait") or {}).get("kind") == "quota":
+                continue
+            since = self.due_since(e)
+            if since and self.now - since >= LAND_OVERFLOW_AFTER:
+                rows.append((since, key))
+        return [k for _, k in sorted(rows)][:LAND_FORWARD_BATCH]
+
+    def overflow_tick(self, live: list[str]) -> None:
+        """At most once per LAND_OVERFLOW_EVERY, off the tick: the rows overflow_due names go to the peers in
+        land.json "overflow" that have room (overflow_send); while they are in flight no worker here takes them."""
+        peers = land_overflow(self.config())
+        if not peers or self.now < self.overflow_after:
+            return
+        if self.overflow_thread is not None and self.overflow_thread.is_alive():
+            return
+        with self.lock:
+            keys = self.overflow_due(live)
+            if not keys:
+                return
+            self.overflow_after = self.now + LAND_OVERFLOW_EVERY
+            self.overflowing = set(keys)
+            rows = [(key, int(self.entries[key].get("gen") or 0), self.handoff_request(key, self.entries[key]))
+                    for key in keys]
+        if self.inline:
+            self.overflow_send(peers, rows)
+        else:
+            self.overflow_thread = threading.Thread(target=self.overflow_send, args=(peers, rows),
+                                                    name="land-overflow", daemon=True)
+            self.overflow_thread.start()
+
+    def overflow_send(self, peers: list[list[str]], rows: list[tuple[str, int, dict]]) -> None:
+        """Ask each peer for its room and send it that many of ROWS; a row a peer accepted is "forwarded" here."""
+        try:
+            for command in peers:
+                if not rows:
+                    break
+                name = land_forward_name(command)
+                try:
+                    answer = self.forward(command, {"op": "room"}, LAND_FORWARD_DEADLINE)
+                    room = answer.get("room") if answer.get("ok") else 0
+                    room = room if isinstance(room, int) and not isinstance(room, bool) else 0
+                    if room <= 0:
+                        log({"event": "land-overflow-full", "peer": name, "pending": len(rows)})
+                        continue
+                    sent, rows = rows[:room], rows[room:]
+                    answer = self.forward(command, {"op": "batch", "requests": [r for _, _, r in sent],
+                                                    "from": policy_host()}, LAND_FORWARD_DEADLINE)
+                    if not answer.get("ok"):
+                        raise WatchError(land_trim(answer.get("reason") or answer.get("code"), 200))
+                    accepted = {str(a) for a in answer.get("accepted") or []}
+                except Exception as error:  # noqa: BLE001  a peer that is down or refuses: the rows stay here
+                    log({"event": "land-overflow-failed", "peer": name, "error": land_trim(
+                        str(error) if isinstance(error, WatchError) else describe(error), 300)})
+                    continue
+                with self.lock:
+                    for key, gen, req in sent:
+                        e = self.entries.get(key)
+                        if req["id"] not in accepted or not e or e["state"] in LAND_DONE or key in self.jobs \
+                                or int(e.get("gen") or 0) != gen:
+                            if req["id"] not in accepted:
+                                rows.append((key, gen, req))  # the next peer may take it
+                            continue
+                        waited = round(self.now - self.due_since(e))
+                        e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                        e.pop("dueLate", None)
+                        self.history(e, "overflowed", to=name, request=req["id"], waited=waited)
+                        self.save(e)
+                log({"event": "land-overflowed", "peer": name, "sent": len(sent), "accepted": len(accepted)})
+        finally:
+            with self.lock:
+                self.overflowing = set()
 
     def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
@@ -14435,6 +14578,11 @@ class LandQueue:
                     late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
+        with contextlib.suppress(OSError):
+            write_json(land_dir() / LAND_POOL_FILE, {
+                "at": self.now, "workers": self.workers(), "busy": len(running), "due": len(due), "dueLate": late,
+                "loadPerCore": land_load_per_core(), "latch": None if latch is None else latch[0],
+                "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
              "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated,
@@ -17546,6 +17694,13 @@ def cmd_land_serve(text: str) -> int:
                           f"{land_forward_name(executor)} (land.json executor); it serves none"}))
         return EXIT_FAIL
     op = req["op"]
+    if op == "room":
+        # A peer's overflow asks before it sends (land_overflow): never room while the daemon is down
+        running = daemon_running()
+        print(json.dumps({"ok": True, "host": policy_host(), "running": running,
+                          "room": land_room(read_json(land_dir() / LAND_POOL_FILE), time.time()) if running else 0},
+                         sort_keys=True))
+        return EXIT_OK
     if op == "status":
         target = req.get("target")
         try:

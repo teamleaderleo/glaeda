@@ -27980,6 +27980,103 @@ class LandTest(Base):
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
 
+    def test_rows_this_hosts_gates_hold_late_overflow_to_a_peer_with_room(self):
+        """land.json "overflow": a due row held here LAND_OVERFLOW_AFTER past its due time (every worker busy) goes to
+        the first peer whose room answer has room, at most that many, oldest due first; a row due only a minute, or
+        landing --after another, stays. Here it is "forwarded", naming the peer, and no worker here judges it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "full-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "idle-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[tuple[str, dict]] = []
+        room = {"full-peer": 0, "idle-peer": 1}
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append((cmd[1], req))
+            if req["op"] == "room":
+                return {"ok": True, "room": room[cmd[1]], "host": cmd[1]}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        oldest, second = self.stuck(11, 3 * 3600), self.stuck(12, 2 * 3600)
+        fresh = self.stuck(13, 60)
+        chained = self.stuck(14, 4 * 3600, after=["o/r#12"])
+        self.tick(30)
+        sent = [(host, [r["target"] for r in req["requests"]]) for host, req in asked if req["op"] == "batch"]
+        self.assertEqual(sent, [("idle-peer", ["o/r#11"])])
+        self.assertEqual([h for h, req in asked if req["op"] == "room"], ["full-peer", "idle-peer"])
+        e = self.q.entries[oldest]
+        self.assertEqual((e["state"], e["forwardedTo"]), ("forwarded", "idle-peer"))
+        self.assertEqual([h["event"] for h in e["history"]].count("overflowed"), 1)
+        req = [r for _, q in asked if q["op"] == "batch" for r in q["requests"]][0]
+        self.assertEqual((req["requester"], req["handoff"]), ("host/lane11", True))
+        for key in (second, fresh, chained):
+            self.assertNotEqual(self.q.entries[key]["state"], "forwarded")
+        self.tick(30)  # within LAND_OVERFLOW_EVERY: no new pass
+        self.assertEqual(len([1 for _, q in asked if q["op"] == "batch"]), 1)
+        del self.q.jobs["pr:o/r#99"]
+        self.q.jobs["pr:o/r#98"] = Busy()
+        self.tick(gg.LAND_OVERFLOW_EVERY + 1)
+        sent = [[r["target"] for r in q["requests"]] for _, q in asked if q["op"] == "batch"]
+        self.assertEqual(sent, [["o/r#11"], ["o/r#12"]])
+        self.assertEqual(self.q.entries[second]["state"], "forwarded")
+        self.assertNotEqual(self.q.entries[fresh]["state"], "forwarded")
+        self.assertNotEqual(self.q.entries[chained]["state"], "forwarded")
+        self.assertEqual(self.explained(), [])  # nothing judged here: the one worker stayed busy throughout
+
+    def test_a_peer_that_refuses_or_is_down_leaves_the_rows_here(self):
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "down-peer", "glaeda-gh", "land", "serve"]]
+
+        def down(cmd: list[str], req: dict, deadline: float) -> dict:
+            raise gg.WatchError("ssh: connect to host down-peer port 22: Connection refused")
+        self.q.forward = down
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual(e["state"], "waiting")
+        self.assertEqual(self.q.overflowing, set())
+
+    def test_a_hosts_room_is_its_idle_workers_less_its_due_rows_from_a_fresh_pool_line(self):
+        now = 1_000_000.0
+        pool = {"at": now - 60, "workers": 5, "busy": 1, "due": 1, "loadPerCore": 0.5, "latch": None,
+                "queueParked": False}
+        self.assertEqual(gg.land_room(pool, now), 3)
+        self.assertEqual(gg.land_room({**pool, "loadPerCore": gg.LAND_LOAD_LINE}, now), 0)
+        self.assertEqual(gg.land_room({**pool, "at": now - gg.LAND_ROOM_FRESH - 1}, now), 0)
+        self.assertEqual(gg.land_room({**pool, "latch": "rest"}, now), 0)
+        self.assertEqual(gg.land_room({**pool, "due": 9}, now), 0)
+        self.assertEqual(gg.land_room(None, now), 0)
+
+    def test_land_serve_answers_room_from_the_pool_line_the_queue_wrote(self):
+        logs: list[dict] = []
+        with mock.patch.object(gg, "log", logs.append):
+            self.tick(1)  # an empty queue's pass writes its pool line
+        pool = gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE)
+        self.assertEqual((pool["busy"], pool["due"]), (0, 0))
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "land_room", lambda doc, now: 3 if doc == pool else -1), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "room"})), 0)
+        self.assertEqual(json.loads(out.getvalue())["room"], 3)
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), contextlib.redirect_stdout(out):
+            gg.cmd_land_serve(json.dumps({"op": "room"}))
+        self.assertEqual(json.loads(out.getvalue())["room"], 0)
+
     def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
         """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an
         unmoved head, another such re-read waits (gated, its status naming why), while a land that can move takes a
