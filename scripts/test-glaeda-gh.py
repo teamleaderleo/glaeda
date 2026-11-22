@@ -30499,7 +30499,8 @@ class LandForwardTest(Base):
                              ("big-exec", "waiting", "cosmic/coord"))
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(gg.main(["land", "status"]), 0)
-            self.assertIn("this host forwards its lands to big-exec", out.getvalue())
+            # land.json names a land-judge here: it judges what it reads on an App token, and hands the rest on
+            self.assertIn("hands the rest to big-exec", out.getvalue())
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
             self.exec_tick(x)
@@ -30650,7 +30651,10 @@ class LandLocalFirstTest(LandForwardTest):
         self.asked.append((host, copy.deepcopy(req)))
         if req["op"] == "room":
             return {"ok": True, "room": self.room[host], "host": host}
-        return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": host}
+        if req["op"] == "batch":
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": host}
+        return {"ok": True, "key": "pr:" + req["target"], "state": "requested", "entry": None, "host": host,
+                "requester": req.get("requester") or ""}
 
     def batches(self) -> list[tuple[str, list[str]]]:
         return [(h, [f"{r['op']}:{r['target']}" for r in q["requests"]]) for h, q in self.asked if q["op"] == "batch"]

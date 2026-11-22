@@ -12000,7 +12000,7 @@ def land_cli_route(key: str, repo: str, fallbacks: list[list[str]], queue: Any =
     if e.get("state") == LAND_FORWARDED and e.get("forwardedTo") in names:
         return fallbacks[names.index(e["forwardedTo"])]
     q = queue if queue is not None else LandQueue(config=land_config())
-    q.now = time.time()
+    q.now, q.latch_free_quiet = time.time(), True
     if q.judges_here({"repo": repo}):
         return None
     for command in fallbacks[:-1]:
@@ -13971,6 +13971,7 @@ class LandQueue:
         self.pass_staggered = 0  # this pass's latch-held judgments that waited for their place in the stagger
         # owner -> (asked at, has an unlatched source, why not: the check's own reason, quoted by hold's notice)
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
+        self.latch_free_quiet = False  # a CLI's own queue (land_cli_route) asks without logging
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
         self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
@@ -15234,7 +15235,7 @@ class LandQueue:
             got = self.call(argv, LAND_LATCH_FREE_DEADLINE)
             free = got.returncode == 0
             why = "" if free else latch_free_reason(got)
-        if seen is None or seen[1] != free:
+        if (seen is None or seen[1] != free) and not self.latch_free_quiet:
             log({"event": "land-latch-free" if free else "land-latch-holds", "owner": owner,
                  **({} if free else {"why": why})})
         self.latch_free_seen[owner] = (self.now, free, why)
@@ -18473,14 +18474,12 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     executor = fallbacks[0] if fallbacks else None
     judges = executor is not None and land_judge(land_config())[0] is not None
     if executor is not None:
-        # This host hands lands on (LAND_EXECUTORS_KEY): what is open here, with the queues of the fallbacks it handed
-        # rows to (a host with no land-judge, which hands every row on: its first fallback's queue as well).
+        # This host hands lands on (LAND_EXECUTORS_KEY): what is open here, with each fallback's queue (a land the CLI
+        # sent on at once leaves no entry here to say where it went).
         names = [land_forward_name(c) for c in fallbacks]
         mine = [e for e in doc["entries"] if e.get("state") != LAND_FORWARDED]
-        asked = {e.get("forwardedTo") for e in doc["entries"] if e.get("state") == LAND_FORWARDED}
-        ask = [c for c, n in zip(fallbacks, names) if n in asked or (not judges and c is executor)]
         remote_entries, errors, first = [], [], None
-        for command in ask:
+        for command in fallbacks:
             try:
                 remote = land_forward(command, {"op": "status", "target": target})
             except WatchError as error:
@@ -18571,9 +18570,14 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
 
 def land_outbox_busy(key: str) -> bool:
     """On a forwarding host: whether a request must wait in requests/ (the daemon forwards it in order) rather than go
-    to the executor now: an older request is still waiting there, or KEY's entry is still open here."""
+    to the executor now: an older request is still waiting there, or KEY's entry is still open here. On a host that
+    judges lands too (a land-judge here, LAND_EXECUTORS_KEY) requests/ also holds the rows its own daemon takes, so
+    there only an older request for KEY holds it."""
     d = LandQueue.requests_dir()
-    if d.is_dir() and any(d.glob("*.json")):
+    waiting = sorted(d.glob("*.json")) if d.is_dir() else []
+    if waiting and land_judge(land_config())[0] is None:
+        return True
+    if any((read_json(p) or {}).get("key") == key for p in waiting):
         return True
     e = read_json(LandQueue.entries_dir() / file_name(key))
     return isinstance(e, dict) and e.get("state") not in LAND_DONE
