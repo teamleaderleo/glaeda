@@ -16282,7 +16282,9 @@ class LandQueue:
             # After a push-making step: never judge (or pin) a head read before it.
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
-                    e["updatedHead"] = head  # this queue's own base merge made it (update_again)
+                    # this queue's own base merge made it (update_again); the time it was read is when this land is
+                    # known to have made that head (land_own_head_at).
+                    e["updatedHead"], e["updatedHeadAt"] = head, self.now
                     if self.pin_follow(e, head, data):
                         return  # the new head's first parent is not read yet: not judged on it
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="head_moved")
@@ -16763,7 +16765,7 @@ class LandQueue:
             return (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) do not include {sent[:12]}, "
                     "where this queue's update_branch was sent: a push, not that update's base merge")
         e["pinSha"] = head
-        e["updatedHead"] = head
+        e["updatedHead"], e["updatedHeadAt"] = head, self.now
         self.history(e, "repin_own_update", pin=pin[:12], head=head[:12],
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
@@ -16813,7 +16815,7 @@ class LandQueue:
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
                 return False
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
-            e["updatedHead"] = head
+            e["updatedHead"], e["updatedHeadAt"] = head, self.now
             e.pop("pinWait", None)
             self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
             self.save(e)
@@ -17256,6 +17258,10 @@ class LandQueue:
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
                 pass
+            elif land_ci_start_left(e, act, answer, head, self.now) is not None:
+                # ci_never_ran at a head this land itself made, inside the bound: ci_never_ran_step waits on the PR
+                # for the repo's own run to appear, so this is not a refusal of the PR's to count (LAND_CI_START).
+                e["streak"] = None
             elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
@@ -17466,6 +17472,38 @@ class LandQueue:
                   f"{land_reason(reason, 200)}", land_trim(nxt))
         return True
 
+    def ci_never_ran_step(self, e: dict, act: dict, answer: dict, head: str, why: str, nxt: str) -> None:
+        """land_judge refused ci_never_ran at HEAD (LAND_CI_START's comment). Off the lock. While a step of this land
+        made HEAD and the bound has time left, E waits on the PR for the repo's own pull_request run to appear there;
+        otherwise E stops, as it always did, naming which of the two cases it is, how long was waited and the call
+        that takes the PR from there. Nothing is merged either way: the gate is land_judge's."""
+        with self.lock:
+            self.check(e)
+            left = land_ci_start_left(e, act, answer, head, self.now)
+            at = land_own_head_at(e, head)
+            if left is not None:
+                waited = LAND_CI_START - left
+                self.history(e, "ci_start_wait", head=head[:12], waited=round(waited), left=round(left))
+                # The refusal's own step (push an empty commit) is deliberately not named while this wait stands: at a
+                # head whose runs GitHub is still creating it moves the head, orphans them and starts the race again.
+                self.wait(e, {"kind": "pr", "sha": head, "until": "done", "why": f"the repo's own pull_request run "
+                              f"has not appeared at {head[:12]} yet ({waited:.0f} s of {LAND_CI_START:.0f} s since "
+                              "this land made that head)"}, left)
+                e["seen"] = land_fingerprint(self.cache_of(e["key"]))  # judged again once the checks move, or at the wake
+                self.save(e)
+                return
+            if at is None:
+                said = (f"and no step of this land made {head[:12] or '?'}, so nothing is going to start that run "
+                        "on its own")
+                step = nxt  # a genuinely unwired head: the refusal's own step (an empty commit, or the wiring) stands
+            else:
+                said = (f"and none ever appeared at {head[:12]} in the {LAND_CI_START:.0f} s after this land made "
+                        "that head")
+                step = land_trim(f"{nxt}, then glaeda-gh land {e['repo']}#{e['number']} "
+                                 f"--wait {LAND_WAIT_DEFAULT:.0f}") if nxt else \
+                    f"glaeda-gh land {e['repo']}#{e['number']} --wait {LAND_WAIT_DEFAULT:.0f}"
+            self.stop(e, "ci_never_ran", f"{land_reason(why)} ({said})", land_trim(step))
+
     def claim(self, e: dict, kind: str, **args: Any) -> None:
         """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
         self.check(e)
@@ -17515,6 +17553,11 @@ class LandQueue:
                 with self.lock:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
                 self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                return
+            if cls == "ci_never_ran":
+                # Not terminal on its own at a head this land just made: ci_never_ran_step waits for the run GitHub
+                # has not created yet, and stops with the same clarity where no run is coming (LAND_CI_START).
+                self.ci_never_ran_step(e, act, answer, head, land_reason(why), land_trim(nxt or answer.get("next")))
                 return
             with self.lock:
                 self.stop(e, cls, land_reason(why), land_trim(nxt or answer.get("next")))
