@@ -36176,6 +36176,39 @@ class ABareWaitFlagTest(unittest.TestCase):
             code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "--timeout", "3600"])
         self.assertEqual((code, seen.get("called")), (0, True))
 
+    def test_a_seconds_flag_the_table_never_listed_still_takes_its_own_default(self) -> None:
+        """The drift a hand table leaves: `post status ID --wait` (called so 2026-11-22, waiting for a queued
+        PR's number) exited 2 with "argument --wait: expected one argument", because the table had no
+        ("post", "--wait") row -- while the parser has declared that flag, with its own default, all along.
+        Every flag the parser spells in seconds (metavar S) is read off its own action now, so one the table
+        never listed works, and so does one added after this. A count that is not seconds (`log errors --max`
+        is lines, metavar N) is left for argparse, and a flag standing in another flag's value slot
+        (`--body --wait`) is that value, which the case above this one holds."""
+        for typed, dest, want in (
+                (["post", "status", "1795389726663-2573281-b1d8b9", "--wait"], "wait", 3600.0),
+                (["post", "comment", "o/r#1", "--body-file", "/p", "--wait"], "wait", 3600.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--max-age"], "max_age",
+                 float(gg.HEAD_PENDING_TTL * 2))):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            self.assertEqual(getattr(gg.parser().parse_args(fixed), dest), want, typed)
+            self.assertIn("with no number is its default", self.err.getvalue())
+        self.assertEqual(gg.bare_wait_synonym(["log", "errors", "o/r", "--max"]),
+                         (["log", "errors", "o/r", "--max"], []))
+
+    def test_main_reaches_the_post_request_for_the_call_that_was_refused(self) -> None:
+        """End to end, the exact argv measured 2026-11-22: `post status ID --wait` waits instead of exiting 2."""
+        seen: dict[str, object] = {}
+
+        def fake_post_status(key: str, wait: float, *a: object, **kw: object) -> int:
+            seen["wait"] = wait
+            return 0
+
+        with mock.patch.object(gg, "cmd_post_status", fake_post_status):
+            code = gg.main(["post", "status", "1795389726663-2573281-b1d8b9", "--wait"])
+        self.assertEqual((code, seen.get("wait")), (0, 3600.0))
+
 
 class AFlagsCaseConventionTest(unittest.TestCase):
     """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
