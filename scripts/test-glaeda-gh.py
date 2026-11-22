@@ -27846,9 +27846,9 @@ class LandTest(Base):
         stored = json.dumps([gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE), e,
                              gg.land_queue_parked(self.t), gg.land_line(e, self.t, latch=None)])
         self.assertNotIn("4242424242", stored)
-        self.assertIn("user ID <redacted>", stored)
+        self.assertIn(f"user {gg.gh_quota_label()}", stored)  # the login, not the id (gh_said)
         self.assertIn(f"retry after {at}Z", stored)  # the actionable words are kept
-        self.assertEqual(gg.land_redact("for user ID 4242424242."), "for user ID <redacted>.")
+        self.assertEqual(gg.land_redact("for user ID 4242424242."), f"for user {gg.gh_quota_label()}.")
         self.assertEqual(gg.land_redact('{"user": 4242424242}'), '{"user": 4242424242}')  # only gh's own sentence
 
     def test_a_park_an_older_daemon_stored_is_redacted_on_the_way_out(self):
@@ -27857,7 +27857,7 @@ class LandTest(Base):
         gg.write_json(gg.land_dir() / gg.LAND_QUOTA_FILE, {
             "until": self.t + 1800, "at": self.t,
             "reason": "land-judge: refused: quota: gh: API rate limit already exceeded for user ID 4242424242."})
-        self.assertIn("user ID <redacted>", gg.land_queue_parked(self.t)["reason"])
+        self.assertIn(f"user {gg.gh_quota_label()}", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", self.queue().queue_quota_reason)
 
@@ -36733,6 +36733,103 @@ class InCallRaceTest(Base):
         self.daemon.transport = overlapped
         self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertIs(self.daemon.in_call, other)
+
+
+# The line `glaeda-gh status pr` printed on 2026-11-22, with the id replaced by a fake: the shape gh and GitHub both
+# use, and the one every assertion below reads, so the sanitized text is written down once and cannot drift.
+SAID_ID = "4242424242"  # a fake account id
+SAID_RAW = f"API rate limit already exceeded for user ID {SAID_ID}."
+SAID_LOGIN = "cmux-agents-lander"
+SAID_SAFE = f"API rate limit already exceeded for user {SAID_LOGIN}."
+HELD_RAW = f"graphql: last real attempt: {SAID_RAW}"
+HELD_SAFE = f"graphql: last real attempt: {SAID_SAFE}"
+
+
+class GitHubSaidTest(unittest.TestCase):
+    """GitHub's own words reach a printed line, a stored cache field and the shared log; its quota refusal quotes the
+    token's numeric account id, which is personal data and must never be in text an agent pastes into a PR body."""
+
+    def setUp(self) -> None:
+        holder = mock.patch.object(gg, "gh_quota_holder", lambda: SAID_LOGIN)
+        holder.start()
+        self.addCleanup(holder.stop)
+
+    def test_a_quota_refusal_names_the_login_whose_bucket_is_spent(self) -> None:
+        """The whole point: the refusal says whose quota is spent -- which is what a reader acts on, whose work
+        pauses or moves -- and not an id. The limit and the reset are what is left untouched."""
+        self.assertEqual(gg.gh_said(SAID_RAW), SAID_SAFE)
+        self.assertEqual(gg.gh_said(HELD_RAW), HELD_SAFE)
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED", "message": SAID_RAW}), SAID_SAFE)
+        self.assertNotIn(SAID_ID, gg.gh_said(SAID_RAW))
+        self.assertIn(SAID_LOGIN, gg.gh_said(SAID_RAW))  # actionable, not vague
+
+    def test_every_sibling_form_of_an_account_id_goes_too(self) -> None:
+        """gh and GitHub write the same refusal several ways, and an unauthenticated read is refused by address."""
+        for raw, want in (
+                (f"API rate limit exceeded for user {SAID_ID}.", f"API rate limit exceeded for user {SAID_LOGIN}."),
+                (f"API rate limit exceeded for user id {SAID_ID}", f"API rate limit exceeded for user {SAID_LOGIN}"),
+                (f"gh: API rate limit already exceeded for user ID {SAID_ID}.", f"gh: {SAID_SAFE}"),
+                ("API rate limit exceeded for 203.0.113.9. (But here is the good news: Authenticated requests get a "
+                 "higher rate limit.)",
+                 "API rate limit exceeded for an unauthenticated caller. (But here is the good news: Authenticated "
+                 "requests get a higher rate limit.)"),
+                (f"You have exceeded a secondary rate limit for installation ID {SAID_ID}.",
+                 "You have exceeded a secondary rate limit for installation (an App of this repository's owner)."),
+                # an id-shaped number that is not an account: a time, a count, a run id in a path
+                ("read at 12:08:00 for 2 checks", "read at 12:08:00 for 2 checks"),
+                ("no workflow run at actions/runs/12345678901", "no workflow run at actions/runs/12345678901")):
+            with self.subTest(raw=raw):
+                self.assertEqual(gg.gh_said(raw, limit=None), want)
+
+    def test_a_refusal_with_no_login_to_name_still_says_whose_bucket_it_is(self) -> None:
+        """A host whose gh has no login in hosts.yml cannot name one; the phrase that stands in must still say the
+        spent bucket is a per-user one (not the repository's, not an App's), so the reader knows what to do."""
+        with mock.patch.object(gg, "gh_quota_holder", lambda: ""):
+            said = gg.gh_said(SAID_RAW)
+        self.assertEqual(said, f"API rate limit already exceeded for user {gg.GH_NO_HOLDER}.")
+        self.assertNotIn(SAID_ID, said)
+        self.assertIn("user", said)
+
+    def test_no_printed_line_of_a_partial_read_carries_an_account_id(self) -> None:
+        """The surface the defect was measured on: `status pr` printed "checks INCONCLUSIVE (partial: 80 of 219
+        read; check pages held: graphql: last real attempt: API rate limit already exceeded for user ID ...)". A
+        cache an older daemon wrote still holds the id, so the printed line drops it on the way out too."""
+        data = {"state": "OPEN", "headRefOid": "a" * 40, "checksTotal": 219, "checksPageError": HELD_RAW,
+                "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS", "required": True}]}
+        text = gg.summary("pr:o/r#1", {"data": data})
+        self.assertNotIn(SAID_ID, text)
+        self.assertRegex(text, r"checks INCONCLUSIVE \(partial: 1 of 219 read; check pages held: "
+                               + re.escape(HELD_SAFE) + r"\)")
+        self.assertNotRegex(text, r"\buser(?:\s+ID)?\s+\d{3,}\b")  # no bare id on any printed line
+        for line in text.splitlines():
+            self.assertNotRegex(line, r"\b\d{9,}\b", line)
+
+    def test_a_stored_field_and_a_log_line_carry_the_login_too(self) -> None:
+        """Not only the print: the error is stored in the cache and logged, and both are read back into text."""
+        self.assertEqual(gg.gh_said(HELD_RAW, limit=None), HELD_SAFE)
+        self.assertEqual(gg.land_redact(SAID_RAW), SAID_SAFE)  # the land queue's own capture, same substitution
+        self.assertEqual(gg.gh_said(SAID_RAW, limit=20), SAID_SAFE[:20])  # the length every site already cut to
+        self.assertEqual(gg.gh_said(None, default="no message"), "no message")
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED"}), "RATE_LIMITED")
+
+    def test_every_github_message_is_read_through_the_chokepoint(self) -> None:
+        """One function, not N regex strips: a site that reads "message" out of GitHub's answer and formats it
+        itself is how the id came back, so every such site names gh_said on its own line. gh_said's own body is
+        where the field is read, and the line that only tests for a message is not formatting it."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()
+        inside = False
+        for n, line in enumerate(source, 1):
+            if line.startswith("def gh_said("):
+                inside = True
+            elif inside and line.startswith(("def ", "class ")):
+                inside = False
+            if inside or not re.search(r'\["message"\]|\(\s*"message"\s*\)', line):
+                continue
+            if re.fullmatch(r'\s*if e\.get\("message"\):.*', line):  # a test for one, then the fields instead
+                continue
+            statement = line if "gh_said" in line else source[n - 2] + line  # the call may open the line before
+            self.assertIn("gh_said", statement, f"scripts/glaeda-gh:{n} formats GitHub's message itself")
+
 
 if __name__ == "__main__":
     unittest.main()
