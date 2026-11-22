@@ -30991,6 +30991,110 @@ class AppPoolTest(Base):
             left = self.daemon.batched("pr", app, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
         self.assertEqual((sent, left), ([[e["key"] for e in app]], []), "the login's stop does not hold the App")
 
+    # -- App GraphQL reads: kept while the login is stopped, and sent in parallel (glaeda#2449)
+
+    def app_prs(self, n: int) -> list[dict]:
+        return [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": None, "touched": NOW} for i in range(1, n + 1)]
+
+    def slow_app(self, seconds: float):
+        """Every App request takes SECONDS (GitHub's 3 s a PR query), counted; the answer is an empty GraphQL doc."""
+        sent: list[float] = []
+        lock = threading.Lock()
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] == f"Bearer {APP_TOKEN}":
+                with lock:
+                    sent.append(time.monotonic())
+                time.sleep(seconds)
+                return 200, {"x-ratelimit-limit": "12500", "x-ratelimit-remaining": "12000",
+                             "x-ratelimit-reset": str(int(NOW + 1800))}, b'{"data":{}}'
+            return self.gh(method, url, headers, body)
+        self.daemon.transport = transport
+        return sent
+
+    def read_prs(self, entries: list[dict], deadline: float, **policy):
+        """One tick's read loop over ENTRIES, through the real request path; the keys that were fetched."""
+        self.daemon.policy = {**self.daemon.policy, **policy}
+        self.daemon.batch["pr"] = 5
+        self.daemon.tick_deadline = time.monotonic() + deadline
+        fetched: list[str] = []
+
+        def fetch(chunk):
+            doc, error = self.daemon.graphql(*gg.pr_query([e["key"] for e in chunk]))
+            if error is None:
+                fetched.extend(e["key"] for e in chunk)
+            return error
+        left = self.daemon.batched("pr", entries, fetch)
+        return fetched, left
+
+    def test_app_pr_batches_read_in_parallel_within_a_tick(self) -> None:
+        """Throughput harness: 60 App PRs, batch 5, each query 0.3 s (GitHub's 3 s, scaled), a 1 s tick. One at a time
+        the tick reads 4 queries (20 PRs); four at once reads all twelve (60 PRs)."""
+        self.slow_app(0.3)
+        serial, _ = self.read_prs(self.app_prs(60), 1.0, appGraphqlParallel=1)
+        self.slow_app(0.3)
+        parallel, _ = self.read_prs(self.app_prs(60), 1.0, appGraphqlParallel=gg.APP_GRAPHQL_PARALLEL)
+        print(f"\n  PRs read in one 1 s tick: serial {len(serial)}, parallel {len(parallel)}", file=sys.stderr)
+        self.assertLessEqual(len(serial), 25)
+        self.assertEqual(sorted(parallel), sorted(e["key"] for e in self.app_prs(60)))
+        self.assertEqual(self.daemon.gql_log, [], "an App read takes no login GraphQL point or slot")
+        self.assertEqual(self.gh.calls, [])
+
+    def test_a_login_stop_sends_only_the_login_chunk_to_rest_not_the_app_chunks_after_it(self) -> None:
+        """One non-App chunk in front returned the whole queue to REST, so every App chunk behind it was read over REST
+        one PR at a time while the App's 12,500 points sat unspent (the broker host, 2026-11-22)."""
+        self.slow_app(0.01)
+        other = [{"key": "pr:o/r#1", "cache": None, "touched": NOW}]
+        with mock.patch.object(self.daemon, "mode", lambda bucket: "stop" if bucket == "graphql" else "normal"):
+            fetched, left = self.read_prs(other + self.app_prs(12), 5.0)
+        self.assertEqual(sorted(fetched), sorted(e["key"] for e in self.app_prs(12)))
+        self.assertEqual([e["key"] for e in left], ["pr:o/r#1"])
+
+    def test_parallel_app_workers_keep_their_own_request_state(self) -> None:
+        seen: list[tuple[str, str]] = []
+        lock = threading.Lock()
+        self.daemon.batch["pr"] = 2
+        self.daemon.tick_deadline = time.monotonic() + 10
+
+        def fetch(chunk):
+            mine = chunk[0]["key"]
+            self.daemon.last_request_source = mine
+            self.daemon.spill = [chunk[0]]
+            time.sleep(0.2)
+            with lock:
+                seen.append((mine, self.daemon.last_request_source))
+            return None
+        left = self.daemon.batched("pr", self.app_prs(8), fetch)
+        self.assertEqual(sorted(e["key"] for e in left), sorted(f"pr:manaflow-ai/cmux#{i}" for i in (1, 3, 5, 7)),
+                         "each worker's spill is its own chunk's entry, never another's")
+        self.assertEqual(len(seen), 4)
+        for mine, source in seen:
+            self.assertEqual(mine, source)
+
+    def test_a_slow_app_batch_in_parallel_still_halves_and_splits(self) -> None:
+        sizes: list[int] = []
+        lock = threading.Lock()
+        self.daemon.batch["pr"] = 8
+        self.daemon.tick_deadline = time.monotonic() + 10
+
+        def fetch(chunk):
+            with lock:
+                sizes.append(len(chunk))
+            time.sleep(0.05)
+            return "graphql: timed out (GitHub answered 502 after 16.0s)" if len(chunk) > 2 else None
+        left = self.daemon.batched("pr", self.app_prs(16), fetch)
+        self.assertEqual(left, [])
+        self.assertEqual(self.daemon.batch["pr"], 4, "halved once per tick")
+        self.assertIn(2, sizes, "the timed-out batches were split down")
+
+    def test_parallel_app_reads_stop_at_the_tick_deadline(self) -> None:
+        self.slow_app(0.4)
+        fetched, left = self.read_prs(self.app_prs(60), 0.5)
+        self.assertLess(len(fetched), 60)
+        self.assertTrue(set(self.daemon.deferred) | set(fetched) >= {e["key"] for e in self.app_prs(60)},
+                        "what was not read is deferred, none dropped")
+
+
     def test_the_login_pace_never_defers_a_batch_the_app_answers(self) -> None:
         """2026-11-22, one host: the PR batches all went on the App, but the login's head and check-page queries filled
         the minute's 40 points, and 1,242 PR reads sat deferred behind "42 of 40 points this minute"."""

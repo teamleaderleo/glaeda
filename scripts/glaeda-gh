@@ -534,6 +534,8 @@ GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
 GQL_BATCH_START = 10
 GQL_GROW_AFTER = 5
 GQL_SPLITS = 8  # queries a kind may add per tick by splitting timed-out batches
+APP_GRAPHQL_PARALLEL_MAX = 8  # the most workers (and the policy's ceiling)
+APP_GRAPHQL_PARALLEL = 4  # App-answered GraphQL queries in flight at once (policy appGraphqlParallel; 1 is serial)
 GQL_BATCH_MIN = 2  # each query costs a point however small, so the batch never drops below this
 SLOW = re.compile(r"HTTP 504|[Tt]imeout|timed out|[Rr]esource limits")  # the query took too long: shrink and split
 # GitHub caps the work one query may do. Past it, it answers 200 with the data it got and, per field it gave up on, a
@@ -3084,6 +3086,7 @@ class AppPool:
         self.graphql_seen: dict | None = None
         self.source = ""  # "key" (the App's key is here) or "pushed" (a read-only token the key home pushed)
         self.spares: list[AppPool] = []  # pools tried after this one's (never nested: a spare has none)
+        self.mint_lock = threading.Lock()  # parallel App reads (APP_GRAPHQL_PARALLEL) mint one token, not one each
 
     def with_spares(self, roles: "tuple[str, ...] | list[str]") -> "AppPool":
         self.spares = [AppPool(role=r, clock=self.clock) for r in roles if r != self.role]
@@ -3172,6 +3175,15 @@ class AppPool:
         held = self.tokens.get(owner)
         if held and held[1] > now:
             return held[0]
+        with self.mint_lock:
+            return self.mint_token(owner, now)
+
+    def mint_token(self, owner: str, now: float) -> str | None:
+        held = self.tokens.get(owner)
+        if held and held[1] > now:
+            return held[0]  # another worker minted it while this one waited
+        if self.rest_until.get(owner, 0.0) > now:
+            return None
         self.tokens.pop(owner, None)
         if not self.ready_fn():
             self.why = f"no {self.role} App on this host"
@@ -4797,12 +4809,13 @@ def daemon_policy() -> dict:
         # module default 500/100 becomes 900/500, not 500/500 with no lean band at all).
         raised = max(r, hard[bucket])
         floors[bucket] = (f if f > raised else raised + (f - r), raised)
+    parallel = int(_bounded(doc.get("appGraphqlParallel"), APP_GRAPHQL_PARALLEL, 1, APP_GRAPHQL_PARALLEL_MAX))
     per_minute = int(_bounded(doc.get("graphqlPerMinute"), GRAPHQL_PER_MINUTE, 1, 5000))
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     consumer_setting = alarms.get("consumerShare")
     consumer = consumer_setting if isinstance(consumer_setting, dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
-            "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
+            "appGraphqlParallel": parallel, "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
                        "consumerShare": False if consumer_setting is False else {
                            "fraction": float(_bounded(consumer.get("fraction"), CONSUMER_SHARE_FRACTION, 0.01, 1.0)),
                            "minCalls": int(_bounded(consumer.get("minCalls"), CONSUMER_SHARE_MIN_CALLS, 1, 5000))},
@@ -4941,16 +4954,68 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
     return " ".join(line.split())
 
 
+class WorkerLocal:
+    """A Daemon attribute that one request's state lives in (last_request_source, spill, caller ...). Every thread but
+    an App read worker (Daemon.isolate) shares the one value, as before; an isolated worker has its own, starting at
+    the default each time it begins, so parallel App reads never see each other's source or spill."""
+
+    def __init__(self, default: Callable[[], Any]) -> None:
+        self.default = default
+        self.name = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __get__(self, obj: Any, cls: type | None = None) -> Any:
+        if obj is None:
+            return self
+        local = obj.__dict__.get("_local")
+        mine = local is not None and getattr(local, "isolated", False)
+        store = local.__dict__ if mine else obj.__dict__
+        key = self.name if mine else "_shared_" + self.name
+        if key not in store:
+            store[key] = self.default()
+        return store[key]
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        local = obj.__dict__.get("_local")
+        if local is not None and getattr(local, "isolated", False):
+            local.__dict__[self.name] = value
+        else:
+            obj.__dict__["_shared_" + self.name] = value
+
+
 class Daemon:
+    last_request_source = WorkerLocal(lambda: "login")  # credential used by the most recent request (App or login)
+    last_app_pool = WorkerLocal(lambda: None)  # the pool of the last App request (a spare's answer is its own)
+    limited = WorkerLocal(list)  # entries the last fetch got only partly: GitHub's per-query resource limit
+    spill = WorkerLocal(list)  # entries a fetch could not finish because GraphQL stopped partway
+    gql_limited = WorkerLocal(lambda: False)  # a GraphQL answer since the last fetch began said the primary limit is reached
+    caller = WorkerLocal(lambda: ("other", "", ""))  # what the request being sent is for (calling)
+
+    @contextlib.contextmanager
+    def isolate(self):
+        """The thread is an App read worker inside: its request state (WorkerLocal) is its own, reset on entry."""
+        local = self._local
+        local.__dict__.clear()
+        local.isolated = True
+        try:
+            yield
+        finally:
+            local.isolated = False
+            local.__dict__.clear()
+
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         self.transport = transport
-        self.last_request_source = "login"  # credential used by the most recent request (App or login)
+        self._local = threading.local()  # (WorkerLocal)
+        self.app_exec: Any = None  # the App read workers (batched), made on first use
+        self.app_exec_lock = threading.Lock()
+        self.spend_lock = threading.Lock()
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
         self.app_pool: AppPool | None = (
             AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES) if app_pool == "auto" else app_pool)
-        self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
@@ -5123,11 +5188,8 @@ class Daemon:
             str(k): [float(t) for t in v if isinstance(t, (int, float))]
             for k, v in (spends or {}).items() if isinstance(v, list)}
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
-        self.spill: list[dict] = []  # entries a fetch could not finish because GraphQL stopped partway
-        self.limited: list[dict] = []  # entries the last fetch got only partly: GitHub's per-query resource limit
         self.gql_first = 0  # index of the kind read first next tick (rotates after the per-minute ceiling held one)
         self.gql_paced: str | None = None  # the kind the ceiling held this tick
-        self.gql_limited = False  # a GraphQL answer since the last fetch began said the primary limit is reached
         self.refunded: dict[str, str] = {}  # head key -> the consumer a failed read refunded, this tick
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
@@ -5148,7 +5210,6 @@ class Daemon:
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
         self.spend_saved_at = float("-inf")
         self.spend_dirty = False
-        self.caller: tuple[str, ...] = ("other", "", "")  # what the request being sent is for (calling)
         alarms = read_json(BASE / ALARMS_FILE)
         self.alarms: dict[str, dict] = {  # alarm -> {"at", "level", ...}; a malformed entry is dropped, never fatal
             str(k): v for k, v in (alarms if isinstance(alarms, dict) else {}).items()
@@ -5371,11 +5432,12 @@ class Daemon:
         it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged."""
         kind, repo, waiter = (tuple(self.caller) + ("", "", ""))[:3]
         key = "\t".join((bucket, name, kind, repo) + ((waiter.replace("\t", " "),) if waiter else ()))
-        row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
-        row[0] += 1
-        row[1] += counted
-        row[2] += points
-        self.spend_dirty = True
+        with self.spend_lock:  # parallel App reads count here at once
+            row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
+            row[0] += 1
+            row[1] += counted
+            row[2] += points
+            self.spend_dirty = True
 
     def spend_rows(self, seconds: float = 3600.0) -> list[dict]:
         """The spend log's rows over the last SECONDS (by the minute, as rest_spent counts), summed per key."""
@@ -8905,11 +8967,42 @@ class Daemon:
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
         to_rest: list[dict] = []
-        while queue:
-            chunk = queue.pop(0)
-            on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
-            if (self.mode("graphql") == "stop" and not on_app) or self.gql_down():
-                return to_rest + chunk + [e for c in queue for e in c]
+        # App-answered chunks read in parallel (APP_GRAPHQL_PARALLEL): READY holds the (chunk, result) pairs of the
+        # round in flight, settled one by one below exactly as an inline read would be.
+        parallel = int(self.policy.get("appGraphqlParallel", APP_GRAPHQL_PARALLEL))
+        ready: list[tuple[list[dict], dict]] = []
+
+        def tail() -> list[dict]:
+            """What a return hands to REST: the queue, and the round's chunks that did not come back clean."""
+            left = [e for c in queue for e in c]
+            for c, r in ready:
+                left += c if r.get("raised") or r.get("error") else r["spilled"]
+            return left
+        while queue or ready:
+            res = None
+            if ready:
+                chunk, res = ready.pop(0)
+                on_app = True
+                if self.gql_down():
+                    return to_rest + chunk + tail()
+            else:
+                chunk = queue.pop(0)
+                on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
+                if self.gql_down():
+                    return to_rest + chunk + tail()
+                if self.mode("graphql") == "stop" and not on_app:
+                    # The login's GraphQL is under its reserve: this chunk goes to REST, and the App's chunks behind it
+                    # still read on the App (its own points, no login slot). It used to return the whole queue to REST,
+                    # so one owner without an App sent every App PR after it over REST one at a time (the broker host,
+                    # 2026-11-22: 12,061 of 12,500 App points left, 29 App queries answered).
+                    to_rest += chunk
+                    continue
+                if on_app and parallel > 1:
+                    mates = [c for c in queue if self.app_entries_eligible(kind, c, "graphql")][:parallel - 1]
+                    if mates:
+                        queue = [c for c in queue if not any(c is m for m in mates)]
+                        round_ = self.read_on_app([chunk] + mates, kind, fetch)
+                        (chunk, res), ready = round_[0], round_[1:]
             # The pace is the login's (gql_minute_points counts no App point), so a chunk the App answers is never
             # held by it. One host, 2026-11-22: every PR batch went on the App (12,500 an hour, under 5% spent) while
             # the login's head and check-page queries filled the minute, and 1,242 PR reads sat deferred behind
@@ -8930,15 +9023,23 @@ class Daemon:
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
             try:
-                began = time.monotonic()
-                with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
-                    error = fetch(chunk)
-                spilled, self.spill = self.spill, []
-                if not error:
-                    self.note_read_seconds(kind, "graphql", time.monotonic() - began, len(chunk) - len(spilled))
-                limited, self.limited = self.limited, []
+                if res is not None:
+                    if res.get("raised") is not None:
+                        raise res["raised"]
+                    error, spilled, limited, self.gql_limited = (res["error"], res["spilled"], res["limited"],
+                                                                 res["gqlLimited"])
+                    if not error:
+                        self.note_read_seconds(kind, "graphql", res["took"], len(chunk) - len(spilled))
+                else:
+                    began = time.monotonic()
+                    with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
+                        error = fetch(chunk)
+                    spilled, self.spill = self.spill, []
+                    if not error:
+                        self.note_read_seconds(kind, "graphql", time.monotonic() - began, len(chunk) - len(spilled))
+                    limited, self.limited = self.limited, []
             except OutOfTime:
-                self.defer(chunk + [e for c in queue for e in c])  # no reason, as in the REST loop
+                self.defer(chunk + tail())  # no reason, as in the REST loop
                 return to_rest
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 # A bug on one entry's answer (an AttributeError on a null node, huge-blue 2026-11-11) used to drop the
@@ -8958,12 +9059,12 @@ class Daemon:
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
                 continue
-            if (error or self.gql_limited) and self.mode("graphql") == "stop":
+            if (error or self.gql_limited) and self.mode("graphql") == "stop" and not on_app:
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
                 # whatever it stored for them, REST reads them this tick and replaces it
-                return to_rest + chunk + [e for c in queue for e in c]
+                return to_rest + chunk + tail()
             if spilled:
-                return to_rest + spilled + [e for c in queue for e in c]
+                return to_rest + spilled + tail()
             if limited:
                 # Partial: not a clean query, and the batch was too big for these entries. Halve it, then re-read only
                 # the partial ones at a size below this chunk's (so a re-read ends at one entry alone), within
@@ -9037,6 +9138,34 @@ class Daemon:
                 size = self.batch[kind]
                 queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
         return to_rest
+
+    def read_on_app(self, chunks: list[list[dict]], kind: str, fetch: Callable[[list[dict]], str | None]
+                    ) -> list[tuple[list[dict], dict]]:
+        """Read CHUNKS, each one an App-answered query, at once on the worker pool (APP_GRAPHQL_PARALLEL). An App's
+        requests take no login GraphQL slot, so only the round trip is shared: GitHub took 3 to 17 s a PR query and
+        one at a time the daemon stored 29 PRs in 600 s with the App 95% unspent. Each worker has its own request
+        state (isolate); what it fetched comes back as a result per chunk, in CHUNKS' order, for batched() to settle
+        on the calling thread (the cache write has its own lock in store). An OutOfTime or a bug is the result's
+        "raised", raised again when its chunk is settled."""
+        import concurrent.futures
+        with self.app_exec_lock:
+            if self.app_exec is None:
+                self.app_exec = concurrent.futures.ThreadPoolExecutor(max_workers=APP_GRAPHQL_PARALLEL_MAX,
+                                                                      thread_name_prefix="glaeda-gh-app")
+
+        def one(chunk: list[dict]) -> dict:
+            with self.isolate():
+                repos = sorted({caller_of(e["key"])[1] for e in chunk})
+                began = time.monotonic()
+                try:
+                    with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
+                        error = fetch(chunk)
+                except BaseException as failure:  # noqa: BLE001  settled (and raised again) on the calling thread
+                    return {"raised": failure}
+                return {"error": error, "spilled": list(self.spill), "limited": list(self.limited),
+                        "gqlLimited": self.gql_limited, "took": (time.monotonic() - began) / len(chunks)}
+        futures = [self.app_exec.submit(one, c) for c in chunks]
+        return [(c, f.result()) for c, f in zip(chunks, futures)]
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
