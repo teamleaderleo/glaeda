@@ -531,8 +531,13 @@ What `--apply` does:
        hold that long with no other listener known to keep up, and it listens until memory
        recovers: the job runs here, slower. When memory recovers, one held listener on a mini resumes at a time, 90 s apart (`mem-cap-start` in the state dir), as a new job's compile peaks minutes after it starts; `maxWaitMin` above 60 is not a setting. The nightly, freshness, gateway and dedicated runners
        are exempt; the gui and session runners are not, as they are held for memory pressure too.
+       **Swap used** (2026-11-21): the same hold applies while swap used is `swapUsedPct` (50) of the swap total or more
+       and at least `swapMinGiB` (2), and listens again under `resumeSwapUsedPct` (35); unreadable swap holds nothing, `swapUsedPct` 0 or
+       `GLAEDA_RUNNER_SWAP_USED_PCT=off` (or a percent) in the runner's environment turns it off or sets it. cmux8s-mac-mini (48 GiB, 14
+       listeners) reached load 527 with 20.5 of 23.5 GB of swap used while pressure and reclaimable memory looked fine; macOS's
+       out-of-application-memory alert then wedged the GUI. It changes no capacity (listeners, 90%/95% targets); it only defers new starts.
        `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needPct` or `needGiB`,
-       `resumePct` or `resumeGiB`, and `maxWaitMin`; GiB wins) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
+       `resumePct` or `resumeGiB`, `maxWaitMin`, `swapUsedPct`, `resumeSwapUsedPct` and `swapMinGiB`; GiB wins) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
        in the runner LaunchAgent's environment turns it off.
      - **Starved-job reserve** (`STARVED_RESERVE`, cmux#45614). A large job can starve behind
        smaller ones that share its units: on 2026-11-17 cmux NEXT DEV's DMG build
