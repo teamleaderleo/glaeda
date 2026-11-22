@@ -11629,6 +11629,23 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
         self.assertIn("read", tops)  # the real table is untouched by the patch above
 
+    def test_a_near_spelling_of_the_command_still_gets_the_shapes_that_command_takes(self) -> None:
+        """`logs job OWNER/REPO/ID` (called so 2026-11-22) runs: the command word is read before the shapes.
+
+        The spelling was corrected to `log` and the call then died on "one of the arguments JOB_ID|RUN_ID
+        --job is required", because `log_job_synonym` -- which does take the one-word target -- had already
+        run and seen `logs`. Every shape rewriter gates on an exact command word, so the whole class is the
+        one fix: a nesting word (`job o/r/7`) reaches the same shape, and so does `seach "cmux next"`."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(gg, "cmd_log_job", return_value=0) as log_job:
+            self.assertEqual(gg.main(["logs", "job", "o/r/7"]), 0)
+            self.assertEqual(gg.main(["job", "o/r/7"]), 0)
+        self.assertEqual(log_job.call_args_list, [mock.call("o/r", 7), mock.call("o/r", 7)])
+        self.assertIn("`log` is the one it means", err.getvalue())
+        with contextlib.redirect_stderr(err), mock.patch.object(gg, "cmd_search", return_value=0) as search:
+            self.assertEqual(gg.main(["seach", "cmux next"]), 0)
+        self.assertEqual(search.call_args_list[0].args[:2], ("both", ["cmux next"]))
+
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
         (both cost a usage error, 2026-11-21)."""
@@ -22881,7 +22898,7 @@ class LandWorld:
         Path(self.mh).write_text("raise SystemExit('not run in tests')\n")
         self.config = {"gh": os.fspath(self.gh), "landJudge": self.mh, "acpmux": "/fake/acpmux",
                        "python": "/fake/python3", "routerReview": "/fake/router-review", "git": "/fake/git",
-                       "laneGh": "/fake/lane-gh"}
+                       "laneGh": "/fake/lane-gh", "gitFetchOnce": "/fake/git-fetch-once"}
         # A fetch step's mirror: a real (empty) directory, its origin what the fake git config answers.
         self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
         Path(self.mirror).mkdir(parents=True, exist_ok=True)
@@ -22943,7 +22960,7 @@ class LandWorld:
                     "ok": True, "merged": True}}, indent=1) + "\n", "")
             err = self.gh_err.get("merge", "merge refused")
             return subprocess.CompletedProcess(argv, rc, json.dumps({"ok": False, "error": err}, indent=1) + "\n", "")
-        if argv[0] in ("/fake/git", "/fake/lane-gh"):
+        if argv[0] in ("/fake/git", "/fake/lane-gh", "/fake/git-fetch-once"):
             return subprocess.CompletedProcess(argv, self.fetch_rc, "", "" if self.fetch_rc == 0 else self.fetch_err)
         if argv[0] == os.fspath(self.gh):
             words = argv[1:]
@@ -23836,7 +23853,8 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("api")[0][3], "repos/o/r/pulls/1/update-branch")
 
     def fetch_calls(self) -> list[list[str]]:
-        return [c for c in self.w.calls if c[0] in ("/fake/git", "/fake/lane-gh") and "config" not in c]
+        return [c for c in self.w.calls
+                if c[0] in ("/fake/git", "/fake/lane-gh", "/fake/git-fetch-once") and "config" not in c]
 
     def git_fetch(self, *refspecs: str) -> list[str]:
         return ["git", "--git-dir", self.w.mirror, "fetch", "--quiet", "--no-tags", "origin",
@@ -23850,9 +23868,13 @@ class LandTest(Base):
         argv = self.git_fetch("+refs/heads/main:refs/remotes/origin/main", LA, "main")
         self.w.answers.append(refusal("unreadable", LA, {"kind": "fetch", "argv": argv}))
         e = self.tick()
-        self.assertEqual(self.fetch_calls(), [["/fake/git", *argv[1:]]])
+        # the git form runs through git-fetch-once (the guarded fetch), its bounds inside the step's
+        once = ["/fake/git-fetch-once", "-C", self.w.mirror, *argv[4:]]
+        self.assertEqual(self.fetch_calls(), [once])
         self.assertIn(["/fake/git", "--git-dir", self.w.mirror, "config", "--get", "remote.origin.url"], self.w.calls)
-        self.assertEqual(self.w.envs[self.w.calls.index(["/fake/git", *argv[1:]])].get(gg.LAND_LANE_ENV), None)
+        env = self.w.envs[self.w.calls.index(once)]
+        self.assertEqual(env.get(gg.LAND_LANE_ENV), None)
+        self.assertLess(sum(float(env[k]) for k in gg.LAND_FETCH_ONCE_ENV), gg.LAND_FETCH_DEADLINE)
         self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
                          ("waiting", "retry", "fetch", 0))
         self.assertEqual(e["wakeAt"] - self.t, gg.NUDGE_MIN * 3)
@@ -23942,6 +23964,76 @@ class LandTest(Base):
                 self.assertEqual(e["stepFail"]["count"], n)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "fetch_refused"))
         self.assertIn("stopped: fetch_refused", self.w.sent()[-1][-1])
+
+    def head_not_in_mirror(self, fill: str) -> tuple[int, dict]:
+        # land_judge's HeadNotInMirror refusal as it answers today: code unreadable, the fill named as a command
+        reason = f"land-judge: refused [unreadable]: CI-data mirror lacks the pinned head {LA[:12]}; fill it: {fill}"
+        return refusal("unreadable", LA, {"kind": "command", "text": fill}, nxt=fill, reason=reason)
+
+    def hq_fill(self) -> list[str]:
+        return ["git", "--git-dir", self.w.mirror, "fetch", "origin", "+refs/pull/1/head:refs/remotes/origin/pr/1"]
+
+    def test_19115_the_head_not_in_mirror_fill_is_run_then_judged_once_more(self):
+        # manaflow-ai/cmuxterm-hq#19115, 2026-11-22: land_judge refused "unreadable: HeadNotInMirror ... fill it: git
+        # --git-dir M.git fetch origin +refs/pull/N/head:...", a command; the queue stopped, a person ran the fetch.
+        self.pr(LA)
+        self.land()
+        self.w.answers += [self.head_not_in_mirror(shlex.join(self.hq_fill())), ok_answer(LA)]
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/git-fetch-once", "-C", self.w.mirror, "origin",
+                                               "+refs/pull/1/head:refs/remotes/origin/pr/1"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "fetch", 0))
+        self.assertEqual(e[gg.LAND_FILL_ONCE]["head"], LA)
+        self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assert_merged_at(LA)
+
+    def test_a_head_still_unread_after_its_fill_stops_after_one_retry(self):
+        self.pr(LA)
+        self.land()
+        fill = shlex.join(self.hq_fill())
+        self.w.answers += [self.head_not_in_mirror(fill)] * 2
+        e = self.tick()
+        e = self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.fetch_calls()), 1)  # one fill, one judgment again: never a second fill
+        self.assertEqual(len(self.w.explains()), 2)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "fill_unread"), e.get("stop"))
+        self.assertIn("lacks the pinned head", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], fill)
+
+    def test_a_failed_head_not_in_mirror_fill_stops_naming_the_fetchs_error(self):
+        self.pr(LA)
+        self.land()
+        self.w.fetch_rc = 128
+        fill = shlex.join(self.hq_fill())
+        self.w.answers.append(self.head_not_in_mirror(fill))
+        e = self.tick()
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "fill_failed"), e.get("stop"))
+        self.assertIn("Could not resolve host", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], fill)
+        self.assertEqual(len(self.w.explains()), 1)
+
+    def test_the_broker_form_of_the_fill_is_run_too_and_other_commands_still_stop(self):
+        # a no-token host's fill (gh_mirror_reads.Unreadable: lane-gh fetch R --dir M --branch pull/N/head) and the
+        # MIRROR_FETCH_FLAGS a token host's ensure_commit names
+        broker = ["lane-gh", "fetch", "o/r", "--dir", self.w.mirror, "--branch", "pull/1/head", "--branch", "main"]
+        flags = ["git", "--git-dir", self.w.mirror, "fetch", "--quiet", "--no-show-forced-updates",
+                 "--no-write-commit-graph", "--no-auto-gc", "--no-tags", "--no-write-fetch-head", "origin",
+                 "+refs/pull/1/head:refs/remotes/origin/pull/1/head"]
+        for argv in (broker, flags):
+            act = gg.land_action(self.head_not_in_mirror(shlex.join(argv))[1], LA)
+            self.assertEqual((act["kind"], act["argv"], act["from"]), ("fetch", argv, "command"))
+        for text in ("glaeda-gh land o/r#1", f"git --git-dir {self.w.mirror} fetch evil main",
+                     f"lane-gh fetch o/other --dir {self.w.mirror} --branch main", "git --git-dir 'unclosed"):
+            self.assertEqual(gg.land_action(self.head_not_in_mirror(text)[1], LA)["kind"], "command", text)
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.head_not_in_mirror(shlex.join(broker)))
+        e = self.tick()
+        self.assertEqual(self.fetch_calls(), [["/fake/lane-gh", *broker[1:]]])
+        self.assertEqual(e["state"], "waiting")
 
     def test_a_refusal_naming_the_broker_update_branch_takes_it(self):
         self.assertTrue(gg.LAND_STEP_NEXT_UPDATE.search(
