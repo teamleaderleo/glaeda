@@ -779,9 +779,12 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 18)
+        self.assertEqual(len(signing), 19)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
+        # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
+        self.assertIn("sign-live-code-variant", signing)
+        self.assertNotIn("build-live-code-variant", signing)
         # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
         # here like its push; its payload names the same ref
         dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
@@ -797,7 +800,7 @@ class HookTest(unittest.TestCase):
                           {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
                           {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
                           {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
-                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          {"job": "build-nightly-app"}, {"job": "build-live-code-variant"}, {"job": "decide"}, {"job": None},
                           *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
                                                                           "merge_group")]):
             with self.subTest(dispatch=overrides):
@@ -14170,6 +14173,48 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
         self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
         self.assertIsNone(self.full_gate(capacity).full(fresh=True))
+
+    def test_the_signing_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
+        """SIGNER_FIRST, replaying cmux15's 2026-11-22 06:12-07:18Z gate log: "stopping the idle listener: a fleet
+        build holds the host lock" on both signing runners every 5 minutes, then 60 s offline. The holder was
+        disk-pressure.sh's cap-only pass (an exclusive host.lock for about 6 s). The signing listener stands down only
+        once a hold has lasted SIGNER_LOCK_SETTLE_S; an ordinary runner still stops at once."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(0)
+        held = "a fleet build holds the host lock"
+        script.write_text(base + " --instance 0\n")
+        self.assertEqual(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                                   capacity_dir=capacity).claimed(), None, "no hold yet")
+        fd = self.hold(fcntl.LOCK_EX)
+        self.assertEqual(self.full_gate(capacity).claimed(), held, "an ordinary runner stops at once")
+        script.write_text(base + " --instance 0 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        gate = self.full_gate(capacity)
+        clock = [1000.0]
+        with mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            for step in (0.0, 5.0, 6.0):  # the 6 s probe, polled while it holds
+                clock[0] = 1000.0 + step
+                self.assertIsNone(gate.claimed(), f"{step} s into a short hold")
+                self.assertIsNone(gate.confirmed(), "the fresh reading right before a stop agrees")
+            fcntl.flock(fd, fcntl.LOCK_UN)  # the probe lets go: the clock restarts
+            clock[0] = 1010.0
+            self.assertIsNone(gate.claimed())
+            self.assertIsNone(gate.lock_held_since)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a build that stays
+            for step in (0.0, 4.0, 8.0, 12.0, 16.0, hook.SIGNER_LOCK_SETTLE_S - 1):
+                clock[0] = 2000.0 + step
+                self.assertIsNone(gate.claimed())
+            clock[0] = 2000.0 + hook.SIGNER_LOCK_SETTLE_S
+            self.assertEqual(gate.claimed(), held, "a hold that lasts does stop the signer")
+            self.assertEqual(gate.confirmed(), held)
+            # a stale clock: seen held, then the listener ran a job and was not asked for a while
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            gate.lock_held_since, gate.lock_held_seen = 3000.0, 3005.0
+            clock[0] = 3600.0
+            self.assertIsNone(gate.claimed(), "the next short hold starts its own clock")
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)

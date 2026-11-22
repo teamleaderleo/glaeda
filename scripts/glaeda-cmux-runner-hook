@@ -541,6 +541,12 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # publishes in one job on the trusted signing runner, so the build no longer waits for a second
                 # run and a second drain. It holds the key for its whole run, build included: one claim, one drain.
                 ("nightly.yml", "nightly-next-one"),
+                # LIVE_CODE_VARIANT (Leo's design, docs/cmux-next/live-code.md in cmux): after nightly-next-one
+                # writes the feed, this job signs and notarizes the same commit's -interposable variant with the
+                # nightly's own identity and publishes it beside the DMG. It is a nightly.yml job on nightly-next
+                # like the rest, so the trust rule (only nightly.yml at refs/heads/nightly-next reaches the
+                # signer) is unchanged; it adds no secret and no entitlement. continue-on-error in the workflow.
+                ("nightly.yml", "sign-live-code-variant"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
@@ -586,6 +592,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
+                        # The live code variant's secret-free -interposable build (LIVE_CODE_VARIANT above):
+                        # scripts/cmux-next/swap-binary.sh with its root under RUNNER_TEMP, no canonical root.
+                        ("nightly.yml", "build-live-code-variant"): "isolated",
                         # cmux's app FFI release build: cargo tests and scripts/cmux-next/build-app-ffi.sh, which
                         # writes only under its workspace (cmux-tui/target/cmux-app-ffi) and a mktemp dir. As an
                         # unknown job it was a compile and waited for canonical root 1 (cmux run 43952668846).
@@ -9450,6 +9459,18 @@ def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure:
     return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
 
 
+FLEET_BUILD_HOLDS_HOST = "a fleet build holds the host lock"
+# SIGNER_FIRST, the host lock: a fleet tool takes host.lock exclusively for a few seconds at a time (cmux15's
+# disk-pressure.sh, every 300 s, held it 6 s per pass on 2026-11-22: its cap-only pass). The gate read each one as a
+# fleet build, stopped both idle signing listeners, and kept them off for the 60 s a stop costs, so GitHub and the
+# nightly lane saw the mini offline every 5 minutes from 06:12Z to 07:18Z. The signing listener now stands down only
+# for a hold that lasts SIGNER_LOCK_SETTLE_S (a real build holds it for minutes). A signing job that meets a hold at
+# admission is refused "capacity: ..." and retried every ADMIT_POLL_S by job-started, so the short one passes.
+# SIGNER_LOCK_GAP_S: a settle clock not refreshed for that long (the listener was busy with a job) starts over.
+SIGNER_LOCK_SETTLE_S = 20.0
+SIGNER_LOCK_GAP_S = 10.0
+
+
 def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None,
               nightly_slot: bool = False) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
@@ -9469,7 +9490,7 @@ def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | No
         # up (a fill on the writer mini), to tell it from another fleet build it is waiting behind.
         if gate_yields(host_lock, holder_pids(state_dir) if state_dir else set()):
             return None
-        return "a fleet build holds the host lock"
+        return FLEET_BUILD_HOLDS_HOST
     finally:
         os.close(fd)  # drops the probe's shared lock too
     return None
@@ -10505,6 +10526,8 @@ class Gate:
         self.pcore_why: str | None = None
         self.pcore_boot: int | None = None
         self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
+        self.lock_held_since: float | None = None  # host_claim: when the host lock was first seen held exclusively
+        self.lock_held_seen = 0.0  # host_claim: when it was last seen held
         self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
         self.cpu_busy: float | None = None
         self.cpu_at = -GATE_CPU_EVERY_S
@@ -10708,8 +10731,7 @@ class Gate:
             # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
             return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
-                        nightly_slot=runner_scope(self.runner_dir).nightly)
+        why = self.host_claim()
         if why is None and self.waiters and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
@@ -10719,6 +10741,20 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
+
+    def host_claim(self) -> str | None:
+        """host_held for this gate. The trusted signing listener (SIGNER_FIRST) ignores an exclusive hold of the host
+        lock until it has lasted SIGNER_LOCK_SETTLE_S: a probe's seconds do not take the signer offline."""
+        scope = runner_scope(self.runner_dir)
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir, nightly_slot=scope.nightly)
+        if why != FLEET_BUILD_HOLDS_HOST or not scope.trusted_signing:
+            self.lock_held_since = None
+            return why
+        now = time.monotonic()
+        if self.lock_held_since is None or now - self.lock_held_seen > SIGNER_LOCK_GAP_S:
+            self.lock_held_since = now
+        self.lock_held_seen = now
+        return why if now - self.lock_held_since >= SIGNER_LOCK_SETTLE_S else None
 
     def exclusive_yield(self) -> str | None:
         """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
@@ -11295,8 +11331,7 @@ class Gate:
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
-                        nightly_slot=runner_scope(self.runner_dir).nightly)
+        why = self.host_claim()
         if why is None and self.waiting:
             again = self.waiting & self.blocking_waiters()
             self.waiting, self.waiting_at = again, time.monotonic()
