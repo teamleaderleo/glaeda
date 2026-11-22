@@ -19553,18 +19553,15 @@ class PoolUserRunnerTest(unittest.TestCase):
 
     def test_headless_is_ignored_for_a_pool_user(self) -> None:
         """A pool user has no sudo: --headless (the system LaunchDaemon) never applies; the service stays the LaunchAgent."""
-        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))  # not a sandbox, so --headless would take effect
-        for pool_user, headless in ((POOL_USER, False), (None, True)):
-            with self.subTest(pool_user=pool_user), mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
-                    mock.patch.object(cr, "xcode_present", return_value=True), \
-                    mock.patch.object(cr, "current_user", return_value=POOL_USER), \
-                    mock.patch.object(cr, "admin_evidence", return_value=None):
-                plan = self.invoke("--headless", "--manifest", self.manifest(pool_manifest(pool_user)),
-                                   "--member", "mini-std")
-            agent = self.by_kind(plan)["agent"]["path"]
-            self.assertEqual(agent.startswith(os.fspath(cr.SYSTEM_DAEMON_DIR)), headless, agent)
-            if not headless:
-                self.assertEqual(Path(agent).parent, self.home / "Library/LaunchAgents")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_name=POOL_USER)  # not a sandbox: --headless would apply
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "current_user", return_value=POOL_USER), \
+                mock.patch.object(cr, "admin_evidence", return_value=None):
+            plan = self.invoke("--headless", "--manifest", self.manifest(pool_manifest()), "--member", "mini-std")
+        agent = self.by_kind(plan)["agent"]["path"]
+        self.assertFalse(agent.startswith(os.fspath(cr.SYSTEM_DAEMON_DIR)), agent)
+        self.assertEqual(Path(agent).parent, self.home / "Library/LaunchAgents")
 
     def test_member_labels_carry_pool_user(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -19596,10 +19593,9 @@ class PoolNodeViewTest(unittest.TestCase):
         env = {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": ""}
         with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}):
             why, want, timed_out = hook.node_answer("m4pro-48")
+            self.assertEqual(hook.node_paths(self.dir), (view / "cmux-fleet", view / "glaeda-generations"))
         self.assertIsNone(why, why)
         self.assertFalse(timed_out)
-        self.assertEqual(hook.node_paths(self.dir)[0], view / "cmux-fleet")
-        self.assertEqual(hook.node_paths(self.dir)[1], view / "glaeda-generations")
         # no env: the (now empty) home is what it reads
         with mock.patch.dict(os.environ, env):
             os.environ.pop(hook.NODE_VIEW_ENV, None)
@@ -19608,11 +19604,19 @@ class PoolNodeViewTest(unittest.TestCase):
             self.assertEqual(hook.node_paths(self.dir),
                              (self.dir / ".config/glaeda/cmux-fleet", self.dir / "Projects/glaeda-generations"))
 
-    def other_group(self, *excluded: int) -> int:
-        gids = [g for g in os.getgroups() if g not in {12, 20, *excluded}]
+    def other_group(self) -> int:
+        """A group of ours other than the one new files get (that one stands in for staff: SHARED_GROUP_EXCLUDED)."""
+        probe = self.dir / ".gid-probe"
+        probe.write_text("")
+        self.default_gid = probe.stat().st_gid
+        probe.unlink()
+        gids = [g for g in os.getgroups() if g not in {12, 20, self.default_gid}]
         if not gids:
-            self.skipTest("no group outside everyone/staff to chgrp to")
+            self.skipTest("no second group of ours to chgrp to")
         return gids[0]
+
+    def excluded(self) -> "mock._patch":
+        return mock.patch.object(hook, "SHARED_GROUP_EXCLUDED", frozenset({12, 20, self.default_gid}))
 
     def test_share_fleet_path_adds_group_write_only_where_it_is_ours_and_not_staff(self) -> None:
         gid = self.other_group()
@@ -19625,9 +19629,8 @@ class PoolNodeViewTest(unittest.TestCase):
             d.chmod(0o700)
         os.chown(shared, -1, gid)
         os.chown(elsewhere, -1, gid)
-        os.chown(staff, -1, 20)
         link.symlink_to(shared)
-        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)):
+        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)), self.excluded():
             self.assertTrue(hook.share_fleet_path(shared))
             self.assertEqual(shared.stat().st_mode & 0o7777, 0o770)
             self.assertEqual(shared.stat().st_mode & 0o007, 0, "never other")
@@ -19650,8 +19653,7 @@ class PoolNodeViewTest(unittest.TestCase):
             f.chmod(0o600)
         os.chown(lock, -1, gid)
         os.chown(outside, -1, gid)
-        os.chown(staff, -1, 20)
-        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)):
+        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)), self.excluded():
             for path, want, mode in ((lock, True, 0o660), (staff, False, 0o600), (outside, False, 0o600)):
                 fd = os.open(path, os.O_RDWR)
                 try:

@@ -57,7 +57,7 @@ if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
 if remote.startswith("/usr/bin/python3 - ") and "pool-node" in remote:  # POOL_USER: publish_node_view
     if host in os.environ.get("FAKE_PUBLISH_FAILS", "").split(","):
-        sys.stderr.write("refusing: not a link this step made\n"); sys.exit(1)
+        sys.stderr.write("refusing: not a link this step made\\n"); sys.exit(1)
     print("published /Users/Shared/cmux-build-fleet/pool-node.d/1-2 generation abcdef012345"); sys.exit(0)
 if " disk-shape " in remote:
     shapes = json.loads(os.environ.get("FAKE_DISK_SHAPE", "{{}}"))
