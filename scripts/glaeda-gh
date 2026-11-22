@@ -13810,12 +13810,9 @@ def land_day(at: float) -> str:
     return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%d")
 
 
-# GitHub's numeric account id, which gh quotes in its own rate-limit error ("API rate limit already exceeded for user
-# ID NNNN"). It is personal data, and the queue's text is pasted into PR and issue bodies by every agent that reads
-# `land status` (leo-workspace tools/public_body_guard.py refuses it there), so the daemon drops the id where it
-# captures the error (LandQueue.call) and where it reads a park an older daemon stored (land_queue_parked). The
-# actionable words -- which limit, and the reset -- are kept.
-LAND_USER_ID = re.compile(r"\b(user(?:\s+id)?)\s+\d{3,}\b", re.I)
+# The land path captures GitHub's words from git's and gh's streams (LandQueue.call) and reads back a park an older
+# daemon stored (land_queue_parked); both go through the one substitution every printed and stored GitHub message
+# does (gh_said's comment), so a quota refusal in the queue names the login whose bucket is spent, never an id.
 
 
 # A word every shell hands on as typed: shlex's own safe set, plus `#` anywhere but the first character.
