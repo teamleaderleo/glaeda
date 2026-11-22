@@ -12106,8 +12106,46 @@ def land_cores() -> int:
 
 
 def land_worker_ceiling(cores: int | None = None) -> int:
-    """One land worker per LAND_CORES_EACH cores, at least 1."""
+    """One land worker per LAND_CORES_EACH cores, at least 1: where the adaptive pool starts (LandQueue.adapt_pool)."""
     return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
+
+
+# The pool grows to what the queue needs and GitHub answers, never to a count set by hand (LandQueue.adapt_pool). It
+# starts at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
+# (gated) grows by LAND_POOL_GROW (at least one worker), and a quota refusal since the last step (park_quota,
+# park_queue_quota) halves it, as TCP's congestion window does. A judgment is land_judge waiting on GitHub, not on the
+# host: huge-blue, 2026-11-22 09:58Z, 17 land_judge/classifier processes held 1,109 MB (about 65 MB each) at 0.1-11%
+# of a core each, judgments ran 3-13 min, and 12 of 12 workers (land.json "workers": 12) were busy with ~1,000 due rows
+# gated each pass. At 32 workers the next 10 minutes judged 38 and merged 13 (12 workers: 15-19 and 2-5). So its
+# ceiling is the host's memory, LAND_JUDGE_MEM_MB each out of half of what is available (land_pool_max), not its cores;
+# the pace and the App pools' own refusals bound what it spends on GitHub. land.json "workers" stays an operator's
+# fixed override.
+LAND_POOL_ADAPT_S = 60.0
+LAND_POOL_GROW = 0.25
+LAND_JUDGE_MEM_MB = 256  # four times the ~65 MB one judgment's process tree measured
+
+
+def land_mem_available_mb() -> int | None:
+    """MemAvailable from /proc/meminfo, else half the physical memory (macOS has no MemAvailable), in MB; None when the
+    host says neither."""
+    with contextlib.suppress(OSError, ValueError):
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (2 * 1024 * 1024))
+    return None
+
+
+def land_pool_max(mem_mb: int | None = None) -> int:
+    """The adaptive pool's ceiling: LAND_JUDGE_MEM_MB per judgment out of half the host's available memory, never under
+    land_worker_ceiling; that ceiling alone where the memory is unknown."""
+    mem = land_mem_available_mb() if mem_mb is None else mem_mb
+    floor = land_worker_ceiling()
+    if mem is None:
+        return floor
+    return max(floor, int(mem) // 2 // LAND_JUDGE_MEM_MB)
 
 
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
@@ -12262,6 +12300,30 @@ LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unread
 LAND_EARLY_HANDOFF_BAD = 3
 LAND_EARLY_HANDOFF_OF = 5
 LAND_EARLY_HANDOFF_WINDOW = 900.0
+# A stop that only says GitHub could not be read (LAND_INFRA_STOPS: quota, an App refusal, a timeout, the login's pace)
+# is no fact about the PR, and its requester can do nothing with it. So it is not a stop (infra_read_stop): a broker
+# client hands the entry at its full head to the broker host's land queue (hand_off_now, as early_hand_off does), and
+# any other host retries it after LAND_INFRA_RETRY_BASE s, doubled per retry at one head up to LAND_INFRA_RETRY_MAX,
+# its wait budget and streak cleared (the wait is no strike). Only after LAND_INFRA_RETRY_CAP retries at one head does
+# it stop, and even then the requester is not woken: a log line and the entry's history (`land status`), as glaeda#2468
+# does for every word a requester cannot act on. retry_deadline is one only when its wait was on an answer that judged
+# nothing (LAND_NOT_JUDGED, LAND_HANDOFF_UNREAD); a retry wait on the PR's own state (train_wait) still stops and tells.
+# Leo, 2026-11-22: "if huge-blue is so weak and liable to falling over, then don't put so much reliance on it".
+# huge-blue, 2026-11-21 10Z-11-22 10Z: 13 pin_unread stops of 6 lands (each "GitHub's quota for this read ..."), 3
+# retry_deadline stops of 3 lands (each "still host_cap"), every one an acpmux wake of its requester.
+LAND_INFRA_STOPS = frozenset({"retry_deadline", "pin_unread", "webview_unreadable", "unreadable_repeated"})
+LAND_INFRA_RETRY_BASE = 600.0
+LAND_INFRA_RETRY_MAX = 3600.0
+LAND_INFRA_RETRY_CAP = 6  # 600+1200+2400+3600+3600+3600 s: about 4 h more at one head before the quiet stop
+
+
+def land_infra_stop(e: dict, code: str) -> bool:
+    """Whether stopping E with CODE would only say GitHub could not be read (LAND_INFRA_STOPS' comment)."""
+    if code not in LAND_INFRA_STOPS:
+        return False
+    # retry_deadline: only when its wait was on an answer that judged nothing, not on the PR's own state (train_wait)
+    return code != "retry_deadline" or str((e.get("waitBudget") or {}).get("code") or "") \
+        in LAND_NOT_JUDGED | LAND_HANDOFF_UNREAD
 # An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
 # read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
 # (`explain --cache-only`, no read sent, no broker queue waited on, a local read of seconds); only a miss goes live,
@@ -12930,6 +12992,12 @@ LAND_NO_LANE = re.compile(r"lease acquisition requires a lane session")
 # entry then reads "forwarded" and does nothing more. Only this refusal hands off: a CI, hold or review refusal is
 # land_judge's answer here and stays this queue's to wait on or stop at.
 LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
+# The broker's land_handoff refusal of a sha that is not the PR's head (cmuxterm-hq parts/49-calls-land-handoff.py:
+# "PR N's head is LIVE, not SHA: nothing was queued"), LIVE read from GitHub just then. The head this VM hands is its
+# own copy's (a judgment's answer, else the daemon's cache), which on a VM that cannot read GitHub -- the very case
+# that hands off -- can be hours old: a retry at it can never be taken, and stopped handoff_refused after
+# LAND_STEP_STOP. hand_off takes LIVE instead (handoff_head_moved).
+LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
@@ -13673,6 +13741,9 @@ class LandQueue:
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
+        self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
+        self.pool_adapted = 0.0  # when adapt_pool last stepped
+        self.quota_refused = float("-inf")  # the last quota refusal (park_quota, park_queue_quota): adapt_pool halves
         self.now = time.time()
         quota = read_json(land_dir() / LAND_QUOTA_FILE)
         self.queue_quota_until = (float(quota.get("until")) if isinstance(quota, dict)
@@ -13883,6 +13954,7 @@ class LandQueue:
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.pass_held_by = {}
+            self.adapt_pool()
             self.log_pool()
             return
         latch = self.latch_held()
@@ -13969,6 +14041,7 @@ class LandQueue:
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.adapt_pool()
         self.log_pool()
 
     # -- forwarding to the land executor (land_executor): this host judges nothing
@@ -14446,6 +14519,7 @@ class LandQueue:
             if self.queue_quota_until >= until and self.queue_quota_until > self.now:
                 return  # a later refusal must never shorten the host-wide hold
             self.queue_quota_until = max(self.queue_quota_until, until)
+            self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
             self.queue_quota_reason = land_reason(land_redact(text), 300)
             self.queue_quota_at = self.now
             self.queue_park_voided = None
@@ -14457,6 +14531,7 @@ class LandQueue:
         LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
+        self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
         if said is not None:
             jitter = land_jitter(e["key"], said)
@@ -14804,9 +14879,33 @@ class LandQueue:
         return [self.path("python", Path(sys.executable)).as_posix(), os.fspath(tool), "ready", "--owner", owner]
 
     def workers(self) -> int:
-        """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
-        this host's cores (land_worker_ceiling), read at each call."""
-        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
+        """The pool's ceiling: land.json "workers" (an operator's override), else the adaptive size (adapt_pool), read
+        at each call."""
+        given = self.config().get("workers")
+        if given is not None:
+            return int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+        return max(1, int(self.pool_size))
+
+    def adapt_pool(self) -> None:
+        """Every LAND_POOL_ADAPT_S, step the adaptive pool (the comment above LAND_POOL_ADAPT_S): halve it after a
+        quota refusal, else grow it while it is full and due rows waited for a worker this pass; logged as land-pool-
+        size when it moves. land.json "workers" fixes it instead."""
+        if self.now - self.pool_adapted < LAND_POOL_ADAPT_S:
+            return
+        last, self.pool_adapted = self.pool_adapted, self.now
+        if self.config().get("workers") is not None:
+            return
+        size, ceiling = self.pool_size, float(land_pool_max())
+        if self.quota_refused > last:
+            size, why = max(1.0, size / 2), "a quota refusal"
+        elif len(self.jobs) >= int(size) and self.pass_gated:
+            size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
+        else:
+            return
+        if int(size) != int(self.pool_size):
+            log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
+                 "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
+        self.pool_size = size
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -14899,7 +14998,7 @@ class LandQueue:
                 "loadPerCore": land_load_per_core(), "latch": None if latch is None else latch[0],
                 "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
-             "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
+             "workersFrom": "land.json" if "workers" in self.config() else f"adaptive:max {land_pool_max()}",
              "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -15152,7 +15251,8 @@ class LandQueue:
             import concurrent.futures
             # at the ceiling (threads start only as jobs need them): judge's cap is the live land.json "workers",
             # so changing it takes effect at once instead of at the next restart
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), self.workers()),
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), land_pool_max(),
+                                                                              self.workers()),
                                                               thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
         self.job_started[key] = (self.now, getattr(fn, "__name__", "job"))
@@ -15227,6 +15327,15 @@ class LandQueue:
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
+        infra = e.pop("infraHandoff", None)
+        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED:
+            # a stop that only said GitHub could not be read here (infra_read_stop): the broker host reads it instead,
+            # unless the cache shows the unpinned head moved since (then it is judged here, at the new head)
+            head = str(infra.get("head") or "")
+            cached = str(data.get("headRefOid") or "").lower()
+            if SHA40.fullmatch(head) and (e.get("pinSha") or not SHA40.fullmatch(cached) or cached == head):
+                self.hand_off_now(e, head, str(infra.get("why") or "GitHub could not be read here"), "handoff_infra")
+                return
         pending, stopped = [], None
         for a in e.get("after") or []:
             ad = (self.cache_of(a) or {}).get("data") or {}
@@ -15278,8 +15387,11 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
-        if e.get("pinSha") and not e.get("pinSeen") and self.pin_wait(e, c or {}, head):
-            return
+        if e.get("pinSha") and not e.get("pinSeen"):
+            if e.get("infraRetry") and e["state"] == "waiting" and float(e.get("wakeAt") or 0) > self.now:
+                return  # pin_unread's backoff (infra_read_stop): no read of the pin before it runs out
+            if self.pin_wait(e, c or {}, head):
+                return
         running = land_checks_running(data, head)
         kind = w.get("kind")
         if e["state"] == "queued":
@@ -15680,6 +15792,20 @@ class LandQueue:
             return None, "partial"
         return {**snap, "dataAt": at}, ""
 
+    def snapshot_places(self, free: bool) -> int:
+        """How many places ahead of the workers the snapshot waits hold (judge's room). While every worker is busy, each
+        wait does, run out or not: a run-out one is judged on the next worker that frees (snapshot_wait). With a worker
+        FREE, only a wait still inside LAND_SNAPSHOT_WAIT does: a run-out row that reaches judge is judged live at once
+        and needs no place, and one the pass no longer reaches (not due, a stale head, the pace) held its place for
+        hours. huge-blue, 2026-11-22 06:59-09:50Z: 43 rows held snapshotWait, 14 of them 1.5-2.7 h old, so jobs and
+        waits read 24 of 24 places with 2 of 12 workers busy, and every row whose snapshot was not ready was gated
+        "every worker busy" (glaeda#36, hq#17575, hq#18023 and hq#18005 from 07:07Z)."""
+        if not free:
+            return len(self.snapshot_waiting)
+        return sum(1 for k in self.snapshot_waiting
+                   if self.now - float(((self.entries.get(k) or {}).get("snapshotWait") or {}).get("since") or 0)
+                   < LAND_SNAPSHOT_WAIT)
+
     def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
         """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
         that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
@@ -15806,7 +15932,7 @@ class LandQueue:
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = len(self.jobs) < workers
-        room = len(self.jobs) + len(self.snapshot_waiting) < workers * (1 + LAND_SNAPSHOT_AHEAD)
+        room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD)
         if not free and not room and not e.get("snapshotWait"):
             self.gated(e)
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
@@ -16184,14 +16310,54 @@ class LandQueue:
         if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
             return False
         why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
-        self.history(e, "handoff_early", head=head[:12], why=why)
+        self.hand_off_now(e, head, why, "handoff_early", fp)
+        return True
+
+    def hand_off_now(self, e: dict, head: str, why: str, event: str, fp: str | None = None) -> None:
+        """Under the lock: hand E at its full HEAD to the broker host's land queue on a job of its own (job's EARLY),
+        with no judgment here and no wait for a worker or a pace slot; EVENT and WHY name it in E's history."""
+        self.history(e, event, head=head[:12], why=why)
         e["handoffDue"] = {"kind": "judgment", "head": head, "why": why, "reason": why}
-        e.update(state="judging", seen=fp)
+        e.update(state="judging", wait=None, wakeAt=None)
+        if fp is not None:
+            e["seen"] = fp
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], head, int(e.get("gen") or 0), True)
         self.changed_entries.discard(e["key"])
+
+    def infra_read_stop(self, e: dict, code: str, reason: str) -> bool:
+        """Under the lock, from stop: when stop CODE only says GitHub could not be read (LAND_INFRA_STOPS' comment),
+        do not stop E. A broker client with E's full head marks it for the broker host's land queue (infraHandoff,
+        handed off by consider on the next pass, off any job this runs in); any other host waits and judges again,
+        backed off per retry at one head. True when E was not stopped; False past LAND_INFRA_RETRY_CAP (or for a
+        stop that is a fact about the PR), and the caller stops it."""
+        if not land_infra_stop(e, code):
+            return False
+        pin = str(e.get("pinSha") or "").lower()
+        head = (pin if code == "pin_unread" else "") or str(e.get("head") or "").lower() \
+            or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        why = land_trim(f"{code}: {land_reason(reason, 160)}", 200)
+        hand = self.broker_client() and e.get("state") != LAND_FORWARDED and bool(SHA40.fullmatch(head)) \
+            and not land_head_moved(pin, head)
+        r = e.get("infraRetry") or {}
+        n = int(r.get("n") or 0) + 1 if r.get("head") == head else 1
+        if not hand and n > LAND_INFRA_RETRY_CAP:
+            return False
+        for held in ("waitBudget", "streak", "unreadRun", "unreadCacheFirst", "pinWait"):
+            e.pop(held, None)  # the wait was GitHub's, not the PR's: no strike, no spent budget (LAND_INFRA_STOPS)
+        if hand:
+            e["infraHandoff"] = {"head": head, "why": why, "code": code}
+            self.wait(e, {"kind": "retry", "why": f"{why}: handed to the broker host's land queue"}, 0.0)
+            log({"event": "land-infra-handoff", "key": e["key"], "code": code, "head": head[:12]})
+            return True
+        after = min(LAND_INFRA_RETRY_MAX, LAND_INFRA_RETRY_BASE * (2 ** (n - 1)))
+        e["infraRetry"] = {"head": head, "n": n, "code": code, "at": self.now}
+        self.history(e, "infra_retry", code=code, n=n, after=int(after), reason=land_reason(reason, 160))
+        self.wait(e, {"kind": "retry", "why": f"{why}: GitHub could not be read, again in {after:.0f} s "
+                      f"({n} of {LAND_INFRA_RETRY_CAP})"}, after)
+        log({"event": "land-infra-retry", "key": e["key"], "code": code, "n": n, "after": after})
         return True
 
     def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
@@ -16850,10 +17016,11 @@ class LandQueue:
         self.save(e)
         return "hand_off"
 
-    def hand_off(self, e: dict, head: str) -> None:
+    def hand_off(self, e: dict, head: str, repinned: bool = False) -> None:
         """Hand E at HEAD to the broker host's land queue (`lane-gh call land_handoff`), after its owner check refused a
         step here (owner_refused) or this VM could not judge it (unjudgeable_here). Taken: the entry is forwarded, the requester told. Refused: counted per head like a
-        step's refusal (backoff, then a stop at LAND_STEP_STOP)."""
+        step's refusal (backoff, then a stop at LAND_STEP_STOP), except a refusal naming the PR's live head
+        (LAND_HANDOFF_HEAD), which hands it off again at that head at once (REPINNED: this is that second call)."""
         due = e.get("handoffDue") or {}
         reason = str(due.get("reason") or "ownership")
         if due.get("kind") == "judgment":
@@ -16892,6 +17059,13 @@ class LandQueue:
                             f"(glaeda-gh land status there)", wake=False)
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
+            live = self.handoff_head_moved(e, head, f"{got.stderr or ''} {got.stdout or ''}", repinned)
+            if live is None:
+                return  # stopped: its pin is not the PR's head
+        if live:
+            self.hand_off(e, live, repinned=True)  # off the lock, as the first call was
+            return
+        with self.lock:
             last = e.get("handoffFail") or {}
             n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}
@@ -16905,6 +17079,31 @@ class LandQueue:
             after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
             self.wait(e, {"kind": "retry", "why": f"the hand-off to the broker host's land queue was refused: "
                           f"backoff {after:.0f} s"}, after)
+
+    def handoff_head_moved(self, e: dict, head: str, out: str, repinned: bool) -> str | None:
+        """Under the lock, after the broker refused E's hand-off at HEAD with OUT: the PR's live head to hand it off at
+        instead when OUT names one (LAND_HANDOFF_HEAD) and E may land it, else "" (counted as any refusal); None when E
+        was stopped because its pin is not that head. A second refusal of this kind in one hand-off (REPINNED: the
+        head moved again between two reads) is counted, never chased."""
+        m = LAND_HANDOFF_HEAD.search(out)
+        if not m or m.group(2) != head or m.group(1) == head or repinned:
+            return ""
+        live = m.group(1)
+        self.nudge(e["key"])  # this host's copy of the head is stale: the daemon reads it again
+        pin = str(e.get("pinSha") or "")
+        if land_head_moved(pin, live):
+            name = key_name(e["key"])
+            self.stop(e, "head_moved", f"the head is {live[:12]} (the broker read it from GitHub), not the --sha "
+                      f"{pin[:12]} it was queued for; nothing was handed off",
+                      f"glaeda-gh land {name} --match-head-commit {live}")
+            return None
+        self.history(e, "handoff_repinned", head=live[:12], was=head[:12])
+        e["head"] = live
+        due = e.get("handoffDue")
+        if isinstance(due, dict):
+            due["head"] = live
+        self.save(e)
+        return live
 
     def broker_land(self, e: dict, sha: str) -> subprocess.CompletedProcess:
         """A lane VM's pinned merge of E at SHA, sent straight to the broker's land (`lane-gh call land`), as a gh
@@ -17198,6 +17397,9 @@ class LandQueue:
 
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)
+        infra = land_infra_stop(e, code)
+        if infra and self.infra_read_stop(e, code, reason):
+            return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
@@ -17214,7 +17416,8 @@ class LandQueue:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
-        self.notify(e, e.get("requester") or "", msg)
+        # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
+        self.notify(e, e.get("requester") or "", msg, wake=not infra)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
@@ -17663,8 +17866,14 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     load = land_load_per_core()
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
-    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
-    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
+    if given is not None:
+        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, 1024)), "land.json"
+    else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
+        line = read_json(land_dir() / LAND_POOL_FILE)
+        size = line.get("workers") if isinstance(line, dict) else None
+        ceiling = int(size) if isinstance(size, int) and not isinstance(size, bool) else land_worker_ceiling()
+        source = "adaptive"
+    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({source})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")
             + f"; load {loads}; {late} due late")
@@ -28200,6 +28409,9 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError(f"post {args.kind} takes {KIND_FORMS[kind]}, not {args.target!r}")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
+        if getattr(args, "label", None) or getattr(args, "remove_label", None):
+            raise WatchError("--label and --remove-label are for post label and post issue "
+                             f"(`glaeda-gh post label {args.target} --label L`)")
         if args.kind == "comment" and args.event != "comment":
             raise WatchError("--event is for post review")
         key = getattr(args, "status_key", None)
@@ -28307,6 +28519,8 @@ def body_guard_args(item: dict, body_file: str) -> list[str]:
     if item["kind"] == "pr":
         return ["pr", "create", "-R", repo, "--title", item["title"], "--head", item["head"], "--base", item["base"],
                 "--body-file", body_file]
+    if item["kind"] == "issue":
+        return ["issue", "create", "-R", repo, "--title", item["title"], "--body-file", body_file]
     if item["kind"] == "review":
         return ["pr", "review", str(item["number"]), "-R", repo, "--body-file", body_file]
     return ["issue", "comment", str(item["number"]), "-R", repo, "--body-file", body_file]
@@ -28440,6 +28654,79 @@ def broker_post(item: dict) -> int:
     print(f"{item['kind']} made through the lane-gh broker (this host holds no token)"
           + (f": {where}" if where else ""))
     return 0
+
+
+def post_one_call_kind(kind: str) -> str | None:
+    """The canonical kind of a write `post` makes in one call, or None for one it queues."""
+    word = (kind or "").strip().lower().replace("_", "-")
+    return POST_ONE_CALL.get(word)
+
+
+def post_one_call_labels(args: argparse.Namespace) -> list[str]:
+    """`--label a --label b` and `--label a,b` are the same two labels (gh takes either)."""
+    return [one.strip() for part in (getattr(args, "label", None) or []) for one in part.split(",") if one.strip()]
+
+
+def post_one_call_args(kind: str, args: argparse.Namespace) -> tuple[list[str], dict | None]:
+    """(the `gh` argument vector for this write, the post-shaped item its body is guarded as or None).
+
+    The target takes the shapes every other command takes (`OWNER/REPO#N`, `pr:OWNER/REPO#N`, a URL, a bare
+    number in a checkout), because the caller copied it out of a wait line, not out of this parser's help.
+    """
+    if kind == "issue":
+        if not re.fullmatch(rf"{NAME}/{NAME}", args.target or ""):
+            raise WatchError("post issue takes OWNER/REPO (with --title T and --body-file F), "
+                             f"not {args.target!r}")
+        if not args.title:
+            raise WatchError("post issue needs --title (and --body-file F, or --body)")
+        body = read_body(args.body, args.body_file)
+        gh = ["issue", "create", "-R", args.target, "--title", args.title, "--body", body]
+        for label in post_one_call_labels(args):
+            gh += ["--label", label]
+        return gh, {"kind": "issue", "repo": args.target, "title": args.title, "body": body}
+    target = drop_kind_prefix(args.target or "", "comment", also=("pr", "comment"))
+    m = KEY_RES["comment"].fullmatch(target)
+    if not m and not BARE_NUMBER.fullmatch(target):
+        raise WatchError(f"post {kind} takes {KIND_FORMS['comment']}, not {args.target!r}")
+    _, owner, repo, number = split_key(parse_key("comment", target))
+    where = f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}"  # as typed: parse_key lowercases its key
+    if args.title or args.head or args.base or args.reviewer:
+        raise WatchError("--head, --base, --title and --reviewer are for post pr")
+    if kind == "label":
+        labels, off = post_one_call_labels(args), (getattr(args, "remove_label", None) or [])
+        if not labels and not off:
+            raise WatchError("post label needs --label L (repeatable, or L,L); --remove-label L takes one off")
+        gh = ["issue", "edit", str(number), "-R", where]  # a PR takes it too: a PR is an issue here
+        for label in labels:
+            gh += ["--add-label", label]
+        for label in off:
+            gh += ["--remove-label", label]
+        return gh, None
+    gh = ["issue", "close", str(number), "-R", where]
+    if args.body is None and args.body_file is None:
+        return gh, None  # closing with no word said: nothing to guard
+    body = read_body(args.body, args.body_file)
+    return gh + ["--comment", body], {"kind": "comment", "repo": where, "number": number, "body": body}
+
+
+def cmd_post_one_call(kind: str, args: argparse.Namespace) -> int:
+    """Make the GitHub write `post` does not queue, here, in this call.
+
+    Until 2026-11-22 this printed the `gh` line and ran nothing, which cost the caller the refusal plus the
+    line typed back -- two tool calls for a one-call write. The body still goes through the same public-text
+    guard a queued post does, and the call still goes through `gh`, this tool's own quota shim, so a write made
+    here is counted, cached and paced exactly like one made the long way.
+    """
+    gh, item = post_one_call_args(kind, args)
+    if item is not None:
+        try:
+            why = body_guard_refusal(item)
+        except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
+            why = f"the body guard failed ({type(error).__name__}: {error})"
+        if why:
+            print(f"glaeda-gh: not posted: {why}", file=sys.stderr)
+            return 3
+    return cmd_gh(gh)
 
 
 def cmd_post(args: argparse.Namespace) -> int:
@@ -29228,6 +29515,12 @@ CHOICE_SYNONYMS = {
     # write post does not queue at all -- would silently run as a comment on an issue. Both spellings route
     # through POST_ELSEWHERE instead, which names the call and runs nothing.
     "comment": ("reply", "note"),
+    # The kinds `post` makes in one call (POST_ONE_CALL). `issue-comment` and `pr-comment` are choices of their
+    # own rather than `comment` synonyms: as a synonym, `pr` would prefix-match `pr-comment` and be refused as
+    # "as close to pr as to comment".
+    "issue": ("issues", "new-issue", "newissue", "bug", "file-issue"),
+    "label": ("labels", "add-label", "add-labels", "tag"),
+    "close": ("close-issue", "close-pr"),
 }
 CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
 
@@ -29335,18 +29628,23 @@ def print_json_error(code: str, reason: str, nxt: str) -> None:
 # 2026-11-22: `post issue` was refused with a hint about target *shapes*, and the gh call had to be worked out by
 # hand. Leo, 2026-11-20: "we need a bunch of synonyms for code for you guys where it just goes \"eh close enough\"
 # and works".
+# Measured again 2026-11-22: naming the call cost the same two tool calls as refusing it did -- the printed line,
+# then the same line typed back. `post` already stands in front of `gh` (one quota shim, one body guard), so for
+# these kinds it makes the write in this call instead of printing it (post_one_call). Leo: "when you guys
+# encounter errors or whatnot, the tool itself should be improved and/or your thing should also be acceptable
+# input or rewritten to make stuff good".
 POST_ELSEWHERE = {
-    ("issue", "issues", "new-issue", "newissue", "bug", "file-issue"):
-        "glaeda-gh gh issue create --repo OWNER/REPO --title T --body-file F",
-    ("issue-comment", "issuecomment", "pr-comment", "prcomment"):
-        "glaeda-gh post comment OWNER/REPO#N --body-file F (one kind for both: a PR is an issue here)",
-    ("label", "labels", "add-label", "tag"):
-        "glaeda-gh gh issue edit N --repo OWNER/REPO --add-label L (a PR takes it too: a PR is an issue here)",
-    ("close", "closed", "close-issue"):
-        "glaeda-gh gh issue close N --repo OWNER/REPO",
     ("merge", "land"):
         "glaeda-gh land OWNER/REPO#N --match-head-commit SHA (the daemon merges it pinned, on green)",
 }
+
+# A write `post` makes in one call, by the kind word typed for it. The value is the canonical kind;
+# POST_KIND_CHOICES puts every word in the parser's choices, so argparse refuses nothing it can run, and
+# CHOICE_SYNONYMS carries the looser spellings (`bug`, `tag`, `closed`).
+POST_ONE_CALL = {"issue": "issue", "label": "label", "close": "close",
+                 "issue-comment": "comment", "pr-comment": "comment"}
+POST_QUEUED_KINDS = ("comment", "pr", "review", "status")
+POST_KIND_CHOICES = POST_QUEUED_KINDS + tuple(POST_ONE_CALL)
 
 
 def post_elsewhere(kind: str) -> str:
@@ -29653,7 +29951,9 @@ def parser() -> argparse.ArgumentParser:
                         "when it is of this head and all green (route pr-rollup)")
     c.add_argument("--json", action="store_true")
     po = sub.add_parser("post", help="queue a comment, PR or review; the daemon posts it, paced for every session")
-    po.add_argument("kind", choices=("comment", "pr", "review", "status"))
+    po.add_argument("kind", choices=POST_KIND_CHOICES, metavar="KIND",
+                    help="comment, pr, review (queued and paced), status, or issue, label, close, issue-comment "
+                         "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
     po.add_argument("--body", help="the text (prefer --body-file: backticks and dollar signs stay data)")
     po.add_argument("--body-file", metavar="PATH", help="the text from a file, - for stdin")
@@ -29668,6 +29968,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
+    po.add_argument("--label", action="append", metavar="L",
+                    help="label: a label to add (repeatable, or L,L); issue: a label for the new issue")
+    po.add_argument("--remove-label", action="append", metavar="L", help="label: a label to take off")
     po.add_argument("--gate", action="store_true",
                     help="comment or review: a receipt a merge waits on (a verdict, a check, a land receipt); it goes "
                          "out ahead of every other queued write (review receipts are recognized without it)")
@@ -30428,8 +30731,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("--wait must be 0 or more seconds")
             if args.kind == "status":
                 return cmd_post_status(args.target, args.wait, args.json)
+            one = post_one_call_kind(args.kind)
             if not args.target:
-                raise WatchError(f"post {args.kind} needs a target")
+                raise WatchError(f"post {args.kind} needs a target"
+                                 + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
+            if one == "comment":
+                args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
+            elif one:
+                return cmd_post_one_call(one, args)
             return cmd_post(args)
         if args.command == "checks":
             if args.wait < 0:
