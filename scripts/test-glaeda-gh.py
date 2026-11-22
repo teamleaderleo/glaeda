@@ -29534,6 +29534,28 @@ class LandTest(Base):
         self.assertEqual(e["dueLate"]["why"], "the login's quota pace (graphql)")
         self.q.jobs.clear()
 
+    def test_the_pool_line_counts_each_gate_holding_a_due_row(self):
+        """huge-blue, 2026-11-22 09:25Z: busy 2 of 12, gated 530, loadGated 0, 220 uncapped queued rows not taken, and
+        every row so held read "every worker busy". The login's share and the snapshot room now name themselves, and
+        the land-pool line counts this pass's due rows per gate (heldBy) and the due rows no gate in judge() saw."""
+        self.q.jobs["pr:p/r#9"] = mock.Mock(done=lambda: False)
+        self.q.entries["pr:p/r#9"] = {"key": "pr:p/r#9", "repo": "p/r", "state": "judging"}
+        self.w.config.update(workers=16, loginWorkers=1)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        with mock.patch.object(self.q, "latch_free", return_value=False):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+            self.assertEqual(self.q.pass_held_by, {"the login's share of the workers (loginWorkers) is busy": 1})
+            self.assertEqual(e["dueLate"]["why"], "the login's share of the workers (loginWorkers) is busy")
+            self.q.pool_logged = 0.0
+            with mock.patch.object(gg, "log") as logged:
+                self.q.log_pool()
+        line = next(c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "land-pool")
+        self.assertEqual(line["heldBy"], {"the login's share of the workers (loginWorkers) is busy": 1})
+        self.assertEqual(line["dueNoGate"], 0)
+        self.q.jobs.clear()
+
     def test_land_status_names_what_holds_the_workers(self):
         """huge-blue, 2026-11-22: `land status` printed "every worker busy" while one worker of 12 ran; the line names
         each judging or acting row, the ceiling and the host's load (reported, not a gate)."""

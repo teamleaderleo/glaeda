@@ -13487,6 +13487,7 @@ class LandQueue:
         self.reset_judged: list[float] = []  # when each latch-held entry's judgment started (reset_staggered)
         self.window: dict[str, float] | None = None  # this quota window's start and spend (window_room), read lazily
         self.pass_capped = 0  # this pass's judgments the window cap left for a later window
+        self.pass_held_by: dict[str, int] = {}  # this pass's due rows left out, per gate (note_late): "heldBy"
         self.pass_staggered = 0  # this pass's latch-held judgments that waited for their place in the stagger
         # owner -> (asked at, has an unlatched source, why not: the check's own reason, quoted by hold's notice)
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
@@ -13697,6 +13698,7 @@ class LandQueue:
             self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
+            self.pass_held_by = {}
             self.log_pool()
             return
         latch = self.latch_held()
@@ -13708,6 +13710,7 @@ class LandQueue:
         self.pass_latched = 0
         self.pass_staggered = 0
         self.pass_capped = 0
+        self.pass_held_by = {}
         # The rows this pass can judge, named before it prunes or re-arms anything, so a re-armed entry is judged from
         # the next pass as it always was. judge_order reads a cache file per row it sorts: a finished row (LAND_DONE
         # for up to LAND_KEEP, 7 days) or one a worker already holds would pay for that read and then be skipped on
@@ -14665,6 +14668,8 @@ class LandQueue:
         this, not only the worker count: huge-blue, 2026-11-22 07:23Z, load 0.48/core under the line, 1 of 12 workers
         busy, 449 due late, and the rows still read "the host's load is over the line" from 05:41-06:46Z, because the
         gates holding them since (the quota pace, the reset stagger, a head read) left the old reason on the row."""
+        if self.due(e):
+            self.pass_held_by[why] = self.pass_held_by.get(why, 0) + 1
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
             load = land_load_per_core()
@@ -14727,7 +14732,10 @@ class LandQueue:
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
              "open": sum(states.values()), "states": states, "waits": waits,
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
-             "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
+             "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped,
+             "heldBy": dict(sorted(self.pass_held_by.items(), key=lambda kv: -kv[1])[:8]),
+             # due rows this pass reached no gate in judge(): left out before it (consider, a park, the latch)
+             "dueNoGate": max(0, len(due) - sum(self.pass_held_by.values())), "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
              "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_reason(self.queue_quota_reason, 160)}
              if self.queue_quota_until > self.now else None,
@@ -15625,7 +15633,8 @@ class LandQueue:
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             if not free or self.snapshot(e["key"], sha)[1] == "wait":
-                self.gated(e)
+                self.gated(e, "every worker busy" if not free else
+                          "snapshot waits ahead fill the room (snapshotWaiting)")
                 return False
         elif self.snapshot_wait(e, sha, free):
             self.note_late(e, "waiting for the daemon's snapshot of its head")
@@ -15637,7 +15646,7 @@ class LandQueue:
             self.gated(e, "the host's free RAM is at the 80% line (MemAvailable)")  # LAND_HEADROOM; one always runs
             return False
         if not self.login_room(e):
-            self.gated(e)  # its reads spend the login: the login's share of the workers is busy
+            self.gated(e, "the login's share of the workers (loginWorkers) is busy")
             return False
         if self.hold_spent(e):
             self.gated(e, "held its workers LAND_HOLD_MAX this window judging nothing")  # LAND_HOLD_MAX
