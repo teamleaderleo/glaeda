@@ -26396,6 +26396,24 @@ class LandTest(Base):
         with mock.patch.object(gg, "policy_host", lambda: "executor"):
             self.assertEqual(gg.land_lane({"lane": "child", "laneHost": "host"}), "")
 
+    def test_a_forwarded_land_keeps_its_pin_and_a_made_up_id_names_its_host(self):
+        """2026-11-22: a land queued pinned on a forwarding host reached the land host unpinned (neither forwarding
+        path carried the sha, and apply() drops the pin of a request with none), and two hosts handing off one PR's
+        same generation made one id."""
+        e = {"pinSha": LA, "gen": 3, "requester": "h/l"}
+        with mock.patch.object(gg.socket, "gethostname", return_value="host-a.local"):
+            a = gg.LandQueue.handoff_request(self.KEY, e)
+        with mock.patch.object(gg.socket, "gethostname", return_value="host-b"):
+            b = gg.LandQueue.handoff_request(self.KEY, e)
+        self.assertEqual((a["sha"], b["sha"]), (LA, LA))
+        self.assertNotEqual(a["id"], b["id"])
+        self.assertTrue(a["id"].startswith("handoff-host-a-"), a["id"])
+        self.assertNotIn("sha", gg.LandQueue.handoff_request(self.KEY, {"gen": 1}))
+        # a request still in requests/ keeps its --sha on the way out too
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        batch, _, _ = self.q.forward_batch()
+        self.assertEqual([r.get("sha") for r in batch], [LA])
+
     def test_a_fresh_land_from_an_older_sender_drops_the_last_queuers_lane(self):
         with mock.patch.object(gg, "policy_host", lambda: "host"):
             gg.land_request("land", "o/r#1", [], "host/first", lane=("first", "host"))

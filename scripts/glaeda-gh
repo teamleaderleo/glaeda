@@ -13859,7 +13859,7 @@ class LandQueue:
                 rid = str(req.get("id") or "")
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
-                batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
+                batch.append({k: req.get(k) for k in ("op", "target", "sha", "after", "requester", "requesterFrom",
                                                       "queuedBy", "lane", "laneHost", "override") if k in req}
                              | {"id": rid})
                 files.append((rid, path))
@@ -13868,9 +13868,13 @@ class LandQueue:
     @staticmethod
     def handoff_request(key: str, e: dict) -> dict:
         """E as one `land serve` request that hands it to another host's queue (an executor's, or a peer's overflow):
-        its request id, requester, lane, --after and override kept, so a resend is applied once."""
+        its request id, requester, lane, --after, --sha pin and override kept, so a resend is applied once. The pin
+        rode neither forwarding path, and the receiving queue's apply() drops the pin of a request with no sha: every
+        land a forwarding host queued pinned reached the land host unpinned (hq#18145, hq#18005, 2026-11-22). A
+        made-up id names this host, so two hosts handing off one PR's same generation are two requests, not one."""
         rid = str(e.get("requestId") or "")
-        return ({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
+        host = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname().split(".")[0])[:24] or "host"
+        return ({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{host}-{file_name(key)[:16]}-"
                  f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
                  "after": [key_name(a) for a in e.get("after") or []],
                  "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
@@ -13878,7 +13882,8 @@ class LandQueue:
                 # an entry from before the lane was recorded names none there: its requester's
                 # PARENT/CHILD would read as a session on the executor's host
                 | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                | ({"override": e["override"]} if e.get("override") else {}))
+                | ({"override": e["override"]} if e.get("override") else {})
+                | ({"sha": e["pinSha"]} if e.get("pinSha") else {}))
 
     # -- overflow to peer land hosts (land_overflow): this host judges, and hands its late rows on
 
