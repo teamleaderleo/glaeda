@@ -26361,9 +26361,10 @@ class Parser(argparse.ArgumentParser):
 
     def error(self, message: str) -> None:  # type: ignore[override]
         hint, one_target = wait_extra_targets(message)
-        nxt = one_target or usage_next(Parser.argv, self.prog)
+        elsewhere, without = flag_elsewhere(message)
+        nxt = one_target or without or usage_next(Parser.argv, self.prog)
         say_waiting(self.format_usage().rstrip("\n"))
-        spellings = kind_spellings(message) or hint
+        spellings = kind_spellings(message) or hint or elsewhere
         say_waiting(f"{self.prog}: error: {message}" + (f" ({spellings})" if spellings else ""))
         say_waiting(f"next: {nxt}")
         if "--json" in Parser.argv:
@@ -27072,6 +27073,66 @@ def flag_options(raw: list[str]) -> dict[str, bool]:
         if nested is not node:
             options.update(parser_options(nested))
     return options
+
+
+def flag_commands(flag: str) -> list[str]:
+    """Every command of this tool whose own options include FLAG, as the words a caller types: `land`,
+    `log search`. The whole path, because a reader told "it is an option of `log`" would type
+    `glaeda-gh log --max-age`, which is the next usage error. Spelling-insensitive, like the rest of the
+    flag reading here, so `--maxAge` finds the command that has `--max-age`."""
+    key = normalized_flag(flag.split("=", 1)[0])
+    top = parser()
+    tops, _ = nesting_table()
+    out: list[str] = []
+    for name in sorted(tops):
+        node = child_parser(top, name)
+        if key in {normalized_flag(o) for o in parser_options(node)}:
+            out.append(name)
+            continue
+        for word in first_slot_words(node):
+            nested = child_parser(node, word)
+            if nested is not node and key in {normalized_flag(o) for o in parser_options(nested)}:
+                out.append(f"{name} {word}")
+    return out
+
+
+def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, str]:
+    """What a flag borrowed from a sibling command is told: (hint, next). ("", "") for any other usage error.
+
+    The siblings of this mistake are all named or routed already -- a command word at the wrong nesting
+    level, a flag in another case convention, a kind with a separator -- and this one was left to argparse's
+    bare "unrecognized arguments: --notify". Measured 2026-11-21: `wait run o/r/ID --timeout 1500 --notify`
+    said that and nothing more, so the reader learned neither that `wait` has no such flag (a wait blocks
+    until the verdict; there is nothing to notify about) nor that `land --notify` is the one that does.
+
+    Nothing is rewritten: which command the caller meant is theirs to say, so this names where the flag
+    lives and offers the call they typed minus the flag that is no part of it."""
+    words = list(Parser.argv if argv is None else argv)
+    found = EXTRA_ARGS.search(message)
+    if not found or not words or words[0].startswith("-"):
+        return "", ""
+    extra = found.group(1).replace(",", " ").split()
+    if not extra or not all(w.startswith("--") and w != "--" for w in extra):
+        return "", ""  # a stray target or value among them is another mistake: argparse's own line names it
+    typed = words[0]
+    # The command that just refused the flag is never named as the place to go: that is a next step which
+    # cannot end the refusal.
+    owners = {w: [c for c in flag_commands(w) if c.split()[0] != typed] for w in extra}
+    named = [w for w in extra if owners[w]]
+    if not named:
+        return "", ""  # no command of this tool has it: argparse's refusal stands as it is
+    kept = [w for w in words if w not in extra]
+
+    def lives(flag: str) -> str:
+        where = owners[flag]
+        return f"{' and '.join(f'`{c}`' for c in where)}'s (`glaeda-gh {where[0]} --help`)"
+
+    if len(named) == 1:
+        hint = f"`{named[0]}` is no option of `{typed}`: it is {lives(named[0])}"
+    else:
+        hint = (f"{', '.join(f'`{w}`' for w in named)} are no options of `{typed}`: "
+                + "; ".join(f"`{w}` is {lives(w)}" for w in named))
+    return hint, " ".join(["glaeda-gh"] + kept)
 
 
 def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
