@@ -7933,6 +7933,56 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW)
         self.assertEqual(len([k for k in read if k.startswith("head:")]), len(shas))
 
+    def test_asked_heads_with_no_answer_keep_the_heads_share_while_a_waited_pr_is_due(self) -> None:
+        """The land host, 2026-11-22: the land queue registered the head of every open entry for land-judge, ~700 asked
+        heads with no answer ranked ahead of every waited PR with no bound, and 600 s stored 48 head reads and 3 PR reads
+        while waited PR data reached 7,195 s. Past REST_HEAD_BUDGET only the first asked head of the tick is read; the
+        others are deferred (first next tick) and the waited PR is read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        shas = [f"{n:040x}" for n in range(1, 6)]
+        for sha in shas:
+            gg.register(f"head:o/r@{sha}", consumer="land-judge")  # asked, never read
+        for n, at in ((9, 8000), (8, 7000)):  # #9 leads (starved_lead); #8 sorts behind the asked heads
+            gg.register(f"pr:o/r#{n}", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(f"pr:o/r#{n}"), {
+                "key": f"pr:o/r#{n}", "fetchedAt": NOW - at, "dataAt": NOW - at, "error": None, "data": {"state": "OPEN"}})
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertIn("pr:o/r#8", read, "the waited PR is read though asked heads ranked ahead of it")
+        heads = [k for k in read if k.startswith("head:")]
+        self.assertEqual(len(heads), 1, f"one asked head a tick past the share: {read}")
+        self.assertEqual({f"head:o/r@{sha}" for sha in shas} - set(heads), self.daemon.deferred & {
+            f"head:o/r@{sha}" for sha in shas}, "the others go first next tick")
+
+    def test_graphql_head_batches_stop_at_the_heads_share_while_waited_prs_are_due(self) -> None:
+        """The same over GraphQL, where the blocked head batches go first (06:57Z and 08:51Z that day: "no pr read stored
+        in the last 600s; ticks spent 600 s, most in read head (518 s)"): past REST_HEAD_BUDGET, once one query went,
+        the rest of the head batches are deferred and the waited PRs are read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "head": 2}
+        shas = [f"{n:040x}" for n in range(1, 7)]
+        for sha in shas:
+            gg.register(f"head:o/r@{sha}", consumer="land-judge")
+        gg.register("pr:o/r#9", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        queries: list[tuple[str, int]] = []
+
+        def fetch(kind):
+            return lambda chunk: queries.append((kind, len(chunk)))
+
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        self.assertEqual([k for k, _ in queries].count("head"), 1, queries)
+        self.assertIn(("pr", 1), queries)
+        self.assertEqual(len({f"head:o/r@{sha}" for sha in shas} & self.daemon.deferred), len(shas) - 2)
+
     def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
         """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
         and an asked head with no answer, or a wait's key, is still read."""
@@ -7969,7 +8019,7 @@ class TickBudgetTest(Base):
         self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
         calls: list[tuple[str, list[str]]] = []
 
-        def batched(kind, entries, fetch):
+        def batched(kind, entries, fetch, until=None):
             if entries:
                 calls.append((kind, [e["key"] for e in entries]))
             return []

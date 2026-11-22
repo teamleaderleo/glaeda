@@ -612,6 +612,12 @@ REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may tak
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
 # (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
 # 325 waited PRs sat 3 h unread; the stale valve restarted the daemon every 30 min to no effect)
+# The asked heads with no answer too, past the first of the tick, and on GraphQL as on REST (the head batches go first
+# there): the land queue registers the head of every open entry for land-judge (watch_head), so ~700 heads were asked and
+# unanswered at once, and they ranked ahead of every waited PR with no bound. The land host, 2026-11-22 10:2xZ: 48 head
+# reads and 3 PR reads stored in 600 s, 331 waited PRs, waited PR data 7,195 s old; at 06:57Z and 08:51Z "no pr read
+# stored in the last 600s; ticks spent 600 s, most in read head (518 s)". One asked head a tick still goes first, so a
+# merge gate's new SHA is never starved; the rest share the tick with the waited PRs.
 REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
 # tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
 # (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
@@ -8109,8 +8115,11 @@ class Daemon:
                 if len(self.gql_log) > before:
                     self.plain_at[kind] = self.now
             if blocked[kind]:
+                # the blocked heads go first, within the heads' share while a waited PR or run is due (REST_HEAD_BUDGET)
+                until = (time.monotonic() + REST_HEAD_BUDGET
+                         if kind == "head" and (blocked["pr"] or blocked["run"]) else None)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind])
+                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind], until=until)
                 self.post_between()
         self.gql_paced = None
         sent = len(self.gql_log)
@@ -8153,12 +8162,18 @@ class Daemon:
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
         plain_until = time.monotonic() + REST_PLAIN_BUDGET
         head_until = time.monotonic() + REST_HEAD_BUDGET
+        # the last waited PR or run in the order: a head past the heads' share ahead of it is deferred (REST_HEAD_BUDGET)
+        last_waited = max((i for i, x in enumerate(over_rest) if x["key"].startswith(("pr:", "run:")) and self.waited(x)),
+                          default=-1)
+        asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
-                if e["key"].startswith("head:") and time.monotonic() >= head_until and not self.head_unanswered(e) \
-                        and any(x["key"].startswith(("pr:", "run:")) and self.waited(x) for x in over_rest[i + 1:]):
-                    self.defer([e])  # the heads' share is spent and a waited PR or run is still unread: it reads now
-                    continue
+                if e["key"].startswith("head:") and time.monotonic() >= head_until and i < last_waited \
+                        and (asked_read or not self.head_unanswered(e)):
+                    self.defer([e], "the heads' share of the tick, waited PRs still to read")
+                    continue  # the heads' share is spent and a waited PR or run is still unread: it reads now
+                if e["key"].startswith("head:") and self.head_unanswered(e):
+                    asked_read = True
                 if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e)
                                                             or self.head_unanswered(e)):
                     self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order
@@ -9019,7 +9034,8 @@ class Daemon:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
                 "head": self.fetch_head_rest}
 
-    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> list[dict]:
+    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None],
+                until: float | None = None) -> list[dict]:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
         halves the batch (once per tick, never below GQL_BATCH_MIN) and is retried at once as two
         halves, so one heavy entry cannot keep the rest stale: it ends up alone, is remembered as
@@ -9028,7 +9044,8 @@ class Daemon:
         the extra queries a tick spends on splitting; what is left waits for the next cycle. Returns the
         entries left unread because GraphQL stopped (its quota, or a throttle) partway, the one that hit it
         included, for the caller to read over REST, and the entries GraphQL failed with a 5xx or no answer that could
-        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN)."""
+        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN).
+        UNTIL (a time.monotonic() deadline): past it, once a query was sent, what is left is deferred (first next tick)."""
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
 
@@ -9064,8 +9081,12 @@ class Daemon:
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
         to_rest: list[dict] = list(backing_off)
+        asked = False  # a query was sent: UNTIL may cut the rest
         while queue:
             chunk = queue.pop(0)
+            if until is not None and asked and time.monotonic() >= until:
+                self.defer(chunk + [e for c in queue for e in c], f"the {kind}s' share of the tick, waited reads due")
+                return to_rest
             on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
             if (self.mode("graphql") == "stop" and not on_app) or self.gql_down():
                 return to_rest + chunk + [e for c in queue for e in c]
@@ -9086,6 +9107,7 @@ class Daemon:
                 continue
             self.gql_limited = False
             self.gql_reason = kind
+            asked = True
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
             try:
