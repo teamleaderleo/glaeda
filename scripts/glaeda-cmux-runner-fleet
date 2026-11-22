@@ -107,6 +107,8 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 STAMP_READ = f"head -c 4096 ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP} 2>/dev/null || echo @no-stamp"  # read-only
 MAX_REASON = 200
+# MAIN_MOVED: how long after origin's main moves past HEAD an apply from HEAD is still accepted (see main_moved)
+MAIN_GRACE_S = 2 * 3600
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -405,9 +407,10 @@ def git(*args: str, timeout: float = 30) -> tuple[int, str, str]:
 
 
 def checkout_source() -> dict[str, Any]:
-    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now. ls-remote
-    fetches nothing and writes nothing here, and a stale local origin/main ref cannot vouch for a stale checkout.
-    refusal is why --apply must not deploy from here, or None."""
+    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now (ls-remote: a
+    stale local origin/main ref cannot vouch for a stale checkout). refusal is why --apply must not deploy from
+    here, or None. MAIN_MOVED: a HEAD origin's main has moved past within MAIN_GRACE_S is accepted (behindMain
+    says by how much), so a run that started at origin/main survives main moving under it; see main_moved."""
     code, out, _ = git("rev-parse", "--verify", "HEAD^{commit}")
     head = out.strip() if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out.strip()) else None
     if head is None:
@@ -419,10 +422,34 @@ def checkout_source() -> dict[str, Any]:
     if main is None:  # git's stderr may name the remote URL: keep it out
         refusal = f"cannot read origin's main (git ls-remote exit {code}), so HEAD {head} cannot be checked"
     elif main != head:
+        moved = main_moved(head, main)
+        if moved is not None:
+            return {"head": head, "originMain": main, "refusal": None, "behindMain": moved}
         refusal = f"HEAD {head} is not origin/main {main}; roll out from a worktree at origin/main"
     else:
         refusal = None
     return {"head": head, "originMain": main, "refusal": refusal}
+
+
+def main_moved(head: str, main: str) -> dict[str, Any] | None:
+    """{commits, seconds}: how far origin's main has moved past HEAD, when HEAD is an ancestor of main and main first
+    moved off it at most MAIN_GRACE_S ago; else None (refused). glaeda's main moves every 10-20 min and a rollout
+    with busy-runner retries runs ~20 min, so a run that checked HEAD == origin/main at its start was refused at
+    its end (2026-11-22, five runs of cmux11s-13s). Not a downgrade: HEAD is on main, and every member's stamp is
+    still checked against HEAD. A HEAD with local commits is not an ancestor of main, and an old checkout's main
+    moved on long ago: both still refused. Fetches main's objects only (--refmap= and --no-write-fetch-head: no ref,
+    no FETCH_HEAD) when this checkout lacks them."""
+    if git("cat-file", "-e", f"{main}^{{commit}}")[0] != 0:
+        git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/main",
+            timeout=120)
+    if git("merge-base", "--is-ancestor", head, main)[0] != 0:  # not an ancestor, or main still unknown here
+        return None
+    code, out, _ = git("log", "--first-parent", "--reverse", "--format=%ct", f"{head}..{main}")
+    stamps = [int(x) for x in out.split() if x.isdigit()] if code == 0 else []
+    if not stamps:
+        return None
+    seconds = max(0, int(time.time()) - stamps[0])  # when main's first commit after HEAD landed
+    return {"commits": len(stamps), "seconds": seconds} if seconds <= MAIN_GRACE_S else None
 
 
 def clean_reason(text: object) -> str:
@@ -536,6 +563,10 @@ def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
 def guard_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     head, main = (guard.get("head") or "unknown")[:12], (guard.get("originMain") or "unknown")[:12]
     lines = [f"source: HEAD {head}, origin/main {main}"]
+    moved = guard.get("behindMain")
+    if moved:  # MAIN_MOVED
+        lines[0] += (f" ({moved['commits']} commit(s) ahead, landed {moved['seconds'] // 60} min ago; HEAD is on main,"
+                     " accepted)")
     for member, row in sorted(guard["hosts"].items()):
         if row["state"] in ("none", "unreadable"):
             what = "no stamp" if row["state"] == "none" else f"unreadable stamp ({row['note']})"
