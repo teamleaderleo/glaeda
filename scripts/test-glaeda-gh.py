@@ -11654,6 +11654,23 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
         self.assertIn("read", tops)  # the real table is untouched by the patch above
 
+    def test_a_near_spelling_of_the_command_still_gets_the_shapes_that_command_takes(self) -> None:
+        """`logs job OWNER/REPO/ID` (called so 2026-11-22) runs: the command word is read before the shapes.
+
+        The spelling was corrected to `log` and the call then died on "one of the arguments JOB_ID|RUN_ID
+        --job is required", because `log_job_synonym` -- which does take the one-word target -- had already
+        run and seen `logs`. Every shape rewriter gates on an exact command word, so the whole class is the
+        one fix: a nesting word (`job o/r/7`) reaches the same shape, and so does `seach "cmux next"`."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(gg, "cmd_log_job", return_value=0) as log_job:
+            self.assertEqual(gg.main(["logs", "job", "o/r/7"]), 0)
+            self.assertEqual(gg.main(["job", "o/r/7"]), 0)
+        self.assertEqual(log_job.call_args_list, [mock.call("o/r", 7), mock.call("o/r", 7)])
+        self.assertIn("`log` is the one it means", err.getvalue())
+        with contextlib.redirect_stderr(err), mock.patch.object(gg, "cmd_search", return_value=0) as search:
+            self.assertEqual(gg.main(["seach", "cmux next"]), 0)
+        self.assertEqual(search.call_args_list[0].args[:2], ("both", ["cmux next"]))
+
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
         (both cost a usage error, 2026-11-21)."""
