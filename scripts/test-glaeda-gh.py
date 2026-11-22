@@ -22842,6 +22842,9 @@ class LandTest(Base):
         super().setUp()
         self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
+        retry = mock.patch.object(gg, "LAND_NOTIFY_RETRY_S", 0.0)  # a refused notice's resends, never a real sleep
+        retry.start()
+        self.addCleanup(retry.stop)
         # The CLI (`glaeda-gh land`) resolves land-judge from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
         paths = mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),))
@@ -26842,6 +26845,57 @@ class LandTest(Base):
         self.assertEqual(e["state"], "stopped")
         self.assertEqual(self.w.notices[-1][0], "land-notify-failed")
 
+    def test_a_refused_notice_is_sent_again_and_one_that_goes_through_is_not_a_failure(self):
+        # 57 of 58 land-notify-failed on one lane VM, 2026-11-21/22, were one refused send ("acpmux: runtime: empty
+        # prompt") and nothing more: the lane never heard its land had ended.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def flaky(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                if len(tries) == 1:
+                    return subprocess.CompletedProcess(argv, 1, "", "acpmux: runtime: empty prompt")
+            return real(argv, timeout, env)
+        self.q.run = flaky
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(tries[0], tries[1])
+        self.assertNotIn("land-notify-failed", [n[0] for n in self.w.notices])
+        retried = [ln for ln in lines if ln.get("event") == "land-notify-retried"]
+        self.assertEqual([(r["tries"], r["why"]) for r in retried], [(2, "acpmux: runtime: empty prompt")])
+
+    def test_a_notice_refused_every_time_is_one_failure_after_its_tries(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def failing(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "no such session")
+            return real(argv, timeout, env)
+        self.q.run = failing
+        self.tick()
+        self.assertEqual(len(tries), gg.LAND_NOTIFY_TRIES)
+        self.assertEqual([n[0] for n in self.w.notices].count("land-notify-failed"), 1)
+
+    def test_a_requester_named_none_is_nobody(self):
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gg.land_requester_from("none"), ("", ""))
+            self.assertEqual(gg.land_requester_from("None"), ("", ""))
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "none"}, clear=True):
+            self.assertEqual(gg.land_requester_from(None), ("", ""))
+        # An entry an older daemon stored as HOST/none falls to the queuing session, or to nobody (land-unnotified).
+        self.assertEqual(gg.land_notify_target({"queuedBy": "tool:ssh-from-x"}, "hostx/none"), "")
+
     def test_cli_land_status_and_cancel(self):
         with mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane-x"}), \
@@ -30103,6 +30157,39 @@ class LandTest(Base):
             self.w.config["workers"] = 12
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
+
+    def test_a_restarted_queue_keeps_its_pool_size(self):
+        """hq#18502: huge-blue re-execs its daemon every 10-30 min. 2026-11-22, land.json's "workers" removed at 12:28Z:
+        the pool grew 16 -> 20 -> 25, a re-exec at 12:39Z put it back at 16 (land_worker_ceiling), under the fixed 32,
+        and the override went back. A new queue starts at the size the last one's pool line said, at once (not at its
+        next land-pool line), bounded by the memory ceiling; a stale or missing line starts from the cores."""
+        q = self.q
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            q.now, q.pass_gated = self.t, 9
+            for _ in range(6):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+            grown = q.workers()
+            self.assertGreater(grown, 4)
+            self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE)["workers"], grown)
+            q.jobs.clear()
+            with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                self.assertEqual(self.queue().workers(), grown)  # the re-exec keeps it
+            with mock.patch.object(gg, "land_mem_available_mb", return_value=4 * 1024):  # 8 workers' worth
+                with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                    self.assertEqual(self.queue().workers(), 8)  # never over the memory ceiling
+            with mock.patch.object(gg.time, "time", return_value=q.now + gg.LAND_ROOM_FRESH + 1):
+                self.assertEqual(self.queue().workers(), 4)  # a stale line: the cores (8 in setUp)
+            (gg.land_dir() / gg.LAND_POOL_FILE).unlink()
+            self.assertEqual(self.queue().workers(), 4)
+            # an operator's fixed size is where the pool goes on from once it is taken out
+            self.w.config["workers"] = 32
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            del self.w.config["workers"]
+            self.assertEqual(q.workers(), 32)
 
     def test_the_pool_ceiling_is_the_hosts_memory_not_its_cores(self):
         self.assertEqual(gg.land_pool_max(40 * 1024), 80)
