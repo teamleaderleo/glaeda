@@ -15897,6 +15897,106 @@ class StaleTmpScratchTest(unittest.TestCase):
         self.assertIn(str(d / "deep/er/blob"), links)
         self.assertIn(os.getcwd(), links)
 
+class DarwinStaleTmpScratchTest(unittest.TestCase):
+    """On a Mac the tmp-stale-scratch holder proof is one bounded lsof listing that must cover every live process a
+    login session started (cmux16, 2026-11-22: 95% full with finished jobs' scratch in /private/tmp, which the
+    family never took because its proof read /proc)."""
+
+    # pid ppid uid ruid stat: launchd, a root daemon and its root child, cmux's shell, a sudo it ran and sudo's
+    # root child, a zombie, another person's session
+    PS = """    1     0     0     0 Ss
+  112     1     0     0 Ss
+  375   112     0     0 S
+  500     1   501   501 S
+  501   500     0   501 S
+  502   501     0     0 S
+  503   500   501   501 Z
+  600     1   502   502 S
+"""
+
+    def setUp(self) -> None:
+        saved = (gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME, dict(gd.POLICY))
+
+        def restore() -> None:
+            gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME = saved[:4]
+            gd.POLICY.clear()
+            gd.POLICY.update(saved[4])
+        self.addCleanup(restore)
+        gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = True, None, None
+
+    def lsof(self, pids: list[int], paths: dict[int, list[str]] | None = None) -> str:
+        out = []
+        for pid in pids:
+            out += [f"p{pid}", "cbash", *(f"n{p}" for p in (paths or {}).get(pid, ["/"]))]
+        return "\n".join(out) + "\n"
+
+    def run_proof(self, lsof_out: str, lsof_code: int = 0, after: str | None = None,
+                  alive: bool = True) -> tuple[list[str], int]:
+        ps = [(0, self.PS), (0, self.PS if after is None else after)]  # ps before and after the listing
+        with mock.patch.object(gd, "_owned_query", side_effect=ps), \
+                mock.patch.object(gd, "_owned_query_split", return_value=(lsof_code, lsof_out, "")), \
+                mock.patch.object(gd, "pid_alive", return_value=alive):
+            return gd.darwin_holder_links()
+
+    def test_the_session_processes_are_the_ones_a_login_account_started(self) -> None:
+        pids = gd.darwin_session_pids(gd.darwin_processes(self.PS))
+        self.assertEqual(pids, {500, 501, 502, 600})  # not launchd, its daemons or a zombie; sudo's child is in
+
+    def test_a_listing_that_covers_every_session_process_proves_it(self) -> None:
+        paths, unread = self.run_proof(self.lsof([500, 501, 502, 600], {500: ["/private/tmp/held/x"]}))
+        self.assertEqual(unread, 0)
+        self.assertIn("/private/tmp/held/x", paths)
+
+    def test_a_session_process_lsof_could_not_read_holds_everything(self) -> None:
+        _, unread = self.run_proof(self.lsof([500, 600]), lsof_code=1)  # sudo (501) and its root child unread
+        self.assertEqual(unread, 2)
+
+    def test_a_process_that_exited_or_turned_zombie_during_the_listing_was_not_missed(self) -> None:
+        after = self.PS.replace("  502   501     0     0 S", "  502   501     0     0 Z").replace(
+            "  501   500     0   501 S\n", "")
+        _, unread = self.run_proof(self.lsof([500, 600]), after=after)
+        self.assertEqual(unread, 0)
+        _, unread = self.run_proof(self.lsof([500, 600]), alive=False)
+        self.assertEqual(unread, 0)
+
+    def test_a_failed_or_empty_listing_is_incomplete(self) -> None:
+        self.assertEqual(self.run_proof(self.lsof([500, 501, 502, 600]), lsof_code=2), ([], 1))
+        self.assertEqual(self.run_proof(""), ([], 1))
+
+    def test_the_family_exists_on_a_mac_only_when_the_proof_is_complete(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 0)):
+            self.assertTrue(gd.stale_tmp_enabled())
+        gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = None, None
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 3)):
+            self.assertFalse(gd.stale_tmp_enabled())
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/x")),
+                             "not proven unheld: 3 processes' open files unreadable")
+
+    def test_a_path_lsof_lists_holds_its_top_level_entry(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/private/tmp/held/deep/f"], 0)):
+            self.assertIn("held by a process", gd.stale_scratch_held(Path("/private/tmp/held")))
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/free")), "")
+
+    def test_the_window_is_6_h_on_a_mac_and_12_h_on_linux(self) -> None:
+        self.assertEqual(gd.stale_tmp_hours(), 6.0)
+        gd.DARWIN = False
+        self.assertEqual(gd.stale_tmp_hours(), 12.0)
+        gd.DARWIN = True
+        gd.POLICY["stale_tmp_scratch_hours_macos"] = 0
+        self.assertFalse(gd.stale_tmp_enabled())
+
+    def test_a_future_mtime_counts_as_its_ctime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "typing-bench"
+            (d / "app").mkdir(parents=True)
+            f = d / "app/cmux DEV"
+            f.write_bytes(b"x")
+            ahead = time.time() + 8 * 3600
+            os.utime(f, (ahead, ahead))
+            newest = gd.deep_newest_mtime(d, ctime=True)
+            self.assertLessEqual(newest, time.time() + 1)  # its ctime (the utime just now), not 8 h from now
+            self.assertGreaterEqual(gd.deep_newest_mtime(d), ahead - 1)  # mtime alone still counts it
+
 
 class CensusSudoTest(unittest.TestCase):
     """The census measures a directory it cannot read with `sudo -n du` where sudo needs no password, so the
