@@ -35137,6 +35137,44 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         said = gg.body_guard_args({"kind": "issue", "repo": "o/r", "title": "T", "body": "B"}, "/tmp/b.md")
         self.assertEqual(said, ["issue", "create", "-R", "o/r", "--title", "T", "--body-file", "/tmp/b.md"])
 
+    def test_an_issue_target_that_names_a_number_is_a_comment_on_it(self) -> None:
+        """No issue is created at a number, so `post issue o/r#5 --body B` can only mean a comment on issue 5.
+        Measured 2026-11-22 on this lane: `post issue manaflow-ai/cmuxterm-hq#15832 --body-file -` was refused
+        ("post issue takes OWNER/REPO ..."), and the row it carried cost a second call under `post comment`."""
+        for target in ("o/r#5", "o/r/5", "comment:o/r#5", "https://github.com/o/r/issues/5", "5"):
+            with self.subTest(target):
+                queued: list[dict] = []
+                with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                        mock.patch.object(gg, "cmd_gh", lambda gh: self.fail("a comment was made in one call")), \
+                        mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                        mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                        mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                        mock.patch.object(gg, "daemon_running", lambda *a, **k: True), \
+                        mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                        mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                        mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gg.main(["post", "issue", target, "--body", "B"]), 0)
+                self.assertEqual([(i["kind"], i["repo"], i["number"]) for i in queued], [("comment", "o/r", 5)])
+                self.assertIn("which exists: this is a comment on it", err.getvalue())
+                self.assertIn("a new issue takes OWNER/REPO and --title", err.getvalue())
+
+    def test_a_repository_target_still_files_a_new_issue_and_a_title_with_a_number_refuses(self) -> None:
+        """The number is the whole signal, and only without --title: `post issue o/r --title T` is untouched,
+        and a title *with* a number is the one ambiguous call, so it refuses naming both writes."""
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r"), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue(""), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r#15832"), "15832")
+        self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B"]),
+                         ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B"])
+        lines: list[str] = []
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda text, *a, **k: lines.append(str(text))):
+            self.assertEqual(gg.main(["post", "issue", "o/r#5", "--title", "T", "--body", "B"]), 64)  # a refusal
+        said = "\n".join(lines)
+        self.assertIn("drop --title to comment on it", said)
+        self.assertIn("pass OWNER/REPO to file a new issue", said)
+
     def test_a_merge_is_named_not_made(self) -> None:
         """The one write still printed, and why: a merge is pinned to a head sha this parser does not take."""
         for word in ("merge", "land"):
