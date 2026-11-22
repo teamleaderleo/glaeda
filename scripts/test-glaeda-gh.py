@@ -872,7 +872,7 @@ class HeadRunOrderTest(unittest.TestCase):
         self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
         asked: list = []
 
-        def graphql(query: str, variables: dict) -> tuple:
+        def graphql(query: str, variables: dict, owner: str | None = None) -> tuple:
             asked.append(variables["ids"])
             return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
                                        {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
@@ -887,7 +887,7 @@ class HeadRunOrderTest(unittest.TestCase):
         gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
         self.assertEqual(asked, [["CR_10", "CR_11"]])
         down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
-                                     graphql=lambda q, v: (None, "graphql: down"))
+                                     graphql=lambda q, v, owner=None: (None, "graphql: down"))
         again = gg.head_data("a" * 40, runs, {}, {}, order)
         again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
                          for k, rs in again["runs"].items()}
@@ -31614,6 +31614,31 @@ class AppPoolTest(Base):
         self.assertEqual(status["lastHour"]["app"], 1)
         self.assertEqual(status["appPool"]["served"], 1)
         self.assertNotIn(APP_TOKEN, text)
+
+
+    def test_inline_owner_and_node_id_reads_of_one_owner_go_on_the_app(self) -> None:
+        """Leo, 2026-11-22: "well, we have apps. several apps. this should not be an issue". The head, head-pages,
+        pr-pages, last-real-attempt and steps reads put their owner in the query text or read by node id, so their
+        variables named no owner and about 870 points an hour went on the login. The caller now names the owner."""
+        page = {"data": {"repository": {"object": {"statusCheckRollup": {"contexts": {
+            "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}}
+        self.app_answers.append((200, {}, json.dumps(page).encode()))
+        first = {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}
+        data = self.daemon.head_pages("a" * 40, [("manaflow-ai", "cmux", first)])
+        self.assertIsInstance(data, dict)
+        self.assertEqual((len(self.app_calls), self.gh.calls), (1, []), "the inline-owner head query is on the App")
+        failed = {"checks": [{"id": "CR_1", "conclusion": "FAILURE"}]}
+        self.app_answers.append((200, {}, b'{"data":{"nodes":[{"id":"CR_1","steps":{"nodes":[]}}]}}'))
+        self.daemon.fill_steps([({"key": "pr:manaflow-ai/cmux#1", "cache": {}}, failed)])
+        self.assertEqual((len(self.app_calls), self.gh.calls), (2, []), "a one-owner node-id steps query is on the App")
+        self.daemon.fill_steps([({"key": "pr:manaflow-ai/cmux#2", "cache": {}},
+                                 {"checks": [{"id": "CR_2", "conclusion": "FAILURE"}]}),
+                                ({"key": "pr:other/r#3", "cache": {}},
+                                 {"checks": [{"id": "CR_3", "conclusion": "FAILURE"}]})])
+        self.assertEqual(len(self.app_calls), 2)
+        self.assertEqual(len(self.gh.calls), 1, "a node-id query spanning two owners stays on the login")
+        self.assertEqual(gg.sole_owner(["Manaflow-AI", "manaflow-ai"]), "manaflow-ai")
+        self.assertIsNone(gg.sole_owner([]))
 
 
 class AppPoolHostTest(unittest.TestCase):

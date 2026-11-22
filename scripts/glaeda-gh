@@ -356,7 +356,7 @@ import urllib.request
 import weakref
 import zlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 BASE = Path(os.environ.get("GLAEDA_GH_DIR") or Path.home() / ".cache/glaeda/gh")
 API = "https://api.github.com"
@@ -1495,6 +1495,13 @@ def split_key(key: str) -> tuple[str, str, str, Any]:
     owner, rest = rest.split("/", 1)
     repo, number = re.split(r"[#/@]", rest, maxsplit=1)
     return kind, owner, repo, number.lower() if kind == "head" else int(number)
+
+
+def sole_owner(owners: Iterable[str]) -> str | None:
+    """The one owner (lowercase) of OWNERS, else None: a GraphQL read whose text or node ids name its repositories goes
+    on that owner's App (AppPool.owner_of), and one spanning owners stays on the login."""
+    found = {o.lower() for o in owners}
+    return next(iter(found)) if len(found) == 1 else None
 
 
 ROUTE_SHA = re.compile(r"[0-9a-fA-F]{40}")
@@ -3143,12 +3150,13 @@ class AppPool:
                     return token
         return app_pool_pushed_token(self.role, owner, self.clock())
 
-    def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
+    def owner_of(self, method: str, path: str, body: dict | None = None, owner: str | None = None) -> str | None:
         """The sole repository owner a read may go to the pool for, else None.
 
-        GraphQL is routed only when its variables name one owner (the daemon's aliased PR/run queries). An opaque
-        query or one spanning owners stays on the login, so an App token can never change viewer or cross-owner
-        semantics.
+        GraphQL is routed only when its variables name one owner (the daemon's aliased PR/run queries) or, when they
+        name none, the caller does (OWNER: a query with its owner in the text, or one by node ids of one owner's
+        repositories). An opaque query or one spanning owners stays on the login, so an App token can never change
+        viewer or cross-owner semantics.
         """
         owners: set[str] = set()
         if method == "GET":
@@ -3167,13 +3175,15 @@ class AppPool:
                         match = APP_POOL_GRAPHQL_URL.match(value)
                         if match:
                             owners.add(match.group(1).lower())
+            if not owners and owner:
+                owners.add(owner.lower())
         if len(owners) != 1:
             return None
         now = self.clock()
         if self.owners_at[1] <= now:  # the config is read once per APP_POOL_TTL, not per request
             self.owners_at = (frozenset(self.owners_fn()), now + APP_POOL_TTL)
-        owner = next(iter(owners))
-        return owner if owner in self.owners_at[0] else None
+        sole = next(iter(owners))
+        return sole if sole in self.owners_at[0] else None
 
     def token(self, owner: str) -> str | None:
         """OWNER's installation token, or None: the read then goes on the login, as it always did."""
@@ -3400,7 +3410,7 @@ class ReadTokenPool(AppPool):
         self.mint_pair = mint or (lambda repo: read_token_mint(self.command, repo))
         self.source = "broker"
 
-    def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
+    def owner_of(self, method: str, path: str, body: dict | None = None, owner: str | None = None) -> str | None:
         m = READ_TOKEN_REPO.match(path) if method == "GET" else None
         return m.group(1).lower() if m else None
 
@@ -6325,8 +6335,11 @@ class Daemon:
     # -- requests
 
     def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None,
-                free: bool = False, content: bool = False) -> tuple[int, dict, Any]:
+                free: bool = False, content: bool = False, owner: str | None = None) -> tuple[int, dict, Any]:
         """One GitHub request.
+
+        owner: the sole owner a GraphQL read whose variables name none reads (AppPool.owner_of), so it can go on the
+        App.
 
         content: a write from the outbox, whose throttling (GitHub's secondary limit on content
         creation) holds the outbox, not the read buckets.
@@ -6343,8 +6356,8 @@ class Daemon:
             self.feed_due()  # nor lets the feed view it keeps for downstream hosts age out (feed_between_reads)
         raw_body = json.dumps(body).encode() if body is not None else None
         pool = self.app_pool
-        owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
-                 and not self.writing else None)
+        hint, owner = owner, (pool.owner_of(method, path, body, owner) if pool is not None and not free
+                              and not content and not self.writing else None)
         route = route_of(method, path)
         scope = pool.scope(owner, method, path, body) if owner else ""
         chosen = pool.pick(owner, scope) if owner else None
@@ -6392,7 +6405,7 @@ class Daemon:
                  "scope": scope, "error": message[:200]})
             if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
                 # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
-                return self.request(method, path, body, etag, free, content)
+                return self.request(method, path, body, etag, free, content, hint)
             # refused: the same read goes on the login at once, as it would have without the App
             self.last_request_source = "login"
             if self.mode(bucket) == "stop" and self.clock() >= self.secondary_until:
@@ -9296,11 +9309,12 @@ class Daemon:
         """Whether GraphQL is out (note_gql_health): its reads go to REST this tick."""
         return self.gql_down_until > self.clock()
 
-    def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
-        """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
+    def graphql(self, query: str, variables: dict, owner: str | None = None) -> tuple[dict | None, str | None]:
+        """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it. owner: the
+        sole owner the query reads when its variables name none (sole_owner), so it can go on the App."""
         began = time.monotonic()
         try:
-            status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
+            status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables}, owner=owner)
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
             message = f"graphql: {describe(error)}"
             self.note_gql_health(message)
@@ -9372,7 +9386,8 @@ class Daemon:
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
         suite_runs, suites_error = self.suite_runs(
-            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
+            owner=sole_owner(split_key(e["key"])[1] for e in entries))
         wanted = self.rollup_wanted() if kind == "pr" else frozenset()
         captured: dict[int, dict] = {}  # PR alias -> its rollup snapshot (capture_rollup), for a land PR
         for i, e in enumerate(entries):
@@ -9552,7 +9567,7 @@ class Daemon:
                 return "graphql: PR check pages wait for the per-minute ceiling"
             reason, self.gql_reason = self.gql_reason, "pr-pages"
             try:
-                more, error = self.graphql("query{" + head_query(owner, repo, sha, cursor, number) + "}", {})
+                more, error = self.graphql("query{" + head_query(owner, repo, sha, cursor, number) + "}", {}, owner)
             finally:
                 self.gql_reason = reason
             if more is None:
@@ -9796,13 +9811,17 @@ class Daemon:
         """Every check on each head commit, one aliased query for the batch (a head with more than 100
         contexts is followed page by page). None, or the error when the whole query failed."""
         parts = []
+        owners = []
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             parts.append(f"h{i}: " + head_query(owner, repo, sha))
+            owners.append(owner)
             if (owner, repo) in CHECKS_OF_RECORD:
                 parts.append(f"m{i}: " + head_query(*CHECKS_OF_RECORD[(owner, repo)], sha))
+                owners.append(CHECKS_OF_RECORD[(owner, repo)][0])
+        sole = sole_owner(owners)
         self.reads += [(self.now, "head", "graphql")] * len(entries)
-        doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {})
+        doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {}, sole)
         if doc is None:
             self.fail(entries, error or "graphql: no response")
             for e in entries:
@@ -9819,7 +9838,7 @@ class Daemon:
         attempts = {alias: ran_nothing_suites((data.get(alias) or {}).get("object"))
                     for i in range(len(entries)) for alias in (f"h{i}", f"m{i}")}
         suite_runs, suites_error = self.suite_runs(
-            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False, owner=sole)
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             node = ((data.get(f"h{i}") or {}).get("object") or {}).get("statusCheckRollup")
@@ -9879,7 +9898,8 @@ class Daemon:
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
 
-    def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict] | str], str | None]:
+    def suite_runs(self, suites: list[str], paced: bool = True,
+                   owner: str | None = None) -> tuple[dict[str, list[dict] | str], str | None]:
         """Suite id -> its check-run context nodes over every attempt (statusCheckRollup's shape, marked
         lastRealAttempt), or the error that suite alone could not be read with (held by the pace, no response, a
         nested error), SUITE_RUNS_BATCH suites per query. The second value is always None, kept for the callers.
@@ -9889,7 +9909,8 @@ class Daemon:
         read the ceiling already admitted, and holding a later chunk starved the PRs whose suites sort last, which the
         next cycle held the same way (router-review BLOCK on glaeda#1916 at 73069ea7). It is bounded by the batch: at
         most GQL_BATCH PRs (or heads and their check-of-record commits) of at most 100 suites, so 2 * GQL_BATCH queries
-        of one point each, and far fewer in practice (a cmux head has about 15 such suites)."""
+        of one point each, and far fewer in practice (a cmux head has about 15 such suites). OWNER: the sole owner of the
+        suites' repositories (sole_owner), so the read by node id can go on the App."""
         suites = list(dict.fromkeys(suites))
         out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
@@ -9902,7 +9923,7 @@ class Daemon:
                 break
             reason, self.gql_reason = self.gql_reason, "last-real-attempt"
             try:
-                doc, error = self.graphql(SUITE_RUNS, {"suites": chunk})
+                doc, error = self.graphql(SUITE_RUNS, {"suites": chunk}, owner)
             finally:
                 self.gql_reason = reason
             if doc is None:
@@ -9957,7 +9978,8 @@ class Daemon:
                     break
                 reason, self.gql_reason = self.gql_reason, "head-pages"
                 try:
-                    more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
+                    more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {},
+                                               owner)
                 finally:
                     self.gql_reason = reason
                 if more is None:
@@ -9971,15 +9993,16 @@ class Daemon:
         for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
             fold_contexts(nodes, runs, statuses, ids, prefix, order, failed)
         data = head_data(sha, runs, statuses, ids, order)
-        self.head_steps(data, failed)
+        self.head_steps(data, failed, owner=sole_owner(o for o, _, _ in sources))
         return data
 
-    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None) -> None:
+    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None, owner: str | None = None) -> None:
         """Store the step count of each failed check run of a head's `data` (attach_steps), so a reader of the store
         judges a red as a live read does (a failed job that ran no step is the runner's refusal, not a red). A
         completed job never changes: each is read once (self.job_steps), in GraphQL by node id (STEPS_QUERY) or, with
         ROOT (`/repos/OWNER/REPO`, a head read over REST), one job at a time within REST_STEPS_MAX. A read that fails
-        or is out of time leaves its rows without `steps` (unknown), and the next read of the head tries again."""
+        or is out of time leaves its rows without `steps` (unknown), and the next read of the head tries again. OWNER: the
+        sole owner of the head's sources (sole_owner), so the read by node id can go on the App."""
         if len(self.job_steps) > 20000:
             self.job_steps.clear()
         want = [i for i in failed if i not in self.job_steps]
@@ -9991,7 +10014,7 @@ class Daemon:
                 chunk = {failed[i]: i for i in want[n:n + STEPS_BATCH]}
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
-                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)})
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)}, owner)
                 except OutOfTime:
                     break
                 finally:
@@ -10038,7 +10061,8 @@ class Daemon:
             try:
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
-                    doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]})
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]}, sole_owner(
+                        split_key(key)[1] for check_id in ids[i:i + STEPS_BATCH] for key in owners[check_id]))
                 finally:
                     self.gql_reason = reason
             except OutOfTime:  # the checks go without their steps; their PRs go first next tick
