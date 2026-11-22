@@ -199,17 +199,20 @@ class FleetTest(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.tool = self.repo / "scripts" / "glaeda-cmux-runner-fleet"
 
-    def git(self, *args: str, cwd: Path | None = None) -> str:
+    def git(self, *args: str, cwd: Path | None = None, **env: str) -> str:
         return subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
                                "-c", "commit.gpgsign=false", "-C", os.fspath(cwd or self.repo), *args],
                               capture_output=True, text=True, check=True, timeout=60,
-                              env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1"},
+                              env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                                   **env},
                               ).stdout.strip()
 
-    def commit(self, name: str) -> str:
+    def commit(self, name: str, ago: int | None = None) -> str:
+        """A commit; ago: committed that many seconds ago."""
         (self.repo / f"{name}.txt").write_text(name + "\n")
         self.git("add", "-A")
-        self.git("commit", "-q", "-m", name)
+        when = {} if ago is None else {"GIT_COMMITTER_DATE": f"@{int(time.time()) - ago} +0000"}
+        self.git("commit", "-q", "-m", name, **when)
         return self.git("rev-parse", "HEAD")
 
     @staticmethod
@@ -842,7 +845,7 @@ class FleetTest(unittest.TestCase):
         self.assertFalse(any(c["tool"] == "gh" for c in calls), "no token minted")
 
     def test_apply_from_a_checkout_that_is_not_origin_main_refuses_and_changes_nothing(self) -> None:
-        newer = self.commit("three")
+        newer = self.commit("three", ago=3 * 3600)  # main moved off this checkout hours ago: an old checkout
         self.git("push", "-q", "origin", "main")
         self.git("checkout", "-q", "--detach", self.head)  # an old checkout: origin's main moved on
         result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
@@ -850,6 +853,38 @@ class FleetTest(unittest.TestCase):
         self.assertIn(f"HEAD {self.head} is not origin/main {newer}", result.stderr)
         self.assertIn("--allow-downgrade REASON", result.stderr)
         self.assertIn("nothing changed", result.stderr)
+        self.assert_nothing_changed()
+
+    def test_apply_accepts_a_head_origin_main_moved_past_during_the_run(self) -> None:
+        """MAIN_MOVED: a run that started at origin/main is not refused when main moves on under it (2026-11-22:
+        five runs of cmux11s-13s, ~20 min each with busy-runner retries, all refused at their final apply). The
+        checkout does not have main's new commits: the guard fetches their objects, not a ref."""
+        clone = self.dir / "clone"
+        self.git("clone", "-q", os.fspath(self.origin), os.fspath(clone), cwd=self.dir)
+        self.git("checkout", "-q", "--detach", self.head, cwd=clone)
+        self.commit("three", ago=600)
+        newer = self.commit("four", ago=60)
+        self.git("push", "-q", "origin", "main")
+        self.tool = clone / "scripts" / "glaeda-cmux-runner-fleet"
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        guard = json.loads(result.stdout)["source"]
+        self.assertEqual((guard["head"], guard["originMain"]), (self.head, newer))
+        self.assertEqual(guard["refusals"], [])
+        self.assertEqual(guard["behindMain"]["commits"], 2)
+        self.assertEqual(self.git("rev-parse", "origin/main", cwd=clone), self.head, "no ref was moved")
+        human = self.fleet("--hosts", "mini-a", "--output", "human")
+        self.assertIn("HEAD is on main, accepted", human.stdout)
+
+    def test_apply_still_refuses_a_head_with_local_commits_even_when_fresh(self) -> None:
+        local = self.commit("local only")  # ahead of origin's main: not an ancestor, whatever its age
+        self.git("checkout", "-q", "-b", "other", self.head)
+        self.commit("three", ago=60)
+        self.git("push", "-q", "origin", "other:main")
+        self.git("checkout", "-q", "--detach", local)
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"HEAD {local} is not origin/main", result.stderr)
         self.assert_nothing_changed()
 
     def test_apply_refuses_a_host_whose_stamp_is_not_an_ancestor_of_head(self) -> None:
