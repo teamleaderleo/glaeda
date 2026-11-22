@@ -12930,6 +12930,12 @@ LAND_NO_LANE = re.compile(r"lease acquisition requires a lane session")
 # entry then reads "forwarded" and does nothing more. Only this refusal hands off: a CI, hold or review refusal is
 # land_judge's answer here and stays this queue's to wait on or stop at.
 LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
+# The broker's land_handoff refusal of a sha that is not the PR's head (cmuxterm-hq parts/49-calls-land-handoff.py:
+# "PR N's head is LIVE, not SHA: nothing was queued"), LIVE read from GitHub just then. The head this VM hands is its
+# own copy's (a judgment's answer, else the daemon's cache), which on a VM that cannot read GitHub -- the very case
+# that hands off -- can be hours old: a retry at it can never be taken, and stopped handoff_refused after
+# LAND_STEP_STOP. hand_off takes LIVE instead (handoff_head_moved).
+LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
@@ -16864,10 +16870,11 @@ class LandQueue:
         self.save(e)
         return "hand_off"
 
-    def hand_off(self, e: dict, head: str) -> None:
+    def hand_off(self, e: dict, head: str, repinned: bool = False) -> None:
         """Hand E at HEAD to the broker host's land queue (`lane-gh call land_handoff`), after its owner check refused a
         step here (owner_refused) or this VM could not judge it (unjudgeable_here). Taken: the entry is forwarded, the requester told. Refused: counted per head like a
-        step's refusal (backoff, then a stop at LAND_STEP_STOP)."""
+        step's refusal (backoff, then a stop at LAND_STEP_STOP), except a refusal naming the PR's live head
+        (LAND_HANDOFF_HEAD), which hands it off again at that head at once (REPINNED: this is that second call)."""
         due = e.get("handoffDue") or {}
         reason = str(due.get("reason") or "ownership")
         if due.get("kind") == "judgment":
@@ -16906,6 +16913,13 @@ class LandQueue:
                             f"(glaeda-gh land status there)", wake=False)
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
+            live = self.handoff_head_moved(e, head, f"{got.stderr or ''} {got.stdout or ''}", repinned)
+            if live is None:
+                return  # stopped: its pin is not the PR's head
+        if live:
+            self.hand_off(e, live, repinned=True)  # off the lock, as the first call was
+            return
+        with self.lock:
             last = e.get("handoffFail") or {}
             n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}
@@ -16919,6 +16933,31 @@ class LandQueue:
             after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
             self.wait(e, {"kind": "retry", "why": f"the hand-off to the broker host's land queue was refused: "
                           f"backoff {after:.0f} s"}, after)
+
+    def handoff_head_moved(self, e: dict, head: str, out: str, repinned: bool) -> str | None:
+        """Under the lock, after the broker refused E's hand-off at HEAD with OUT: the PR's live head to hand it off at
+        instead when OUT names one (LAND_HANDOFF_HEAD) and E may land it, else "" (counted as any refusal); None when E
+        was stopped because its pin is not that head. A second refusal of this kind in one hand-off (REPINNED: the
+        head moved again between two reads) is counted, never chased."""
+        m = LAND_HANDOFF_HEAD.search(out)
+        if not m or m.group(2) != head or m.group(1) == head or repinned:
+            return ""
+        live = m.group(1)
+        self.nudge(e["key"])  # this host's copy of the head is stale: the daemon reads it again
+        pin = str(e.get("pinSha") or "")
+        if land_head_moved(pin, live):
+            name = key_name(e["key"])
+            self.stop(e, "head_moved", f"the head is {live[:12]} (the broker read it from GitHub), not the --sha "
+                      f"{pin[:12]} it was queued for; nothing was handed off",
+                      f"glaeda-gh land {name} --match-head-commit {live}")
+            return None
+        self.history(e, "handoff_repinned", head=live[:12], was=head[:12])
+        e["head"] = live
+        due = e.get("handoffDue")
+        if isinstance(due, dict):
+            due["head"] = live
+        self.save(e)
+        return live
 
     def broker_land(self, e: dict, sha: str) -> subprocess.CompletedProcess:
         """A lane VM's pinned merge of E at SHA, sent straight to the broker's land (`lane-gh call land`), as a gh
