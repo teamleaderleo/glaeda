@@ -73,6 +73,54 @@ gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
 # Nor may a test's secondary 403 write the host's own login latch marks (latch_write_secondary), or a host's marks or
 # another test's hold it: every test runs with a fresh GH_QUOTA_STATE of its own (a test may still patch its own).
+# Every name in os's exec family, because a stub for one of them is not a stub for the family. The
+# broker's merge route uses `os.execv`; its create/read hand-off uses `os.execve` (the guard gets its
+# own PATH and hop mark, not this process's). A harness that patched only `execv` let that second
+# route exec the real stand-in guard -- `exit 0` -- which replaced the unittest process: every `-k`
+# selection reaching BrokerMergeGuardTest's combined-short-flag case ended at exit 0 with no
+# `Ran N tests` verdict, reading green while running almost nothing. Measured on this host
+# 2026-11-22: `-k flag` and `-k main_` both ended that way.
+EXEC_NAMES = tuple(name for name in ("execv", "execve", "execvp", "execvpe",
+                                     "execl", "execle", "execlp", "execlpe") if hasattr(os, name))
+
+
+@contextlib.contextmanager
+def exec_recorded(seen: list[tuple[str, list[str], dict[str, str] | None]]):
+    """Record (path, argv, env) for any os.exec* a call takes; SystemExit(0) stands for the exec ending it.
+
+    The env is recorded because it is not this process's: the create/read hand-off uses execve precisely so
+    that the guard's PATH and hop mark belong to the process being started, leaving os.environ here
+    untouched. A harness that read os.environ after such a call would be asserting the older behaviour."""
+    def record(path, *rest):
+        argv = rest[0] if rest and isinstance(rest[0], (list, tuple)) else list(rest)
+        env = rest[1] if len(rest) > 1 and isinstance(rest[1], dict) else None
+        seen.append((os.fspath(path), [os.fspath(word) for word in argv], env))
+        raise SystemExit(0)
+
+    with contextlib.ExitStack() as stack:
+        for name in EXEC_NAMES:
+            stack.enter_context(mock.patch.object(os, name, record))
+        yield
+
+
+def exec_names_called(source: str) -> set[str]:
+    """The os.exec* names the script under test actually calls: EXEC_NAMES has to cover all of them."""
+    return set(re.findall(r"\bos\.(exec[a-z]*)\s*\(", source))
+
+
+def post_args(kind: str, target: str, **overrides):
+    """Real parsed args for a `post` call, never a Mock.
+
+    A Mock answers every attribute, so `getattr(args, "label", None)` reads a flag the call never carried
+    as *set*: post_item's label check refused four of these tests the moment they first ran (they had sat
+    behind a test that replaced the runner, so nobody had seen them). The parser produces this object in
+    life, so it produces it here, and a flag added later arrives with its real default."""
+    args = gg.parser().parse_args(["post", kind, target, "--body", overrides.pop("body", "hi")])
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
 _testcase_run = unittest.TestCase.run
 
 
@@ -675,9 +723,11 @@ class Base(unittest.TestCase):
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
         # A `wait pr|run` against a daemon that serves waits execs into bash: never the test runner.
-        execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
-        execv.start()
-        self.addCleanup(execv.stop)
+        for name in EXEC_NAMES:
+            blocked = mock.patch.object(gg.os, name,
+                                        side_effect=AssertionError(f"os.{name} in a test process"))
+            blocked.start()
+            self.addCleanup(blocked.stop)
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
@@ -12002,11 +12052,7 @@ class BrokerBase(Base):
             os.environ.pop(gg.BROKER_MARK, None)
             os.environ.pop(gg.BROKER_DEPTH, None)
 
-        def execv(path: str, argv: list[str]) -> None:
-            execed.append((path, argv))
-            raise SystemExit(0)
-
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
+        with exec_recorded(execed), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
@@ -12810,16 +12856,13 @@ class BrokerMergeGuardTest(BrokerBase):
         os.environ.pop(gg.BROKER_MARK, None)
         os.environ.pop(gg.BROKER_DEPTH, None)
 
-        def execv(path: str, argv: list[str]) -> None:
-            execed.append((path, argv))
-            raise SystemExit(0)
-
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
+        with exec_recorded(execed), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
                 code = None
+        self.exec_env = execed[0][2] if execed else None  # what execve handed it, not this process's
         return code, err.getvalue(), (execed[0][0] if execed else None), (execed[0][1][1:] if execed else None)
 
     def test_every_merge_route_goes_to_the_guard(self) -> None:
@@ -12907,7 +12950,11 @@ class BrokerMergeGuardTest(BrokerBase):
                 self.assertIsNone(code)
                 self.assertEqual(path, str(self.guard))
                 self.assertEqual(passed, args)
-                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                # The guard's directory leads the PATH the *guard* is handed, and this process's PATH is
+                # left alone: mutating it here would put that directory and the hop mark on every later
+                # call in the same process, which is wrong whenever the exec does not happen.
+                self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                self.assertNotEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
 
     def test_a_comment_in_combined_short_flags_is_a_create(self) -> None:
         # `-dc x` is --delete-branch then --comment x; `-cx` is --comment x: both close with a comment, which creates.
@@ -14070,17 +14117,14 @@ class BrokerQuotaGuardTest(BrokerBase):
         """(the path cmd_gh exec'd, the argv it handed it), as a fresh process would see it."""
         seen: list[tuple[str, list[str]]] = []
 
-        def execv(path: str, argv: list[str]) -> None:
-            seen.append((path, argv))
-            raise SystemExit(0)
-
         for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
             if name not in self.kept:
                 os.environ.pop(name, None)
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
+        with exec_recorded(seen), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 gg.cmd_gh(list(args if args is not None else self.READ))
+        self.exec_env = seen[0][2] if seen else None  # what execve handed it, not this process's
         return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
 
     READ = ("pr", "view", "7", "-R", "o/r", "--json", "state")
@@ -14092,9 +14136,10 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
         self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
                          "the line it is handed is the line that was typed")
-        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+        # Both are the env execve hands the guard, not this process's: the hand-off leaves os.environ alone.
+        self.assertEqual(self.exec_env.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
                          "the pass back here knows it has been round")
-        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(guard.parent),
                          "led by the guard's own directory, so it finds the gh after it as usual")
 
     def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
@@ -19055,8 +19100,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
 
     def test_a_queued_post_stamps_its_repository(self) -> None:
         no_guard(self)
-        args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+        args = post_args("comment", "O/R#7")
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
@@ -19067,8 +19111,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
         the write and upstream_refuse_posts failed it a tick later, so the PR was never opened and `post pr` said
         nothing was wrong. The broker writes it with a token minted for the call."""
         no_guard(self)
-        args = mock.Mock(kind="pr", target="O/R", body="why", body_file=None, wait=0, json=False,
-                         head="lane/x", base="main", title="a title", reviewer=None, event="comment")
+        args = post_args("pr", "O/R", body="why", head="lane/x", base="main", title="a title")
         ran: list[list[str]] = []
 
         def answer(argv, **_kw):
@@ -19088,8 +19131,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
 
     def test_a_write_the_broker_cannot_make_is_refused_with_its_body_and_the_command_for_it(self) -> None:
         no_guard(self)
-        args = mock.Mock(kind="review", target="O/R#7", body="the review body", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+        args = post_args("review", "O/R#7", body="the review body")
         err = io.StringIO()
         with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
                 mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no call for a review")), \
@@ -19118,8 +19160,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
             with self.subTest(kind=kind):
                 made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
                     "head": None, "base": None, "title": None}
-                args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
-                                 reviewer=None, event="comment", **made)
+                args = post_args(kind, target, **made)
                 err = io.StringIO()
                 with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
                         contextlib.redirect_stderr(err):
@@ -35905,6 +35946,119 @@ class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
         self.assertNotIn("unrecognized arguments", said)
 
 
+<<<<<<< ours
+=======
+class AnExecNeverReplacesTheRunnerTest(unittest.TestCase):
+    """No route in this script may exec for real inside the suite, under any name in os's exec family.
+
+    Until 2026-11-22 the three recording harnesses patched `os.execv` alone. The broker's create and
+    read hand-off uses `os.execve`, so `BrokerMergeGuardTest`'s combined-short-flag case exec'd the
+    stand-in guard (`exit 0`) for real, which replaced the unittest process: `-k flag` and `-k main_`
+    each ended at exit 0 with no `Ran N tests` line, and the 22 tests behind that one had never run."""
+
+    def test_the_family_covers_every_exec_name_the_script_calls(self) -> None:
+        called = exec_names_called((ROOT / "scripts" / "glaeda-gh").read_text())
+        self.assertTrue(called, "the script does exec: a reader that finds none is broken, not the script")
+        self.assertEqual(called - set(EXEC_NAMES), set(),
+                         "a route exec's under a name no harness stubs, so it would replace the test runner")
+
+    def test_a_recorded_exec_keeps_its_path_argv_and_env(self) -> None:
+        seen: list[tuple[str, list[str], dict[str, str] | None]] = []
+        with self.assertRaises(SystemExit), exec_recorded(seen):
+            os.execve("/bin/true", ["/bin/true", "x"], {"K": "v"})
+        self.assertEqual(seen, [("/bin/true", ["/bin/true", "x"], {"K": "v"})])
+        seen.clear()
+        with self.assertRaises(SystemExit), exec_recorded(seen):
+            os.execv("/bin/true", ["/bin/true", "y"])
+        self.assertEqual(seen, [("/bin/true", ["/bin/true", "y"], None)])
+        seen.clear()
+        with self.assertRaises(SystemExit), exec_recorded(seen):
+            os.execlp("true", "true", "z")  # the execl shape: the argv is the varargs
+        self.assertEqual(seen, [("true", ["true", "z"], None)])
+
+
+class ABareWaitFlagTest(unittest.TestCase):
+    """`--wait` with no number is the flag's own default, not a usage error. Measured 2026-11-22: `land
+    o/r#N --match-head-commit SHA --wait --timeout 3600` -- one flag under both its spellings -- exited 2
+    with "expected one argument" and queued nothing, and the land was queued 67 s later on the retype."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_a_bare_wait_takes_the_default_this_flag_documents(self) -> None:
+        for typed, want in (
+                (["land", "o/r#1", "--wait"], 3600.0),
+                (["land", "o/r#1", "--sha", "a" * 40, "--wait"], 3600.0),
+                (["wait", "pr", "o/r#1", "--timeout"], 3600.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--wait"], 30.0),
+                (["on-event", "replay", "--wait"], 30.0)):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            args = gg.parser().parse_args(fixed)
+            self.assertEqual(getattr(args, "wait", None) or getattr(args, "timeout", None), want, typed)
+            self.assertIn("with no number is its default", self.err.getvalue())
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + fixed)}`", self.err.getvalue())
+
+    def test_the_two_spellings_of_one_flag_in_a_row_land_the_request(self) -> None:
+        """The call that was refused: `--wait --timeout 3600`. The first is read as bare (the next word is
+        not a count), the second keeps its 3600, and both are the same `wait` destination, so the later one
+        wins -- one wait of 3600 seconds, and the land is queued in this call."""
+        typed = ["land", "o/r#1", "--match-head-commit", "b" * 40, "--wait", "--timeout", "3600"]
+        fixed, refusal = gg.bare_wait_synonym(list(typed))
+        self.assertEqual(refusal, [])
+        args = gg.parser().parse_args(fixed)
+        self.assertEqual((args.wait, args.sha), (3600.0, "b" * 40))
+
+    def test_a_bare_max_is_dropped_so_its_computed_ceiling_stands(self) -> None:
+        """`--max`'s default is not a number in the parser (it is WAIT_MAX_TIMES x the timeout, worked out
+        later), so "its default" is the flag being absent."""
+        for typed in (["land", "o/r#1", "--wait", "60", "--max"], ["wait", "pr", "o/r#1", "--max"]):
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            self.assertNotIn("--max", fixed, typed)
+            self.assertIsNone(getattr(gg.parser().parse_args(fixed), "max_wait", None)
+                              or getattr(gg.parser().parse_args(fixed), "max", None), typed)
+        self.assertIn("the ceiling it computes from the timeout", self.err.getvalue())
+
+    def test_a_wait_flag_with_a_number_or_a_duration_is_left_alone(self) -> None:
+        for typed in (["land", "o/r#1", "--wait", "600"],
+                      ["land", "o/r#1", "--wait", "20m"],
+                      ["land", "o/r#1", "--wait", "0"],
+                      ["land", "o/r#1", "--wait=600"],
+                      ["wait", "pr", "o/r#1", "--timeout", "1h", "--max", "4h"],
+                      ["checks", "o/r", "a" * 40, "--consumer", "x", "--wait", "0"],
+                      ["land", "o/r#1", "--notify", "--json"],
+                      ["post", "comment", "o/r#1", "--body", "--wait"],
+                      ["gh", "api", "x", "--wait"]):
+            self.assertEqual(gg.bare_wait_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a flag with its value says nothing")
+
+    def test_a_target_after_a_bare_wait_stays_the_target(self) -> None:
+        """The risk of reading the next word as the value: `land --wait o/r#1` must still land o/r#1,
+        with the default wait, rather than spending the target on the flag."""
+        fixed, refusal = gg.bare_wait_synonym(["land", "--wait", "o/r#1"])
+        self.assertEqual((fixed, refusal), (["land", "--wait", "3600", "o/r#1"], []))
+        args = gg.parser().parse_args(fixed)
+        self.assertEqual((args.words, args.wait), (["o/r#1"], 3600.0))
+
+    def test_main_reaches_the_land_request_for_the_call_that_was_refused(self) -> None:
+        """End to end: the exact argv measured 2026-11-22 now queues, instead of exiting 2 unqueued."""
+        seen: dict[str, object] = {}
+
+        def fake_land(*a: object, **kw: object) -> int:
+            seen["called"] = True
+            return 0
+
+        with mock.patch.object(gg, "cmd_land", fake_land):
+            code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "--timeout", "3600"])
+        self.assertEqual((code, seen.get("called")), (0, True))
+
+
+>>>>>>> theirs
 class AFlagsCaseConventionTest(unittest.TestCase):
     """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
     spelling two real options would both answer to is refused rather than picked."""
