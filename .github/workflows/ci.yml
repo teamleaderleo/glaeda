@@ -330,6 +330,7 @@ jobs:
               Path("scripts/test-quarry-parallel.py"),
               Path("scripts/status_page.py"),
               Path("scripts/test-status-page.py"),
+              Path("scripts/test-ci-suite-verdict.py"),
               Path("scripts/unittest-shard"),
               Path("scripts/test-unittest-shard.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
@@ -357,15 +358,36 @@ jobs:
           # Every suite runs and reports on its own: one red suite no longer skips the rest (glaeda#1562's
           # tests never ran while test-glaeda-disk was red). Each failure is an annotation and a summary row.
           # Add a new test suite as `suite python3 scripts/test-x.py`: a bare line stops the step at its failure.
+          # A suite's exit code is not its verdict. A test that exec's, or calls os._exit, replaces the
+          # runner: the step then sees exit 0 with no summary line and reads green while every test after
+          # that one never ran. Measured 2026-11-22: test-glaeda-gh.py's combined-short-flag case exec'd a
+          # stand-in guard (`exit 0`), so `-k flag` and `-k main_` each ended at exit 0 with no `Ran N
+          # tests` line, 22 tests unrun. So every suite must print a summary line, and one that does not is
+          # red with its last error named. The wording is suite-remote's: unittest prints `Ran N tests`
+          # then `OK` or `FAILED`; a file with its own runner prints `... tests passed`.
           failed=()
+          VERDICT='^(Ran [0-9]+ test|OK\b|FAILED\b|.*\btests? passed\b)'
+          BROKE='^(Traceback \(most recent call last\)|[A-Za-z_]*(Error|Exception)\b|error:|FAIL:|ERROR:)'
           suite() {
+            local log rc=0
+            log="$(mktemp)"
             echo "::group::$*"
-            if "$@"; then echo "::endgroup::"; else
-              rc=$?
-              echo "::endgroup::"
+            # tee keeps the suite's output streaming into the group; the pipeline's own status is tee's,
+            # so the suite's code is read from PIPESTATUS with errexit off around it.
+            set +e
+            "$@" 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
               echo "::error title=Suite failed (exit $rc)::$*"
               failed+=("$*")
+            elif ! grep -Eq "$VERDICT" "$log"; then
+              why="$(grep -Em1 "$BROKE" "$log" | cut -c1-200)"
+              echo "::error title=Suite printed no verdict (exit 0): it ended before its own summary::$* ${why:+-- last error: $why}"
+              failed+=("$* (no verdict printed)")
             fi
+            rm -f "$log"
           }
           suite bash scripts/test-bootstrap.sh
           suite python3 scripts/test-benchmark-developer-loop.py
@@ -405,6 +427,7 @@ jobs:
           suite python3 scripts/test-glaeda-sync-main.py
           suite python3 scripts/test-delivery-concurrency.py
           suite python3 scripts/test-workflow-job-bounds.py
+          suite python3 scripts/test-ci-suite-verdict.py
           suite python3 scripts/test-hot-pressure-shadow.py
           suite python3 scripts/test-hot-run.py
           suite python3 scripts/test-verify-focused.py
