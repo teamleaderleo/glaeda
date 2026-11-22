@@ -7477,6 +7477,27 @@ else:
         self.assertIn("diffRustcVersion", result.stdout)
         self.assertTrue(self.lock_free())
 
+    def test_a_removed_diff_sidecar_toolchain_names_the_toolchain_to_install(self) -> None:
+        # cmux19 2026-11-18: a sweep removed 1.88.0; the gate said only "diffRustcVersion '' != ...", which
+        # glaeda-mini-health's node_toolchain_missing heal (RUST_TOOLCHAIN_RE) does not match, for 12+ hours
+        self.fleet()
+        receipt = {**self.TOOLCHAIN, "diffRustToolchain": "1.88.0",
+                   "diffRustcVersion": "rustc 1.88.0 (6b00bc388 2025-06-23)"}
+        for pin in ("1.88.0", "1.88.0-aarch64-apple-darwin"):
+            with self.subTest(pin):
+                self.node(receipt_toolchain={**receipt, "diffRustToolchain": pin},
+                          installed=("1.98.1-aarch64-apple-darwin",))
+                result = self.eligible_start()
+                self.assertEqual(result.returncode, 1)
+                why = "rust toolchain 1.88.0-aarch64-apple-darwin is not installed"
+                self.assertIn(why, result.stdout)
+                self.assertNotIn("diffRustcVersion ''", result.stdout)
+                self.assertTrue(self.lock_free())
+                # the heal reads exactly this name: glaeda-mini-health's RUST_TOOLCHAIN_RE, as its source spells it
+                heal = re.search(r'^RUST_TOOLCHAIN_RE = re\.compile\(r"(.+)"\)$',
+                                 (ROOT / "scripts/glaeda-mini-health").read_text(), re.M)
+                self.assertEqual(re.search(heal.group(1), result.stdout).group(1), "1.88.0-aarch64-apple-darwin")
+
     def test_a_timed_out_eligibility_probe_is_named_as_a_timeout_not_an_invalid_receipt(self) -> None:
         """On a mini too loaded to start Python within ELIGIBILITY_BUDGET_S the validator or node status gives no
         answer. node_answer flags it, so the health agent raises no node_ineligible; the refusal names the timeout."""

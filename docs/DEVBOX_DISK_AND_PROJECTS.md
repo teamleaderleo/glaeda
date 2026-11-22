@@ -40,6 +40,31 @@ macOS installs a pressure/idle LaunchAgent and a daily devbox Projects tidy agen
 the equivalent user systemd units. Reports and apply receipts remain under the owning user's
 Glaeda state directories.
 
+## A class receipt's toolchain went missing
+
+Pattern: a cleanup removes a rustup toolchain that a fleet class receipt names, and the runner gate
+holds every listener off. cmux19, 2026-11-18: a cruft sweep ("toolchains") removed
+`~/.rustup/toolchains/1.88.0-aarch64-apple-darwin`, the m6-16 receipt's `diffRustToolchain` (the
+DiffSidecar pin), with 1.95.0 and 1.98.1. job-started then refused with `diffRustcVersion '' !=
+'rustc 1.88.0 ...'`, which no heal matched, and cmux's only FFI release pool stayed offline 12+ hours.
+
+Two detectors cover the class:
+
+- **glaeda-disk `rustup_verdict`** keeps every toolchain a class receipt on the host names
+  (`~/.config/glaeda/cmux-fleet/class-acceptance/*.json`: `toolchain.rustcVersion`,
+  `diffRustToolchain`, `diffRustcVersion`), besides the rustup default, overrides,
+  `$RUSTUP_TOOLCHAIN` and the `rust-toolchain` files of checkouts under `~/Projects` and of the
+  runners' checkouts (`~/actions-runner*/_work/<repo>/<repo>`, three levels down for
+  `Native/DiffSidecar`). A receipt that is there but cannot be read or parsed keeps every
+  toolchain (fail closed). Test: `test_rustup_toolchains_a_class_receipt_or_runner_checkout_names_stay`.
+- **glaeda-cmux-runner-hook `toolchain_refusal`** names a missing `diffRustToolchain` as `rust
+  toolchain <version>-<triple> is not installed` (a bare `1.88.0` resolved with rustup's host
+  triple, as for `rustcVersion`), so glaeda-mini-health's `node_toolchain_missing` heal
+  (`RUST_TOOLCHAIN_RE`, `heal_node_toolchain`) reinstalls it on its next pass. Test:
+  `test_a_removed_diff_sidecar_toolchain_names_the_toolchain_to_install`.
+
+Any other cleanup that removes rustup toolchains on a fleet mini must read the same receipts.
+
 ## Read-only checkout evidence
 
 Two compiled tools (`src/bin/`) answer exact questions about a checkout without catalog,
