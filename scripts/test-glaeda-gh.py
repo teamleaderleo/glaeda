@@ -32910,6 +32910,71 @@ class AppPoolTest(Base):
         pool.bench_file().write_text(json.dumps({"roles": {"ci-watch": {"graphql:x:y": "soon", "ok:z": NOW + 10}}}))
         self.assertEqual(pool.restore_bench().unreadable, {"ok:z": NOW + 10}, "a bad entry drops, the good one stays")
 
+    def fallbacks(self, *reads: tuple) -> list[dict]:
+        """The login-fallback lines READS ((args, kwargs) to request) log, in order."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for args, kwargs in reads:
+                self.daemon.request(*args, **kwargs)
+        self.assertNotIn(APP_TOKEN, out.getvalue(), "a fallback line never carries a token")
+        self.assertNotIn(TOKEN, out.getvalue())
+        return [json.loads(l) for l in out.getvalue().splitlines() if '"login-fallback"' in l]
+
+    def test_every_read_on_the_login_logs_one_fallback_line_with_its_cause(self) -> None:
+        viewer = {"query": "query { viewer { login } }", "variables": {}}
+        mixed = {"query": "query($o0:String!,$r0:String!,$n0:Int!,$o1:String!,$r1:String!,$n1:Int!){x}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1, "o1": "other", "r1": "r", "n1": 1}}
+        lines = self.fallbacks((("GET", "/rate_limit"), {"free": True}),
+                               (("GET", "/repos/o/r/pulls/1"), {}),
+                               (("POST", "/graphql", viewer), {}),
+                               (("POST", "/graphql", mixed), {}),
+                               (("POST", "/repos/manaflow-ai/cmux/issues/1/comments", {"body": "x"}), {"content": True}),
+                               (("POST", "/graphql", {"query": "mutation { x }", "variables": {}}), {"content": True}),
+                               (("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        self.assertEqual([l["cause"] for l in lines], ["rate-limit-read", "owner-without-app", "graphql-no-owner",
+                                                       "graphql-many-owners"],
+                         "a write logs nothing, and a read the App answered logs nothing")
+        self.assertEqual(lines[1]["route"], "GET /repos/{owner}/{repo}/pulls/{id}")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(self.pool.owner_why("GET", "/user"), (None, "not-a-repo-route"))
+        self.assertEqual(self.pool.owner_why("POST", "/graphql", {"query": "mutation { x }"}), (None, "write"))
+        self.daemon.writing = True
+        try:
+            lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        finally:
+            self.daemon.writing = False
+        self.assertEqual([l["cause"] for l in lines], ["outbox"], "a queued write's lookup stays on the login, named")
+
+    def test_a_refused_read_then_a_benched_route_name_their_causes(self) -> None:
+        self.app_answers.append((403, {}, b'{"message":"Resource not accessible by integration"}'))
+        path = "/repos/manaflow-ai/cmux/branches/main/protection"
+        lines = self.fallbacks((("GET", path), {}), (("GET", path), {}))
+        self.assertEqual([l["cause"] for l in lines], ["refused", "route-benched"])
+        self.assertEqual(lines[1]["pools"], {"ci-watch": "route-benched"})
+        self.assertEqual(lines[1]["owner"], "manaflow-ai")
+        self.assertEqual(lines[1]["scope"], "GET /repos/manaflow-ai/cmux/branches/*/protection")
+
+    def test_a_spent_pool_reads_as_resting_and_a_missing_app_as_no_token(self) -> None:
+        self.app_answers.append((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message":"API rate limit exceeded"}'))
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}),
+                               (("GET", "/repos/manaflow-ai/cmux/pulls/2"), {}))
+        self.assertEqual([l["cause"] for l in lines], ["refused", "pool-resting"])
+        self.ready = False
+        self.pool.rest_until.clear()
+        self.pool.tokens.clear()
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/3"), {}))
+        self.assertEqual([(l["cause"], l["pools"]) for l in lines], [("no-token", {"ci-watch": "no-token"})])
+
+    def test_a_chain_with_one_holder_resting_names_each_role(self) -> None:
+        spare = gg.AppPool(role="land-judge", mint=lambda owner: None, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: False, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        self.mint_token = None
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        self.assertEqual([(l["cause"], l["pools"]) for l in lines],
+                         [("pool-resting", {"ci-watch": "pool-resting", "land-judge": "no-token"})])
+
 
 class AppPoolHostTest(unittest.TestCase):
     """The default pool finds the App and gh_app_token.py on the host by itself: no agent sets anything."""
@@ -33008,6 +33073,53 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("POST", "/graphql", mutation))
         query = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
         self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
+
+    def test_the_apps_first_chain_skips_a_role_this_host_holds_no_token_of(self) -> None:
+        """Leo, 2026-11-22: "use more of the apps then. go make more". land-judge and glaeda lead the chain; a host
+        without their tokens reads on ci-watch, as before, and says so only in passed_over."""
+        self.push_token(3600)
+        chain = gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(",")))
+        pool = gg.AppPool(role=chain[0]).with_spares(chain[1:])
+        scope = pool.scope("manaflow-ai", "GET", "/repos/manaflow-ai/cmux/pulls/1")
+        chosen = pool.pick("manaflow-ai", scope)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.role, "ci-watch")
+        self.assertEqual(chosen.token("manaflow-ai"), APP_TOKEN)
+        self.assertEqual([p.role for p in [pool, *pool.spares]], ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+        (self.creds / "ci-watch-token.json").unlink()
+        chosen.tokens.clear()
+        chosen.rest_until.clear()
+        self.assertIsNone(pool.pick("manaflow-ai", scope))
+        self.assertEqual(pool.passed_over("manaflow-ai", scope),
+                         ("no-token", dict.fromkeys(["land-judge", "glaeda", "ci-watch", "quota-goblin"], "no-token")))
+
+
+class AppPoolChainTest(unittest.TestCase):
+    """The order a read asks the Apps in (app_pool_chain) and its off switch, GLAEDA_GH_APP_SPARES."""
+
+    def test_the_default_chain_is_land_judge_glaeda_ci_watch_quota_goblin(self) -> None:
+        self.assertEqual(gg.APP_POOL_CHAIN, "land-judge,glaeda,ci-watch,quota-goblin")
+        self.assertEqual(gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(","))),
+                         ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+
+    def test_a_list_without_the_primary_is_the_spares_after_it_as_before(self) -> None:
+        self.assertEqual(gg.app_pool_chain(("quota-goblin",)), ["ci-watch", "quota-goblin"], "the chain before")
+        self.assertEqual(gg.app_pool_chain(()), ["ci-watch"], "GLAEDA_GH_APP_SPARES='' still turns the spares off")
+        self.assertEqual(gg.app_pool_chain(("glaeda", "ci-watch", "glaeda")), ["glaeda", "ci-watch"])
+
+    def test_the_daemon_builds_its_pool_in_the_chain_s_order(self) -> None:
+        saved = (gg.APP_POOL_SPARES, gg.BASE)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        gg.BASE = Path(tmp.name)
+        try:
+            for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), ["land-judge", "glaeda", "ci-watch", "quota-goblin"]),
+                                 (("quota-goblin",), ["ci-watch", "quota-goblin"])):
+                gg.APP_POOL_SPARES = spares
+                daemon = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
+                self.assertEqual([p.role for p in [daemon.app_pool, *daemon.app_pool.spares]], want)
+        finally:
+            gg.APP_POOL_SPARES, gg.BASE = saved
 
 
 class ShorthandFlagTest(unittest.TestCase):
