@@ -35789,6 +35789,87 @@ class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
         self.assertNotIn("unrecognized arguments", said)
 
 
+class ABareWaitFlagTest(unittest.TestCase):
+    """`--wait` with no number is the flag's own default, not a usage error. Measured 2026-11-22: `land
+    o/r#N --match-head-commit SHA --wait --timeout 3600` -- one flag under both its spellings -- exited 2
+    with "expected one argument" and queued nothing, and the land was queued 67 s later on the retype."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_a_bare_wait_takes_the_default_this_flag_documents(self) -> None:
+        for typed, want in (
+                (["land", "o/r#1", "--wait"], 3600.0),
+                (["land", "o/r#1", "--sha", "a" * 40, "--wait"], 3600.0),
+                (["wait", "pr", "o/r#1", "--timeout"], 3600.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--wait"], 30.0),
+                (["on-event", "replay", "--wait"], 30.0)):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            args = gg.parser().parse_args(fixed)
+            self.assertEqual(getattr(args, "wait", None) or getattr(args, "timeout", None), want, typed)
+            self.assertIn("with no number is its default", self.err.getvalue())
+            self.assertIn(f"read as `{' '.join(['glaeda-gh'] + fixed)}`", self.err.getvalue())
+
+    def test_the_two_spellings_of_one_flag_in_a_row_land_the_request(self) -> None:
+        """The call that was refused: `--wait --timeout 3600`. The first is read as bare (the next word is
+        not a count), the second keeps its 3600, and both are the same `wait` destination, so the later one
+        wins -- one wait of 3600 seconds, and the land is queued in this call."""
+        typed = ["land", "o/r#1", "--match-head-commit", "b" * 40, "--wait", "--timeout", "3600"]
+        fixed, refusal = gg.bare_wait_synonym(list(typed))
+        self.assertEqual(refusal, [])
+        args = gg.parser().parse_args(fixed)
+        self.assertEqual((args.wait, args.sha), (3600.0, "b" * 40))
+
+    def test_a_bare_max_is_dropped_so_its_computed_ceiling_stands(self) -> None:
+        """`--max`'s default is not a number in the parser (it is WAIT_MAX_TIMES x the timeout, worked out
+        later), so "its default" is the flag being absent."""
+        for typed in (["land", "o/r#1", "--wait", "60", "--max"], ["wait", "pr", "o/r#1", "--max"]):
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            self.assertNotIn("--max", fixed, typed)
+            self.assertIsNone(getattr(gg.parser().parse_args(fixed), "max_wait", None)
+                              or getattr(gg.parser().parse_args(fixed), "max", None), typed)
+        self.assertIn("the ceiling it computes from the timeout", self.err.getvalue())
+
+    def test_a_wait_flag_with_a_number_or_a_duration_is_left_alone(self) -> None:
+        for typed in (["land", "o/r#1", "--wait", "600"],
+                      ["land", "o/r#1", "--wait", "20m"],
+                      ["land", "o/r#1", "--wait", "0"],
+                      ["land", "o/r#1", "--wait=600"],
+                      ["wait", "pr", "o/r#1", "--timeout", "1h", "--max", "4h"],
+                      ["checks", "o/r", "a" * 40, "--consumer", "x", "--wait", "0"],
+                      ["land", "o/r#1", "--notify", "--json"],
+                      ["post", "comment", "o/r#1", "--body", "--wait"],
+                      ["gh", "api", "x", "--wait"]):
+            self.assertEqual(gg.bare_wait_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a flag with its value says nothing")
+
+    def test_a_target_after_a_bare_wait_stays_the_target(self) -> None:
+        """The risk of reading the next word as the value: `land --wait o/r#1` must still land o/r#1,
+        with the default wait, rather than spending the target on the flag."""
+        fixed, refusal = gg.bare_wait_synonym(["land", "--wait", "o/r#1"])
+        self.assertEqual((fixed, refusal), (["land", "--wait", "3600", "o/r#1"], []))
+        args = gg.parser().parse_args(fixed)
+        self.assertEqual((args.words, args.wait), (["o/r#1"], 3600.0))
+
+    def test_main_reaches_the_land_request_for_the_call_that_was_refused(self) -> None:
+        """End to end: the exact argv measured 2026-11-22 now queues, instead of exiting 2 unqueued."""
+        seen: dict[str, object] = {}
+
+        def fake_land(*a: object, **kw: object) -> int:
+            seen["called"] = True
+            return 0
+
+        with mock.patch.object(gg, "cmd_land", fake_land):
+            code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "--timeout", "3600"])
+        self.assertEqual((code, seen.get("called")), (0, True))
+
+
 class AFlagsCaseConventionTest(unittest.TestCase):
     """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
     spelling two real options would both answer to is refused rather than picked."""
