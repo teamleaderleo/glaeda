@@ -12305,6 +12305,38 @@ def land_forward_name(command: list[str]) -> str:
     return " ".join(command)[:120]
 
 
+# A host that forwards its own lands (land.json "executor") relays a `land serve` request it is sent to that executor,
+# once. 2026-11-22 17:16-17:32Z: the broker host's land.json named an executor (a control-plane cutover), and every
+# lane VM's hand-off -- the lane broker's land_handoff runs `glaeda-gh land serve` on that host, and follows no
+# redirect (LAND_REDIRECT_HOPS is glaeda-gh's own forwarder) -- was refused not_executor, so each VM judged the PR
+# again, 300 s a judgment. The relay keeps the refusal's purpose (two hosts never hand a PR back and forth): it names
+# itself in the request's "relayedBy", and a request that already carries one is refused as before, with "executor"
+# named, so a PR goes at most one hop past the host it was sent to.
+LAND_RELAY_KEY = "relayedBy"
+LAND_RELAY_DEADLINE = 50.0  # inside the broker's 60 s hand-off call, with room for this host's own start
+
+
+def land_serve_relay(executor: list[str], req: dict, forward: Callable[..., dict] | None = None) -> int:
+    """`land serve` on a forwarding host: REQ relayed once to EXECUTOR (land_serve_relay's comment), its answer printed
+    as it came, with "relayedBy" naming this host; not_executor when REQ was already relayed or the relay failed."""
+    host, name = policy_host(), land_forward_name(executor)
+    if req.get(LAND_RELAY_KEY):
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{host} forwards its own lands to {name} "
+                          f"(land.json executor), and this request was already relayed by "
+                          f"{land_trim(str(req.get(LAND_RELAY_KEY)), 80)}: it serves none", "executor": name}))
+        return EXIT_FAIL
+    wait = req.get("wait") if isinstance(req.get("wait"), (int, float)) and not isinstance(req.get("wait"), bool) else 0
+    try:
+        answer = (forward or land_forward)(executor, {**req, LAND_RELAY_KEY: host},
+                                           LAND_RELAY_DEADLINE + max(0.0, min(float(wait), 86400.0)))
+    except WatchError as error:
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{host} forwards its own lands to {name} "
+                          f"(land.json executor) and could not relay this request there: {land_trim(str(error), 200)}", "executor": name}))
+        return EXIT_FAIL
+    print(json.dumps({**answer, LAND_RELAY_KEY: host}, sort_keys=True))
+    return EXIT_OK if answer.get("ok") else EXIT_FAIL
+
+
 # Per-PR land leases: the first piece of the decentralized land queue (docs/adr/0023-decentralized-land-queue.md).
 # huge-blue, 2026-11-22 07:59Z: one host held all 887 open lands (29 merges/h, queue-to-merge p50 77 min, p90 3.4 h)
 # and every other host forwarded to it, so losing it stopped every land and nothing measured the wait. A lease says
@@ -19295,7 +19327,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
 def cmd_land_serve(text: str) -> int:
     """`land serve`: the executor's end of land.json's "executor" on a forwarding host. One JSON request line on stdin
     ({"op": "land" | "withdraw" | "status" | "batch", ...}), one JSON answer line on stdout. A host that forwards its
-    own lands is no executor: it refuses, so two hosts never hand a PR back and forth."""
+    own lands relays the request to its executor once (land_serve_relay), so two hosts never hand a PR back and forth."""
     try:
         req = json.loads(text)
     except ValueError:
@@ -19306,10 +19338,7 @@ def cmd_land_serve(text: str) -> int:
         return EXIT_FAIL
     executor = land_executor()
     if executor is not None:
-        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none",
-                          "executor": land_forward_name(executor)}))
-        return EXIT_FAIL
+        return land_serve_relay(executor, req)
     op = req["op"]
     if op == "room":
         # A peer's overflow asks before it sends (land_overflow): never room while the daemon is down

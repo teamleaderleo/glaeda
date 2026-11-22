@@ -30935,7 +30935,8 @@ class LandForwardTest(Base):
         self.assertEqual(self.w.explains(), [])
 
     def test_serve_refuses_on_a_host_that_forwards_and_on_a_bad_line(self):
-        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status"}), "not_executor"),
+        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status", "relayedBy": "h"}),
+                                    "not_executor"),
                                    ({}, "not json", "bad_request"),
                                    ({}, json.dumps({"op": "land", "target": "nope"}), "bad_request")):
             with self.subTest(code=code), mock.patch.object(gg, "land_config", return_value=config), \
@@ -30943,6 +30944,54 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_a_forwarding_host_relays_a_served_request_once(self):
+        """huge-blue, 2026-11-22 17:20Z: a host that forwards its own lands refused every lane VM's hand-off
+        (not_executor); now it relays the request to its executor once, and a relayed request is never relayed on."""
+        sent = []
+
+        def forward(command, request, deadline):
+            sent.append((command, request, deadline))
+            return {"ok": True, "state": "requested", "key": "pr:o/r#1", "host": "cp-1"}
+
+        exe = ["ssh", "-o", "BatchMode=yes", "-i", "/k", "cmux-cp-1", "glaeda-gh", "land", "serve"]
+        req = {"op": "land", "target": "o/r#1", "requester": "fs-agent-lane-2/x", "id": "x-1", "wait": 10}
+        with mock.patch.object(gg, "policy_host", return_value="huge-blue"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.land_serve_relay(exe, req, forward), gg.EXIT_OK)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["ok"], doc["host"], doc["relayedBy"]), (True, "cp-1", "huge-blue"))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1]["relayedBy"], "huge-blue")
+        self.assertEqual(sent[0][1]["target"], "o/r#1")
+        self.assertEqual(sent[0][2], gg.LAND_RELAY_DEADLINE + 10)
+        # already relayed: refused, nothing sent
+        with mock.patch.object(gg, "policy_host", return_value="cmux-cp-1"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.land_serve_relay(exe, {**req, "relayedBy": "huge-blue"}, forward), gg.EXIT_FAIL)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["code"], "not_executor")
+        self.assertIn("already relayed by huge-blue", doc["reason"])
+        self.assertIn("cmux-cp-1", doc["reason"])
+        self.assertEqual(doc["executor"], "cmux-cp-1")  # glaeda-gh's forwarders follow it (LAND_REDIRECT_HOPS)
+        self.assertEqual(len(sent), 1)
+
+    def test_a_relay_that_fails_says_so_and_an_executor_refusal_passes_through(self):
+        def down(command, request, deadline):
+            raise gg.WatchError("land executor: no answer within 50s")
+
+        def refuses(command, request, deadline):
+            return {"ok": False, "code": "land_draft", "reason": "draft"}
+
+        req = {"op": "land", "target": "o/r#1", "id": "x-1"}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.land_serve_relay(["reach", "cp"], req, down), gg.EXIT_FAIL)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["code"], "not_executor")
+        self.assertIn("could not relay this request there: land executor: no answer within 50s", doc["reason"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.land_serve_relay(["reach", "cp"], req, refuses), gg.EXIT_FAIL)
+        self.assertEqual(json.loads(out.getvalue())["code"], "land_draft")
 
     def test_a_remote_wait_that_ends_with_the_land_still_going_is_a_timeout(self):
         """Review F1: `land --wait N` forwarded, the executor answering "requested" with no entry, exited 0."""
@@ -31066,7 +31115,7 @@ class LandForwardTest(Base):
     def test_serve_names_where_it_forwards(self):
         with mock.patch.object(gg, "land_config", return_value={"executor": ["ssh", "-o", "BatchMode=yes", "cp1", "x"]}), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "status"})), gg.EXIT_FAIL)
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "status", "relayedBy": "h"})), gg.EXIT_FAIL)
         doc = json.loads(out.getvalue())
         self.assertEqual((doc["code"], doc["executor"]), ("not_executor", "cp1"))
 
