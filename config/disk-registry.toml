@@ -12,7 +12,7 @@
 # A glob (`*`) in a path is expanded; each match is a root. Per-host overrides go under [hosts.<name>] (the short,
 # lowercased hostname, as config/runner-gate.json keys it), e.g.
 #
-#   [hosts.cmux22.cache.derived-data]
+#   [hosts.mini-a.cache.derived-data]
 #   budget_gib = 200
 
 schema = "glaeda-disk-registry/v1"

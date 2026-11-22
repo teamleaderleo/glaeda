@@ -36,7 +36,7 @@ def doc(**cache) -> dict:
 
 class LoaderTest(unittest.TestCase):
     def test_shipped_registry_parses_with_the_designs_caches(self):
-        registry = reg.load(ROOT / "config" / "disk-registry.toml", host="cmux22")
+        registry = reg.load(ROOT / "config" / "disk-registry.toml", host="mini-a")
         names = [c.name for c in registry.caches]
         self.assertEqual(names, ["derived-data", "compile-cache", "simulator-runtimes", "toolchains", "git-mirror"])
         dd = reg.cache_by_name(registry, "derived-data")
@@ -47,9 +47,9 @@ class LoaderTest(unittest.TestCase):
 
     def test_host_override_applies_to_that_host_only(self):
         d = doc()
-        d["hosts"] = {"cmux22": {"cache": {"dd": {"budget_gib": 5}}}}
-        self.assertEqual(reg.parse(d, "cmux22").caches[0].budget_gib, 5)
-        self.assertEqual(reg.parse(d, "cmux17").caches[0].budget_gib, 1)
+        d["hosts"] = {"mini-a": {"cache": {"dd": {"budget_gib": 5}}}}
+        self.assertEqual(reg.parse(d, "mini-a").caches[0].budget_gib, 5)
+        self.assertEqual(reg.parse(d, "mini-b").caches[0].budget_gib, 1)
 
     def test_refuses_what_it_cannot_read_exactly(self):
         bad = [
