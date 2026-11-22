@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -c 'import sys,importlib.machinery as _m;_p=__file__=sys.argv[0]=sys.argv.pop(1);exec(_m.SourceFileLoader("__main__",_p).get_code("__main__"))'
 """glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
 
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
@@ -19010,7 +19010,7 @@ def coord_alert_spawn(text: str) -> None:
         coord_alert_missing(text)
         return
     try:
-        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "coord-alert", text],
+        subprocess.Popen([*self_argv(), "coord-alert", text],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
     except OSError as error:
@@ -21209,7 +21209,7 @@ def block(rid: str, left: float, req: dict | None = None) -> None:
                     "GLAEDA_WAIT_PROGRESS": str(WAIT_PROGRESS_EVERY)})
     os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
                     str(max(1, int(left + 0.999))), os.fspath(d / ".served"), str(WAITS_CHECK),
-                    sys.executable, os.path.abspath(__file__), "wait-resume", rid])
+                    *self_argv(), "wait-resume", rid])
 
 
 def resume_wait(rid: str) -> int:
@@ -25941,7 +25941,7 @@ def read_runners(path: str) -> list[dict]:
     """One runners listing (org or repo path), through this broker, piped, so the answer cache shares the read
     whether or not the gh shim is on PATH."""
     try:
-        done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", "--paginate",
+        done = run_bounded([*self_argv(), "gh", "api", "--paginate",
                             f"{path}?per_page=100", "--jq",
                             ".runners[] | {name, status, busy, labels: [.labels[].name]}"], timeout=120,
                            env=internal_env())
@@ -25971,7 +25971,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     path = f"repos/{repo}/actions/variables/{RUNNER_STATE_VARIABLE}"
     where = f"{RUNNER_STATE_VARIABLE} on {repo}"
     try:
-        done = run_bounded([sys.executable, str(Path(__file__).resolve()), "gh", "api", path, "--jq", ".value"],
+        done = run_bounded([*self_argv(), "gh", "api", path, "--jq", ".value"],
                            timeout=60, env=internal_env())
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
@@ -26144,7 +26144,7 @@ def search_terms(kind: str, words: list[str], repos: list[str], state: str, auth
 def search_read(terms: str, limit: int) -> dict:
     """One GraphQL search, piped through this broker, so its answer is kept for every session on the host and
     nothing touches REST (read_runners' route: the cache shares the read whether or not the shim is on PATH)."""
-    argv = [sys.executable, str(Path(__file__).resolve()), "gh", "api", "graphql",
+    argv = [*self_argv(), "gh", "api", "graphql",
             "-f", f"query={SEARCH_GQL}", "-f", f"q={terms}", "-F", f"n={limit}"]
     try:
         done = run_bounded(argv, timeout=120, env=internal_env())
@@ -29678,6 +29678,22 @@ def main(argv: list[str] | None = None) -> int:
 # re-runs this same file once, in the same pid, from bytecode cached under ~/.cache, with the loader the gh wrapper
 # already uses (leo-workspace tools/lane-vm-bootstrap). -I keeps the cwd off sys.path; the -X flag still applies.
 LONG_LIVED = ("wait", "wait-resume")
+# The first line runs this file the same way for every exec of it by path (the gh shim, the lane-gh broker, hooks):
+# SELF_LOADER, from bytecode SourceFileLoader caches beside it (~/.local/bin/__pycache__; checked against the file's
+# mtime and size, so an update recompiles once). huge-blue, 2026-11-22 07:55Z: 384 glaeda-gh processes in 60 s, all but
+# one compiling this file from source, 0.34 s CPU each against 0.10 s from bytecode (~3 of the host's cores).
+SELF_LOADER = ('import sys,importlib.machinery as _m;_p=__file__=sys.argv[0]=sys.argv.pop(1);'
+               'exec(_m.SourceFileLoader("__main__",_p).get_code("__main__"))')
+
+
+def self_argv() -> list[str]:
+    """This file run again by this Python through SELF_LOADER (as its first line does), not compiled from source."""
+    return [sys.executable, "-I", "-c", SELF_LOADER, os.path.abspath(__file__)]
+
+
+def from_loader() -> bool:
+    """Run through a -c loader (the first line, self_argv or PYC_LOADER): already from bytecode when it was cached."""
+    return "-c" in list(getattr(sys, "orig_argv", ()))[:6]
 PYC_ENV = "GLAEDA_GH_FROM_PYC"
 PYC_LOADER = ('import sys, types, importlib.machinery as m; p = sys.argv[1]; sys.argv = sys.argv[1:]; '
               'g = types.ModuleType("__main__"); g.__file__ = p; sys.modules["__main__"] = g; '
@@ -29688,7 +29704,7 @@ def bytecode_argv(argv: list[str], env, executable: str, script: str) -> list[st
     """The argv that re-runs SCRIPT ARGV from cached bytecode, or None to run on here: not a wait, already from
     bytecode (PYC_ENV), or no HOME to cache under (never /tmp)."""
     home = env.get("HOME")
-    if not argv or argv[0] not in LONG_LIVED or env.get(PYC_ENV) or not home or not executable:
+    if not argv or argv[0] not in LONG_LIVED or env.get(PYC_ENV) or not home or not executable or from_loader():
         return None
     return [executable, "-I", "-X", f"pycache_prefix={home}/.cache/gh-quota/pycache", "-c", PYC_LOADER,
             os.path.abspath(script), *argv]

@@ -29443,6 +29443,36 @@ class WaitFromBytecodeTest(unittest.TestCase):
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
 
 
+class RunFromBytecodeTest(unittest.TestCase):
+    """huge-blue, 2026-11-22 07:55Z: 384 glaeda-gh execs in 60 s, all but one compiled from source (0.34 s CPU each, 0.10
+    s from bytecode). Run by path, the first line loads it through SELF_LOADER from bytecode cached beside it."""
+
+    def test_the_first_line_is_the_self_loader(self) -> None:
+        first = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()[0]
+        self.assertEqual(first, f"#!/usr/bin/env -S python3 -I -c '{gg.SELF_LOADER}'")
+        self.assertLessEqual(len(first.encode()), 250)  # under Linux's 256-byte shebang limit
+        self.assertNotIn("'", gg.SELF_LOADER)
+        self.assertEqual(gg.self_argv()[1:4], ["-I", "-c", gg.SELF_LOADER])
+
+    def test_run_by_path_it_caches_its_bytecode_and_reads_its_own_name(self) -> None:
+        if not shutil.which("env") or sys.platform == "win32":
+            self.skipTest("no env -S here")
+        with tempfile.TemporaryDirectory() as d:
+            tool = Path(d, "glaeda-gh")
+            shutil.copy2(ROOT / "scripts" / "glaeda-gh", tool)
+            env = {**os.environ, "HOME": d, "GLAEDA_GH_DIR": d}
+            for _ in range(2):
+                done = subprocess.run([os.fspath(tool), "nosuch"], env=env, capture_output=True, text=True,
+                                      timeout=60, cwd=d)
+                self.assertIn("usage: glaeda-gh", done.stderr)
+            self.assertTrue(list(Path(d, "__pycache__").glob("glaeda-gh*.pyc")))
+            # a wait run this way is already from bytecode: no second load
+            done = subprocess.run([os.fspath(tool), "wait", "pid", str(2 ** 22 + 7), "--timeout", "5"], env=env,
+                                  capture_output=True, text=True, timeout=60, cwd=d)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertFalse(Path(d, ".cache", "gh-quota", "pycache").exists())
+
+
 class RefreshStallTest(AlarmBase):
     """huge-blue, 2026-11-17: the daemon's PR data reached 3585 s old (about 13:2xZ) and then 1392 s (about 14:5xZ) with
     its heartbeat fresh, errors "graphql: HTTP 502" and "controller: URLError", at the 40 points/min GraphQL pace; a
