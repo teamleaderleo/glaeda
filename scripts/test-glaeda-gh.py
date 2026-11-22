@@ -27265,6 +27265,67 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
         self.assertIn("unknown tool", e["stop"]["reason"])
 
+    def test_a_timed_out_hand_off_is_outcome_unknown_sent_again_and_never_stops_the_row(self):
+        # fs-agent-lane-3, 2026-11-22 21:20-21:38Z: the broker's relay took 135 s and 439 s for one land_handoff (its
+        # relay_take) and took it both times (cmux-cp-1 accepted cmux#47528 and #49643), but the 60 s deadline cut each
+        # call short and counted it a refusal: six rows stopped "handoff_refused ... timed out after 60s". The deadline
+        # is above that take, and a timeout is sent again (the broker applies one head once), never counted.
+        self.assertGreater(gg.LAND_HANDOFF_DEADLINE, 439)
+        given: list[float] = []
+        cut = {"left": gg.LAND_STEP_STOP + 2}
+        real = self.w.run
+
+        def run(argv: list[str], timeout: float, env: dict) -> Any:
+            if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
+                given.append(timeout)
+                if cut["left"] > 0:
+                    cut["left"] -= 1
+                    self.w.calls.append(list(argv))
+                    raise subprocess.TimeoutExpired(argv, timeout)
+            return real(argv, timeout, env)
+
+        self.w.run = run
+        self.q = self.queue()
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        e = {}
+        for _ in range(gg.LAND_STEP_STOP + 3):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+            if e.get("state") in ("forwarded", "stopped"):
+                break
+        self.assertEqual(len(self.handoffs()), gg.LAND_STEP_STOP + 3)
+        self.assertEqual(set(given), {gg.LAND_HANDOFF_DEADLINE})
+        self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"), e.get("stop"))
+        events = [h.get("event") for h in e["history"]]
+        self.assertEqual(events.count("handoff_timed_out"), gg.LAND_STEP_STOP + 2)
+        self.assertNotIn("handoff_refused", events)
+        self.assertNotIn("handoffFail", e)
+        self.assertNotIn("handoffTimeout", e)
+
+    def test_a_requester_queued_under_the_vms_old_image_name_is_sent_as_a_session_on_this_vm(self):
+        # rows queued as freestyle-vm/SESSION before the VM was renamed fs-agent-lane-3 went out with no requester,
+        # and the broker refused them: "requester must be a session on fs-agent-lane-3"
+        self.assertEqual(gg.land_handoff_requester("freestyle-vm/lane", "fs-agent-lane-3"), "fs-agent-lane-3/lane")
+        self.assertEqual(gg.land_handoff_requester("fs-agent-lane-3/lane", "fs-agent-lane-3"), "fs-agent-lane-3/lane")
+        self.assertEqual(gg.land_handoff_requester("other-host/lane", "fs-agent-lane-3"), "")
+        self.assertEqual(gg.land_handoff_requester("freestyle-vm/", "fs-agent-lane-3"), "")
+        self.assertEqual(gg.land_handoff_requester("", "fs-agent-lane-3"), "")
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "fs-agent-lane-3"):
+            self.land(requester="freestyle-vm/lane")
+            self.w.gh_rc["merge"] = 1
+            self.w.gh_err["merge"] = self.NOT_OWNER
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "fs-agent-lane-3/lane"})
+        self.assertEqual(e["state"], "forwarded")
+
     STALE = "PR 1's head is " + LB + ", not " + LA + ": nothing was queued. The hand-off is for the PR's head now"
 
     def stale_handoff(self) -> tuple[int, str, str]:
