@@ -25730,6 +25730,30 @@ class LandTest(Base):
         # the limits themselves are allowed, unchanged
         self.assertEqual(gg.land_override("r" * 200, "t" * 240), {"reason": "r" * 200, "receipt": "t" * 240})
 
+    def test_land_takes_the_callers_land_judge_override_as_its_override(self):
+        """hq#18032, 2026-11-22: the rulebook's override is LAND_JUDGE_OVERRIDE="<why>"; `glaeda-gh land` read only its
+        flags, so a helper that set it queued with no override and every merge try was refused as if none was given."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(gg.land_override_given(None, None, {"LAND_JUDGE_OVERRIDE": "base red, run 1 job 2"}),
+                             ("base red, run 1 job 2", gg.LAND_OVERRIDE_ENV_RECEIPT))
+        self.assertIn("LAND_JUDGE_OVERRIDE is set", err.getvalue())
+        both = {"LAND_JUDGE_OVERRIDE": "why", "LAND_JUDGE_OVERRIDE_RECEIPT": "run 9"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.land_override_given(None, None, both), ("why", "run 9"))
+        self.assertEqual(gg.land_override_given(None, None, {"LAND_JUDGE_OVERRIDE": "  "}), (None, None))
+        self.assertEqual(gg.land_override_given(None, None, {}), (None, None))
+        self.assertEqual(gg.land_override_given("flag", "t", both), ("flag", "t"))  # a flag given wins
+        self.assertEqual(gg.land_override_given("flag", None, both), ("flag", None))  # and is refused alone, as before
+        # end to end: the env alone queues an override that rides every merge try
+        with mock.patch.dict(gg.os.environ, {"LAND_JUDGE_OVERRIDE": "the base's red is not this PR's"}), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "say_waiting", lambda *_: None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            gg.main(["land", "o/r#1"])
+        reqs = [json.loads(p.read_text()) for p in gg.LandQueue.requests_dir().glob("*.json")]
+        self.assertEqual([r.get("override") for r in reqs],
+                         [{"reason": "the base's red is not this PR's", "receipt": gg.LAND_OVERRIDE_ENV_RECEIPT}])
+
     def test_a_reason_two_characters_too_long_is_fitted_not_refused(self):
         """2026-11-21: a 202-character reason cost a refusal and a second land call, for 2 characters."""
         with contextlib.redirect_stderr(io.StringIO()) as err:

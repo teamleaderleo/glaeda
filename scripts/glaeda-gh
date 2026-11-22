@@ -16902,6 +16902,28 @@ def land_override(reason: str | None, receipt: str | None) -> dict | None:
     return out
 
 
+# The landing rulebook's override is the environment (`LAND_JUDGE_OVERRIDE="<why>"` before the pinned merge), and
+# helpers set it before `glaeda-gh land` too; the land command read only its flags, so on hq#18032 (2026-11-22) a land
+# run with LAND_JUDGE_OVERRIDE set queued with no override and its merge was refused as if none was given. With
+# neither flag, a non-empty LAND_JUDGE_OVERRIDE is the reason and LAND_JUDGE_OVERRIDE_RECEIPT (else
+# LAND_OVERRIDE_ENV_RECEIPT) the receipt; a flag given wins over the environment.
+LAND_OVERRIDE_ENV_RECEIPT = "none given: LAND_JUDGE_OVERRIDE from the caller's environment"
+
+
+def land_override_given(reason: str | None, receipt: str | None,
+                        env: "dict[str, str] | os._Environ[str] | None" = None) -> tuple[str | None, str | None]:
+    """The (reason, receipt) `land` queues: its --override-reason / --override-receipt flags, else the caller's
+    LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) as land-judge itself reads them."""
+    if reason is not None or receipt is not None:
+        return reason, receipt
+    env = os.environ if env is None else env
+    why = str(env.get("LAND_JUDGE_OVERRIDE") or "")
+    if not why.strip():
+        return None, None
+    print("glaeda-gh land: LAND_JUDGE_OVERRIDE is set: queued with it as --override-reason", file=sys.stderr)
+    return why, str(env.get("LAND_JUDGE_OVERRIDE_RECEIPT") or "").strip() or LAND_OVERRIDE_ENV_RECEIPT
+
+
 def land_request_override(req: dict) -> dict | None:
     """A request's override as land_override takes it (fitted to the limits, not dropped for them), or None when it
     names none or one no guess fixes (an older sender's, an empty one): never a merge override no queue checked."""
@@ -29264,8 +29286,9 @@ def parser() -> argparse.ArgumentParser:
                          "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) is "
                          "the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
-                    help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's "
-                         "override); one line, at most 200 characters; needs --override-receipt")
+                    help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
+                         "line, at most 200 characters; needs --override-receipt. Neither flag: the caller's own "
+                         "LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) is taken")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
                     help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
@@ -29903,7 +29926,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
-            override = land_override(args.override_reason, args.override_receipt)
+            override = land_override(*land_override_given(args.override_reason, args.override_receipt))
             return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,
                             args.max_wait)
         if args.command == "on-event":
