@@ -1279,6 +1279,12 @@ PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus head
                    f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
                    f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
 PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
+# ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
+# cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
+# 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
+# it, so none could be probed: ~1,000 waited PRs needed ~3,500 s of full reads a pass, about 100 PRs were stored per
+# 600 s, and waited PR data reached 16,000 s old. A backlog is now drained by probes, the changed PRs read in full.
+PR_FULL_BEHIND_EVERY = 3600
 PR_WHOLE_EVERY = 1800  # ... and a PR past one page of checks is read whole (pages and all) at least this often
 SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
@@ -9546,7 +9552,8 @@ class Daemon:
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
-        (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY, still open, and every
+        (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY (PR_FULL_BEHIND_EVERY while
+        PR reads are behind, pr_behind), still open, and every
         failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
         c = e.get("cache") or {}
         data = c.get("data")
@@ -9554,9 +9561,24 @@ class Daemon:
         return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
                 and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
-                and isinstance(c.get("fullAt"), (int, float)) and self.now - c["fullAt"] < PR_FULL_EVERY
+                and isinstance(c.get("fullAt"), (int, float))
+                and self.now - c["fullAt"] < (PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
                 and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
                 and not self.rollup_stale(e["key"], c))
+
+    def pr_behind(self, cache: dict) -> bool:
+        """Whether PR reads are behind, so probe_ok lets a probe stand in for a full read up to PR_FULL_BEHIND_EVERY:
+        the last tick deferred a PR read, or this PR's own data is already older than PR_FULL_EVERY (a restarted
+        daemon has no deferral to go by, and its first tick is the longest)."""
+        memo = getattr(self, "pr_deferred_memo", None)
+        if memo is None or memo[0] != self.now or memo[1] is not self.deferred_before:
+            # once a tick: probe_ok asks for every due PR, and a backlog defers about as many
+            memo = self.pr_deferred_memo = (self.now, self.deferred_before,
+                                            any(k.startswith("pr:") for k in self.deferred_before))
+        if memo[2]:
+            return True
+        at = cache.get("dataAt")
+        return isinstance(at, (int, float)) and self.now - at >= PR_FULL_EVERY
 
     def rollup_wanted(self) -> frozenset[str]:
         """The PRs the land queue holds (not done): a full read of one keeps its rollup snapshot. Once per tick."""
