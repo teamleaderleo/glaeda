@@ -8709,6 +8709,71 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertNotIn("reclaimable", {i.verdict for i in gd.runtime_items(runtimes, devices, now)})
         self.assertEqual(gd.runtime_items({"A": rt("1", old)}, None, now), [])
 
+    def test_simulator_runtimes_an_installed_xcode_sdk_needs_are_kept(self) -> None:
+        import plistlib
+        apps = self.root / "Applications"
+        plats = "Contents/Developer/Platforms"
+
+        def sdk(app, platform, name, settings=None, build=None):
+            d = apps / app / plats / f"{platform}.platform/Developer/SDKs/{name}"
+            d.mkdir(parents=True)
+            if settings is not None:
+                (d / "SDKSettings.json").write_text(settings)
+            if build:
+                (d / "System/Library/CoreServices").mkdir(parents=True)
+                (d / "System/Library/CoreServices/SystemVersion.plist").write_bytes(
+                    plistlib.dumps({"ProductBuildVersion": build}))
+        sdk("Xcode_26.6.app", "iPhoneSimulator", "iPhoneSimulator.sdk", '{"Version": "26.5"}', "23F70")
+        sdk("Xcode_26.6.app", "WatchSimulator", "WatchSimulator.sdk", '{"Version": "26.5"}')
+        sdk("Xcode_27.0.app", "iPhoneSimulator", "iPhoneSimulator.sdk", '{"Version": "27.0"}')
+        sdk("Xcode_27.0.app", "AppleTVSimulator", "AppleTVSimulator.sdk", "not json")  # unreadable: fail closed
+        (apps / "Xcode.app").symlink_to(apps / "Xcode_26.6.app")  # one Xcode, counted once
+        sdks = gd.xcode_sim_sdks(apps)
+        self.assertEqual(sdks, [("Xcode_26.6.app", "iphonesimulator", "26.5", "23F70"),
+                                ("Xcode_26.6.app", "watchsimulator", "26.5", None),
+                                ("Xcode_27.0.app", "appletvsimulator", None, None),
+                                ("Xcode_27.0.app", "iphonesimulator", "27.0", None)])
+
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
+
+        def rt(os_name, plat, version, build):
+            return {"runtimeIdentifier": f"com.apple.CoreSimulator.SimRuntime.{os_name}-{version.replace('.', '-')}",
+                    "platformIdentifier": f"com.apple.platform.{plat}", "version": version, "build": build,
+                    "deletable": True, "lastUsedAt": old, "sizeBytes": 8 * gd.GIB, "state": "Ready"}
+        runtimes = {"ios27": rt("iOS", "iphonesimulator", "27.0", "24A5"),
+                    "ios265": rt("iOS", "iphonesimulator", "26.5", "23F77"),  # the pinned Xcode's runtime
+                    "ios262": rt("iOS", "iphonesimulator", "26.2", "23C54"),
+                    "watch265": rt("watchOS", "watchsimulator", "26.5", "23R1"),
+                    "watch262": rt("watchOS", "watchsimulator", "26.2", "23S1"),
+                    "watch30": rt("watchOS", "watchsimulator", "30.0", "24R1"),
+                    "tv262": rt("tvOS", "appletvsimulator", "26.2", "23K1"),
+                    "tv30": rt("tvOS", "appletvsimulator", "30.0", "24K1"),
+                    "xr262": rt("xrOS", "xrsimulator", "26.2", "23N1"),
+                    "xr30": rt("xrOS", "xrsimulator", "30.0", "24N1")}
+        devices = {"devices": {}}
+        # without the SDK rule, 26.5 would go once 27 is installed: the bug this guards
+        self.assertEqual(gd.runtime_items(runtimes, devices, now)[1].verdict, "reclaimable")
+        items = {i.path: i for i in gd.runtime_items(runtimes, devices, now, sdks)}
+        self.assertEqual({k: i.verdict for k, i in items.items()},
+                         {"ios27": "kept", "ios265": "kept", "ios262": "reclaimable", "watch265": "kept",
+                          "watch262": "reclaimable", "watch30": "kept", "tv262": "kept", "tv30": "kept",
+                          "xr262": "reclaimable", "xr30": "kept"})
+        self.assertIn("Xcode_26.6.app's iphonesimulator 26.5 SDK needs it", items["ios265"].reasons)
+        self.assertIn("Xcode_27.0.app's appletvsimulator SDK version cannot be read", items["tv262"].reasons)
+        # the platform comes from runtimeIdentifier when platformIdentifier is missing; the build alone matches too
+        bare = {**runtimes["ios262"], "platformIdentifier": None, "build": "23F70"}
+        self.assertEqual(gd.runtime_items({"x": bare}, devices, now, sdks)[0].verdict, "kept")
+        # an unknown platform or version, or an Xcode whose platforms cannot be listed, keeps the runtime
+        unknown = {**runtimes["ios262"], "platformIdentifier": "", "runtimeIdentifier": "odd"}
+        self.assertEqual(gd.runtime_items({"x": unknown}, devices, now, sdks)[0].verdict, "kept")
+        noversion = {**runtimes["ios262"], "version": ""}
+        self.assertEqual(gd.runtime_items({"x": noversion}, devices, now, sdks)[0].verdict, "kept")
+        (apps / "Xcode_broken.app/Contents").mkdir(parents=True)
+        self.assertIn(("Xcode_broken.app", gd.ANY_PLATFORM, None, None), gd.xcode_sim_sdks(apps))
+        self.assertNotIn("reclaimable", {i.verdict for i in gd.runtime_items(
+            runtimes, devices, now, gd.xcode_sim_sdks(apps))})
+
     def test_xcode_copies_are_report_only_with_their_pins(self) -> None:
         apps = self.root / "Applications"
         for name in ("Xcode.app", "Xcode_26.6.app"):
