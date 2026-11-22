@@ -29448,10 +29448,12 @@ class RunFromBytecodeTest(unittest.TestCase):
     s from bytecode). Run by path, the first line loads it through SELF_LOADER from bytecode cached beside it."""
 
     def test_the_first_line_is_the_self_loader(self) -> None:
-        first = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()[0]
-        self.assertEqual(first, f"#!/usr/bin/env -S python3 -I -c '{gg.SELF_LOADER}'")
-        self.assertLessEqual(len(first.encode()), 250)  # under Linux's 256-byte shebang limit
+        first, second, third = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()[:3]
+        self.assertEqual(first, "#!/bin/sh")  # no shebang arguments: macOS splits them, Linux does not
+        self.assertEqual(second, f'"""exec" python3 -I -c \'{gg.SELF_LOADER}\' "$0" "$@"')
         self.assertNotIn("'", gg.SELF_LOADER)
+        self.assertNotIn('"""', gg.SELF_LOADER)
+        self.assertTrue(gg.DOC.startswith(third) and third.startswith("glaeda-gh: "))
         self.assertEqual(gg.self_argv()[1:4], ["-I", "-c", gg.SELF_LOADER])
 
     def test_run_by_path_it_caches_its_bytecode_and_reads_its_own_name(self) -> None:

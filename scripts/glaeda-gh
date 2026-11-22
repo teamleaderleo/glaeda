@@ -1,5 +1,6 @@
-#!/usr/bin/env -S python3 -I -c 'import sys,importlib.machinery as _m;_p=__file__=sys.argv[0]=sys.argv.pop(1);exec(_m.SourceFileLoader("__main__",_p).get_code("__main__"))'
-"""glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
+#!/bin/sh
+"""exec" python3 -I -c 'import sys,importlib.machinery as _m;_p=__file__=sys.argv[0]=sys.argv.pop(1);exec(_m.SourceFileLoader("__main__",_p).get_code("__main__"))' "$0" "$@"
+glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
 
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
@@ -28766,7 +28767,7 @@ class OptionalJobId(argparse.Action):
 
 
 def parser() -> argparse.ArgumentParser:
-    p = Parser(prog="glaeda-gh", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Parser(prog="glaeda-gh", description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
     sv = sub.add_parser("serve", help="run the daemon (the only process that polls GitHub); launchd or systemd runs it")
     sv.add_argument("--foreground-ok", action="store_true",
@@ -29678,7 +29679,8 @@ def main(argv: list[str] | None = None) -> int:
 # re-runs this same file once, in the same pid, from bytecode cached under ~/.cache, with the loader the gh wrapper
 # already uses (leo-workspace tools/lane-vm-bootstrap). -I keeps the cwd off sys.path; the -X flag still applies.
 LONG_LIVED = ("wait", "wait-resume")
-# The first line runs this file the same way for every exec of it by path (the gh shim, the lane-gh broker, hooks):
+# The first two lines run this file the same way for every exec of it by path (the gh shim, the lane-gh broker, hooks):
+# /bin/sh execs SELF_LOADER (a shebang with arguments splits on macOS), and Python reads that line as the docstring's.
 # SELF_LOADER, from bytecode SourceFileLoader caches beside it (~/.local/bin/__pycache__; checked against the file's
 # mtime and size, so an update recompiles once). huge-blue, 2026-11-22 07:55Z: 384 glaeda-gh processes in 60 s, all but
 # one compiling this file from source, 0.34 s CPU each against 0.10 s from bytecode (~3 of the host's cores).
@@ -29692,8 +29694,15 @@ def self_argv() -> list[str]:
 
 
 def from_loader() -> bool:
-    """Run through a -c loader (the first line, self_argv or PYC_LOADER): already from bytecode when it was cached."""
-    return "-c" in list(getattr(sys, "orig_argv", ()))[:6]
+    """Run through SELF_LOADER (the first lines or self_argv) and its bytecode could be cached beside this file."""
+    if list(getattr(sys, "orig_argv", ()))[1:4] != ["-I", "-c", SELF_LOADER]:
+        return False
+    here = os.path.dirname(os.path.abspath(__file__))
+    cache = os.path.join(here, "__pycache__")
+    return os.access(cache if os.path.isdir(cache) else here, os.W_OK)
+
+
+DOC = __doc__.partition('"$@"\n')[2] or __doc__  # the usage, without the /bin/sh line the docstring opens with
 PYC_ENV = "GLAEDA_GH_FROM_PYC"
 PYC_LOADER = ('import sys, types, importlib.machinery as m; p = sys.argv[1]; sys.argv = sys.argv[1:]; '
               'g = types.ModuleType("__main__"); g.__file__ = p; sys.modules["__main__"] = g; '
