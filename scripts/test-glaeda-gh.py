@@ -20082,6 +20082,44 @@ class PrProbeTest(Base):
         self.assertEqual(self.gh.full_reads, 2, "a probe never stands in for more than PR_FULL_EVERY")
         self.assertEqual(self.gh.probes, int(gg.PR_FULL_EVERY // gg.CYCLE))
 
+    def touch(self, at: float) -> None:
+        for n in range(1, 11):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            os.utime(path, (at, at))
+
+    def test_a_backlog_is_probed_past_pr_full_every_then_read_in_full(self) -> None:
+        """One host, 2026-11-22: a full cmux PR cost GitHub ~3.5 s and a probe ~0.5 s, and every PR in a backlog was
+        past PR_FULL_EVERY, so none was probed: ~100 PRs stored per 600 s, waited PR data 16,000 s old."""
+        self.daemon.tick(NOW)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 0))
+        later = NOW + gg.PR_FULL_EVERY + gg.CYCLE
+        self.touch(later)
+        self.daemon.deferred = {"pr:o/r#99"}  # the last tick ran out of room for a PR read
+        self.daemon.tick(later)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 1), "behind, an unchanged PR is probed")
+        self.assertEqual(gg.read_cache("pr:o/r#3")["dataAt"], later)
+        self.assertEqual(gg.read_cache("pr:o/r#3")["fullAt"], NOW)
+        caught_up = later + gg.CYCLE
+        self.touch(caught_up)
+        self.daemon.tick(caught_up)
+        self.assertEqual(self.gh.full_reads, 2, "once nothing is behind, the full read PR_FULL_EVERY owes goes out")
+
+    def test_data_older_than_pr_full_every_is_probed_first(self) -> None:
+        """A restarted daemon carries no deferral; a PR whose own data is that old is behind all the same."""
+        self.daemon.tick(NOW)
+        later = NOW + gg.PR_FULL_EVERY + gg.CYCLE
+        self.touch(later)
+        self.daemon.tick(later)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 1))
+
+    def test_behind_a_pr_is_still_read_in_full_every_pr_full_behind_every(self) -> None:
+        self.daemon.tick(NOW)
+        later = NOW + gg.PR_FULL_BEHIND_EVERY + gg.CYCLE
+        self.touch(later)
+        self.daemon.deferred = {"pr:o/r#99"}
+        self.daemon.tick(later)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (2, 0))
+
     def test_a_new_head_or_a_merge_is_never_confirmed(self) -> None:
         self.daemon.tick(NOW)
         self.gh.prs[("o", "r", 2)]["headRefOid"] = "b" * 40
