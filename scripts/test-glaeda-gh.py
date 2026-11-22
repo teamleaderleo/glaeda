@@ -7686,15 +7686,20 @@ class ChildReapingTest(unittest.TestCase):
                                   text=True, timeout=30)
         self.assertEqual(done.stdout, "plain\n")  # a host with no timeout runs it as it is
 
+    def until_zombie(self, pid: int) -> bool:
+        deadline = time.monotonic() + 5
+        while not self.zombie(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.zombie(pid)
+
     def test_detached_children_are_reaped_and_never_left_defunct(self) -> None:
-        procs = [gg.spawn_detached(["true"], stdin=subprocess.DEVNULL) for _ in range(3)]
-        for proc in procs:
-            deadline = time.monotonic() + 5
-            while not self.zombie(proc.pid) and time.monotonic() < deadline:
-                time.sleep(0.05)
-        self.assertTrue(all(self.zombie(p.pid) for p in procs), "the children ended unreaped (as they were)")
-        self.assertEqual(gg.reap_children(), 0)
-        self.assertFalse(any(self.zombie(p.pid) for p in procs))
+        first = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertTrue(self.until_zombie(first.pid), "it ended, and nothing waited for it yet")
+        second = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertFalse(self.zombie(first.pid), "the next spawn reaps what ended")
+        self.assertTrue(self.until_zombie(second.pid))
+        self.assertEqual(gg.reap_children(), 0)  # what serve's tick does
+        self.assertFalse(self.zombie(second.pid))
         self.assertEqual(gg.DETACHED, [])
 
     def test_a_bounded_child_carries_its_deadline_for_the_reaper(self) -> None:
