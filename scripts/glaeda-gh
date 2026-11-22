@@ -13785,8 +13785,31 @@ class LandQueue:
             at = c.get("dataAt")
             if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
                 return False
-        return self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
-                          "the cache shows it")
+        if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
+                      "the cache shows it"):
+            return True
+        return self.stop_moved_pin(e, c, data)
+
+    def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
+        """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
+        full head that this queue's own update-branch did not make (pin_follow's case: no update was ever sent for
+        E). A cache file read, no GitHub call, so a row gated behind busy workers, the load line or the pace cap stops
+        as soon as the read lands instead of when a worker is free to judge it (judge and pin_wait stop it the same
+        way). A lane host, 2026-11-22: a pinned row waiting on its stack sat 3 h on a head that had moved."""
+        pin = str(e.get("pinSha") or "")
+        head = str(data.get("headRefOid") or "").lower()
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head):
+            return False
+        if e.get("updateSent") or e.get("preStepHead") or e.get("pinFollow"):
+            return False  # this queue moved the head itself: pin_follow decides on the first parent
+        since = float(e.get("pinSince") or e.get("created") or 0)
+        at = c.get("dataAt")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
+            return False  # a copy older than the pin may predate the push the pin names
+        e.pop("pinWait", None)
+        self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+                  f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+        return True
 
     def retire_ended(self) -> None:
         """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""

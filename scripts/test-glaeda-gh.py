@@ -27530,6 +27530,28 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--sha {LC}", e["stop"]["next"])
 
+    def test_a_pinned_row_whose_fresh_cached_head_moved_stops_without_a_worker(self):
+        """A cache read since the pin that shows another head stops the row on the cache look (retire_from_cache), with
+        no worker, judgment or GitHub call: rows gated behind busy workers or the load line sat open on moved heads.
+        A copy older than the pin, and a head the queue's own update-branch made, stop nothing."""
+        self.nudge_reads = False  # nothing reads the PR here but the cache writes below
+        self.pr(LA)
+        self.land_pinned(LB)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        self.assertNotEqual(e["state"], "stopped")
+        calls = len(self.w.calls)
+        with self.q.lock:
+            self.assertFalse(self.q.retire_from_cache(e))  # LA was cached before the pin: proves nothing
+        self.w.set_pr(self.KEY, land_pr(LC), self.t + 5)
+        with self.q.lock:
+            self.assertFalse(self.q.retire_from_cache({**e, "updateSent": {"head": LB}}))  # pin_follow's case
+            self.assertTrue(self.q.retire_from_cache(e))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {LC}", e["stop"]["next"])
+        self.assertEqual([c for c in self.w.calls[calls:] if "gh" in c or "explain" in c], [])  # only the notice
+        self.assertEqual(self.w.explains(), [])
+
     def test_a_stale_cached_head_never_stops_a_newer_pin_as_head_moved(self):
         """The cache is stale and the pin is newer: judge()'s head_moved compares the pin with the cached head, so
         before pin_wait the land stopped head_moved on a head GitHub no longer has. No stop until a read since the
