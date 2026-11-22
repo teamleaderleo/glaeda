@@ -12044,6 +12044,14 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# Of the due entries (queued, or waiting past their wake) only the first this many per worker, in judge_order, hold a
+# waited watch; the rest are read like a parked entry (LAND_PEEK_EVERY), and the tick that brings one inside the window
+# waits on it again, so its judgment is handed a fresh copy (and fresh_head/snapshot_wait nudge a read regardless).
+# The broker host, 2026-11-22 06:00Z: 1,349 pr watches waited on in 600 s, 1,200 of them the land queues'. Its own
+# queue held 304 queued and 65 waiting past their wake for 12 workers, a lane VM's 82 and 90, most "due since" hours
+# ago behind busy workers, and every one was waited: about 8,100 PR reads an hour the read loop cannot make, so even
+# the PRs a worker was about to judge went unread.
+LAND_WATCH_AHEAD = 2
 # A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
 # deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
 LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
@@ -12990,6 +12998,7 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
         # checks before land-judge's first judgment asks; a test's WATCH alone records neither.
         self.head_watch = head_watch or ((lambda key: register(key, consumer=LAND_HEAD_CONSUMER,
@@ -13296,7 +13305,12 @@ class LandQueue:
                 else:
                     awake.append(key)
             live = awake
-        for key in sorted(live, key=self.judge_order):
+        order = sorted(live, key=self.judge_order)
+        # Only the first LAND_WATCH_AHEAD per worker of the due entries, in the order workers take them, are read at
+        # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
+        due_keys = [k for k in order if self.due(self.entries[k])]
+        self.lean = set(due_keys[max(1, self.workers() * LAND_WATCH_AHEAD):])
+        for key in order:
             try:
                 if self.queue_quota_parked():
                     break  # a worker parked the host while this pass was submitting judgments
@@ -14315,7 +14329,8 @@ class LandQueue:
         --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
+        due = self.due(e) and (e["key"] not in self.lean or bool(e.get("snapshotWait")))
+        waited = due or w.get("kind") == "head_change" or self.wake_near(e)
         self.watch_head(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):

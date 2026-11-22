@@ -27921,6 +27921,43 @@ class LandTest(Base):
             self.tick(30)
         self.assertEqual(calls, [])
 
+    def test_only_the_due_entries_workers_reach_next_hold_a_waited_pr_watch(self):
+        """The broker host, 2026-11-22 06:00Z: 1,349 pr watches waited on in 600 s, 1,200 the land queues', since every
+        due entry (queued, or past its wake) was waited however many stood ahead of it for a busy worker. With 1 worker
+        busy and 60 due entries, only the first LAND_WATCH_AHEAD in judge_order are waited; the rest get the parked
+        entry's unwaited read per LAND_PEEK_EVERY. When the worker frees, the next one is waited and judged."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            if not key.startswith("head:"):
+                calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        keys = [self.stuck(2000 + i, 3600 - 30 * i) for i in range(60)]  # due, oldest wake first
+        start = self.t
+        while self.t - start < 1800:
+            self.tick(30)
+        waited = {k for k, w, _ in calls if w}
+        self.assertEqual(waited, set(keys[:gg.LAND_WATCH_AHEAD]))
+        peeked = [k for k, w, once in calls if once and not w]
+        self.assertEqual(set(peeked), set(keys[gg.LAND_WATCH_AHEAD:]))
+        self.assertLessEqual(len(peeked), (60 - gg.LAND_WATCH_AHEAD) * (1800 / gg.LAND_PEEK_EVERY + 1))
+        # The worker frees: the entries are judged in the same order, the waited one first
+        del self.q.jobs["pr:o/r#99"]
+        self.retries(60)
+        self.tick(30)
+        self.assertEqual(self.explained()[:2], ["2000", "2001"])
+
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
         self.pr(LA)
