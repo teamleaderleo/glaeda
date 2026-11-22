@@ -31806,6 +31806,32 @@ def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, st
     return hint, " ".join(["glaeda-gh"] + kept)
 
 
+NESTING_WRITE_INPUT = {("post", "comment"): ("--body", "--body-file"),
+                       ("post", "review"): ("--body", "--body-file"),
+                       ("post", "pr"): ("--head", "--base", "--title")}
+
+# Every command here only reads, in the order a caller who named no command would want them: the ones that
+# answer at once before `wait`, which blocks. A word whose commands are all in here can be routed without
+# choosing between reading and writing, because there is no write among them to choose.
+NESTING_READ_FIRST = ("status", "log", "search", "checks", "budget", "audit", "read", "wait")
+
+
+def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) -> bool:
+    """Whether `PARENT WORD TARGET` with the long flags TYPED is a call PARENT could carry out at all.
+
+    The caller's own evidence, not a guess about intent: `post pr` takes OWNER/REPO and refuses without
+    --head, --base and --title, so `glaeda-gh pr o/r#5` is no `post pr` on either count; `post comment`
+    refuses without a body, so a flagless `comment o/r#5` is no write either. Dropping a parent that could
+    only refuse is what leaves `nesting_synonym` with reads alone, and a word it may then route.
+    """
+    if parent != "post":
+        return True
+    if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
+        return False
+    needs = NESTING_WRITE_INPUT.get((parent, word))
+    return not needs or bool({normalized_flag(f) for f in needs} & typed)
+
+
 def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
 
@@ -31813,11 +31839,17 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
     one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
 
-    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    A word more than one command takes, where one of them writes, is *refused*, never guessed: `comment`, `pr` and `run` are each a word
     of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
     would pick between reading and writing. The refusal names every command that takes the word, each as a
     line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
-    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one.
+
+    Two narrowings keep that refusal for the calls it is really about. A parent that could only refuse the
+    call as typed is dropped (`nesting_parent_fits`), and when every parent left only reads there is no
+    read-or-write choice to protect, so the word is routed to the read that answers at once and the blocking
+    sibling is named: `glaeda-gh run o/r/123` and `glaeda-gh pr o/r#5` were each refused with three lines to
+    choose from until 2026-11-22, and each cost the refusal plus the same call typed again under `status`."""
     if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
         return raw, []
     tops, table = nesting_table()
@@ -31831,6 +31863,18 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
         if len(fits) == 1:
             parents = fits
+    if len(parents) > 1:
+        target = next((w for w in raw[1:] if not w.startswith("-")), "")
+        could = [p for p in parents if nesting_parent_fits(p, word, target, typed)]
+        if could:
+            parents = could
+    if len(parents) > 1 and set(parents) <= set(NESTING_READ_FIRST):
+        first = min(parents, key=NESTING_READ_FIRST.index)
+        rest = [p for p in parents if p != first]
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh', first, word] + raw[1:])}` (`{word}` is a word of "
+              f"{len(parents)} commands and every one of them only reads, so this is the one that answers at "
+              f"once; {', '.join(f'`glaeda-gh {p} {word}`' for p in rest)} also reads it)", file=sys.stderr)
+        return [first, word] + raw[1:], []  # said once, here: the single-parent line below would repeat it
     if len(parents) > 1:
         refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
                    f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
