@@ -21616,7 +21616,8 @@ class LogScanTest(Base):
         for argv in (["log", "errors", "o/r", "9", "--reads", "-1"],
                      ["log", "search", "o/r", "pat", "--reads", "-1"]):
             err = io.StringIO()
-            with mock.patch("sys.stderr", err), mock.patch.object(gg.Parser, "argv", argv):
+            # `say_waiting`, not sys.stderr: the refusal writes fd 2 (diagnostics_in says why).
+            with self.diagnostics_in(err), mock.patch.object(gg.Parser, "argv", argv):
                 with self.assertRaises(SystemExit) as exit_:
                     gg.main(list(argv))
             self.assertEqual(exit_.exception.code, 64, argv)
