@@ -14843,6 +14843,7 @@ class LandQueue:
             with self.lock:
                 self.count("explain")
             return
+        hand = ""
         with self.lock:
             self.check(e)
             self.count("explain")
@@ -14869,6 +14870,14 @@ class LandQueue:
                 self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            hand = self.unjudgeable_here(e, answer, act, head)
+            if hand:
+                e["handoffDue"] = {"kind": "judgment", "head": head, "why": hand, "reason": "unreadable here"}
+                self.save(e)
+        if hand:
+            self.hand_off(e, head)  # off the lock, as step_refused's owner hand-off is
+            return
+        with self.lock:
             if self.unread_repeated(e, answer, head):
                 return
             if answer.get("ok") or act.get("kind") in LAND_WAIT_KINDS:
@@ -14900,6 +14909,22 @@ class LandQueue:
                 return
             self.save(e)
         self.take(e, act, answer)
+
+    def unjudgeable_here(self, e: dict, answer: dict, act: dict, head: str) -> str:
+        """Under the lock: why this lane VM should hand E at HEAD to the broker host's land queue instead of judging it
+        again here, or "". A judgment that read nothing about the PR ("unreadable", "explain_failed") on a broker
+        client: the VM reads GitHub through the broker's upstream, and when that is slow every judgment here costs a
+        worker for minutes and reads nothing again. gcp-agent-lane-10, 2026-11-22: manaflow-ai/cmux#48064 at
+        1ebd272819aa answered "unreadable" after 5m9s (store 22 s, GraphQL and REST timed out), about 25 green lands
+        sat behind such answers, all 8 workers busy, none ever handed off. The broker host judges it with its own
+        fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. A host with its own login,
+        a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
+        code = str(answer.get("code") or "")
+        if code not in ("unreadable", "explain_failed") or answer.get("cacheOnly") or not SHA40.fullmatch(head):
+            return ""
+        if not self.broker_client() or e.get("state") == LAND_FORWARDED:
+            return ""
+        return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
         """Under the lock, for each judged answer (LAND_UNREAD_SAME_STOP's comment): an "unreadable" one counts its
@@ -15507,9 +15532,14 @@ class LandQueue:
 
     def hand_off(self, e: dict, head: str) -> None:
         """Hand E at HEAD to the broker host's land queue (`lane-gh call land_handoff`), after its owner check refused a
-        step here (owner_refused). Taken: the entry is forwarded, the requester told. Refused: counted per head like a
+        step here (owner_refused) or this VM could not judge it (unjudgeable_here). Taken: the entry is forwarded, the requester told. Refused: counted per head like a
         step's refusal (backoff, then a stop at LAND_STEP_STOP)."""
         due = e.get("handoffDue") or {}
+        reason = str(due.get("reason") or "ownership")
+        if due.get("kind") == "judgment":
+            what = f"this VM could not judge it at {head[:12]} ({due.get('why') or reason})"
+        else:
+            what = f"the broker refused this lane's {due.get('kind') or 'step'} at {head[:12]} ({due.get('why') or reason})"
         args: dict[str, Any] = {"number": int(e["number"]), "sha": head}
         requester = str(e.get("requester") or "")
         if requester.startswith(f"{policy_host()}/"):
@@ -15536,11 +15566,9 @@ class LandQueue:
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
                                   "request": str(doc.get("request") or "")}
                 e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=host)
-                self.history(e, "handed_off", to=host, head=head[:12], why="ownership")
+                self.history(e, "handed_off", to=host, head=head[:12], why=reason)
                 self.save(e)
-                self.notify(e, requester, f"glaeda land: {self.url(e)} handed to {host}: the broker refused this "
-                            f"lane's {due.get('kind') or 'step'} at {head[:12]} ({due.get('why') or 'ownership'}); "
-                            f"{host}'s land queue judges it (land_judge) and merges it, or says why not "
+                self.notify(e, requester, f"glaeda land: {self.url(e)} handed to {host}: {what}; {host}'s land queue judges it (land_judge) and merges it, or says why not "
                             f"(glaeda-gh land status there)")
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
@@ -15549,8 +15577,7 @@ class LandQueue:
             e["handoffFail"] = {"head": head, "count": n, "at": self.now, "why": said}
             self.history(e, "handoff_refused", head=head[:12], why=land_trim(said, 160), n=n)
             if n >= LAND_STEP_STOP:
-                self.stop(e, "handoff_refused", f"the broker refused this lane's {due.get('kind') or 'step'} at "
-                          f"{head[:12]} for ownership ({due.get('why') or ''}), and handing it to the broker host's "
+                self.stop(e, "handoff_refused", f"{what}, and handing it to the broker host's "
                           f"land queue was refused {n} times: {said}",
                           f"the PR's owner lane lands it, or from a host with its own login: glaeda-gh land "
                           f"{key_name(e['key'])}")

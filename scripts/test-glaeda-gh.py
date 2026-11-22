@@ -25414,6 +25414,47 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], self.handoffs()), ("waiting", []))
 
+    UNREAD = ("land-judge: unreadable: the head's checks could not be read (glaeda-gh's store did not answer; "
+              "graphql: timed out; rest: timed out)")
+
+    def test_a_judgment_that_read_nothing_on_a_lane_vm_hands_the_land_to_the_broker_host(self):
+        # gcp-agent-lane-10, 2026-11-22: cmux#48064 at 1ebd272819aa answered "unreadable" after 5m9s on the VM's slow
+        # upstream; about 25 green lands sat behind such answers with all 8 workers busy, and none was ever handed off.
+        # The first judgment that read nothing hands the PR to the broker host, which judges it with its own reads.
+        for code in ("unreadable", "explain_failed"):
+            with self.subTest(code=code):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.broker = True
+                self.pr(LA)
+                with mock.patch.object(gg, "policy_host", lambda: "host"):
+                    self.land(requester="host/lane")
+                    self.w.answers.append(refusal(code, LA, {"kind": "retry"}, reason=self.UNREAD))
+                    e = self.tick()
+                [call] = self.handoffs()
+                self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+                self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
+                said = [c[-1] for c in self.w.sent() if "handed to huge-blue" in c[-1]]
+                self.assertTrue(said and "could not judge it" in said[0], self.w.sent())
+                for _ in range(3):
+                    self.tick(600)
+                self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+                self.broker = False
+
+    def test_a_judgment_that_read_nothing_stays_local_off_a_lane_vm_or_without_a_full_head(self):
+        # A host with its own login keeps judging (unread_repeated's run); so does a VM that has no full head to pin.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        e = self.tick()
+        self.assertEqual(self.handoffs(), [])
+        self.assertNotEqual(e["state"], "forwarded")
+        e = {"state": "waiting"}
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "unreadable", "reason": "x"}, {}, LA[:12]), "")
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "ci", "reason": "x"}, {}, LA), "")
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "unreadable", "cacheOnly": True}, {}, LA), "")
+
     def test_a_refused_hand_off_backs_off_then_stops_and_says_so(self):
         self.broker = True
         self.pr(LA)
