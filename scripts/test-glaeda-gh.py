@@ -29177,6 +29177,148 @@ class LandTest(Base):
         self.daemon.land_tick()
         self.assertIsNotNone(self.daemon.land_queue)
 
+    # -- per-PR leases (land.json "leases", docs/adr/0023-decentralized-land-queue.md)
+
+    def lease_config(self, holder: str = "host-a", remote: str | None = None) -> gg.LandLeases:
+        cache = Path(self.tmp.name) / f"leases-{holder}.git"
+        self.w.config["leases"] = {"cache": os.fspath(cache), "holder": holder} | ({"remote": remote} if remote else {})
+        return gg.LandLeases(cache, remote, holder, clock=lambda: self.t)
+
+    def test_with_leases_a_merge_claims_fences_and_releases_its_lease(self):
+        mine = self.lease_config()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        _, lease = mine.read(self.KEY)
+        self.assertEqual((lease["holder"], lease["gen"], lease["state"], lease["outcome"], lease["head"]),
+                         ("host-a", 1, "released", "merged", LA))
+        events = [h.get("event") for h in self.q.entries[self.KEY].get("history") or []]
+        self.assertIn("lease", events)
+
+    def test_a_live_lease_on_another_host_holds_the_merge_until_it_runs_out(self):
+        remote = Path(self.tmp.name) / "store.git"
+        subprocess.run(["git", "init", "--bare", "-q", os.fspath(remote)], check=True)
+        other = gg.LandLeases(Path(self.tmp.name) / "leases-host-b.git", os.fspath(remote), "host-b",
+                              clock=lambda: self.t)
+        theirs = other.claim(self.KEY, head=LA)
+        self.assertIsNotNone(theirs)
+        self.lease_config("host-a", os.fspath(remote))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])  # host-b holds it: no merge from here
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertIn("host-b holds the lease", e["wait"]["why"])
+        self.assertGreaterEqual(e["wakeAt"], theirs["expires"])  # woken when that lease can have run out
+        # host-b went away: its lease runs out, and this host takes it (generation 2) and merges.
+        self.t = theirs["expires"] + 5
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+        _, lease = other.read(self.KEY)
+        self.assertEqual((lease["holder"], lease["gen"], lease["outcome"]), ("host-a", 2, "merged"))
+        self.assertIsNone(other.renew(self.KEY, theirs))  # the stale holder cannot renew over it
+
+    def test_an_unreachable_lease_store_sends_no_merge_and_retries(self):
+        self.lease_config("host-a", os.fspath(Path(self.tmp.name) / "no-such-store.git"))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["why"]),
+                         ("waiting", "retry", "lease store unreachable"))
+
+
+class LandLeaseStoreTest(Base):
+    """LandLeases: per-PR land leases in git refs, compare-and-swap on the ref, so two hosts never hold one PR
+    (docs/adr/0023-decentralized-land-queue.md). The remote is a real bare repository: the push's
+    --force-with-lease is the same check a GitHub-hosted store makes."""
+
+    KEY = "pr:o/r#7"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.t = NOW
+        self.remote = Path(self.tmp.name) / "store.git"
+        subprocess.run(["git", "init", "--bare", "-q", os.fspath(self.remote)], check=True)
+
+    def host(self, name: str, remote: bool = True) -> gg.LandLeases:
+        return gg.LandLeases(Path(self.tmp.name) / f"cache-{name}.git", os.fspath(self.remote) if remote else None,
+                             name, clock=lambda: self.t)
+
+    def test_one_claim_wins_and_the_other_host_is_refused_while_it_lives(self):
+        a, b = self.host("a"), self.host("b")
+        lease = a.claim(self.KEY, head=LA)
+        self.assertEqual((lease["holder"], lease["gen"], lease["state"]), ("a", 1, "held"))
+        self.assertEqual(gg.LandLeases.ref(self.KEY), "refs/glaeda-land/leases/o/r/7")
+        self.assertIsNone(b.claim(self.KEY))
+        self.assertEqual(a.fence(self.KEY, lease), (True, ""))
+
+    def test_a_race_from_the_same_old_value_has_exactly_one_winner(self):
+        a, b = self.host("a"), self.host("b")
+        oid_a, _ = a.read(self.KEY)
+        oid_b, _ = b.read(self.KEY)
+        won_a = a.swap(self.KEY, oid_a, {"holder": "a", "gen": 1, "state": "held", "expires": self.t + 60})
+        won_b = b.swap(self.KEY, oid_b, {"holder": "b", "gen": 1, "state": "held", "expires": self.t + 60})
+        self.assertIsNotNone(won_a)
+        self.assertIsNone(won_b)
+        self.assertEqual(b.read(self.KEY)[1]["holder"], "a")
+
+    def test_an_expired_lease_is_taken_at_the_next_generation_and_fences_the_stale_holder(self):
+        a, b = self.host("a"), self.host("b")
+        old = a.claim(self.KEY, ttl=60)
+        self.t += 61
+        new = b.claim(self.KEY)
+        self.assertEqual((new["holder"], new["gen"]), ("b", 2))
+        ok, why = a.fence(self.KEY, old)
+        self.assertFalse(ok)
+        self.assertIn("b holds the lease (generation 2, this host had 1)", why)
+        self.assertIsNone(a.renew(self.KEY, old))
+        self.assertFalse(a.release(self.KEY, old))  # never written over another holder's lease
+        self.assertEqual(b.read(self.KEY)[1]["state"], "held")
+
+    def test_a_lease_too_close_to_its_end_does_not_fence_a_merge_until_renewed(self):
+        a = self.host("a")
+        lease = a.claim(self.KEY, ttl=gg.LAND_LEASE_MERGE_ROOM + 30)
+        self.t += 60
+        ok, why = a.fence(self.KEY, lease)
+        self.assertFalse(ok)
+        self.assertIn("left, under", why)
+        lease = a.renew(self.KEY, lease)
+        self.assertEqual(a.fence(self.KEY, lease), (True, ""))
+        self.assertEqual(lease["gen"], 1)  # a renewal keeps the generation
+
+    def test_the_holders_own_claim_renews_and_a_release_frees_it_at_once(self):
+        a, b = self.host("a"), self.host("b")
+        first = a.claim(self.KEY)
+        again = a.claim(self.KEY)
+        self.assertEqual(again["gen"], first["gen"])
+        self.assertTrue(a.release(self.KEY, again, "merged"))
+        taken = b.claim(self.KEY)
+        self.assertEqual((taken["holder"], taken["gen"]), ("b", 2))
+
+    def test_a_local_store_alone_compares_and_swaps_too(self):
+        a, b = self.host("a", remote=False), gg.LandLeases(Path(self.tmp.name) / "cache-a.git", None, "b",
+                                                           clock=lambda: self.t)
+        self.assertIsNotNone(a.claim(self.KEY))
+        self.assertIsNone(b.claim(self.KEY))
+
+    def test_an_unreachable_remote_raises_rather_than_answering_free(self):
+        a = gg.LandLeases(Path(self.tmp.name) / "cache-x.git", os.fspath(Path(self.tmp.name) / "gone.git"), "a",
+                          clock=lambda: self.t)
+        with self.assertRaises(gg.LandLeaseError):
+            a.claim(self.KEY)
+
+    def test_land_leases_reads_land_json(self):
+        self.assertIsNone(gg.land_leases({}))
+        got = gg.land_leases({"leases": {"cache": "~/x.git", "remote": "git@github.com:o/state.git", "holder": "h"}})
+        self.assertEqual((got.cache, got.remote, got.holder),
+                         (Path(os.path.expanduser("~/x.git")), "git@github.com:o/state.git", "h"))
+
 
 class LandForwardTest(Base):
     """land.json's "executor": a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15

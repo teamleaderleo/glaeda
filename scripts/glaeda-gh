@@ -314,6 +314,9 @@ when this file changes, so an update takes effect without a restart.
   forwards it, in order; entries still open here are handed off (state "forwarded") once their running step ends.
   On a lane VM, a merge or update the broker refuses for ownership ("was not pushed by") hands the entry, once per
   head, to the broker host's land queue (lane-gh call land_handoff), which judges and merges it or says why not.
+  land.json "leases" ({"remote": URL, "cache": PATH, "holder": NAME}) fences every merge with a per-PR lease in git
+  refs (refs/glaeda-land/leases/OWNER/REPO/N, compare-and-swap): a merge goes out only while this host holds the
+  PR's lease at its generation, so two hosts' queues never step one PR (docs/adr/0023-decentralized-land-queue.md).
 """
 
 from __future__ import annotations
@@ -11721,6 +11724,187 @@ def land_forward_name(command: list[str]) -> str:
     return " ".join(command)[:120]
 
 
+# Per-PR land leases: the first piece of the decentralized land queue (docs/adr/0023-decentralized-land-queue.md).
+# huge-blue, 2026-11-22 07:59Z: one host held all 887 open lands (29 merges/h, queue-to-merge p50 77 min, p90 3.4 h)
+# and every other host forwarded to it, so losing it stopped every land and nothing measured the wait. A lease says
+# which host works a PR's land now, so any host may run the queue and two never step the same PR.
+#
+# The store is git refs: refs/glaeda-land/leases/OWNER/REPO/N in a repository every host can push to (land.json
+# "leases": {"remote": URL, "cache": PATH}), or a local bare repository ("cache" alone: one host, or the tests). Each
+# value is one parentless commit whose message is the lease's JSON; a change is a compare-and-swap of the ref
+# (`git update-ref REF NEW OLD` locally, `git push --force-with-lease=REF:OLD` to the remote), so of two hosts
+# claiming from the same old value exactly one wins, whichever store the ref lives in. A lease names its holder, a
+# generation (one more at every claim: the fencing token) and an expiry; a holder renews it while it works and
+# releases it when the entry ends. A claim takes a lease that is absent, released or expired, never a live one.
+# Fencing: before a merge the holder fences (land_lease_fence): the ref must still be the exact value it wrote
+# (holder, generation) with at least LAND_LEASE_MERGE_ROOM left, else the merge is not sent; the merge itself is
+# pinned with --match-head-commit, so a holder whose lease ran out mid-merge can at worst merge the same pinned head
+# a second time, which GitHub refuses as already merged.
+LAND_LEASE_REFS = "refs/glaeda-land/leases"
+LAND_LEASE_TTL = 600.0  # a lease's life from its claim or renewal; a holder renews every LAND_LEASE_TTL / 3
+LAND_LEASE_MERGE_ROOM = 120.0  # a merge is sent only while the lease has at least this long left (LAND_MERGE_DEADLINE)
+LAND_LEASE_GIT_DEADLINE = 30.0  # one git call against the store
+LAND_LEASE_IDENTITY = {"GIT_AUTHOR_NAME": "glaeda-land", "GIT_AUTHOR_EMAIL": "glaeda-land@invalid",
+                       "GIT_COMMITTER_NAME": "glaeda-land", "GIT_COMMITTER_EMAIL": "glaeda-land@invalid"}
+LAND_LEASE_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+class LandLeaseError(WatchError):
+    """The lease store could not be read or written (not a refusal: a refusal is a None answer)."""
+
+
+class LandLeases:
+    """Claim, renew, release and fence per-PR land leases in a git ref store (see LAND_LEASE_REFS)."""
+
+    def __init__(self, cache: Path, remote: str | None = None, holder: str | None = None,
+                 clock: Callable[[], float] | None = None,
+                 run: Callable[..., subprocess.CompletedProcess] | None = None):
+        self.cache = Path(cache)
+        self.remote = remote or None
+        self.holder = holder or policy_host()
+        self.clock = clock or time.time
+        self.run = run or run_bounded
+
+    @staticmethod
+    def ref(key: str) -> str:
+        kind, owner, repo, number = split_key(key)
+        if kind != "pr":
+            raise LandLeaseError(f"land lease: {key!r} is not a PR")
+        return f"{LAND_LEASE_REFS}/{owner}/{repo}/{number}"
+
+    def git(self, *args: str, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | LAND_LEASE_IDENTITY \
+            | {"GIT_TERMINAL_PROMPT": "0"}
+        try:
+            got = self.run(["git", "--git-dir", os.fspath(self.cache), *args], LAND_LEASE_GIT_DEADLINE,
+                           input_text=input_text, env=env)
+        except subprocess.TimeoutExpired:
+            raise LandLeaseError(f"land lease: git {args[0]} gave no answer within {LAND_LEASE_GIT_DEADLINE:.0f}s") \
+                from None
+        except OSError as error:
+            raise LandLeaseError(f"land lease: git {args[0]}: {type(error).__name__}") from None
+        if check and got.returncode != 0:
+            tail = (got.stderr or "").strip().splitlines()[-1:] or [f"exit {got.returncode}"]
+            raise LandLeaseError(f"land lease: git {args[0]}: {land_redact(tail[0])}"[:UPSTREAM_ERROR_MAX])
+        return got
+
+    def ensure(self) -> None:
+        if not (self.cache / "HEAD").is_file():
+            self.cache.mkdir(parents=True, exist_ok=True)
+            self.git("init", "--bare", "-q")
+
+    def read(self, key: str) -> tuple[str, dict | None]:
+        """(the ref's commit or "" when absent, its lease or None). With a remote, the remote's value: it is fetched."""
+        self.ensure()
+        ref = self.ref(key)
+        if self.remote:
+            got = self.git("fetch", "-q", "--no-tags", self.remote, f"+{ref}:{ref}", check=False)
+            if got.returncode != 0:
+                if "couldn't find remote ref" not in (got.stderr or "").lower():
+                    tail = (got.stderr or "").strip().splitlines()[-1:] or [f"exit {got.returncode}"]
+                    raise LandLeaseError(f"land lease: fetch: {land_redact(tail[0])}"[:UPSTREAM_ERROR_MAX])
+                self.git("update-ref", "-d", ref, check=False)  # absent on the remote: absent here too
+                return "", None
+        got = self.git("rev-parse", "--verify", "-q", f"{ref}^{{commit}}", check=False)
+        oid = (got.stdout or "").strip()
+        if got.returncode != 0 or not oid:
+            return "", None
+        body = self.git("log", "-1", "--format=%B", oid).stdout or ""
+        with contextlib.suppress(ValueError):
+            doc = json.loads(body)
+            if isinstance(doc, dict):
+                return oid, doc
+        return oid, {"holder": "", "gen": 0, "expires": 0.0, "state": "unreadable"}
+
+    def swap(self, key: str, old: str, lease: dict) -> str | None:
+        """LEASE written over OLD ("" = absent) as one compare-and-swap: its commit, or None when the ref moved."""
+        ref = self.ref(key)
+        new = (self.git("commit-tree", LAND_LEASE_EMPTY_TREE, "-m", json.dumps(lease, sort_keys=True)).stdout
+               or "").strip()
+        if self.remote:
+            got = self.git("push", "-q", "--porcelain", f"--force-with-lease={ref}:{old}", self.remote,
+                           f"{new}:{ref}", check=False)
+            if got.returncode != 0:
+                said = f"{got.stdout or ''} {got.stderr or ''}".lower()
+                if "stale info" in said or "rejected" in said or "fetch first" in said or "non-fast-forward" in said:
+                    return None
+                tail = (got.stderr or "").strip().splitlines()[-1:] or [f"exit {got.returncode}"]
+                raise LandLeaseError(f"land lease: push: {land_redact(tail[0])}"[:UPSTREAM_ERROR_MAX])
+            self.git("update-ref", ref, new, check=False)
+            return new
+        got = self.git("update-ref", ref, new, old or "0" * 40, check=False)
+        return new if got.returncode == 0 else None
+
+    def live(self, lease: dict | None, now: float) -> bool:
+        return isinstance(lease, dict) and lease.get("state") == "held" and float(lease.get("expires") or 0) > now
+
+    def claim(self, key: str, head: str = "", ttl: float = LAND_LEASE_TTL) -> dict | None:
+        """This host's lease on KEY: a new one (generation + 1) when none is live, the same one renewed when this
+        host already holds it; None while another host's lease is live, or when another claim won the race."""
+        oid, lease = self.read(key)
+        now = self.clock()
+        if self.live(lease, now) and lease.get("holder") != self.holder:
+            return None
+        if self.live(lease, now):
+            return self.renew(key, lease | {"oid": oid}, ttl, head)
+        gen = int((lease or {}).get("gen") or 0) + 1
+        new = {"key": key, "holder": self.holder, "gen": gen, "acquired": now, "expires": now + ttl,
+               "state": "held", "head": head}
+        wrote = self.swap(key, oid, new)
+        return None if wrote is None else new | {"oid": wrote}
+
+    def renew(self, key: str, lease: dict, ttl: float = LAND_LEASE_TTL, head: str = "") -> dict | None:
+        """LEASE (as claim returned it) extended by TTL from now, or None when it is no longer this holder's."""
+        oid, now_lease = self.read(key)
+        now = self.clock()
+        if oid != lease.get("oid") or not self.live(now_lease, now) or now_lease.get("holder") != self.holder \
+                or int(now_lease.get("gen") or 0) != int(lease.get("gen") or 0):
+            return None
+        new = {k: v for k, v in now_lease.items()} | {"expires": now + ttl} | ({"head": head} if head else {})
+        wrote = self.swap(key, oid, new)
+        return None if wrote is None else new | {"oid": wrote}
+
+    def release(self, key: str, lease: dict, outcome: str = "released") -> bool:
+        """LEASE given up (OUTCOME: released, merged, stopped...): the next claim takes it at once. False when it was
+        no longer this holder's (nothing is written over another holder's lease)."""
+        oid, now_lease = self.read(key)
+        if oid != lease.get("oid") or not isinstance(now_lease, dict) or now_lease.get("holder") != self.holder:
+            return False
+        new = {k: v for k, v in now_lease.items()} | {"state": "released", "outcome": outcome,
+                                                       "expires": self.clock()}
+        return self.swap(key, oid, new) is not None
+
+    def fence(self, key: str, lease: dict, room: float = LAND_LEASE_MERGE_ROOM) -> tuple[bool, str]:
+        """(may this holder still act on KEY, why not): the ref is the exact value LEASE wrote, held by this host at
+        LEASE's generation, with at least ROOM seconds left."""
+        oid, now_lease = self.read(key)
+        now = self.clock()
+        if not isinstance(now_lease, dict) or not oid:
+            return False, "no lease is held"
+        if now_lease.get("holder") != self.holder or int(now_lease.get("gen") or 0) != int(lease.get("gen") or 0):
+            return False, (f"{now_lease.get('holder') or 'another host'} holds the lease (generation "
+                           f"{now_lease.get('gen')}, this host had {lease.get('gen')})")
+        if oid != lease.get("oid"):
+            return False, "the lease changed since this host wrote it"
+        if not self.live(now_lease, now):
+            return False, f"the lease is {now_lease.get('state') or 'gone'} or ran out"
+        if float(now_lease.get("expires") or 0) - now < room:
+            return False, f"the lease has {float(now_lease.get('expires') or 0) - now:.0f}s left, under {room:.0f}s"
+        return True, ""
+
+
+def land_leases(config: dict | None = None, clock: Callable[[], float] | None = None) -> LandLeases | None:
+    """land.json's "leases" store ({"cache": PATH, "remote": URL, "holder": NAME}), or None: no leases (today's
+    single queue per host)."""
+    doc = (land_config() if config is None else config).get("leases")
+    if not isinstance(doc, dict):
+        return None
+    cache = doc.get("cache") or os.fspath(land_dir() / "leases.git")
+    remote = doc.get("remote") if isinstance(doc.get("remote"), str) and doc.get("remote") else None
+    holder = doc.get("holder") if isinstance(doc.get("holder"), str) and doc.get("holder") else None
+    return LandLeases(Path(os.path.expanduser(str(cache))), remote, holder, clock)
+
+
 LAND_STATES = ("queued", "waiting_after", "judging", "acting", "waiting", "merged", "stopped", "cancelled",
                LAND_FORWARDED)
 LAND_DONE = frozenset({"merged", "stopped", "cancelled", LAND_FORWARDED})
@@ -16352,6 +16536,46 @@ class LandQueue:
         # Apps busy) read as one, and six alternating ones stopped the entry (router review of glaeda#2239, F1).
         return subprocess.CompletedProcess(got.args, got.returncode or 1, "", said)
 
+    def merge_lease(self, e: dict, sha: str) -> dict | None | bool:
+        """With land.json "leases" (land_leases): this host's fenced lease on E for a merge at SHA, or False when the
+        merge must not be sent (another host holds it: waited until its lease can run out; the store did not answer:
+        retried). None without leases: today's one queue per host, nothing to fence."""
+        leases = land_leases(self.config(), clock=lambda: self.now)
+        if leases is None:
+            return None
+        key = e["key"]
+        try:
+            lease = leases.claim(key, head=sha)
+            ok, why = (False, "") if lease is None else leases.fence(key, lease)
+            if lease is None:
+                _, other = leases.read(key)
+                why = f"{(other or {}).get('holder') or 'another host'} holds the lease"
+                left = max(LAND_FORWARD_RETRY / 2, float((other or {}).get("expires") or 0) - leases.clock() + 1)
+            else:
+                left = LAND_FORWARD_RETRY / 2
+        except LandLeaseError as error:
+            with self.lock:
+                self.history(e, "lease_unreadable", error=land_trim(str(error), 200))
+                self.wait(e, {"kind": "retry", "why": "lease store unreachable"}, LAND_FORWARD_RETRY)
+            return False
+        if lease is not None and ok:
+            with self.lock:
+                self.history(e, "lease", holder=lease["holder"], gen=lease["gen"], head=sha[:12])
+            return lease
+        with self.lock:
+            self.history(e, "lease_refused", why=land_trim(why, 200), head=sha[:12])
+            self.wait(e, {"kind": "retry", "why": land_trim(why, 200)}, left)
+        return False
+
+    def lease_release(self, e: dict, lease: dict, outcome: str) -> None:
+        leases = land_leases(self.config(), clock=lambda: self.now)
+        if leases is None:
+            return
+        try:
+            leases.release(e["key"], lease, outcome)
+        except LandLeaseError as error:  # it runs out on its own: LAND_LEASE_TTL
+            log({"event": "land-lease-release-failed", "key": e["key"], "error": land_trim(str(error), 200)})
+
     def do_merge(self, e: dict, sha: str, answer: dict) -> None:
         if not SHA40.fullmatch(sha):
             with self.lock:
@@ -16373,6 +16597,9 @@ class LandQueue:
                           "~/.config/glaeda/land.json")
             return
         repo, number = e["repo"], str(e["number"])
+        lease = self.merge_lease(e, sha)
+        if lease is False:
+            return
         with self.lock:
             self.claim(e, "merge", sha=sha)
         if self.broker_client():
@@ -16395,6 +16622,8 @@ class LandQueue:
             doc = json.loads(view.stdout or "")
             state = str(doc.get("state") or "")
             merge_sha = str((doc.get("mergeCommit") or {}).get("oid") or "")
+        if state == "MERGED" and lease:
+            self.lease_release(e, lease, "merged")  # off the lock: one git push; it runs out on its own anyway
         with self.lock:
             self.finish(e, got, verified=state)
             if state == "MERGED":
