@@ -126,7 +126,8 @@ if dest.endswith("mini-fleet.json"):
 """
 FAKE_GH = """#!{python}
 import json, os, sys
-open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:],
+                                                     "gh_token": os.environ.get("GH_TOKEN", "")}}) + "\\n")
 path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
 if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
     groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
@@ -226,6 +227,31 @@ class FleetTest(unittest.TestCase):
         return subprocess.run([sys.executable, os.fspath(self.tool), "--manifest", os.fspath(self.manifest),
                                "--output", "json", *args], capture_output=True, text=True, timeout=120,
                               env={**self.env, **env}, check=False)
+
+    def test_runner_calls_go_on_the_fleet_app_not_the_login(self) -> None:
+        """A direct --apply mints the fleet runner App's token (fleet_app_token.py) for the runner reads and mints,
+        so they stop spending the operator's gh login; other calls, a caller's GH_TOKEN and a host with no App
+        (exit 3) keep the login."""
+        tool = self.dir / "fleet_app_token.py"
+        tool.write_text("import os, sys\n"
+                        "open(os.environ['FAKE_LOG'] + '.mints', 'a').write(sys.argv[2] + '\\n')\n"
+                        "sys.exit(int(os.environ.get('FAKE_APP_RC', '0')) or print('ghs_apptoken' + sys.argv[2]))\n")
+        result = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        gh = [c for c in self.calls() if c["tool"] == "gh"]
+        runner_calls = [c for c in gh if any("actions/runners" in a for a in c["argv"])]
+        self.assertTrue(runner_calls)
+        self.assertTrue(all(c["gh_token"] == "ghs_apptokenrepo" for c in runner_calls), runner_calls)
+        release = [c for c in gh if "repos/actions/runner/releases/latest" in c["argv"]]
+        self.assertEqual([c["gh_token"] for c in release], [""], "the release read keeps the login")
+        self.assertEqual((self.dir / "calls.jsonl.mints").read_text().split(), ["repo"], "one mint per scope")
+        self.log.unlink()
+        self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), GH_TOKEN="ghs_caller")
+        self.assertTrue(all(c["gh_token"] == "ghs_caller" for c in self.calls() if c["tool"] == "gh"))
+        self.log.unlink()
+        none = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), FAKE_APP_RC="3")
+        self.assertEqual(none.returncode, 0, none.stdout + none.stderr)
+        self.assertTrue(all(c["gh_token"] == "" for c in self.calls() if c["tool"] == "gh"))
 
     def calls(self) -> list[dict]:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []

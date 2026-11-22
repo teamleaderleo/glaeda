@@ -170,12 +170,71 @@ def set_max_procs(limit: int) -> None:
     _PROCS = threading.BoundedSemaphore(max(1, limit))
 
 
+# The runner reads and mints go out as the fleet's runner App (manaflow-glaeda-route, minted by cmuxterm-hq's
+# build-fleet/mini-ops/fleet_app_token.py), not the operator's gh login. runner-apply.sh already does this, but a
+# direct `--apply` fell back to the login: on the operator's Mac they were the login's largest caller and it hit
+# GitHub's rate limit. Only the runner paths on the App's installation take the token: anything else, a GH_TOKEN
+# the caller set, or a host with no App (exit 3) keeps gh's own login as before. Tokens live an hour.
+APP_TOKEN_REUSE_S = 50 * 60
+APP_SCOPES = (("orgs/manaflow-ai/actions/runner", "org"), ("repos/manaflow-ai/cmux/actions/runners", "repo"))
+_APP_TOKENS: dict[str, tuple[str | None, float]] = {}
+_APP_LOCK = threading.Lock()
+_APP_SAID: list[str] = []
+
+
+def app_token_tool() -> Path | None:
+    candidates = [os.environ.get("FLEET_APP_TOKEN_TOOL", "")]
+    if os.environ.get("MINI_OPS_DIR"):
+        candidates.append(os.path.join(os.environ["MINI_OPS_DIR"], "fleet_app_token.py"))
+    candidates += [os.path.expanduser(f"~/{root}/build-fleet/mini-ops/fleet_app_token.py")
+                   for root in ("Projects/cmuxterm-hq", "src/cmuxterm-hq", "cmuxterm-hq")]
+    return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
+
+
+def app_scope(argv: list[str]) -> str | None:
+    """The fleet_app_token scope a gh call takes, or None to keep gh's own login."""
+    if not argv or argv[0] != "gh" or os.environ.get("GH_TOKEN"):
+        return None
+    path = next((a for a in argv[2:] if "/" in a and not a.startswith("-")), "")
+    return next((scope for prefix, scope in APP_SCOPES if path.startswith(prefix)), None)
+
+
+def app_token(scope: str) -> str | None:
+    with _APP_LOCK:  # one mint per scope in flight; a host with no App is learned once per run
+        cached = _APP_TOKENS.get(scope)
+        if cached and (cached[0] is None or time.monotonic() - cached[1] < APP_TOKEN_REUSE_S):
+            return cached[0]
+        tool = app_token_tool()
+        if tool is None:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        try:
+            out = subprocess.run(["/usr/bin/env", "python3", os.fspath(tool), "token", scope], capture_output=True,
+                                 text=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None  # not cached: the next call asks again, this one keeps the login
+        token = out.stdout.strip()
+        if out.returncode == 3:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        if out.returncode != 0 or not TOKEN_RE.fullmatch(token):
+            return None
+        _APP_TOKENS[scope] = (token, time.monotonic())
+        if scope not in _APP_SAID:
+            _APP_SAID.append(scope)
+            print(f"github: the fleet's runner App ({scope} scope) for runner calls", file=sys.stderr)
+        return token
+
+
 def _launch(argv: list[str], timeout: float, stdin: str | None) -> subprocess.CompletedProcess:
     if _PROCS is None:
         set_max_procs(max_procs(raise_nofile()))
+    scope = app_scope(argv)
+    token = app_token(scope) if scope else None
+    env = {**os.environ, "GH_TOKEN": token} if token else None
     with _PROCS:  # type: ignore[union-attr]
         return subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, env=env)
 
 
 def run(argv: list[str], timeout: float, stdin: str | None = None) -> tuple[int, str, str]:
