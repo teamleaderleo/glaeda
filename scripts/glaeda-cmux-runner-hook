@@ -9371,6 +9371,19 @@ MEMORY_CAP_MAX_WAIT_LIMIT_MIN = 60.0  # a longer maxWaitMin is not a setting: no
 MEMORY_CAP_STAGGER_S = float(os.environ.get("GLAEDA_RUNNER_MEMORY_CAP_STAGGER_S") or 90.0)
 MEMORY_CAP_START_FILE = "mem-cap-start"
 MEMORY_CAPPED = "a new job will not fit in this mini's memory"
+# SWAP_HOLD (2026-11-21, Leo 11-17: "don't pull back just add more"; 11-19: "stretch everything till it's at like...
+# 90% cpu/ram"): a 48 GiB mini (14 listeners) hit load 527 with 20.5 of 23.5 GB of swap used, then 21.8 of
+# 23.5 GB, and macOS's out-of-application-memory alert wedged the GUI. Pressure level and reclaimable pages did not
+# say so in time. So the memory cap also holds a new job while swap USED is SWAP_USED_PCT of the swap total or more
+# (and at least SWAP_MIN_GIB, so a small swap file at idle never holds), and listens again below SWAP_RESUME_PCT.
+# It changes no capacity (listeners, the 90%/95% targets); it only defers new starts, exactly as the memory cap does
+# (same exemptions, same maxWaitMin). Unreadable swap holds nothing. memoryCap swapUsedPct (0 is off),
+# resumeSwapUsedPct and swapMinGiB set it; GLAEDA_RUNNER_SWAP_USED_PCT (a percent, or off) in the runner's
+# environment wins.
+SWAP_HOLD_ENV = "GLAEDA_RUNNER_SWAP_USED_PCT"
+SWAP_USED_PCT = 50.0
+SWAP_RESUME_PCT = 35.0
+SWAP_MIN_GIB = 2.0
 # Speculative pages are file-backed pages already in vm.page_pageable_external_count, so they are not added again.
 # The file-backed count also holds running compiles' mapped executables, so this is an upper bound: it leans toward
 # admitting, and the memory-pressure level backs it.
@@ -9381,6 +9394,24 @@ class MemoryCap(NamedTuple):
     need_mib: int
     resume_mib: int
     max_wait_s: float
+    swap_pct: float = SWAP_USED_PCT  # 0: the swap hold is off
+    swap_resume_pct: float = SWAP_RESUME_PCT
+    swap_min_mib: int = int(SWAP_MIN_GIB * 1024)
+
+
+def _swap_marks(value: dict[str, Any] | None) -> tuple[float, float, int] | None:
+    """(swapUsedPct, resumeSwapUsedPct, swapMinGiB in MiB) of a memoryCap dict, each defaulting to the code mark; None
+    when one is not a number or the marks are out of order (resume above the hold mark, a pct over 100, a negative)."""
+    value = value or {}
+    try:
+        pct = float(value.get("swapUsedPct", SWAP_USED_PCT))
+        resume = float(value.get("resumeSwapUsedPct", min(SWAP_RESUME_PCT, pct)))
+        floor = float(value.get("swapMinGiB", SWAP_MIN_GIB))
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= pct <= 100 and 0 <= resume <= pct and 0 <= floor < 1e6):
+        return None
+    return pct, resume, int(floor * 1024)
 
 
 def _memory_cap(value: Any, ram_mib: int | None = None) -> MemoryCap | None | bool:
@@ -9415,7 +9446,10 @@ def _memory_cap(value: Any, ram_mib: int | None = None) -> MemoryCap | None | bo
             return False
     else:
         return False
-    return MemoryCap(int(need), int(resume), wait * 60.0)
+    marks = _swap_marks(value if isinstance(value, dict) else None)
+    if marks is None:
+        return False
+    return MemoryCap(int(need), int(resume), wait * 60.0, *marks)
 
 
 def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None,
@@ -9437,6 +9471,14 @@ def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str 
     if isinstance(entry, dict) and "memoryCap" in entry and _live_entry(entry, now) \
             and (got := _memory_cap(entry["memoryCap"], ram)) is not False:
         cap = got  # type: ignore[assignment]
+    swap_env = os.environ.get(SWAP_HOLD_ENV, "").strip().lower()
+    if cap is not None and swap_env:
+        try:
+            pct = 0.0 if swap_env in ("off", "false", "no", "disabled") else float(swap_env)
+        except ValueError:
+            pct = None
+        if pct is not None and 0 <= pct <= 100:
+            cap = cap._replace(swap_pct=pct, swap_resume_pct=min(cap.swap_resume_pct, pct))
     return cap
 
 
@@ -9464,10 +9506,25 @@ def reclaimable_mib() -> int | None:
     return parse_reclaimable(out.stdout) if out.returncode == 0 else None
 
 
-def memory_short(cap: MemoryCap | None, held: bool, reclaimable: int | None, pressure: int | None) -> str | None:
+def swap_short(cap: MemoryCap, held: bool, swap: tuple[int, int] | None) -> str | None:
+    """Why swap is too full for a new job, or None: swap used (bytes, of the total) at the cap's swap_pct of the total
+    or more and at least its floor, or, once `held`, still at its resume mark or more (hysteresis). Off at 0;
+    unreadable or empty swap holds nothing."""
+    if cap.swap_pct <= 0 or swap is None or swap[1] <= 0:
+        return None
+    used, total = swap
+    mark = cap.swap_resume_pct if held else cap.swap_pct
+    if used >= cap.swap_min_mib * (1 << 20) and used * 100.0 >= total * mark:
+        return f"swap {used / (1 << 30):.1f} of {total / (1 << 30):.1f} GiB used ({used * 100.0 / total:.0f}%, " \
+               f"{'listens again under' if held else 'holds at'} {mark:g}%)"
+    return None
+
+
+def memory_short(cap: MemoryCap | None, held: bool, reclaimable: int | None, pressure: int | None,
+                 swap: tuple[int, int] | None = None) -> str | None:
     """Why a new job will not fit in memory now, or None: memory pressure at GATE_MEMORY_PRESSURE_HOLD or more, or
-    reclaimable memory under the cap's need (its resume mark once `held`, so it does not flap). Unreadable
-    readings hold nothing."""
+    reclaimable memory under the cap's need (its resume mark once `held`, so it does not flap), or swap used high
+    (swap_short). Unreadable readings hold nothing."""
     if cap is None:
         return None
     if pressure is not None and pressure >= GATE_MEMORY_PRESSURE_HOLD:
@@ -9476,7 +9533,7 @@ def memory_short(cap: MemoryCap | None, held: bool, reclaimable: int | None, pre
     mark = cap.resume_mib if held else cap.need_mib
     if reclaimable is not None and reclaimable < mark:
         return f"{reclaimable / 1024:.1f} GiB reclaimable, under {mark / 1024:g} GiB"
-    return None
+    return swap_short(cap, held, swap)
 
 
 def mean_load_per_core(samples: list[tuple[float, float]], cores: int | None, now: float) -> float | None:
@@ -10647,7 +10704,7 @@ class Gate:
         # holds and since when (monotonic)
         self.mem_cap: MemoryCap | None = gate_memory_cap(None, "", 0.0)
         self.mem_at = -GATE_CPU_EVERY_S
-        self.mem_reading: tuple[int | None, int | None] = (None, None)
+        self.mem_reading: tuple[int | None, int | None, tuple[int, int] | None] = (None, None, None)
         self.mem_why: str | None = None
         self.mem_since: float | None = None
         self.mem_waived = False  # a hold ran past maxWaitMin; ignored until a new job fits again
@@ -11015,7 +11072,8 @@ class Gate:
         if now - self.mem_at >= GATE_CPU_EVERY_S:
             fresh = now - self.memory_at < GATE_CPU_EVERY_S  # saturated() just read the level
             level = self.memory_pressure if fresh else memory_pressure_level()
-            self.mem_reading, self.mem_at = (reclaimable_mib(), level), now
+            swap = swap_usage() if self.mem_cap.swap_pct > 0 else None
+            self.mem_reading, self.mem_at = (reclaimable_mib(), level, swap), now
             if self.mem_reading[0] is None and sys.platform == "darwin" and not self.mem_unread_noted:
                 gate_log("the memory cap cannot read reclaimable memory (sysctl); only memory pressure applies")
                 self.mem_unread_noted = True

@@ -9968,6 +9968,7 @@ class MemoryCapTest(unittest.TestCase):
             "name": "cmux17-glaeda-2", "labels": ["glaeda-mini", self.LABEL]}}))
         self.mem = [2048]  # MiB reclaimable
         self.pressure = [1]
+        self.swap: list[tuple[int, int] | None] = [None]  # (used, total) bytes; None: unreadable
         self.jobs: list[dict] = []
         self.feed = True
         for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
@@ -9976,6 +9977,7 @@ class MemoryCapTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("reclaimable_mib", lambda: self.mem[0]), ("memory_pressure_level", lambda: self.pressure[0]),
+                           ("swap_usage", lambda: self.swap[0]),
                            ("gate_host", lambda: "cmux17"), ("load_cap_fetch", self.fetch),
                            ("gate_settings_doc", lambda *a: (None, "")), ("gate_log", lambda line: None)):
             patcher = mock.patch.object(hook, name, side_effect=fake)
@@ -10066,6 +10068,61 @@ class MemoryCapTest(unittest.TestCase):
         self.assertIn("pressure level 2", hook.memory_short(cap, False, 9000, 2) or "", "pressure says it too")
         self.assertIsNone(hook.memory_short(cap, False, None, None), "unreadable holds nothing")
         self.assertIsNone(hook.memory_short(None, False, 0, 4), "off holds nothing")
+
+    def test_swap_used_holds_with_hysteresis_and_only_defers(self) -> None:
+        gib = 1 << 30
+        cap = hook.MemoryCap(2560, 5120, 600.0)
+        self.assertEqual((cap.swap_pct, cap.swap_resume_pct), (50.0, 35.0))
+        # 2026-11-21 a 48 GiB mini: 20.5 of 23.5 GB used with plenty "reclaimable" and pressure 1
+        busy = (int(20.5 * gib), int(23.5 * gib))
+        self.assertIn("swap 20.5 of 23.5 GiB", hook.memory_short(cap, False, 9000, 1, busy) or "")
+        self.assertIn("swap 16.0 of 16.4 GiB", hook.memory_short(cap, False, 9000, 1, (16 * gib, int(16.4 * gib))) or "")
+        self.assertIsNone(hook.memory_short(cap, False, 9000, 1, (11 * gib, 24 * gib)), "46% is under the 50% mark")
+        self.assertIn("swap", hook.memory_short(cap, False, 9000, 1, (12 * gib, 24 * gib)) or "", "50% holds")
+        self.assertIn("swap", hook.memory_short(cap, True, 9000, 1, (10 * gib, 24 * gib)) or "", "held: 42% is over 35%")
+        self.assertIsNone(hook.memory_short(cap, True, 9000, 1, (8 * gib, 24 * gib)), "33% is under the resume mark")
+        self.assertIsNone(hook.memory_short(cap, False, 9000, 1, (int(1.5 * gib), 2 * gib)), "under the 2 GiB floor")
+        for swap in (None, (0, 0), (5 * gib, 0)):
+            self.assertIsNone(hook.memory_short(cap, False, 9000, 1, swap), f"unreadable or empty swap holds nothing: {swap}")
+        self.assertIsNone(hook.memory_short(cap._replace(swap_pct=0), False, 9000, 1, busy), "0 turns it off")
+        # settings
+        self.assertEqual(hook._memory_cap({"swapUsedPct": 60, "resumeSwapUsedPct": 40, "swapMinGiB": 4}, 51200),
+                         hook.MemoryCap(2560, 5120, 600.0, 60.0, 40.0, 4096))
+        self.assertEqual(hook._memory_cap({"swapUsedPct": 30}, 51200).swap_resume_pct, 30.0, "resume capped at the mark")
+        self.assertIs(hook._memory_cap({"swapUsedPct": 30, "resumeSwapUsedPct": 40}, 51200), False)
+        self.assertIs(hook._memory_cap({"swapUsedPct": 101}, 51200), False)
+        self.assertIs(hook._memory_cap({"swapUsedPct": "x"}, 51200), False)
+        with mock.patch.dict(os.environ, {hook.SWAP_HOLD_ENV: "off"}):
+            self.assertEqual(hook.gate_memory_cap(None, "x", 0.0, raw="", ram_mib=51200).swap_pct, 0.0)
+        with mock.patch.dict(os.environ, {hook.SWAP_HOLD_ENV: "70"}):
+            self.assertEqual(hook.gate_memory_cap(None, "x", 0.0, raw="", ram_mib=51200).swap_pct, 70.0)
+        declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
+        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", 0.0, raw="", ram_mib=51200).swap_pct, 50.0)
+        # at the gate: holds under swap pressure, resumes below the mark, and never strands a job
+        self.mem[0] = 20000
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        self.assertIsNone(self.poll())
+        self.swap[0] = busy
+        why = self.poll()
+        self.assertTrue(why and why.startswith(hook.MEMORY_CAPPED) and "swap 20.5 of 23.5" in why, why)
+        self.swap[0] = (10 * gib, 24 * gib)
+        self.assertIsNotNone(self.poll(), "held: 42% is still over the resume mark")
+        self.jobs.append(self.job("queued", ago=600 + 5))
+        self.assertIsNone(self.poll(), "a job waited maxWaitMin: it runs here, slower")
+        self.jobs.pop()
+        self.jobs.append(self.job("queued", ago=1, workflow="nightly-next"))
+        self.assertIsNone(self.poll(), "an urgent job listens at once")
+        self.jobs.pop()
+        self.swap[0] = (8 * gib, 24 * gib)
+        self.assertIsNone(self.poll(), "below the resume mark it listens again")
+        self.swap[0] = busy
+        self.assertIsNotNone(self.poll())
+        for scope in (hook.RunnerScope(gateway=True), hook.RunnerScope(nightly=True), hook.RunnerScope(fresh=True),
+                      hook.RunnerScope(dedicated=True)):
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.gate.memory_capped(), f"exempt like the memory cap: {scope}")
+        with mock.patch.dict(os.environ, {hook.SWAP_HOLD_ENV: "off"}):
+            self.assertIsNone(self.poll(), "the swap hold's own off switch")
 
     def test_holds_while_another_host_keeps_up_and_never_strands(self) -> None:
         self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
