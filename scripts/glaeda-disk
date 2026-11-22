@@ -212,12 +212,15 @@ HEAD on a branch, tag or remote ref of its repository, which survives, and no co
 own reflog holds. Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
 
-On Linux a top-level temp-dir entry no other class owns, untouched (mtime and ctime, anywhere in its tree)
-for stale_tmp_scratch_hours (12 by default), is the tmp-stale-scratch family's instead of "tmp": a
+A top-level temp-dir entry no other class owns, untouched (mtime and ctime, anywhere in its tree) for
+stale_tmp_scratch_hours (12 by default; stale_tmp_scratch_hours_macos, 6, on a Mac), is the tmp-stale-scratch family's
+instead of "tmp": a
 bootstrap test's tree, a mktemp checkout, a clippy repo copy, each left by a process that is gone. Its
 checkouts are each judged (nothing unpushed), and it goes only once no process has its cwd, root or an
-open file inside it, read from every /proc entry (with `sudo -n` for other accounts' processes). A proof
-that cannot read every process keeps it, and the family exists only where the proof can be complete.
+open file inside it, read from every /proc entry (with `sudo -n` for other accounts' processes); on a Mac from one
+bounded lsof listing of every process's cwd and open files, which must cover every live process a login session started
+(darwin_holder_links). A proof that cannot read every process keeps it, and the family exists only where the proof can
+be complete.
 Without it 21 GiB of 18-19 h old unheld /tmp trees sat on a full huge-blue (2026-11-21) while the pass freed
 nothing. Unreadable folders the census meets are measured with `sudo -n du` where sudo needs no password,
 so the accounting gap is only what nothing could measure.
@@ -1312,6 +1315,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "5d3ef91a91a33767a02b1ab8a1441bc22d9d0334261f08d023e68889baa421f8",
     "fc721033bb0823960cfebc55bc401ff0ecf6691e535baad0fc571bd4c39fb7d2",
     "b956998b301fbfc71dc40700e0ac0ec60179d8cda36fd5f96bf30e06b9b19ce8",
+    "a0839b207ad34939c906c250c8076201ec3a4a81e299c82f3d909247cd2cdca9",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2467,6 +2471,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "pressure_idle_hours": 0.5,
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
+    # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
+    # finished jobs' scratch in /private/tmp, perf-sentry-scrub 7.2G, typing-bench 3.0G, ra-base-wt 871M)
+    "stale_tmp_scratch_hours_macos": 6.0,
     # Read what this account cannot (other users' /proc entries, root-only folders the census meets) with
     # `sudo -n` where sudo needs no password; false: never
     "sudo_reads": True,
@@ -5517,11 +5524,115 @@ def sudo_proc_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str
     return [x for x in links if isinstance(x, str)], denied
 
 
+# macOS has no /proc: lsof lists every process's cwd and open files (proc_pidinfo, no stat of mounts: -b). Run as
+# this account it reads this account's processes only, so the proof must show that every other live process is a
+# system service: no ancestor of it was started by a login account (uid DARWIN_LOGIN_UID_MIN and up, the first a Mac
+# creates being 501). A root process a user started (sudo, a setuid helper) or another person's session counts as
+# unread and holds every entry, as an unreadable /proc entry does on Linux. launchd's system daemons (root and the _
+# role accounts) never work in a user's top-level /tmp scratch. Zombies hold nothing, and a process that started or
+# exited during the listing is not one lsof missed.
+DARWIN_LOGIN_UID_MIN = 500
+DARWIN_LOGIN_UID_MAX = 2**31 - 1  # nobody is -2, which ps may print as 4294967294
+
+
+def darwin_processes(out: str) -> dict[int, tuple[int, int, int, str]]:
+    """`ps -axo pid=,ppid=,uid=,ruid=,stat=` as pid -> (ppid, uid, ruid, stat)."""
+    procs: dict[int, tuple[int, int, int, str]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid, uid, ruid = (int(x) for x in parts[:4])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, uid, ruid, parts[4])
+    return procs
+
+
+def darwin_session_pids(procs: dict[int, tuple[int, int, int, str]]) -> set[int]:
+    """The live (not zombie) processes a login account started: its own uid or real uid, or an ancestor's, is a login
+    account's (DARWIN_LOGIN_UID_MIN to DARWIN_LOGIN_UID_MAX)."""
+    def login(uid: int) -> bool:
+        return DARWIN_LOGIN_UID_MIN <= uid <= DARWIN_LOGIN_UID_MAX
+
+    memo: dict[int, bool] = {}
+
+    def started_by_login(pid: int) -> bool:
+        chain: list[int] = []
+        found = False
+        while True:
+            if pid in memo:
+                found = memo[pid]
+                break
+            if pid not in procs or pid in chain:
+                break
+            chain.append(pid)
+            ppid, uid, ruid, _ = procs[pid]
+            if login(uid) or login(ruid):
+                found = True
+                break
+            pid = ppid
+        for p in chain:
+            memo[p] = found
+        return found
+
+    return {pid for pid, (_, _, _, st) in procs.items() if not st.startswith("Z") and started_by_login(pid)}
+
+
+def lsof_pids_and_paths(out: str) -> tuple[set[int], list[str]]:
+    """The pids `lsof -Fpcn` listed and the paths they hold (lsof_open_paths: PASSIVE_HOLDERS left out)."""
+    pids = {int(line[1:]) for line in out.splitlines() if line.startswith("p") and line[1:].isdigit()}
+    return pids, lsof_open_paths(out)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: another account's process, alive
+        return True
+    return True
+
+
+def darwin_holder_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str], int]:
+    """Every path a Mac process has as its cwd or holds open, and how many live processes a login session started
+    lsof did not list (ps before, one bounded lsof, ps after). A failed or empty ps or lsof counts one unread process."""
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    ps = ["ps", "-axo", "pid=,ppid=,uid=,ruid=,stat="]
+    try:
+        code, before = _owned_query(ps, timeout)
+        if code != 0 or not before.strip():
+            return [], 1
+        code, out, _ = _owned_query_split([lsof, *LSOF_NO_MOUNT_STAT, "-n", "-P", "-Fpcn"], timeout)
+        if code not in (0, 1):  # 1: lsof also exits so when it could not read another account's process
+            return [], 1
+        code, after = _owned_query(ps, timeout)
+        if code != 0 or not after.strip():
+            return [], 1
+    except (OSError, subprocess.SubprocessError):
+        return [], 1
+    pids, paths = lsof_pids_and_paths(out)
+    if not pids or not paths:
+        return [], 1
+    later = darwin_processes(after)
+    must = darwin_session_pids(darwin_processes(before))
+    unread = {pid for pid in must - pids
+              if pid in later and not later[pid][3].startswith("Z") and pid != os.getpid() and pid_alive(pid)}
+    return paths, len(unread)
+
+
 def stale_scratch_holders(fresh: bool = False) -> tuple[frozenset[str], int]:
     """Every path a process has as its cwd or root or holds open (open_index), and how many processes' entries could
-    not be read: this account's /proc read first, and when it misses any, the whole read again as root."""
+    not be read: this account's /proc read first, and when it misses any, the whole read again as root; on a Mac
+    darwin_holder_links."""
     global _STALE_HOLDERS
     if _STALE_HOLDERS is not None and not fresh:
+        return _STALE_HOLDERS
+    if DARWIN:
+        links, unread = darwin_holder_links()
+        _STALE_HOLDERS = (open_index(links), unread)
         return _STALE_HOLDERS
     links, denied = proc_links()
     unread = len(set(denied))
@@ -5543,16 +5654,23 @@ def stale_scratch_held(path: Path, fresh: bool = False) -> str:
 
 
 def stale_tmp_hours() -> float:
+    if DARWIN:
+        return float(POLICY.get("stale_tmp_scratch_hours_macos", 6.0))
     return float(POLICY.get("stale_tmp_scratch_hours", 12.0))
 
 
 def stale_tmp_enabled() -> bool:
-    """The family exists on Linux where its holder proof can be complete: sudo reads every process, or this account
-    already can (it is root, or no other account runs anything). Elsewhere "tmp" keeps every entry as before."""
+    """The family exists where its holder proof can be complete: on Linux sudo reads every process, or this account
+    already can (it is root, or no other account runs anything); on a Mac lsof listed every process a login session
+    started (darwin_holder_links). Elsewhere "tmp" keeps every entry as before."""
     global _STALE_TMP_ENABLED
     if _STALE_TMP_ENABLED is None:
-        _STALE_TMP_ENABLED = (not DARWIN and stale_tmp_hours() > 0
-                              and (sudo_reads() or not proc_links()[1]))
+        if stale_tmp_hours() <= 0:
+            _STALE_TMP_ENABLED = False
+        elif DARWIN:
+            _STALE_TMP_ENABLED = not stale_scratch_holders()[1]
+        else:
+            _STALE_TMP_ENABLED = sudo_reads() or not proc_links()[1]
     return _STALE_TMP_ENABLED
 
 
@@ -5603,7 +5721,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                   skip=(f"claude-{uid}",), skip_prefixes=STALE_TMP_PROTECTED_PREFIXES, files=True,
                   min_bytes=1024**2, git_disposable=True, nested_git=True, deep_mtime=True,
                   min_idle_hours=stale_tmp_hours(), owner="nothing: top-level /tmp scratch no class owns",
-                  rebuild_minutes=0.5, platform="linux")] if stale_tmp_enabled() else []),
+                  rebuild_minutes=0.5, platform=host_cache_platform())] if stale_tmp_enabled() else []),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
         # so a unit's DerivedData can go while the clones below cmux-base and work stay protected.
@@ -7479,8 +7597,11 @@ _SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
 
 def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool = False) -> float:
     """The newest mtime of path and everything below it (lstat, never following a link), and with CTIME the newest
-    ctime too. Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it
-    cannot list, another filesystem."""
+    ctime too, where an mtime later than its entry's ctime counts as that ctime: every write and every utime sets ctime
+    to the kernel's clock, so an mtime past it is a stamp, not a use (cmux16, 2026-11-22: a built app in
+    /private/tmp/typing-bench stamped 8 h ahead read as used 2 h from now, then as just used for 8 h more).
+    Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it cannot list,
+    another filesystem."""
     now = time.time()
     try:
         st = path.lstat()
@@ -7488,7 +7609,9 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool =
         return 0.0
     except OSError:
         return now
-    newest, dev = max(st.st_mtime, st.st_ctime) if ctime else st.st_mtime, st.st_dev
+    def used(s: os.stat_result) -> float:
+        return s.st_mtime if not ctime else max(s.st_ctime, min(s.st_mtime, s.st_ctime))
+    newest, dev = used(st), st.st_dev
     if not stat.S_ISDIR(st.st_mode):
         return newest
     stack = [os.fspath(path)]
@@ -7506,7 +7629,7 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool =
                         continue
                     except OSError:
                         return now
-                    newest = max(newest, est.st_mtime, est.st_ctime if ctime else 0.0)
+                    newest = max(newest, used(est))
                     if stat.S_ISDIR(est.st_mode):
                         if est.st_dev != dev:
                             return now  # a mount inside: not this tree's to judge
