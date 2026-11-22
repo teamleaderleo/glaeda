@@ -6300,6 +6300,18 @@ class OverloadTest(Base):
         self.assertEqual(self.daemon.batch["pr"], gg.GQL_BATCH_START)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_a_slow_502_on_a_big_batch_is_a_timeout_it_halves_and_never_takes_graphql_out(self) -> None:
+        # GitHub answers a too-heavy PR batch with 502 after 11-16 s, not 504: counted as down, it sent every PR
+        # to one-by-one REST and the batch never shrank. A 502 that took past GQL_SLOW_5XX_AFTER is a timeout.
+        keys = self.watch(20)
+        self.transport(lambda prs: (502, b"{}") if len(prs) > 5 else None)
+        with mock.patch.object(gg, "GQL_SLOW_5XX_AFTER", 0.0):
+            self.daemon.tick(NOW)
+        self.assertLessEqual(self.daemon.batch["pr"], 5)
+        self.assertEqual(self.daemon.gql_down_streak, 0)
+        self.assertFalse(self.daemon.gql_down())
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
+
     def test_a_heavy_pr_backs_off_and_rejoins_once_it_answers(self) -> None:
         self.watch(6)
         poison = [3]
