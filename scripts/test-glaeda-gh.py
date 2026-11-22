@@ -26994,6 +26994,52 @@ class LandTest(Base):
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap (graphql:", gg.land_line(capped[0], self.t, latch=None))
 
+    def test_a_cache_only_judgment_is_not_repeated_while_nothing_it_reads_has_moved(self):
+        """A cache-only judgment reads this host's own caches and sends nothing, so one that missed can only answer
+        differently once something it reads moves. 2026-11-22, one host: 682 of them in 24 h over 118 (repo, PR, head)
+        triples, cmux#46507 probed 139 times at one unmoved head, holding a land worker each time -- the only dedupe
+        compared the host's last charged judgment time, which every *other* entry's live judgment moves. The probe
+        now waits for its own inputs: the head, the daemon's kept read of the PR, its rollup snapshot, and the shared
+        gh cache."""
+        head = "c" * 40
+        self.pr(head)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        self.live_graphql(0, [])  # GraphQL spent to its reserve: every judgment of this entry is cache-only
+        probes: list[bool] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                probes.append("--cache-only" in argv)
+            return real(argv, timeout, env)
+        self.q.run = run
+        e = self.tick(30)
+        self.assertEqual(probes, [True])  # the first probe runs, and the caches miss (cache_answers off)
+        self.assertEqual(e["state"], "waiting")  # its place is kept under the cap, as before
+        self.assertIn("not judged this window: host cap (graphql", gg.land_line(e, self.t, latch=None))
+        missed = e.get("cacheOnlyMissed") or {}
+        self.assertEqual(missed.get("inputs"), self.q.cache_only_inputs(self.KEY, head))
+        # Every other entry's live judgment moves the host's last charged judgment time, which was the whole dedupe.
+        self.q.now = self.t = self.t + 300
+        self.q.window["graphqlAt"] = self.t
+        self.assertFalse(self.q.window_room(e, head))  # nothing this probe reads moved: no second probe
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+        self.assertEqual(e.get("windowCapped", {}).get("pool"), "graphql")  # capped, exactly as before the probe
+        # The daemon read the PR again: its caches may answer differently now, so one more probe is worth its worker.
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e["cacheOnlyJudge"], self.t)
+        self.assertEqual(e["cacheOnlyInputs"], self.q.cache_only_inputs(self.KEY, head))
+        self.assertNotEqual(e["cacheOnlyInputs"], missed["inputs"])
+        # The per-slot bound this gate narrows is still a bound: a miss waits for the next slot even at a new head.
+        e["cacheOnlyMissed"] = {"start": self.t, "at": self.t, "inputs": e.pop("cacheOnlyInputs")}
+        self.assertFalse(self.q.window_room(e, "d" * 40))
+        self.q.now = self.t = self.t + 300
+        self.q.window["graphqlAt"] = self.t
+        self.assertTrue(self.q.window_room(e, "d" * 40))  # a new slot and a new head: judged from the caches
+
     def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
         """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
         The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the

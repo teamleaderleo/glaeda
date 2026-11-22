@@ -13120,6 +13120,19 @@ def land_seconds(value: Any, default: float, low: float = 1.0, high: float = 864
     return default if not math.isfinite(f) or f <= 0 else min(high, max(low, f))
 
 
+def gh_cache_newest() -> float:
+    """The newest write in the host's shared gh cache (leo-workspace tools/gh_shared_cache.py: entries under
+    $GH_QUOTA_STATE/cache), as a mtime, or 0.0 when there is none to read. A cache-only judgment reads that cache and
+    nothing else live, so this number moving is the only way its answer can change (cache_only_inputs)."""
+    newest = 0.0
+    with contextlib.suppress(OSError):
+        with os.scandir(latch_state_dir() / "cache") as it:
+            for entry in it:
+                with contextlib.suppress(OSError):
+                    newest = max(newest, entry.stat().st_mtime)
+    return newest
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -14446,7 +14459,16 @@ class LandQueue:
         rest = nexts.get("rest")
         return rest is not None and rest[0] <= self.now
 
-    def window_room(self, e: dict) -> bool:
+    def cache_only_inputs(self, key: str, sha: str) -> list:
+        """Everything a cache-only judgment of KEY at SHA reads: the head it is pinned to, the daemon's kept PR read,
+        its rollup snapshot, and the newest write in the host's shared gh cache. Nothing else is read live, so an
+        unmoved list means a probe that missed must miss again (window_room)."""
+        c = self.cache_of(key) or {}
+        snap = self.snapshot_of(key) or {}
+        return [sha, c.get("fp"), c.get("fullAt"), c.get("dataAt"),
+                snap.get("fp"), snap.get("readAt"), snap.get("complete"), gh_cache_newest()]
+
+    def window_room(self, e: dict, sha: str = "") -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
         read, counted in the pass's land-pool line ("capped")."""
@@ -14455,6 +14477,7 @@ class LandQueue:
         over = [pool for pool, got in nexts.items() if got is not None and got[0] > self.now]
         e.pop("cacheOnlyJudge", None)
         e.pop("paceNext", None)
+        e.pop("cacheOnlyInputs", None)
         first = e.pop("unreadCacheFirst", None)
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
@@ -14470,12 +14493,19 @@ class LandQueue:
             # REST, charged to REST alone (LAND_REST_ROUTE's comment).
             e["cacheOnlyJudge"] = "rest"
             return True
-        if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == slot:
+        if over == ["graphql"]:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
-            # One that missed already in this slot waits for the next, as any capped entry does.
-            e["cacheOnlyJudge"] = slot
-            e["paceNext"] = nxt
-            return True
+            # One that missed already waits, as any capped entry does: in that slot, and past it while nothing a
+            # cache-only judgment reads has moved. The slot alone is no dedupe (it is the host's last charged judgment,
+            # so every other entry's live judgment moves it): 2026-11-22, one host probed cmux#46507 at one unmoved
+            # head 139 times in 24 h, holding a worker each time to read caches that could not answer.
+            missed = e.get("cacheOnlyMissed") or {}
+            inputs = self.cache_only_inputs(e["key"], sha)
+            if missed.get("start") != slot and missed.get("inputs") != inputs:
+                e["cacheOnlyJudge"] = slot
+                e["cacheOnlyInputs"] = inputs
+                e["paceNext"] = nxt
+                return True
         self.pass_capped += 1
         # Held by the cap from here to its judgment: not counted toward its wait's deadline (LAND_WAIT_HELD), as a
         # latch or a quota park is. Router review of glaeda#2244, F1: a 200-entry simulation stopped an "unreadable"
@@ -15217,7 +15247,7 @@ class LandQueue:
         if not self.load_room(e):
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
-        if not self.window_room(e):
+        if not self.window_room(e, sha):
             return False  # this window's share is spent: judged in a later one, its place kept
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
@@ -15329,6 +15359,7 @@ class LandQueue:
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
         cache_only = e.pop("cacheOnlyJudge", None)
         pace_next = e.pop("paceNext", None)
+        cache_inputs = e.pop("cacheOnlyInputs", None)
         cached = argv + ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]
         # After an unreadable answer: the caches first, live only on a miss (LAND_UNREAD_SAME_STOP's comment); paced out
         # of GraphQL: the caches alone (the comment above LAND_JUDGE_COST)
@@ -15382,7 +15413,7 @@ class LandQueue:
             # the time it waits there is not counted toward its wait's deadline (cappedSince, LAND_WAIT_HELD).
             nxt = float(pace_next) if isinstance(pace_next, (int, float)) else self.now + LAND_RETRY_DEFAULT
             with self.lock:
-                e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now}
+                e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now, "inputs": cache_inputs}
                 seen = (self.reading("graphql") if self.reading is not None else None) or {}
                 e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt,
                                      "remaining": seen.get("remaining"), "reset": seen.get("reset")}
