@@ -14692,7 +14692,9 @@ class LandQueue:
         return None
 
     def headroom_take(self) -> None:
-        """Charge one judgment started this pass against the headroom read for it."""
+        """Charge one judgment started this pass against this pass's headroom, read now if nothing asked yet (the
+        first start, with no job running, skips headroom_why), so every start is charged."""
+        self.headroom_left()
         at, cpu, mem, read = self.headroom
         if at == self.now:
             self.headroom = (at, cpu - 1, mem - 1, read)

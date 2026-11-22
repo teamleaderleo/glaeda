@@ -29489,6 +29489,9 @@ class LandTest(Base):
             self.assertEqual(self.q.headroom_why(), "the host's free CPU is at the 80% line (/proc/stat idle+nice)")
             self.q.now += 1  # the next pass reads the host again
             self.assertIsNone(self.q.headroom_why())
+            self.q.now += 1
+            self.q.headroom_take()  # a pass's first start, nothing asked yet: charged all the same
+            self.assertEqual(int(self.q.headroom_left()[0]), 1)
         # RAM: 16 GiB, 3.3 GiB free: under 20% after one more judgment
         with mock.patch.object(gg, "land_cpu_free", return_value=0.9), \
                 mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
