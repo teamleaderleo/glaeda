@@ -27354,6 +27354,29 @@ class LandTest(Base):
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
 
+    def test_a_ci_jobs_rate_limit_parks_only_its_entry_never_the_queue(self):
+        """land_judge's "job rate-limited" quota answer names one CI job's rerun time on the installation's limit:
+        its row waits for it, and the next row is judged on the same pass (LAND_JOB_QUOTA)."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        reset = self.t + 1800
+        at = time.strftime("%H:%M", time.gmtime(reset))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300}, reason=(
+            f"land-judge: refused: base_red_excuse.py job rate-limited at {LA} (exit 3): run 7; job 9; no attempt "
+            f"before {at}Z. Rerun run 7 (job 9) no sooner than {at}Z; the repo installation's API limit refused only "
+            "that hand-off job")))
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["said"]), ("waiting", "quota", True))
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        self.tick(5)
+        self.assertEqual(len(self.w.explains()), 2)  # the second row was judged, not held behind the first
+        self.assertNotEqual(self.q.entries[key2]["state"], "queued")
+
     def test_a_refusal_naming_no_reset_parks_only_its_entry_never_the_queue(self):
         """gcp lane, 2026-11-21 07:44Z: an "unreadable" judgment whose secondary-limit words were cut before their time
         ("until 07:5 ...") took its entry's 9th backoff, 3600 s, and park_quota parked the whole host's queue on it until

@@ -12999,6 +12999,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# land_judge's "quota" answer for one CI job that spent the repo installation's API limit ("base_red_excuse.py job
+# rate-limited at HEAD ...: run R; job J; no attempt before HH:MMZ. Rerun run R ... the repo installation's API limit
+# refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
+# installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
+# never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
@@ -15179,9 +15186,10 @@ class LandQueue:
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
-    def park_quota(self, e: dict, text: str) -> None:
+    def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
-        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken. HOST False parks
+        only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
         self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
@@ -15193,7 +15201,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None:
+        if said is not None and host:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -17055,7 +17063,8 @@ class LandQueue:
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
-                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}",
+                                host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
