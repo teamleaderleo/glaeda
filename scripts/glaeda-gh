@@ -14292,6 +14292,14 @@ class LandQueue:
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
+        self.note_late(e, why)
+
+    def note_late(self, e: dict, why: str) -> None:
+        """E, due and not started this pass, has WHY on record as what holds it (dueLate) once it is LAND_DUE_LATE past
+        its wake, and its record says the gate holding it now. Every gate in judge() that leaves a due row out calls
+        this, not only the worker count: huge-blue, 2026-11-22 07:23Z, load 0.48/core under the line, 1 of 12 workers
+        busy, 449 due late, and the rows still read "the host's load is over the line" from 05:41-06:46Z, because the
+        gates holding them since (the quota pace, the reset stagger, a head read) left the old reason on the row."""
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
             load = land_load_per_core()
@@ -14456,6 +14464,15 @@ class LandQueue:
         e.pop("cacheOnlyJudge", None)
         e.pop("paceNext", None)
         first = e.pop("unreadCacheFirst", None)
+        if self.latch_free(e):
+            # Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
+            # login this pace spreads: neither paced nor charged here, as the login's latch already does not hold it
+            # (latch_free). huge-blue, 2026-11-22 07:12-07:25Z: load 0.56-0.65/core, 12 workers, busy 1-2, capped
+            # 243-268 rows a pass, dueLate 425 -> 520 in 13 min: manaflow-ai rows waited on slots of the login's
+            # GraphQL they never spend. The App's own refusals are what is measured for them (spent_until, the park).
+            if first is not None:
+                e["cacheOnlyJudge"] = "unread"
+            return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
@@ -14494,6 +14511,9 @@ class LandQueue:
         """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk; a cache-only judgment
         (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
+        if self.latch_free(e):  # read on the lander App pools: the login's window is not charged (window_room)
+            e.pop("windowCapped", None)
+            return
         if not isinstance(e.get("cacheOnlyJudge"), float):  # a pace slot's cache-only judgment sends nothing
             # a REST-route judgment (LAND_REST_ROUTE) sends no GraphQL the pace could give: charged to REST alone
             pools = ("rest",) if e.get("cacheOnlyJudge") == "rest" else LAND_JUDGE_COST
@@ -15180,6 +15200,7 @@ class LandQueue:
         # recover before either another event arrives or the recovery sweep runs.
         self.changed_entries.add(e["key"])
         if self.reset_staggered(e):
+            self.note_late(e, "the login's reset stagger")
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = len(self.jobs) < workers
@@ -15189,6 +15210,7 @@ class LandQueue:
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
         pin = self.fresh_head(e, sha, free)
         if pin is None:
+            self.note_late(e, "waiting for the daemon's read of its head")
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)):
@@ -15201,6 +15223,7 @@ class LandQueue:
                 self.gated(e)
                 return False
         elif self.snapshot_wait(e, sha, free):
+            self.note_late(e, "waiting for the daemon's snapshot of its head")
             return False  # judged on the daemon's next read of this head (one read, shared), not on land_judge's own
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
@@ -15218,6 +15241,7 @@ class LandQueue:
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e):
+            self.note_late(e, f"the login's quota pace ({(e.get('windowCapped') or {}).get('pool') or '?'})")
             return False  # this window's share is spent: judged in a later one, its place kept
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()

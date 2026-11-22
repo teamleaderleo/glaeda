@@ -26678,6 +26678,29 @@ class LandTest(Base):
                                         {**readings[p], "seenAt": self.t - readings[p]["ago"]})
         readings[pool] = {"limit": 5000, "remaining": remaining, "reset": reset, "ago": seen_ago}
 
+    def test_the_logins_pace_holds_only_owners_read_on_the_login(self):
+        """huge-blue, 2026-11-22 07:12-07:25Z: load 0.56-0.65/core, 12 workers, busy 1-2, capped 243-268 rows a pass,
+        dueLate 425 -> 520 in 13 min. A lander's reads go to the lander App pools: an owner the latch-free check says
+        so for is judged with the login's GraphQL and REST spent to the reserve, and the login's window is not
+        charged; the login's own owner still waits for its reset."""
+        reset = self.t + 1800
+        self.give_reading("graphql", 0, reset)
+        self.give_reading("rest", 0, reset)
+        self.q.latch_free_seen.update({"o": (self.t, False, "no App pool here serves o")})
+        self.pr(LA)
+        self.land()
+        self.tick(1)
+        self.assertEqual((self.w.explains(), self.q.pass_capped), ([], 1))
+        self.q.latch_free_seen.update({"o": (self.t, True, "")})
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(3):
+            self.give_reading("graphql", 0, reset)
+            self.give_reading("rest", 0, reset)
+            self.tick(1)
+        self.assert_merged_at(LA)
+        w = self.q.window_now()
+        self.assertEqual((w["rest"], w["graphql"]), (0.0, 0.0))
+
     def test_a_fresh_reading_above_the_reserve_releases_a_retry_after_mark(self):
         logs: list[dict] = []
         p = mock.patch.object(gg, "log", logs.append)
@@ -29011,6 +29034,29 @@ class LandTest(Base):
         self.assertIn("the host's load is over the line (busy 1 of", line)
         self.assertIn(f"load {round(over, 2)}/core, line {gg.LAND_LOAD_LINE}", line)
         self.assertNotIn("every worker busy", line)
+        self.q.jobs.clear()
+
+    def test_a_due_late_row_names_the_gate_holding_it_now_not_the_load_line_it_left(self):
+        """huge-blue, 2026-11-22 07:23Z: load 0.48/core under the line, 1 of 12 workers busy, 449 due late, the rows
+        still reading "the host's load is over the line" from 05:41-06:46Z. A row the quota pace holds once the load
+        drops says so."""
+        over = gg.LAND_LOAD_LINE + 0.18
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        with mock.patch.object(gg, "land_load_per_core", return_value=over):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertEqual(e["dueLate"]["why"], "the host's load is over the line")
+
+        def capped(entry):
+            entry["windowCapped"] = {"pool": "graphql"}
+            return False
+        with mock.patch.object(gg, "land_load_per_core", return_value=0.48), \
+                mock.patch.object(self.q, "window_room", side_effect=capped):
+            e = self.tick(1)
+        self.assertEqual(e["dueLate"]["why"], "the login's quota pace (graphql)")
+        self.assertNotIn("over the line", gg.land_line(e, self.t, latch=None))
         self.q.jobs.clear()
 
     def test_a_pinned_row_whose_head_moved_is_not_merge_ready(self):
