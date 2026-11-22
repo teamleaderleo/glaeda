@@ -3420,6 +3420,38 @@ class BalanceTest(Base):
         # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
         self.assertTrue(missing.get("missing"))
 
+    def test_a_forbidden_protection_rule_keeps_the_required_checks_it_last_read(self) -> None:
+        """The broker host, 2026-11-22: a read App's answer carries FORBIDDEN at baseRef.branchProtectionRule (classic
+        protection needs administration) beside every other field. The PR is read; the checks it last called required
+        stay required, so a required check that has not reported yet stays missing, never green."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[workflow_check("build", 11)])
+        self.gh.prs[("o", "r", 1)]["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["ci-status"]},
+                                                 "rules": {"nodes": []}}
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.assertIn("ci-status", gg.read_cache(key)["data"]["requiredMissing"])
+        gh = self.daemon.transport
+
+        def forbidden(method, url, headers, body):
+            status, h, out = gh(method, url, headers, body)
+            if url.endswith("/graphql") and b"pullRequest(number:" in (body or b""):
+                doc = json.loads(out)
+                doc["data"]["p0"]["pullRequest"]["baseRef"]["branchProtectionRule"] = None
+                doc["errors"] = [{"type": "FORBIDDEN", "message": "Resource not accessible by integration",
+                                  "path": ["p0", "pullRequest", "baseRef", "branchProtectionRule"]}]
+                out = json.dumps(doc).encode()
+            return status, h, out
+        self.daemon.transport = forbidden
+        self.gh.prs[("o", "r", 1)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].append(
+            workflow_check("test", 11))
+        self.gh.prs[("o", "r", 1)]["updatedAt"] = iso(NOW + gg.CYCLE)
+        self.daemon.tick(NOW + gg.CYCLE)
+        cached = gg.read_cache(key)
+        self.assertFalse(cached.get("error"))
+        self.assertIn("test", [c["name"] for c in cached["data"]["checks"]])
+        self.assertIn("ci-status", cached["data"]["requiredMissing"])
+
     def test_prs_over_rest_when_graphql_is_poorer_read_the_same(self) -> None:
         checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
                   workflow_check("lint", 12, workflow="Lint", conclusion=None, suite=None),
@@ -31004,6 +31036,21 @@ class AppPoolTest(Base):
              "message": "Could not resolve to a Repository with the name 'manaflow-ai/cmux'."}]}).encode()))
         self.daemon.request("POST", "/graphql", query)
         self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1), "a repository it lacks goes on the login")
+        self.assertTrue(self.pool.unreadable)
+
+    def test_a_forbidden_protection_rule_alone_is_the_apps_answer_not_a_refusal(self) -> None:
+        """GitHub's own words (the ci-watch App, the broker host, 2026-11-22): a PR whose base has classic protection
+        answers FORBIDDEN at baseRef.branchProtectionRule only; any other FORBIDDEN still refuses."""
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}", "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 9}}
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": {"pullRequest": {"number": 9}}}, "errors": [
+            {"type": "FORBIDDEN", "path": ["p0", "pullRequest", "baseRef", "branchProtectionRule"],
+             "message": "Resource not accessible by integration"}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls), self.pool.unreadable), (1, 0, {}))
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": None}, "errors": [
+            {"type": "FORBIDDEN", "path": ["p0"], "message": "Resource not accessible by integration"}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1))
         self.assertTrue(self.pool.unreadable)
 
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:

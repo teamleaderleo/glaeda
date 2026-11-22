@@ -2982,6 +2982,22 @@ APP_POOL_ANSWERED_NOT_FOUND = re.compile(
     r"NOT_FOUND Could not resolve to (?:a PullRequest|an Issue|an issue or pull request) with the number of \d+\.?", re.I)
 
 
+# A PR's base branch with classic protection: its rule needs administration, which no read App holds, so the App's
+# answer carries FORBIDDEN at pN.pullRequest.baseRef.branchProtectionRule and every other field of the PR. Counted as a
+# refusal it put cmux and cmuxterm-hq on the login for APP_POOL_ROUTE_REST, under the login's pace and reserve: the
+# broker host, 2026-11-22 05:0xZ, both read Apps "refused graphql:manaflow-ai:cmuxterm-hq,cmux" with 12,234 of 12,500
+# points left, every path on REST, waited PR data 8,629 s old. That one field is not the App's refusal: fetch_aliased
+# keeps the checks it last called required instead, as a REST read without reads_protection does.
+APP_FORBIDDEN_PROTECTION = ("baseRef", "branchProtectionRule")
+
+
+def protection_forbidden(error: Any) -> bool:
+    """Whether one GraphQL error is the App's FORBIDDEN on a base branch's classic protection rule only."""
+    path = error.get("path") if isinstance(error, dict) else None
+    return (isinstance(path, list) and tuple(path[-2:]) == APP_FORBIDDEN_PROTECTION
+            and str(error.get("type") or "") == "FORBIDDEN")
+
+
 def app_graphql_refused(message: str) -> bool:
     """Whether a 200 GraphQL answer's errors (request's "TYPE message ..." text) say the App may not read it: FORBIDDEN,
     or a NOT_FOUND other than a missing PR or issue number (a repository the installation does not cover)."""
@@ -6296,7 +6312,8 @@ class Daemon:
             if isinstance(doc, dict):
                 errors = doc.get("errors")
                 error_text = " ".join(str(e.get("type") or "") + " " + str(e.get("message") or "")
-                                      for e in errors if isinstance(e, dict)) if isinstance(errors, list) else ""
+                                      for e in errors if isinstance(e, dict) and not protection_forbidden(e)
+                                      ) if isinstance(errors, list) else ""
                 message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
             else:
                 message = ""
@@ -9251,6 +9268,14 @@ class Daemon:
             if err.get("type") == RESOURCE_LIMITS:
                 limits.setdefault(str(path[0]), str(err.get("message") or RESOURCE_LIMITS)[:200])
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
+        if kind == "pr":
+            for err in doc.get("errors") or []:
+                found = re.fullmatch(rf"{alias}(\d+)", str(err["path"][0])) if protection_forbidden(err) else None
+                i = int(found.group(1)) if found else -1
+                base = ((data.get(f"{alias}{i}") or {}).get(field) or {}).get("baseRef") if found else None
+                if 0 <= i < len(entries) and isinstance(base, dict):  # (APP_FORBIDDEN_PROTECTION)
+                    base["branchProtectionRule"] = {
+                        "requiredStatusCheckContexts": sorted(prior_required(entries[i].get("cache") or {}))}
         parsed = {}
         fps: dict[int, str | None] = {}  # PR alias -> its fingerprint (pr_fingerprint), None when partial
         attempts: dict[int, list[str] | str] = {}  # PR alias -> its suites whose newest attempt ran nothing
