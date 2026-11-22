@@ -30642,6 +30642,52 @@ class PrintedTargetNotationTest(unittest.TestCase):
                 self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
 
 
+class PostKindMadeElsewhereTest(unittest.TestCase):
+    """`post` queues the three writes a session makes in bulk; the other GitHub writes are one call away. A kind
+    this tool can name must not dead-end: argparse's own line lists the four kinds, which reads as "glaeda-gh
+    cannot file an issue" for a write it does file. Measured 2026-11-22: `glaeda-gh post issue --title ...
+    --body-file ...` was refused with a hint about target *shapes*, and `gh issue create` had to be worked out by
+    hand."""
+
+    def test_each_word_an_agent_types_names_the_call_that_makes_it(self) -> None:
+        for word, inside in (("issue", "gh issue create --repo OWNER/REPO"), ("issues", "gh issue create"),
+                             ("new-issue", "gh issue create"), ("bug", "gh issue create"),
+                             ("issue-comment", "glaeda-gh post comment OWNER/REPO#N"),
+                             ("pr-comment", "glaeda-gh post comment OWNER/REPO#N"),
+                             ("label", "--add-label"), ("add_label", "--add-label"),
+                             ("close", "gh issue close"), ("merge", "glaeda-gh land OWNER/REPO#N")):
+            with self.subTest(word):
+                hand = gg.post_elsewhere(word)
+                self.assertIn(inside, hand)
+                self.assertIn("post queues comment, pr and review", hand)
+                # and it is what the refusal prints as its next step, from the post parser or the top-level one
+                for prog in ("glaeda-gh", "glaeda-gh post"):
+                    self.assertEqual(gg.usage_next(["post", word, "--body", "b"], prog), hand)
+
+    def test_a_kind_post_does_take_is_left_to_its_own_refusal(self) -> None:
+        """Narrow by construction: a real kind, a typo of one and a target in the kind's place are other
+        mistakes, each with its own line. `pr` must never be answered with "made in one call"."""
+        for word in ("pr", "comment", "review", "status", "revieww", "pr:o/r#5", ""):
+            with self.subTest(word):
+                self.assertEqual(gg.post_elsewhere(word), "")
+        self.assertEqual(gg.usage_next(["post", "pr", "--title", "t"], "glaeda-gh post"), "glaeda-gh post --help")
+
+    def test_the_target_shape_hint_gives_way_to_the_call(self) -> None:
+        """The spelling hint answers "the kind and target were one word"; for a write made elsewhere no target
+        shape is the problem, so the refusal says one thing, not two."""
+        self.assertEqual(gg.kind_spellings("argument kind: invalid choice: 'issue' "
+                                           "(choose from comment, pr, review, status)"), "")
+        self.assertIn("a pr target is",
+                      gg.kind_spellings("argument kind: invalid choice: 'pr:o/r/7241' "
+                                        "(choose from comment, pr, review, status)"))
+
+    def test_a_word_that_starts_a_synonym_is_not_run_as_that_choice(self) -> None:
+        """`issue` must not run as `comment` because "issue-comment" starts with it: posting an issue and
+        commenting on one are different writes. This is why neither spelling is a `comment` synonym."""
+        self.assertEqual(gg.close_choice("issue", ("comment", "pr", "review", "status")), ("", []))
+        self.assertEqual(gg.close_choice("reply", ("comment", "pr", "review", "status")), ("comment", []))
+
+
 class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
     """The detector for the whole class: one table of the subcommands that take a PR or issue target, each
     asserted against the *same* form set, so the next subcommand to parse targets its own way fails here

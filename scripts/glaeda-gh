@@ -26349,6 +26349,10 @@ CHOICE_SYNONYMS = {
     "open": ("opened", "active"),
     "prs": ("pr", "pulls", "pull-requests", "pull"),
     "issues": ("issue",),
+    # Not "issue-comment" or "pr-comment": `comment` is matched by the start of a word too, so an `issue` -- a
+    # write post does not queue at all -- would silently run as a comment on an issue. Both spellings route
+    # through POST_ELSEWHERE instead, which names the call and runs nothing.
+    "comment": ("reply", "note"),
 }
 CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
 
@@ -26433,6 +26437,8 @@ def kind_spellings(message: str) -> str:
     bad = KIND_CHOICE.search(message)
     if not bad or ": say which)" in message:  # a plain word as close to two kinds (close_choice): no target shape
         return ""
+    if post_elsewhere(bad.group(1)):
+        return ""  # a write made elsewhere: the `next:` line names its call, and no target shape is the problem
     split = split_kind_prefix(bad.group(1))
     if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
         return f"a {split[0]} target is {KIND_FORMS.get(split[0], 'named by its own form')}"
@@ -26445,6 +26451,36 @@ def print_json_error(code: str, reason: str, nxt: str) -> None:
     with contextlib.suppress(OSError, ValueError):
         sys.stdout.write(json.dumps({"ok": False, "code": code, "reason": reason, "next": nxt}) + "\n")
         sys.stdout.flush()
+
+
+# GitHub writes `post` does not queue, by the word an agent types for them. The daemon's outbox carries the three
+# writes every session makes in bulk (comment, pr, review), and its pacing is what makes them safe to make in bulk;
+# an issue or a label is made once, so it goes straight through the quota shim. argparse's own refusal lists the
+# kinds and stops there, which reads as "this tool cannot do it" for a write it does do one call away. Measured
+# 2026-11-22: `post issue` was refused with a hint about target *shapes*, and the gh call had to be worked out by
+# hand. Leo, 2026-11-20: "we need a bunch of synonyms for code for you guys where it just goes \"eh close enough\"
+# and works".
+POST_ELSEWHERE = {
+    ("issue", "issues", "new-issue", "newissue", "bug", "file-issue"):
+        "glaeda-gh gh issue create --repo OWNER/REPO --title T --body-file F",
+    ("issue-comment", "issuecomment", "pr-comment", "prcomment"):
+        "glaeda-gh post comment OWNER/REPO#N --body-file F (one kind for both: a PR is an issue here)",
+    ("label", "labels", "add-label", "tag"):
+        "glaeda-gh gh issue edit N --repo OWNER/REPO --add-label L (a PR takes it too: a PR is an issue here)",
+    ("close", "closed", "close-issue"):
+        "glaeda-gh gh issue close N --repo OWNER/REPO",
+    ("merge", "land"):
+        "glaeda-gh land OWNER/REPO#N --match-head-commit SHA (the daemon merges it pinned, on green)",
+}
+
+
+def post_elsewhere(kind: str) -> str:
+    """The call that makes a GitHub write `post` does not queue, for the word typed in the kind's place."""
+    word = kind.strip().lower().replace("_", "-")
+    for words, hand in POST_ELSEWHERE.items():
+        if word in words:
+            return f"post queues comment, pr and review; this one is made in one call: {hand}"
+    return ""
 
 
 def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
@@ -26473,6 +26509,12 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
             return (f"wait takes one target, because its exit code is that target's verdict: "
                     f"`glaeda-gh status {words[1]} {' '.join(targets)}` reads them all in one gather, "
                     f"or run one wait each (`{one}`)")
+    # prog is "glaeda-gh post" when the post parser itself refuses the kind, and "glaeda-gh" when the top-level
+    # one does: the word typed, not the prog, says which command was meant.
+    if len(words) >= 2 and words[0] == "post" and prog in ("glaeda-gh", "glaeda-gh post"):
+        hand = post_elsewhere(words[1])
+        if hand:
+            return hand
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
         return f"glaeda-gh {words[0]} --help"
