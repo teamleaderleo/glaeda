@@ -35813,25 +35813,50 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
     def test_a_word_several_commands_take_is_refused_naming_every_one(self) -> None:
         """`comment` is a real three-way collision in this tree: a word of `status` (a read), of `wait` (a
         read that blocks) and of `post` (a write on a public thread). Guessing for the caller would guess
-        between reading and writing, so it refuses and names all three, each as a line that runs."""
-        for word in ("comment", "pr", "run"):
-            fixed, refusal = gg.nesting_synonym([word, "o/r#1"])
-            self.assertEqual(fixed, [word, "o/r#1"], "argv is never half-rewritten when it refuses")
+        between reading and writing, so it refuses and names all three, each as a line that runs.
+
+        The vectors carry evidence for a read *and* for the write (`--body` is `post`'s, `--timeout` is
+        `wait`'s), which is what leaves the write in the running: with neither kind of evidence the write
+        could only refuse and the word routes to the read instead (the two tests below)."""
+        for argv in (["comment", "o/r#1", "--body", "hi", "--timeout", "60"],
+                     ["pr", "o/r", "--title", "T", "--timeout", "60"]):
+            word = argv[0]
+            fixed, refusal = gg.nesting_synonym(list(argv))
+            self.assertEqual(fixed, argv, "argv is never half-rewritten when it refuses")
             self.assertGreater(len(refusal), 2, f"{word} has more than one real parent")
             parents = sorted(gg.nesting_table()[1][word])
             self.assertIn(f"`{word}` is a word of {len(parents)} commands", refusal[0])
             for parent in parents:
                 self.assertIn(f"{parent} {word}", refusal[0])
-                self.assertIn(f"next: glaeda-gh {parent} {word} o/r#1", refusal)
-        comment = gg.nesting_synonym(["comment", "manaflow-ai/cmux#1"])[1]
-        self.assertEqual(sorted(comment[1:]), ["next: glaeda-gh post comment manaflow-ai/cmux#1",
-                                               "next: glaeda-gh status comment manaflow-ai/cmux#1",
-                                               "next: glaeda-gh wait comment manaflow-ai/cmux#1"])
+                self.assertIn(f"next: {gg.typed_line(['glaeda-gh', parent, word] + argv[1:])}", refusal)
+
+    def test_a_word_whose_every_command_only_reads_is_routed_to_the_read_that_answers_at_once(self) -> None:
+        """`run` is a word of `status` and `wait` only, and `pr o/r#5` and a flagless `comment o/r#5` are no
+        `post` call at all (`post pr` takes OWNER/REPO and needs --head/--base/--title; `post comment` needs
+        a body), so each of these is a choice among reads, which is no read-or-write choice to protect.
+        Before 2026-11-22 all three refused with three lines to pick from, and the caller paid the refusal
+        plus the same call typed again under `status`."""
+        for argv, canonical in ((["run", "o/r/123"], ["status", "run", "o/r/123"]),
+                                (["run", "o/r/123", "--jobs"], ["status", "run", "o/r/123", "--jobs"]),
+                                (["pr", "o/r#5"], ["status", "pr", "o/r#5"]),
+                                (["comment", "o/r#5"], ["status", "comment", "o/r#5"])):
+            self.err.truncate(0), self.err.seek(0)
+            self.assertEqual(gg.nesting_synonym(list(argv)), (canonical, []), argv)
+            said = self.err.getvalue()
+            self.assertIn(f"read as `{gg.typed_line(['glaeda-gh'] + canonical)}`", said)
+            self.assertIn("every one of them only reads", said)
+            self.assertIn(f"`glaeda-gh wait {argv[0]}`", said, "the blocking sibling is named, not hidden")
+        # The narrowing is the parent's own contract, asserted directly so the reason survives a refactor.
+        self.assertFalse(gg.nesting_parent_fits("post", "pr", "o/r#5", set()))
+        self.assertTrue(gg.nesting_parent_fits("post", "pr", "o/r", {"title"}))
+        self.assertFalse(gg.nesting_parent_fits("post", "comment", "o/r#5", set()))
+        self.assertTrue(gg.nesting_parent_fits("post", "comment", "o/r#5", {"bodyfile"}))
+        self.assertTrue(gg.nesting_parent_fits("status", "pr", "o/r#5", set()), "a read is never dropped")
 
     def test_the_refusal_is_the_whole_call_and_nothing_runs(self) -> None:
         """The exit code a usage error already has, and no request queued: an ambiguous write must not post."""
         with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
-            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1"]), 64)
+            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1", "--body", "hi", "--timeout", "60"]), 64)
         self.assertIn("not a command of its own", self.err.getvalue())
 
     def test_the_callers_own_flags_narrow_an_ambiguous_word_to_one_command(self) -> None:
@@ -35844,10 +35869,12 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
                          (["post", "comment", "o/r#1", "--body-file", "-"], []))
         self.assertEqual(gg.nesting_synonym(["pr", "o/r", "--title", "t", "--head", "h"])[0][:2], ["post", "pr"])
         self.assertEqual(gg.nesting_synonym(["run", "o/r/12", "--jobs", "--timeout", "60"])[0][:2], ["wait", "run"])
-        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--json"])
-        self.assertEqual(fixed, ["comment", "o/r#1", "--json"])
-        self.assertTrue(refusal, "a flag every candidate has is no evidence: it still refuses")
-        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--nonsense"])
+        # `--json` is an option of all three, so it narrows nothing; what leaves one command standing is
+        # that `post comment` refuses without a body, and the two reads left route to the nearer read.
+        self.assertEqual(gg.nesting_synonym(["comment", "o/r#1", "--json"]),
+                         (["status", "comment", "o/r#1", "--json"], []))
+        fixed, refusal = gg.nesting_synonym(["comment", "o/r#1", "--body", "hi", "--nonsense"])
+        self.assertEqual(fixed, ["comment", "o/r#1", "--body", "hi", "--nonsense"])
         self.assertTrue(refusal, "a flag no candidate has does not get to pick the command either")
 
     def test_every_spelling_that_works_today_is_left_exactly_as_typed(self) -> None:
