@@ -8851,6 +8851,10 @@ class Daemon:
         daemon stored over the last READ_PROGRESS_WINDOW, so a slower GitHub narrows the window instead of leaving
         every waited PR older than STALE_DATA_AFTER; at least LAND_WATCH_FLOOR."""
         reads = sum(1 for t in self.read_done.get("pr", []) if self.now - t < READ_PROGRESS_WINDOW)
+        started = getattr(self, "started_tick", None)
+        up = None if started is None else self.now - started
+        if up is not None and 0 < up < READ_PROGRESS_WINDOW:  # a daemon just started has read for up s, not the window
+            reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
     def land_tick(self) -> None:
@@ -15611,8 +15615,16 @@ class LandQueue:
             self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
+        # Every worker's judgment holds its PR waited, so the pool is demand on the read loop too: no more workers
+        # than the reads it keeps fresh (read_room, LAND_WATCH_SHARE). cmux-cp-1, 2026-11-22: 175 workers, 262 waited
+        # PRs, 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old.
+        room = self.read_room()
+        if room is not None:
+            ceiling = max(1.0, min(ceiling, float(room)))
         if self.quota_refused > last:
             size, why = max(1.0, size / 2), "a quota refusal"
+        elif size > ceiling and room is not None and int(ceiling) == int(room):
+            size, why = ceiling, "more workers than the read loop keeps fresh"
         elif len(self.jobs) >= int(size) and self.pass_gated:
             size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
         else:

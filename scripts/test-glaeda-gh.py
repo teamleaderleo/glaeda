@@ -30724,6 +30724,34 @@ class LandTest(Base):
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
 
+    def test_the_pool_grows_no_wider_than_the_read_loop_keeps_fresh(self):
+        """cmux-cp-1, 2026-11-22 20:54Z, with the watch window capped: the pool at 175 workers, each judgment's PR
+        waited, held 262 waited PRs against 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old. The pool
+        grows no wider than the daemon's read room and steps down to it when the room shrinks; a quota refusal still halves."""
+        q, room = self.q, [6]
+        q.read_room = lambda: room[0]
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            q.now, q.pass_gated = 1000.0, 7
+            for _ in range(10):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+            self.assertEqual(q.workers(), 6)
+            room[0] = 3  # GitHub slowed: the pool steps down to the room
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 3)
+            room[0] = None  # no room known: the memory ceiling alone
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 4)
+        q.jobs.clear()
+        # a daemon up for less than the window counts its reads over its uptime
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.started_tick, d.read_done = NOW, NOW - 120, {"pr": [NOW - 30] * 60}
+        self.assertEqual(d.land_read_room(), int(60 * gg.READ_PROGRESS_WINDOW / 120 * gg.LAND_WATCH_SHARE))
+
     def test_a_restarted_queue_keeps_its_pool_size(self):
         """hq#18502: huge-blue re-execs its daemon every 10-30 min. 2026-11-22, land.json's "workers" removed at 12:28Z:
         the pool grew 16 -> 20 -> 25, a re-exec at 12:39Z put it back at 16 (land_worker_ceiling), under the fixed 32,
