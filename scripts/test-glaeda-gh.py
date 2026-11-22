@@ -32511,6 +32511,35 @@ class AppPoolTest(Base):
         self.assertEqual(self.pool.status()["graphqlPoints"], 7)
         self.assertEqual(self.pool.status()["graphqlSeen"]["remaining"], 100)
 
+    def test_another_threads_login_request_never_books_an_app_graphql_answer_as_login_spend(self) -> None:
+        # The source of graphql()'s request was one field on the daemon: a login request on another thread (the
+        # outbox, the content-pause ask, a land thread) between request()'s return and graphql()'s read made the
+        # App's answer login spend (gql_log, note_spend) and its rateLimit the login's budget. Leo, 2026-11-22: "this
+        # is clearly not measured properly".
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            answer = inner(method, url, headers, body)
+            if headers["Authorization"] == f"Bearer {APP_TOKEN}" and url.endswith("/graphql"):
+                other = threading.Thread(target=self.daemon.request, args=("GET", "/repos/o/r/pulls/1"))
+                other.start()
+                other.join()
+            return answer
+
+        self.daemon.transport = transport
+        self.app_answers.append((200, {"x-ratelimit-limit": "10000", "x-ratelimit-remaining": "100",
+                                       "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"data":{"rateLimit":{"limit":10000,"remaining":100,"resetAt":"2030-01-01T00:00:00Z","cost":7}}}'))
+        query = ("query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0)"
+                 "{number}}}")
+        doc, error = self.daemon.graphql(query, {"o0": "manaflow-ai", "r0": "cmux", "n0": 1})
+        self.assertIsNone(error)
+        self.assertEqual(len(self.gh.calls), 1, "the other thread's read went on the login")
+        self.assertEqual(self.daemon.gql_log, [], "the App's points are not the login's")
+        self.assertEqual(self.daemon.budget["graphql"]["remaining"], 4000, "nor its rateLimit the login's budget")
+        self.assertEqual(self.pool.status()["graphqlPoints"], 7)
+
     def test_head_and_follow_up_queries_go_on_the_app_and_the_route_never_reaches_github(self) -> None:
         # One day's hour on two hosts: every login GraphQL point was a head, a check page, a suite attempt or a step
         # query, none of which named its owner in variables, while the PR reads beside them went on the App.

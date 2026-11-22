@@ -5278,6 +5278,28 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
 
 
 class Daemon:
+    # Which credential this thread's last request() used, and its App pool: per thread, never one field on the daemon.
+    # graphql() reads them right after its request() returns, while the outbox, the content-pause ask and the land
+    # threads send their own requests on the same daemon (request's in_call comment: huge-blue 2026-11-22). A shared
+    # field let another thread's login request flip "app" to "login" in between, so an App's GraphQL answer was booked
+    # as login spend (gql_log, note_spend "graphql", spend.json's daemon:glaeda-gh) and its rateLimit as the login's
+    # budget. Leo, 2026-11-22: "this is clearly not measured properly".
+    @property
+    def last_request_source(self) -> str:
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "source", "login")
+
+    @last_request_source.setter
+    def last_request_source(self, value: str) -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).source = value
+
+    @property
+    def last_app_pool(self) -> "AppPool | None":
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "pool", None)
+
+    @last_app_pool.setter
+    def last_app_pool(self, value: "AppPool | None") -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).pool = value
+
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         # The clock comes first: the pool built below reads it (restore_bench), and a clock set afterwards
