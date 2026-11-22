@@ -11589,7 +11589,13 @@ LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/
 # while the 1-minute load per core is under LAND_LOAD_LINE (land_load_room). One judgment always runs. land.json
 # "workers" stays an operator's override of the ceiling. The 4 this replaced was set by hand; gcp-agent-lane-1,
 # 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
-LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
+# Past LAND_MEASURE_BUSY busy judgments the ceiling comes from what those judgments measurably cost (the host's load
+# over their count), not from LAND_CORES_EACH: a judgment waits on GitHub far longer than it computes.
+# gcp-agent-lane-2, 2026-11-22 05:10Z: 10 busy at load 0.33/core of 32 cores (about 1 core each, not 2), then
+# "every worker busy (busy 16 of 16, load 0.32/core)" with 46 rows due late, two thirds of the host idle. The ceiling
+# never passes one worker per core (the pool's own threads), and load_room still gates every start past the first.
+LAND_CORES_EACH = 2  # the cost of a judgment before any runs: one python land_judge plus its gh children
+LAND_MEASURE_BUSY = 4  # busy judgments needed before their measured cost replaces LAND_CORES_EACH
 LAND_LOAD_LINE = 0.8  # the handbook's 80% headroom line
 
 
@@ -11600,9 +11606,18 @@ def land_cores() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def land_worker_ceiling(cores: int | None = None) -> int:
-    """One land worker per LAND_CORES_EACH cores, at least 1."""
-    return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
+def land_worker_ceiling(cores: int | None = None, busy: int | None = None, load: float | None = None) -> int:
+    """One land worker per LAND_CORES_EACH cores, and more once BUSY judgments (at least LAND_MEASURE_BUSY, with LOAD
+    the host's 1-minute load per core) measure a judgment costing less than that: the ceiling is then one worker per
+    measured core each, never more than one per core and never under the LAND_CORES_EACH floor. At least 1."""
+    cores = land_cores() if cores is None else max(1, int(cores))
+    floor = max(1, cores // LAND_CORES_EACH)
+    if busy is None or int(busy) < LAND_MEASURE_BUSY or load is None:
+        return floor
+    each = (float(load) * cores) / int(busy)  # total load over the judgments carrying it: measured cores per judgment
+    if each <= 0:
+        return cores
+    return max(floor, min(cores, int(cores // each)))
 
 
 def land_load_per_core(cores: int | None = None) -> float | None:
@@ -13953,8 +13968,10 @@ class LandQueue:
 
     def workers(self) -> int:
         """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
-        this host's cores (land_worker_ceiling), read at each call. Past the first busy worker, load_room decides."""
-        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
+        this host's cores and what its busy judgments measurably cost (land_worker_ceiling), read at each call. Past
+        the first busy worker, load_room decides."""
+        ceiling = land_worker_ceiling(busy=len(self.jobs), load=land_load_per_core())
+        return int(land_seconds(self.config().get("workers"), ceiling, 1, 1024))
 
     def merge_ready(self, e: dict) -> bool:
         """Whether E is one merge away: judged ok at the head the cache shows with its merge step next (judge_tier 0),
@@ -16566,7 +16583,7 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     load = land_load_per_core()
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
-    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+    ceiling = int(land_seconds(given, land_worker_ceiling(busy=len(running), load=load), 1, 1024))
     return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")

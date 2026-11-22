@@ -28694,6 +28694,34 @@ class LandTest(Base):
         with mock.patch.object(gg, "land_cores", return_value=32):
             self.assertEqual(self.q.workers(), 3)
 
+    def test_busy_judgments_that_cost_less_than_a_core_each_raise_the_ceiling(self):
+        """gcp-agent-lane-2, 2026-11-22 05:10Z: 10 judgments busy at load 0.33/core of 32 cores (about 1 core each,
+        not the LAND_CORES_EACH 2), then "every worker busy (busy 16 of 16, load 0.32/core)" with 46 rows due late
+        and two thirds of the host idle: a judgment waits on GitHub far longer than it computes. Past
+        LAND_MEASURE_BUSY busy judgments the ceiling is one worker per measured core each, never over one per core,
+        never under the LAND_CORES_EACH floor."""
+        for cores, busy, load, want in (
+            (32, 10, 0.33, 30),  # the measurement above: about 1.06 cores each
+            (32, 16, 0.32, 32),  # 0.64 each: capped at one worker per core (the pool's threads)
+            (32, 8, 0.60, 16),   # 2.4 each, costlier than the floor assumes: the floor holds
+            (32, 3, 0.10, 16),   # too few busy to measure anything: the floor
+            (32, 10, None, 16),  # a host that does not say its load: the floor
+            (32, None, 0.33, 16),  # nothing busy to measure
+            (2, 8, 0.10, 2),     # a small host: still never more workers than cores
+        ):
+            self.assertEqual(gg.land_worker_ceiling(cores=cores, busy=busy, load=load), want, (cores, busy, load))
+
+    def test_the_pool_reads_that_measured_ceiling_and_an_override_still_wins(self):
+        for i in range(10):
+            self.q.jobs[f"pr:o/r#{i}"] = None
+        with mock.patch.object(gg, "land_cores", return_value=32), \
+                mock.patch.object(gg, "land_load_per_core", return_value=0.33):
+            self.assertEqual(self.q.workers(), 30)
+            self.w.config["workers"] = 6
+            self.assertEqual(self.q.workers(), 6)  # land.json stays the operator's override
+        del self.w.config["workers"]
+        self.q.jobs.clear()
+
     def test_past_the_load_line_only_the_first_judgment_starts(self):
         """Admission on the measured load (hand-set-concurrency-number.md): with no worker busy one judgment always
         starts; past it, a worker is taken only while the 1-minute load per core is under LAND_LOAD_LINE."""
