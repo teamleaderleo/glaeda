@@ -26590,6 +26590,72 @@ class LandTest(Base):
         self.assertIn(LB, doc["next"])
         self.assertIn("land_pin_invented", gg.LAND_REQUEST_REFUSED)
 
+    def test_the_moved_pin_refusal_shows_the_hex_at_which_the_two_shas_differ(self):
+        """Every sha in this script is abbreviated to 12 hex, which is a name. In the one message whose whole subject
+        is that the head is not the pin, a name is not enough: 2026-11-22 on this host, landing
+        teamleaderleo/glaeda#2558 pinned to its own head with a typed tail, the queue printed "the head is
+        f40f866c791c, not the --sha f40f866c791c it was queued for" -- two identical strings, so the reader could
+        not see which sha to pin, and the row's own next step was the only usable part of it. The clause now widens
+        to the first hex at which they differ."""
+        head, pin = "f40f866c791cf6faad60726b7a48c27236a640fc", "f40f866c791c1e5e2d4ba3dad6a8f5b09ae3b8f6"
+        said = gg.land_moved_clause(head, pin)
+        self.assertEqual(said, f"the head is {head[:13]}, not the --sha {pin[:13]} it was queued for")
+        self.assertNotEqual(head[:13], pin[:13], "the two shas the clause names differ in the text it prints")
+        # 12 hex when 12 already differ (every other pair): the width is a floor, not a change of habit.
+        self.assertEqual(gg.land_moved_clause(LB, LA), f"the head is {LB[:12]}, not the --sha {LA[:12]} it was "
+                                                       "queued for")
+        # A pin shorter than the head reads the same, and never past the whole sha of either.
+        self.assertEqual(gg.land_moved_clause(head, pin[:13]), gg.land_moved_clause(head, pin))
+        self.assertIn(head, gg.land_moved_clause(head, head[:39] + "0"))
+        # NOTE rides the head, for the hand-off refusal, which read it somewhere the others did not.
+        self.assertEqual(gg.land_moved_clause(LB, LA, " (the broker read it from GitHub)"),
+                         f"the head is {LB[:12]} (the broker read it from GitHub), not the --sha {LA[:12]} it was "
+                         "queued for")
+
+    def test_a_hand_written_pin_is_judged_against_the_callers_own_checkout_when_the_cache_has_none(self):
+        """The invented-pin check judges a pin against this host's cached head, and a PR opened minutes ago has no
+        cached read: teamleaderleo/glaeda#2558's request was judged `why=no_data` and accepted, and the row took a
+        tick and ~95 s to stop head_moved. That is exactly when a pin is written out by hand -- right after the push
+        that opened the PR. The checkout the caller ran in holds that head already, for one local git call.
+
+        Only this check may take it. The ancestor check may not: a checkout routinely holds commits the PR's head
+        does not have yet, so a pin that is an ancestor of this head is the ordinary case."""
+        head = "f40f866c791cf6faad60726b7a48c27236a640fc"
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"):
+            self.assertEqual(gg.land_pin_local_head("o/r", lambda rest: head.upper()), head)
+            self.assertEqual(gg.land_pin_local_head("O/R", lambda rest: head), head, "the repo matches by case")
+            self.assertEqual(gg.land_pin_local_head("o/other", lambda rest: head), "", "another repo's checkout")
+            self.assertEqual(gg.land_pin_local_head("o/r", lambda rest: "nope"), "", "not a sha")
+            self.assertEqual(gg.land_pin_local_head("o/r", lambda rest: None), "", "git could not answer")
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: ""):
+            self.assertEqual(gg.land_pin_local_head("o/r", lambda rest: head), "", "not a checkout at all")
+        # The refusal names where the head came from, because it is not the cache this time.
+        said = gg.land_pin_extends_head_refusal("o/r", 1, head[:12] + "1e5e2d4ba3dad6a8f5b09ae3b8f6", head,
+                                                "the HEAD of this checkout of o/r")
+        self.assertIsNotNone(said)
+        self.assertIn(f"The whole head, the HEAD of this checkout of o/r, is {head}", said[0])
+        self.assertEqual(said[1], f"glaeda-gh land o/r#1 --match-head-commit {head}")
+
+    def test_land_takes_the_checkouts_head_for_an_unread_pr_and_refuses_the_typed_pin(self):
+        """End to end, the case measured: no cached read of the PR, a pin that is the checkout's own head with a
+        typed tail. Nothing is queued and nothing is read from GitHub."""
+        head = "f40f866c791cf6faad60726b7a48c27236a640fc"
+        invented = head[:12] + "1e5e2d4ba3dad6a8f5b09ae3b8f6"
+        self.pr(head)  # GitHub would say this head, but no read of it was ever cached
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "run_bounded", side_effect=lambda argv, *a, **k:
+                                  gg.subprocess.CompletedProcess(argv, 0, head, "")), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, invented)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"]), (gg.EXIT_FAIL, False, "land_pin_invented"))
+        self.assertIn(f"this checkout of o/r, is {head}", doc["reason"])
+        self.assertEqual(doc["next"], f"glaeda-gh land o/r#1 --match-head-commit {head}")
+
     def test_land_refuses_a_pin_behind_the_head_and_names_the_head_to_pin(self):
         """The request answers it: nothing is queued, nothing is read from GitHub, and the step is the same command
         with the head the cache holds."""
