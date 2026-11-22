@@ -1704,7 +1704,11 @@ guest repository's job never takes a canonical root or the persistent-DerivedDat
 id. It costs 4 units (isolated), or 2 units when its id ends in `-light`, or 1 unit plus the one
 simulator token when its id ends in `-sim` or `simulator`. A repository the hook cannot identify is a
 guest. cmux jobs wait for room with no time limit (its rescue workflow moves one that waits too long); a
-guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Guests share
+guest has no rescue, so it waits up to `--guest-wait` (600 s) for room before it is refused. Time a fleet
+build holds `host.lock` does not count (`GUEST_HOST_WAIT`): GitHub never moves a handed job, so refusing
+it for the build only failed it red (cmuxterm-hq's scheduled next-dogfood, run 44505512009, refused on
+cmux19 after 600 s on 2026-11-19). The guest waits for the build to end, up to `--guest-host-wait`
+(3600 s) in all, so a stranded lock still refuses it. Guests share
 the runner user's `$HOME` and `/Users/Shared/cmux-build-fleet`, so the trust boundary is anyone who
 can push a branch to any repository in the group (outside collaborators and bots such as Dependabot
 included), and these hosts hold no secrets.
