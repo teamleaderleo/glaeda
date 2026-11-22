@@ -32,6 +32,13 @@ class IdleRepairTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_systemd_unit_counts_a_queued_run_as_success(self) -> None:
+        # A queued run (busy host, or another run holds the lock) is the queue working; the unit must not show as
+        # failed for it, or a failed-units detector pages for every busy minute (2026-11-22).
+        unit = (ROOT / "ops/systemd/glaeda-idle-repair.service").read_text()
+        statuses = [line.split("=", 1)[1].split() for line in unit.splitlines() if line.startswith("SuccessExitStatus=")]
+        self.assertIn(str(idle.QUEUED_EXIT), [code for line in statuses for code in line])
+
     def test_busy_host_is_queued_without_running_repairs(self) -> None:
         disk = mock.Mock()
         disk.host_busy.return_value = "a build is running"
