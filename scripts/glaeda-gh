@@ -3237,6 +3237,7 @@ class AppPool:
         self.owners_fn = owners or self.owners_from_config
         self.ready_fn = ready or self.held_here
         self.owners_at: tuple[frozenset[str], float] = (frozenset(), float("-inf"))  # (owners, read again after)
+        self.ready_at: tuple[bool, float] = (False, float("-inf"))  # passed_over's (ready_fn(), read again after)
         self.tokens: dict[str, tuple[str, float]] = {}  # owner (lowercase) -> (token, use until)
         self.unreadable: dict[str, float] = {}  # installation/repository/resource scope -> on the login until then
         self.rest_until: dict[str, float] = {}  # owner (lowercase) -> not asked again before this
@@ -3256,7 +3257,9 @@ class AppPool:
     def pick(self, owner: str, scope: str, body: dict | None = None) -> "AppPool | None":
         """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE, nor
         any node a GraphQL BODY asks (bench_nodes)."""
-        any_node = body is not None and any(k.startswith("node:") for p in [self, *self.spares] for k in p.unreadable)
+        now = self.clock()
+        any_node = body is not None and any(k.startswith("node:") and until > now
+                                            for p in [self, *self.spares] for k, until in p.unreadable.items())
         nodes = list(graphql_body_nodes(body).values()) if any_node else []  # (no node benched: no parse per read)
         for pool in [self, *self.spares]:
             if pool.covers(scope) and not pool.nodes_benched(nodes) and pool.token(owner):
@@ -3274,8 +3277,12 @@ class AppPool:
 
     def bench_nodes(self, nodes: "list[str]", until: float) -> None:
         """Keep NODES on the login until UNTIL in every pool of the chain: another organization's IP allow list
-        refuses this host's address (foreign_ip_refusal), whichever App asks."""
+        refuses this host's address (foreign_ip_refusal), whichever App asks. A node bench whose time has passed is
+        dropped here, so the benches a day of refusals leaves never grow without bound."""
+        now = self.clock()
         for pool in [self, *self.spares]:
+            for key in [k for k, at in pool.unreadable.items() if k.startswith("node:") and at <= now]:
+                del pool.unreadable[key]
             for node in nodes:
                 pool.unreadable[f"node:{node}"] = until
             pool.save_bench()
@@ -3354,7 +3361,11 @@ class AppPool:
             return None, "graphql-many-owners" if owners else "graphql-no-owner"
         now = self.clock()
         if self.owners_at[1] <= now:  # the config is read once per APP_POOL_TTL, not per request
-            self.owners_at = (frozenset(self.owners_fn()), now + APP_POOL_TTL)
+            # every role of the chain's owners, not the first role's alone: a host holding only pushed tokens, none
+            # of them the first role's for this owner, would otherwise send all of the owner's reads to the login
+            # ("owner-without-app") while a later role of the chain holds its token. pick() then finds that role.
+            self.owners_at = (frozenset().union(*(pool.owners_fn() for pool in [self, *self.spares])),
+                              now + APP_POOL_TTL)
         owner = next(iter(owners))
         return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
 
@@ -3368,7 +3379,7 @@ class AppPool:
         for pool in [self, *self.spares]:
             if not pool.covers(scope):
                 each[pool.role] = "route-benched"
-            elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_fn():
+            elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_cached():
                 each[pool.role] = "no-token"
             else:
                 each[pool.role] = "pool-resting"
@@ -3376,6 +3387,14 @@ class AppPool:
         if not held:
             return "no-token", each
         return ("pool-resting" if "pool-resting" in held else "route-benched"), each
+
+    def ready_cached(self) -> bool:
+        """ready_fn() (held_here: directory scans and token file reads) once per APP_POOL_TTL, for passed_over,
+        which asks it of every role on each read that goes on the login; token() refreshes it whenever it asks."""
+        now = self.clock()
+        if self.ready_at[1] <= now:
+            self.ready_at = (bool(self.ready_fn()), now + APP_POOL_TTL)
+        return self.ready_at[0]
 
     def token(self, owner: str) -> str | None:
         """OWNER's installation token, or None: the read then goes on the login, as it always did."""
@@ -3386,7 +3405,9 @@ class AppPool:
         if held and held[1] > now:
             return held[0]
         self.tokens.pop(owner, None)
-        if not self.ready_fn():
+        ready = bool(self.ready_fn())
+        self.ready_at = (ready, now + APP_POOL_TTL)  # what passed_over says next is this read's, not an older one
+        if not ready:
             self.why = f"no {self.role} App on this host"
             self.rest_until[owner] = now + APP_POOL_REST
             return None
@@ -6603,11 +6624,12 @@ class Daemon:
     # -- requests
 
     def note_login_fallback(self, method: str, path: str, body: dict | None, free: bool, owner: str | None,
-                            scope: str, refused: bool) -> None:
+                            scope: str, refused: bool, content: bool = False) -> None:
         """One "login-fallback" line for a read about to go on the shared login: its kind, route or scope and cause
         (never a token). Before it, the log could not say why a read spent the login: spend.json counts the login's
         requests by route, and app-pool-refused names only an App's refusal, not a read no App was asked for.
-        Causes: rate-limit-read (/rate_limit reads the login's own budget), outbox (a queued write's lookups),
+        Causes: rate-limit-read (/rate_limit reads the login's own budget), outbox (a queued write's lookups, and any
+        content=True read, which skips the pool by design),
         no-app-pool, refused (the last App of the chain refused it just now), AppPool.owner_why's (write is never
         logged: a write is the login's by design) and AppPool.passed_over's. A write logs nothing."""
         query = str(body.get("query") or "") if isinstance(body, dict) else ""
@@ -6616,7 +6638,7 @@ class Daemon:
         pool, pools = self.app_pool, None
         if free:
             cause = "rate-limit-read"
-        elif self.writing:
+        elif self.writing or content:
             cause = "outbox"
         elif pool is None:
             cause = "no-app-pool"
@@ -6729,7 +6751,7 @@ class Daemon:
         if not self.secondary_admit(bucket, 1):
             # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
             raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
-        self.note_login_fallback(method, path, body, free, owner, scope, refused=bool(app_token))
+        self.note_login_fallback(method, path, body, free, owner, scope, refused=bool(app_token), content=content)
         if self.token is None:
             self.token = self.token_source()
         headers = self.read_headers(self.token, etag, raw_body is not None)
