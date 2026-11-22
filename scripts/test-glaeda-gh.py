@@ -31065,6 +31065,39 @@ class AppPoolTest(Base):
         self.assertEqual(self.pool.status()["graphqlPoints"], 7)
         self.assertEqual(self.pool.status()["graphqlSeen"]["remaining"], 100)
 
+    def test_head_and_follow_up_queries_go_on_the_app_and_the_route_never_reaches_github(self) -> None:
+        # One day's hour on two hosts: every login GraphQL point was a head, a check page, a suite attempt or a step
+        # query, none of which named its owner in variables, while the PR reads beside them went on the App.
+        bodies: list[dict] = []
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            bodies.append(json.loads(body))
+            return inner(method, url, headers, body)
+
+        self.daemon.transport = transport
+        sha = "a" * 40
+        self.daemon.graphql(gg.heads_query([f"head:manaflow-ai/cmux@{sha}"]), {})
+        self.daemon.graphql("query{" + gg.head_query("manaflow-ai", "cmux", sha, "c1", 5) + "}", {})
+        self.daemon.graphql(gg.SUITE_RUNS, {"suites": ["S1"]}, ["manaflow-ai/cmux"])
+        self.daemon.graphql(gg.STEPS_QUERY, {"ids": ["J1"]}, ["manaflow-ai/cmux", "manaflow-ai/cmux"])
+        self.assertEqual(len(self.app_calls), 4)
+        self.assertEqual(self.gh.calls, [])
+        self.assertTrue(all(gg.APP_POOL_ROUTE_FIELD not in b for b in bodies), "the route is the pool's, not GitHub's")
+        self.assertEqual(self.daemon.gql_log, [], "nothing spent on the login")
+        # a query by node id with no route, or one routed across owners, stays on the login
+        self.daemon.graphql(gg.SUITE_RUNS, {"suites": ["S1"]})
+        self.daemon.graphql(gg.SUITE_RUNS, {"suites": ["S1"]}, ["manaflow-ai/cmux", "other/r"])
+        self.assertEqual(len(self.app_calls), 4)
+        self.assertEqual(len(self.gh.calls), 2)
+        self.assertTrue(all(gg.APP_POOL_ROUTE_FIELD not in b for b in bodies))
+
+    def test_a_head_batch_is_app_eligible_over_graphql(self) -> None:
+        heads = [{"key": f"head:manaflow-ai/cmux@{c * 40}"} for c in "ab"]
+        self.assertEqual(self.daemon.app_entries_eligible("head", heads, "graphql"), heads)
+        self.assertTrue(self.daemon.app_answers("query{" + gg.head_query("manaflow-ai", "cmux", "a" * 40, "c", 1) + "}", {}))
+        self.assertFalse(self.daemon.app_answers(gg.SUITE_RUNS, {"suites": ["S1"]}))
+
     def test_a_spent_app_pool_asks_the_spare_app_before_the_login(self) -> None:
         spare_token = "ghs_" + "s" * 36
         spare = gg.AppPool(role="quota-goblin", mint=lambda owner: spare_token, owners=lambda: ["manaflow-ai"],

@@ -2973,6 +2973,30 @@ APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (b
 APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
 APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
 APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
+# The follow-up queries of a read name their repository another way: a head and its check pages in the query text
+# (head_query's repository(owner:"X",name:"Y")), and a suite's or a check run's nodes(ids:) not at all, so the daemon
+# names the repositories it asked about in the body's APP_POOL_ROUTE_FIELD ("OWNER/REPO", ...), which request() strips
+# before sending. Without either, every one of them went on the login: one day's hour on two hosts, the login's
+# GraphQL points were all heads (head, head-pages), PR check pages (pr-pages), suite attempts (last-real-attempt) and
+# steps, about 670 and 825 an hour, while the PR and run reads beside them went on the App and the login sat at its
+# reserve with both role Apps over 90% unspent.
+APP_POOL_GRAPHQL_LITERAL = re.compile(r'repository\(owner:"([A-Za-z0-9][A-Za-z0-9-]{0,38})",name:"([A-Za-z0-9._-]+)"\)')
+APP_POOL_ROUTE_FIELD = "route"
+APP_POOL_ROUTE_REPO = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)$")
+
+
+def graphql_named_repos(body: dict | None) -> list[tuple[str, str]]:
+    """The (owner, repo) pairs a GraphQL body names outside its variables: head_query's literal repositories, and the
+    daemon's APP_POOL_ROUTE_FIELD for a query by node id. Lowercase."""
+    if not isinstance(body, dict):
+        return []
+    pairs = [(o.lower(), r.lower()) for o, r in APP_POOL_GRAPHQL_LITERAL.findall(str(body.get("query") or ""))]
+    route = body.get(APP_POOL_ROUTE_FIELD)
+    for item in route if isinstance(route, list) else []:
+        m = APP_POOL_ROUTE_REPO.match(item) if isinstance(item, str) else None
+        if m:
+            pairs.append((m.group(1).lower(), m.group(2).lower()))
+    return pairs
 
 
 # A GraphQL NOT_FOUND for a pull request or issue number that does not exist is GitHub's answer for that alias, the same
@@ -3145,9 +3169,9 @@ class AppPool:
     def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
         """The sole repository owner a read may go to the pool for, else None.
 
-        GraphQL is routed only when its variables name one owner (the daemon's aliased PR/run queries). An opaque
-        query or one spanning owners stays on the login, so an App token can never change viewer or cross-owner
-        semantics.
+        GraphQL is routed only when it names one owner: in its variables (the daemon's aliased PR/run queries), in
+        head_query's literal repositories, or in the daemon's route field (graphql_named_repos). An opaque query or
+        one spanning owners stays on the login, so an App token can never change viewer or cross-owner semantics.
         """
         owners: set[str] = set()
         if method == "GET":
@@ -3166,6 +3190,7 @@ class AppPool:
                         match = APP_POOL_GRAPHQL_URL.match(value)
                         if match:
                             owners.add(match.group(1).lower())
+            owners.update(o for o, _ in graphql_named_repos(body))
         if len(owners) != 1:
             return None
         now = self.clock()
@@ -3210,6 +3235,7 @@ class AppPool:
                     match = APP_POOL_GRAPHQL_URL.match(value)
                     if match:
                         repos.add(match.group(2).lower())
+            repos.update(r for _, r in graphql_named_repos(body))
             return "graphql:" + owner + (":" + ",".join(sorted(repos)) if repos else "")
         bare = path.split("?", 1)[0]
         for pattern, family in APP_POOL_BRANCH_ROUTES:
@@ -4706,6 +4732,29 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
     suites = "" if cursor else " " + SUITE_ATTEMPTS
     return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
             + contexts + suites + "}}}")
+
+
+def heads_query(keys: list[str]) -> str:
+    """One aliased query for every head in KEYS (h0, h1, ...), with each one's CHECKS_OF_RECORD commit (m0, ...), plus
+    the rate limit. Its repositories are literal (head_query), which is how AppPool.owner_of finds their owner."""
+    parts = []
+    for i, key in enumerate(keys):
+        _, owner, repo, sha = split_key(key)
+        parts.append(f"h{i}: " + head_query(owner, repo, sha))
+        if (owner, repo) in CHECKS_OF_RECORD:
+            parts.append(f"m{i}: " + head_query(*CHECKS_OF_RECORD[(owner, repo)], sha))
+    return "query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}"
+
+
+def heads_repos(keys: list[str]) -> list[str]:
+    """The repositories ("OWNER/REPO") heads_query(KEYS) reads: each head's, and its CHECKS_OF_RECORD one."""
+    out = []
+    for key in keys:
+        _, owner, repo, _ = split_key(key)
+        out.append(f"{owner}/{repo}")
+        if (owner, repo) in CHECKS_OF_RECORD:
+            out.append("/".join(CHECKS_OF_RECORD[(owner, repo)]))
+    return out
 
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
@@ -6340,7 +6389,9 @@ class Daemon:
         if not content and not free:
             self.post_due()  # a read phase never holds a queued write past its spacing
             self.feed_due()  # nor lets the feed view it keeps for downstream hosts age out (feed_between_reads)
-        raw_body = json.dumps(body).encode() if body is not None else None
+        # the route field names the repositories for the App pool only (graphql_named_repos); GitHub never sees it
+        sent = {k: v for k, v in body.items() if k != APP_POOL_ROUTE_FIELD} if isinstance(body, dict) else body
+        raw_body = json.dumps(sent).encode() if sent is not None else None
         pool = self.app_pool
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
                  and not self.writing else None)
@@ -8884,6 +8935,8 @@ class Daemon:
             query, variables = run_query([e["key"] for e in entries])
         elif kind in ("pr", "comment"):
             query, variables = pr_query([e["key"] for e in entries], kind)
+        elif kind == "head":
+            query, variables = heads_query([e["key"] for e in entries]), {}
         else:
             return None
         return "POST", "/graphql", {"query": query, "variables": variables}
@@ -9288,11 +9341,15 @@ class Daemon:
         """Whether GraphQL is out (note_gql_health): its reads go to REST this tick."""
         return self.gql_down_until > self.clock()
 
-    def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
-        """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
+    def graphql(self, query: str, variables: dict, route: "list[str] | None" = None) -> tuple[dict | None, str | None]:
+        """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it. ROUTE names
+        the repositories ("OWNER/REPO") a query by node id reads, so one owner's App can answer it (graphql_named_repos)."""
         began = time.monotonic()
+        body: dict[str, Any] = {"query": query, "variables": variables}
+        if route:
+            body[APP_POOL_ROUTE_FIELD] = sorted(set(route))
         try:
-            status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
+            status, _, doc = self.request("POST", "/graphql", body)
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
             message = f"graphql: {describe(error)}"
             self.note_gql_health(message)
@@ -9364,7 +9421,8 @@ class Daemon:
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
         suite_runs, suites_error = self.suite_runs(
-            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
+            route=["/".join(split_key(e["key"])[1:3]) for e in entries])
         wanted = self.rollup_wanted() if kind == "pr" else frozenset()
         captured: dict[int, dict] = {}  # PR alias -> its rollup snapshot (capture_rollup), for a land PR
         for i, e in enumerate(entries):
@@ -9466,6 +9524,18 @@ class Daemon:
         pace = self.policy.get("graphqlPerMinute", GRAPHQL_PER_MINUTE)
         return spent < pace and (spent == 0 or spent + max(1, cost) <= pace)
 
+    def app_answers(self, query: str, variables: dict, route: "list[str] | None" = None) -> bool:
+        """Whether this GraphQL query would go on an App pool, not the login: the login's pace and hourly shares
+        (gql_room, pr_pages_points) never hold it, as batched() never holds a chunk the App answers."""
+        pool = self.app_pool
+        if pool is None:
+            return False
+        body: dict[str, Any] = {"query": query, "variables": variables}
+        if route:
+            body[APP_POOL_ROUTE_FIELD] = sorted(set(route))
+        owner = pool.owner_of("POST", "/graphql", body)
+        return owner is not None and pool.pick(owner, pool.scope(owner, "POST", "/graphql", body)) is not None
+
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
         now = self.clock()
@@ -9536,15 +9606,17 @@ class Daemon:
         for _ in range(PR_CONTEXT_MAX_PAGES - 1):
             if not cursor:
                 return "graphql: PR check page has no cursor"
-            if self.pr_pages_points() >= PR_PAGES_POINTS_PER_HOUR:
+            query = "query{" + head_query(owner, repo, sha, cursor, number) + "}"
+            on_app = self.app_answers(query, {})  # the login's hourly share and pace are the login's alone
+            if not on_app and self.pr_pages_points() >= PR_PAGES_POINTS_PER_HOUR:
                 # Over its hourly share: a required context may sit past this page, so the PR reads pending
                 # (checksPageError), never green on a partial rollup, until the rolling hour frees room.
                 return "graphql: PR check pages over their hourly share"
-            if not self.gql_room():
+            if not on_app and not self.gql_room():
                 return "graphql: PR check pages wait for the per-minute ceiling"
             reason, self.gql_reason = self.gql_reason, "pr-pages"
             try:
-                more, error = self.graphql("query{" + head_query(owner, repo, sha, cursor, number) + "}", {})
+                more, error = self.graphql(query, {})
             finally:
                 self.gql_reason = reason
             if more is None:
@@ -9787,14 +9859,8 @@ class Daemon:
     def fetch_heads(self, entries: list[dict]) -> str | None:
         """Every check on each head commit, one aliased query for the batch (a head with more than 100
         contexts is followed page by page). None, or the error when the whole query failed."""
-        parts = []
-        for i, e in enumerate(entries):
-            _, owner, repo, sha = split_key(e["key"])
-            parts.append(f"h{i}: " + head_query(owner, repo, sha))
-            if (owner, repo) in CHECKS_OF_RECORD:
-                parts.append(f"m{i}: " + head_query(*CHECKS_OF_RECORD[(owner, repo)], sha))
         self.reads += [(self.now, "head", "graphql")] * len(entries)
-        doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {})
+        doc, error = self.graphql(heads_query([e["key"] for e in entries]), {})
         if doc is None:
             self.fail(entries, error or "graphql: no response")
             for e in entries:
@@ -9811,7 +9877,8 @@ class Daemon:
         attempts = {alias: ran_nothing_suites((data.get(alias) or {}).get("object"))
                     for i in range(len(entries)) for alias in (f"h{i}", f"m{i}")}
         suite_runs, suites_error = self.suite_runs(
-            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
+            route=heads_repos([e["key"] for e in entries]))
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             node = ((data.get(f"h{i}") or {}).get("object") or {}).get("statusCheckRollup")
@@ -9871,7 +9938,8 @@ class Daemon:
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
 
-    def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict] | str], str | None]:
+    def suite_runs(self, suites: list[str], paced: bool = True,
+                   route: "list[str] | None" = None) -> tuple[dict[str, list[dict] | str], str | None]:
         """Suite id -> its check-run context nodes over every attempt (statusCheckRollup's shape, marked
         lastRealAttempt), or the error that suite alone could not be read with (held by the pace, no response, a
         nested error), SUITE_RUNS_BATCH suites per query. The second value is always None, kept for the callers.
@@ -9888,13 +9956,13 @@ class Daemon:
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start in range(0, len(suites), SUITE_RUNS_BATCH):
             chunk = suites[start:start + SUITE_RUNS_BATCH]
-            if paced and not self.gql_room():
+            if paced and not self.app_answers(SUITE_RUNS, {"suites": chunk}, route) and not self.gql_room():
                 for suite_id in suites[start:]:
                     out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
                 break
             reason, self.gql_reason = self.gql_reason, "last-real-attempt"
             try:
-                doc, error = self.graphql(SUITE_RUNS, {"suites": chunk})
+                doc, error = self.graphql(SUITE_RUNS, {"suites": chunk}, route)
             finally:
                 self.gql_reason = reason
             if doc is None:
@@ -9963,10 +10031,11 @@ class Daemon:
         for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
             fold_contexts(nodes, runs, statuses, ids, prefix, order, failed)
         data = head_data(sha, runs, statuses, ids, order)
-        self.head_steps(data, failed)
+        self.head_steps(data, failed, route=[f"{owner}/{repo}" for owner, repo, _ in sources])
         return data
 
-    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None) -> None:
+    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None,
+                   route: "list[str] | None" = None) -> None:
         """Store the step count of each failed check run of a head's `data` (attach_steps), so a reader of the store
         judges a red as a live read does (a failed job that ran no step is the runner's refusal, not a red). A
         completed job never changes: each is read once (self.job_steps), in GraphQL by node id (STEPS_QUERY) or, with
@@ -9983,7 +10052,7 @@ class Daemon:
                 chunk = {failed[i]: i for i in want[n:n + STEPS_BATCH]}
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
-                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)})
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)}, route)
                 except OutOfTime:
                     break
                 finally:
@@ -10030,7 +10099,9 @@ class Daemon:
             try:
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
-                    doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]})
+                    # the repositories of the PRs that show these checks: one owner's App answers it (owner_of)
+                    route = sorted({"/".join(split_key(k)[1:3]) for c in ids[i:i + STEPS_BATCH] for k in owners[c]})
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]}, route)
                 finally:
                     self.gql_reason = reason
             except OutOfTime:  # the checks go without their steps; their PRs go first next tick
