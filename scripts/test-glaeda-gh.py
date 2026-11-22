@@ -28509,6 +28509,37 @@ class LandTest(Base):
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
 
+    def test_a_worker_that_frees_between_passes_takes_the_oldest_waiting_row_without_a_pass(self):
+        """huge-blue, 2026-11-22 11:31Z: the pass runs once per daemon tick, 90-100 s apart under a long queue, and
+        workers that freed 30 s into it sat idle until the next one while 864 rows were due. refill hands a freed
+        worker the next row the last pass left waiting for one, oldest due first, with no pass of its own."""
+        self.w.config["workers"] = 1
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        self.stuck(11, 2 * 3600)
+        self.stuck(12, 3 * 3600)
+        self.retries(2)
+        self.tick(30)
+        self.assertEqual(self.q.next_up, ["pr:o/r#12", "pr:o/r#11"])  # the pass's order: oldest wake first
+        self.assertEqual(self.explained(), [])
+        self.assertEqual(self.q.refill(self.t), 0, "no worker free: nothing considered")
+        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+        self.q.refill(self.t + 1)
+        self.assertEqual(self.explained(), ["12"])  # taken at once, by the oldest row, before any pass
+        self.assertEqual(self.q.next_up, ["pr:o/r#11"])
+        self.assertEqual(self.q.refill(self.t + 2), 0, "the worker is busy again")
+
+    def test_refill_takes_no_row_while_the_login_latch_held_the_pass(self):
+        """A latch the pass saw holds every row it skipped: a refill between passes starts none of them."""
+        self.q.next_up = ["pr:o/r#11"]
+        self.stuck(11, 2 * 3600)
+        self.q.pass_latch = ("rest", self.t + 600)
+        self.assertEqual(self.q.refill(self.t), 0)
+        self.assertEqual(self.explained(), [])
+
     def test_rows_this_hosts_gates_hold_late_overflow_to_a_peer_with_room(self):
         """land.json "overflow": a due row held here LAND_OVERFLOW_AFTER past its due time (every worker busy) goes to
         the first peer whose room answer has room, at most that many, oldest due first; a row due only a minute, or

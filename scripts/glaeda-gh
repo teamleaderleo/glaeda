@@ -6394,6 +6394,7 @@ class Daemon:
         self.last_request_source = "login"
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
+        self.land_refill()  # between two of the read phase's requests: a freed land worker takes its next row
         bucket = "graphql" if path == "/graphql" else "rest"
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
@@ -8487,6 +8488,27 @@ class Daemon:
         if self.land_queue is not None and key in self.land_queue.entries:
             self.land_dirty.add(key)
 
+    def land_refill(self) -> None:
+        """At most every LAND_REFILL_EVERY, on the tick's own thread and never inside a land pass: hand the land
+        workers that freed since the last pass their next rows (LandQueue.refill). The pass itself runs once per tick,
+        after up to TICK_BUDGET of reads, and the workers it fills free long before that (LandQueue.refill's comment)."""
+        q = self.land_queue
+        if q is None or self.reexec_waiting or getattr(self, "in_land", False) \
+                or threading.get_ident() != getattr(self, "tick_thread", None):
+            return
+        at = time.monotonic()
+        if at - getattr(self, "land_refilled", float("-inf")) < LAND_REFILL_EVERY:
+            return
+        self.land_refilled = at
+        self.in_land = True
+        try:
+            with self.phase("land refill"):
+                q.refill(None if getattr(self, "clock_real", True) else self.now)
+        except Exception as error:  # noqa: BLE001  the land queue must never stop the reads
+            self.errors.append(f"land refill: {describe(error)} at {error_site(error)}")
+        finally:
+            self.in_land = False
+
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
         an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
@@ -8506,7 +8528,12 @@ class Daemon:
             if isinstance(key, str) and key in self.land_queue.entries:
                 dirty.add(key)
             marker.unlink(missing_ok=True)
-        self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
+        self.in_land = True  # a request the pass makes (a /rate_limit reading) starts no refill inside it
+        try:
+            self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
+        finally:
+            self.in_land = False
+        self.land_refilled = time.monotonic()
 
     # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
 
@@ -12639,6 +12666,11 @@ LAND_WAKE_PREFETCH = 180.0
 # first for (Daemon.snapshot_waits) could not come within LAND_SNAPSHOT_WAIT. Ahead of the workers at most this many
 # per worker wait on their snapshot reads.
 LAND_SNAPSHOT_AHEAD = 1
+# A worker that frees between two passes takes the next row the last pass left waiting for one (LandQueue.refill),
+# asked at most this often (seconds) from the daemon's read phase, and considering at most LAND_REFILL_TRIES rows per
+# free worker each time (a row may still wait on its head read or snapshot, and the next one is tried).
+LAND_REFILL_EVERY = 2.0
+LAND_REFILL_TRIES = 3
 LAND_POOL_LOG_EVERY = 300.0
 LAND_LATCH_FREE_EVERY = 60.0  # how often an owner's unlatched read source is asked again (LandQueue.latch_free)
 LAND_LATCH_FREE_DEADLINE = 10.0  # the land-pool log line (LandQueue.log_pool)
@@ -13723,6 +13755,11 @@ class LandQueue:
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
+        # The due rows the last full pass left for a worker, in its order: a worker that frees between two passes
+        # takes the next of them (refill), not the next pass (LAND_REFILL_EVERY)
+        self.next_up: list[str] = []
+        self.pass_wanted: list[str] = []
+        self.pass_ended: float | None = None  # the pass's latch end (land_latch_spread): no refill inside its spread
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
@@ -14003,40 +14040,83 @@ class LandQueue:
         # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
         due_keys = [k for k in order if self.due(self.entries[k])]
         self.lean = set(due_keys[max(1, self.workers() * LAND_WATCH_AHEAD):])
+        self.pass_wanted = []
+        self.pass_ended = ended
         for key in order:
-            try:
-                if self.queue_quota_parked():
-                    break  # a worker parked the host while this pass was submitting judgments
-                e = self.entries[key]
-                with self.lock:
-                    if self.retire_from_cache(e):
-                        continue  # ended: no hold, park or worker needed to say so
-                if latch is not None and not self.latch_free(e):
-                    self.pass_latched += 1
-                    with self.lock:
-                        self.hold(e, latch)
-                    continue  # a held latch: no judge, read, watch or nudge for this entry this pass
-                if ended is not None and self.now < ended + land_jitter(key, ended) and not e.get("staggeredAt") \
-                        and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
-                    if self.reset_cap():
-                        with self.lock:
-                            self.keep_watching(e)  # read by the daemon's batch now, judged from that copy later
-                    continue  # the latch just ended: this entry's place in the reset spread is still ahead
-                with self.lock:
-                    if self.parked(e):
-                        continue
-                    if e.get("latchHeld"):
-                        # no mark holds it this pass (re-read above, never the until it stored): due now, and its
-                        # status names no latch, even if no worker takes it yet (gated)
-                        self.unhold(e)
-                        self.save(e)
-                    self.keep_watching(e)
-                    self.changed_entries.discard(key)
-                    self.consider(e)
-            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
-                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+            if self.queue_quota_parked():
+                break  # a worker parked the host while this pass was submitting judgments
+            self.pass_one(key, latch, ended)
+        # what refill hands the workers that free before the next pass, in this pass's order
+        self.next_up = [] if latch is not None else self.pass_wanted
         self.adapt_pool()
         self.log_pool()
+
+    def pass_one(self, key: str, latch: tuple[str, float] | None, ended: float | None) -> None:
+        """One row of a pass (tick), or of a refill between passes: retire, hold, stagger, park, else consider."""
+        try:
+            e = self.entries[key]
+            with self.lock:
+                if self.retire_from_cache(e):
+                    return  # ended: no hold, park or worker needed to say so
+            if latch is not None and not self.latch_free(e):
+                self.pass_latched += 1
+                with self.lock:
+                    self.hold(e, latch)
+                return  # a held latch: no judge, read, watch or nudge for this entry this pass
+            if ended is not None and self.now < ended + land_jitter(key, ended) and not e.get("staggeredAt") \
+                    and int((e.get("latchHeld") or {}).get("windows") or 0) < LAND_LATCH_STARVED_WINDOWS:
+                if self.reset_cap():
+                    with self.lock:
+                        self.keep_watching(e)  # read by the daemon's batch now, judged from that copy later
+                return  # the latch just ended: this entry's place in the reset spread is still ahead
+            with self.lock:
+                if self.parked(e):
+                    return
+                if e.get("latchHeld"):
+                    # no mark holds it this pass (re-read above, never the until it stored): due now, and its
+                    # status names no latch, even if no worker takes it yet (gated)
+                    self.unhold(e)
+                    self.save(e)
+                self.keep_watching(e)
+                self.changed_entries.discard(key)
+                self.consider(e)
+        except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+            log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def refill(self, now: float | None = None) -> int:
+        """Between two passes: hand each worker that freed to the next row the last pass left waiting for one
+        (next_up, in its order), so a worker never idles until the next pass. Returns how many rows it considered.
+
+        The pass runs once per daemon tick, at its end (finish_tick), and a tick spends up to TICK_BUDGET reading.
+        huge-blue, 2026-11-22 11:31-11:37Z: ticks 90-100 s apart under a 1,100-row queue; all 32 workers started in
+        the same second, freed over the next 30-60 s and stayed free until the next pass, so 864 rows were due, 696
+        of them past LAND_DUE_LATE, the oldest 5.9 h, at ~80 judgments per 10 min, and every row read "every worker
+        busy" between passes that found the workers idle. Each row here goes through the pass's own body (pass_one),
+        so every gate (latch, park, fresh head, snapshot, login share, pace) still holds; at most LAND_REFILL_TRIES
+        rows per free worker are considered, so a refill costs a few rows' work, never a pass's sort."""
+        self.now = time.time() if now is None else now
+        if not self.next_up or self.pass_latch is not None or self.refused is not None:
+            return 0
+        if self.pass_ended is not None:
+            return 0  # the reset spread after a latch: the pass's own stagger decides who goes
+        self.reap()
+        free = self.workers() - len(self.jobs)
+        if free <= 0:
+            return 0
+        tried = 0
+        while self.next_up and len(self.jobs) < self.workers() and tried < free * LAND_REFILL_TRIES:
+            if self.queue_quota_parked():
+                break
+            key = self.next_up.pop(0)
+            e = self.entries.get(key)
+            if e is None or e["state"] in LAND_DONE or key in self.jobs or key in self.overflowing \
+                    or not self.due(e):
+                continue
+            tried += 1
+            self.pass_one(key, None, None)
+        if tried:
+            self.count("refill")
+        return tried
 
     # -- forwarding to the land executor (land_executor): this host judges nothing
 
@@ -14928,6 +15008,8 @@ class LandQueue:
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
+        if why == "every worker busy":
+            self.pass_wanted.append(e["key"])  # ready for a worker: the next one that frees (refill)
         self.note_late(e, why)
 
     def note_late(self, e: dict, why: str) -> None:
@@ -17664,6 +17746,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
     bits = [f"{key_name(e['key'])}", e.get("state", "?")]
     if e.get("head"):
         bits.append(f"head {str(e['head'])[:12]}")
+    pin = str(e.get("pinSha") or "")
+    if pin and pin.lower() != str(e.get("head") or "").lower():
+        # the head last judged is not the one a re-request pinned: say the pin, which the next judgment takes
+        bits.append(f"pin {pin[:12]}")
     if e["state"] == "waiting" and w:
         what = w.get("kind")
         if w.get("run"):
