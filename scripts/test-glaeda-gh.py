@@ -22648,6 +22648,8 @@ class LandWorld:
         self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
         Path(self.mirror).mkdir(parents=True, exist_ok=True)
         self.origin = "https://github.com/o/r.git"
+        self.real_git = False  # /fake/git runs the real git (LandTest.union_origin)
+        self.home = tmp
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
@@ -22682,6 +22684,11 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
+            return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=timeout,
+                                  env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
+                                       "GIT_CONFIG_NOSYSTEM": "1"})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
@@ -26177,6 +26184,111 @@ class LandTest(Base):
     CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
                         'request-branch","status":"422"}')
+
+    def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md") -> tuple[str, str]:
+        """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
+        line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. (head, base)."""
+        origin = Path(self.tmp.name) / "origin"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(origin), *args], check=True, capture_output=True,
+                                  text=True, env=env).stdout.strip()
+        origin.mkdir()
+        git("init", "-q", "-b", "main")
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "receive.denyCurrentBranch", "ignore")
+        (origin / ".gitattributes").write_text(attrs)
+        (origin / path).parent.mkdir(parents=True, exist_ok=True)
+        (origin / path).write_text("- 10:00Z goal set\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("checkout", "-qb", "lane/x")
+        with open(origin / path, "a") as f:
+            f.write("- 11:00Z the lane's line\n")
+        git("commit", "-qam", "the lane appends")
+        head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        with open(origin / path, "a") as f:
+            f.write("- 11:05Z another PR's line, landed first\n")
+        git("commit", "-qam", "main appends")
+        base = git("rev-parse", "HEAD")
+        url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
+        url.start()
+        self.addCleanup(url.stop)
+        self.w.real_git = True
+        self.origin_git = git
+        return head, base
+
+    def union_conflict_tick(self, head: str) -> dict:
+        """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
+        conflict, as it does whatever .gitattributes says."""
+        data = {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}
+        self.w.set_pr(self.KEY, data, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        return self.tick()
+
+    def test_a_conflict_only_in_union_files_is_merged_here_and_the_pinned_land_goes_on(self):
+        """manaflow-ai/cmuxterm-hq#17917, 2026-11-21/22: its pinned land stopped update_branch_conflict three times on
+        goals/hot-verify-share.md, which .gitattributes marks merge=union, each hand-resolved by merging main: GitHub's
+        update-branch ignores .gitattributes. The queue now makes that merge itself and the land goes on."""
+        head, base = self.union_origin()
+        e = self.union_conflict_tick(head)
+        self.assertEqual(len([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertNotEqual(merged, head)
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("show", f"{merged}:goals/x.md"),
+                         "- 10:00Z goal set\n- 11:00Z the lane's line\n- 11:05Z another PR's line, landed first")
+        self.assertEqual(self.origin_git("diff", "--name-only", base, merged), "goals/x.md")  # the PR's own diff only
+        done = [h for h in e["history"] if h["event"] == "union_merged"]
+        self.assertEqual([(h["head"], h["merge"], h["paths"]) for h in done], [(head[:12], merged[:12], "goals/x.md")])
+        # GitHub shows the merge as the new head: the pin follows it (first parent the pin) and the land merges it.
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+        self.assert_merged_at(merged)
+
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertNotIn("unionMerge", e)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
+    def test_a_conflict_outside_union_files_still_stops_and_pushes_nothing(self):
+        head, _ = self.union_origin(attrs="docs/*.md merge=union\n")
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("not merge=union in main's .gitattributes: goals/x.md", e["stop"]["reason"])
+        self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # once per head: the same refusal again at this head stops at once, with no second merge attempt
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "union_merge_skipped"]), 1)
+
+    def test_a_union_merge_never_lands_on_a_branch_that_is_not_the_judged_head(self):
+        """A fork's PR whose branch name also exists on the base repository, or a push since the judgment: the branch
+        github.com holds is not the head, so nothing is merged or pushed onto it."""
+        head, base = self.union_origin()
+        self.origin_git("update-ref", "refs/heads/lane/x", base)  # someone else's lane/x
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn(f"is at {base[:12]}, not the head {head[:12]}", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), base)
 
     def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
         """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
@@ -32506,6 +32618,70 @@ class AppPoolTest(Base):
         self.assertEqual(status["lastHour"]["app"], 1)
         self.assertEqual(status["appPool"]["served"], 1)
         self.assertNotIn(APP_TOKEN, text)
+
+    IP_ALLOW_LIST = (b'{"errors":[{"type":"FORBIDDEN","message":"Although you appear to have the correct '
+                     b'authorization credentials, the `cursor` organization has an IP allow list enabled, and your '
+                     b'IP address is not permitted to access this resource."}]}')
+    CMUX_QUERY = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0)"
+                           "{pullRequest(number:$n0){number}}}",
+                  "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+
+    def refuse_cmux_graphql(self) -> None:
+        """Answer the next App GraphQL read the way this fleet's App is really answered for manaflow-ai/cmux."""
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 self.IP_ALLOW_LIST))
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+
+    def test_a_benched_scope_is_published_so_an_idle_app_is_not_read_as_a_routing_bug(self) -> None:
+        self.refuse_cmux_graphql()
+        self.assertEqual(self.pool.status()["unreadable"], {"graphql:manaflow-ai:cmux": round(NOW + gg.APP_POOL_ROUTE_REST)})
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.assertIsNone(self.pool.status()["unreadable"], "an hour on, nothing is benched")
+
+    def test_a_benched_scope_survives_the_re_exec_that_used_to_forget_it(self) -> None:
+        """One host, 2026-11-22: 23 doomed App queries for graphql:manaflow-ai:cmux in a day against an hour-long
+        bench, because 54 re-execs each dropped the bench with the process."""
+        self.refuse_cmux_graphql()
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 1, "the read went on the login")
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST})
+        self.daemon.app_pool = fresh
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 1, "the re-exec does not re-send the doomed query")
+        self.assertEqual(len(self.gh.calls), 2)
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 2, "the hour over, the App is asked again")
+
+    def test_a_bench_whose_hour_has_passed_is_not_restored(self) -> None:
+        self.refuse_cmux_graphql()
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {})
+
+    def test_one_role_s_bench_does_not_bench_another_role_s_app(self) -> None:
+        self.refuse_cmux_graphql()
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        spare.save_bench()
+        self.assertEqual(spare.restore_bench().unreadable, {})
+        self.assertEqual(gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                                    clock=lambda: self.daemon.clock()).restore_bench().unreadable,
+                         {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST},
+                         "the spare writing its own bench keeps ci-watch's")
+
+    def test_a_missing_or_unreadable_bench_file_restores_nothing(self) -> None:
+        pool = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                          clock=lambda: self.daemon.clock())
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().parent.mkdir(parents=True, exist_ok=True)
+        pool.bench_file().write_text("not json at all")
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().write_text(json.dumps({"roles": {"ci-watch": {"graphql:x:y": "soon", "ok:z": NOW + 10}}}))
+        self.assertEqual(pool.restore_bench().unreadable, {"ok:z": NOW + 10}, "a bad entry drops, the good one stays")
 
 
 class AppPoolHostTest(unittest.TestCase):
