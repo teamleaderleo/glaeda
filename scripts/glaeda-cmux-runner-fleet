@@ -332,15 +332,52 @@ def mint(scope: str, kind: str = "registration-token") -> str | None:
         return token
 
 
+# A run reads every runner's labels from one list of its scope, not one `?name=` read per instance: the operator's
+# gh holds the only credential that may read runners (no role App may hold the runner permission), and on
+# cosmic-gray one apply's per-instance reads were ~550 of the login's calls in 4.6 h. The list is kept for the run
+# (LABELS_REUSE_S bounds a long one); a failed read is not cached, so the next instance asks again.
+LABELS_REUSE_S = 5 * 60
+_LISTED: dict[str, tuple[dict[str, str], float]] = {}
+_LIST_LOCKS: dict[str, threading.Lock] = {}
+_LIST_LOCKS_GUARD = threading.Lock()
+
+
+def scope_runner_labels(scope: str) -> dict[str, str] | None:
+    """Runner name -> its labels, sorted and comma-separated, for every runner GitHub lists in `scope`; None when
+    the read fails."""
+    with _LIST_LOCKS_GUARD:
+        lock = _LIST_LOCKS.setdefault(scope, threading.Lock())
+    with lock:  # instances run at once: one list per scope in flight, the rest wait for its answer
+        cached = _LISTED.get(scope)
+        if cached and time.monotonic() - cached[1] < LABELS_REUSE_S:
+            return cached[0]
+        code, out, _ = run(["gh", "api", "--paginate", f"{scope}/actions/runners?per_page=100",
+                            "--jq", ".runners[] | [.name, [.labels[]?.name]] | tojson"], 60)
+        if code != 0:
+            _LISTED.pop(scope, None)
+            return None
+        listed: dict[str, str] = {}
+        try:
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                name, labels = json.loads(line)
+                if isinstance(name, str) and isinstance(labels, list):
+                    found = sorted(str(label) for label in labels if label)
+                    listed[name] = ",".join(label for label in found if "," not in label)
+        except (ValueError, TypeError):
+            _LISTED.pop(scope, None)
+            return None
+        _LISTED[scope] = (listed, time.monotonic())
+        return listed
+
+
 def github_labels(scope: str, name: str) -> str | None:
     """The labels GitHub lists for runner `name` now, comma-separated, read with this operator's gh; None when the
     read fails or GitHub lists no such runner (the mini then decides as before). The minis hold no gh login, so
     without this each apply re-registered every idle runner whatever its labels were."""
-    code, out, _ = run(["gh", "api", f"{scope}/actions/runners?name={urllib.parse.quote(name)}&per_page=100"], 60)
-    try:
-        runners = json.loads(out).get("runners") if code == 0 else None
-    except (ValueError, AttributeError):
-        return None
+    listed = scope_runner_labels(scope)
+    return listed.get(name) if listed is not None else None
     for found in runners if isinstance(runners, list) else []:
         if isinstance(found, dict) and found.get("name") == name:
             labels = sorted(str(label.get("name")) for label in found.get("labels") or [] if isinstance(label, dict))
