@@ -27178,6 +27178,44 @@ class LandTest(Base):
         e["refresh"] = {}
         self.assertFalse(self.q.refresh_due(e, self.w.cache[self.KEY]))  # a fresh copy: no read
 
+    def test_a_due_entry_on_a_host_with_its_own_login_reads_a_stale_copy_itself(self):
+        """2026-11-22 01:00Z: a PR green and requested pinned three times sat on a copy 81 then 117 min old
+        on a host with its own login (the nudge only marked it waited in a pass hours behind), so every judgment
+        was "unreadable". A copy older than LAND_OWN_REFRESH_AFTER and read before the land request is read directly, a
+        re-request of the open entry at the head the copy shows included, before it is judged."""
+        self.fresh_head = LB
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 7020
+        self.land()
+        e = self.tick()
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual(self.w.explains(), [])  # not judged on the stale copy
+        self.assertIsNone(e["refresh"]["error"])
+        self.w.answers.append(ok_answer(LB))
+        self.tick()
+        self.assert_merged_at(LB)  # the head the fresh read showed
+        self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def test_own_login_refreshes_follow_a_land_request_only_paced_and_capped(self):
+        self.pr(LA)
+        self.w.cache[self.KEY]["dataAt"] = self.t - 3600
+        c = self.w.cache[self.KEY]
+        e = {"key": self.KEY, "state": "waiting", "wait": {"kind": "pr"}, "wakeAt": self.t - 1}
+        self.assertFalse(self.q.refresh_due(e, c))  # no land request: the daemon's pass reads it
+        e["requestedAt"] = c["dataAt"] - 1
+        self.assertFalse(self.q.refresh_due(e, c))  # read since the request
+        e["requestedAt"] = c["dataAt"] + gg.LAND_OWN_REFRESH_AFTER - 1
+        self.assertFalse(self.q.refresh_due(e, c))  # the copy was fresh enough when asked: aged since, not stale then
+        e["requestedAt"] = self.t
+        e["refresh"] = {"at": self.t - gg.LAND_OWN_REFRESH_AFTER + 1}
+        self.assertFalse(self.q.refresh_due(e, c))  # read this recently already
+        e["refresh"] = {}
+        self.q.own_refreshed = [self.t - 1] * gg.LAND_OWN_REFRESH_MAX
+        self.assertFalse(self.q.refresh_due(e, c))  # the host's hourly cap
+        self.q.own_refreshed = [self.t - gg.LAND_WINDOW_S - 1] * gg.LAND_OWN_REFRESH_MAX
+        self.assertTrue(self.q.refresh_due(e, c))
+        self.assertEqual(len(self.q.own_refreshed), 1)
+
     def test_a_stale_land_judge_checkout_warns_once_and_clears(self):
         """gcp-codex-lane-12, 2026-11-17: a lane VM's leo-workspace sat at #5512 and its land_judge refused every merge
         as unreadable. The startup check warns (never refuses) once, prints in `land status`, and clears once."""

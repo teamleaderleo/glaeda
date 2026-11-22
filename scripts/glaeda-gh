@@ -10627,6 +10627,18 @@ LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's war
 # own update-branch, so it sat out LAND_HEAD_TIMEOUT and judged unpinned; cmux#44209's held 02:24Z data for hours.
 LAND_REFRESH_AFTER = float(UPSTREAM_DIRECT_AFTER)
 LAND_REFRESH_EVERY = float(STALE_DATA_AFTER)
+# A host with its own login (the broker host) reads its landing PRs in the daemon's waited pass, and the land worker's
+# nudge only marks the PR waited there. With hundreds of waited PRs that pass ran hours behind, and nothing else read a
+# due entry's PR: 2026-11-22 01:00Z, a PR (157/157 green, three pinned land requests at one head) sat on a copy
+# 81, then 117 min old, so land_judge answered "unreadable: not judged" on every try and a pinned merge by hand was
+# refused the same way. The coordinator: "a land request should get a fresh read of its head, not wait its turn in a
+# 10,000 s pass". A re-request of an open entry is not queued again, and a pin the stale copy already showed counted as
+# seen (pin_wait), so nothing asked for a read. So an entry whose copy was older than LAND_OWN_REFRESH_AFTER at its last land request
+# (requestedAt, a re-request's too), and is not read since, is read directly here too (direct_read, as on an upstream host), at most every LAND_OWN_REFRESH_AFTER per entry and
+# LAND_OWN_REFRESH_MAX per LAND_WINDOW_S per host: a PR read is a handful of requests, so the cap costs well under one
+# percent of an hour's login quota however many entries the queue holds.
+LAND_OWN_REFRESH_AFTER = 600.0
+LAND_OWN_REFRESH_MAX = 120
 
 
 def land_judge(config: dict) -> tuple[Path | None, list[Path]]:
@@ -12259,6 +12271,7 @@ class LandQueue:
         self.config_given = config
         self.reads_upstream = reads_upstream
         self.refresh = refresh
+        self.own_refreshed: list[float] = []  # this host's own-login refreshes in the last LAND_WINDOW_S (refresh_due)
         self.behind = behind
         self.behind_at = float("-inf")
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
@@ -12446,6 +12459,10 @@ class LandQueue:
             pin = land_pin_sha(req.get("sha"))
         except WatchError:
             pin = ""
+        # refresh_due: on a host with its own login, a copy already stale when the request was written is read first
+        sent = req.get("at")
+        e["requestedAt"] = min(float(sent), self.now) \
+            if isinstance(sent, (int, float)) and not isinstance(sent, bool) else self.now
         if pin:
             e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
         else:
@@ -13910,16 +13927,27 @@ class LandQueue:
 
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
-        LAND_REFRESH_AFTER (see there), started on a worker: True when one was started."""
+        LAND_REFRESH_AFTER (see there); on a host with its own login, a direct read of a due entry's PR whose copy is
+        that was older than LAND_OWN_REFRESH_AFTER at its last land request. Started on a worker: True when one was started (or waits for one)."""
         at = (c or {}).get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
         urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
         last = (e.get("refresh") or {}).get("at")
-        if isinstance(last, (int, float)) and self.now - last < (LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY):
+        own = not self.reads_upstream()
+        every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
+        if isinstance(last, (int, float)) and self.now - last < every:
             return False
-        if not self.reads_upstream():
-            return False  # a host with its own login: the nudge (and the stale valve) refresh it
+        if own:
+            # A host with its own login: the nudge reads it in the daemon's waited pass, unless the copy was already
+            # older than LAND_OWN_REFRESH_AFTER when the entry's last land request came (see there) and no read has
+            # answered since, within the host's hourly cap
+            self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]
+            asked = e.get("requestedAt")
+            if not isinstance(asked, (int, float)) or isinstance(asked, bool) \
+                    or asked - at < LAND_OWN_REFRESH_AFTER \
+                    or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
+                return False
         if self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
             if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
                 e["feedNoRefresh"] = at
@@ -13928,6 +13956,8 @@ class LandQueue:
         if len(self.jobs) >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at)}
+        if own:
+            self.own_refreshed.append(self.now)
         self.save(e)
         self.submit(e["key"], self.refresh_job, e["key"])
         return True
