@@ -14642,6 +14642,9 @@ class TartLimaReferencesTest(unittest.TestCase):
         with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
             items = self.survey(gd.LIMA_VMS)
         self.assertEqual(items["leo-scratch"].verdict, "kept", "off a fleet mini a person's claim still holds")
+        policy = self.root / "disk-policy.json"
+        policy.write_text(json.dumps({"fleet_claims_expire": False}))
+        self.assertEqual(gd.disk_policy(policy)["fleet_claims_expire"], False, "one host can turn it off")
 
     def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
         base = self.tart_vm("ubase", 30 * 24, self.ECID)

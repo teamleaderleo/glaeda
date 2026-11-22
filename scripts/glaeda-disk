@@ -2449,6 +2449,7 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "sudo_reads": True,
     # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
     "build_caches_unwindowed": True,
+    "fleet_claims_expire": True,  # a person's VM claim on a fleet mini holds only until its "until" (vm_claim)
     # Every build cache on a volume together (BUDGET_FAMILY_IDS and the fleet compilation cache) stays under this share of
     # it (space()'s syntax; "0" turns it off). Over it, a pressure pass spends warm build state past BUDGET_IDLE_HOURS
     # by value until the caches are back under BUDGET_STOP_SHARE of it.
@@ -16272,7 +16273,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     BUILD_CACHES_UNWINDOWED = (role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
                                and bool(POLICY["build_caches_unwindowed"]))
-    FLEET_CLAIMS_EXPIRE = role == "fleet-mini" and not reserved and bool(POLICY.get("fleet_claims_expire", True))
+    FLEET_CLAIMS_EXPIRE = role == "fleet-mini" and not reserved and bool(POLICY["fleet_claims_expire"])
     use_profile_state(RUNNER_CACHE_PROFILE)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
