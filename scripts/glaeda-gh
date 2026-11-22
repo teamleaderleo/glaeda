@@ -2830,7 +2830,8 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     open for as long as it lives. Here the child leads its own process group and the whole group is
     killed. Raises subprocess.TimeoutExpired or OSError."""
     timeout = SUBPROCESS_DEADLINE if timeout is None else timeout
-    with subprocess.Popen(argv, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
+    with subprocess.Popen(self_bounded(argv, timeout, env),
+                          stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
         try:
             out, err = proc.communicate(input=input_text, timeout=timeout)
@@ -2846,6 +2847,113 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
                     stream.close()
             raise subprocess.TimeoutExpired(argv, timeout) from None
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+# A bound held only by its caller (communicate(timeout=) then killpg) ends with the caller: the daemon's execv (an
+# update, the stale valve) or a killed `budget` drops every thread mid-wait, and the child, in its own session, runs
+# on. cosmic-gray 2026-11-22: 55 `reach HOST sh -c '... @@budget ...'` probes (bound FLEET_HOST_TIMEOUT, 25 s) alive
+# 29 minutes, and 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days, started by an image the
+# daemon had execv'd away (cmuxterm-hq handbook: mirror-read-outlives-its-bound.md). So the bound also lives in the
+# child: coreutils `timeout` leads its process group and signals the whole group at the bound, whoever the parent is.
+SELF_BOUND_SLACK = 5.0  # the child's own bound is this long past its caller's, so a live caller always acts first
+SELF_BOUND_KILL = 5  # timeout -k: SIGKILL this long after the SIGTERM
+TIMEOUT_PATHS = ("/opt/homebrew/bin/timeout", "/usr/local/bin/timeout", "/usr/bin/timeout", "/bin/timeout",
+                 "/opt/homebrew/bin/gtimeout", "/usr/local/bin/gtimeout")
+TIMEOUT_ENV = "GLAEDA_GH_TIMEOUT_CMD"  # a test's or an operator's coreutils timeout; empty turns the self-bound off
+DETACHED_BOUND = 600.0  # a fire-and-forget alert send (tell-coordinator, coord-alert) running longer is hung
+
+
+def coreutils_timeout() -> str | None:
+    """The coreutils `timeout` this host has (GLAEDA_GH_TIMEOUT_CMD, else the first of TIMEOUT_PATHS), or None."""
+    if TIMEOUT_ENV in os.environ:
+        named = os.environ[TIMEOUT_ENV]
+        return named if named and os.access(named, os.X_OK) else None
+    return next((p for p in TIMEOUT_PATHS if os.access(p, os.X_OK)), None)
+
+
+def self_bounded(argv: list[str], seconds: float | None, env: dict | None = None) -> list[str]:
+    """ARGV run under `timeout -k SELF_BOUND_KILL SECONDS+SELF_BOUND_SLACK`, so it ends at its bound even when its
+    caller is gone first. ARGV unchanged with no bound, no timeout on this host, or an ARGV[0] that does not resolve
+    (Popen's OSError then names it, as the callers expect, instead of timeout's exit 127)."""
+    tool = coreutils_timeout()
+    if not argv or seconds is None or not math.isfinite(seconds) or tool is None:
+        return list(argv)
+    if shutil.which(argv[0], path=(env if env is not None else os.environ).get("PATH")) is None:
+        return list(argv)
+    return [tool, "-k", str(SELF_BOUND_KILL), f"{max(0.0, seconds) + SELF_BOUND_SLACK:g}", *argv]
+
+
+def remote_self_bounded(script: str, seconds: float) -> str:
+    """A `sh -c` SCRIPT for another host that bounds itself there: under that host's coreutils timeout (the first of
+    TIMEOUT_PATHS; ssh's PATH has no Homebrew) at SECONDS, so a remote side whose ssh or caller died ends too; run
+    as it is where the host has none."""
+    inner = shlex.quote(script)
+    found = " ".join(shlex.quote(p) for p in TIMEOUT_PATHS)
+    return (f'for t in {found}; do if [ -x "$t" ]; then exec "$t" -k {SELF_BOUND_KILL} {seconds:g} sh -c {inner}; '
+            f'fi; done; {script}')
+
+
+# Every child serve starts and does not wait for is reaped here, each tick (reap_children). An unreaped child is a
+# zombie until the daemon exits, and the daemon re-executes itself instead of exiting: the new image holds no Popen
+# for the old image's children, so serve adopts them by PID when it starts (adopt_inherited) and reaps those too.
+DETACHED: list[subprocess.Popen] = []
+INHERITED: set[int] = set()
+DETACHED_LOCK = threading.Lock()
+
+
+def spawn_detached(argv: list[str], bound: float | None = None, **kwargs: Any) -> subprocess.Popen:
+    """Popen(ARGV) in a session of its own, not waited for, kept for reap_children; with BOUND, self_bounded. Raises
+    OSError as Popen does."""
+    reap_children()
+    proc = subprocess.Popen(self_bounded(argv, bound, kwargs.get("env")), start_new_session=True, **kwargs)
+    with DETACHED_LOCK:
+        DETACHED.append(proc)
+    return proc
+
+
+def child_pids(parent: int) -> set[int]:
+    """PARENT's child processes now (zombies included), from one ps."""
+    try:
+        done = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in done.stdout.splitlines():
+        words = line.split()
+        if len(words) == 2 and words[1] == str(parent) and words[0].isdigit():
+            pids.add(int(words[0]))
+    return pids
+
+
+def adopt_inherited() -> int:
+    """serve's first step: every child this PID has before the new image starts any is the previous image's (an
+    execv keeps the PID and its children), kept for reap_children. The count adopted."""
+    found = child_pids(os.getpid())
+    with DETACHED_LOCK:
+        INHERITED.update(found)
+    return len(found)
+
+
+def reap_children() -> int:
+    """Wait for every detached and inherited child that ended (never blocking); the count still running."""
+    with DETACHED_LOCK:
+        alive = []
+        for proc in DETACHED:
+            with contextlib.suppress(Exception):  # a test's stand-in, or a poll the OS refused: dropped
+                if proc.poll() is None:
+                    alive.append(proc)
+        DETACHED[:] = alive
+        for pid in list(INHERITED):
+            try:
+                ended, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                ended = pid  # reaped already, or not ours
+            except OSError:
+                continue
+            if ended:
+                INHERITED.discard(pid)
+        return len(DETACHED) + len(INHERITED)
 
 
 def internal_env() -> dict:
@@ -6305,11 +6413,10 @@ class Daemon:
             log({"event": "alarm-unsent", "alarm": name, "why": f"no {ALARM_CMD}"})
             return
         try:
-            self.alarm_procs.append(subprocess.Popen(
+            self.alarm_procs.append(spawn_detached(
                 [os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level,
-                 *(["--source-key", source_key] if source_key else []), text],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True))
+                 *(["--source-key", source_key] if source_key else []), text], bound=DETACHED_BOUND,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         except OSError as error:
             log({"event": "alarm-unsent", "alarm": name, "why": describe(error)})
 
@@ -18312,9 +18419,9 @@ class LandQueue:
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
                 try:
                     with open(logs / f"review-{repo.replace('/', '_')}-{number}-{head[:12]}.log", "ab") as sink:
-                        subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
-                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(e), start_new_session=True,
-                                         close_fds=True, cwd=os.environ.get("HOME") or "/")
+                        spawn_detached([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
+                                       stdout=sink, stderr=subprocess.STDOUT, env=self.env(e),
+                                       close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
                     e["reviewed"] = [h for h in e["reviewed"] if h != key]
@@ -20097,6 +20204,7 @@ def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: floa
 
 
 def serve(foreground_ok: bool = False) -> int:
+    inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     lock = hold_daemon_lock()
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
@@ -20109,7 +20217,7 @@ def serve(foreground_ok: bool = False) -> int:
     stamp = me.stat().st_mtime
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid()})
+    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -20131,6 +20239,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.tick_failed(describe(error), site)
             except Exception as report:  # noqa: BLE001  e.g. a full disk: keep serving
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
+        with contextlib.suppress(Exception):  # noqa: BLE001  a reap that fails is tried again next tick
+            reap_children()
         time.sleep(TICK)
         watchdog.beat()
         try:
@@ -21102,9 +21212,9 @@ def incident_send(text: str, level: str, source_key: str, to: str = "", cls: str
     if ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK):
         route = (["--to", to] if to else []) + (["--class", cls] if cls else [])
         try:
-            subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
-                              source_key, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
+                            source_key, text], bound=DETACHED_BOUND, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "to": to or None, "text": text})
             return
         except OSError as error:
@@ -21304,9 +21414,8 @@ def coord_alert_spawn(text: str) -> None:
         coord_alert_missing(text)
         return
     try:
-        subprocess.Popen([*self_argv(), "coord-alert", text],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([*self_argv(), "coord-alert", text], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": describe(error), "text": text})
 
@@ -21323,9 +21432,8 @@ def coord_alert_missing(text: str) -> None:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT} and no {ALARM_CMD}", "text": text})
         return
     try:
-        subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT}; {ALARM_CMD}: {describe(error)}", "text": text})
         return
@@ -24675,7 +24783,8 @@ def fetch_host(host: str, local: bool) -> dict:
     if local:
         return local_host_report()
     try:
-        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(FLEET_HOST_SCRIPT)], timeout=FLEET_HOST_TIMEOUT)
+        script = remote_self_bounded(FLEET_HOST_SCRIPT, FLEET_HOST_TIMEOUT)  # its own bound there, too
+        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(script)], timeout=FLEET_HOST_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"error": f"unreachable (no answer in {FLEET_HOST_TIMEOUT:g}s)"}
     except OSError as error:

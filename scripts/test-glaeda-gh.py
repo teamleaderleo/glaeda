@@ -7419,7 +7419,8 @@ class FleetBudgetTest(Base):
         self.assertEqual(gg.fetch_host("far", False)["budget"], {})
         args = Path(gg.REACH_CMD + ".args").read_text().splitlines()
         self.assertEqual(args[:3], ["far", "sh", "-c"])
-        self.assertEqual(shlex.split("\n".join(args[3:])), [gg.FLEET_HOST_SCRIPT])
+        self.assertEqual(shlex.split("\n".join(args[3:])),
+                         [gg.remote_self_bounded(gg.FLEET_HOST_SCRIPT, gg.FLEET_HOST_TIMEOUT)])
         gg.REACH_CMD = self.script("reach", 'echo "reach: no route to far" >&2; exit 4\n')
         self.assertEqual(gg.fetch_host("far", False)["error"], "unreachable (exit 4: reach: no route to far)")
         gg.REACH_CMD = self.script("reach", "sleep 30\n")
@@ -7591,6 +7592,136 @@ class BoundedSubprocessTest(unittest.TestCase):
     def test_an_answer_within_the_deadline_is_returned(self) -> None:
         result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+
+
+class ChildReapingTest(unittest.TestCase):
+    """cosmic-gray 2026-11-22: 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days (alert sends
+    nobody waited for, many started by an image the daemon had execv'd away) and 55 `reach` probes of the budget
+    sweep alive 29 minutes past their 25 s bound, the bound held only by a caller that was gone. Every child serve
+    does not wait for is reaped each tick, the old image's by PID; a bounded child ends at its bound on its own."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("SELF_BOUND_SLACK", "SELF_BOUND_KILL"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+        gg.SELF_BOUND_SLACK = 0.3
+        gg.SELF_BOUND_KILL = 1
+        self.addCleanup(self.forget)
+
+    def forget(self) -> None:
+        with gg.DETACHED_LOCK:
+            gg.DETACHED.clear()
+            gg.INHERITED.clear()
+
+    def tool(self, body: str) -> str:
+        path = Path(self.tmp.name) / f"tool-{len(os.listdir(self.tmp.name))}"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def stat(self, pid: int) -> str:
+        done = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def zombie(self, pid: int) -> bool:
+        return self.stat(pid).startswith("Z")
+
+    def gone(self, pid: int, within: float) -> bool:
+        """PID no longer runs (absent, or a zombie of a parent that is not this test) within WITHIN seconds."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if not self.stat(pid) or self.zombie(pid):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_no_timeout_or_no_bound_leaves_the_argv_alone(self) -> None:
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: ""}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], None), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], math.inf), ["sh", "-c", "true"])
+        absent = os.fspath(Path(self.tmp.name) / "absent")
+        self.assertEqual(gg.self_bounded([absent], 5), [absent])  # Popen's OSError names it, not timeout's 127
+        fake = self.tool("exec \"$@\"\n")
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: fake}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), [fake, "-k", "1", "5.3", "sh", "-c", "true"])
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_the_bound_ends_the_whole_group_after_its_caller_is_gone(self) -> None:
+        """The caller never waits (it is gone: an execv, a SIGKILL); the child and the grandchild holding its pipes
+        still end at the bound."""
+        marker = Path(self.tmp.name) / "grandchild.pid"
+        tool = self.tool(f"sleep 60 &\necho $! > {marker}\nsleep 60\n")
+        proc = subprocess.Popen(gg.self_bounded([tool], 0.2), start_new_session=True, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        deadline = time.monotonic() + 5
+        while not (marker.exists() and marker.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(marker.read_text())
+        self.assertTrue(self.gone(grandchild, 8), "the grandchild outlived its bound")
+        self.assertIsNotNone(proc.wait(8))
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_run_bounded_answers_as_before_under_its_own_bound(self) -> None:
+        result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+        self.assertEqual(gg.run_bounded(["cat"], 10, input_text="in\n").stdout, "in\n")
+        with self.assertRaises(OSError):
+            gg.run_bounded([os.fspath(Path(self.tmp.name) / "absent")], 10)
+
+    def test_the_remote_script_bounds_itself_where_the_host_has_timeout(self) -> None:
+        done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo \"@@x 'q'\"", 5)], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.stdout, "@@x 'q'\n")
+        if any(os.access(p, os.X_OK) for p in gg.TIMEOUT_PATHS):
+            started = time.monotonic()
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("sleep 30", 0.3)], capture_output=True,
+                                  timeout=30)
+            self.assertEqual(done.returncode, 124)
+            self.assertLess(time.monotonic() - started, 10)
+        with mock.patch.object(gg, "TIMEOUT_PATHS", (os.fspath(Path(self.tmp.name) / "none"),)):
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo plain", 5)], capture_output=True,
+                                  text=True, timeout=30)
+        self.assertEqual(done.stdout, "plain\n")  # a host with no timeout runs it as it is
+
+    def test_detached_children_are_reaped_and_never_left_defunct(self) -> None:
+        procs = [gg.spawn_detached(["true"], stdin=subprocess.DEVNULL) for _ in range(3)]
+        for proc in procs:
+            deadline = time.monotonic() + 5
+            while not self.zombie(proc.pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertTrue(all(self.zombie(p.pid) for p in procs), "the children ended unreaped (as they were)")
+        self.assertEqual(gg.reap_children(), 0)
+        self.assertFalse(any(self.zombie(p.pid) for p in procs))
+        self.assertEqual(gg.DETACHED, [])
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_a_bounded_detached_child_ends_at_its_bound(self) -> None:
+        proc = gg.spawn_detached(["sleep", "30"], bound=0.2, stdin=subprocess.DEVNULL)
+        self.assertIsNotNone(proc.wait(10))
+        self.assertEqual(gg.reap_children(), 0)
+
+    def test_the_previous_images_children_are_adopted_by_pid_and_reaped(self) -> None:
+        """An execv keeps the PID and its children; the new image holds no Popen for them."""
+        pids = [os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ) for _ in range(2)]
+        pids.append(os.posix_spawn("/bin/sh", ["sh", "-c", "sleep 1"], os.environ))
+        self.assertLessEqual(set(pids), gg.child_pids(os.getpid()))
+        with mock.patch.object(gg, "child_pids", return_value=set(pids)):
+            self.assertEqual(gg.adopt_inherited(), 3)
+        deadline = time.monotonic() + 5
+        while not all(self.zombie(p) for p in pids[:2]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(gg.reap_children(), 1)  # the sleeping one still runs
+        self.assertFalse(any(self.zombie(p) for p in pids[:2]))
+        deadline = time.monotonic() + 10
+        while gg.reap_children() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(gg.INHERITED, set())
+        with mock.patch.object(gg, "child_pids", return_value={999999}):
+            gg.adopt_inherited()
+        self.assertEqual(gg.reap_children(), 0)  # not ours: dropped, never retried
 
 
 class TickBudgetTest(Base):
