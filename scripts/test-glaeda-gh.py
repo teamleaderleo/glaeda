@@ -31230,11 +31230,18 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
         self.enter.__enter__()
         self.addCleanup(self.enter.__exit__, None, None, None)
 
+    def refuse(self, argv: list[str]) -> None:
+        """Run a call this tool must refuse as a usage error. `Parser.error` exits 64 rather than returning
+        it, because argparse never hands control back: a caller branching on the code sees a process exit."""
+        with self.assertRaises(SystemExit) as exit_:
+            gg.main(list(argv))
+        self.assertEqual(exit_.exception.code, 64, argv)
+
     def test_an_unrecognized_flag_names_the_command_whose_option_it_is(self) -> None:
         """Measured 2026-11-21: `glaeda-gh wait run o/r/ID --timeout 1500 --notify` answered "error:
         unrecognized arguments: --notify" and nothing else, so the reader learned neither that `wait` has no
         such flag nor that `land --notify` is the one that does -- a round trip through two --help pages."""
-        self.assertEqual(gg.main(["wait", "run", "o/r/9", "--timeout", "10", "--notify"]), 64)
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify"])
         said = self.err.getvalue()
         self.assertIn("--notify", said)
         self.assertIn("no option of `wait`", said)
@@ -31243,7 +31250,7 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
     def test_the_next_step_is_the_same_call_without_the_borrowed_flag(self) -> None:
         """A refusal names a next step that can end it, and here the call the caller meant is the one they
         typed minus the flag that is no part of it. It is checked by parsing it, not by reading it."""
-        self.assertEqual(gg.main(["wait", "run", "o/r/9", "--timeout", "10", "--notify"]), 64)
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify"])
         steps = [line[len("next: "):] for line in self.err.getvalue().splitlines()
                  if line.startswith("next: ")]
         self.assertEqual(steps, ["glaeda-gh wait run o/r/9 --timeout 10"])
@@ -31253,7 +31260,7 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
     def test_a_flag_no_command_of_this_tool_has_is_left_to_argparse(self) -> None:
         """The bound on the claim: this says where a flag lives, so it must stay silent about a flag that
         lives nowhere, rather than inventing a command for `--banana`."""
-        self.assertEqual(gg.main(["wait", "run", "o/r/9", "--timeout", "10", "--banana"]), 64)
+        self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--banana"])
         said = self.err.getvalue()
         self.assertIn("unrecognized arguments: --banana", said)
         self.assertNotIn("no option of", said)
@@ -31281,7 +31288,7 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
         """A caller reading --json gets the refusal as its document, not only on stderr (output contract)."""
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(gg.main(["wait", "run", "o/r/9", "--timeout", "10", "--notify", "--json"]), 64)
+            self.refuse(["wait", "run", "o/r/9", "--timeout", "10", "--notify", "--json"])
         doc = json.loads(out.getvalue().strip().splitlines()[-1])
         self.assertFalse(doc["ok"])
         self.assertIn("no option of `wait`", doc["reason"])
