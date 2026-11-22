@@ -12212,10 +12212,54 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
 
 
 def land_forward_name(command: list[str]) -> str:
-    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
-    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
+    """The executor as said in messages: `reach HOST ...`'s HOST, `ssh [OPTIONS] HOST ...`'s HOST, else the program's
+    words. huge-blue, 2026-11-22 17:20Z: its executor became `ssh -o ... HOST glaeda-gh land serve`, and every message
+    named the executor "-o"."""
+    name = Path(command[0]).name
+    if name == "reach" and len(command) > 1:
         return command[1]
+    if name == "ssh":
+        rest = command[1:]
+        while rest and rest[0].startswith("-"):
+            flag, rest = rest[0], rest[1:]
+            if len(flag) == 2 and flag[1] in LAND_SSH_VALUE_FLAGS and rest:
+                rest = rest[1:]  # the flag's value (-o Option=..., -i FILE, -p PORT, ...)
+        if rest:
+            return rest[0]
     return " ".join(command)[:120]
+
+
+LAND_SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")  # ssh's flags that take the next word as their value
+# A host that forwards its own lands (land.json "executor") relays a `land serve` request it is sent to that executor,
+# once. huge-blue, 2026-11-22: from 17:20:41Z its land.json named an executor (the control-plane move, RFD 0039), and
+# every lane VM's hand-off -- the broker's land_handoff runs `glaeda-gh land serve` on huge-blue -- was refused
+# "not_executor: huge-blue forwards its own lands to -o ... it serves none" (fs-agent-lane-2: 4 refusals 17:20-17:30Z,
+# each PR judged again on the VM, 300 s a judgment). The refusal was there so two hosts never hand a PR back and forth;
+# the relay keeps that: it names itself in the request's "relayedBy", and a request that already carries one is
+# refused as before, so a PR goes at most one hop past the host it was sent to.
+LAND_RELAY_KEY = "relayedBy"
+LAND_RELAY_DEADLINE = 50.0  # inside the broker's 60 s hand-off call, with room for this host's own start
+
+
+def land_serve_relay(executor: list[str], req: dict, forward: Callable[..., dict] | None = None) -> int:
+    """`land serve` on a forwarding host: REQ relayed once to EXECUTOR (land_serve_relay's comment), its answer printed
+    as it came, with "relayedBy" naming this host; not_executor when REQ was already relayed or the relay failed."""
+    host, name = policy_host(), land_forward_name(executor)
+    if req.get(LAND_RELAY_KEY):
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{host} forwards its own lands to {name} "
+                          f"(land.json executor), and this request was already relayed by "
+                          f"{land_trim(str(req.get(LAND_RELAY_KEY)), 80)}: it serves none"}))
+        return EXIT_FAIL
+    wait = req.get("wait") if isinstance(req.get("wait"), (int, float)) and not isinstance(req.get("wait"), bool) else 0
+    try:
+        answer = (forward or land_forward)(executor, {**req, LAND_RELAY_KEY: host},
+                                           LAND_RELAY_DEADLINE + max(0.0, min(float(wait), 86400.0)))
+    except WatchError as error:
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{host} forwards its own lands to {name} "
+                          f"(land.json executor) and could not relay this request there: {land_trim(str(error), 200)}"}))
+        return EXIT_FAIL
+    print(json.dumps({**answer, LAND_RELAY_KEY: host}, sort_keys=True))
+    return EXIT_OK if answer.get("ok") else EXIT_FAIL
 
 
 # Per-PR land leases: the first piece of the decentralized land queue (docs/adr/0023-decentralized-land-queue.md).
@@ -19156,7 +19200,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
 def cmd_land_serve(text: str) -> int:
     """`land serve`: the executor's end of land.json's "executor" on a forwarding host. One JSON request line on stdin
     ({"op": "land" | "withdraw" | "status" | "batch", ...}), one JSON answer line on stdout. A host that forwards its
-    own lands is no executor: it refuses, so two hosts never hand a PR back and forth."""
+    own lands relays the request to its executor once (land_serve_relay), so two hosts never hand a PR back and forth."""
     try:
         req = json.loads(text)
     except ValueError:
@@ -19167,9 +19211,7 @@ def cmd_land_serve(text: str) -> int:
         return EXIT_FAIL
     executor = land_executor()
     if executor is not None:
-        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
-        return EXIT_FAIL
+        return land_serve_relay(executor, req)
     op = req["op"]
     if op == "room":
         # A peer's overflow asks before it sends (land_overflow): never room while the daemon is down
