@@ -27096,6 +27096,20 @@ def flag_commands(flag: str) -> list[str]:
     return out
 
 
+def typed_command(words: list[str]) -> str:
+    """The command path WORDS typed, spelled as `flag_commands` spells one: `log search` where that is a command
+    of its own, `wait` where the next word is a choice of `wait`'s own positional rather than a nested parser."""
+    if not words:
+        return ""
+    tops, _ = nesting_table()
+    if words[0] not in tops:
+        return words[0]
+    node = child_parser(parser(), words[0])
+    if len(words) > 1 and child_parser(node, words[1]) is not node:
+        return f"{words[0]} {words[1]}"
+    return words[0]
+
+
 def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, str]:
     """What a flag borrowed from a sibling command is told: (hint, next). ("", "") for any other usage error.
 
@@ -27114,24 +27128,47 @@ def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, st
     extra = found.group(1).replace(",", " ").split()
     if not extra or not all(w.startswith("--") and w != "--" for w in extra):
         return "", ""  # a stray target or value among them is another mistake: argparse's own line names it
-    typed = words[0]
+    # Everything at or after the first `--` is a word the caller quoted as a positional (`log search o/r --
+    # --notify` searches for the text `--notify`), never a flag of theirs: the sibling rewriter
+    # flag_spelling_synonym stops at `--` for the same reason. A flag only named there is argparse's to
+    # explain, and the ones named here are dropped from the call by count, not by equality, so a copy the
+    # caller quoted survives into the next step.
+    cut = words.index("--") if "--" in words else len(words)
+    typed_words, quoted = words[:cut], words[cut:]
+    extra = [w for w in extra if w in typed_words]
+    if not extra:
+        return "", ""
     # The command that just refused the flag is never named as the place to go: that is a next step which
-    # cannot end the refusal.
-    owners = {w: [c for c in flag_commands(w) if c.split()[0] != typed] for w in extra}
-    named = [w for w in extra if owners[w]]
+    # cannot end the refusal. The whole path, not its first word: `log job --reads` is answered by `log
+    # search`, a different command that happens to share a top-level word.
+    typed = typed_command(typed_words)
+    def name_of(flag: str) -> str:
+        return flag.split("=", 1)[0]  # `--notify=x` is the option `--notify`, which is what lives elsewhere
+
+    owners = {w: [c for c in flag_commands(name_of(w)) if c != typed] for w in dict.fromkeys(extra)}
+    named = [w for w in owners if owners[w]]
     if not named:
-        return "", ""  # no command of this tool has it: argparse's refusal stands as it is
-    kept = [w for w in words if w not in extra]
+        return "", ""  # no other command of this tool has it: argparse's refusal stands as it is
+    left: dict[str, int] = {}
+    for w in extra:
+        left[w] = left.get(w, 0) + 1
+    kept = []
+    for w in typed_words:
+        if left.get(w):
+            left[w] -= 1
+            continue
+        kept.append(w)
+    kept += quoted
 
     def lives(flag: str) -> str:
         where = owners[flag]
         return f"{' and '.join(f'`{c}`' for c in where)}'s (`glaeda-gh {where[0]} --help`)"
 
     if len(named) == 1:
-        hint = f"`{named[0]}` is no option of `{typed}`: it is {lives(named[0])}"
+        hint = f"`{name_of(named[0])}` is no option of `{typed}`: it is {lives(named[0])}"
     else:
-        hint = (f"{', '.join(f'`{w}`' for w in named)} are no options of `{typed}`: "
-                + "; ".join(f"`{w}` is {lives(w)}" for w in named))
+        hint = (f"{', '.join(f'`{name_of(w)}`' for w in named)} are no options of `{typed}`: "
+                + "; ".join(f"`{name_of(w)}` is {lives(w)}" for w in named))
     return hint, " ".join(["glaeda-gh"] + kept)
 
 
