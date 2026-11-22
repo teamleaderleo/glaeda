@@ -13012,6 +13012,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# land_judge's "quota" answer for one CI job that spent the repo installation's API limit ("base_red_excuse.py job
+# rate-limited at HEAD ...: run R; job J; no attempt before HH:MMZ. Rerun run R ... the repo installation's API limit
+# refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
+# installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
+# never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
@@ -15301,9 +15308,10 @@ class LandQueue:
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
-    def park_quota(self, e: dict, text: str) -> None:
+    def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
-        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken. HOST False parks
+        only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
         self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
@@ -15315,7 +15323,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None:
+        if said is not None and host:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -17177,7 +17185,8 @@ class LandQueue:
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
-                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}",
+                                host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
@@ -31895,6 +31904,32 @@ def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, st
     return hint, " ".join(["glaeda-gh"] + kept)
 
 
+NESTING_WRITE_INPUT = {("post", "comment"): ("--body", "--body-file"),
+                       ("post", "review"): ("--body", "--body-file"),
+                       ("post", "pr"): ("--head", "--base", "--title")}
+
+# Every command here only reads, in the order a caller who named no command would want them: the ones that
+# answer at once before `wait`, which blocks. A word whose commands are all in here can be routed without
+# choosing between reading and writing, because there is no write among them to choose.
+NESTING_READ_FIRST = ("status", "log", "search", "checks", "budget", "audit", "read", "wait")
+
+
+def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) -> bool:
+    """Whether `PARENT WORD TARGET` with the long flags TYPED is a call PARENT could carry out at all.
+
+    The caller's own evidence, not a guess about intent: `post pr` takes OWNER/REPO and refuses without
+    --head, --base and --title, so `glaeda-gh pr o/r#5` is no `post pr` on either count; `post comment`
+    refuses without a body, so a flagless `comment o/r#5` is no write either. Dropping a parent that could
+    only refuse is what leaves `nesting_synonym` with reads alone, and a word it may then route.
+    """
+    if parent != "post":
+        return True
+    if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
+        return False
+    needs = NESTING_WRITE_INPUT.get((parent, word))
+    return not needs or bool({normalized_flag(f) for f in needs} & typed)
+
+
 def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
 
@@ -31902,11 +31937,17 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
     one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
 
-    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    A word more than one command takes, where one of them writes, is *refused*, never guessed: `comment`, `pr` and `run` are each a word
     of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
     would pick between reading and writing. The refusal names every command that takes the word, each as a
     line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
-    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one.
+
+    Two narrowings keep that refusal for the calls it is really about. A parent that could only refuse the
+    call as typed is dropped (`nesting_parent_fits`), and when every parent left only reads there is no
+    read-or-write choice to protect, so the word is routed to the read that answers at once and the blocking
+    sibling is named: `glaeda-gh run o/r/123` and `glaeda-gh pr o/r#5` were each refused with three lines to
+    choose from until 2026-11-22, and each cost the refusal plus the same call typed again under `status`."""
     if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
         return raw, []
     tops, table = nesting_table()
@@ -31920,6 +31961,18 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
         if len(fits) == 1:
             parents = fits
+    if len(parents) > 1:
+        target = next((w for w in raw[1:] if not w.startswith("-")), "")
+        could = [p for p in parents if nesting_parent_fits(p, word, target, typed)]
+        if could:
+            parents = could
+    if len(parents) > 1 and set(parents) <= set(NESTING_READ_FIRST):
+        first = min(parents, key=NESTING_READ_FIRST.index)
+        rest = [p for p in parents if p != first]
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh', first, word] + raw[1:])}` (`{word}` is a word of "
+              f"{len(parents)} commands and every one of them only reads, so this is the one that answers at "
+              f"once; {', '.join(f'`glaeda-gh {p} {word}`' for p in rest)} also reads it)", file=sys.stderr)
+        return [first, word] + raw[1:], []  # said once, here: the single-parent line below would repeat it
     if len(parents) > 1:
         refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
                    f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
