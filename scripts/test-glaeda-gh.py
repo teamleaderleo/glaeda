@@ -54,6 +54,7 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -6306,12 +6307,15 @@ class OverloadTest(Base):
     (2026-10-19, 89 watched PRs): 25 PRs per query took 10-11 s and one of two answered 504; 10 took
     4-6 s and 5 took 2-3 s, all 200, every one costing 1 point. Latency, not cost, sets the limit."""
 
-    def overloaded(self, limit: int | None = None, poison: int | None = None):
+    def overloaded(self, limit: int | None = None, poison: int | None = None, rest_down: bool = False):
         """A transport that answers 504 to a PR query with more than `limit` PRs, or that includes
-        PR `poison` (one PR heavy enough to time out alone)."""
+        PR `poison` (one PR heavy enough to time out alone). REST_DOWN: REST answers 503 to every PR read too, so
+        nothing can read them (a PR GraphQL times out on alone is read over REST instead)."""
         sizes = []
 
         def transport(method, url, headers, body):
+            if rest_down and "/pulls/" in url:
+                return 503, {}, b'{"message": "unavailable"}'
             if url.endswith("/graphql"):
                 doc = json.loads(body)
                 prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
@@ -6360,10 +6364,7 @@ class OverloadTest(Base):
         self.daemon.tick(NOW)
         for key in keys:
             entry = gg.read_cache(key)
-            if key == "pr:o/r#7":
-                self.assertIn("HTTP 504", entry["error"])
-            else:
-                self.assertIsNotNone(entry["data"], key)
+            self.assertIsNotNone(entry["data"], key)  # #7 too: too heavy for GraphQL alone, REST read it
         self.assertEqual(set(self.daemon.heavy), {"pr:o/r#7"})
         self.assertEqual(self.daemon.batch["pr"], 5)  # halved once on this tick, not once per split
         # from now on #7 is read alone and the rest batch normally: one query, not a cascade of splits
@@ -6447,6 +6448,21 @@ class OverloadTest(Base):
                 os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertNotIn("pr:o/r#3", self.daemon.heavy)
+
+    def test_a_pr_too_heavy_for_graphql_alone_is_read_over_rest_every_cycle(self) -> None:
+        # the broker host, 2026-11-22: a PR with 163 checks 504'd alone every time; it was marked heavy and
+        # then nothing read it, so the PR a land was blocked on kept data 14,000+ s old. REST reads it instead.
+        keys = self.watch(6)
+        self.transport(lambda prs: (504, b"{}") if 3 in prs else None)
+        for cycle in range(0, 2 * gg.HEAVY_AFTER + 2):
+            for n in range(1, 7):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+            entry = gg.read_cache("pr:o/r#3")
+            self.assertIsNotNone(entry["data"], cycle)
+            self.assertEqual(entry["dataAt"], NOW + cycle * gg.CYCLE, cycle)  # read on this cycle, alone or backing off
+        self.assertGreaterEqual(self.daemon.heavy["pr:o/r#3"]["fails"], gg.HEAVY_AFTER)
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
     def resource_limited(self, partial, field="statusCheckRollup"):
         """Answer PR queries as GitHub does past its per-query resource limit: 200, with each PR `partial(prs)` names
@@ -6544,7 +6560,7 @@ class OverloadTest(Base):
 
     def test_a_pr_never_read_counts_in_the_oldest_data(self) -> None:
         self.watch(1)
-        self.overloaded(poison=1)
+        self.overloaded(poison=1, rest_down=True)
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["oldestData"]["pr"], 5 * gg.CYCLE)
@@ -6604,7 +6620,7 @@ class OverloadTest(Base):
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
-        self.overloaded(limit=0)  # every PR query fails from now on
+        self.overloaded(limit=0, rest_down=True)  # every PR read fails from now on, GraphQL and REST
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         status = gg.read_json(gg.BASE / "daemon.json")
         self.assertEqual(status["oldestData"]["pr"], 5 * gg.CYCLE)
@@ -22514,6 +22530,9 @@ class LandWorld:
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
+        # `gh api PATH --jq ...` reads by path prefix: what the jq answers (None: the read fails). Unset: exit 0, no
+        # output, which no reader can use (a run read before a rerun: rerun as before)
+        self.api: dict[str, str | None] = {}
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
         # as lane-gh prints it: the broker's whole envelope, indented over many lines
         self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
@@ -22561,6 +22580,11 @@ class LandWorld:
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
                 return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
+            if words[:1] == ["api"] and len(words) > 1:
+                for prefix, out in self.api.items():
+                    if words[1].startswith(prefix):
+                        return subprocess.CompletedProcess(argv, 1 if out is None else 0, f"{out or ''}\n",
+                                                           "HTTP 502" if out is None else "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
@@ -22697,7 +22721,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "block", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -22707,6 +22732,17 @@ class LandTest(Base):
         sent = self.w.sent()[-1]
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
+
+    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
+        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
+        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
         self.pr(LA)
@@ -23586,6 +23622,83 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def stale_api(self, run: int, files: list[str], ahead: int = 3, event: str = "pull_request") -> None:
+        """RUN's merge was built on main at BASE_THEN; main is AHEAD commits past it now, changing FILES."""
+        self.w.api[f"repos/o/r/actions/runs/{run}"] = json.dumps(
+            {"id": run, "event": event, "created_at": "2026-11-22T00:05:00Z",
+             "pull_requests": [{"base": {"ref": "main"}}]})
+        self.w.api["repos/o/r/commits?"] = "b" * 40
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = json.dumps(
+            {"status": "ahead", "ahead_by": ahead, "files": files})
+
+    def test_a_rerun_of_a_merge_the_base_fixed_since_is_a_pinned_base_merge_instead(self):
+        # cmux run 44964926915 attempt 3 (2026-11-22 02:42Z) replayed a 00:05Z merge without base fix 27647ffd3ae
+        # (scripts/ci/api_call_log/env.sh) and failed again: only a new head gets a new merge commit.
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.stale_api(5, ["scripts/ci/api_call_log/env.sh"])
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.assertEqual(e["reruns"], {f"{LA}|5": 1})  # counted against LAND_RERUN_CAP as the rerun was
+        stale = [h for h in e["history"] if h["event"] == "stale_replay"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("scripts/ci/api_call_log/env.sh", stale[0]["why"])
+
+    def assert_rerun_as_before(self) -> None:
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"]])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "stale_replay"], [])
+
+    def test_a_fresh_run_is_rerun_as_before(self):
+        self.stale_api(5, ["src/a.ts"])  # the base moved, off the CI paths and under STALE_REPLAY_BEHIND
+        self.assert_rerun_as_before()
+
+    def test_a_push_run_is_rerun_as_before(self):
+        self.stale_api(5, [".github/workflows/ci.yml"], event="push")
+        self.assert_rerun_as_before()
+
+    def test_an_unread_run_is_rerun_as_before(self):
+        self.w.api["repos/o/r/actions/runs/5"] = None
+        self.assert_rerun_as_before()
+
+    def test_an_unread_compare_is_rerun_as_before(self):
+        self.stale_api(5, ["scripts/ci/x.sh"])
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = None
+        self.assert_rerun_as_before()
+
+    def test_stale_replay_why_is_cmuxterm_hq_stale_replay(self):
+        run = {"id": 9, "event": "pull_request", "created_at": "2026-11-22T00:05:00Z",
+               "pull_requests": [{"base": {"ref": "main"}}]}
+        then = lambda ref, at: "c" * 40
+
+        def cmp(status: str = "ahead", ahead: int = 3, files: tuple = ()) -> Any:
+            return lambda that, ref: {"status": status, "ahead_by": ahead, "files": list(files)}
+
+        self.assertIn("51 commits behind main", gg.stale_replay_why(run, then, cmp(ahead=51)))
+        self.assertIn(".github/workflows/a.yml", gg.stale_replay_why(run, then, cmp(files=(".github/workflows/a.yml",))))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(ahead=50, files=("src/a.ts",))), "")
+        self.assertIn("src/a.ts", gg.stale_replay_why(run, then, cmp(files=("src/a.ts",)), patterns=("src/*",)))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(status="diverged", ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "event": "push"}, then, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99)), "")
+        self.assertIn("main", gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99), default_base="main"))
+        self.assertEqual(gg.stale_replay_why(run, lambda ref, at: None, cmp(ahead=99)), "")
+
+        def boom(*_: Any) -> Any:
+            raise RuntimeError("HTTP 502")
+
+        self.assertEqual(gg.stale_replay_why(run, boom, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why(run, then, boom), "")
+
     # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
     # job failed a test on a local port; a hand rerun was the step.
     RUN = 44118660533
@@ -23633,6 +23746,20 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_an_unrelated_red_on_a_merge_the_base_fixed_since_is_a_pinned_base_merge_once(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.stale_api(self.RUN, ["scripts/ci/api_call_log/env.sh"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["unrelatedReruns"]),
+                         ("waiting", "head_change", [f"{LA}|{self.RUN}"]))
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "stale_replay"], ["stale_replay"])
 
     def test_the_same_red_after_its_one_rerun_stops_own_red_even_after_a_restart(self):
         self.unrelated_world(["webviews/src/a.ts"])
@@ -24241,17 +24368,23 @@ class LandTest(Base):
         self.land("o/r#2", after=["o/r#3"], requester="host/two")
         self.land("o/r#1", after=["o/r#2"], requester="host/one")
         self.w.answers.append(numbered(refusal("block", LC, {"kind": "stop", "stop": "block", "why": "BLOCK"}), 3))
-        self.tick()
-        self.tick()
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick()
+            self.tick()
         es = self.q.entries
         self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
+        # #3's requester is woken by its stop; #2's wait behind it is a log line, never a wake (LandQueue.notify)
         told = {m[3]: m[-1] for m in self.w.sent()}
-        self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
-        self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
-        self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued
+        self.assertEqual(list(told), ["host/three"])
+        quiet = {d["to"]: d["message"] for d in logged if d.get("event") == "land-notice-quiet"}
+        self.assertIn("o/r#3, which it lands after, stopped (block)", quiet["host/two"])
+        self.assertIn("next: glaeda-gh land o/r#3", quiet["host/two"])
+        self.assertNotIn("host/one", quiet)  # #1 waits on #2, which is still queued
+        self.assertIn("after_stopped_waiting", [h.get("event") for h in es["pr:o/r#2"]["history"]])
         for _ in range(5):
             self.tick(600)
-        self.assertEqual(len(self.w.sent()), 2)  # told once, never again while #3 stays stopped
+        self.assertEqual(len(self.w.sent()), 1)  # #3's stop, told once
         # #3 is fixed and landed again: the chain lands in order (one judged at a time, so answers in chain order)
         self.w.answers += [numbered(ok_answer(LC), 3), numbered(ok_answer(LB), 2), numbered(ok_answer(LA), 1)]
         self.land("o/r#3", requester="host/three")
@@ -24732,9 +24865,14 @@ class LandTest(Base):
         self.land("o/r#2", requester="host/two")
         self.land(after=["o/r#2"], requester="host/one")
         self.stop_o_r_2("BLOCK one")
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
         self.tick()
         self.tick(600)
-        to_one = lambda: [m for m in self.w.sent() if m[3] == "host/one"]
+        self.assertFalse([m for m in self.w.sent() if m[3] == "host/one"])  # a wait behind a stop wakes no one
+        to_one = lambda: [d for d in logs if d.get("event") == "land-notice-quiet" and d["to"] == "host/one"]
         self.assertEqual(len(to_one()), 1)
         self.stop_o_r_2("BLOCK two")  # landed again, and stopped again: a new stop
         self.land("o/r#2", requester="host/two")
@@ -25444,7 +25582,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
         self.assertEqual(e["handedOff"]["head"], LA)
         self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
-        self.assertTrue(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
+        # handed off is no wake: the requester hears from huge-blue's queue when it merges or stops
+        self.assertFalse(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
         # nothing more here: no judgment, no step, no second hand-off
         for _ in range(5):
             self.tick(600)
@@ -25966,12 +26105,15 @@ class LandTest(Base):
                 with mock.patch.object(gg, "policy_host", lambda: "host"):
                     self.land(requester="host/lane")
                     self.w.answers.append(refusal(code, LA, {"kind": "retry"}, reason=self.UNREAD))
-                    e = self.tick()
+                    logged: list[dict] = []
+                    with mock.patch.object(gg, "log", logged.append):
+                        e = self.tick()
                 [call] = self.handoffs()
                 self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
                 self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
-                said = [c[-1] for c in self.w.sent() if "handed to huge-blue" in c[-1]]
-                self.assertTrue(said and "could not judge it" in said[0], self.w.sent())
+                self.assertFalse([c for c in self.w.sent() if "handed to huge-blue" in c[-1]], self.w.sent())
+                said = [d["message"] for d in logged if d.get("event") == "land-notice-quiet"]
+                self.assertTrue(said and "handed to huge-blue" in said[0] and "could not judge it" in said[0], logged)
                 for _ in range(3):
                     self.tick(600)
                 self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
@@ -27017,6 +27159,52 @@ class LandTest(Base):
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap (graphql:", gg.land_line(capped[0], self.t, latch=None))
 
+    def test_a_cache_only_judgment_is_not_repeated_while_nothing_it_reads_has_moved(self):
+        """A cache-only judgment reads this host's own caches and sends nothing, so one that missed can only answer
+        differently once something it reads moves. 2026-11-22, one host: 682 of them in 24 h over 118 (repo, PR, head)
+        triples, cmux#46507 probed 139 times at one unmoved head, holding a land worker each time -- the only dedupe
+        compared the host's last charged judgment time, which every *other* entry's live judgment moves. The probe
+        now waits for its own inputs: the head, the daemon's kept read of the PR, its rollup snapshot, and the shared
+        gh cache."""
+        head = "c" * 40
+        self.pr(head)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        self.live_graphql(0, [])  # GraphQL spent to its reserve: every judgment of this entry is cache-only
+        probes: list[bool] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                probes.append("--cache-only" in argv)
+            return real(argv, timeout, env)
+        self.q.run = run
+        e = self.tick(30)
+        self.assertEqual(probes, [True])  # the first probe runs, and the caches miss (cache_answers off)
+        self.assertEqual(e["state"], "waiting")  # its place is kept under the cap, as before
+        self.assertIn("not judged this window: host cap (graphql", gg.land_line(e, self.t, latch=None))
+        missed = e.get("cacheOnlyMissed") or {}
+        self.assertEqual(missed.get("inputs"), self.q.cache_only_inputs(self.KEY, head))
+        # Every other entry's live judgment moves the host's last charged judgment time, which was the whole dedupe.
+        self.q.now = self.t = self.t + 300
+        self.q.window["graphqlAt"] = self.t
+        self.assertFalse(self.q.window_room(e, head))  # nothing this probe reads moved: no second probe
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+        self.assertEqual(e.get("windowCapped", {}).get("pool"), "graphql")  # capped, exactly as before the probe
+        # The daemon read the PR again: its caches may answer differently now, so one more probe is worth its worker.
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e["cacheOnlyJudge"], self.t)
+        self.assertEqual(e["cacheOnlyInputs"], self.q.cache_only_inputs(self.KEY, head))
+        self.assertNotEqual(e["cacheOnlyInputs"], missed["inputs"])
+        # The per-slot bound this gate narrows is still a bound: a miss waits for the next slot even at a new head.
+        e["cacheOnlyMissed"] = {"start": self.t, "at": self.t, "inputs": e.pop("cacheOnlyInputs")}
+        self.assertFalse(self.q.window_room(e, "d" * 40))
+        self.q.now = self.t = self.t + 300
+        self.q.window["graphqlAt"] = self.t
+        self.assertTrue(self.q.window_room(e, "d" * 40))  # a new slot and a new head: judged from the caches
+
     def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
         """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
         The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the
@@ -27553,6 +27741,28 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--sha {LC}", e["stop"]["next"])
 
+    def test_a_pinned_row_whose_fresh_cached_head_moved_stops_without_a_worker(self):
+        """A cache read since the pin that shows another head stops the row on the cache look (retire_from_cache), with
+        no worker, judgment or GitHub call: rows gated behind busy workers or the load line sat open on moved heads.
+        A copy older than the pin, and a head the queue's own update-branch made, stop nothing."""
+        self.nudge_reads = False  # nothing reads the PR here but the cache writes below
+        self.pr(LA)
+        self.land_pinned(LB)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        self.assertNotEqual(e["state"], "stopped")
+        calls = len(self.w.calls)
+        with self.q.lock:
+            self.assertFalse(self.q.retire_from_cache(e))  # LA was cached before the pin: proves nothing
+        self.w.set_pr(self.KEY, land_pr(LC), self.t + 5)
+        with self.q.lock:
+            self.assertFalse(self.q.retire_from_cache({**e, "updateSent": {"head": LB}}))  # pin_follow's case
+            self.assertTrue(self.q.retire_from_cache(e))
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {LC}", e["stop"]["next"])
+        self.assertEqual([c for c in self.w.calls[calls:] if "gh" in c or "explain" in c], [])  # only the notice
+        self.assertEqual(self.w.explains(), [])
+
     def test_a_stale_cached_head_never_stops_a_newer_pin_as_head_moved(self):
         """The cache is stale and the pin is newer: judge()'s head_moved compares the pin with the cached head, so
         before pin_wait the land stopped head_moved on a head GitHub no longer has. No stop until a read since the
@@ -27871,13 +28081,15 @@ class LandTest(Base):
         self.tick(30)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
-        sent = self.w.sent()
-        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        # "nothing to do" is a log line, never a wake (LandQueue.notify)
+        self.assertEqual(self.w.sent(), [])
+        sent = [(d["to"], d["message"]) for d in logs if d.get("event") == "land-notice-quiet"]
+        self.assertEqual(sorted(s[0] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        # The line quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
         self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
                             and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
-        self.assertEqual(len(self.w.sent()), 3, "told once")
+        self.assertEqual(len([d for d in logs if d.get("event") == "land-notice-quiet"]), 3, "said once")
         # The next clear: at once, past no spread, oldest wake first
         self.retries(3)
         self.tick(reset2 + 1 - self.t)
@@ -29002,6 +29214,38 @@ class LandTest(Base):
             self.assertTrue(self.q.load_room())  # a host that does not say its load admits
         self.q.jobs.clear()
 
+    def test_the_load_line_reads_busy_cpu_not_the_run_queue(self):
+        """huge-blue, 2026-11-22 07:00Z: load 1.11/core over the 0.8 line held 362 lands while a lane VM read
+        0.66/core at 92% idle: loadavg counts threads blocked on IO. Where /proc/stat reads, the line is the busy CPU
+        share since the last sample; before two samples, or with no /proc/stat, the load average stands in."""
+        samples = iter([(100, 1000), (110, 1100), (190, 1200)])
+        clock = iter([0.0, 2.0, 2.5, 5.0])
+        with mock.patch.dict(gg._LAND_CPU, clear=True):
+            read = lambda: next(samples)
+            now = lambda: next(clock)
+            self.assertIsNone(gg.land_cpu_busy(read, now))  # one sample: no share yet
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # 10 busy of 100: 10%, though the load is high
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # within LAND_CPU_SAMPLE_S: reused, not re-read
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.8)  # 80 of 100
+        with mock.patch.dict(gg._LAND_CPU, clear=True), \
+                mock.patch.object(gg, "land_cpu_busy", return_value=0.1), \
+                mock.patch.object(gg.os, "getloadavg", return_value=(40.0, 0, 0)):
+            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.1)
+        with mock.patch.object(gg, "land_cpu_busy", return_value=None), \
+                mock.patch.object(gg.os, "getloadavg", return_value=(8.0, 0, 0)):
+            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
+
+    def test_proc_stat_counts_idle_iowait_and_nice_as_not_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stat")
+            with open(p, "w") as f:
+                f.write("cpu  10 2 3 50 30 1 1 3 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n")
+            self.assertEqual(gg.proc_stat_cpu(p), (18, 100))  # 10 user + 3 system + 1 + 1 + 3 steal; nice 2 is not
+            with open(p, "w") as f:
+                f.write("intr 1 2\n")
+            self.assertIsNone(gg.proc_stat_cpu(p))
+        self.assertIsNone(gg.proc_stat_cpu(os.path.join(d, "gone")))
+
     def test_a_row_one_merge_away_starts_over_the_load_line(self):
         """huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores, busy=1 of workers=12, and green pinned PRs sat "the
         host's load is over the line" for hours (cmuxterm-hq#17398 waited 9168 s) until merged by hand. A row the
@@ -29049,7 +29293,7 @@ class LandTest(Base):
             e = self.tick(gg.LAND_DUE_LATE + 1)
         self.assertEqual(e["dueLate"]["why"], "the host's load is over the line")
 
-        def capped(entry):
+        def capped(entry, sha=""):
             entry["windowCapped"] = {"pool": "graphql"}
             return False
         with mock.patch.object(gg, "land_load_per_core", return_value=0.48), \
