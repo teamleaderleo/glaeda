@@ -1197,6 +1197,14 @@ PULL_REUSE_MAX = 300
 # required check passing before its workflow ends) shows within PR_REST_FULL_EVERY rather than the next cycle. Only
 # the REST route: GraphQL's rollup is one read already.
 PR_REST_FULL_EVERY = 300
+# A failed head with every check finished (settled) passes the same gate for this long after its last full read: its
+# check runs can change only through a suite (a rerun queues the suite again, a new push is a new head the pull and
+# issue show), so the gate's three reads see every change a full read would. Under a backlog no read came within
+# PR_REST_FULL_EVERY of the last, so every read was a full one: huge-blue 2026-11-22 00:05Z, 650 waited PRs (609 of
+# them land's, the oldest five all failed heads), GraphQL stopped, 33-43 PR reads per 600 s at ~12 requests a read,
+# and the oldest waited PR 13701 s unread. Only failed heads: a green one is about to merge, and its full read
+# re-reads the pull whose merge state a land rules on.
+PR_REST_SETTLED_FULL_EVERY = 1800
 PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in full
 # A wait on a PR read over REST that has run LONG_WAIT_AFTER is read every LONG_WAIT_FACTOR cycles (a check event the
 # controller delivers still reads it at once): a cmux wait runs 30-60 minutes, and its last minutes decide nothing the
@@ -9653,8 +9661,9 @@ class Daemon:
             # running is not settled; review F1)
             settled_head = (was.get("headRefOid") == sha and bool(was.get("checks"))
                             and all(str(c.get("status") or "").upper() == "COMPLETED" for c in was.get("checks") or []))
-            if sha and not settled_head:
+            if sha and (not settled_head or was.get("checkState") == "FAILURE"):
                 # the gate's baseline, read before the check runs so a suite finishing meanwhile reads as a change
+                # (a settled failed head's too: PR_REST_SETTLED_FULL_EVERY gates it on its suites)
                 with contextlib.suppress(WatchError):
                     self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
@@ -9701,10 +9710,19 @@ class Daemon:
         data = prior.get("data") if isinstance(prior.get("data"), dict) else None
         full = prior.get("restFullAt")
         if (data is None or e.get("jobs") or prior.get("via") != "rest" or prior.get("error")
-                or not isinstance(full, (int, float)) or isinstance(full, bool) or self.now - full >= PR_REST_FULL_EVERY
-                or str(data.get("state") or "").upper() != "OPEN" or data.get("checkState") not in ("PENDING", "FAILURE")
-                or not any(str(c.get("status") or "").upper() != "COMPLETED" for c in data.get("checks") or [])
-                or not data.get("headRefOid") or self.mode("rest") == "stop"):
+                or not isinstance(full, (int, float)) or isinstance(full, bool)
+                or str(data.get("state") or "").upper() != "OPEN" or not data.get("headRefOid")
+                or self.mode("rest") == "stop"):
+            return False
+        checks = data.get("checks") or []
+        running = any(str(c.get("status") or "").upper() != "COMPLETED" for c in checks)
+        if running and data.get("checkState") in ("PENDING", "FAILURE"):
+            bound = PR_REST_FULL_EVERY
+        elif checks and not running and data.get("checkState") == "FAILURE":
+            bound = PR_REST_SETTLED_FULL_EVERY  # a settled failed head
+        else:
+            return False
+        if self.now - full >= bound:
             return False
         sha = str(data["headRefOid"])
         issue_path, pull_path = f"{root}/issues/{number}", f"{root}/pulls/{number}"

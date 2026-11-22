@@ -17657,6 +17657,8 @@ class DaemonPolicyTest(Base):
         self.daemon.now = NOW
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
+        # REST reads a PR as fast as GraphQL here (measured), so quota decides (route's readSeconds, #2393)
+        self.daemon.read_secs = [(NOW - 10, "pr", b, 0.5, 1) for b in ("rest", "graphql")] * gg.READ_SECONDS_MIN_READS
         self.assertEqual(self.daemon.route("pr"), "rest")  # REST is far richer
         self.assertEqual(self.daemon.mode("rest"), "normal")
         self.spend_rest(2000 - gg.REST_READ_MAX["pr"])
@@ -20219,6 +20221,70 @@ class CmuxWaitsRestCostTest(Base):
         after = len(self.gh.calls)
         self.daemon.tick(t)
         self.assertFalse([c for c in self.gh.calls[after:] if "/4cmux" in c[1] and "/check-runs" in c[1]])
+
+    def touch_all(self, t: float) -> None:
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/cmux#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+
+    def test_a_settled_failed_head_is_gated_past_the_running_bound_until_its_suite_moves(self) -> None:
+        """huge-blue 2026-11-22 00:05Z: 650 waited PRs over REST, the oldest all failed heads, each read in full
+        (~12 requests) because no read came within PR_REST_FULL_EVERY of the last. A settled failed head passes the
+        gate for PR_REST_SETTLED_FULL_EVERY; a rerun (its suite queued again) still reads it in full."""
+        for i, c in enumerate(self.contexts(1)):
+            c.update(status="COMPLETED", conclusion="FAILURE" if i == 5 else "SUCCESS")  # (run_over_rest sets 0)
+        self.gh.prs[("o", "cmux", 1)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        self.run_over_rest(minutes=1)
+        self.assertEqual(gg.read_cache("pr:o/cmux#1")["data"]["checkState"], "FAILURE")
+        # the fixture's bot comment moved the issue past the kept pull's PULL_REUSE_MAX: one full read takes it in
+        t = NOW + gg.PR_REST_FULL_EVERY + gg.CYCLE
+        self.touch_all(t)
+        self.daemon.tick(t)
+        t += gg.PR_REST_FULL_EVERY + 10 * gg.CYCLE  # past the running bound, inside the settled one
+        self.assertLess(t - gg.read_cache("pr:o/cmux#1")["restFullAt"], gg.PR_REST_SETTLED_FULL_EVERY)
+        self.touch_all(t)
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        asked = [c[1] for c in self.gh.calls[after:] if "/1cmux" in c[1] or c[1].endswith(("/cmux/issues/1", "/cmux/pulls/1"))]
+        self.assertTrue(asked, "the settled head was not read at all")
+        self.assertFalse([u for u in asked if "/check-runs" in u or "/actions/runs" in u], asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#1")["dataAt"], t, "a gated read is a read as of now")
+        # a rerun of the failed job: its suite is running again, so the head is read in full
+        self.contexts(1)[5].update(status="IN_PROGRESS", conclusion=None)
+        t += 5 * gg.CYCLE
+        self.touch_all(t)
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertTrue([c for c in self.gh.calls[after:] if "/1cmux" in c[1] and "/check-runs" in c[1]], [c[1] for c in self.gh.calls[after:]])
+        # past the settled bound a settled failed head is read in full again
+        for c in self.contexts(1):
+            c.update(status="COMPLETED", conclusion="FAILURE")
+        t += 5 * gg.CYCLE
+        self.touch_all(t)
+        self.daemon.tick(t)
+        t += gg.PR_REST_SETTLED_FULL_EVERY
+        self.touch_all(t)
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertTrue([c for c in self.gh.calls[after:] if "/1cmux" in c[1] and "/check-runs" in c[1]])
+        full = [c[1] for c in self.gh.calls[after:] if "/1cmux" in c[1] or c[1].endswith(("/cmux/issues/1", "/cmux/pulls/1"))
+                or "/cmux/actions/" in c[1] or "/cmux/rules/" in c[1]
+                or "/cmux/branches/" in c[1]]
+        print(f"\nHARNESS settled failed cmux head ({self.CHECKS} checks) past PR_REST_FULL_EVERY: gated read "
+              f"{len(asked)} requests, full read {len(full)}", file=sys.stderr)
+        self.assertLessEqual(len(asked), 3, asked)
+
+    def test_a_settled_green_head_is_not_gated(self) -> None:
+        for c in self.contexts(2):
+            c.update(status="COMPLETED", conclusion="SUCCESS")
+        self.gh.prs[("o", "cmux", 2)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "SUCCESS"
+        self.run_over_rest(minutes=1)
+        t = NOW + gg.PR_REST_FULL_EVERY + 10 * gg.CYCLE
+        self.touch_all(t)
+        after = len(self.gh.calls)
+        self.daemon.tick(t)
+        self.assertTrue([c for c in self.gh.calls[after:] if "/2cmux" in c[1] and "/check-runs" in c[1]])
 
     def test_a_jobs_watch_is_never_gated(self) -> None:
         self.run_over_rest(minutes=1)
