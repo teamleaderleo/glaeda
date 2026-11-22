@@ -3006,6 +3006,15 @@ def app_graphql_refused(message: str) -> bool:
     return "NOT_FOUND" in APP_POOL_ANSWERED_NOT_FOUND.sub("", message)
 
 
+# A branch's rule or protection read is one route family of its repository: the App lacks administration for every
+# branch alike, and a lane branch has a path of its own (the broker host, 2026-11-22: a 403 for each of
+# rules/branches/main, .../lane/a, .../lane/b, each an App request and a login retry).
+APP_POOL_BRANCH_ROUTES = (
+    (re.compile(r"^(/repos/[^/]+/[^/]+)/rules/branches/.+$"), "/rules/branches/*"),
+    (re.compile(r"^(/repos/[^/]+/[^/]+)/branches/.+/protection(?:/.*)?$"), "/branches/*/protection"),
+)
+
+
 def app_pool_tool() -> Path | None:
     """gh_app_token.py beside the gh-quota shim's gh_quota.py (leo-workspace tools/), or None."""
     with contextlib.suppress(OSError, RuntimeError):
@@ -3187,7 +3196,10 @@ class AppPool:
 
     @staticmethod
     def scope(owner: str, method: str, path: str, body: dict | None = None) -> str:
-        """Key a refusal to the installation and resource that produced it, never the whole owner pool."""
+        """Key a refusal to the installation and resource that produced it, never the whole owner pool. A GraphQL
+        scope names its repositories sorted ("graphql:OWNER:a,b"), so the same set is one key in any order, and
+        covers()/answered() weigh each repository alone. A REST branch rule or protection read is keyed to its
+        repository and route family, not each branch's own path (APP_POOL_BRANCH_ROUTE)."""
         if path == "/graphql":
             repos = set()
             for key, value in (body or {}).get("variables", {}).items():
@@ -3197,12 +3209,35 @@ class AppPool:
                     match = APP_POOL_GRAPHQL_URL.match(value)
                     if match:
                         repos.add(match.group(2).lower())
-            return "graphql:" + owner + (":" + ",".join(repos) if repos else "")
-        return f"{method} {path.split('?', 1)[0]}"
+            return "graphql:" + owner + (":" + ",".join(sorted(repos)) if repos else "")
+        bare = path.split("?", 1)[0]
+        for pattern, family in APP_POOL_BRANCH_ROUTES:
+            match = pattern.match(bare)
+            if match:
+                return f"{method} {match.group(1)}{family}"
+        return f"{method} {bare}"
+
+    @staticmethod
+    def graphql_repos(scope: str) -> tuple[str, list[str]]:
+        """("OWNER", [repo, ...]) of a GraphQL scope; ("", []) for any other."""
+        if not scope.startswith("graphql:"):
+            return "", []
+        owner, _, repos = scope[len("graphql:"):].partition(":")
+        return owner, [r for r in repos.split(",") if r]
 
     def covers(self, scope: str) -> bool:
-        """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks)."""
-        return self.unreadable.get(scope, 0.0) <= self.clock()
+        """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks). A GraphQL chunk is
+        covered unless one of its own repositories is benched (a set is never benched as a set)."""
+        now = self.clock()
+        if self.unreadable.get(scope, 0.0) > now:
+            return False
+        owner, repos = self.graphql_repos(scope)
+        return not any(self.unreadable.get(f"graphql:{owner}:{r}", 0.0) > now for r in repos)
+
+    def named_repos(self, scope: str, message: str) -> list[str]:
+        """The repositories of GraphQL SCOPE that MESSAGE (an answer's error text) names, as a whole word."""
+        _, repos = self.graphql_repos(scope)
+        return [r for r in repos if re.search(rf"(?<![\w.-]){re.escape(r)}(?![\w.-])", message, re.I)]
 
     def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
         """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
@@ -3225,7 +3260,16 @@ class AppPool:
             self.fell_back += 1
             return False
         if status in {403, 404} or (status == 200 and app_graphql_refused(message)):
-            self.unreadable[scope] = now + APP_POOL_ROUTE_REST
+            owner_, repos = self.graphql_repos(scope)
+            if len(repos) > 1:
+                # A refused multi-repository chunk benches only the repositories its errors name; one that names none
+                # benches nothing (the caller reads per repository, batched() chunks by repository, so the next
+                # asks the App again). The broker host, 2026-11-22: sets "cmux,cmuxterm-hq" and "cmuxterm-hq,cmux"
+                # were each benched an hour as sets while the App held 12,234 of 12,500 points.
+                for repo in self.named_repos(scope, message):
+                    self.unreadable[f"graphql:{owner_}:{repo}"] = now + APP_POOL_ROUTE_REST
+            else:
+                self.unreadable[scope] = now + APP_POOL_ROUTE_REST
             self.fell_back += 1
             return False
         if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
@@ -6321,7 +6365,8 @@ class Daemon:
                 self.note_spend("rest", route, 0)
                 self.sent.append((self.now, "app"))
                 return status, h, doc
-            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status})
+            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status, "route": route,
+                 "scope": scope, "error": message[:200]})
             if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
                 # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
                 return self.request(method, path, body, etag, free, content)
@@ -8858,7 +8903,7 @@ class Daemon:
         manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
         groups: dict[str, list[dict]] = {}
         for e in entries:
-            groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+            groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)  # owner/repo: a benched repo alone
         if len(groups) < 2:
             return self.app_entries_eligible(kind, entries, bucket)
         ok = {e["key"] for g in groups.values() for e in self.app_entries_eligible(kind, g, bucket)}
@@ -8897,9 +8942,11 @@ class Daemon:
             # watches interleaved at GQL_BATCH 15, so 108 of the hour's 163 login GraphQL points were spent by
             # cross-owner batches and only 5 by a manaflow-ai batch an App could take. Grouping costs one query per
             # owner (a query is a point at most, and an App's costs the login nothing).
+            # And one repository per query: a refused query benches the repositories its errors name, and one that names
+            # none benches nothing, so a mixed chunk's refusal would cost the App's whole set another try each tick.
             groups: dict[str, list[dict]] = {}
             for e in rest:
-                groups.setdefault(split_key(e["key"])[1].lower(), []).append(e)
+                groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])

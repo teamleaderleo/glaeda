@@ -30973,6 +30973,74 @@ class AppPoolTest(Base):
             self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
         self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
 
+    @staticmethod
+    def gql_body(*repos: str) -> dict:
+        return {"query": "query { x }", "variables": {f"{p}{i}": v for i, r in enumerate(repos)
+                                                        for p, v in (("o", "manaflow-ai"), ("r", r), ("n", 1))}}
+
+    def refuse(self, scope: str, status: int, message: str) -> bool:
+        return self.pool.answered("manaflow-ai", scope, status, {"x-ratelimit-remaining": "12000",
+                                                                 "x-ratelimit-reset": str(int(NOW + 900))}, message)
+
+    def test_a_refused_multi_repo_graphql_chunk_benches_the_repos_its_errors_name_never_the_set(self) -> None:
+        """The broker host, 2026-11-22: "cmux,cmuxterm-hq" and "cmuxterm-hq,cmux" were each benched an hour as sets
+        while the App held 12,234 of 12,500 points, and every PR read went on the login's pace."""
+        scope = lambda *repos: self.pool.scope("manaflow-ai", "POST", "/graphql", self.gql_body(*repos))
+        self.assertEqual(scope("cmux", "cmuxterm-hq"), scope("cmuxterm-hq", "cmux"), "one key in any order")
+        self.assertFalse(self.refuse(scope("cmux", "cmuxterm-hq"), 200, "NOT_FOUND Could not resolve to a Repository "
+                                                                    "with the name 'manaflow-ai/cmuxterm-hq'."))
+        for mix in (("cmux",), ("cmux", "other"), ("other", "cmux")):
+            self.assertIs(self.pool.pick("manaflow-ai", scope(*mix)), self.pool, f"{mix} still on the App")
+        for mix in (("cmuxterm-hq",), ("cmux", "cmuxterm-hq"), ("cmuxterm-hq", "cmux"), ("other", "cmuxterm-hq")):
+            self.assertIsNone(self.pool.pick("manaflow-ai", scope(*mix)), f"{mix} holds the benched repo")
+
+    def test_a_refused_multi_repo_graphql_chunk_naming_no_repo_benches_nothing(self) -> None:
+        scope = lambda *repos: self.pool.scope("manaflow-ai", "POST", "/graphql", self.gql_body(*repos))
+        self.assertFalse(self.refuse(scope("cmux", "cmuxterm-hq"), 200, "FORBIDDEN Resource not accessible"))
+        for mix in (("cmux",), ("cmuxterm-hq",), ("cmux", "cmuxterm-hq"), ("cmuxterm-hq", "cmux")):
+            self.assertIs(self.pool.pick("manaflow-ai", scope(*mix)), self.pool, f"{mix} still on the App")
+        self.assertFalse(self.refuse(scope("cmux"), 200, "FORBIDDEN Resource not accessible"))
+        self.assertIsNone(self.pool.pick("manaflow-ai", scope("cmux")), "a one-repo refusal benches that repo")
+
+    def test_a_batch_is_one_repo_per_query_so_a_benched_repo_holds_only_its_own_entries(self) -> None:
+        keys = [f"pr:manaflow-ai/{r}#{i}" for i in range(1, 4) for r in ("cmux", "cmuxterm-hq")]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        for chunk in sent:
+            self.assertEqual(len({k.split("#")[0] for k in chunk}), 1, f"one repo per query: {chunk}")
+        self.assertEqual(sorted(k for c in sent for k in c), sorted(keys))
+        self.pool.unreadable["graphql:manaflow-ai:cmuxterm-hq"] = NOW + 600
+        got = self.daemon.app_eligible_by_owner("pr", entries, "graphql")
+        self.assertEqual([e["key"] for e in got], [k for k in keys if "/cmux#" in k])
+
+    def test_a_branch_rule_or_protection_refusal_is_one_route_family_of_its_repo(self) -> None:
+        """A 403 for each of rules/branches/main, .../lane/a, .../lane/b: each branch had its own scope, so each cost an
+        App request and a login retry."""
+        s = lambda path: self.pool.scope("manaflow-ai", "GET", path)
+        base = "/repos/manaflow-ai/cmuxterm-hq"
+        self.assertEqual(s(f"{base}/rules/branches/main"), s(f"{base}/rules/branches/lane/a?x=1"))
+        self.assertEqual(s(f"{base}/branches/main/protection"), s(f"{base}/branches/lane/b/protection/required_status_checks"))
+        self.assertNotEqual(s(f"{base}/rules/branches/main"), s(f"{base}/branches/main/protection"))
+        self.assertNotEqual(s(f"{base}/rules/branches/main"), s("/repos/manaflow-ai/cmux/rules/branches/main"))
+        self.assertFalse(self.refuse(s(f"{base}/rules/branches/main"), 403, "Resource not accessible by integration"))
+        self.assertIsNone(self.pool.pick("manaflow-ai", s(f"{base}/rules/branches/lane/other")))
+        self.assertIs(self.pool.pick("manaflow-ai", s(f"{base}/pulls/1")), self.pool)
+        self.assertIs(self.pool.pick("manaflow-ai", s("/repos/manaflow-ai/cmux/rules/branches/main")), self.pool)
+
+    def test_the_refusal_event_names_its_route_and_the_first_of_the_error(self) -> None:
+        self.app_answers.append((200, {}, json.dumps({"errors": [{"type": "NOT_FOUND", "message": "x" * 300}]}).encode()))
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.request("POST", "/graphql", query)
+        event = next(json.loads(l) for l in out.getvalue().splitlines() if '"app-pool-refused"' in l)
+        self.assertEqual(event["route"], "POST /graphql")
+        self.assertEqual(event["scope"], "graphql:manaflow-ai:cmux")
+        self.assertEqual(event["error"], "NOT_FOUND " + "x" * 190)
+
     def test_with_the_login_graphql_stopped_app_prs_still_go_on_the_app_graphql(self) -> None:
         """2026-11-22 03:26Z, one host: the login's GraphQL stopped, route() sent every PR over REST, one read each, and
         29 PRs were stored in 600 s while the App's GraphQL sat unspent. The App's PRs go to its GraphQL in batches;
