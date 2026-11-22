@@ -10815,7 +10815,7 @@ class WaitSubscriptionTest(Base):
         self.daemon.serve_waits()
         self.assertEqual(self.woken(reader), "0\n")
         out = (gg.waits_dir() / f"{rid}.out").read_text()
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a decided request stayed")
 
     def test_a_red_or_a_timeout_says_what_cmd_wait_says(self) -> None:
@@ -10922,7 +10922,7 @@ class WaitSubscriptionTest(Base):
                 child.kill()
                 child.wait()
         self.assertEqual(child.returncode, 0, out + err)
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
 
     def test_an_older_daemon_gets_the_polling_wait(self) -> None:
@@ -33510,7 +33510,8 @@ class ShorthandFlagTest(unittest.TestCase):
 
     def test_wait_until_forms_unchanged(self):
         args, err = self.parse(["wait", "pr", "o/r#1"])
-        self.assertEqual((args.until, err), ("green", ""))
+        # unset, so main can tell "no --until" (green, or merged for a PR glaeda land holds: wait_until_chosen)
+        self.assertEqual((args.until, err), (None, ""))
         for word in ("green", "done", "required", "merged"):
             with self.subTest(word=word):
                 args, err = self.parse(["wait", "pr", "o/r#1", "--until", word])
