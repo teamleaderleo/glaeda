@@ -4211,6 +4211,36 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("admitted busy", other.stdout)
         self.finish("s3")
 
+    def test_a_fast_tier_job_behind_an_older_units_waiter_runs_busy_not_refused(self) -> None:
+        """FAST_TIER_BUSY (hq#17742): the fast tier behind an older job waiting here for units (fair_turn's "has
+        waited longer here for units", run 45042885544 on ultra2, 16:22Z) is admitted busy past FAST_TIER_WAIT, not
+        refused; the waiter keeps its turn for the units. Only a waiting nightly job still refuses it."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"],
+                                      "who": "ultra2-glaeda fill-main-test (run 45042885544)"}) + "\n")
+        try:
+            busy = self.job("fast-tier", "s0", 14, None, env=self.FAST_TIER)
+            self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+            self.assertIn("(ultra2-glaeda fill-main-test (run 45042885544) has waited longer here for units);"
+                          " admitted busy", busy.stdout)
+            self.assertIn("holding 0/14 units for fast-tier (isolated", busy.stdout)
+            self.assertTrue(hook.probe(capacity / "unit-0"), "the waiter's units stay free for its turn")
+        finally:
+            self.finish("s0")
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"], "tier": hook.TIER_NIGHTLY,
+                                      "who": "cmux14-glaeda-2 build (run 1)"}) + "\n")
+        try:
+            nightly = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
+            self.assertEqual(nightly.returncode, 1, nightly.stdout)
+            self.assertIn("is a nightly job and goes first here for units", nightly.stdout)
+            self.assertNotIn("admitted busy", nightly.stdout)
+        finally:
+            marker.unlink()
+            self.finish("s1")
+
     def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
         """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
         caught the fast tier with 4 of 14 free while its admission asked for its own p90 (8) and was refused after 60
