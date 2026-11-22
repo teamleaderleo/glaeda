@@ -3138,9 +3138,11 @@ class AppPool:
 # f***ing huge blue anyway". Everything the token cannot read (heads, comments, a refused route, a repo the broker
 # mints nothing for) still goes upstream, and every write still goes through the broker. upstream.json
 # "readToken": [...] names the program (`ARGV OWNER/REPO {}` answering {token, expires_at}); false turns it off.
-# 0600 in APP_POOL_DIR beside the pushed read-only App tokens, never in BASE (the cache holds no token): one broker
-# mint per repo, shared by this host's processes (the daemon, a wait's or a land's direct read)
-READ_TOKEN_FILE = "lane-read-tokens.json"
+# Kept where lane-gh's own direct reads keep it (leo-workspace#7651: TOKEN_DIR/OWNER__REPO.json, 0600, {token,
+# expires_at, refresh_before_s}), never in BASE (the cache holds no token): one broker mint per repo, shared by this
+# host's processes (the daemon, a wait's or a land's direct read, and lane-gh's own GETs). A file others can read is
+# never used.
+READ_TOKEN_DIR = Path(os.environ.get("LANE_GH_DIRECT_TOKEN_DIR") or Path.home() / ".cache/lane-gh/read-tokens")
 READ_TOKEN_MIN_LEFT = 600.0  # a token closer than this to expires_at is minted again (the broker's own margin)
 READ_TOKEN_REST = 900.0  # a repo the broker minted nothing for is not asked again for this long
 READ_TOKEN_DEADLINE = 30.0  # one mint through the broker
@@ -3189,7 +3191,7 @@ def read_token_mint(command: list[str], repo: str) -> tuple[str, float] | None:
 class ReadTokenPool(AppPool):
     """The broker's read tokens as an AppPool keyed by repository ("owner/repo", lowercase), for GETs of that
     repository only: Daemon.request sends a read with it and, on a refusal, asks the login, which a lane VM has
-    none of (read_direct then leaves the key to the upstream). Kept in READ_TOKEN_FILE so a wait's direct read
+    none of (read_direct then leaves the key to the upstream). Kept in READ_TOKEN_DIR so a wait's direct read
     (its own process) reuses the daemon's token instead of asking the broker again."""
 
     def __init__(self, command: list[str], clock: Callable[[], float] = time.time,
@@ -3203,19 +3205,34 @@ class ReadTokenPool(AppPool):
         m = READ_TOKEN_REPO.match(path) if method == "GET" else None
         return m.group(1).lower() if m else None
 
-    def held(self) -> dict:
-        doc = read_json(APP_POOL_DIR / READ_TOKEN_FILE)
-        return doc if isinstance(doc, dict) else {}
+    @staticmethod
+    def kept_path(repo: str) -> Path:
+        return READ_TOKEN_DIR / (repo.lower().replace("/", "__") + ".json")
+
+    def held(self, repo: str) -> tuple[str, float] | None:
+        """REPO's kept token and the time to mint again (expires_at less its refresh margin), or None."""
+        path = self.kept_path(repo)
+        try:
+            if path.stat().st_mode & 0o077:
+                return None
+        except OSError:
+            return None
+        doc = read_json(path)
+        if not isinstance(doc, dict) or not TOKEN_RE.fullmatch(str(doc.get("token") or "")):
+            return None
+        expires = iso_epoch(str(doc.get("expires_at") or ""))
+        margin = doc.get("refresh_before_s")
+        margin = float(margin) if isinstance(margin, (int, float)) and margin >= 0 else READ_TOKEN_MIN_LEFT
+        return (str(doc["token"]), expires - margin) if expires is not None else None
 
     def keep(self, repo: str, pair: tuple[str, float] | None) -> None:
+        path = self.kept_path(repo)
         with contextlib.suppress(OSError):
-            doc = self.held()
             if pair is None:
-                doc.pop(repo, None)
+                path.unlink(missing_ok=True)
             else:
-                doc[repo] = {"token": pair[0], "expiresAt": pair[1]}
-            write_json(APP_POOL_DIR / READ_TOKEN_FILE, {k: v for k, v in doc.items() if isinstance(v, dict)
-                                                and float(v.get("expiresAt") or 0) > self.clock()})
+                write_json(path, {"token": pair[0], "refresh_before_s": int(READ_TOKEN_MIN_LEFT),
+                                  "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(pair[1]))})
 
     def token(self, owner: str) -> str | None:
         now = self.clock()
@@ -3224,11 +3241,10 @@ class ReadTokenPool(AppPool):
         held = self.tokens.get(owner)
         if held and held[1] > now:
             return held[0]
-        kept = self.held().get(owner)
-        if isinstance(kept, dict) and TOKEN_RE.fullmatch(str(kept.get("token") or "")) \
-                and float(kept.get("expiresAt") or 0) - READ_TOKEN_MIN_LEFT > now:
-            self.tokens[owner] = (str(kept["token"]), float(kept["expiresAt"]) - READ_TOKEN_MIN_LEFT)
-            return self.tokens[owner][0]
+        kept = self.held(owner)
+        if kept is not None and kept[1] > now:
+            self.tokens[owner] = kept
+            return kept[0]
         pair = self.mint_pair(owner)
         if pair is None or pair[1] - READ_TOKEN_MIN_LEFT <= now:
             self.why = f"the broker minted no read token for {owner}"
@@ -3248,7 +3264,7 @@ class ReadTokenPool(AppPool):
 def read_token_reader(key: str) -> "Daemon | None":
     """A wait's or a land's direct read of KEY's repository with this host's read token (read_token_daemon), or None
     when there is none: the read then goes through the broker's GET as before. A token the broker minted for the
-    daemon is reused (READ_TOKEN_FILE), so this asks the broker nothing then."""
+    daemon is reused (READ_TOKEN_DIR), so this asks the broker nothing then."""
     command = read_token_command()
     if command is None:
         return None

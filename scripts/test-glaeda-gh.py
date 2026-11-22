@@ -31655,11 +31655,24 @@ class LaneReadTokenTest(UpstreamTest):
 
         self.daemon.read_token_source = gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=mint)
         self.daemon.read_transport = github
-        gg.APP_POOL_DIR.mkdir(parents=True, exist_ok=True)
-        self.addCleanup(lambda: (gg.APP_POOL_DIR / gg.READ_TOKEN_FILE).unlink(missing_ok=True))
+        saved = gg.READ_TOKEN_DIR
+        gg.READ_TOKEN_DIR = Path(tempfile.mkdtemp(prefix="glaeda-read-tokens-"))
+        self.addCleanup(shutil.rmtree, gg.READ_TOKEN_DIR, True)
+        self.addCleanup(setattr, gg, "READ_TOKEN_DIR", saved)
 
     def upstream_keys(self) -> list[str]:
         return sorted(k["key"] for r in self.asked for k in r["keys"])
+
+    def test_a_token_lane_gh_kept_is_used_and_one_others_can_read_is_not(self) -> None:
+        kept = gg.READ_TOKEN_DIR / "o__r.json"  # as lane-gh's direct GET writes it (leo-workspace#7651)
+        doc = {"token": self.READ, "app": "lanes-read", "refresh_before_s": 300,
+               "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 3600))}
+        kept.write_text(json.dumps(doc))
+        kept.chmod(0o600)
+        pool = gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=lambda repo: self.fail("minted with one kept"))
+        self.assertEqual(pool.token("o/r"), self.READ)
+        kept.chmod(0o644)
+        self.assertEqual(gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=lambda repo: None).token("o/r"), None)
 
     def test_a_watched_run_is_read_with_the_read_token_and_not_sent_upstream(self) -> None:
         self.gh.runs[9] = {"id": 9, "status": "in_progress"}
@@ -31675,8 +31688,9 @@ class LaneReadTokenTest(UpstreamTest):
         for path in gg.BASE.rglob("*"):  # the token is kept beside the pushed App tokens, never in the cache
             if path.is_file():
                 self.assertNotIn(self.READ, path.read_text(errors="replace"), path)
-        kept = gg.APP_POOL_DIR / gg.READ_TOKEN_FILE
+        kept = gg.READ_TOKEN_DIR / "o__r.json"  # lane-gh's own layout: its direct GETs share this token
         self.assertEqual(stat.S_IMODE(kept.stat().st_mode), 0o600)
+        self.assertEqual(sorted(json.loads(kept.read_text())), ["expires_at", "refresh_before_s", "token"])
         # a second process (a wait's direct read) takes the kept token: the broker is not asked again
         again = gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=lambda repo: self.fail("minted twice"))
         self.assertEqual(again.token("o/r"), self.READ)
