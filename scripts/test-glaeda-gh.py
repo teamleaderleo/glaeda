@@ -5492,6 +5492,21 @@ class ClientTest(Base):
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
 
+    def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
+        """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
+        --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
+        here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
+        sha = "a" * 40
+        by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
+        for word in ("--pin", "--pinned", "--match-head-commit"):
+            args = gg.parser().parse_args(["land", "o/r#1", word, sha])
+            self.assertEqual(args.sha, sha, word)
+            self.assertEqual(vars(args), vars(by_sha), word)
+        for kind, target in (("pr", "o/r#1"), ("run", "o/r/12")):
+            waited = gg.parser().parse_args(["wait", kind, target, "--pin", sha])
+            self.assertEqual(waited.sha, sha)
+            self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
+
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
         --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
