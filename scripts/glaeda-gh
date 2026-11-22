@@ -16471,7 +16471,12 @@ class LandQueue:
             counts = counts and not e.pop("stepQuotaParked", False)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
+        # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
+        # so without this line no log on the land host says how long a judgment took, and a change meant to make
+        # judgments faster (one mirror fetch per head) has no before or after to read.
+        started = time.monotonic()
         answer = self.explain(e, sha)
+        took = round(time.monotonic() - started, 1)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, land_judge read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
@@ -16506,6 +16511,9 @@ class LandQueue:
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
+            log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
+                 "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
+                 "why": why or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
