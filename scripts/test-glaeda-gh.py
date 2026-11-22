@@ -30307,6 +30307,48 @@ class LandForwardTest(Base):
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
 
+    def test_a_land_behind_an_earlier_request_says_it_is_normal_when_it_goes_and_not_to_reach_the_executor(self):
+        """The bare "an earlier request is still waiting to be forwarded" read as a stall, and callers reached the
+        executor by hand around the queue. The line says this is normal, the backoff left and its UTC send time, and
+        not to reach the executor (its name from land.json's executor, never a fixed host) directly."""
+        now = 1_800_000_000.0
+        gg.land_dir().mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.land_dir() / gg.LAND_FORWARD_FILE, {"executor": "big-exec", "state": "failing",
+                                                             "error": "fanout-client: refused", "at": now - 60,
+                                                             "retryAt": now + 180})
+        line = gg.land_forward_pending("big-exec", now)
+        for part in ("still waiting to be forwarded", "this is normal", "180 s more", gg.utc_clock(now + 180),
+                     "do not reach big-exec directly", "fanout-client: refused"):
+            self.assertIn(part, line)
+        gg.write_json(gg.land_dir() / gg.LAND_FORWARD_FILE, {"executor": "big-exec", "state": "ok", "at": now})
+        line = gg.land_forward_pending("big-exec", now)
+        self.assertIn("no backoff now", line)
+        self.assertIn(gg.utc_clock(now + gg.LAND_FORWARD_DEADLINE), line)
+        self.assertIn("do not reach big-exec directly", line)
+        # end to end: a request already in requests/ holds the next one there, and the line names the executor
+        gg.LandQueue.requests_dir().mkdir(parents=True, exist_ok=True)
+        (gg.LandQueue.requests_dir() / "older.json").write_text("{}", encoding="utf-8")
+        with mock.patch.object(gg, "land_forward", side_effect=AssertionError("sent around the queue")), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 0, False),
+                             gg.EXIT_OK)
+        self.assertIn(f"forwards it to {gg.land_forward_name(list(self.EXEC))}", out.getvalue())
+        self.assertIn(f"do not reach {gg.land_forward_name(list(self.EXEC))} directly", out.getvalue())
+
+    def test_a_forward_runs_its_executor_with_the_control_slot_marker(self):
+        """A forward is one small control-plane call: the host's fan-out admission once refused it as a background
+        client. The executor command runs with the marker that asks for the reserved control slot."""
+        seen = {}
+
+        def bounded(argv, timeout=None, input_text=None, env=None):
+            seen["env"] = env
+            return subprocess.CompletedProcess(argv, 0, '{"ok": true}\n', "")
+        with mock.patch.object(gg, "run_bounded", bounded), mock.patch.object(gg, "program_path", lambda p: p):
+            self.assertTrue(gg.land_forward(["reach", "h"], {"op": "status"})["ok"])
+        self.assertEqual(seen["env"][gg.LAND_FORWARD_SLOT_ENV], "glaeda-land-forward")
+        self.assertEqual(seen["env"].get("PATH"), os.environ.get("PATH"))
+
     def test_a_remote_wait_that_ends_with_the_land_still_going_is_a_timeout(self):
         """Review F1: `land --wait N` forwarded, the executor answering "requested" with no entry, exited 0."""
         answer = {"ok": True, "state": "requested", "entry": None, "requester": "cosmic/coord", "key": self.KEY}
