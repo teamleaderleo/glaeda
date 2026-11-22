@@ -2937,6 +2937,29 @@ class HookTest(unittest.TestCase):
             self.addCleanup(os.close, fd)
         return fds
 
+    def test_an_isolated_job_on_a_full_mini_is_refused_at_its_bound_unless_switched_off(self) -> None:
+        """ISOLATED_WAIT end to end: generated-files (isolated, 6 units) on a 7-unit mini with 2 units held waits its
+        bound, not the explicit longer --gui-wait, then is refused and drops its waiter marker. With the switch off it
+        keeps the --gui-wait it was given."""
+        self.fleet()
+        self.take_units(2)
+        flow = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/x"}
+        began = time.monotonic()
+        bounded = self.job("generated-files", "g0", 7, None, "--gui-wait", "600",
+                           env={**flow, hook.ISOLATED_WAIT_ENV: "2"})
+        self.assertLess(time.monotonic() - began, 60, "the bound, not --gui-wait 600")
+        self.assertEqual(bounded.returncode, 1, bounded.stdout)
+        self.assertIn("an isolated job: it waits 2 s at most for capacity (ISOLATED_WAIT", bounded.stdout)
+        self.assertIn("refused: capacity: 5 of 7 units free, generated-files (isolated) needs 6", bounded.stdout)
+        self.assertEqual(list((self.dir / "capacity").glob(f"{hook.ADMIT_WANT}*")), [])
+        off = self.job("generated-files", "g1", 7, None, "--gui-wait", "1", env={**flow, hook.ISOLATED_WAIT_ENV: "off"})
+        self.assertEqual(off.returncode, 1, off.stdout)
+        self.assertNotIn("ISOLATED_WAIT", off.stdout)
+        light = self.job("swift-package-tests", "g2", 7, None, "--gui-wait", "1", env={**flow, hook.ISOLATED_WAIT_ENV: "2"})
+        self.assertNotIn("ISOLATED_WAIT", light.stdout, "another class keeps its wait")
+        for runner in ("g0", "g1", "g2"):
+            self.finish(runner)
+
     def test_dev_compile_wait_holds_admissions_only_while_waiting(self) -> None:
         self.fleet()
         self.take_units(12)
@@ -11948,6 +11971,31 @@ class GateTest(unittest.TestCase):
         # composes like the other bounds: a shorter explicit wait is kept
         self.assertEqual(hook.bounded_wait(None, bound), bound)
         self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
+
+    def test_an_isolated_job_waits_a_bounded_time_for_capacity(self) -> None:
+        """ISOLATED_WAIT: generated-files (isolated) needs all 7 units of a 7-unit mini; on cmux13s job 137308886591
+        waited in job-started from 18:39Z to its cancel near 19:48Z ("N of 7 units free") while smaller jobs ran
+        beside it. An ordinary home-repo isolated job now waits ISOLATED_CAPACITY_WAIT_S at most and is refused, so
+        the owned-pool rescue places it again; GLAEDA_RUNNER_ISOLATED_WAIT_S sets the bound, "off" or 0 lifts it."""
+        home, bound = hook.DEFAULT_HOME_REPO, hook.ISOLATED_CAPACITY_WAIT_S
+        self.assertEqual(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", "", env=""), bound)
+        self.assertEqual(hook.isolated_capacity_wait("Manaflow-AI/cmux", home, "isolated", "", env=""), bound)
+        self.assertEqual(hook.job_class("generated-files", "manaflow-ai/cmux", home, "cmux-next.yml")[0], "isolated")
+        for repo, klass, tier in (("someone/else", "isolated", ""), (None, "isolated", ""),
+                                  ("manaflow-ai/cmux", "compile", ""), ("manaflow-ai/cmux", "light", ""),
+                                  ("manaflow-ai/cmux", "isolated", hook.TIER_NIGHTLY),
+                                  ("manaflow-ai/cmux", "isolated", hook.TIER_STACK),
+                                  ("manaflow-ai/cmux", "isolated", hook.TIER_DEV)):
+            with self.subTest(repo=repo, klass=klass, tier=tier):
+                self.assertIsNone(hook.isolated_capacity_wait(repo, home, klass, tier, env=""))
+        for env, want in (("300", 300.0), (" 120 ", 120.0), ("off", None), ("OFF", None), ("0", None),
+                          ("-5", None), ("inf", None), ("ten", bound)):
+            with self.subTest(env=env):
+                self.assertEqual(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", "", env=env), want)
+        with mock.patch.dict(os.environ, {hook.ISOLATED_WAIT_ENV: "off"}):
+            self.assertIsNone(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", ""))
+        with mock.patch.dict(os.environ, {hook.ISOLATED_WAIT_ENV: ""}):
+            self.assertEqual(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", ""), bound)
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}

@@ -2173,6 +2173,27 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 FAST_TIER_CAPACITY_WAIT_S = 60.0
 
 
+ISOLATED_WAIT_ENV = "GLAEDA_RUNNER_ISOLATED_WAIT_S"
+ISOLATED_CAPACITY_WAIT_S = 600.0  # ISOLATED_WAIT: placeholder, sized below from the hook logs
+
+
+def isolated_capacity_wait(repo: str | None, home_repo: str, klass: str, tier: str,
+                           env: str | None = None) -> float | None:
+    """ISOLATED_CAPACITY_WAIT_S (or GLAEDA_RUNNER_ISOLATED_WAIT_S; "off" or 0 for no bound) for an ordinary home-repo
+    job of the isolated class, else None (ISOLATED_WAIT). A guest has GUEST_WAIT_S, and a nightly, stack or feed job
+    keeps its own bound or rank."""
+    if repo is None or repo.lower() != home_repo.lower() or klass != "isolated" or tier:
+        return None
+    raw = (os.environ.get(ISOLATED_WAIT_ENV) if env is None else env) or ""
+    if raw.strip().lower() == "off":
+        return None
+    try:
+        bound = float(raw) if raw.strip() else ISOLATED_CAPACITY_WAIT_S
+    except ValueError:
+        bound = ISOLATED_CAPACITY_WAIT_S  # a bad value keeps the default, never an unbounded wait by typo
+    return bound if bound > 0 and math.isfinite(bound) else None
+
+
 def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
     """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
     if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
@@ -15472,6 +15493,12 @@ def main(argv: list[str] | None = None) -> int:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                    job_workflow())[0]
+            isolated_bound = isolated_capacity_wait(repo, args.home_repo, claim_class, tier)
+            if isolated_bound is not None and (cap is None or isolated_bound < cap):
+                cap = isolated_bound
+                print(f"{PREFIX}: an isolated job: it waits {isolated_bound:g} s at most for capacity "
+                      f"(ISOLATED_WAIT, {ISOLATED_WAIT_ENV}=off to lift it), then is refused so cmux's owned-pool "
+                      "rescue places it again", flush=True)
             if claim_class == EXCLUSIVE_CLASS and not is_guest(repo, args.home_repo):
                 hook = hook_sha256()
                 if signing_hook_listed(repo, os.environ.get("GITHUB_SHA"), hook) is False:
