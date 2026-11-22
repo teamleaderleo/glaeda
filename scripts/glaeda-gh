@@ -28370,6 +28370,9 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError(f"post {args.kind} takes {KIND_FORMS[kind]}, not {args.target!r}")
         if args.head or args.base or args.title or args.reviewer:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
+        if getattr(args, "label", None) or getattr(args, "remove_label", None):
+            raise WatchError("--label and --remove-label are for post label and post issue "
+                             f"(`glaeda-gh post label {args.target} --label L`)")
         if args.kind == "comment" and args.event != "comment":
             raise WatchError("--event is for post review")
         key = getattr(args, "status_key", None)
@@ -28477,6 +28480,8 @@ def body_guard_args(item: dict, body_file: str) -> list[str]:
     if item["kind"] == "pr":
         return ["pr", "create", "-R", repo, "--title", item["title"], "--head", item["head"], "--base", item["base"],
                 "--body-file", body_file]
+    if item["kind"] == "issue":
+        return ["issue", "create", "-R", repo, "--title", item["title"], "--body-file", body_file]
     if item["kind"] == "review":
         return ["pr", "review", str(item["number"]), "-R", repo, "--body-file", body_file]
     return ["issue", "comment", str(item["number"]), "-R", repo, "--body-file", body_file]
@@ -28610,6 +28615,79 @@ def broker_post(item: dict) -> int:
     print(f"{item['kind']} made through the lane-gh broker (this host holds no token)"
           + (f": {where}" if where else ""))
     return 0
+
+
+def post_one_call_kind(kind: str) -> str | None:
+    """The canonical kind of a write `post` makes in one call, or None for one it queues."""
+    word = (kind or "").strip().lower().replace("_", "-")
+    return POST_ONE_CALL.get(word)
+
+
+def post_one_call_labels(args: argparse.Namespace) -> list[str]:
+    """`--label a --label b` and `--label a,b` are the same two labels (gh takes either)."""
+    return [one.strip() for part in (getattr(args, "label", None) or []) for one in part.split(",") if one.strip()]
+
+
+def post_one_call_args(kind: str, args: argparse.Namespace) -> tuple[list[str], dict | None]:
+    """(the `gh` argument vector for this write, the post-shaped item its body is guarded as or None).
+
+    The target takes the shapes every other command takes (`OWNER/REPO#N`, `pr:OWNER/REPO#N`, a URL, a bare
+    number in a checkout), because the caller copied it out of a wait line, not out of this parser's help.
+    """
+    if kind == "issue":
+        if not re.fullmatch(rf"{NAME}/{NAME}", args.target or ""):
+            raise WatchError("post issue takes OWNER/REPO (with --title T and --body-file F), "
+                             f"not {args.target!r}")
+        if not args.title:
+            raise WatchError("post issue needs --title (and --body-file F, or --body)")
+        body = read_body(args.body, args.body_file)
+        gh = ["issue", "create", "-R", args.target, "--title", args.title, "--body", body]
+        for label in post_one_call_labels(args):
+            gh += ["--label", label]
+        return gh, {"kind": "issue", "repo": args.target, "title": args.title, "body": body}
+    target = drop_kind_prefix(args.target or "", "comment", also=("pr", "comment"))
+    m = KEY_RES["comment"].fullmatch(target)
+    if not m and not BARE_NUMBER.fullmatch(target):
+        raise WatchError(f"post {kind} takes {KIND_FORMS['comment']}, not {args.target!r}")
+    _, owner, repo, number = split_key(parse_key("comment", target))
+    where = f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}"  # as typed: parse_key lowercases its key
+    if args.title or args.head or args.base or args.reviewer:
+        raise WatchError("--head, --base, --title and --reviewer are for post pr")
+    if kind == "label":
+        labels, off = post_one_call_labels(args), (getattr(args, "remove_label", None) or [])
+        if not labels and not off:
+            raise WatchError("post label needs --label L (repeatable, or L,L); --remove-label L takes one off")
+        gh = ["issue", "edit", str(number), "-R", where]  # a PR takes it too: a PR is an issue here
+        for label in labels:
+            gh += ["--add-label", label]
+        for label in off:
+            gh += ["--remove-label", label]
+        return gh, None
+    gh = ["issue", "close", str(number), "-R", where]
+    if args.body is None and args.body_file is None:
+        return gh, None  # closing with no word said: nothing to guard
+    body = read_body(args.body, args.body_file)
+    return gh + ["--comment", body], {"kind": "comment", "repo": where, "number": number, "body": body}
+
+
+def cmd_post_one_call(kind: str, args: argparse.Namespace) -> int:
+    """Make the GitHub write `post` does not queue, here, in this call.
+
+    Until 2026-11-22 this printed the `gh` line and ran nothing, which cost the caller the refusal plus the
+    line typed back -- two tool calls for a one-call write. The body still goes through the same public-text
+    guard a queued post does, and the call still goes through `gh`, this tool's own quota shim, so a write made
+    here is counted, cached and paced exactly like one made the long way.
+    """
+    gh, item = post_one_call_args(kind, args)
+    if item is not None:
+        try:
+            why = body_guard_refusal(item)
+        except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
+            why = f"the body guard failed ({type(error).__name__}: {error})"
+        if why:
+            print(f"glaeda-gh: not posted: {why}", file=sys.stderr)
+            return 3
+    return cmd_gh(gh)
 
 
 def cmd_post(args: argparse.Namespace) -> int:
@@ -29398,6 +29476,12 @@ CHOICE_SYNONYMS = {
     # write post does not queue at all -- would silently run as a comment on an issue. Both spellings route
     # through POST_ELSEWHERE instead, which names the call and runs nothing.
     "comment": ("reply", "note"),
+    # The kinds `post` makes in one call (POST_ONE_CALL). `issue-comment` and `pr-comment` are choices of their
+    # own rather than `comment` synonyms: as a synonym, `pr` would prefix-match `pr-comment` and be refused as
+    # "as close to pr as to comment".
+    "issue": ("issues", "new-issue", "newissue", "bug", "file-issue"),
+    "label": ("labels", "add-label", "add-labels", "tag"),
+    "close": ("close-issue", "close-pr"),
 }
 CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
 
@@ -29505,18 +29589,23 @@ def print_json_error(code: str, reason: str, nxt: str) -> None:
 # 2026-11-22: `post issue` was refused with a hint about target *shapes*, and the gh call had to be worked out by
 # hand. Leo, 2026-11-20: "we need a bunch of synonyms for code for you guys where it just goes \"eh close enough\"
 # and works".
+# Measured again 2026-11-22: naming the call cost the same two tool calls as refusing it did -- the printed line,
+# then the same line typed back. `post` already stands in front of `gh` (one quota shim, one body guard), so for
+# these kinds it makes the write in this call instead of printing it (post_one_call). Leo: "when you guys
+# encounter errors or whatnot, the tool itself should be improved and/or your thing should also be acceptable
+# input or rewritten to make stuff good".
 POST_ELSEWHERE = {
-    ("issue", "issues", "new-issue", "newissue", "bug", "file-issue"):
-        "glaeda-gh gh issue create --repo OWNER/REPO --title T --body-file F",
-    ("issue-comment", "issuecomment", "pr-comment", "prcomment"):
-        "glaeda-gh post comment OWNER/REPO#N --body-file F (one kind for both: a PR is an issue here)",
-    ("label", "labels", "add-label", "tag"):
-        "glaeda-gh gh issue edit N --repo OWNER/REPO --add-label L (a PR takes it too: a PR is an issue here)",
-    ("close", "closed", "close-issue"):
-        "glaeda-gh gh issue close N --repo OWNER/REPO",
     ("merge", "land"):
         "glaeda-gh land OWNER/REPO#N --match-head-commit SHA (the daemon merges it pinned, on green)",
 }
+
+# A write `post` makes in one call, by the kind word typed for it. The value is the canonical kind;
+# POST_KIND_CHOICES puts every word in the parser's choices, so argparse refuses nothing it can run, and
+# CHOICE_SYNONYMS carries the looser spellings (`bug`, `tag`, `closed`).
+POST_ONE_CALL = {"issue": "issue", "label": "label", "close": "close",
+                 "issue-comment": "comment", "pr-comment": "comment"}
+POST_QUEUED_KINDS = ("comment", "pr", "review", "status")
+POST_KIND_CHOICES = POST_QUEUED_KINDS + tuple(POST_ONE_CALL)
 
 
 def post_elsewhere(kind: str) -> str:
@@ -29823,7 +29912,9 @@ def parser() -> argparse.ArgumentParser:
                         "when it is of this head and all green (route pr-rollup)")
     c.add_argument("--json", action="store_true")
     po = sub.add_parser("post", help="queue a comment, PR or review; the daemon posts it, paced for every session")
-    po.add_argument("kind", choices=("comment", "pr", "review", "status"))
+    po.add_argument("kind", choices=POST_KIND_CHOICES, metavar="KIND",
+                    help="comment, pr, review (queued and paced), status, or issue, label, close, issue-comment "
+                         "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
     po.add_argument("--body", help="the text (prefer --body-file: backticks and dollar signs stay data)")
     po.add_argument("--body-file", metavar="PATH", help="the text from a file, - for stdin")
@@ -29838,6 +29929,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
+    po.add_argument("--label", action="append", metavar="L",
+                    help="label: a label to add (repeatable, or L,L); issue: a label for the new issue")
+    po.add_argument("--remove-label", action="append", metavar="L", help="label: a label to take off")
     po.add_argument("--gate", action="store_true",
                     help="comment or review: a receipt a merge waits on (a verdict, a check, a land receipt); it goes "
                          "out ahead of every other queued write (review receipts are recognized without it)")
@@ -30598,8 +30692,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("--wait must be 0 or more seconds")
             if args.kind == "status":
                 return cmd_post_status(args.target, args.wait, args.json)
+            one = post_one_call_kind(args.kind)
             if not args.target:
-                raise WatchError(f"post {args.kind} needs a target")
+                raise WatchError(f"post {args.kind} needs a target"
+                                 + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
+            if one == "comment":
+                args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
+            elif one:
+                return cmd_post_one_call(one, args)
             return cmd_post(args)
         if args.command == "checks":
             if args.wait < 0:
