@@ -14749,6 +14749,13 @@ class LandQueue:
         w.setdefault("graphql", 0.0)
         return w
 
+    def graphql_spent(self) -> bool:
+        """Whether GraphQL's fresh live count is spent to its hard reserve (pace_next's spent case): no GraphQL read
+        the daemon would make for this queue comes before its reset (LAND_REST_ROUTE)."""
+        seen = self.reading("graphql") if self.reading is not None else None
+        return land_reading_state(seen, None, self.now) == "fresh" \
+            and float(seen["remaining"]) - hard_reserve_floor()["graphql"] < LAND_JUDGE_COST["graphql"]
+
     def rest_route_room(self, nexts: dict, seen: dict | None) -> bool:
         """Whether a judgment GraphQL's pace leaves out may go over REST now (LAND_REST_ROUTE): GraphQL's fresh reading
         is spent to its hard reserve (no slot opens before its reset), and REST has a fresh reading with paced room
@@ -15365,6 +15372,13 @@ class LandQueue:
             return None, "unpinned"
         if self.reads_upstream():
             return None, "upstream"
+        if self.graphql_spent():
+            # The snapshot is a GraphQL full read's, and the daemon sends none while GraphQL is spent to its hard
+            # reserve: no "wait", so no room ahead of the workers is held for it (judge) and the judgment goes on to
+            # the REST route (LAND_REST_ROUTE). huge-blue, 2026-11-22 08:04-08:38Z: GraphQL 0/5000, 21-24 snapshot
+            # waits filled the 24 places ahead of 12 workers (1-2 busy), and glaeda#2461 (2/2 green, pinned) sat
+            # "every worker busy" 34 min without one judgment, never reaching the REST route.
+            return None, "graphql spent"
         c = self.cache_of(key) or {}
         fp = c.get("fp")
         if not isinstance(fp, str) and c.get("via") != "graphql":

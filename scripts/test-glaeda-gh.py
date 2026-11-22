@@ -27347,6 +27347,58 @@ class LandTest(Base):
         self.assertGreaterEqual(w["rest"], gg.LAND_JUDGE_COST["rest"])
         self.assertGreater(3900 - reserve["rest"], gg.LAND_JUDGE_COST["rest"])
 
+    def test_graphql_spent_snapshot_waits_hold_no_room_so_a_pinned_land_takes_the_rest_route(self):
+        """huge-blue, 2026-11-22 08:04-08:38Z: GraphQL 0/5000, REST 3864/5000. 21-24 snapshot waits (each for a
+        GraphQL full read the daemon sends none of while GraphQL is spent) filled the 24 places ahead of 12 workers
+        with 1-2 busy, and glaeda#2461 (2/2 green, pinned) sat "every worker busy" 34 min without one judgment: the
+        REST route (LAND_REST_ROUTE) is decided after that room check, so it was never reached. With GraphQL spent to
+        its hard reserve no snapshot is waited for: the pinned land is judged over REST and merges."""
+        head = format(0xF3, "040x")
+        reset = self.t + 1200
+        self.q.reading = lambda pool: {"limit": 5000, "remaining": 0 if pool == "graphql" else 3900, "reset": reset,
+                                       "seenAt": self.t}
+        full = self.q.workers() * (1 + gg.LAND_SNAPSHOT_AHEAD)
+        others = {f"pr:o/r#{100 + n}": format(0x100 + n, "040x") for n in range(full)}
+        for key, other in others.items():
+            self.w.set_pr(key, land_pr(other), self.t)
+            self.w.cache[key].update(fp=f"read-{other[-3:]}", via="graphql")  # its snapshot is the next GraphQL read's
+            gg.land_request("land", key.removeprefix("pr:"), [], "host/lane", sha=other)
+        self.tick(0)
+
+        def fill() -> None:
+            # Other lands' snapshot waits, as many as the room ahead of the workers, renewed each pass as the 885 due
+            # that morning renewed them: each one that ran out was followed by the next
+            for key, other in others.items():
+                if self.q.entries[key].get("state") not in gg.LAND_DONE:
+                    self.q.entries[key]["snapshotWait"] = {"sha": other, "since": self.t}
+                    self.q.snapshot_waiting.add(key)
+        fill()
+        self.w.set_pr("pr:o/r#1", land_pr(head), self.t)
+        self.w.cache["pr:o/r#1"].update(fp="graphql-read-before-the-quota-ran-out", via="graphql")  # no snapshot kept
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        seen: list[str] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[argv.index("explain") + 2])
+                seen.append(n)
+                if n == 1 and "--cache-only" not in argv:
+                    rc, doc = ok_answer(head)
+                    doc["action"]["number"] = 1
+                    self.w.answers.append((rc, doc))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(20):
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            fill()
+            self.tick(30)
+        e = self.q.entries["pr:o/r#1"]
+        self.assertIn(1, seen, gg.land_line(e, self.t, latch=None))
+        self.assertEqual(e["state"], "merged", gg.land_line(e, self.t, latch=None))
+        self.assertGreaterEqual(gg.read_json(gg.land_dir() / "window.json")["rest"], gg.LAND_JUDGE_COST["rest"])
+
     def test_graphql_spent_with_rest_unread_still_waits_for_the_graphql_reset(self):
         """The REST route spends only what GitHub's count shows: with no fresh REST reading, a cache miss under a
         spent GraphQL pool keeps its place (host_cap) and sends no live judgment."""
