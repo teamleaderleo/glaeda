@@ -31225,10 +31225,12 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
     flag borrowed from a sibling command was the one left to argparse's bare "unrecognized arguments"."""
 
     def setUp(self) -> None:
+        # A usage refusal writes file descriptor 2 through `say_waiting`, which `redirect_stderr` does not
+        # touch (it swaps `sys.stderr`): the wording is asserted through that seam, as `diagnostics_in` does.
         self.err = io.StringIO()
-        self.enter = contextlib.redirect_stderr(self.err)
-        self.enter.__enter__()
-        self.addCleanup(self.enter.__exit__, None, None, None)
+        said = mock.patch.object(gg, "say_waiting", lambda line: print(line, file=self.err))
+        said.start()
+        self.addCleanup(said.stop)
 
     def refuse(self, argv: list[str]) -> None:
         """Run a call this tool must refuse as a usage error. `Parser.error` exits 64 rather than returning
@@ -31266,22 +31268,58 @@ class AFlagOfAnotherCommandTest(unittest.TestCase):
         self.assertNotIn("no option of", said)
 
     def test_a_flag_of_a_nested_command_is_named_with_its_whole_path(self) -> None:
-        """`--reads` is `log search`'s, not `log`'s and not `status`'s: a reader told "it is an option of log"
-        would type `glaeda-gh log --reads`, which is another usage error. The words typed are the whole path."""
-        owners = gg.flag_commands("--max-age")
+        """`--reads` is `log search`'s and `log flaky`'s, not `log`'s: a reader told "it is an option of log"
+        would type `glaeda-gh log --reads`, which is another usage error. The words typed are the whole path, so
+        the fixture has to be a flag only a nested command owns -- a top-level one would pass with the nested
+        walk deleted."""
+        owners = gg.flag_commands("--reads")
         self.assertTrue(owners, "the fixture flag must exist somewhere, or this test proves nothing")
+        self.assertTrue(all(" " in owner for owner in owners), owners)  # every owner is a nested command
+        self.assertIn("log search", owners)
         for owner in owners:
             node = gg.child_parser(gg.parser(), owner.split()[0])
             for word in owner.split()[1:]:
                 node = gg.child_parser(node, word)
-            self.assertIn("--max-age", gg.parser_options(node), owner)
+            self.assertIn("--reads", gg.parser_options(node), owner)
 
     def test_the_command_the_caller_typed_is_never_named_as_the_place_to_go(self) -> None:
         """`flag_commands` answers "where does this flag live"; naming the command that just refused it would
-        be a next step that cannot end the refusal."""
-        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --notify", ["wait", "run", "o/r/9"])
-        self.assertIn("land", hint)
-        self.assertNotIn("`wait` has it", hint)
+        be a next step that cannot end the refusal. The case that constrains it is a flag the typed command
+        owns alongside a sibling: `log search --reads` must be answered with `log flaky`, never with itself."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --reads", ["log", "search", "o/r", "pat"])
+        self.assertIn("`log flaky`", hint)
+        self.assertNotIn("glaeda-gh log search --help", hint, "the command that refused it is not the way out")
+        self.assertEqual(nxt, "glaeda-gh log search o/r pat")
+
+    def test_a_sibling_of_the_typed_command_still_answers_for_its_own_flag(self) -> None:
+        """The filter drops the command that refused the flag, not its whole top-level family: `log job --reads`
+        is answered by `log search`, which is a different command that happens to share the word `log`."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --reads", ["log", "job", "o/r/9"])
+        self.assertIn("`log search`", hint)
+        self.assertIn("no option of `log job`", hint)
+        self.assertEqual(nxt, "glaeda-gh log job o/r/9")
+
+    def test_a_word_the_caller_quoted_after_a_separator_is_not_a_borrowed_flag(self) -> None:
+        """`log search o/r -- --notify` searches for the text `--notify`: everything at or after `--` is a
+        positional the caller quoted, so nothing there is a flag of theirs to explain, and a next step that
+        dropped it would search for something else (or, with the pattern eaten, not parse at all)."""
+        self.assertEqual(gg.flag_elsewhere("unrecognized arguments: --notify",
+                                           ["log", "search", "o/r", "--", "--notify", "--notify"]), ("", ""))
+        self.assertEqual(gg.flag_elsewhere("unrecognized arguments: --notify",
+                                           ["log", "search", "o/r", "pat", "--", "--notify"]), ("", ""))
+        # One of each: the flag typed as a flag goes, the quoted copy stays, and the step still parses.
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --notify",
+                                      ["log", "search", "o/r", "--notify", "--", "--notify"])
+        self.assertIn("`land`", hint)
+        self.assertEqual(nxt, "glaeda-gh log search o/r -- --notify")
+        gg.parser().parse_args(nxt.split()[1:])
+
+    def test_the_hint_names_the_option_without_the_value_written_onto_it(self) -> None:
+        """`--notify=x` is the option `--notify` with a value: it is `--notify` that lives elsewhere, and
+        ``--notify=x` is no option of `wait`` reads as a flag nothing has."""
+        hint, nxt = gg.flag_elsewhere("unrecognized arguments: --notify=x", ["wait", "run", "o/r/9"])
+        self.assertIn("`--notify` is no option of `wait`", hint)
+        self.assertNotIn("--notify=x", hint)
         self.assertEqual(nxt, "glaeda-gh wait run o/r/9")
 
     def test_the_json_refusal_carries_the_same_words(self) -> None:
