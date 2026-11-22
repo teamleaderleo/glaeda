@@ -10654,6 +10654,34 @@ class RerunWaitTest(Base):
         self.assertEqual(code, gg.EXIT_FAIL)
 
 
+class RerunRefusedNextStepTest(unittest.TestCase):
+    """manaflow-ai/cmuxterm-hq run 45058762303, 2026-11-22: `gh run rerun ... --failed` answered "run 45058762303
+    cannot be rerun; This workflow run cannot be retried" and nothing else, twice. Read as "the rerun did nothing",
+    it cost another wait on a red a newer run had already replaced. A rerun that does not take names what does."""
+
+    def test_a_refused_rerun_names_the_two_steps_that_move_it(self) -> None:
+        said = gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 1)
+        self.assertIsNotNone(said)
+        self.assertIn("o/r/50", said)
+        self.assertIn("glaeda-gh status run", said)
+        self.assertIn("push the head again", said)
+
+    def test_the_api_spelling_of_a_rerun_counts_too(self) -> None:
+        said = gg.rerun_next_step("o/r", ["run 50"], ["api", "repos/o/r/actions/runs/50/rerun-failed-jobs"], 1)
+        self.assertIsNotNone(said)
+        self.assertIn("o/r/50", said)
+
+    def test_a_rerun_that_took_and_any_other_write_say_nothing(self) -> None:
+        self.assertIsNone(gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 0))
+        self.assertIsNone(gg.rerun_next_step("o/r", ["run 50"], ["run", "cancel", "50"], 1))
+        self.assertIsNone(gg.rerun_next_step("o/r", ["run 50"], ["pr", "merge", "7"], 1))
+
+    def test_a_run_id_it_cannot_name_still_leaves_a_usable_line(self) -> None:
+        said = gg.rerun_next_step(None, None, ["run", "rerun", "50"], 1)
+        self.assertIsNotNone(said)
+        self.assertIn("that run", said)
+
+
 class WaitPrNotMergedTest(Base):
     """manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr
     manaflow-ai/cmux#50409` (no --until) ended at 14:51Z with "result: success, ended_by: success" on green checks;
@@ -31251,7 +31279,9 @@ class LandForwardTest(Base):
         self.assertEqual(self.w.explains(), [])
 
     def test_serve_refuses_on_a_host_that_forwards_and_on_a_bad_line(self):
-        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status"}), "not_executor"),
+        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "room"}), "not_executor"),
+                                   ({"executor": ["reach", "x"]}, json.dumps({"op": "land", "target": "o/r#1",
+                                                                              "relayedBy": "h"}), "not_executor"),
                                    ({}, "not json", "bad_request"),
                                    ({}, json.dumps({"op": "land", "target": "nope"}), "bad_request")):
             with self.subTest(code=code), mock.patch.object(gg, "land_config", return_value=config), \
@@ -31259,6 +31289,28 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_serve_on_a_forwarding_host_hands_a_land_to_its_executor_once(self):
+        """A lane VM's hand-off reaches the broker host's `land serve`; once that host forwarded its own lands it
+        refused them all (not_executor), and nothing could take the PR."""
+        sent: list = []
+
+        def forward(command, request, *a, **k):
+            sent.append((command, request))
+            return {"ok": True, "request": "r1", "host": "big-exec"}
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", forward), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1", "sha": LA})), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["host"], "big-exec")
+        self.assertEqual(sent[0][0], ["reach", "big-exec"])
+        self.assertEqual((sent[0][1]["target"], sent[0][1]["sha"], bool(sent[0][1]["relayedBy"])), ("o/r#1", LA, True))
+
+        def down(command, request, *a, **k):
+            raise gg.WatchError("land executor: no answer within 60s")
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", down), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1"})), gg.EXIT_FAIL)
+        self.assertEqual(json.loads(out.getvalue())["code"], "not_executor")
 
     def test_a_land_behind_an_earlier_request_says_it_is_normal_when_it_goes_and_not_to_reach_the_executor(self):
         """The bare "an earlier request is still waiting to be forwarded" read as a stall, and callers reached the
