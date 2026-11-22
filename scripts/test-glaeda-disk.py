@@ -98,6 +98,11 @@ gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
+# Nor trim the Cargo targets of the host running the suite: only a test's own roots are swept.
+_sweep_cargo_targets = gd.sweep_cargo_targets
+gd.sweep_cargo_targets = (lambda receipt, roots=None, *args, **kw:
+                          {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
+                          if roots is None else _sweep_cargo_targets(receipt, roots, *args, **kw))
 # Nor repack the shared mirrors of the host running the suite: only a test's own home's.
 _compact_shared_mirrors = gd.compact_shared_mirrors
 gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
@@ -5469,7 +5474,7 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = gd.HOME.stat().st_dev
         if self.root.stat().st_dev != dev:
             self.skipTest("the fake volume is HOME's; this temp dir is on another")
-        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
         dd = gd.Family("xcode-derived-data", self.root / "dd", True, "", min_idle_hours=12)
         dd.root.mkdir()
@@ -5515,7 +5520,7 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = gd.HOME.stat().st_dev
         if self.root.stat().st_dev != dev:
             self.skipTest("the fake volume is HOME's; this temp dir is on another")
-        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
         root = self.root / "xcode"
         (root / "node-store/cas/00").mkdir(parents=True)
@@ -13382,7 +13387,8 @@ class ActivityClockTest(unittest.TestCase):
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
                 "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET",
-                "BUDGET_WARM_DEVS", "PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED", "PRESSURE_SIM_RUNTIMES")
+                "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE", "PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED",
+                "PRESSURE_SIM_RUNTIMES")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:
@@ -13762,13 +13768,14 @@ class DeadItemsTest(unittest.TestCase):
         self.root = Path(os.path.realpath(self.tmp.name))
         self.home = self.root / "home"
         self.home.mkdir()
-        self.saved = (gd.HOME, gd.FLEET_ROOT)
-        gd.HOME, gd.FLEET_ROOT = self.home, self.root / "shared-fleet"
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE)
+        # A test that ran main() may leave FLEET_CLAIMS_EXPIRE set; these tests read claims as off a fleet mini.
+        gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE = self.home, self.root / "shared-fleet", False
         gd._DISCOVERED.clear()
         gd._ENDED_STEPS.clear()
 
     def tearDown(self) -> None:
-        gd.HOME, gd.FLEET_ROOT = self.saved
+        gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE = self.saved
         gd._DISCOVERED.clear()
         self.tmp.cleanup()
 
@@ -14543,6 +14550,7 @@ class TartLimaReferencesTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(gd, "HOME", self.home))
         stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
         stack.enter_context(mock.patch.dict(gd._LAUNCHD_INSTALLED, {}, clear=True))
+        stack.enter_context(mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False))  # a test turns it on itself
         gd._DISCOVERED.clear()
         self.addCleanup(gd._DISCOVERED.clear)
 
@@ -14618,6 +14626,34 @@ class TartLimaReferencesTest(unittest.TestCase):
             sizes = {os.fspath(build): 29 * gd.GIB, os.fspath(running): 30 * gd.GIB, os.fspath(bake): 40 * gd.GIB}
             fams = [self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)]
             self.assertEqual(gd._budget_dev_bytes(fams, sizes), {})
+
+    def test_a_persons_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """Leo, 2026-11-22: "it's the fleet. they dont have anything protected"."""
+        forever = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(forever, "leo", 26 * 24)
+        bare = self.lima_vm("no-owner", 26 * 24)
+        self.claim(bare, None, 26 * 24)
+        dated = self.lima_vm("leo-dated", 26 * 24)
+        (dated / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() + 3 * 3600}))
+        self.age(dated, 26 * 24)
+        lapsed = self.lima_vm("leo-lapsed", 26 * 24)
+        (lapsed / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() - 60}))
+        self.age(lapsed, 26 * 24)
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "reclaimable", items["leo-scratch"].reasons)
+        self.assertIn("claim by leo on a fleet mini is stale: it names no until", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["no-owner"].verdict, "reclaimable", items["no-owner"].reasons)
+        self.assertEqual(items["leo-dated"].verdict, "kept", items["leo-dated"].reasons)
+        self.assertIn("claimed by leo until", items["leo-dated"].reasons[-1])
+        self.assertEqual(items["leo-lapsed"].verdict, "reclaimable", items["leo-lapsed"].reasons)
+        self.assertIn("its until has passed", items["leo-lapsed"].reasons[-1])
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "off a fleet mini a person's claim still holds")
+        policy = self.root / "disk-policy.json"
+        policy.write_text(json.dumps({"fleet_claims_expire": False}))
+        self.assertEqual(gd.disk_policy(policy)["fleet_claims_expire"], False, "one host can turn it off")
 
     def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
         base = self.tart_vm("ubase", 30 * 24, self.ECID)
@@ -15889,6 +15925,153 @@ class CensusSudoTest(unittest.TestCase):
             self.assertIsNone(gd._census_sudo_du(self.locked, 5))
 
 
+
+class CargoStaleArtifactsTest(unittest.TestCase):
+    """cargo-stale-artifacts: stale units inside a live Cargo target go, the newest per crate stem, open files,
+    build/ and the top-level binaries stay (an agent lane VM, 2026-11-22: a live worktree's target/debug at 137 GiB)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.receipt = self.root / "receipts.jsonl"
+        wt = self.root / ".wt/checkouts/cmux/lane--live/cmux-tui"
+        (wt / "src").mkdir(parents=True)
+        self.target = wt / "target"
+        self.debug = self.target / "debug"
+        for d in ("deps", "incremental", "build/foo-0123456789abcdef/out", ".fingerprint"):
+            (self.debug / d).mkdir(parents=True)
+        (self.target / "CACHEDIR.TAG").write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n")
+        (self.debug / ".cargo-lock").write_text("")
+        self.files: dict[str, Path] = {}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def put(self, rel: str, hours: float, data: bytes = b"x" * 8192) -> Path:
+        p = self.debug / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.name.startswith("s-") or rel.startswith("incremental/") and rel.count("/") == 1:
+            p.mkdir(exist_ok=True)
+            (p / "query-cache.bin").write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p / "query-cache.bin", (when, when))
+            os.utime(p, (when, when))
+        else:
+            p.write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p, (when, when))
+        return p
+
+    def sweep(self, apply: bool = True, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], apply=apply,
+                                          stale_hours=6.0, **kw)
+
+    def fixture(self) -> dict[str, Path]:
+        f = {}
+        # four test binaries of acpmux: the three past the window go, the newest (2h, "recent" below) stays
+        f["old_bin"] = self.put("deps/acpmux-1111111111111111", 30)
+        f["old_bin_d"] = self.put("deps/acpmux-1111111111111111.d", 30)
+        f["mid_bin"] = self.put("deps/acpmux-2222222222222222", 10)
+        f["new_bin"] = self.put("deps/acpmux-3333333333333333", 8)
+        # acpmux's library: one unit, old, but the newest of its stem (lib), so it stays
+        f["lib_rlib"] = self.put("deps/libacpmux-4444444444444444.rlib", 40)
+        f["lib_rmeta"] = self.put("deps/libacpmux-4444444444444444.rmeta", 40)
+        f["lib_d"] = self.put("deps/acpmux-4444444444444444.d", 40)
+        # a stale library unit of serde beside a newer one: the old one goes whole
+        f["serde_old"] = self.put("deps/libserde-5555555555555555.rlib", 20)
+        f["serde_old_meta"] = self.put("deps/libserde-5555555555555555.rmeta", 20)
+        f["serde_new"] = self.put("deps/libserde-6666666666666666.rlib", 1)
+        # the newest acpmux test binary
+        f["recent"] = self.put("deps/acpmux-7777777777777777", 2)
+        # incremental: two old crate dirs of acpmux, the newest stays
+        f["inc_old"] = self.put("incremental/acpmux-1abcdefgh2ij", 30)
+        f["inc_new"] = self.put("incremental/acpmux-3klmnopqr4st", 20)
+        # never touched: build/, the top-level binary, .fingerprint, a name no pattern matches
+        f["build"] = self.put("build/foo-0123456789abcdef/out/gen.rs", 99)
+        f["top"] = self.put("acpmux", 99)
+        f["fingerprint"] = self.put(".fingerprint/acpmux-1111111111111111", 99)
+        f["odd"] = self.put("deps/notes.txt", 99)
+        return f
+
+    def test_stale_units_go_and_the_newest_per_stem_stays(self) -> None:
+        f = self.fixture()
+        res = self.sweep()
+        gone = {n for n, p in f.items() if not p.exists()}
+        self.assertEqual(gone, {"old_bin", "old_bin_d", "mid_bin", "new_bin", "serde_old", "serde_old_meta",
+                                "inc_old"})
+        self.assertEqual((res["targets"], res["units"]), (1, 5))
+        self.assertGreater(res["bytes"], 0)
+        self.assertEqual(list(res["by_target"]), [os.fspath(self.target)])
+        rec = json.loads(self.receipt.read_text().splitlines()[-1])
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.CARGO_STALE_FAMILY, "reclaimed", 5))
+
+    def test_a_used_within_the_window_unit_stays_beside_a_newer_one(self) -> None:
+        f = self.fixture()
+        self.put("deps/acpmux-8888888888888888", 1)  # newest now; "recent" (2h) is inside the 6h window
+        self.sweep()
+        self.assertTrue(f["recent"].exists())
+        self.assertFalse(f["new_bin"].exists())
+
+    def test_a_dry_run_counts_and_removes_nothing(self) -> None:
+        f = self.fixture()
+        res = self.sweep(apply=False)
+        self.assertEqual(res["units"], 5)
+        self.assertTrue(all(p.exists() for p in f.values()))
+        self.assertFalse(self.receipt.exists())
+
+    def test_a_recent_atime_keeps_an_old_unit(self) -> None:
+        f = self.fixture()
+        old = time.time() - 30 * 3600
+        os.utime(f["old_bin"], (time.time(), old))  # read just now (a test run), written long ago
+        self.sweep()
+        self.assertTrue(f["old_bin"].exists())
+        self.assertTrue(f["old_bin_d"].exists(), "a unit goes whole or not at all")
+        self.assertFalse(f["mid_bin"].exists())
+
+    def test_an_open_file_keeps_its_unit(self) -> None:
+        f = self.fixture()
+        with f["mid_bin"].open("rb"):
+            res = self.sweep()
+            self.assertTrue(f["mid_bin"].exists())
+        self.assertEqual(res["kept"].get("open in a process"), 1)
+        self.assertFalse(f["old_bin"].exists())
+
+    def test_a_cargo_build_holding_the_lock_keeps_the_profile(self) -> None:
+        f = self.fixture()
+        with (self.debug / ".cargo-lock").open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            pid = os.fork()
+            if pid == 0:  # another process's flock, as cargo's would be
+                try:
+                    res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=6.0)
+                    os._exit(0 if res["units"] == 0 else 1)
+                except BaseException:
+                    os._exit(2)
+            _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
+
+    def test_targets_are_found_through_wt_checkouts_and_links_are_not_followed(self) -> None:
+        elsewhere = self.root / "elsewhere/target"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "CACHEDIR.TAG").write_text("# This file is a cache directory tag created by cargo.\n")
+        (self.root / ".wt/checkouts/cmux/lane--live/link").symlink_to(elsewhere.parent)
+        found = gd.find_cargo_targets([self.root / ".wt/checkouts"])
+        self.assertEqual(found, [self.target])
+
+    def test_policy_roots_reach_lane_worktrees(self) -> None:
+        self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])
+        self.assertIn(self.root / ".wt/checkouts", gd.cargo_stale_roots(self.root))
+        self.assertEqual(gd.POLICY_DEFAULTS["cargo_stale_hours"], 6.0)
+
+    def test_zero_hours_turns_it_off(self) -> None:
+        f = self.fixture()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=0)
+        self.assertEqual(res["units"], 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
 class PressureHeldBytesTest(unittest.TestCase):
     """Leo, 2026-11-22: "5 Mac minis that stopped taking work because their disks are low. find the useful solutions to
     prevent these" / "fleet's own cleanup tools, which never delete VMs or protected folders. this is not good enough.
