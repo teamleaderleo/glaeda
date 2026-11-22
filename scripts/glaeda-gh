@@ -25891,6 +25891,19 @@ LOG_SCAN_READS = 40  # default cap on logs read from the controller per command 
 # `log errors` given a run id, unlike the scans, reads through to REST on the person's own quota, so its cap is
 # small: a run of a wide matrix has dozens of failed jobs and nobody asked for all of them. The rest are named.
 LOG_ERRORS_RUN_READS = 5
+RUN_HINT_JOBS = 5  # how many of a run's jobs a refusal or note offers as commands; the rest are counted
+
+
+def reads_cap(word: str) -> int:
+    """A `--reads` value: how many logs this command may read, 0 for none. A negative one is no cap at all --
+    it silently became 1 here and read nothing in `log search` -- so it is refused rather than guessed."""
+    try:
+        count = int(word)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {word!r}") from None
+    if count < 0:
+        raise argparse.ArgumentTypeError(f"{word}: a read cap is 0 (read none) or more, never negative")
+    return count
 LOG_LINE_MAX = 300  # a printed log line is cut here
 LOG_FAILED = frozenset({"failure", "timed_out"})
 LOG_STAMP = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?")
@@ -26149,7 +26162,7 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
     Exit 0 when a flaky test is listed, 1 when none."""
     test_re = log_regex(test, "TEST", re.I)
     job_re = log_regex(job, "--job", re.I)
-    repo, ctl, recs, more = log_scan_setup(repo, since, controller)
+    repo, ctl, recs, more = log_scan_setup(repo, since, controller, "log flaky")
     # (run, job name) -> the latest attempt that passed. A re-run is a later attempt of the same run: a matrix sibling
     # with the same name passing in the same attempt is not one, and a record without a run is never matched.
     passed_attempt: dict[tuple, int] = {}
@@ -26244,7 +26257,7 @@ def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool = Fal
     if not failed:
         return (f"; {number} is run {number} of {repo}, not a job, and none of its {len(jobs)} finished jobs failed "
                 f"(`glaeda-gh status run {repo}/{number} --jobs`)")
-    steps = " ".join(f"`glaeda-gh log errors {repo} {r['id']}`" for r in failed[:5])
+    steps = " ".join(f"`glaeda-gh log errors {repo} {r['id']}`" for r in failed[:RUN_HINT_JOBS])
     return (f"; {number} is run {number} of {repo}, not a job: its failed job(s) are "
             f"{', '.join(str(r['id']) for r in failed)} -- {steps}")
 
@@ -26273,33 +26286,49 @@ def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, 
     # Bounded, newest first: unlike the sibling scans this path can fall through to REST on the person's own
     # quota, so a run of a wide matrix (60 failed jobs measured) must not read every one of them unasked. The
     # jobs past the cap are named as their own commands, which is a next step the reader can take.
-    take, over = failed[:max(reads, 1)], failed[max(reads, 1):]
+    # The cap is the cap that ran: `--reads 0` reads nothing and lists the run's failed jobs, rather than
+    # reading one while the note says "past --reads 0". A negative one is refused in the parser.
+    take, over = (failed[:reads], failed[reads:]) if reads > 0 else ([], failed)
     say_waiting(f"glaeda-gh: {job} is run {job} of {repo}, not a job: reading "
                 f"{'its' if not over else f'the newest {len(take)} of its'} {len(failed)} failed job(s)")
     read, unread = [], []
     for r in take:
         one, src, reason = job_log_read(repo, int(r["id"]), controller, rest)
         if one is None:
-            unread.append(f"{r['id']} ({reason})")
+            unread.append({"job": int(r["id"]), "why": reason})
         else:
             read.append((int(r["id"]), one, src))
     if over:
-        steps = " ".join(f"`glaeda-gh log errors {repo} {r['id']}`" for r in over)
-        say_waiting(f"glaeda-gh: {len(over)} more failed job(s) past --reads {reads}, unread: {steps}")
+        # Bounded like `run_id_hint`'s own offer: a next step has to be readable to be a next step (95
+        # commands, 3001 characters measured on a 100-failed-job run).
+        named = over[:RUN_HINT_JOBS]
+        steps = " ".join(f"`glaeda-gh log errors {repo} {r['id']}`" for r in named)
+        rest_of = f" ({len(over) - len(named)} more in `glaeda-gh status run {repo}/{job} --jobs`)" \
+            if len(over) > len(named) else ""
+        say_waiting(f"glaeda-gh: {len(over)} more failed job(s) past --reads {reads}, "
+                    f"unread: {steps}{rest_of}")
     if unread:
-        say_waiting(f"glaeda-gh: no log for {', '.join(unread)}")
+        say_waiting("glaeda-gh: no log for "
+                    + ", ".join(f"{u['job']} ({u['why']})" for u in unread))
     if not read:
         return EXIT_FAIL
-    return log_errors_emit(repo, read, limit, as_json, job)
+    return log_errors_emit(repo, read, limit, as_json, job,
+                           {"failed": len(failed), "past_reads": [int(r["id"]) for r in over or []],
+                            "unread": unread})
 
 
 def log_errors_emit(repo: str, logs: list[tuple[int, bytes, str]], limit: int, as_json: bool,
-                    run: int | None) -> int:
+                    run: int | None, bounds: dict | None = None) -> int:
     """Print the error lines of each (job, log, source). One job keeps the shape it always printed; a run prints
-    one block per job, and `--json` carries them under `run` and `jobs`, so a one-job reader never has to branch."""
+    one block per job, and `--json` carries them under `run` and `jobs`, so a one-job reader never has to branch.
+
+    BOUNDS is what the run's read left out: the true number of failed jobs, the ids the `--reads` cap did not
+    reach, and the ones whose log was nowhere. They belong in the document and not only on stderr, or a
+    `--json` reader takes a bounded read for the whole answer -- the mistake this command exists to stop."""
     found = [{"job": job, "source": source, **log_errors(text, limit)} for job, text, source in logs]
     if as_json:
-        one = {"repo": repo, **found[0]} if run is None else {"repo": repo, "run": run, "jobs": found}
+        one = ({"repo": repo, **found[0]} if run is None
+               else {"repo": repo, "run": run, "jobs": found, **(bounds or {})})
         print(json.dumps(one, sort_keys=True))
         return EXIT_OK
     for f in found:
@@ -26772,7 +26801,7 @@ def parser() -> argparse.ArgumentParser:
         job.add_argument("--job", dest="job", type=int, action=ShorthandFlag, metavar="ID",
                          canonical="`{prog} OWNER/REPO {}`", help="the same as JOB_ID|RUN_ID")
     le.add_argument("--max", type=int, default=40, metavar="N", help="lines shown per job (default 40)")
-    le.add_argument("--reads", type=int, default=LOG_ERRORS_RUN_READS, metavar="N",
+    le.add_argument("--reads", type=reads_cap, default=LOG_ERRORS_RUN_READS, metavar="N",
                     help="given a run id, how many of its failed jobs to read, newest first (default "
                          "%(default)s; the rest are named with their own commands)")
     le.add_argument("--json", action="store_true")
@@ -26795,7 +26824,7 @@ def parser() -> argparse.ArgumentParser:
                             help="only jobs of this trigger")
             ls.add_argument("--conclusion", default="failed",
                             help="failed (default: failure or timed_out), any, or one conclusion (success)")
-        ls.add_argument("--reads", type=int, default=LOG_SCAN_READS if kind == "search" else LOG_SCAN_READS * 2,
+        ls.add_argument("--reads", type=reads_cap, default=LOG_SCAN_READS if kind == "search" else LOG_SCAN_READS * 2,
                         metavar="N", help="logs read from the controller at most (kept ones are free; default "
                                           "%(default)s)")
         ls.add_argument("--limit", type=int, default=20, metavar="N", help="rows shown (default 20)")
