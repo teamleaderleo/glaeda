@@ -32193,5 +32193,37 @@ for _case in (LaneReadTokenTest, UpstreamTickBudgetTest):  # UpstreamTest's own 
     for _name in [n for n in vars(UpstreamTest) if n.startswith("test_") and n not in vars(_case)]:
         setattr(_case, _name, None)
 
+
+class InCallRaceTest(Base):
+    """huge-blue, 2026-11-22: a post failed "bad queue entry: TypeError at glaeda-gh:6200 request" after GitHub had
+    created the PR: another thread's request on the same daemon ended mid-call and cleared self.in_call."""
+
+    def test_a_request_survives_another_threads_request_ending_during_it(self) -> None:
+        self.daemon.now = NOW
+        real = self.daemon.transport
+        other = {"what": "GET other", "since": time.monotonic()}
+
+        def racing(*args):
+            self.daemon.in_call = other  # another thread's request started ...
+            answer = real(*args)
+            self.daemon.in_call = None   # ... and ended, while this one was still in flight
+            return answer
+        self.daemon.transport = racing
+        self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual(self.daemon.last_call["what"].split()[0], "GET")
+
+    def test_a_request_ending_leaves_another_threads_call_in_flight(self) -> None:
+        self.daemon.now = NOW
+        real = self.daemon.transport
+        other = {"what": "GET other", "since": time.monotonic()}
+
+        def overlapped(*args):
+            answer = real(*args)
+            self.daemon.in_call = other  # another thread's request started and is still running
+            return answer
+        self.daemon.transport = overlapped
+        self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.assertIs(self.daemon.in_call, other)
+
 if __name__ == "__main__":
     unittest.main()

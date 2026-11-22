@@ -6110,17 +6110,22 @@ class Daemon:
                 headers["Content-Type"] = "application/json"
             # Timed as "github" like a login request: huge-blue, 2026-11-20 12:0xZ, "read rest 596.0, github 40.0" in
             # a window where most reads went out on the App, so nobody could tell GitHub's answers from local work.
-            self.in_call = {"what": f"{method} {route} (app)", "since": time.monotonic()}
+            # One request's own record: another thread's request on this client clears self.in_call when it ends,
+            # so reading it back here raised TypeError mid-post (huge-blue, 2026-11-22: "bad queue entry: TypeError
+            # at glaeda-gh:6200 request" after the PR was already created).
+            call = {"what": f"{method} {route} (app)", "since": time.monotonic()}
+            self.in_call = call
             try:
                 status, h, raw = self.transport(method, API + path, headers, raw_body)
             except BaseException:
                 self.note_spend("rest", route, 0)  # the App's pool, never the login's share
                 raise
             finally:
-                took = time.monotonic() - self.in_call["since"]
+                took = time.monotonic() - call["since"]
                 self.note_spent("github", took)
-                self.last_call = {"what": self.in_call["what"], "tookS": round(took, 1), "at": round(self.now, 3)}
-                self.in_call = None
+                self.last_call = {"what": call["what"], "tookS": round(took, 1), "at": round(self.now, 3)}
+                if self.in_call is call:
+                    self.in_call = None
             try:
                 doc = json.loads(raw) if raw else None
             except ValueError:
@@ -6187,7 +6192,8 @@ class Daemon:
                              for r in graphql_slot_holders()) or "by other processes"
             raise WatchError(f"held: all {graphql_slots()} GraphQL slots of this login on this host are in flight "
                              f"({GRAPHQL_SLOT_DIR}/: {held}); not sent")
-        self.in_call = {"what": what, "since": time.monotonic()}
+        call = {"what": what, "since": time.monotonic()}  # this request's own record (see the App path above)
+        self.in_call = call
         if slot is not None:
             graphql_slot_flight(slot[0], True)
         try:
@@ -6197,10 +6203,11 @@ class Daemon:
                 self.note_spend("rest", route_of(method, path), 0 if free else 1)
             raise
         finally:
-            took = time.monotonic() - self.in_call["since"]
+            took = time.monotonic() - call["since"]
             self.note_spent("github", took)
             self.last_call = {"what": what, "tookS": round(took, 1), "at": round(self.now, 3)}
-            self.in_call = None
+            if self.in_call is call:
+                self.in_call = None
             if slot is not None:
                 graphql_slot_release(slot[0])
         if charged and status == 304:
