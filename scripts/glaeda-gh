@@ -5221,7 +5221,9 @@ class Daemon:
                 "reads": {k: len(v) for k, v in self.read_done.items()},
                 "lastReadAt": {k: (round(v[-1], 3) if v else None) for k, v in self.read_done.items()},
                 "spentS": {k: round(v, 1) for k, v in sorted(phases.items(), key=lambda x: -x[1])},
-                "inCall": self.progress_call(), "lastCall": self.last_call, "slots": graphql_slot_holders()}
+                "inCall": self.progress_call(), "lastCall": self.last_call, "slots": graphql_slot_holders(),
+                # REST_PREFETCH_*, since the daemon started: sent early, taken by their read, settled unasked
+                "prefetch": dict(self.prefetch_stats)}
 
     def free_slots(self) -> list[dict[str, Any]]:
         """Free the GraphQL slots this process has held past GRAPHQL_SLOT_HOLD_MAX (graphql_slot_reap), each logged
