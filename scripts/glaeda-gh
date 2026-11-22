@@ -12162,12 +12162,27 @@ LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GL
                  "GH_QUOTA_LANDING_READ": "land-judge"}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 # The land pool is sized by the host it runs on, read at every pass, never a hand-set count (cmuxterm-hq
-# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): a ceiling
-# of one worker per LAND_CORES_EACH cores (land_worker_ceiling). land.json "workers" stays an operator's override of
-# the ceiling. No host-load line admits or holds a judgment: LAND_LOAD_LINE (0.8 per core) is gone (see
-# land_load_per_core's comment for what it measured and why). The 4 this replaced was set by hand; gcp-agent-lane-1,
-# 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
-LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
+# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule). Two parts:
+# - the count is the adaptive pool (LandQueue.adapt_pool, the comment above LAND_POOL_ADAPT_S): it starts at one
+#   worker per LAND_CORES_EACH cores (land_worker_ceiling) and grows to land_pool_max; land.json "workers" overrides it;
+# - admission is the host's live headroom, re-read each pass: past the first running judgment, a pass starts at most
+#   as many as the CPU free to a judgment (idle, plus niced work it preempts) and MemAvailable hold over the 80% line,
+#   at a judgment's measured cost each (LandQueue.headroom_take). A host that reports neither is held by the count.
+# No load-average line admits or holds a judgment (glaeda#2472: the load is a run-queue length, not CPU use).
+# huge-blue, 2026-11-22 10:10Z: 32 of 32 busy (land.json 32), each judgment at 0.1-0.4% CPU and 18-44 MB, while
+# /proc/stat said idle 18.5% and nice 33.8% of 32 cores.
+# Measured (glaeda#2472, a live `land-judge explain` on a 16-core lane host, 3 runs at each of 3 loads): 3.9-4.6 s
+# CPU (user+sys), peak RSS 128.4 MB, wall 27-434 s, 85-99% of it waiting on GitHub and the quota. So at its densest a
+# judgment holds 4.6 s of CPU over its shortest 27 s wall: LAND_JUDGMENT_CORES, the divisor at admission.
+LAND_CORES_EACH = 2  # where the adaptive pool starts: one worker per this many cores
+LAND_JUDGMENT_CORES = 4.6 / 27  # about 0.17 of a core
+LAND_JUDGMENT_RSS = 128.4e6  # bytes
+LAND_HEADROOM = 0.8  # the handbook's headroom line: lands take at most this share of the host's cores and RAM
+LAND_WORKER_MAX = 1024  # land_seconds' bound on the ceiling and on land.json "workers"
+LAND_HEADROOM_OFF = 'land.json "headroomHold": false'  # the headroom hold's override (LandQueue.headroom_why)
+LAND_CPU_WINDOW_MIN, LAND_CPU_WINDOW_MAX, LAND_CPU_FRESH = 1.0, 60.0, 0.25  # seconds (land_cpu_free)
+_LAND_CPU: list = [None, None, None, None]  # [monotonic at, /proc/stat counters, last free share, its nice part]
+_LAND_CPU_LOCK = threading.Lock()
 
 
 def land_cores() -> int:
@@ -12175,6 +12190,65 @@ def land_cores() -> int:
     with contextlib.suppress(AttributeError, OSError):
         return max(1, len(os.sched_getaffinity(0)))
     return max(1, os.cpu_count() or 1)
+
+
+def land_meminfo(field: str) -> float | None:
+    """FIELD of /proc/meminfo in bytes, or None where the host has none (macOS) or does not say."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return float(line.split()[1]) * 1024
+    return None
+
+
+def land_mem_total() -> float | None:
+    """The host's RAM in bytes (/proc/meminfo, else sysconf, which macOS answers), or None."""
+    total = land_meminfo("MemTotal")
+    if total is None:
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            total = float(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    return total if total and total > 0 else None
+
+
+def land_mem_available() -> float | None:
+    """The RAM the host can give a new process without swapping (MemAvailable), or None where it is not reported."""
+    return land_meminfo("MemAvailable")
+
+
+def land_proc_stat() -> tuple[int, ...] | None:
+    """The aggregate cpu line of /proc/stat (user nice system idle iowait irq softirq steal), or None."""
+    with contextlib.suppress(OSError, ValueError):
+        with open("/proc/stat", encoding="ascii") as f:
+            parts = f.readline().split()
+        if len(parts) >= 5 and parts[0] == "cpu":
+            return tuple(int(v) for v in parts[1:9])
+    return None
+
+
+def land_cpu_free(now: float | None = None) -> float | None:
+    """The share of the host's CPU a new judgment can have: idle plus nice (niced work yields to it), over the window
+    since the last read when that is LAND_CPU_WINDOW_MIN to LAND_CPU_WINDOW_MAX old, else over a fresh LAND_CPU_FRESH
+    window; None where /proc/stat cannot be read (macOS). Read under a lock, so two callers never race a sample."""
+    with _LAND_CPU_LOCK:
+        at = time.monotonic() if now is None else now
+        last_at, last, share, _nice = _LAND_CPU
+        if last_at is not None and at - last_at < LAND_CPU_WINDOW_MIN and share is not None:
+            return share
+        if last_at is None or last is None or at - last_at > LAND_CPU_WINDOW_MAX:
+            last = land_proc_stat()
+            if last is None:
+                return None
+            time.sleep(LAND_CPU_FRESH)
+            at = time.monotonic() if now is None else at + LAND_CPU_FRESH
+        cur = land_proc_stat()
+        if cur is None:
+            return None
+        d = [b - a for a, b in zip(last, cur)]
+        total = sum(d)
+        share = None if total <= 0 else max(0.0, min(1.0, (d[1] + d[3]) / total))
+        _LAND_CPU[:] = [at, cur, share, None if total <= 0 else max(0.0, min(1.0, d[1] / total))]
+        return share
 
 
 def land_worker_ceiling(cores: int | None = None) -> int:
@@ -13832,6 +13906,8 @@ class LandQueue:
         self.live_reads: list[tuple[float, bool]] = []  # this host's last live judgments: (at, read nothing) (early_hand_off)
         self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
+        # (pass, starts the CPU allows, starts the RAM allows, what was read): the host's headroom, read once per pass
+        self.headroom: tuple[float, float, float, dict] = (-1.0, math.inf, math.inf, {})
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         # The due rows the last full pass left for a worker, in its order: a worker that frees between two passes
@@ -15036,7 +15112,7 @@ class LandQueue:
         at each call."""
         given = self.config().get("workers")
         if given is not None:
-            return int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+            return int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX))
         return max(1, int(self.pool_size))
 
     def adapt_pool(self) -> None:
@@ -15059,6 +15135,44 @@ class LandQueue:
             log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
                  "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
         self.pool_size = size
+
+    def headroom_left(self) -> tuple[float, float]:
+        """How many more judgments this pass may start (CPU, RAM): the host's headroom over the LAND_HEADROOM line,
+        read at the pass's first ask, over a judgment's measured cost (LAND_JUDGMENT_CORES, LAND_JUDGMENT_RSS), less
+        those this pass already started (headroom_take). inf for a resource the host does not report."""
+        if self.headroom[0] != self.now:
+            cores, free = land_cores(), land_cpu_free()
+            avail, total = land_mem_available(), land_mem_total()
+            cpu = math.inf if free is None else (free - (1 - LAND_HEADROOM)) * cores / LAND_JUDGMENT_CORES
+            mem = (math.inf if avail is None or total is None
+                   else (avail - total * (1 - LAND_HEADROOM)) / LAND_JUDGMENT_RSS)
+            nice = _LAND_CPU[3] if free is not None else None
+            read = {"cpuFree": None if free is None else round(free, 3),
+                    "niceShare": None if nice is None else round(nice, 3),
+                    "memAvailableGB": None if avail is None else round(avail / 1e9, 1)}
+            self.headroom = (self.now, cpu, mem, read)
+        return self.headroom[1], self.headroom[2]
+
+    def headroom_why(self) -> str | None:
+        """Why the host's headroom holds one more judgment this pass, or None when it does not. land.json
+        "headroomHold": false turns the hold off (an operator's override, named in the reason); the pool's count
+        still holds."""
+        if self.config().get("headroomHold") is False:
+            return None
+        cpu, mem = self.headroom_left()
+        if cpu < 1:
+            return f"the host's free CPU is at the 80% line (/proc/stat idle+nice; {LAND_HEADROOM_OFF} turns this off)"
+        if mem < 1:
+            return f"the host's free RAM is at the 80% line (MemAvailable; {LAND_HEADROOM_OFF} turns this off)"
+        return None
+
+    def headroom_take(self) -> None:
+        """Charge one judgment started this pass against this pass's headroom, read now if nothing asked yet (the
+        first start, with no job running, skips headroom_why), so every start is charged."""
+        self.headroom_left()
+        at, cpu, mem, read = self.headroom
+        if at == self.now:
+            self.headroom = (at, cpu - 1, mem - 1, read)
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -15154,6 +15268,9 @@ class LandQueue:
                 "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"adaptive:max {land_pool_max()}",
+             "headroom": {**self.headroom[3], **{k: (None if v == math.inf else max(0, int(v)))
+                                                  for k, v in (("cpuStarts", self.headroom[1]),
+                                                               ("memStarts", self.headroom[2]))}},
              "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -16112,6 +16229,9 @@ class LandQueue:
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
             return False
+        if self.jobs and (held := self.headroom_why()):
+            self.gated(e, held)  # LAND_HEADROOM, read once a pass; the first judgment always runs
+            return False
         if not self.login_room(e):
             self.gated(e, "the login's share of the workers (loginWorkers) is busy")
             return False
@@ -16151,6 +16271,7 @@ class LandQueue:
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
+        self.headroom_take()
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         self.changed_entries.discard(e["key"])
         return True
@@ -18177,7 +18298,7 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
     if given is not None:
-        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, 1024)), "land.json"
+        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX)), "land.json"
     else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
         line = read_json(land_dir() / LAND_POOL_FILE)
         size = line.get("workers") if isinstance(line, dict) else None
@@ -19071,7 +19192,10 @@ REEXEC_DRAIN_MAX = 300.0
 # A release update re-execs a daemon with land work running at most once per this many seconds of its uptime; until
 # then the update waits and the land queue works on ("hold"). huge-blue, 2026-11-18: glaeda main merges re-exec'd the
 # daemon at 14:51, 15:06, 15:09, 15:22 and 15:24Z, each dropping every judgment in flight. Idle, it re-execs at once.
-REEXEC_UPDATE_GAP = 1800.0
+# 300 s, not the 1800 s it was: huge-blue, 2026-11-22, a merged land fix (glaeda#2462, on disk 09:15Z) was held to
+# ~09:43Z while the queue it fixed stayed capped. The drain (REEXEC_DRAIN_MAX) already bounds what a re-exec drops (no
+# new step starts, a claimed step is judged again), so the gap only spaces re-execs: one per 5 min at most.
+REEXEC_UPDATE_GAP = 300.0
 
 
 def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,
