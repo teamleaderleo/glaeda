@@ -25132,6 +25132,21 @@ class LandTest(Base):
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
                        nxt=nxt, reason=f"land-judge: refused: checks still running at {head[:8]}")
 
+    def test_each_judgment_logs_its_wall_time(self):
+        # The entry pops judging after each judgment, so nothing else on the land host says how long one took.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.land()
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick()
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual(len(judged), 1, lines)
+        self.assertEqual((judged[0]["key"], judged[0]["code"], judged[0]["step"], judged[0]["head"]),
+                         (self.KEY, "ok", "merge", LA[:12]))
+        self.assertIsInstance(judged[0]["took_s"], float)
+        self.assertGreaterEqual(judged[0]["took_s"], 0.0)
+
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
         # 1800 s wait timed out with the checks still queued, and the third judgment stopped both: "checks_running: 3
