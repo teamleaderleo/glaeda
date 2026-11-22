@@ -1227,6 +1227,18 @@ PR_REST_FULL_EVERY = 300
 # re-reads the pull whose merge state a land rules on.
 PR_REST_SETTLED_FULL_EVERY = 1800
 PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in full
+# The REST loop reads one PR at a time, and each read's requests went out one after another: ~650 waited PRs at ~2 s a
+# read is a ~1300 s pass however few requests each costs (huge-blue 2026-11-22). So the conditional GETs the next
+# REST_PREFETCH_AHEAD reads will send (the paths and ETags their last read kept: Daemon.prefetch_rest) go out early on
+# REST_PREFETCH_WORKERS threads, and each read takes its answers as it asks for them. Only the transport runs on a
+# worker: admission (the quota latch, the REST share, the secondary hold, the per-minute cap) is decided before a
+# request is sent, and charging, the spend log and the limits are request()'s, on the loop's thread, as for any other
+# request. Only conditional requests go early, so one a read does not ask for after all is most often a free 304; one
+# that is not is charged when the tick settles it (settle_prefetch). REST_PREFETCH_HELD bounds what is in flight or
+# held unasked.
+REST_PREFETCH_WORKERS = 4
+REST_PREFETCH_AHEAD = 6
+REST_PREFETCH_HELD = 24
 # A wait on a PR read over REST that has run LONG_WAIT_AFTER is read every LONG_WAIT_FACTOR cycles (a check event the
 # controller delivers still reads it at once): a cmux wait runs 30-60 minutes, and its last minutes decide nothing the
 # first ones did not.
@@ -5010,6 +5022,11 @@ class Daemon:
         # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
         self.confirming: dict[str, tuple[dict, Any]] = {}
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: answers every watch on them shares
+        # REST_PREFETCH_*: (method, path, ETag) -> a request sent early, until its read takes it or the tick settles it
+        self.prefetched: dict[tuple[str, str, str], dict] = {}
+        self.prefetch_workers = REST_PREFETCH_WORKERS  # 0 sends every request on the loop's thread, as before
+        self.prefetch_pool: Any = None
+        self.prefetch_stats = {"sent": 0, "taken": 0, "unasked": 0}
         self.cut_reads: dict[str, float] = {}  # key -> the tick its REST read was first cut off partway (RESUME_MAX)
         self.resume_key, self.resume_from = "", float("inf")  # the read resuming now, and since when its parts stand
         self.job_lists_asked: dict[str, float] = {}  # a run's job-list page -> the tick that last asked it
@@ -6245,12 +6262,7 @@ class Daemon:
             pool = chosen
             self.last_app_pool = chosen
             self.last_request_source = "app"
-            headers = {"Authorization": f"Bearer {app_token}", "Accept": "application/vnd.github+json",
-                       "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
-            if etag:
-                headers["If-None-Match"] = etag
-            if raw_body is not None:
-                headers["Content-Type"] = "application/json"
+            headers = self.read_headers(app_token, etag, raw_body is not None)
             # Timed as "github" like a login request: huge-blue, 2026-11-20 12:0xZ, "read rest 596.0, github 40.0" in
             # a window where most reads went out on the App, so nobody could tell GitHub's answers from local work.
             # One request's own record: another thread's request on this client clears self.in_call when it ends,
@@ -6259,7 +6271,7 @@ class Daemon:
             call = {"what": f"{method} {route} (app)", "since": time.monotonic()}
             self.in_call = call
             try:
-                status, h, raw = self.transport(method, API + path, headers, raw_body)
+                status, h, raw = self.send(method, path, headers, raw_body)
             except BaseException:
                 self.note_spend("rest", route, 0)  # the App's pool, never the login's share
                 raise
@@ -6299,12 +6311,7 @@ class Daemon:
             raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.token is None:
             self.token = self.token_source()
-        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
-                   "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
-        if etag:
-            headers["If-None-Match"] = etag
-        if raw_body is not None:
-            headers["Content-Type"] = "application/json"
+        headers = self.read_headers(self.token, etag, raw_body is not None)
         # The outbox -- a write and the lookups that keep it from landing twice -- is what sessions
         # asked for, at most one write per POST_SPACING, and would cost the same through gh. The share
         # caps the daemon's polling, so the outbox is neither counted against it nor held by it:
@@ -6340,7 +6347,7 @@ class Daemon:
         if slot is not None:
             graphql_slot_flight(slot[0], True)
         try:
-            status, h, raw = self.transport(method, API + path, headers, raw_body)
+            status, h, raw = self.send(method, path, headers, raw_body)
         except BaseException:
             if bucket == "rest":  # never answered, but GitHub may have counted it (as charge_rest above assumes)
                 self.note_spend("rest", route_of(method, path), 0 if free else 1)
@@ -8021,6 +8028,7 @@ class Daemon:
                 if cut is not None and self.now - cut <= RESUME_MAX and not (isinstance(data_at, (int, float))
                                                                              and data_at >= cut):
                     self.resume_key, self.resume_from = e["key"], cut
+                self.prefetch_rest(over_rest[i:i + REST_PREFETCH_AHEAD])
                 began = time.monotonic()
                 try:
                     with self.calling(*caller_of(e["key"]), waiter_of(e)), self.phase("read rest"):
@@ -8061,6 +8069,7 @@ class Daemon:
                 self.deferred_since.pop(e["key"], None)
         finally:
             self.resume_key, self.resume_from = "", float("inf")
+            self.settle_prefetch()
         for e in self.jobs_only:
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):
@@ -10246,24 +10255,9 @@ class Daemon:
         the read on in full: no full read within PR_REST_FULL_EVERY, a settled, closed or GraphQL-read entry, `--jobs`,
         a head with no suite or more than one page of them, a changed suite or status, a closed issue, or an issue that
         changed while the kept pull is past PULL_REUSE_MAX. Raises OutOfTime."""
-        data = prior.get("data") if isinstance(prior.get("data"), dict) else None
-        full = prior.get("restFullAt")
-        if (data is None or e.get("jobs") or prior.get("via") != "rest" or prior.get("error")
-                or not isinstance(full, (int, float)) or isinstance(full, bool)
-                or str(data.get("state") or "").upper() != "OPEN" or not data.get("headRefOid")
-                or self.mode("rest") == "stop"):
+        if not self.rest_gate_due(e, prior):
             return False
-        checks = data.get("checks") or []
-        running = any(str(c.get("status") or "").upper() != "COMPLETED" for c in checks)
-        if running and data.get("checkState") in ("PENDING", "FAILURE"):
-            bound = PR_REST_FULL_EVERY
-        elif checks and not running and data.get("checkState") == "FAILURE":
-            bound = PR_REST_SETTLED_FULL_EVERY  # a settled failed head
-        else:
-            return False
-        if self.now - full >= bound:
-            return False
-        sha = str(data["headRefOid"])
+        sha = str(prior["data"]["headRefOid"])
         issue_path, pull_path = f"{root}/issues/{number}", f"{root}/pulls/{number}"
         gate_paths = (suites_path(root, sha), f"{root}/commits/{sha}/status?per_page=100&page=1")
         kept = {p: old.get(p) for p in (issue_path, pull_path) + gate_paths}
@@ -10291,6 +10285,180 @@ class Daemon:
             return False  # the full read says what failed
         self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest")
         return True
+
+    def rest_gate_due(self, e: dict, prior: dict) -> bool:
+        """Whether E's REST PR read goes to its gate (rest_gate_holds) rather than straight to a full read: an open,
+        REST-read entry with a running PENDING or FAILURE head read in full within PR_REST_FULL_EVERY, or a settled
+        failed head within PR_REST_SETTLED_FULL_EVERY. No request."""
+        data = prior.get("data") if isinstance(prior.get("data"), dict) else None
+        full = prior.get("restFullAt")
+        if (data is None or e.get("jobs") or prior.get("via") != "rest" or prior.get("error")
+                or not isinstance(full, (int, float)) or isinstance(full, bool)
+                or str(data.get("state") or "").upper() != "OPEN" or not data.get("headRefOid")
+                or self.mode("rest") == "stop"):
+            return False
+        checks = data.get("checks") or []
+        running = any(str(c.get("status") or "").upper() != "COMPLETED" for c in checks)
+        if running and data.get("checkState") in ("PENDING", "FAILURE"):
+            bound = PR_REST_FULL_EVERY
+        elif checks and not running and data.get("checkState") == "FAILURE":
+            bound = PR_REST_SETTLED_FULL_EVERY  # a settled failed head
+        else:
+            return False
+        return self.now - full < bound
+
+    def prefetch_paths(self, e: dict) -> list[tuple[str, str]]:
+        """(path, ETag) of the conditional GETs E's REST PR read will most likely send, as it will send them: its
+        gate's three when the gate is due (rest_gate_due), else every path its last read kept; with the ETag repo_part
+        will seed (a shared answer's, else the kept one's). None a shared answer still serves (no request), none
+        unconditional (a first read: an unasked answer would cost), none an `unavailable` or `gone` part. No request."""
+        if not e["key"].startswith("pr:"):
+            return []
+        prior = e.get("cache") or {}
+        old = prior.get("restParts") or {}
+        data = prior.get("data") if isinstance(prior.get("data"), dict) else None
+        if not isinstance(old, dict) or not old or data is None or prior.get("via") != "rest" or e.get("jobs"):
+            return []
+        _, owner, repo, number = split_key(e["key"])
+        root = f"/repos/{owner}/{repo}"
+        if self.rest_gate_due(e, prior):
+            sha = str(data["headRefOid"])
+            paths = [f"{root}/issues/{number}", suites_path(root, sha), f"{root}/commits/{sha}/status?per_page=100&page=1"]
+        else:
+            paths = list(old)
+            pull = old.get(f"{root}/pulls/{number}")
+            at = pull.get("at") if isinstance(pull, dict) else None
+            # rest_pull asks the issue first while the kept pull may stand (and the pull only when the issue moved),
+            # else the pull, and the issue only when the PR changed since: the likelier one goes early
+            reusable = (self.etags and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX
+                        and bool((old.get(f"{root}/issues/{number}") or {}).get("etag")))
+            unlikely = f"{root}/pulls/{number}" if reusable else f"{root}/issues/{number}"
+            paths = [path for path in paths if path != unlikely]
+        out = []
+        for path in paths:
+            kept = old.get(path) if isinstance(old.get(path), dict) else {}
+            if kept.get("unavailable") or kept.get("gone"):
+                continue
+            shared = self.repo_parts.get(path)
+            repo_level = path.startswith((f"{root}/actions/workflows", f"{root}/rules/branches/", f"{root}/branches/"))
+            if shared is not None and self.now - shared["at"] < (REST_REPO_PART_TTL if repo_level else REST_HEAD_PART_TTL):
+                continue
+            lent = (shared or {}).get("part") or {}
+            seed = lent if lent.get("etag") and "doc" in lent else kept
+            if seed.get("etag") and "doc" in seed:
+                out.append((path, str(seed["etag"])))
+        return out
+
+    def read_headers(self, token: str, etag: str | None, json_body: bool = False) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
+        if etag:
+            headers["If-None-Match"] = etag
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def prefetch_rest(self, upcoming: list[dict]) -> None:
+        """Send early, on the prefetch pool, the conditional GETs the UPCOMING REST reads will send (prefetch_paths;
+        REST_PREFETCH_*), each with the credential request() will pick for it (the App's for an owner it serves, else
+        the login's). A login request goes only as request() would send it: no secondary hold, REST not stopped, room
+        in the REST share and the per-minute cap for it and for every login request already held. Never raises."""
+        if self.prefetch_workers <= 0 or self.upstream() is not None or self.writing:
+            return
+        try:
+            held_login = sum(1 for h in self.prefetched.values() if h["login"])
+            login_ok = None  # decided at the first login request
+            for e in upcoming:
+                for path, etag in self.prefetch_paths(e):
+                    if len(self.prefetched) >= REST_PREFETCH_HELD or time.monotonic() >= self.tick_deadline:
+                        return
+                    key = ("GET", path, etag)
+                    if key in self.prefetched:
+                        continue
+                    pool = self.app_pool
+                    owner = pool.owner_of("GET", path) if pool is not None else None
+                    scope = pool.scope(owner, "GET", path) if owner else ""
+                    chosen = pool.pick(owner, scope) if owner else None
+                    token = chosen.token(owner) if chosen else None
+                    login = not token
+                    if login:
+                        if login_ok is None:
+                            login_ok = self.mode("rest") != "stop" and self.secondary_admit("rest", 1)
+                        cap = int(pace_settings()["minute_cap_calls"])
+                        recent = sum(1 for t in self.minute_sent["rest"] if self.clock() - t < PACE_WINDOW)
+                        if not login_ok or not self.rest_room(held_login + 1) or recent + held_login + 1 >= cap:
+                            continue
+                        if self.token is None:
+                            self.token = self.token_source()
+                        token = self.token
+                    headers = self.read_headers(token, etag)
+                    if self.prefetch_pool is None:
+                        import concurrent.futures
+                        self.prefetch_pool = concurrent.futures.ThreadPoolExecutor(
+                            max_workers=self.prefetch_workers, thread_name_prefix="glaeda-gh-rest")
+                    self.prefetched[key] = {"future": self.prefetch_pool.submit(self.transport, "GET", API + path,
+                                                                                headers, None),
+                                            "headers": headers, "login": login, "pool": chosen, "owner": owner,
+                                            "scope": scope, "caller": self.caller_for(e), "route": route_of("GET", path),
+                                            "minute": int(self.clock() // 60)}
+                    self.prefetch_stats["sent"] += 1
+                    held_login += login
+        except Exception as error:  # noqa: BLE001  (an early read is only ever a saving)
+            self.errors.append(f"prefetch: {describe(error)}")
+
+    def caller_for(self, e: dict) -> tuple:
+        return tuple(caller_of(e["key"])) + (waiter_of(e),)
+
+    def send(self, method: str, path: str, headers: dict[str, str], raw_body: bytes | None) -> tuple[int, dict, bytes]:
+        """request()'s one transport call: the answer a prefetch already asked for with these exact headers
+        (prefetch_rest), waited for within the tick, else the request itself, now."""
+        held = self.prefetched.pop((method, path, headers.get("If-None-Match") or ""), None) if raw_body is None else None
+        if held is not None and held["headers"] != headers:
+            self.settle_one(held)  # another credential (a token minted or a pool refused since): not this request's
+            held = None
+        if held is None:
+            return self.transport(method, API + path, headers, raw_body)
+        import concurrent.futures
+        self.prefetch_stats["taken"] += 1
+        try:
+            return held["future"].result(timeout=max(0.1, min(HTTP_DEADLINE, self.tick_deadline - time.monotonic()
+                                                              + SOCKET_TIMEOUT)))
+        except concurrent.futures.TimeoutError:
+            # charged as sent (request() charged it before): GitHub may count it whenever it ends
+            raise WatchError("request failed: no answer from the prefetch in time") from None
+
+    def settle_prefetch(self) -> None:
+        """Account for every early request no read asked for (prefetch_rest): spent, logged and limited as request()
+        would have, once its answer is in (each within SOCKET_TIMEOUT, else charged as sent)."""
+        while self.prefetched:
+            self.settle_one(self.prefetched.pop(next(iter(self.prefetched))))
+
+    def settle_one(self, held: dict) -> None:
+        import concurrent.futures
+        self.prefetch_stats["unasked"] += 1
+        try:
+            status, h, raw = held["future"].result(timeout=SOCKET_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            status, h, raw = 0, {}, b""
+        except Exception:  # noqa: BLE001  (never answered: GitHub may still have counted it)
+            status, h, raw = 0, {}, b""
+        with self.calling(*held["caller"]):
+            if not held["login"]:
+                self.note_spend("rest", held["route"], 0)
+                if status and held["pool"] is not None:
+                    held["pool"].answered(held["owner"], held["scope"], status, h, "")
+                self.sent.append((self.now, "app"))
+                return
+            counted = 0 if status == 304 else 1
+            if counted:
+                self.charge_rest(held["minute"], 1)
+            self.minute_sent["rest"].append(self.clock())
+            self.note_spend("rest", held["route"], counted)
+            self.sent.append((self.now, "rest304" if status == 304 else "rest"))
+        if status in {403, 429} and h.get("retry-after") and h.get("x-ratelimit-remaining") != "0":
+            self.secondary_hit("rest", h.get("retry-after"))
+        elif status in {403, 429} and SECONDARY.search(raw.decode("utf-8", "replace") if raw else ""):
+            self.secondary_hit("rest", h.get("retry-after"))
 
     def rest_pull(self, old: dict, parts: dict, root: str, number: Any, reuse: bool = True) -> tuple[dict, bool]:
         """(the pull, whether it is the kept one) for a REST PR read. The kept pull stands, with no pulls/N request,

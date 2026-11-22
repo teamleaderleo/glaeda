@@ -20464,6 +20464,130 @@ class ConcurrentWaitsRestTest(Base):
         self.assertTrue(all(r[3] >= 0 and r[4] >= 1 for r in timed), timed)
 
 
+class RestPrefetchTest(Base):
+    """huge-blue 2026-11-22: ~650 waited PRs over REST with GraphQL stopped, one PR read at a time at ~2 s a read (each
+    request ~0.2-0.6 s, sent one after another), so a pass over them took ~1300 s however few requests each read cost.
+    REST_PREFETCH_*: the conditional GETs of the next reads go out early on a bounded pool. The harness: 24 waited PRs
+    over REST, every GitHub answer DELAY late, a gated tick (3 requests a read) and a full one (PR_REST_FULL_EVERY
+    later), serial and prefetched; the same requests, spend and stored data either way."""
+
+    N = 24
+    DELAY = 0.03
+
+    def setUp(self) -> None:
+        super().setUp()
+        for n in range(1, self.N + 1):
+            node = pr_node(n, rollup="PENDING", checks=[check_run("lint"), check_run("test", "IN_PROGRESS", None)])
+            node.update(url=f"https://github.com/o/r/pull/{n}", headRefOid=f"{n:x}".ljust(40, "a")[:40],
+                        mergeStateStatus="BLOCKED")
+            self.gh.prs[("o", "r", n)] = node
+            gg.register(f"pr:o/r#{n}", waited=True, began=NOW)
+
+    def wait_all(self, t: float) -> None:
+        for n in range(1, self.N + 1):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+            os.utime(path, (t, t))
+
+    def run_ticks(self, workers: int) -> dict:
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": ["graphql"], "restShare": 1.0})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.daemon.prefetch_workers = 0
+        self.daemon.tick(NOW)  # every PR's first read: nothing kept to send early
+        gh, lock = self.gh, threading.Lock()
+        threads: set[str] = set()
+
+        def slow(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+            time.sleep(self.DELAY)
+            threads.add(threading.current_thread().name)
+            with lock:  # the fake's own state is not thread-safe; the delay is outside it
+                return gh(method, url, headers, body)
+
+        self.daemon.transport = slow
+        self.daemon.prefetch_workers = workers
+        out: dict = {}
+        for name, t in (("gated", NOW + gg.CYCLE), ("full", NOW + gg.PR_REST_FULL_EVERY + 2 * gg.CYCLE)):
+            gh.repo_pushes += 1
+            self.wait_all(t)
+            calls, left, began = len(gh.calls), gh.rest_remaining, time.monotonic()
+            self.daemon.tick(t)
+            out[name] = {"seconds": time.monotonic() - began, "requests": len(gh.calls) - calls,
+                         "counted": left - gh.rest_remaining}
+        def rel(v: Any) -> Any:  # the clock's own start moves between the two runs
+            if isinstance(v, dict):
+                return {k: rel(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [rel(x) for x in v]
+            return v - NOW if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v - NOW) < 1e6 else v
+
+        out["data"] = {n: rel(gg.read_cache(f"pr:o/r#{n}")["data"]) for n in range(1, self.N + 1)}
+        out["fresh"] = all(gg.read_cache(f"pr:o/r#{n}")["dataAt"] == NOW + gg.PR_REST_FULL_EVERY + 2 * gg.CYCLE
+                           for n in range(1, self.N + 1))
+        out["threads"] = len(threads - {threading.current_thread().name})
+        out["spent"] = self.daemon.rest_spent()
+        return out
+
+    def test_prefetched_reads_send_the_same_requests_in_a_fraction_of_the_time(self) -> None:
+        serial = self.run_ticks(0)
+        self.tearDown()
+        self.setUp()
+        early = self.run_ticks(gg.REST_PREFETCH_WORKERS)
+        for name in ("gated", "full"):
+            print(f"\nHARNESS {self.N} waited PRs over REST, {name} tick, {self.DELAY * 1000:.0f} ms a request: "
+                  f"serial {serial[name]['seconds']:.2f} s / {serial[name]['requests']} requests / "
+                  f"{serial[name]['counted']} counted; prefetched {early[name]['seconds']:.2f} s / "
+                  f"{early[name]['requests']} requests / {early[name]['counted']} counted", file=sys.stderr)
+            self.assertEqual(early[name]["counted"], serial[name]["counted"], name)
+            self.assertLessEqual(early[name]["requests"], serial[name]["requests"] + gg.REST_PREFETCH_HELD, name)
+            self.assertLess(early[name]["seconds"], serial[name]["seconds"] * 0.6, name)
+        self.assertEqual(early["data"], serial["data"])
+        self.assertTrue(serial["fresh"] and early["fresh"], "a PR was left unread")
+        self.assertEqual(early["spent"], serial["spent"], "the REST share was charged differently")
+        self.assertEqual(serial["threads"], 0)
+        self.assertLessEqual(early["threads"], gg.REST_PREFETCH_WORKERS)
+        self.assertFalse(self.daemon.prefetched, "an early request was left unsettled")
+
+    def test_nothing_goes_early_while_rest_is_stopped_or_held(self) -> None:
+        self.run_ticks(0)
+        self.daemon.prefetch_workers = gg.REST_PREFETCH_WORKERS
+        self.daemon.now = NOW + 3 * gg.CYCLE
+        upcoming = [{"key": f"pr:o/r#{n}", "cache": gg.read_cache(f"pr:o/r#{n}")} for n in range(1, 4)]
+        self.daemon.tick_deadline = time.monotonic() + 30
+        self.assertTrue(self.daemon.prefetch_paths(upcoming[0]))
+        self.daemon.secondary_until = self.daemon.clock() + 60
+        self.daemon.prefetch_rest(upcoming)
+        self.assertFalse(self.daemon.prefetched, "sent early during a secondary hold")
+        self.daemon.secondary_until = 0
+        self.daemon.backoff["rest"] = self.daemon.now + 60
+        self.daemon.prefetch_rest(upcoming)
+        self.assertFalse(self.daemon.prefetched, "sent early while REST is stopped")
+        self.daemon.backoff["rest"] = 0
+        with mock.patch.object(self.daemon, "rest_room", return_value=False):
+            self.daemon.prefetch_rest(upcoming)
+        self.assertFalse(self.daemon.prefetched, "sent early past the REST share")
+        self.daemon.prefetch_rest(upcoming)
+        self.assertTrue(self.daemon.prefetched)
+        self.assertLessEqual(len(self.daemon.prefetched), gg.REST_PREFETCH_HELD)
+
+    def test_an_early_answer_no_read_asks_for_is_charged_unless_it_is_a_304(self) -> None:
+        self.run_ticks(0)
+        self.daemon.prefetch_workers = gg.REST_PREFETCH_WORKERS
+        self.daemon.now = NOW + 3 * gg.CYCLE
+        self.daemon.tick_deadline = time.monotonic() + 30
+        self.gh.repo_pushes += 1
+        e = {"key": "pr:o/r#1", "cache": gg.read_cache("pr:o/r#1")}
+        spent, sent = self.daemon.rest_spent(), len(self.daemon.sent)
+        self.daemon.prefetch_rest([e])
+        held = len(self.daemon.prefetched)
+        self.assertGreater(held, 0)
+        statuses = [h["future"].result()[0] for h in self.daemon.prefetched.values()]
+        self.daemon.settle_prefetch()
+        self.assertFalse(self.daemon.prefetched)
+        self.assertEqual(len(self.daemon.sent), sent + held)
+        self.assertEqual(self.daemon.rest_spent() - spent, sum(1 for s in statuses if s != 304))
+
+
 class CmuxWaitsRestCostTest(Base):
     """claude-sr2-coord, 2026-11-17 09:41Z and 10:36Z: cosmic-gray's REST pool drained at 127-169/min, and the daemon's
     top routes were commits/SHA/check-runs pages, runs/ID/jobs pages and pulls/N on manaflow-ai/cmux, from `glaeda-gh
