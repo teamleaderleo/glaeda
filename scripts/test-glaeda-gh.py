@@ -26537,6 +26537,63 @@ class LandTest(Base):
         self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_draft", self.KEY))
         self.assertEqual(doc["next"], "gh pr ready 1 -R o/r, then glaeda-gh land o/r#1")
 
+    def test_a_pin_this_queue_already_followed_forward_leaves_the_live_row_alone(self):
+        """A land the queue already followed forward is answered with the pin the row holds, never re-pinned backwards.
+        efficiency-standing-lane, 2026-11-22: glaeda#2542 was queued pinned 27b86dab, followed to 3ec2af7c by
+        repin_own_update at 20:00Z, and the head was ed96f931 when a re-pin at 3ec2af7c reached the queue at 20:06Z,
+        which parked the row in pin_wait for a head that was already gone. NOW counts that class (land-re-pin-loop,
+        14 that day): the agent watching from outside sees a head that is not its pin, re-pins by hand, and by then
+        the hand-written pin is the stale one."""
+        entry = {"key": self.KEY, "state": "waiting", "pinSha": LB, "requester": "host/lane",
+                 "history": [{"event": "repin_own_update", "head": LB[:12], "pin": LA[:12]}]}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), entry)
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("the live row is not re-queued")):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(rc, gg.EXIT_OK)  # not a refusal: the row is live and pinned ahead of this request
+        self.assertIn(f"the row holds {LB[:12]}", said[0])
+        self.assertIn("park it (pin_wait), so nothing was changed", said[0])
+        self.assertIn(f"next: glaeda-gh wait pr o/r#1 --until merged --sha {LB} --timeout 1800", said[0])
+        # The row itself is untouched: same state, same pin, no history written by the request.
+        self.assertEqual(gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY)), entry)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("the live row is not re-queued")), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, LA)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_OK, True, "land_pin_followed", self.KEY))
+        self.assertEqual((doc["pin"], doc["was"]), (LB, LA))
+
+    def test_only_this_requester_s_own_live_followed_row_answers_a_pin(self):
+        """What the check does *not* read as a follow: a finished row, an unpinned one, one still pinned where the
+        caller pinned, another session's row, and a history with no follow away from this pin. Each of those is queued
+        exactly as it always was, since only the queue's own recorded follow proves the caller's pin is the stale one."""
+        follow = {"event": "repin_own_update", "head": LB[:12], "pin": LA[:12]}
+        live = {"state": "waiting", "pinSha": LB, "requester": "host/lane", "history": [follow]}
+        self.assertEqual(gg.land_pin_already_followed(live, LA, "host/lane"), LB)
+        for event in gg.LAND_PIN_FOLLOW_EVENTS:  # every follow event records the pin it moved away from
+            for field in ("pin", "was"):
+                self.assertEqual(gg.land_pin_already_followed(
+                    {**live, "history": [{"event": event, field: LA[:12]}]}, LA, "host/lane"), LB, (event, field))
+        for entry, why in ((None, "no row at all"),
+                           ({}, "an empty row"),
+                           ({**live, "state": "merged"}, "a merged row"),
+                           ({**live, "state": "stopped"}, "a stopped row"),
+                           ({**live, "pinSha": ""}, "an unpinned row"),
+                           ({**live, "pinSha": "nope"}, "a pin that is no sha"),
+                           ({**live, "pinSha": LA}, "a row still pinned where the caller pinned"),
+                           ({**live, "requester": "other/lane"}, "another session's row"),
+                           ({**live, "history": []}, "no history"),
+                           ({**live, "history": [{"event": "queued", "pin": LA[:12]}]}, "no follow event"),
+                           ({**live, "history": [{**follow, "pin": LC[:12]}]}, "a follow away from another pin")):
+            self.assertEqual(gg.land_pin_already_followed(entry, LA, "host/lane"), "", why)
+        self.assertEqual(gg.land_pin_already_followed(live, "", "host/lane"), "", "an unpinned request")
+
     def test_a_draft_read_that_is_stale_or_shadowed_by_a_write_refuses_nothing(self):
         """A refusal built from a read that may no longer hold is never final: it is queued as before, and the
         merge-time check answers it. So the request-time check keeps inside the live-field bound, and drops a read a
