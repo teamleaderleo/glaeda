@@ -12183,9 +12183,13 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.ineligible())
 
     def short(self, gate: hook.Gate) -> str | None:
-        """DISK_RECLAIM_NOW: low_disk never holds the listener; what it found short (and started reclaim for) is
-        disk_short's reason, or None."""
-        self.assertIsNone(gate.low_disk(), "a disk reading never holds the listener (DISK_RECLAIM_NOW)")
+        """DISK_RECLAIM_NOW: a one-job peak never holds the listener; what low_disk found short (and started reclaim
+        for) is disk_short's reason, or None. RUNNER_JOBS_HOLD: the jobs in flight's disk does hold it; then the
+        reason is its numbers, prefixed "held: "."""
+        held = gate.low_disk()
+        if held is not None:
+            self.assertIn("RUNNER_JOBS_HOLD", held, "only the jobs in flight's disk or a full disk holds")
+            return f"held: {gate.disk_held} (RUNNER_JOBS_DISK)"
         return gate.disk_short[0] if gate.disk_short else None
 
     def test_every_runner_warns_while_free_disk_is_under_its_floor(self) -> None:
@@ -12490,8 +12494,8 @@ class GateTest(unittest.TestCase):
     def test_an_idle_runner_counts_the_jobs_in_flight_before_it_takes_one(self) -> None:
         """RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight
         (from hq build-fleet/runner-job-disk.json) stays free"). Over one job's peak, an idle pool runner beside two
-        running jobs reclaims until 10 + 5.3 x 3 = 25.9 GiB is free, and keeps listening (DISK_RECLAIM_NOW); the value
-        per job is the file's."""
+        running jobs reclaims until 10 + 5.3 x 3 = 25.9 GiB is free and takes no job until it fits (RUNNER_JOBS_HOLD,
+        hq#19208: 1.3 GiB free beside 7 runner jobs); the value per job is the file's."""
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
             (self.tmp / name).mkdir()
@@ -12510,7 +12514,10 @@ class GateTest(unittest.TestCase):
                           "(or listening first) and this one", why or "")
             self.assertIn("the p95 of 11438 jobs, 2026-11-02..2026-11-15", why or "")
             self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup aims at the floor, over the need")
-            self.assertIsNone(gate.claimed(), "an idle look keeps the listener")
+            self.assertIn("taking no job until it fits (RUNNER_JOBS_HOLD)", gate.low_disk() or "",
+                          "the jobs in flight's disk holds the listener")
+            self.assertIn("25.9 GiB required", gate.disk_held or "", "the hold keeps its numbers")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.claimed() or "", "the held look is what claimed() reports")
             free["gib"] = 26.0
             self.assertIsNone(self.short(gate), "room for both jobs in flight and the next one: listening")
             free["gib"] = 21.0
