@@ -31001,6 +31001,81 @@ class LandForwardTest(Base):
         with self.assertRaisesRegex(gg.WatchError, "Could not resolve"):
             gg.land_forward(["reach", "h"], {"op": "batch"}, run=broken)
 
+    def test_the_executor_name_skips_ssh_options(self):
+        # 2026-11-22 17:16Z: a cutover's `ssh -o BatchMode=yes HOST ...` was named "-o" in every notice
+        ssh = ["ssh", "-o", "BatchMode=yes", "new-exec", ".local/bin/glaeda-gh", "land", "serve"]
+        self.assertEqual(gg.land_forward_name(ssh), "new-exec")
+        self.assertEqual(gg.land_forward_name(["ssh", "-T", "-oBatchMode=yes", "h2", "x"]), "h2")
+        self.assertEqual(gg.land_forward_name(list(self.EXEC)), "big-exec")
+        self.assertEqual(gg.land_forward_name(["/opt/bin/serve-land", "--x"]), "/opt/bin/serve-land --x")
+        with mock.patch.object(gg, "policy_host", return_value="me"):
+            self.assertEqual(gg.land_redirected(ssh, "other-exec"),
+                             ["ssh", "-o", "BatchMode=yes", "other-exec", ".local/bin/glaeda-gh", "land", "serve"])
+            for host in ("new-exec", "me", "-o", "", None, "a b"):
+                self.assertIsNone(gg.land_redirected(ssh, host), host)
+            self.assertIsNone(gg.land_redirected(["/opt/bin/serve-land"], "x"))
+
+    def test_serve_names_where_it_forwards(self):
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["ssh", "-o", "BatchMode=yes", "cp1", "x"]}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "status"})), gg.EXIT_FAIL)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["code"], doc["executor"]), ("not_executor", "cp1"))
+
+    def test_a_not_executor_answer_is_followed_one_hop_never_back(self):
+        """2026-11-22 17:16-17:32Z: huge-blue named an executor itself and refused every forward (not_executor); the
+        forwarders' outboxes grew for 18 min. Before: the refusal raised. After: the request goes to the host it names."""
+        calls: list[list[str]] = []
+
+        def serve(table):
+            def run(argv, deadline, input_text=None):
+                calls.append(argv)
+                host = argv[1]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(table[host]) + "\n", "")
+            return run
+
+        refuse = {"ok": False, "code": "not_executor", "reason": "hb forwards", "executor": "cp1"}
+        took = {"ok": True, "accepted": ["1"]}
+        with mock.patch.object(gg, "policy_host", return_value="me"):
+            answer = gg.land_forward(["reach", "hb", "glaeda-gh"], {"op": "batch"}, run=serve({"hb": refuse, "cp1": took}))
+            self.assertEqual((answer["accepted"], answer["redirectedTo"]), (["1"], "cp1"))
+            self.assertEqual([c[1] for c in calls], ["hb", "cp1"])
+            # cp1 forwarding on too: one hop only, and the refusal says the path
+            calls.clear()
+            chain = {"hb": refuse, "cp1": {**refuse, "executor": "cp2"}}
+            with self.assertRaisesRegex(gg.LandNotExecutor, "redirected from cp1 via cp1|via cp1"):
+                gg.land_forward(["reach", "hb", "glaeda-gh"], {"op": "batch"}, run=serve(chain))
+            self.assertEqual([c[1] for c in calls], ["hb", "cp1"])
+            # naming this host itself, or no host: no redirect, the refusal raised as before
+            for to in ("me", None):
+                calls.clear()
+                with self.assertRaises(gg.LandNotExecutor):
+                    gg.land_forward(["reach", "hb", "x"], {"op": "batch"},
+                                    run=serve({"hb": {**refuse, "executor": to}}))
+                self.assertEqual(len(calls), 1)
+
+    def test_a_misrouted_executor_fires_once_and_a_redirect_is_said(self):
+        self.pr(LA)
+        self.q = self.forwarding()
+        refused = gg.LandNotExecutor("land executor: not_executor: big-exec forwards its own lands to cp1", "")
+        self.q.forward = mock.Mock(side_effect=refused)
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.tick(700)
+        fires = [n for n in self.w.notices if n[0] == "land-forward-misrouted"]
+        self.assertEqual(len(fires), 1)
+        self.assertEqual(fires[0][1], "fire")
+        self.assertIn("big-exec", fires[0][2])
+        # the executor named a host it forwards to: the batch went there, the row says so, one warn names both
+        self.q.forward = lambda cmd, req, deadline: {**self.executor_serve(req), "redirectedTo": "cp1"}
+        self.tick(700)
+        self.tick(700)
+        said = [n for n in self.w.notices if n[0] == "land-forward-redirected"]
+        self.assertEqual(len(said), 1)
+        self.assertIn("cp1", said[0][2])
+        self.assertFalse(self.q.forward_misrouted)
+        self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 0)
+
 
 class WaitFromBytecodeTest(unittest.TestCase):
     """A wait re-runs itself once from cached bytecode: the compile heap was 54 MB of each waiter's 57 MB."""
