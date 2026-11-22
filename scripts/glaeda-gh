@@ -12766,6 +12766,19 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # unfinished. A new head or a requeue starts it again (an "ok" whose merge is refused for running checks does not).
 # Past STRAGGLER_AFTER a check queued with no runner is a straggler to `wait`; four hours of nothing moving at all is
 # a check that will never start.
+# That bound keys progress on what the wait waits for -- the checks the cache shows unfinished at the head, and how
+# many checks its read held (land_wait_shape) -- not on every check's conclusion (land_check_fingerprint). Queue host,
+# 2026-11-22: cmux#49430 took 51 waits in 9.8 h at one head on a "webview" refusal that named the PR's own reds, every
+# one of them logged idle 0, while no check at that head was unfinished at all. Its check fingerprint flipped between
+# two values in reads 60 s apart (0d357b46 -> 7b1e99e0 -> 0d357b46) and its check page read 175 of 208 checks under
+# "API rate limit already exceeded"; cmux#48267's reads 500 s apart changed 50 of their 223 checks, every one a
+# completed check whose workflow was read as its run's name one time ("cmux-next · d1498b49d07a") and as its
+# workflow's the next ("cmux-next"). Each flip reset movedAt, so the 4 h bound could never fire: 5 rows were judged
+# 52 times in 24 h past the bound they should have stopped at (cmux#49430 23 of those, and still waiting), 4 of
+# them with no stop at all, each paying one land_judge every LAND_VERDICT_KEEP for as long as the row lived, and no
+# requester was ever told its reds. A completed check read differently and a check page a read could not finish are
+# not a wait making progress; a check finishing, starting, or appearing where the reads had held none (the count
+# rising) still is.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # What made a judgment run (judge's WHY, kept on the entry and counted with explain_unmoved_<why>): a bound of the
 # queue's own ran out (LAND_JUDGE_DUE) or some evidence changed. An "unmoved" judgment -- same head, same check
@@ -13882,6 +13895,21 @@ def land_check_fingerprint(cache: dict | None) -> str:
     """What a kept verdict was judged on (LAND_VERDICT_KEEP): the head, its state, each check run and status, and
     mergeability only as CONFLICTING or not: UNKNOWN <-> MERGEABLE turns on every push to the base."""
     return land_fingerprint(cache, conflict_only=True)
+
+
+def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
+    """What a wait on the checks at HEAD waits for, as its stuck bound keys progress (LAND_WAIT_STUCK's comment): a
+    fingerprint of the checks CACHE shows unfinished at HEAD, by name and status, and how many checks its read held.
+    ("", 0) when the cache is not at HEAD, which says nothing about the wait either way. Not the workflow name: a
+    check read over REST carries its run's name where a GraphQL read carries its workflow's (rest_contexts), so the
+    same check names two workflows depending on the route the read took."""
+    data = (cache or {}).get("data") or {}
+    if not head or str(data.get("headRefOid") or "").lower() != head:
+        return "", 0
+    checks = data.get("checks") or []
+    unfinished = sorted((str(c.get("name") or ""), str(c.get("status") or ""))
+                        for c in checks if str(c.get("status") or "").upper() not in ("COMPLETED", ""))
+    return hashlib.sha256(json.dumps([head, unfinished], sort_keys=True).encode()).hexdigest()[:16], len(checks)
 
 
 def land_fetch_mirror_ok(mirror: str) -> bool:
@@ -17282,12 +17310,13 @@ class LandQueue:
         LAND_WAIT_STUCK, and E is stopped naming the checks still unfinished."""
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
-        fp = land_check_fingerprint(c) if str(data.get("headRefOid") or "").lower() == head else ""
+        fp, seen = land_wait_shape(c, head)
         w = e.get("waitRefused") or {}
         if w.get("head") != head:
-            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "count": 0}
-        elif fp and fp != w.get("fp"):
-            w.update(fp=fp, movedAt=self.now)
+            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "checks": seen, "count": 0}
+        elif fp and (fp != w.get("fp") or seen > int(w.get("checks") or 0)):
+            # the unfinished checks changed, or a check appeared the reads at this head had not held yet
+            w.update(fp=fp, checks=max(seen, int(w.get("checks") or 0)), movedAt=self.now)
         w["count"] = int(w.get("count") or 0) + 1
         w["code"] = code
         e["waitRefused"] = w
