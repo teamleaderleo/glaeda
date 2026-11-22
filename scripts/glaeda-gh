@@ -734,6 +734,7 @@ CLIENT_RUN_LONG_POLL = STALE_RUN_REREAD
 WAIT_INTEREST = CLIENT_RUN_LONG_POLL + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
+FEED_HELD_MAX = 50  # pages feed_between_reads keeps for the next tick at most; past it the feed waits for that tick
 # on-event: a command run once per finished run (or one job of it) the controller's feed shows (`on-event`).
 # Leo, on an hourly Cloud probe: "but what's the point of checking every hour?"
 ON_EVENT_CONFIG = Path(os.environ.get("GLAEDA_GH_ON_EVENT_CONFIG") or Path.home() / ".config/glaeda/on-event.json")
@@ -4978,6 +4979,10 @@ class Daemon:
         self.controller = self.controller_source() if self.controller_source else controller
         self.controller_down_until = 0.0
         self.controller_feed_at = float("-inf")
+        self.feed_held: list[dict] = []  # feed pages read between a tick's reads, for the next read_controller
+        self.feed_between = False  # feed_between_reads is reading (a request it makes must not read again)
+        self.feed_after_controller = False  # this tick is past its controller phase: its reads may read the feed
+        self.tick_thread: int | None = None  # the thread running tick (feed_due reads the feed on it alone)
         self.controller_failures = 0
         self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
@@ -6274,6 +6279,7 @@ class Daemon:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if not content and not free:
             self.post_due()  # a read phase never holds a queued write past its spacing
+            self.feed_due()  # nor lets the feed view it keeps for downstream hosts age out (feed_between_reads)
         raw_body = json.dumps(body).encode() if body is not None else None
         pool = self.app_pool
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
@@ -7910,6 +7916,7 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
+        self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
         if self.started_tick is None:
@@ -7944,6 +7951,7 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+        self.feed_after_controller = True  # from here a long tick reads the feed between its reads (feed_due)
         # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
         self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
         self.deferred_before = dict(self.deferred_since)
@@ -10829,7 +10837,7 @@ class Daemon:
         log({"event": "controller", "from": getattr(self.controller, "base", None),
              "to": getattr(current, "base", None)})
         self.controller = current
-        self.controller_cursor, self.controller_seen = None, {}
+        self.controller_cursor, self.controller_seen, self.feed_held = None, {}, []
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.feed_marks, self.feed_live_since = {}, None
@@ -10865,29 +10873,18 @@ class Daemon:
                 and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
-        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
-        pages: list[dict] = []
+        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
+        last tick's reads (feed_held) are applied here first: their cursor is already past them."""
+        pages, self.feed_held = self.feed_held, []
         if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
             self.controller_feed_at = self.now
             try:
-                pages = self.read_feed()
+                fresh = self.read_feed()
             except WatchError as error:
+                self.feed_held = pages  # read, cursor past them: the next tick that reads applies them
                 return self.controller_down(error)
-            if getattr(self, "controller_feed_error", None) is None:
-                self.controller_failures = 0
-                self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
-            if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
-                    or any(page.get("reset") for page in pages)):
-                self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
-            self.controller_ok_at = self.now
-            for page in pages:
-                for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
-                    repo = str(item.get("repo") or "").lower()
-                    if "/" in repo:
-                        self.fed_repos[repo] = self.now
-                        self.feed_mark(repo, item)
-            if pages:
-                self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+            self.took_feed(fresh)
+            pages += fresh
         if pages or self.on_event_procs:
             # here, before the baseline reads below can return early: the cursor has moved past these pages
             try:
@@ -10928,6 +10925,72 @@ class Daemon:
                                       "token": bool(self.controller.token)}
         if pages:
             self.save_feed_view()
+
+    def took_feed(self, pages: list[dict]) -> None:
+        """The feed answered now with PAGES: when it answered (controller_ok_at), since when without a gap
+        (feed_live_since), and what it delivered per repository and PR (fed_repos, feed_marks)."""
+        if getattr(self, "controller_feed_error", None) is None:
+            self.controller_failures = 0
+            self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
+        if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
+                or any(page.get("reset") for page in pages)):
+            self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
+        self.controller_ok_at = self.now
+        for page in pages:
+            for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
+                repo = str(item.get("repo") or "").lower()
+                if "/" in repo:
+                    self.fed_repos[repo] = self.now
+                    self.feed_mark(repo, item)
+        if pages:
+            self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+
+    def feed_due(self) -> None:
+        """feed_between_reads, asked before every read request (as post_due is), on the tick's own thread only: a land
+        worker's request on another thread never touches the feed's cursor or view. A fault takes the controller out,
+        as one in the tick's controller phase does, and never fails the read that asked."""
+        if not self.feed_after_controller or threading.get_ident() != self.tick_thread:
+            return
+        try:
+            self.feed_between_reads()
+        except Exception as error:  # noqa: BLE001
+            self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+
+    def feed_between_reads(self) -> None:
+        """Read the change feed between a tick's GitHub reads once CONTROLLER_FEED_EVERY has passed since the last
+        feed read. A tick with a read backlog runs for minutes, and a feed read only at its start lets controller_ok_at
+        age past CONTROLLER_FRESH: then every downstream's read answer drops this host's feed view (feed_view), nothing
+        vouches for any lane VM's copy, and each of them reads its PRs from GitHub itself (hq#17503: 12k GETs an hour
+        with the view never fresh). The pages are kept in feed_held for the next tick's read_controller to apply
+        (on-event hooks, runs, nudges, comments); here only the view's bookkeeping moves, and the view is saved."""
+        if (self.feed_between or self.controller is None or self.controller_cursor is None
+                or len(self.feed_held) >= FEED_HELD_MAX):
+            return  # (no cursor: this daemon follows no feed yet, or reads through an upstream)
+        now = self.clock()
+        if (now <= self.now or now - self.controller_feed_at < CONTROLLER_FEED_EVERY
+                or now < self.controller_down_until):
+            return  # (now <= self.now: no time has passed since the tick's own feed read)
+        tick_now, budget_end = self.now, self.controller_budget_end
+        self.feed_between, self.now, self.controller_feed_at = True, now, now
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        with contextlib.suppress(AttributeError):
+            self.controller.budget_end = self.controller_budget_end
+        try:
+            try:
+                pages = self.read_feed()
+            except WatchError as error:
+                self.controller_feed_error = None
+                return self.controller_down(error)
+            self.took_feed(pages)
+            self.feed_held += pages
+            self.save_feed_view()
+            if self.controller_feed_error is not None:  # a later page failed: the pages before it are kept above
+                error, self.controller_feed_error = self.controller_feed_error, None
+                self.controller_down(error)
+        finally:
+            self.feed_between, self.now, self.controller_budget_end = False, tick_now, budget_end
+            with contextlib.suppress(AttributeError):
+                self.controller.budget_end = budget_end
 
     def save_feed_view(self) -> None:
         """Keep this daemon's feed view in UPSTREAM_FEED_FILE for `read` (feed_view): what a downstream host, which

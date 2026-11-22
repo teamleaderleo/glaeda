@@ -1998,6 +1998,45 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 3 * gg.TICK)
         self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), NOW + 3 * gg.TICK), "the feed is out")
 
+    def test_a_long_tick_reads_the_feed_between_its_reads_so_the_view_stays_fresh(self) -> None:
+        """feed_due / feed_between_reads, asked before every read request: a tick that runs past CONTROLLER_FRESH (a
+        read backlog: ~600 s on the broker host, hq#17503) still keeps the view a downstream rules with fresh; the
+        pages it read wait in feed_held for the next tick to apply, and only the tick's own thread reads them."""
+        sha = "b" * 40
+        key, data = "pr:o/r#1", {"headRefOid": sha, "headRefName": "topic"}
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        gg.CONTROLLER_FEED_EVERY = 20  # (setUp's 0 reads the feed each tick; its cleanup restores it)
+        feeds = len(self.ctl.feeds)
+        self.daemon.feed_due()  # no time has passed since the tick's own feed read
+        self.assertEqual(len(self.ctl.feeds), feeds)
+        late = NOW + gg.TICK + gg.CONTROLLER_FRESH + 5  # the same tick, still reading
+        self.daemon.clock = lambda: late
+        self.ctl.suites.append({"id": 6, "repo": "o/r", "head_sha": sha, "status": "completed"})
+        other = threading.Thread(target=self.daemon.feed_due)
+        other.start()
+        other.join()
+        self.assertEqual(len(self.ctl.feeds), feeds, "a land worker's request on another thread reads no feed")
+        self.daemon.feed_due()
+        self.assertEqual(len(self.ctl.feeds), feeds + 1)
+        view = gg.feed_view(key, data, gg.load_feed_view(), late)
+        self.assertIsNotNone(view, "the view is fresh though the tick began CONTROLLER_FRESH ago")
+        self.assertEqual((view["at"], view["eventAt"]), (late, late))
+        self.assertEqual(self.daemon.now, NOW + gg.TICK, "the tick's own clock is left as it was")
+        self.assertEqual(len(self.daemon.feed_held), 1)
+        self.daemon.feed_due()  # within CONTROLLER_FEED_EVERY: no second read
+        self.assertEqual(len(self.ctl.feeds), feeds + 1)
+        del self.daemon.clock
+        self.daemon.tick(late + 1)
+        self.assertEqual(self.daemon.feed_held, [], "the next tick applied the held pages")
+        self.ctl.down = True
+        self.daemon.feed_after_controller = True
+        self.daemon.clock = lambda: late + 1 + gg.CONTROLLER_FEED_EVERY
+        self.daemon.feed_due()
+        self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), late + 1 + gg.CONTROLLER_FEED_EVERY),
+                          "a feed that failed between reads is out")
+
     def test_a_new_controller_has_to_show_its_coverage_again(self) -> None:
         self.daemon.tick(NOW)
         self.feed_covers()
