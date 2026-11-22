@@ -31399,6 +31399,70 @@ def _post_target(kind: str, target: str) -> tuple[str, int]:
     return item["repo"], item["number"]
 
 
+class ABranchTypedAsATargetTest(unittest.TestCase):
+    """A branch is what an agent has in hand; the PR number is what this tool takes. `status pr --head BRANCH` and
+    `status run --branch main` are both unrecognized arguments (two refused calls, 2026-11-21), and a branch typed
+    as the target said only what a target must look like -- not how to get the number from the branch."""
+
+    def step(self, kind: str, text: str) -> str:
+        with self.assertRaises(gg.WatchError) as caught:
+            gg.parse_key(kind, text)
+        return str(caught.exception)
+
+    def test_a_branch_named_with_its_repository_is_answered_with_the_one_search(self) -> None:
+        for kind in ("pr", "comment"):
+            with self.subTest(kind=kind):
+                said = self.step(kind, "teamleaderleo/glaeda@my-branch")
+                self.assertIn("is a branch", said)
+                self.assertIn("glaeda-gh search prs --repo teamleaderleo/glaeda head:my-branch --state open "
+                              "--field target,state", said)
+
+    def test_a_bare_branch_word_is_a_branch_only_where_the_checkout_has_one(self) -> None:
+        """`feat/x` reads exactly like OWNER/REPO, so the answer comes from the checkout the caller stands in
+        rather than from the shape of the word: its branches, and its origin for the repository."""
+        with mock.patch.object(gg, "local_branch", return_value=True), \
+                mock.patch.object(gg, "cwd_repo", return_value="teamleaderleo/glaeda"):
+            for text in ("my-branch", "feat/x"):
+                with self.subTest(text):
+                    self.assertIn(f"--repo teamleaderleo/glaeda head:{text} --state open", self.step("pr", text))
+        with mock.patch.object(gg, "local_branch", return_value=False):
+            said = self.step("pr", "nonsense")
+            self.assertIn("must be OWNER/REPO#N", said, "no branch of that name here: the old refusal stands")
+            self.assertNotIn("search prs", said)
+        # A branch here whose checkout has no GitHub origin has no repository to search, so nothing is invented.
+        with mock.patch.object(gg, "local_branch", return_value=True), \
+                mock.patch.object(gg, "cwd_repo", return_value=None):
+            self.assertIn("must be OWNER/REPO#N", self.step("pr", "my-branch"))
+
+    def test_what_is_not_a_branch_keeps_the_refusal_it_had(self) -> None:
+        for kind, text in (("pr", "teamleaderleo/glaeda@" + "a" * 40),  # a head, which `head` takes as it stands
+                           ("pr", "teamleaderleo/glaeda@7"),            # a number: the PR form, said as such
+                           ("pr", "not/a/repo@b"),
+                           ("run", "my-branch")):                       # a run id is never a branch
+            with self.subTest(kind=kind, text=text), mock.patch.object(gg, "local_branch", return_value=True), \
+                    mock.patch.object(gg, "cwd_repo", return_value="teamleaderleo/glaeda"):
+                self.assertNotIn("search prs", self.step(kind, text))
+        self.assertEqual(gg.branch_target_step("pr", ""), "")
+
+    def test_local_branch_reads_this_checkout_only(self) -> None:
+        """The one git call behind the bare-word case, against a real repository: its own branches and its
+        remote-tracking ones count, a name neither holds does not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = lambda *a: subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True, check=True)
+            run("init", "-q", "-b", "main")
+            run("config", "user.email", "a@b.c")
+            run("config", "user.name", "a")
+            (Path(tmp) / "f").write_text("x", encoding="utf-8")
+            run("add", "f")
+            run("commit", "-qm", "one")
+            run("branch", "feat/x")
+            run("update-ref", "refs/remotes/origin/pushed-only", "HEAD")
+            for name in ("main", "feat/x", "pushed-only"):
+                self.assertTrue(gg.local_branch(name, tmp), name)
+            for name in ("no-such-branch", "", "origin/main", "*", "feat/*", "fe?t/x", " "):
+                self.assertFalse(gg.local_branch(name, tmp), name)
+
+
 class WaitTwoTargetsNamesTheCallThatWorksTest(unittest.TestCase):
     """`status pr A B` reads two targets and `wait pr A B` cannot, so the refusal names the calls that do.
 
