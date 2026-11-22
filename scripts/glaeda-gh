@@ -3302,9 +3302,79 @@ def read_times(text: str) -> dict[tuple[str, str | None], dict[str, float]]:
     return out
 
 
+def _finite(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+# UPSTREAM_FEED_FILE as last loaded, by its stat: `read` runs inside the lane-gh broker for every lane VM's upstream
+# tick (several a second), so the file is parsed once per write, not once per call.
+_FEED_VIEW_LOADED: dict[str, Any] = {"stamp": None, "doc": None}
+
+
+def load_feed_view() -> dict | None:
+    """This host's daemon's feed view (Daemon.save_feed_view), or None."""
+    path = BASE / UPSTREAM_FEED_FILE
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    stamp = (os.fspath(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    if _FEED_VIEW_LOADED["stamp"] != stamp:
+        doc = read_json(path)
+        _FEED_VIEW_LOADED.update(stamp=stamp, doc=doc if isinstance(doc, dict) else None)
+    return _FEED_VIEW_LOADED["doc"]
+
+
+def feed_view(key: str, data: dict | None, doc: dict | None, now: float) -> dict | None:
+    """What this host's feed says about PR KEY, for a downstream's land_feed_quiet (upstream_feed_quiet): since when
+    the feed has answered without a gap (liveSince), when it last answered (at), and the newest event it delivered for
+    the PR, the head this host's copy names, or its branch (eventAt, None for none). None, so the downstream holds
+    nothing quiet, unless the feed answers now (CONTROLLER_FRESH) and covers the repository (FED_REPO_KEEP), as
+    Daemon.fed asks."""
+    if not key.startswith("pr:") or not isinstance(doc, dict):
+        return None
+    live, ok = doc.get("liveSince"), doc.get("okAt")
+    if not _finite(live) or not _finite(ok) or not 0 <= now - ok <= CONTROLLER_FRESH:
+        return None
+    try:
+        _, owner, repo, number = split_key(key)
+    except ValueError:
+        return None
+    repo = f"{owner}/{repo}".lower()
+    fed_at = (doc.get("fedRepos") or {}).get(repo) if isinstance(doc.get("fedRepos"), dict) else None
+    if not _finite(fed_at) or ok - fed_at > FED_REPO_KEEP:
+        return None
+    marks = doc.get("marks") if isinstance(doc.get("marks"), dict) else {}
+    data = data if isinstance(data, dict) else {}
+    head = str(data.get("headRefOid") or "").lower()
+    names = [f"pr:{repo}#{number}"] + ([f"sha:{repo}@{head}"] if head else []) \
+        + ([f"branch:{repo}@{data['headRefName']}"] if data.get("headRefName") else [])
+    events = [marks[m] for m in names if _finite(marks.get(m))]
+    return {"liveSince": live, "at": ok, "eventAt": max(events) if events else None, "head": head or None}
+
+
+def upstream_feed_quiet(view: dict, sha: str, since: float, now: float) -> bool:
+    """land_feed_quiet on a host that follows no feed, from the upstream's VIEW of the PR (feed_view, given at
+    answeredAt): the view is fresh (UPSTREAM_FEED_FRESH), the feed answered without a gap since before SINCE and has
+    answered after it, and its newest event for the PR, its head or its branch is older than SINCE, with
+    UPSTREAM_FEED_SKEW for the two hosts' clocks. A SHA other than the head the upstream's view was taken for is not
+    covered by it: False."""
+    live, at, event, answered = view.get("liveSince"), view.get("at"), view.get("eventAt"), view.get("answeredAt")
+    if not (_finite(live) and _finite(at) and _finite(answered) and _finite(since)):
+        return False
+    if not 0 <= now - answered <= UPSTREAM_FEED_FRESH:
+        return False
+    if sha and str(sha).lower() != str(view.get("head") or "").lower():
+        return False
+    if live > since - UPSTREAM_FEED_SKEW or at < since:
+        return False
+    return event is None or (_finite(event) and event < since - UPSTREAM_FEED_SKEW)
+
+
 def cmd_read(text: str) -> int:
     """`read`: register each key (sessions' interest, as `status` does) and print what the cache holds
-    now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG)."""
+    now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG). A PR's entry also
+    carries this host's feed view of it (feed_view), which a downstream host rules land_feed_quiet with."""
     items = read_request(text)
     readers = read_readers(text)
     times = read_times(text)
@@ -3330,6 +3400,10 @@ def cmd_read(text: str) -> int:
             if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
+        if cached is not None and key.startswith("pr:"):
+            view = feed_view(key, cached.get("data"), load_feed_view(), time.time())
+            if view is not None:
+                entries[key]["feed"] = view
         if consumer:
             if ledger is None:
                 doc = read_json(BASE / CONSUMERS_FILE)
@@ -4553,6 +4627,9 @@ class Daemon:
         self.feed_marks: dict[str, float] = {}
         self.feed_live_since: float | None = None
         self.feed_unstarved = 0  # PR waits not handed back as starved: the feed showed their copy current
+        # On an upstream host: PR key -> the upstream's feed view of it (feed_view) and when it was given (answeredAt)
+        self.upstream_feed: dict[str, dict] = {}
+        self.feed_view_saved: tuple | None = None  # what save_feed_view last wrote (it writes only on a change)
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
@@ -7967,7 +8044,9 @@ class Daemon:
             if failed is not None:
                 self.upstream_status = failed
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
-        self.consumer_sent = {k: t for k, t in self.consumer_sent.items() if self.now - t < 2 * HEAD_INTEREST}
+        self.upstream_feed = {k: v for k, v in self.upstream_feed.items()
+                              if self.now - v["answeredAt"] <= UPSTREAM_FEED_FRESH}
+        self.consumer_sent ={k: t for k, t in self.consumer_sent.items() if self.now - t < 2 * HEAD_INTEREST}
         kinds = {kind: [e for e in due if e["key"].startswith(kind + ":")] for kind in CYCLES}
         return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
 
@@ -8024,6 +8103,11 @@ class Daemon:
         # each `continue` below clears it (upstream_outage_over); every store() after them drops errorFrom anyway.
         for e in due:
             entry = got.get(e["key"])
+            feed = entry.get("feed") if isinstance(entry, dict) else None
+            if isinstance(feed, dict):  # the upstream's feed view of a PR (feed_view), for land_feed_quiet here
+                self.upstream_feed[e["key"]] = {**feed, "answeredAt": self.now}
+            else:
+                self.upstream_feed.pop(e["key"], None)
             if not isinstance(entry, dict):
                 self.upstream_outage_over(e)
                 continue  # the upstream has not read it yet: asked again in UPSTREAM_NEW
@@ -10003,6 +10087,7 @@ class Daemon:
             self.errors.append(what)
         self.controller_down_until = self.now + wait
         self.feed_live_since = None  # what the feed misses while out is not known: no PR is quiet until it is back
+        self.save_feed_view()  # nor on a downstream host that rules with this view
         if not isinstance(error, NoReceiver):
             # The notice says what the fallback costs, not only that it happened: every run read this host makes until
             # the controller answers again spends the shared REST quota (one account, 5000/h for every lane together)
@@ -10158,6 +10243,25 @@ class Daemon:
         if pages and self.now >= self.controller_down_until:  # an on-event lookup above may have taken it out
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
+        if pages:
+            self.save_feed_view()
+
+    def save_feed_view(self) -> None:
+        """Keep this daemon's feed view in UPSTREAM_FEED_FILE for `read` (feed_view): what a downstream host, which
+        follows no feed, rules land_feed_quiet with. Written after each feed read (every CONTROLLER_FEED_EVERY at
+        most), and when the feed goes out (controller_down), so a downstream never trusts a view this daemon dropped.
+        Best effort: a lost write leaves the old view, whose okAt ages out of CONTROLLER_FRESH."""
+        view = {"liveSince": self.feed_live_since,
+                "okAt": self.controller_ok_at if math.isfinite(self.controller_ok_at) else None,
+                "fedRepos": self.fed_repos, "marks": self.feed_marks}
+        mark = (view["liveSince"], view["okAt"], len(self.feed_marks), len(self.fed_repos))
+        if mark == self.feed_view_saved:
+            return
+        try:
+            write_json(BASE / UPSTREAM_FEED_FILE, view)
+            self.feed_view_saved = mark
+        except (OSError, ValueError, TypeError):
+            pass
 
     def feed_mark(self, repo: str, item: dict) -> None:
         """Note that the feed delivered ITEM (a run, suite or comment of REPO) now, under every PR, head and branch it
@@ -10198,7 +10302,11 @@ class Daemon:
         """True when the controller's feed says nothing could have happened to KEY's PR since SINCE: it has answered
         without a gap since before then (feed_live_since), answers now, covers the repository (fed) and delivered no
         run, suite or comment for the PR, for SHA or for the branch the cached PR names since then. Anything else
-        (no feed, a gap, an event) is False: the land queue reads as it would with no feed (LAND_FEED_QUIET_MAX)."""
+        (no feed, a gap, an event) is False: the land queue reads as it would with no feed (LAND_FEED_QUIET_MAX).
+        On an upstream host, which follows no feed, the upstream's view of the key rules (upstream_feed_quiet)."""
+        view = self.upstream_feed.get(key)
+        if view is not None:
+            return upstream_feed_quiet(view, sha, since, self.now)
         if not key.startswith("pr:") or self.feed_live_since is None or self.feed_live_since > since:
             return False
         if not self.fed(key):
@@ -10893,6 +11001,17 @@ LAND_VERDICT_KEEP = 600.0
 LAND_FEED_QUIET_MAX = 1800.0
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
+# An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
+# the upstream (controller "off"). So its feed_live_since stayed None, land_feed_quiet was always False there, and
+# neither feed gate (wait_feed_quiet, refresh_due) ever held a read: each lane VM read every PR it waited on or landed
+# through the broker every UPSTREAM_DIRECT_AFTER. huge-blue's broker, 2026-11-21 22Z: glaeda-upstream made 14,180 GETs,
+# 11,673 of them a path the same VM had read before (pulls/N re-read at a median 120 s gap), while only about 6% were
+# a path more than one VM read. The upstream host's daemon now keeps its feed view in UPSTREAM_FEED_FILE (written each
+# time it reads the feed), `read` answers each PR key with it (feed_view), and the downstream rules with that view
+# (upstream_feed_quiet) exactly as land_feed_quiet does with its own feed.
+UPSTREAM_FEED_FILE = "feed-view.json"  # under BASE: {"liveSince", "okAt", "fedRepos", "marks"} (Daemon.save_feed_view)
+UPSTREAM_FEED_FRESH = 3 * UPSTREAM_EVERY  # a downstream trusts a key's feed view this long after the upstream gave it
+UPSTREAM_FEED_SKEW = 5.0  # seconds of clock difference between hosts an event time is given against a copy's dataAt
 LAND_NOT_JUDGED = frozenset({"quota", "unreadable", "host_cap", "explain_failed"})  # answers that judged nothing
 LAND_STREAK_STOP = 3 # identical refusals in a row (code, head, step) that stop an entry
 LAND_RETRY_STREAK_STOP = 8  # ... for could-not-judge answers (quota, unreadable), which back off between tries
