@@ -12149,6 +12149,14 @@ LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
 LAND_SERVE_OPS = ("land", "withdraw", "status", "batch", "room")
 LAND_FORWARDED = "forwarded"
+# A request `land serve` gets on a host that forwards its own lands is handed on to that host's executor, once
+# (the request then carries LAND_SERVE_RELAY_KEY, and a host that gets one relayed never relays it again, so two hosts
+# still never pass a PR back and forth). It was refused not_executor: 2026-11-22, after huge-blue's lands moved to
+# cmux-cp-1, every lane VM's hand-off of a PR it could not judge (the broker asks the broker host's `land serve`) was
+# refused, and leo-workspace#8504 sat 100 min with nothing able to take it. "room" and "batch" (a peer's overflow)
+# stay refused: a host with an executor takes no overflow.
+LAND_SERVE_RELAYED = frozenset({"land", "withdraw", "status"})
+LAND_SERVE_RELAY_KEY = "relayedBy"
 LAND_REQUESTER_SHAPE = re.compile(r"[^\s\x00-\x1f]{1,200}")  # acpmux send takes it as one argv word
 LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
 LAND_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
@@ -19554,6 +19562,16 @@ def cmd_land_serve(text: str) -> int:
                                                                         f"of {', '.join(LAND_SERVE_OPS)}"}))
         return EXIT_FAIL
     executor = land_executor()
+    if executor is not None and req["op"] in LAND_SERVE_RELAYED and not req.get(LAND_SERVE_RELAY_KEY):
+        # LAND_SERVE_RELAYED's comment: handed on to this host's executor, once
+        try:
+            answer = land_forward(executor, {**req, LAND_SERVE_RELAY_KEY: policy_host()})
+        except WatchError as error:
+            print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands "
+                              f"to {land_forward_name(executor)}, which did not take this one: {error}"}))
+            return EXIT_FAIL
+        print(json.dumps(answer, sort_keys=True))
+        return EXIT_OK if answer.get("ok") else EXIT_FAIL
     if executor is not None:
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
                           f"{land_forward_name(executor)} (land.json executor); it serves none"}))

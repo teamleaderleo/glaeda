@@ -31155,7 +31155,9 @@ class LandForwardTest(Base):
         self.assertEqual(self.w.explains(), [])
 
     def test_serve_refuses_on_a_host_that_forwards_and_on_a_bad_line(self):
-        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status"}), "not_executor"),
+        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "room"}), "not_executor"),
+                                   ({"executor": ["reach", "x"]}, json.dumps({"op": "land", "target": "o/r#1",
+                                                                              "relayedBy": "h"}), "not_executor"),
                                    ({}, "not json", "bad_request"),
                                    ({}, json.dumps({"op": "land", "target": "nope"}), "bad_request")):
             with self.subTest(code=code), mock.patch.object(gg, "land_config", return_value=config), \
@@ -31163,6 +31165,28 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_serve_on_a_forwarding_host_hands_a_land_to_its_executor_once(self):
+        """A lane VM's hand-off reaches the broker host's `land serve`; once that host forwarded its own lands it
+        refused them all (not_executor), and nothing could take the PR."""
+        sent: list = []
+
+        def forward(command, request, *a, **k):
+            sent.append((command, request))
+            return {"ok": True, "request": "r1", "host": "big-exec"}
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", forward), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1", "sha": LA})), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["host"], "big-exec")
+        self.assertEqual(sent[0][0], ["reach", "big-exec"])
+        self.assertEqual((sent[0][1]["target"], sent[0][1]["sha"], bool(sent[0][1]["relayedBy"])), ("o/r#1", LA, True))
+
+        def down(command, request, *a, **k):
+            raise gg.WatchError("land executor: no answer within 60s")
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", down), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1"})), gg.EXIT_FAIL)
+        self.assertEqual(json.loads(out.getvalue())["code"], "not_executor")
 
     def test_a_land_behind_an_earlier_request_says_it_is_normal_when_it_goes_and_not_to_reach_the_executor(self):
         """The bare "an earlier request is still waiting to be forwarded" read as a stall, and callers reached the
