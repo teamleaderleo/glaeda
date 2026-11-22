@@ -4241,9 +4241,10 @@ class HookTest(unittest.TestCase):
             self.assertTrue(hook.probe(self.dir / "capacity/unit-10"), "the busy job took none of the free units")
         finally:
             self.finish("s1")
-        # a signing job holding the mini (every gateway token): nothing runs busy beside it
+        # a signing job holding the mini (every token its class takes): nothing runs busy beside it
         capacity = self.dir / "capacity"
-        signing = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX) for name in hook.GATEWAY_TOKENS]
+        signing = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX)
+                   for name in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
         try:
             beside = self.job("fast-tier", "s2", 14, None, env=self.FAST_TIER)
             self.assertEqual(beside.returncode, 1, beside.stdout)
@@ -19652,8 +19653,16 @@ class DedicatedHookTest(unittest.TestCase):
         hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
         self.assertIsNone(hook.exclusive_claim(capacity))
         marker.unlink()
-        # a signing job holding the mini: it holds both gateway tokens, which only the exclusive class takes together
+        # ordinary gateway jobs holding every gateway token are not a signing job (glaeda#1974 review F1)
         fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+        try:
+            self.assertIsNone(hook.exclusive_claim(capacity))
+        finally:
+            for fd in fds:
+                os.close(fd)
+        # a signing job holding the mini: it holds every token its class takes, the fast and gui tokens too
+        fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+               for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
         try:
             self.assertIn("holds this mini", hook.exclusive_claim(capacity))
             result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
@@ -19719,8 +19728,9 @@ class DedicatedHookTest(unittest.TestCase):
             hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
             self.assertIsNone(yielding.claimed())
             marker.unlink()
-            # the signing job holds the mini (both gateway tokens): held until it lets go, then it listens again
-            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+            # the signing job holds the mini (every token its class takes): held until it lets go, then it listens
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+                   for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
             try:
                 self.assertIn("holds this mini", yielding.claimed())
                 self.assertIsNone(plain.claimed())
