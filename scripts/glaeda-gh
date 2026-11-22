@@ -5369,6 +5369,9 @@ class Daemon:
         self.upstream_feed: dict[str, dict] = {}
         self.feed_view_saved: tuple | None = None  # what save_feed_view last wrote (it writes only on a change)
         self.reexec_waiting: float | bool = False  # since when an update has waited on a running land step (serve)
+        # Until when (time.monotonic) a drain past REEXEC_DRAIN_MAX lets the judgments past half their bound finish:
+        # read once, when the drain limit is first reached (LandQueue.finishing; reexec_due's finish_until)
+        self.reexec_finish_until: float | None = None
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
         self.rollup_keys: tuple[float, frozenset[str]] = (float("nan"), frozenset())  # (self.now, rollup_wanted)
@@ -8788,6 +8791,12 @@ class Daemon:
             return False
         q.reap()
         return bool(q.jobs)
+
+    def land_finishing(self) -> float:
+        """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for
+        none: a drain at REEXEC_DRAIN_MAX lets them finish instead of judging them again (reexec_due)."""
+        q = self.land_queue
+        return 0.0 if q is None else q.finishing(time.monotonic())
 
     def land_nudge(self, key: str) -> None:
         """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
@@ -14377,6 +14386,9 @@ class LandQueue:
         self.jobs: dict[str, Any] = {}
         self.live_reads: list[tuple[float, bool]] = []  # this host's last live judgments: (at, read nothing) (early_hand_off)
         self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
+        # key: (time.monotonic when its land_judge explain began, that call's own timeout): the judgments running now,
+        # so a re-exec drain can let one about to finish end instead of judging it again (finishing, reexec_due)
+        self.judging: dict[str, tuple[float, float]] = {}
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         # (pass, starts the CPU allows, starts the RAM allows, what was read): the host's headroom, read once per pass
         self.headroom: tuple[float, float, float, dict] = (-1.0, math.inf, math.inf, {})
@@ -15445,6 +15457,14 @@ class LandQueue:
         since = float(b.get("since") or at)
         return any(h.get("event") == "latch_held" and since <= float(h.get("at") or 0) <= at
                    for h in e.get("history") or [])
+
+    def finishing(self, now: float) -> float:
+        """The latest end (time.monotonic: start plus its own timeout) of the judgments running at NOW that are past
+        half that timeout, or 0.0 for none. Each call is killed at its timeout (call), so the end is a bound."""
+        with self.lock:
+            ends = [start + bound for start, bound in self.judging.values()
+                    if now - start >= bound / 2 and now < start + bound]
+        return max(ends, default=0.0)
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -16979,8 +16999,14 @@ class LandQueue:
         with self.lock:
             self.count("snapshot" if extra else "live")
         for n, run_argv in enumerate(tries):
-            got = self.call(run_argv, LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE,
-                            extra=extra)
+            bound = LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE
+            with self.lock:
+                self.judging[e["key"]] = (time.monotonic(), bound)
+            try:
+                got = self.call(run_argv, bound, extra=extra)
+            finally:
+                with self.lock:
+                    self.judging.pop(e["key"], None)
             answer = None
             for line in reversed((got.stdout or "").strip().splitlines()):
                 with contextlib.suppress(ValueError):
@@ -20143,12 +20169,18 @@ REEXEC_DRAIN_MAX = 300.0
 # ~09:43Z while the queue it fixed stayed capped. The drain (REEXEC_DRAIN_MAX) already bounds what a re-exec drops (no
 # new step starts, a claimed step is judged again), so the gap only spaces re-execs: one per 5 min at most.
 REEXEC_UPDATE_GAP = 300.0
+# Lane VMs, 2026-11-21..22: 25 of 101 re-execs on one (12 of 102 on another) cut a land judgment still running at
+# REEXEC_DRAIN_MAX, and the next daemon judged it again from zero (judgments: p50 265 s, p90 300 s). A judgment past
+# half its own timeout when the drain limit is reached finishes first ("finish"), bounded by that timeout
+# (LandQueue.finishing): the end is read once, at the limit, so a judgment that starts or crosses half later extends
+# nothing.
 
 
 def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,
-               up: float = REEXEC_UPDATE_GAP) -> str | None:
+               up: float = REEXEC_UPDATE_GAP, finish_until: float | None = None) -> str | None:
     """What serve does about an update: None (nothing changed), "hold" (land work runs and the daemon is up under
     REEXEC_UPDATE_GAP: it goes on, the update waits), "defer" (draining: the running land jobs end, no new one starts),
+    "finish" (past REEXEC_DRAIN_MAX, still draining until FINISH_UNTIL: a judgment past half its timeout ends),
     "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a job still running."""
     if not changed:
         return None
@@ -20158,8 +20190,34 @@ def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: floa
     if since is None and up < REEXEC_UPDATE_GAP:
         return "hold"
     if since is not None and now - since >= REEXEC_DRAIN_MAX:
+        if finish_until is not None and now < finish_until:
+            return "finish"
         return f"a land step still ran after {int(REEXEC_DRAIN_MAX)} s; its claim is judged again"
     return "defer"
+
+
+def script_stat(path: Path) -> tuple[int, int, int]:
+    """(mtime_ns, size, inode): what serve compares every tick before it reads the script's bytes (script_changed)."""
+    st = path.stat()
+    return st.st_mtime_ns, st.st_size, st.st_ino
+
+
+def script_changed(path: Path, seen: dict) -> bool:
+    """Whether PATH's content differs from the content this daemon started on. SEEN holds "stat" and "sha" (taken at
+    start) and "changedStat" (a stat already hashed and found different). A lane VM, 2026-11-21..22: 175 release
+    installs, 40 of them with a byte-identical glaeda-gh, and every install re-exec'd the daemon on its mtime alone.
+    Cheap: a stat each tick; the file is hashed only when its stat moved, and same bytes only remember the new stat."""
+    key = script_stat(path)
+    if key == seen.get("stat"):
+        return False
+    if key == seen.get("changedStat"):
+        return True
+    if hashlib.sha256(path.read_bytes()).hexdigest() == seen.get("sha"):
+        seen["stat"] = key
+        seen.pop("changedStat", None)
+        return False
+    seen["changedStat"] = key
+    return True
 
 
 def serve(foreground_ok: bool = False) -> int:
@@ -20172,7 +20230,7 @@ def serve(foreground_ok: bool = False) -> int:
         if swept:
             log({"event": "swept", "tempFiles": swept})
     me = Path(__file__).resolve()
-    stamp = me.stat().st_mtime
+    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
     log({"event": "start", "pid": os.getpid()})
@@ -20204,14 +20262,27 @@ def serve(foreground_ok: bool = False) -> int:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
-            changed = me.stat().st_mtime != stamp
-            due = reexec_due(changed, daemon.land_busy(), daemon.reexec_waiting, time.monotonic(),
-                             time.monotonic() - started)
+            changed = script_changed(me, seen)
+            if not changed and daemon.reexec_waiting:
+                # the script is back to the bytes this daemon runs (a reverted install): nothing to re-exec for, so the
+                # drain ends and land steps start again (land_tick)
+                daemon.reexec_waiting, daemon.reexec_finish_until = False, None
+                log({"event": "reexec-dropped", "why": "the script is back to the content this daemon runs"})
+            busy, at = daemon.land_busy(), time.monotonic()
+            if changed and busy and daemon.reexec_waiting and daemon.reexec_finish_until is None \
+                    and at - daemon.reexec_waiting >= REEXEC_DRAIN_MAX:
+                daemon.reexec_finish_until = daemon.land_finishing()
+                if daemon.reexec_finish_until > at:
+                    log({"event": "reexec-finishing", "why": f"a land judgment past half its bound finishes first, "
+                                                             f"at most {int(daemon.reexec_finish_until - at)} s more"})
+            due = reexec_due(changed, busy, daemon.reexec_waiting, at, at - started, daemon.reexec_finish_until)
             if due == "hold":
                 if not held:
                     held = True
                     log({"event": "reexec-held", "why": f"land work runs; the update waits until the daemon has been "
                                                         f"up {int(REEXEC_UPDATE_GAP)} s or the queue is idle"})
+            elif due == "finish":
+                pass  # still draining: no new land step starts (land_tick), the judgment logged above ends
             elif due == "defer":
                 if not daemon.reexec_waiting:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})

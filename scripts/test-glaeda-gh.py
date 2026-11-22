@@ -21287,6 +21287,82 @@ class ReexecDrainTest(Base):
         # one gap and one drain, 10 min at most.
         self.assertLessEqual(gg.REEXEC_UPDATE_GAP + gg.REEXEC_DRAIN_MAX, 600.0)
 
+    def test_a_judgment_past_half_its_bound_finishes_within_that_bound(self) -> None:
+        # A lane VM, 2026-11-21..22: 25 of 101 re-execs cut a judgment still running at REEXEC_DRAIN_MAX.
+        limit = 100.0 + gg.REEXEC_DRAIN_MAX
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit, finish_until=limit + 60), "finish")
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit + 59, finish_until=limit + 60), "finish")
+        cut = gg.reexec_due(True, True, 100.0, limit + 60, finish_until=limit + 60)
+        self.assertNotIn(cut, (None, "defer", "reexec", "finish"), "bounded by the judgment's own end")
+        self.assertNotIn(gg.reexec_due(True, True, 100.0, limit, finish_until=0.0), (None, "defer", "finish"))
+        self.assertEqual(gg.reexec_due(True, False, 100.0, limit, finish_until=limit + 60), "reexec", "it ended")
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit - 1, finish_until=limit + 60), "defer")
+
+    def test_same_bytes_reinstalled_do_not_reexec(self) -> None:
+        """A lane VM, 2026-11-21..22: 40 of 175 release installs left glaeda-gh byte-identical, and each re-exec'd the
+        daemon on its mtime. Only a change of content does now; the file is hashed only when its stat moved."""
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        seen = {"stat": gg.script_stat(path), "sha": gg.hashlib.sha256(b"one").hexdigest()}
+        self.assertFalse(gg.script_changed(path, seen))
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"one")
+        os.utime(later, ns=(seen["stat"][0] + 10**9, seen["stat"][0] + 10**9))
+        later.replace(path)  # an install: same bytes, new inode and mtime
+        self.assertNotEqual(gg.script_stat(path), seen["stat"])
+        self.assertFalse(gg.script_changed(path, seen))
+        self.assertEqual(seen["stat"], gg.script_stat(path), "the new stat is remembered")
+        with mock.patch.object(gg.hashlib, "sha256", side_effect=AssertionError("hashed an unmoved stat")):
+            self.assertFalse(gg.script_changed(path, seen))
+        path.write_bytes(b"two")
+        os.utime(path, ns=(seen["stat"][0] + 2 * 10**9, seen["stat"][0] + 2 * 10**9))
+        self.assertTrue(gg.script_changed(path, seen))
+        with mock.patch.object(gg.hashlib, "sha256", side_effect=AssertionError("hashed the same changed stat")):
+            self.assertTrue(gg.script_changed(path, seen))
+        path.write_bytes(b"one")  # reverted: nothing to re-exec for
+        os.utime(path, ns=(seen["stat"][0] + 3 * 10**9, seen["stat"][0] + 3 * 10**9))
+        self.assertFalse(gg.script_changed(path, seen))
+
+    def serve_over(self, rewrite: bytes) -> list:
+        """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
+        script = Path(self.tmp.name) / "bin" / "glaeda-gh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_bytes(b"# the daemon's code\n")
+
+        class Stop(Exception):
+            pass
+
+        class Idle:
+            valve_due, reexec_waiting, reexec_finish_until, ticks = None, False, None, 0
+
+            def tick(self) -> dict:
+                self.ticks += 1
+                if self.ticks == 2:
+                    new = script.with_name("glaeda-gh.new")
+                    new.write_bytes(rewrite)
+                    os.utime(new, (time.time() + 60, time.time() + 60))
+                    new.replace(script)  # how an install lands: a new file renamed over the old
+                if self.ticks > 4:
+                    raise Stop
+                return {"modes": {}, "paths": {}, "errors": []}
+
+            def land_busy(self) -> bool:
+                return False
+
+        execs: list = []
+        with mock.patch.object(gg, "__file__", os.fspath(script)), mock.patch.object(gg, "Daemon", Idle), \
+                mock.patch.object(gg, "Watchdog", mock.MagicMock()), mock.patch.object(gg, "TICK", 0), \
+                mock.patch.object(gg, "error_site", side_effect=Stop), \
+                mock.patch.object(gg.os, "execv", side_effect=lambda *a: execs.append(a)), self.assertRaises(Stop):
+            gg.serve()
+        return execs
+
+    def test_serve_reexecs_on_new_content_not_on_a_same_bytes_install(self) -> None:
+        self.assertEqual(self.serve_over(b"# the daemon's code\n"), [], "same bytes, new mtime and inode")
+        execs = self.serve_over(b"# new code\n")
+        self.assertTrue(execs, "new content re-execs")
+        self.assertEqual(execs[0][1][1:], [os.fspath(Path(self.tmp.name) / "bin" / "glaeda-gh"), "serve"])
+
     def test_a_waiting_reexec_starts_no_land_step(self) -> None:
         queue = mock.Mock()
         self.daemon.land_queue = queue
@@ -23165,6 +23241,31 @@ class LandTest(Base):
         self.tick(gg.LAND_TOUCH + 1)
         self.assertEqual(heads[-1], f"head:o/r@{LB}")
         self.assertEqual(len(heads), 3)
+
+    def test_a_running_judgment_is_known_with_its_start_and_bound(self):
+        """A re-exec drain at REEXEC_DRAIN_MAX lets a judgment past half its bound finish (LandQueue.finishing): the
+        queue knows each running explain's start and timeout, and forgets it when the call returns."""
+        seen: list[dict] = []
+        run = self.w.run
+
+        def watching(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if "explain" in argv:
+                seen.append({**self.q.judging, "timeout": timeout})
+            return run(argv, timeout, env)
+
+        self.q.run = watching
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(len(seen), 1)
+        start, bound = seen[0][self.KEY]
+        self.assertEqual(bound, seen[0]["timeout"])
+        self.assertEqual(self.q.judging, {}, "a finished judgment is forgotten")
+        self.q.judging[self.KEY] = (start, bound)
+        self.assertEqual(self.q.finishing(start + bound / 2 - 1), 0.0, "under half its bound: not let finish")
+        self.assertEqual(self.q.finishing(start + bound / 2), start + bound)
+        self.assertEqual(self.q.finishing(start + bound), 0.0, "past its own bound: nothing to wait for")
 
     def test_tip_merge_update_branch_head_race_then_merge(self):
         self.pr(LA)
