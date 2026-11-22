@@ -31156,6 +31156,108 @@ class WaitFromBytecodeTest(unittest.TestCase):
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
 
 
+class LandWaitAlarmTest(AlarmBase):
+    """The land queue's wait clock (LAND_GREEN_WAIT_PAGE). huge-blue, 2026-11-22 07:59Z: 887 open entries, queue-to-merge
+    p50 77 min and p90 3.4 h, green PRs such as leo-workspace#7930 waiting since 05:57Z, and no number said so."""
+
+    HEAD = "a" * 40
+
+    def green(self, n: int, waited: float, ok_since: bool = True) -> dict:
+        """An open row judged ok with its merge step next at the head the cache shows, green for WAITED seconds."""
+        at = NOW - waited
+        x = {"at": NOW - 5, "ok": True, "head": self.HEAD, "action": {"kind": "merge"}}
+        if ok_since:
+            x["okSince"] = at
+        return {"key": f"pr:o/r#{n}", "state": "waiting", "explain": x,
+                "history": [{"at": at, "event": "judged", "head": self.HEAD[:12], "step": "merge", "code": "ok"},
+                            {"at": NOW - 5, "event": "judged", "head": self.HEAD[:12], "step": "merge", "code": "ok"}]}
+
+    def cache(self, key: str) -> dict:
+        return {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD}}
+
+    def queue_with(self, rows: list[dict]) -> Any:
+        gg.land_dir().mkdir(parents=True, exist_ok=True)
+        q = gg.LandQueue(cache_of=self.cache, inline=True, config={})
+        q.now = NOW
+        q.entries = {e["key"]: e for e in rows}
+        with mock.patch.object(gg, "log") as logged:
+            q.log_pool()
+        self.pool_line = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "land-pool"][-1]
+        self.daemon.land_queue = q
+        return q
+
+    def test_the_clock_counts_only_green_rows_at_the_cached_head(self) -> None:
+        rows = [self.green(1, 600), self.green(2, 1200), self.green(3, 3000, ok_since=False)]
+        rows.append({**self.green(4, 9000), "explain": {**self.green(4, 9000)["explain"], "head": "b" * 40}})  # moved
+        rows.append({**self.green(5, 9000), "state": "merged"})
+        rows.append({**self.green(6, 9000), "explain": {"ok": False, "head": self.HEAD, "action": {"kind": "wait"}}})
+        g = gg.land_green_waits(rows, self.cache, NOW)
+        self.assertEqual((g["rows"], g["p50S"], g["p95S"], g["past"]), (3, 1200, 3000, 1))
+        self.assertEqual((g["oldest"], g["oldestS"]), ("o/r#3", 3000))  # no okSince: its first judged line at the head
+        self.assertEqual(gg.land_green_waits([], self.cache, NOW)["p50S"], None)
+
+    def test_a_clean_row_no_judgment_reached_counts_from_when_it_was_queued(self) -> None:
+        """huge-blue, 2026-11-22 08:15Z: 653 rows queued, never judged; only 5 judged ok at their head."""
+        clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+        queued = {"key": "pr:o/r#7", "state": "queued", "created": NOW - 7200, "dueAt": NOW - 4000}
+        refused = {"key": "pr:o/r#8", "state": "waiting", "created": NOW - 9000,
+                   "explain": {"at": NOW - 60, "ok": False, "head": self.HEAD, "action": {"kind": "review"}}}
+        g = gg.land_green_waits([queued, refused], clean, NOW)
+        self.assertEqual((g["rows"], g["judged"], g["p50S"], g["oldest"]), (1, 0, 4000, "o/r#7"))
+        running = lambda key: {"key": key, "data": {**clean(key)["data"],  # noqa: E731
+                                                    "checks": [{"status": "IN_PROGRESS"}]}}
+        self.assertEqual(gg.land_green_waits([queued], running, NOW)["rows"], 0)
+
+    def test_a_median_past_30_minutes_pages_and_under_it_stays_quiet(self) -> None:
+        self.policy()
+        self.queue_with([self.green(n, 29 * 60) for n in range(5)])
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual((self.pool_line["greenWaitP50S"], self.pool_line["greenWaitP95S"]), (1740, 1740))
+        self.queue_with([self.green(n, 31 * 60) for n in range(5)])
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity fire", told[0])
+        self.assertIn("green PRs wait to merge: p50 31m, p95 31m over 5 row(s) one merge away (5 judged ok) of 5 open",
+                      told[0])
+        self.assertEqual(self.notice_lines()[-1]["kind"], "land-wait")
+        self.daemon.check_alarms()  # still past: not sent again within the hour
+        self.assertEqual(len(self.told_lines()), 1)
+
+    def test_a_tail_past_30_minutes_warns_while_the_median_is_under(self) -> None:
+        self.policy()
+        self.queue_with([self.green(n, 60) for n in range(18)] + [self.green(20, 3600)])
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])  # one row past: under LAND_GREEN_WAIT_TAIL
+        self.queue_with([self.green(n, 60) for n in range(18)] + [self.green(20, 3600), self.green(21, 7300)])
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity warn", told[0])
+        self.assertIn("p50 60s, p95 60m", told[0])
+        self.assertIn("oldest o/r#21 (2h01m)", told[0])
+
+    def test_the_alarm_is_off_by_policy_and_on_a_stale_reading(self) -> None:
+        self.policy(landWait=False)
+        self.queue_with([self.green(1, 7200)])
+        self.daemon.check_alarms()
+        self.policy()
+        self.daemon.now = NOW + 3 * gg.LAND_POOL_LOG_EVERY  # no land-pool line since: no reading to page on
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        with mock.patch.object(gg, "policy_doc", return_value={"alarms": {"landWait": False}}):
+            self.assertFalse(gg.daemon_policy()["alarms"]["landWait"])
+        with mock.patch.object(gg, "policy_doc", return_value={}):
+            self.assertTrue(gg.daemon_policy()["alarms"]["landWait"])  # on by default
+
+    def test_land_status_prints_the_clock(self) -> None:
+        line = gg.land_green_line(gg.land_green_waits([self.green(1, 600), self.green(2, 2400)], self.cache, NOW))
+        self.assertEqual(line, "glaeda land: green waits: 2 row(s) one merge away (2 judged ok), p50 10m, p95 40m, 1 past "
+                               "30m; oldest o/r#2 (40m); pages past 30m")
+
+
 class RunFromBytecodeTest(unittest.TestCase):
     """huge-blue, 2026-11-22 07:55Z: 384 glaeda-gh execs in 60 s, all but one compiled from source (0.34 s CPU each, 0.10
     s from bytecode). Run by path, the first line loads it through SELF_LOADER from bytecode cached beside it."""
