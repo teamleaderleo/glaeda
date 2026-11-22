@@ -28669,6 +28669,54 @@ class LandTest(Base):
         self.tick(1)
         self.assertEqual(self.w.explains()[0][-3:], ["--sha", LB, "--json"])
 
+    def no_data_unreadable(self, n: int) -> None:
+        for _ in range(n):
+            self.w.answers.append((3, {"ok": False, "code": "unreadable", "head": LA,
+                                       "reason": "land-judge: refused: unreadable: GitHub timed out",
+                                       "next": "", "action": {"v": 1, "kind": "retry", "after_s": 120}}))
+
+    def no_data_judgments(self, seconds: float, step: float = 10.0) -> list[float]:
+        """Run the queue SECONDS with no cached copy of the PR; when each live judgment ran (seconds from the start)."""
+        start, at = self.t, []
+        while self.t - start < seconds:
+            before = len(self.w.judgments())
+            self.tick(step)
+            if len(self.w.judgments()) > before:
+                at.append(round(self.t - start))
+        return at
+
+    def test_a_pr_the_daemon_cannot_read_backs_off_between_no_data_judgments(self):
+        """Queue host, 2026-11-22 14:37-15:37Z: 118 unreadable judgments why=no_data, each ~177 s of a worker, because
+        the no-data path judged again LAND_NO_DATA_AFTER after each answer and never read its retry's wake. The
+        judgments now follow the retry's backoff (doubling to LAND_RETRY_MAX), still at least every LAND_RETRY_MAX."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_unreadable(40)
+        at = self.no_data_judgments(4 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        # before: one every 130 s (40 in the first 87 min); now 130, 260, 500, 980, 1940 s, then every 1800 s: 11
+        self.assertLessEqual(len(at), 12, at)
+        self.assertTrue(all(b >= a for a, b in zip(gaps, gaps[1:])), gaps)  # never faster than the one before
+        self.assertLessEqual(max(gaps), gg.LAND_RETRY_MAX + 20, gaps)  # never stranded: bounded
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+    def test_the_daemons_first_copy_after_a_no_data_judgment_is_judged_at_once(self):
+        """The backoff waits for nothing but its wake or the PR's first copy: the read the daemon could not do arrives
+        and the land is judged on it that pass, pinned to the head it shows."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_unreadable(3)
+        at = self.no_data_judgments(600)
+        self.assertEqual(len(at), 3, at)  # LAND_NO_DATA_AFTER, then the retry's 120 s and 240 s; the next 480 s on
+        e = self.q.entries[self.KEY]
+        self.assertGreater(e["wakeAt"], self.t + 60)
+        self.pr(LA)
+        self.w.answers.insert(0, ok_answer(LA))
+        e = self.tick(2)
+        self.assertEqual(self.w.judgments()[-1][-3:], ["--sha", LA, "--json"])
+        self.assertEqual(e["state"], "merged")
+        self.assertIn("data_seen", [h.get("why") for h in e["history"]])
+
     def test_a_full_pin_the_cache_contradicts_still_stops(self):
         """The trust is in the pin, not over a read: a cached head that is not the pin still stops head_moved."""
         self.pr(LA)
