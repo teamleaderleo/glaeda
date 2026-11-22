@@ -26642,6 +26642,18 @@ class LandTest(Base):
         self.tick()
         self.assertEqual((len(self.w.explains()), len(self.handoffs())), (4, 5))
 
+    def test_a_pinned_land_with_no_read_of_its_pr_is_handed_off_early_at_its_pin(self):
+        # fs-agent-lane-2, 2026-11-22: no_data entries pinned to a full head were each judged here first (300 s,
+        # explain_failed) although 3 of the last 5 judgments had read nothing: early_hand_off had no head to give.
+        self.broker = True
+        self.unreadable_lands(gg.LAND_EARLY_HANDOFF_BAD)
+        gg.land_request("land", "o/r#4", [], "host/lane", sha=LA)
+        self.tick()
+        e = self.q.entries["pr:o/r#4"]
+        self.assertEqual((len(self.w.explains()), len(self.handoffs())), (3, 4))
+        self.assertEqual(json.loads(self.handoffs()[-1][4])["sha"], LA)
+        self.assertIn("handoff_early", [h.get("event") for h in e["history"]])
+
     def test_the_broker_host_never_hands_off_early_however_many_reads_fail(self):
         self.unreadable_lands(gg.LAND_EARLY_HANDOFF_BAD)
         self.pr(LA, key="pr:o/r#4")
