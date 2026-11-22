@@ -12106,8 +12106,46 @@ def land_cores() -> int:
 
 
 def land_worker_ceiling(cores: int | None = None) -> int:
-    """One land worker per LAND_CORES_EACH cores, at least 1."""
+    """One land worker per LAND_CORES_EACH cores, at least 1: where the adaptive pool starts (LandQueue.adapt_pool)."""
     return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
+
+
+# The pool grows to what the queue needs and GitHub answers, never to a count set by hand (LandQueue.adapt_pool). It
+# starts at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
+# (gated) grows by LAND_POOL_GROW (at least one worker), and a quota refusal since the last step (park_quota,
+# park_queue_quota) halves it, as TCP's congestion window does. A judgment is land_judge waiting on GitHub, not on the
+# host: huge-blue, 2026-11-22 09:58Z, 17 land_judge/classifier processes held 1,109 MB (about 65 MB each) at 0.1-11%
+# of a core each, judgments ran 3-13 min, and 12 of 12 workers (land.json "workers": 12) were busy with ~1,000 due rows
+# gated each pass. At 32 workers the next 10 minutes judged 38 and merged 13 (12 workers: 15-19 and 2-5). So its
+# ceiling is the host's memory, LAND_JUDGE_MEM_MB each out of half of what is available (land_pool_max), not its cores;
+# the pace and the App pools' own refusals bound what it spends on GitHub. land.json "workers" stays an operator's
+# fixed override.
+LAND_POOL_ADAPT_S = 60.0
+LAND_POOL_GROW = 0.25
+LAND_JUDGE_MEM_MB = 256  # four times the ~65 MB one judgment's process tree measured
+
+
+def land_mem_available_mb() -> int | None:
+    """MemAvailable from /proc/meminfo, else half the physical memory (macOS has no MemAvailable), in MB; None when the
+    host says neither."""
+    with contextlib.suppress(OSError, ValueError):
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (2 * 1024 * 1024))
+    return None
+
+
+def land_pool_max(mem_mb: int | None = None) -> int:
+    """The adaptive pool's ceiling: LAND_JUDGE_MEM_MB per judgment out of half the host's available memory, never under
+    land_worker_ceiling; that ceiling alone where the memory is unknown."""
+    mem = land_mem_available_mb() if mem_mb is None else mem_mb
+    floor = land_worker_ceiling()
+    if mem is None:
+        return floor
+    return max(floor, int(mem) // 2 // LAND_JUDGE_MEM_MB)
 
 
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
@@ -13673,6 +13711,9 @@ class LandQueue:
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
+        self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
+        self.pool_adapted = 0.0  # when adapt_pool last stepped
+        self.quota_refused = float("-inf")  # the last quota refusal (park_quota, park_queue_quota): adapt_pool halves
         self.now = time.time()
         quota = read_json(land_dir() / LAND_QUOTA_FILE)
         self.queue_quota_until = (float(quota.get("until")) if isinstance(quota, dict)
@@ -13883,6 +13924,7 @@ class LandQueue:
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.pass_held_by = {}
+            self.adapt_pool()
             self.log_pool()
             return
         latch = self.latch_held()
@@ -13969,6 +14011,7 @@ class LandQueue:
                     self.consider(e)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.adapt_pool()
         self.log_pool()
 
     # -- forwarding to the land executor (land_executor): this host judges nothing
@@ -14446,6 +14489,7 @@ class LandQueue:
             if self.queue_quota_until >= until and self.queue_quota_until > self.now:
                 return  # a later refusal must never shorten the host-wide hold
             self.queue_quota_until = max(self.queue_quota_until, until)
+            self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
             self.queue_quota_reason = land_reason(land_redact(text), 300)
             self.queue_quota_at = self.now
             self.queue_park_voided = None
@@ -14457,6 +14501,7 @@ class LandQueue:
         LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
+        self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
         if said is not None:
             jitter = land_jitter(e["key"], said)
@@ -14804,9 +14849,33 @@ class LandQueue:
         return [self.path("python", Path(sys.executable)).as_posix(), os.fspath(tool), "ready", "--owner", owner]
 
     def workers(self) -> int:
-        """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
-        this host's cores (land_worker_ceiling), read at each call."""
-        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
+        """The pool's ceiling: land.json "workers" (an operator's override), else the adaptive size (adapt_pool), read
+        at each call."""
+        given = self.config().get("workers")
+        if given is not None:
+            return int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+        return max(1, int(self.pool_size))
+
+    def adapt_pool(self) -> None:
+        """Every LAND_POOL_ADAPT_S, step the adaptive pool (the comment above LAND_POOL_ADAPT_S): halve it after a
+        quota refusal, else grow it while it is full and due rows waited for a worker this pass; logged as land-pool-
+        size when it moves. land.json "workers" fixes it instead."""
+        if self.now - self.pool_adapted < LAND_POOL_ADAPT_S:
+            return
+        last, self.pool_adapted = self.pool_adapted, self.now
+        if self.config().get("workers") is not None:
+            return
+        size, ceiling = self.pool_size, float(land_pool_max())
+        if self.quota_refused > last:
+            size, why = max(1.0, size / 2), "a quota refusal"
+        elif len(self.jobs) >= int(size) and self.pass_gated:
+            size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
+        else:
+            return
+        if int(size) != int(self.pool_size):
+            log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
+                 "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
+        self.pool_size = size
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -14899,7 +14968,7 @@ class LandQueue:
                 "loadPerCore": land_load_per_core(), "latch": None if latch is None else latch[0],
                 "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
-             "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
+             "workersFrom": "land.json" if "workers" in self.config() else f"adaptive:max {land_pool_max()}",
              "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -15152,7 +15221,8 @@ class LandQueue:
             import concurrent.futures
             # at the ceiling (threads start only as jobs need them): judge's cap is the live land.json "workers",
             # so changing it takes effect at once instead of at the next restart
-            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), self.workers()),
+            self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(land_cores(), land_pool_max(),
+                                                                              self.workers()),
                                                               thread_name_prefix="land")
         self.jobs[key] = self.pool.submit(fn, *args)
         self.job_started[key] = (self.now, getattr(fn, "__name__", "job"))
@@ -17663,8 +17733,14 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     load = land_load_per_core()
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
-    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
-    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
+    if given is not None:
+        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, 1024)), "land.json"
+    else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
+        line = read_json(land_dir() / LAND_POOL_FILE)
+        size = line.get("workers") if isinstance(line, dict) else None
+        ceiling = int(size) if isinstance(size, int) and not isinstance(size, bool) else land_worker_ceiling()
+        source = "adaptive"
+    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({source})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")
             + f"; load {loads}; {late} due late")

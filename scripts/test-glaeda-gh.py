@@ -29592,16 +29592,62 @@ class LandTest(Base):
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
 
-    def test_the_pool_is_sized_from_the_hosts_cores_not_a_hand_set_four(self):
+    def test_the_pool_starts_from_the_hosts_cores_not_a_hand_set_four(self):
         """gcp-agent-lane-1, 2026-11-21 20:05Z: 28 lands past due, p50 82 min, each "every worker busy" (4 of 4) on a
-        32-core VM; LAND_WORKERS 4 was set by hand. The ceiling is one worker per LAND_CORES_EACH cores, read at each
-        call; land.json "workers" stays an operator's override."""
+        32-core VM; LAND_WORKERS 4 was set by hand. The pool starts at one worker per LAND_CORES_EACH cores
+        (land_worker_ceiling); land.json "workers" stays an operator's override."""
         for cores, want in ((1, 1), (2, 1), (8, 4), (16, 8), (32, 16)):
-            with mock.patch.object(gg, "land_cores", return_value=cores):
-                self.assertEqual(self.q.workers(), want, cores)
+            self.assertEqual(gg.land_worker_ceiling(cores), want, cores)
+        self.assertEqual(self.q.workers(), 4)  # 8 cores (setUp)
         self.w.config["workers"] = 3
         with mock.patch.object(gg, "land_cores", return_value=32):
             self.assertEqual(self.q.workers(), 3)
+
+    def test_a_full_pool_with_rows_waiting_grows_until_github_refuses(self):
+        """Leo: "you shouldnt need to set minimums in the first place". huge-blue, 2026-11-22 09:44-09:59Z: land.json
+        "workers": 12, 12 of 12 busy, ~1,000 due rows gated a pass, judgments 3-13 min of GitHub waits at about 65 MB
+        and a few % of a core each. A full pool with due rows waiting grows by a quarter a step up to its memory
+        ceiling; a quota refusal halves it; an idle or unfull pool stays; land.json "workers" fixes it."""
+        q = self.q
+        self.assertEqual(q.workers(), 4)
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            for n in range(4):
+                q.jobs[f"pr:o/r#{n + 100}"] = mock.Mock(done=lambda: False)
+            q.now, q.pass_gated = 1000.0, 7
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 5)
+            q.adapt_pool()  # within LAND_POOL_ADAPT_S: no step
+            self.assertEqual(q.workers(), 5)
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()  # 5 jobs needed to be full: 4 running, so it holds
+            self.assertEqual(q.workers(), 5)
+            sizes = []
+            for _ in range(20):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+                sizes.append(q.workers())
+            self.assertEqual(sizes[:4], [6, 7, 9, 12])
+            self.assertEqual(sizes[-1], 80)  # 40 GB available: half of it at LAND_JUDGE_MEM_MB each
+            q.pass_gated = 0  # nothing waits for a worker: no growth
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 80)
+            q.pass_gated = 3
+            q.park_quota({"key": "pr:o/r#1", "state": "judging", "history": []}, "API rate limit exceeded")
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 40)
+            self.w.config["workers"] = 12
+            self.assertEqual(q.workers(), 12)
+        q.jobs.clear()
+
+    def test_the_pool_ceiling_is_the_hosts_memory_not_its_cores(self):
+        self.assertEqual(gg.land_pool_max(40 * 1024), 80)
+        self.assertEqual(gg.land_pool_max(100), 4)  # never under the core-based start (8 cores in setUp)
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=None):
+            self.assertEqual(gg.land_pool_max(), 4)
 
     def test_the_hosts_load_holds_no_judgment(self):
         """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
@@ -29683,7 +29729,7 @@ class LandTest(Base):
                 mock.patch.object(gg, "land_worker_ceiling", return_value=12), \
                 mock.patch.object(gg, "land_config", return_value={}):
             line = gg.land_holders_line(rows, time.time())
-        self.assertIn("workers 2 busy of 12 (cores): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
+        self.assertIn("workers 2 busy of 12 (adaptive): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
                       line)
         self.assertIn("load 0.98/core; 1 due late", line)
         self.assertNotIn("line", line.split("load")[-1])
