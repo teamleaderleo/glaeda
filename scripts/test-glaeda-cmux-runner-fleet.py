@@ -137,11 +137,11 @@ elif path == "repos/actions/runner/releases/latest":
     print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
                       "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
                                   "browser_download_url": "https://example.invalid/x"}}]}}))
-elif "/actions/runners?name=" in path:  # the operator's read of a runner's labels; FAKE_NO_RUNNERS: none listed
-    import urllib.parse
-    name = urllib.parse.unquote(path.split("name=", 1)[1].split("&", 1)[0])
-    listed = [] if os.environ.get("FAKE_NO_RUNNERS") else [{{"name": name, "labels": [{{"name": "self-hosted"}}, {{"name": "glaeda-mini"}}]}}]
-    print(json.dumps({{"total_count": len(listed), "runners": listed}}))
+elif path.endswith("/actions/runners?per_page=100"):  # the operator's one list of a scope's runners; FAKE_NO_RUNNERS: none
+    hosts = ("mini-a", "mini-b", "mini-light")
+    names = [h + "-glaeda" + s for h in hosts for s in [""] + ["-" + str(k) for k in range(1, 16)] + ["-nightly-next"]]
+    for name in [] if os.environ.get("FAKE_NO_RUNNERS") else names:  # gh --jq prints one tojson line per runner
+        print(json.dumps([name, ["self-hosted", "glaeda-mini"]]))
 elif "/repositories" in path:
     print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
 elif path.startswith("repos/") and path.count("/") == 2:
@@ -290,13 +290,14 @@ class FleetTest(unittest.TestCase):
         # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
         releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
         self.assertEqual(len(releases), 1)
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 10,
-                         "one token, eight label reads and one release read")
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 3,
+                         "one token, one runner list for the scope and one release read")
         # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
         self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
-        reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
-                       and any("runners?name=" in a for a in c["argv"]))
-        self.assertIn("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-3&per_page=100", reads)
+        reads = [c["argv"] for c in calls if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertEqual(len(reads), 1, "eight instances on one scope read its runners once, not once each")
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners?per_page=100", reads[0])
+        self.assertIn("--paginate", reads[0])
         unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
         self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
         self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
@@ -445,8 +446,7 @@ class FleetTest(unittest.TestCase):
         tokens = [c["argv"] for c in self.calls() if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
         self.assertIn("repos/manaflow-ai/cmux/actions/runners/registration-token", [a for t in tokens for a in t])
         lists = [c["argv"] for c in self.calls() if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
-        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-nightly-next" in " ".join(a)
-                            for a in lists),
+        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?per_page=100" in a for a in lists),
                         "its labels are read from its own scope, so a mini without gh never re-registers it")
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
