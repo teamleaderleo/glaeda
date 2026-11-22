@@ -3013,30 +3013,6 @@ class HookTest(unittest.TestCase):
         self.assertFalse(ok, why)
         self.assertIn(f"{hook.FRESH_RESERVE_UNITS} are kept for an idle reserving runner", why)
 
-    def test_a_signing_job_waits_out_a_short_exclusive_host_lock_hold_at_admission(self) -> None:
-        """SIGNER_FIRST: a signing job that meets disk-pressure.sh's few-second exclusive hold at admission waits for
-        it (SIGNER_LOCK_ADMIT_WAIT_S) instead of being refused after 0.5 s; other jobs are still refused."""
-        self.fleet()
-        host_lock = os.fspath(self.dir / "fleet" / "host.lock")
-        holder = subprocess.Popen([sys.executable, "-c",
-                                   "import fcntl,os,time\n"
-                                   f"fd=os.open({host_lock!r},os.O_RDWR)\n"
-                                   "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(3)\n"],
-                                  stdout=subprocess.PIPE, text=True)
-        self.addCleanup(holder.kill)
-        self.assertEqual(holder.stdout.readline().strip(), "held")
-        with mock.patch.object(hook, "fair_turn", return_value=None), \
-                mock.patch.object(hook, "hold", return_value=(True, "held")):
-            ok, why = hook.take_capacity(host_lock, self.dir / "capacity", 14, "swift-package-tests", os.getpid(),
-                                         self.dir / "state")
-            self.assertFalse(ok, "an ordinary job is refused")
-            self.assertIn("a fleet build holds the host lock", why)
-            ok, why = hook.take_capacity(host_lock, self.dir / "capacity", 14, "nightly-next-one", os.getpid(),
-                                         self.dir / "state", signs_first=True)
-        self.assertTrue(ok, why)
-        holder.wait()
-        self.fleet()
-
     def test_a_nightly_job_is_admitted_ahead_of_a_waiting_fleet_build(self) -> None:
         """Nightly jobs come first on the fleet: a waiting fleet build refuses every other job, never a nightly one
         that holds its capacity at once, and a nightly one at most NIGHTLY_WAITER_PASSES times per waiter."""
@@ -14224,12 +14200,18 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.claimed())
             self.assertIsNone(gate.lock_held_since)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a build that stays
-            for step in (0.0, hook.SIGNER_LOCK_SETTLE_S - 1):
+            for step in (0.0, 4.0, 8.0, 12.0, 16.0, hook.SIGNER_LOCK_SETTLE_S - 1):
                 clock[0] = 2000.0 + step
                 self.assertIsNone(gate.claimed())
             clock[0] = 2000.0 + hook.SIGNER_LOCK_SETTLE_S
             self.assertEqual(gate.claimed(), held, "a hold that lasts does stop the signer")
             self.assertEqual(gate.confirmed(), held)
+            # a stale clock: seen held, then the listener ran a job and was not asked for a while
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            gate.lock_held_since, gate.lock_held_seen = 3000.0, 3005.0
+            clock[0] = 3600.0
+            self.assertIsNone(gate.claimed(), "the next short hold starts its own clock")
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)

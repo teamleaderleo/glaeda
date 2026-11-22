@@ -7115,8 +7115,6 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 except OSError:
                     if attempt == 5:
                         preempted = preempt_yielding(host_lock, job or "a job", holder_pids(state_dir))
-                        if preempted is None and signs_first and wait_host_shared(fd, SIGNER_LOCK_ADMIT_WAIT_S):
-                            break  # SIGNER_FIRST: a short exclusive hold (SIGNER_LOCK_SETTLE_S) is waited out
                         if preempted is None or not wait_host_shared(fd, PREEMPT_ADMISSION_WAIT_S):
                             os.close(fd)
                             return False, ("capacity: a fleet build holds the host lock"
@@ -9386,11 +9384,11 @@ FLEET_BUILD_HOLDS_HOST = "a fleet build holds the host lock"
 # disk-pressure.sh, every 300 s, held it 6 s per pass on 2026-11-22: its cap-only pass). The gate read each one as a
 # fleet build, stopped both idle signing listeners, and kept them off for the 60 s a stop costs, so GitHub and the
 # nightly lane saw the mini offline every 5 minutes from 06:12Z to 07:18Z. The signing listener now stands down only
-# for a hold that lasts SIGNER_LOCK_SETTLE_S (a real build holds it for minutes), and a signing job that meets a
-# short hold at admission waits SIGNER_LOCK_ADMIT_WAIT_S for it instead of being refused after 0.5 s. It stays
-# under ADMISSION_WAIT_S, which another admission gives up after.
+# for a hold that lasts SIGNER_LOCK_SETTLE_S (a real build holds it for minutes). A signing job that meets a hold at
+# admission is refused "capacity: ..." and retried every ADMIT_POLL_S by job-started, so the short one passes.
+# SIGNER_LOCK_GAP_S: a settle clock not refreshed for that long (the listener was busy with a job) starts over.
 SIGNER_LOCK_SETTLE_S = 20.0
-SIGNER_LOCK_ADMIT_WAIT_S = ADMISSION_WAIT_S / 2
+SIGNER_LOCK_GAP_S = 10.0
 
 
 def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None,
@@ -10449,6 +10447,7 @@ class Gate:
         self.pcore_boot: int | None = None
         self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
         self.lock_held_since: float | None = None  # host_claim: when the host lock was first seen held exclusively
+        self.lock_held_seen = 0.0  # host_claim: when it was last seen held
         self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
         self.cpu_busy: float | None = None
         self.cpu_at = -GATE_CPU_EVERY_S
@@ -10672,8 +10671,9 @@ class Gate:
             self.lock_held_since = None
             return why
         now = time.monotonic()
-        if self.lock_held_since is None:
+        if self.lock_held_since is None or now - self.lock_held_seen > SIGNER_LOCK_GAP_S:
             self.lock_held_since = now
+        self.lock_held_seen = now
         return why if now - self.lock_held_since >= SIGNER_LOCK_SETTLE_S else None
 
     def exclusive_yield(self) -> str | None:
