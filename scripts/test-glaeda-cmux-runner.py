@@ -14117,6 +14117,23 @@ class GateTest(unittest.TestCase):
                           " --compile-slots 2 --canonical-roots 2 --instance 13\n")
         return self.full_gate(capacity)
 
+    def test_the_signing_listener_listens_on_a_mini_whose_units_are_all_taken(self) -> None:
+        """SIGNER_FIRST, replaying ultra1's 2026-11-22 00:01-00:45Z gate log: "stopping the idle listener: all 30
+        capacity units on this mini are taken", five times, while PR jobs held every unit. The signing listener
+        listens anyway (its job waits at admission and drains the mini, SIGNING_DRAIN); a side runner beside it is
+        still held, and memory, disk and the fleet's holds still apply."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(30)
+        script.write_text(base + " --instance 0\n")
+        held = self.full_gate(capacity).full()
+        self.assertIn("all 30 capacity units on this mini are taken", held or "", "an ordinary runner is held")
+        script.write_text(base + " --instance 0 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
+        self.assertIsNone(self.full_gate(capacity).full(fresh=True))
+
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)
         self.assertTrue(scope.sim)

@@ -11608,7 +11608,12 @@ class Gate:
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
         scope = runner_scope(self.runner_dir)
-        if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
+        if scope.nightly or scope.trusted_signing:
+            # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini. SIGNER_FIRST: so does the
+            # trusted signing runner. Its job waits at admission as a nightly waiter (FEED_FIRST), and from then on no
+            # new PR or side job takes a unit (SIGNING_DRAIN): the units are reserved at admission, the running jobs
+            # finish, none is killed. ultra1, 2026-11-22 00:01-00:45Z: "all 30 capacity units on this mini are taken"
+            # stopped the idle signing listener five times while PR jobs filled the units.
             self.full_why = None
             return None
         own = max(self.fit_units, listen_fit_units(self.runner_dir))
