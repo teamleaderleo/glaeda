@@ -26451,6 +26451,36 @@ class LandTest(Base):
         self.assertEqual((took[-1]["code"], took[-1]["head"], took[-1]["override"]),
                          ("ci_never_ran", LB[:12], self.OVERRIDE["reason"]))
 
+    def test_land_override_answers_a_ws_check_that_never_posts_past_its_wait(self):
+        """lw#8689 and lw#8708, 2026-11-22 21:55-23:20Z: queued with an override and a receipt, judged ws_check_missing
+        (wait_pr) for 1.5 h while the ws-check verdict never came. Inside LAND_OVERRIDE_WAIT_S the wait holds; past
+        it at the same head, the override's pinned merge goes; with no override the wait holds."""
+        missing = ("land-judge: refused: PR #1 head " + LA + " has ws-check still pending, and it changes tools/x.py: a "
+                   "PR that changes tools/ waits for its ws-check result even on the lagging sync")
+        for override in (dict(self.OVERRIDE), None):
+            with self.subTest(override=bool(override)):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA)
+                gg.land_request("land", "o/r#1", [], "host/lane", override=override)
+                for _ in range(3):
+                    self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr"}, reason=missing,
+                                                  nxt="glaeda-gh wait pr o/r#1 --until done"))
+                e = self.tick()
+                self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+                e = self.tick(gg.LAND_OVERRIDE_WAIT_S / 2)
+                self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))  # inside its wait: held
+                e = self.tick(gg.LAND_OVERRIDE_WAIT_S)
+                if override is None:
+                    self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+                    continue
+                self.assert_merged_at(LA)
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE"), self.OVERRIDE["reason"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual(took[-1]["code"], "ws_check_missing")
+
     def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
         never = "git commit --allow-empty -m x && git push"
         for override, answer, stopped in (
