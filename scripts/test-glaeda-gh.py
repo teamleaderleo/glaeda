@@ -7697,6 +7697,18 @@ class ChildReapingTest(unittest.TestCase):
         self.assertFalse(any(self.zombie(p.pid) for p in procs))
         self.assertEqual(gg.DETACHED, [])
 
+    def test_a_bounded_child_carries_its_deadline_for_the_reaper(self) -> None:
+        before = time.time()
+        env = gg.deadline_env({"PATH": "/usr/bin:/bin"}, 10)
+        self.assertEqual(env["CMUX_DEADLINE_OWNER"], "glaeda-gh")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertTrue(before + 10 <= int(env["CMUX_DEADLINE"]) <= time.time() + 10 + 0.3 + 1 + 1, env)
+        self.assertIsNone(gg.deadline_env(None, None))
+        self.assertEqual(gg.deadline_env({"A": "1"}, math.inf), {"A": "1"})
+        seen = gg.run_bounded(["sh", "-c", 'echo "$CMUX_DEADLINE_OWNER $CMUX_DEADLINE"'], 10).stdout.split()
+        self.assertEqual(seen[0], "glaeda-gh")
+        self.assertGreaterEqual(int(seen[1]), int(before) + 10)
+
     @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
     def test_a_bounded_detached_child_ends_at_its_bound(self) -> None:
         proc = gg.spawn_detached(["sleep", "30"], bound=0.2, stdin=subprocess.DEVNULL)

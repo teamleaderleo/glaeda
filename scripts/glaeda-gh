@@ -2830,6 +2830,7 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     open for as long as it lives. Here the child leads its own process group and the whole group is
     killed. Raises subprocess.TimeoutExpired or OSError."""
     timeout = SUBPROCESS_DEADLINE if timeout is None else timeout
+    env = deadline_env(env, timeout)
     with subprocess.Popen(self_bounded(argv, timeout, env),
                           stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
@@ -2861,6 +2862,23 @@ TIMEOUT_PATHS = ("/opt/homebrew/bin/timeout", "/usr/local/bin/timeout", "/usr/bi
                  "/opt/homebrew/bin/gtimeout", "/usr/local/bin/gtimeout")
 TIMEOUT_ENV = "GLAEDA_GH_TIMEOUT_CMD"  # a test's or an operator's coreutils timeout; empty turns the self-bound off
 DETACHED_BOUND = 600.0  # a fire-and-forget alert send (tell-coordinator, coord-alert) running longer is hung
+
+
+DEADLINE_ENV = "CMUX_DEADLINE"  # unix seconds past which this process tree is over its bound (agent-orphan-reaper)
+DEADLINE_OWNER_ENV = "CMUX_DEADLINE_OWNER"  # the tool that set it
+DEADLINE_OWNER = "glaeda-gh"
+
+
+def deadline_env(env: dict | None, seconds: float | None) -> dict | None:
+    """ENV (None: this process's) plus CMUX_DEADLINE, the epoch second the child's self-bound has killed it by, and
+    CMUX_DEADLINE_OWNER: the shared contract by which leo-workspace's agent-orphan-reaper prunes any tool's child
+    that outlived its bound, whatever tool started it. ENV unchanged with no finite bound."""
+    if seconds is None or not math.isfinite(seconds):
+        return env
+    base = dict(os.environ if env is None else env)
+    base[DEADLINE_ENV] = str(math.ceil(time.time() + max(0.0, seconds) + SELF_BOUND_SLACK + SELF_BOUND_KILL))
+    base[DEADLINE_OWNER_ENV] = DEADLINE_OWNER
+    return base
 
 
 def coreutils_timeout() -> str | None:
@@ -2905,6 +2923,8 @@ def spawn_detached(argv: list[str], bound: float | None = None, **kwargs: Any) -
     """Popen(ARGV) in a session of its own, not waited for, kept for reap_children; with BOUND, self_bounded. Raises
     OSError as Popen does."""
     reap_children()
+    if bound is not None:
+        kwargs["env"] = deadline_env(kwargs.get("env"), bound)
     proc = subprocess.Popen(self_bounded(argv, bound, kwargs.get("env")), start_new_session=True, **kwargs)
     with DETACHED_LOCK:
         DETACHED.append(proc)
@@ -16974,7 +16994,8 @@ class LandQueue:
 
     @staticmethod
     def _run_real(argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
-        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env = deadline_env(env, timeout)  # its bound in the child too: the queue's caller can execv mid-step
+        with subprocess.Popen(self_bounded(argv, timeout, env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True, env=env,
                               cwd=os.environ.get("HOME") or "/") as proc:
             try:
@@ -20205,6 +20226,8 @@ def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: floa
 
 def serve(foreground_ok: bool = False) -> int:
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
+    for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
+        os.environ.pop(name, None)
     lock = hold_daemon_lock()
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
