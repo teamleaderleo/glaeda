@@ -8951,6 +8951,11 @@ class Daemon:
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
 
+        # A heavy entry GraphQL times out on alone, between its lone retries: REST reads it (the broker host, 2026-11-22:
+        # a PR with 163 checks 504'd on every lone query, nothing read it, and the PR a due land was blocked on kept
+        # data 14,000+ s old while the stale valve restarted the daemon every 30 min).
+        backing_off: list[dict] = []
+
         def chunks(group: list[dict]) -> list[list[dict]]:
             alone, rest = [], []
             for e in group:
@@ -8959,6 +8964,8 @@ class Daemon:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
+                else:
+                    backing_off.append(e)
             # One owner per query. An App installation answers a read only when the whole query names one owner
             # (AppPool.owner_of returns None for a cross-owner body), so a batch that mixes owners has no App and
             # all of it -- the App-servable entries included -- goes on the shared login's 5,000 points an hour
@@ -8975,7 +8982,7 @@ class Daemon:
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
-        to_rest: list[dict] = []
+        to_rest: list[dict] = list(backing_off)
         while queue:
             chunk = queue.pop(0)
             on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
@@ -9069,11 +9076,11 @@ class Daemon:
                         else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
                 then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS)
                         else "split into halves and retried" if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS
-                        else "read alone, next cycle")
+                        else "REST reads it this tick")  # a lone timeout: too heavy for GraphQL even alone
                 self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
-                if down:
-                    to_rest += chunk
+                if down or (error and SLOW.search(error)):
+                    to_rest += chunk  # too heavy for GraphQL even alone: REST reads it this tick, page by page
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
                 h["at"] = self.now

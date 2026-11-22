@@ -6306,12 +6306,15 @@ class OverloadTest(Base):
     (2026-10-19, 89 watched PRs): 25 PRs per query took 10-11 s and one of two answered 504; 10 took
     4-6 s and 5 took 2-3 s, all 200, every one costing 1 point. Latency, not cost, sets the limit."""
 
-    def overloaded(self, limit: int | None = None, poison: int | None = None):
+    def overloaded(self, limit: int | None = None, poison: int | None = None, rest_down: bool = False):
         """A transport that answers 504 to a PR query with more than `limit` PRs, or that includes
-        PR `poison` (one PR heavy enough to time out alone)."""
+        PR `poison` (one PR heavy enough to time out alone). REST_DOWN: REST answers 503 to every PR read too, so
+        nothing can read them (a PR GraphQL times out on alone is read over REST instead)."""
         sizes = []
 
         def transport(method, url, headers, body):
+            if rest_down and "/pulls/" in url:
+                return 503, {}, b'{"message": "unavailable"}'
             if url.endswith("/graphql"):
                 doc = json.loads(body)
                 prs = [v for k, v in doc["variables"].items() if k.startswith("n")]
@@ -6360,10 +6363,7 @@ class OverloadTest(Base):
         self.daemon.tick(NOW)
         for key in keys:
             entry = gg.read_cache(key)
-            if key == "pr:o/r#7":
-                self.assertIn("HTTP 504", entry["error"])
-            else:
-                self.assertIsNotNone(entry["data"], key)
+            self.assertIsNotNone(entry["data"], key)  # #7 too: too heavy for GraphQL alone, REST read it
         self.assertEqual(set(self.daemon.heavy), {"pr:o/r#7"})
         self.assertEqual(self.daemon.batch["pr"], 5)  # halved once on this tick, not once per split
         # from now on #7 is read alone and the rest batch normally: one query, not a cascade of splits
@@ -6447,6 +6447,21 @@ class OverloadTest(Base):
                 os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertNotIn("pr:o/r#3", self.daemon.heavy)
+
+    def test_a_pr_too_heavy_for_graphql_alone_is_read_over_rest_every_cycle(self) -> None:
+        # the broker host, 2026-11-22: a PR with 163 checks 504'd alone every time; it was marked heavy and
+        # then nothing read it, so the PR a land was blocked on kept data 14,000+ s old. REST reads it instead.
+        keys = self.watch(6)
+        self.transport(lambda prs: (504, b"{}") if 3 in prs else None)
+        for cycle in range(0, 2 * gg.HEAVY_AFTER + 2):
+            for n in range(1, 7):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+            entry = gg.read_cache("pr:o/r#3")
+            self.assertIsNotNone(entry["data"], cycle)
+            self.assertEqual(entry["dataAt"], NOW + cycle * gg.CYCLE, cycle)  # read on this cycle, alone or backing off
+        self.assertGreaterEqual(self.daemon.heavy["pr:o/r#3"]["fails"], gg.HEAVY_AFTER)
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
     def resource_limited(self, partial, field="statusCheckRollup"):
         """Answer PR queries as GitHub does past its per-query resource limit: 200, with each PR `partial(prs)` names
@@ -6544,7 +6559,7 @@ class OverloadTest(Base):
 
     def test_a_pr_never_read_counts_in_the_oldest_data(self) -> None:
         self.watch(1)
-        self.overloaded(poison=1)
+        self.overloaded(poison=1, rest_down=True)
         self.daemon.tick(NOW)
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["oldestData"]["pr"], 5 * gg.CYCLE)
@@ -6604,7 +6619,7 @@ class OverloadTest(Base):
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
-        self.overloaded(limit=0)  # every PR query fails from now on
+        self.overloaded(limit=0, rest_down=True)  # every PR read fails from now on, GraphQL and REST
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         status = gg.read_json(gg.BASE / "daemon.json")
         self.assertEqual(status["oldestData"]["pr"], 5 * gg.CYCLE)
