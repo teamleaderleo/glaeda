@@ -1125,7 +1125,8 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     set_pool_user(member, pool_user)
     # POOL_USER: the node view the pool account's gate reads is published before that gate is asked (apply only)
     unpublished = publish_node_view(member, summary) if pool_user and args.apply else None
-    eligible, why = check(member, summary)
+    # a view that failed to publish fails the member before its gate is asked (that gate would read a stale view)
+    eligible, why = (False, "node view not published") if unpublished else check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
                            "gatewayRunners": summary.get("gatewayRunners") or 0,
                            "simRunners": summary.get("simRunners") or 0,
