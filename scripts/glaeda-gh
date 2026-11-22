@@ -2801,10 +2801,24 @@ def gh_graphql_read(args: list[str]) -> bool:
         return False
 
 
+# A lane VM holds no GitHub login (lane_vm_gh: its gh is the lane-gh broker's credential chain), so its `gh` GraphQL
+# reads spend no login hour of this host's: the broker asks them on its read Apps first, behind its own per-VM read
+# admission and per-identity connection caps. The two slots of the login "default" (no hosts.yml here) were a queue
+# with nothing behind it: gcp-agent-lane-1, 2026-11-22 16:19:42Z, `gh pr view 49882 --json ...` waited exactly
+# GRAPHQL_SLOT_WAIT (120 s) for a slot before it reached lane-gh at 16:21:42Z, and overflow.log held 3,331 such
+# 120 s waits (56 in the hour to 16:25Z), every lane's land-judge read among them; with broker reads taking 15-25 s
+# each under load, two slots carried about one read every 10 s for the whole VM. land-judge's explain then ran 9.5
+# min against glaeda land's 300 s kill and every judgment read "unreadable". So on a lane VM a CLI read takes no slot;
+# the daemon's own reads keep theirs (Daemon.request).
+
+
 def gh_graphql_slot_for(args: list[str]) -> Any:
     """For the broker: a held slot's open file when `gh ARGS` is a GraphQL read that needs one, else None (not a
-    GraphQL read, a gh call nested under a slot its parent holds, or GRAPHQL_SLOT_WAIT passed: logged)."""
+    GraphQL read, a lane VM's read (no login here: the lane-gh broker paces it), a gh call nested under a slot its
+    parent holds, or GRAPHQL_SLOT_WAIT passed: logged)."""
     if not gh_graphql_read(args):
+        return None
+    if lane_vm_gh() is not None:
         return None
     holder = os.environ.get(GRAPHQL_SLOT_ENV, "")
     if holder.isdigit() and int(holder) > 1:

@@ -12551,6 +12551,25 @@ class GraphqlSlotsTest(BrokerBase):
         self.assertFalse(gg.gh_graphql_read(["api", "repos/o/r/pulls/7"]))
         self.assertFalse(gg.gh_graphql_read(["api", "graphql", "-f", "query=mutation{addComment(input:{}){clientMutationId}}"]))
 
+    def test_a_lane_vm_cli_read_takes_no_login_slot(self) -> None:
+        # gcp-agent-lane-1, 2026-11-22: no login on the VM ("default"), every gh GraphQL read through the lane-gh
+        # broker; `gh pr view` waited the whole 120 s GRAPHQL_SLOT_WAIT for one of two slots before it was sent.
+        chain = Path(os.environ["GLAEDA_GH_LANE_CHAIN"])
+        chain.parent.mkdir(parents=True, exist_ok=True)
+        chain.write_text("#!/bin/sh\nexec \"$HOME/.local/bin/lane-gh-credential\" gh \"$@\"\n")
+        chain.chmod(0o755)
+        self.addCleanup(chain.unlink, missing_ok=True)
+        held = [gg.graphql_slot_take(None) for _ in range(2)]  # both of the host's slots held
+        start = time.monotonic()
+        self.assertIsNone(gg.gh_graphql_slot_for(["pr", "view", "7", "-R", "o/r", "--json", "state"]))
+        self.assertLess(time.monotonic() - start, 1.0)
+        overflow = gg.BASE / gg.GRAPHQL_SLOT_DIR / "overflow.log"
+        self.assertFalse(overflow.exists() and overflow.read_text(), "no wait, so no overflow line")
+        chain.unlink()  # off a lane VM the slot still bounds the login's reads: both held, none free
+        self.assertIsNone(gg.graphql_slot_take(None))
+        for got in held:
+            got[0].close()
+
     def test_a_gh_call_nested_under_a_held_slot_uses_its_parents(self) -> None:
         held = [gg.graphql_slot_take(None) for _ in range(2)]
         os.environ[gg.GRAPHQL_SLOT_ENV] = str(os.getpid())  # this process holds one: a nested call never waits
