@@ -11302,6 +11302,12 @@ LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_
 LAND_FILES_MAX = 3000  # GitHub lists at most this many files of a PR: a list that long may not be whole
 # merge_hold's words for a job its runner refused at setup (cmux scripts/ci/base_red_excuse.py)
 LAND_SETUP_REFUSED = "was refused at setup by its runner"
+# test_reds.py's words for a step that ended on SIGTERM (exit 143): the runner or its job-clean hook stopping the job,
+# not a test failing. manaflow-ai/cmux#46146 (2026-11-22, run 44963202562): 'acpmux tests (lib, hub_integration)'
+# printed no failing test and ended "Process completed with exit code 143" 12 s into a tool test the PR does not
+# touch; land stopped it own_red. It takes the setup refusal's one rerun per (head, run); a test that hangs until a
+# SIGTERM ends it is red again on that rerun and stops own_red then.
+LAND_SIGTERM_RED = ": the test process crashed (signal 15)"  # right after the unexcused job's name
 LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
 
 
@@ -14616,14 +14622,19 @@ class LandQueue:
         """An own_red stop whose red is in a job the PR's changed paths cannot affect (LAND_UNRELATED_REDS): one
         `gh run rerun RUN --failed` per (head, run), kept on the entry before it is sent, then a wait on the PR's
         checks at HEAD. A job its runner refused at setup (merge_hold: "it gets re-run, never excused") takes the
-        same one rerun with no inert-path rule: no change makes a runner refuse a job. True when it took that step;
+        same one rerun with no inert-path rule: no change makes a runner refuse a job; so does a job its step's SIGTERM
+        ended with no failing test (LAND_SIGTERM_RED). True when it took that step;
         False: the stop goes ahead, as before."""
         repo, number = e["repo"], str(e["number"])
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         checks = data.get("checks") if isinstance(data.get("checks"), list) else []
         head_ok = bool(SHA40.fullmatch(head)) and str(data.get("headRefOid") or "").lower() == head
         flow, run, why = land_own_red(answer, act, checks, head_ok)
-        setup = bool(run) and LAND_SETUP_REFUSED in f"{answer.get('reason') or ''} {act.get('why') or ''}"
+        said = f"{answer.get('reason') or ''} {act.get('why') or ''}"
+        stopped = "refused at setup by its runner" if LAND_SETUP_REFUSED in said else (
+            "stopped by SIGTERM with no failing test" if (first := LAND_OWN_RED_JOB.search(said))
+            and said[first.end():].startswith(LAND_SIGTERM_RED) else "")
+        setup = bool(run) and bool(stopped)
         rule = land_unrelated_rule(repo, flow, self.config()) if run and not setup else None
         if run and rule is None and not setup:
             why = f"workflow '{flow}' has no inert-path rule, so the change can affect it"
@@ -14652,7 +14663,7 @@ class LandQueue:
                 return False
             e["unrelatedReruns"] = [*(e.get("unrelatedReruns") or []), done][-LAND_UNRELATED_KEEP:]
             self.history(e, "unrelated_red", run=run, workflow=flow, files=len(files),
-                         **({"why": "refused at setup by its runner"} if setup else {}))
+                         **({"why": stopped} if setup else {}))
             self.claim(e, "rerun_failed", runs=[run], unrelated=True)
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
@@ -14663,7 +14674,7 @@ class LandQueue:
                 return False
             self.nudge(e["key"])
             self.wait(e, {"kind": "pr", "sha": head, "rerun": True, "runs": land_rerun_marks(checks, [run]),
-                          "why": f"reran run {run}, " + ("a job its runner refused at setup" if setup
+                          "why": f"reran run {run}, " + (f"a job {stopped}" if setup
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 

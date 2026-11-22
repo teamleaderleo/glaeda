@@ -22765,6 +22765,58 @@ class LandTest(Base):
         self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
         self.assertIn("already rerun once", json.dumps(e["history"]))
 
+    # manaflow-ai/cmux#46146 (2026-11-22, run 44963202562): a job SIGTERM ended (exit 143) with no failing test, read
+    # "the test process crashed (signal 15)", stopped own_red. It takes the same one rerun as a setup refusal.
+    SIGTERM = ("merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: "
+               "'Native/OptChat/optchat-chief': the test process crashed (signal 15) (a crash, a cut-short run or a "
+               "failure no parser names is never a base red)")
+
+    def sigterm(self, text: str | None = None) -> tuple[int, dict]:
+        why = (text or self.SIGTERM).format(head=LA)
+        return refusal("red_not_excused", LA, {"kind": "stop", "stop": "own_red", "why": why}, reason=why)
+
+    def test_a_job_sigterm_ended_is_rerun_once_with_no_path_rule_then_merged(self):
+        self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.sigterm())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"), e.get("history"))
+        self.assertIn("stopped by SIGTERM", json.dumps(e["history"]))
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_job_sigterm_ended_again_after_its_rerun_stops_own_red(self):
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.sigterm())
+        self.tick()
+        self.pr_red(True, running=True)
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.sigterm())
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
+
+    def test_another_signal_or_a_sigterm_in_a_later_job_is_no_rerun(self):
+        for text in (self.SIGTERM.replace("signal 15", "signal 11"),
+                     "merge_hold: refused: base_red_excuse.py exit 1 at {head}: not excused: "
+                     "'Native/OptChat/optchat-chief': 2 tests failed; 'other': the test process crashed (signal 15)"):
+            with self.subTest(text=text[-60:]):
+                self.setUp()
+                self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]
+                self.pr_red(True)
+                self.land()
+                self.w.answers.append(self.sigterm(text))
+                e = self.tick()
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"))
+
     def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
         self.unrelated_world(["webviews/src/a.ts"])
         self.w.gh_rc["rerun"] = 1
