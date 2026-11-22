@@ -31758,20 +31758,30 @@ def parser_options(p: argparse.ArgumentParser) -> dict[str, bool]:
     return out
 
 
-def flag_options(raw: list[str]) -> dict[str, bool]:
-    """The long options the command in RAW accepts, the top-level ones included."""
-    tops, _ = nesting_table()
+def parser_nodes(raw: list[str]) -> list[argparse.ArgumentParser]:
+    """The parsers whose options the command in RAW accepts, outermost first: the top level, the command
+    itself, and the nested command under it. One walk, because every flag reading here wants the same
+    three: which options there are, which of them take a value, and what each one's default is."""
     top = parser()
-    options = parser_options(top)
+    nodes = [top]
+    tops, _ = nesting_table()
     if not raw or raw[0] not in tops:
-        return options
+        return nodes
     node = child_parser(top, raw[0])
-    options.update(parser_options(node))
+    nodes.append(node)
     deeper = [w for w in raw[1:] if not w.startswith("-")]
     if deeper:
         nested = child_parser(node, deeper[0])
         if nested is not node:
-            options.update(parser_options(nested))
+            nodes.append(nested)
+    return nodes
+
+
+def flag_options(raw: list[str]) -> dict[str, bool]:
+    """The long options the command in RAW accepts, the top-level ones included."""
+    options: dict[str, bool] = {}
+    for node in parser_nodes(raw):
+        options.update(parser_options(node))
     return options
 
 
@@ -32214,28 +32224,66 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
 # `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
 # --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
 # first one's value -- exited 2 with argparse's "expected one argument" and nothing queued. Measured on this host 2026-11-22 landing teamleaderleo/glaeda#2559: the land was queued on
-# the retype, 67 s later. The value here is each flag's own documented default, so a bare flag means "wait,
-# the usual amount", which is what it reads as. "" drops the flag: its default is computed (--max is
-# WAIT_MAX_TIMES x the timeout), and absent is exactly that default.
-BARE_WAIT_VALUE: dict[tuple[str, str], str] = {
-    ("land", "--wait"): "3600",      # the flag's default is 0 (do not wait), which a typed --wait cannot mean
-    ("wait", "--timeout"): "3600",   # the parser's own default
-    ("checks", "--wait"): "30",      # the parser's own default
-    ("on-event", "--wait"): "30",    # its default is 0 (do not wait), same reading as land's
-    ("land", "--max"): "",
-    ("wait", "--max"): "",
+# the retype, 67 s later.
+#
+# This was a hand table of (command, flag) -> seconds, and it drifted the same day: `glaeda-gh post status
+# ID --wait`, waiting for a queued PR's number, was refused with "argument --wait: expected one argument"
+# because `post --wait` had no row -- while the parser had declared that flag, with its own default, all
+# along. So the value is read off the flag's own action now and no flag can be missing from it. A default
+# of 0 is the one the parser cannot answer ("do not wait" is not what a typed --wait means): that is what
+# BARE_WAIT_ZERO is for, and an hour is the reading where it says nothing.
+BARE_WAIT_ZERO_SECONDS = "3600"
+BARE_WAIT_ZERO: dict[tuple[str, str], str] = {
+    ("on-event", "--wait"): "30",  # one replayed command ending, not a merge queue: seconds, not an hour
 }
+
+
+def bare_wait_defaults(raw: list[str]) -> dict[str, str]:
+    """Each option of the command in RAW that the parser spells in seconds -> what a bare typing means.
+
+    `type=seconds`, or `type=float` with `metavar="S"`, is how this parser says "a count of seconds", so a
+    count that is not seconds is not here: `log errors --max` is lines (metavar N) and stays argparse's.
+    The value is the action's own default. "" drops the flag, for a default the parser computes later
+    (`--max` is WAIT_MAX_TIMES x the timeout): absent is exactly that default."""
+    out: dict[str, str] = {}
+    for node in parser_nodes(raw):
+        for action in node._actions:  # noqa: SLF001
+            if action.type is not seconds and not (action.type is float and action.metavar == "S"):
+                continue
+            for option in action.option_strings:
+                if not option.startswith("--"):
+                    continue
+                if action.default is None:
+                    out[option] = ""
+                elif action.default:
+                    out[option] = f"{float(action.default):g}"
+                else:
+                    out[option] = BARE_WAIT_ZERO.get((raw[0], option), BARE_WAIT_ZERO_SECONDS)
+    return out
+
+
+def value_hungry_flags(raw: list[str]) -> frozenset[str]:
+    """The options of the command in RAW that take exactly one value, so the word after one of them is that
+    value even when it is spelled like a flag: `post comment --body --wait` waits for nothing, it posts
+    "--wait". A flag whose value is optional (`--notify`, nargs="?") is not one of these: argparse gives it
+    its const and reads the next word on its own, so `land o/r#N --notify --wait` is a bare wait."""
+    return frozenset(option for node in parser_nodes(raw) for action in node._actions  # noqa: SLF001
+                     for option in action.option_strings
+                     if option.startswith("--") and action.nargs is None)
 
 
 def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A wait or ceiling flag typed with no number takes its own default: (argv, refusal lines, never any).
 
-    Only the flags in BARE_WAIT_VALUE, only when the next word is not a count of seconds this flag could
-    take (`seconds` decides, so 20m and 1800 are still values), and only in canonical spelling, which
-    `flag_spelling_synonym` has already made of every flag it recognises. Said on stderr with the whole
-    call, so the next one is typed with the number."""
+    Only the flags `bare_wait_defaults` reads off this command's parser, only when the next word is not a
+    count of seconds this flag could take (`seconds` decides, so 20m and 1800 are still values), and only
+    in canonical spelling, which `flag_spelling_synonym` has already made of every flag it recognises. A
+    flag standing in another flag's value slot (`post comment --body --wait`) is that flag's value and is
+    left alone. Said on stderr with the whole call, so the next one is typed with the number."""
     if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
         return raw, []
+    values = bare_wait_defaults(raw)
+    hungry = value_hungry_flags(raw)
     fixed: list[str] = []
     said: list[str] = []
     i = 0
@@ -32244,10 +32292,10 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         if word == "--":
             fixed.extend(raw[i:])
             break
-        value = BARE_WAIT_VALUE.get((raw[0], word))
+        value = values.get(word)
         nxt = raw[i + 1] if i + 1 < len(raw) else None
         has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
-        if value is None or has_value:
+        if value is None or has_value or (fixed and fixed[-1] in hungry):
             fixed.append(word)
             i += 1
             continue
