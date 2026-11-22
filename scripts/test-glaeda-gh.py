@@ -22185,12 +22185,12 @@ LA, LB, LC = "a" * 40, "b" * 40, "c" * 40
 
 
 def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: str = "",
-            draft: bool = False) -> dict:
+            draft: bool = False, mergeable: str = "MERGEABLE") -> dict:
     """A PR cache entry's data, as parse_pr stores it. PARENT is the head commit's first parent as the read gave it
     (pr_head_parent); "" is a read that does not say, which is what a REST read and a lagging commit list give."""
     if checks is None:
         checks = [("ci", "COMPLETED", "SUCCESS")]
-    return {"state": state, "headRefOid": head, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+    return {"state": state, "headRefOid": head, "mergeable": mergeable, "mergeStateStatus": "CLEAN",
             "isDraft": draft,
             **({"headParent": parent} if parent else {}),
             "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
@@ -24518,6 +24518,53 @@ class LandTest(Base):
         self.assertGreaterEqual(len(judged), 2)
         self.assertEqual(day.get("explain_unmoved"), len(judged) - 1)
         self.assertEqual([h.get("unmoved") for h in judged], [None] + [True] * (len(judged) - 1))
+        # Every one of them ran because the retry's own backoff ran out, which is the queue working as designed,
+        # never work it could have skipped: the count says so by kind, so the total is not read as waste.
+        self.assertEqual([h.get("why") for h in judged], ["queued"] + ["woke"] * (len(judged) - 1))
+        self.assertEqual([h.get("due") for h in judged], [None] + [True] * (len(judged) - 1))
+        self.assertEqual(day.get("explain_unmoved_woke"), len(judged) - 1)
+        split = gg.land_unmoved_split(day)
+        self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]),
+                         (len(judged) - 1, 0, {}))
+
+    def test_a_mergeability_flip_alone_judges_again_and_is_counted_as_the_skippable_kind(self):
+        # The other half of the same count, and the only half worth removing: mergeable UNKNOWN <-> MERGEABLE turns on
+        # every push to the base, moves land_fingerprint (which the wake reads) and not land_check_fingerprint (which
+        # the verdict's keep reads), so once LAND_VERDICT_KEEP has run out it judges again at the same head on the
+        # same checks for an answer that cannot differ. Counted apart from the backoff's judgments (explain_unmoved_
+        # fp_moved) so "judgments that moved nothing" is not read as one waste: hq#15832 Fix 120 measured 171 of them
+        # and nearly held every retry for 600 s on the strength of the total, which would have delayed every recovery.
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                      "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(wait())
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        first = len(self.w.explains())
+        # inside the keep, a flip is answered from the verdict: no judgment at all
+        self.pr(LA, mergeable="UNKNOWN")
+        self.tick(gg.LAND_VERDICT_KEEP / 2)
+        self.assertEqual(len(self.w.explains()), first, "the kept verdict answered the flip")
+        # past the keep, the same flip judges again (left flipped: flipping back would restore the fingerprint)
+        self.w.answers.append(wait())
+        e = self.tick(gg.LAND_VERDICT_KEEP)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        self.assertEqual(len(self.w.explains()), first + 1)
+        self.assertEqual((judged[-1].get("why"), judged[-1].get("unmoved"), judged[-1].get("due")),
+                         ("fp_moved", True, None))
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        split = gg.land_unmoved_split(day)
+        self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]), (0, 1, {"fp_moved": 1}))
+
+    def test_land_status_never_prints_the_unmoved_total_without_its_split(self):
+        # A count whose name reads as waste has to say which half is skippable, in the line that prints it.
+        day = {"explain": 10, "explain_unmoved": 4, "explain_unmoved_woke": 3, "explain_unmoved_fp_moved": 1}
+        split = gg.land_unmoved_split(day)
+        self.assertEqual((split["judged"], split["unmoved"], split["due"], split["redundant"]), (10, 4, 3, 1))
+        self.assertTrue(set(gg.LAND_JUDGE_DUE) <= set(gg.LAND_JUDGE_WHY))
+        self.assertEqual(gg.land_unmoved_split({}), {"judged": 0, "unmoved": 0, "due": 0, "redundant": 0,
+                                                     "byWhy": {}, "redundantByWhy": {}})
 
     def test_checks_that_never_start_stop_at_the_long_bound_naming_them(self):
         for code in ("checks_running", "checks_queued_no_runner"):

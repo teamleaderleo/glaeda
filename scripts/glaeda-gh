@@ -11467,6 +11467,14 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # Past STRAGGLER_AFTER a check queued with no runner is a straggler to `wait`; four hours of nothing moving at all is
 # a check that will never start.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
+# What made a judgment run (judge's WHY, kept on the entry and counted with explain_unmoved_<why>): a bound of the
+# queue's own ran out (LAND_JUDGE_DUE) or some evidence changed. An "unmoved" judgment -- same head, same check
+# fingerprint -- is the queue working as designed when a bound ran out, and redundant only when it was a change the
+# verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
+# delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
+LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
+                            "run_done", "comment_seen", "reran", "fp_moved", ""})
+LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
 # (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
@@ -14125,7 +14133,7 @@ class LandQueue:
             since = e.setdefault("noDataSince", self.now)
             self.nudge(e["key"])
             # land_judge reads the head; a full pin (land_full_pin) is judged at once on the caller's own read
-            if (self.now - since >= LAND_NO_DATA_AFTER or land_full_pin(e)) and self.judge(e, "", fp):
+            if (self.now - since >= LAND_NO_DATA_AFTER or land_full_pin(e)) and self.judge(e, "", fp, why="no_data"):
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
@@ -14137,7 +14145,7 @@ class LandQueue:
             if running:
                 self.wait_running(e, head, fp)
             else:
-                self.judge(e, head, fp)
+                self.judge(e, head, fp, why="queued")
             return
         if kind == "head_change":
             # After a push-making step: never judge (or pin) a head read before it.
@@ -14146,9 +14154,9 @@ class LandQueue:
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
                     if self.pin_follow(e, head, data):
                         return  # the new head's first parent is not read yet: not judged on it
-                self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
+                self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="head_moved")
             elif woke:
-                if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
+                if self.judge(e, "", fp, why="head_timeout"):  # land_judge reads the head itself: the cache never showed the new one
                     self.history(e, "head_timeout", before=w.get("before"))
             elif float((c or {}).get("fetchedAt") or 0) < float(w.get("since") or 0) or self.now - float(
                     w.get("nudgedAt") or 0) >= NUDGE_MIN:
@@ -14156,28 +14164,30 @@ class LandQueue:
                 self.nudge(e["key"])
             return
         if kind == "repin":
-            self.judge(e, str(w.get("sha") or "") or head, fp)
+            self.judge(e, str(w.get("sha") or "") or head, fp, why="repin")
             return
         # Against the head the cache showed when it was last judged: land_judge's own head can differ from a stale cache.
         moved = bool(head and e.get("seenHead") and head != e.get("seenHead"))
         if kind == "run":
             rd = (self.cache_of(w.get("key", "")) or {}).get("data") or {}
-            if ((rd.get("status") == "completed" or moved) and not running) or woke:
-                self.judge(e, head, fp)
+            done = (rd.get("status") == "completed" or moved) and not running
+            if done or woke:
+                self.judge(e, head, fp, why=("head_moved" if moved else "run_done") if done else "woke")
             return
         if kind == "comment":
-            if ((self.comment_seen(w) or moved) and not running) or woke:
-                self.judge(e, head, fp)
+            seen = (self.comment_seen(w) or moved) and not running
+            if seen or woke:
+                self.judge(e, head, fp, why=("head_moved" if moved else "comment_seen") if seen else "woke")
             return
         if kind == "retry":
             if (moved and not running) or woke:
                 if not moved and self.feed_holds(e, head):
                     return  # the wait judged before this could-not-judge answer stands (LAND_FEED_QUIET_MAX)
-                self.judge(e, head, fp)
+                self.judge(e, head, fp, why="head_moved" if moved and not running else "woke")
             return
         if running:
             if woke:  # a check that never finishes (a status never posted, no runner): land_judge says what now
-                self.judge(e, head, fp)
+                self.judge(e, head, fp, why="checks_woke")
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             elif w.get("rerun"):
@@ -14200,7 +14210,7 @@ class LandQueue:
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
-            self.judge(e, head, fp, counts=woke)
+            self.judge(e, head, fp, counts=woke, why="woke" if woke else ("reran" if reran else "fp_moved"))
 
     def pin_follow(self, e: dict, head: str, data: dict) -> bool:
         """E's pin follows HEAD when HEAD is the merge commit this queue's own update-branch just made on top of the
@@ -14620,8 +14630,8 @@ class LandQueue:
         self.history(e, "head_unpinned", head=sha[:12])
         return ""
 
-    def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> bool:
-        """Judge E at SHA on a free worker; True when it was handed one. None free: it stays as it is and is considered
+    def judge(self, e: dict, sha: str, fp: str, counts: bool = True, why: str = "") -> bool:
+        """Judge E at SHA on a free worker; WHY names what made it run (LAND_JUDGE_WHY). True when it was handed one. None free: it stays as it is and is considered
         again next tick (the tick goes least recently judged first), so the pool never queues. Ahead of the workers at
         most LAND_SNAPSHOT_AHEAD per worker start a snapshot wait (each puts its PR's read first); past that, one whose
         snapshot is ready (or that needs none) still takes a free worker, and the rest wait without nudging a read."""
@@ -14640,9 +14650,9 @@ class LandQueue:
         if pin is None:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
-        if land_head_moved(str(e.get("pinSha") or ""), sha) and (why := self.follow_own_update(e, sha)):
+        if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)):
             self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for "
-                      f"({why})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+                      f"({own})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
@@ -14684,7 +14694,8 @@ class LandQueue:
         if since:
             held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
-                 judging={"sha": sha, "at": self.now, "counts": counts, "held": held})
+                 judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
+                          "why": why if why in LAND_JUDGE_WHY else "fp_moved"})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
@@ -14876,6 +14887,7 @@ class LandQueue:
             judging = e.pop("judging", None) or {}
             counts = judging.get("counts", True)
             held = float(judging.get("held") or 0.0)
+            why = str(judging.get("why") or "")  # what made this judgment run (LAND_JUDGE_WHY)
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
             counts = counts and not e.pop("stepQuotaParked", False)
@@ -14899,17 +14911,22 @@ class LandQueue:
             # judgment at the same head on the same check fingerprint could only reach the verdict above it
             # (explain_unmoved in `land status`): measured, never acted on. Counted here and nowhere else on purpose:
             # the verdict's own wait is still honoured to the second, so this changes no step, wake or merge.
+            # Counted again by what made it run (explain_unmoved_<why>), because the two kinds read alike and are not:
+            # a bound of the queue's own running out (LAND_JUDGE_DUE) is the design, and only a change the verdict does
+            # not depend on is redundant. Without the split, "45% unmoved" names a waste that is mostly backoff.
             checks = str(e.get("seenChecks") or "")
             prior = e.get("explain") or {}
             unmoved = bool(checks) and prior.get("head") == head and prior.get("checks") == checks
             if unmoved:
                 self.count("explain_unmoved")
+                self.count(f"explain_unmoved_{why or 'other'}")
             e["explain"] = {"at": self.now, "ok": bool(answer.get("ok")), "code": str(answer.get("code") or ""),
                             "reason": land_reason(answer.get("reason")), "next": land_trim(answer.get("next")),
                             "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict),
-                            "checks": checks}
+                            "checks": checks, "why": why}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
-                         head=head[:12], step=act.get("kind"), unmoved=unmoved or None)
+                         head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
+                         due=True if unmoved and why in LAND_JUDGE_DUE else None)
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
@@ -15920,6 +15937,22 @@ def land_counts() -> dict:
     return doc.get("days") if isinstance(doc, dict) and isinstance(doc.get("days"), dict) else {}
 
 
+LAND_UNMOVED_PREFIX = "explain_unmoved_"
+
+
+def land_unmoved_split(day: dict) -> dict:
+    """A day's judgments that moved nothing, split by what made each run: "due", a bound of the queue's own running
+    out (LAND_JUDGE_DUE: its backoff, its wake, a fresh row), and "redundant", a change the verdict does not depend
+    on. Only the second is work the queue could have skipped, so `land status` never prints the one total alone:
+    read together they name a waste that is mostly the backoff doing its job (hq#15832 Fix 120)."""
+    by = {k[len(LAND_UNMOVED_PREFIX):]: int(v) for k, v in day.items()
+          if k.startswith(LAND_UNMOVED_PREFIX) and isinstance(v, int) and not isinstance(v, bool)}
+    due = {k: v for k, v in by.items() if k in LAND_JUDGE_DUE}
+    red = {k: v for k, v in by.items() if k not in LAND_JUDGE_DUE}
+    return {"judged": int(day.get("explain") or 0), "unmoved": int(day.get("explain_unmoved") or 0),
+            "due": sum(due.values()), "redundant": sum(red.values()), "byWhy": by, "redundantByWhy": red}
+
+
 _land_seq = 0
 _land_written: dict[str, Path] = {}  # request id -> the requests/ file this process wrote for it (land_request_path)
 
@@ -16292,8 +16325,18 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         for k, v in (counts[day] or {}).items():
             week[k] = week.get(k, 0) + int(v)
     def fmt(d: dict) -> str:
-        return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda x: -x[1])) or "none"
+        return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda x: -x[1])
+                         if not k.startswith(LAND_UNMOVED_PREFIX)) or "none"
     print(f"steps taken today: {fmt(today)}; last 7 days: {fmt(week)}")
+    split = land_unmoved_split(today)
+    doc["unmovedToday"] = split
+    if split["unmoved"]:
+        share = f" of {split['judged']}" if split["judged"] else ""
+        why = ", ".join(f"{k} {v}" for k, v in sorted(split["redundantByWhy"].items(), key=lambda x: -x[1]))
+        print(f"judgments that moved nothing today: {split['unmoved']}{share}; "
+              f"{split['due']} a bound of the queue's own running out (its backoff, its wake: the design), "
+              f"{split['redundant']} on a change the verdict does not depend on"
+              + (f" ({why}): that share alone is skippable" if why else ": none skippable"))
     print(f"stopped by cause: {fmt(doc['stoppedByCause'])}")
     if target and not entries:
         return EXIT_FAIL
