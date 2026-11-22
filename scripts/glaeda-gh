@@ -11857,7 +11857,8 @@ def land_direct_read(key: str) -> str | None:
 # pr_owner.py x2 at one look) and was its top REST caller (500/h). land.json's "executor" names a program, as
 # upstream.json's "command" does (`["reach", "huge-blue", ".local/bin/glaeda-gh", "land", "serve"]`), that takes one
 # JSON request line on stdin and answers one JSON line: the far side is `glaeda-gh land serve` on the executor host.
-# With it, this host judges, steps, watches and runs land_judge for nothing:
+# With it (and, since LAND_EXECUTORS_KEY, only for the rows this host cannot judge on an App token, or with no land-judge
+# here at all), this host judges, steps, watches and runs land_judge for nothing:
 # - `land`, `land cancel` and `land status` go to the executor (the same answer they print here: a request is
 #   applied there, and the executor's queue notifies the requester, HOST/SESSION as named here, with acpmux send);
 # - a request the executor did not take (it was unreachable) stays in this host's requests/ (an outbox), and the
@@ -11878,11 +11879,45 @@ LAND_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 
 
 def land_executor(config: dict | None = None) -> list[str] | None:
-    """land.json's "executor" program (a list of words), or None: this host runs its own land queue."""
-    command = (land_config() if config is None else config).get(LAND_EXECUTOR_KEY)
-    if isinstance(command, list) and command and all(isinstance(a, str) and a for a in command):
-        return command
-    return None
+    """The first of land.json's fallbacks (land_fallbacks), or None: this host has none."""
+    fallbacks = land_fallbacks(config)
+    return fallbacks[0] if fallbacks else None
+
+
+# Local first, fallbacks after. 2026-11-22: one host's queue held 1,100+ open rows and judged ~128/h while every other
+# host forwarded to it, though since 2026-11-17 App role tokens reach every land host (pushed every 900 s) and a
+# judgment costs ~4 s CPU and 128 MB RSS. Leo, 12:15Z: stop centralizing on one host. So "executor" is no longer a
+# whole-host mode: a host judges a land in its own queue whenever it reads that owner off the login (latch_free: an
+# App source here), and hands on only (a) rows it cannot judge on an App token (no App source for the owner, or no
+# land-judge here) and (b) rows its own gates (workers, load line) hold late (overflow_tick, LAND_OVERFLOW_KEY's
+# comment; land.json "overflow" if set, else these fallbacks). land.json "executors" names the fallbacks, each a
+# program as "executor" is, in the order they are tried; the old "executor" alone is a one-element list. A row of (a)
+# goes to the first fallback whose `land serve` "room" answer has room, the last one without asking (as an executor
+# was), through the outbox (forward_tick, forward_send): a fallback that is down is skipped for the next, and a row
+# none took stays here and is sent again after a backoff, so nothing is lost. A row handed on before goes back to the
+# same fallback (forward_route), a --after row to where its first --after went, and a cancel of a row this host does
+# not hold to every fallback. A host with fallbacks serves no `land serve` (cmd_land_serve), so two hosts never pass a
+# row back and forth.
+LAND_EXECUTORS_KEY = "executors"
+
+
+def land_program(command: Any) -> bool:
+    return isinstance(command, list) and bool(command) and all(isinstance(a, str) and a for a in command)
+
+
+def land_fallbacks(config: dict | None = None) -> list[list[str]]:
+    """land.json's fallbacks in the order tried: "executors" (programs), else "executor" as one; [] for none."""
+    cfg = land_config() if config is None else config
+    listed = cfg.get(LAND_EXECUTORS_KEY)
+    if isinstance(listed, list):
+        out: list[list[str]] = []
+        for command in listed:
+            if land_program(command) and command not in out:
+                out.append(command)
+        if out:
+            return out
+    command = cfg.get(LAND_EXECUTOR_KEY)
+    return [command] if land_program(command) else []
 
 
 # Land overflow: more than one host takes a busy host's lands. huge-blue, 2026-11-22 07:59Z: 888 open, 624 due late (the
@@ -11951,6 +11986,30 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
     if not answer.get("ok") and answer.get("code") in ("not_executor", "bad_request"):
         raise WatchError(f"land executor: {answer.get('code')}: {land_trim(answer.get('reason'), 200)}")
     return answer
+
+
+def land_cli_route(key: str, repo: str, fallbacks: list[list[str]], queue: Any = None) -> list[str] | None:
+    """For `land` on a host with FALLBACKS: None when this host's queue takes KEY (an entry open here, or a land-judge
+    here and an App source for REPO's owner, LandQueue.judges_here), else the fallback to send it to: the one it was
+    handed to before, else the first whose room answer has room (any but the last), else the last."""
+    e = read_json(LandQueue.entries_dir() / file_name(key))
+    e = e if isinstance(e, dict) else {}
+    if e.get("state") and e["state"] not in LAND_DONE:
+        return None
+    names = [land_forward_name(c) for c in fallbacks]
+    if e.get("state") == LAND_FORWARDED and e.get("forwardedTo") in names:
+        return fallbacks[names.index(e["forwardedTo"])]
+    q = queue if queue is not None else LandQueue(config=land_config())
+    q.now = time.time()
+    if q.judges_here({"repo": repo}):
+        return None
+    for command in fallbacks[:-1]:
+        with contextlib.suppress(WatchError):
+            room = land_forward(command, {"op": "room"})
+            if room.get("ok") and isinstance(room.get("room"), int) and not isinstance(room.get("room"), bool) \
+                    and room["room"] > 0:
+                return command
+    return fallbacks[-1]
 
 
 def land_forward_name(command: list[str]) -> str:
@@ -14005,8 +14064,14 @@ class LandQueue:
         d = self.requests_dir()
         if not d.is_dir():
             return
+        fallbacks = bool(land_fallbacks(self.config()))
         for p in sorted(d.glob("*.json")):
             try:
+                if fallbacks:
+                    req = read_json(p)
+                    with self.lock:
+                        if isinstance(req, dict) and not self.request_here(req):
+                            continue  # forward_batch sends it on
                 self.ingest_one(p)
             except Exception as error:  # noqa: BLE001  one bad request must not stall the queue
                 log({"event": "land-error", "request": p.name, "error": describe(error), "site": error_site(error)})
@@ -14108,10 +14173,12 @@ class LandQueue:
         recovery = self.now >= self.recovery_at
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
-        executor = land_executor(self.config())
-        if executor is not None:
-            self.forward_tick(executor)
-            return
+        fallbacks = land_fallbacks(self.config())
+        if fallbacks:
+            # local first (LAND_EXECUTORS_KEY's comment): only the rows this host cannot judge on an App token go on
+            self.forward_tick(fallbacks)
+            if self.land_judge()[0] is None:
+                return  # nothing judges here: every row was handed on, as an executor's forwarder did
         self.ingest()
         self.changed_entries.update(key for key in dirty or () if key in self.entries)
         self.reap()
@@ -14147,7 +14214,9 @@ class LandQueue:
         # TICK (2s) -- 72,900 cache file reads per 600s window at 0.30 ms each, and the daemon's own row read "ticks
         # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
         live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs
-                and k not in self.overflowing]
+                and k not in self.overflowing and k not in self.sending]
+        if fallbacks:
+            live = [k for k in live if self.judges_here(self.entries[k])]  # the rest wait for forward_tick
         for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
@@ -14260,11 +14329,46 @@ class LandQueue:
             self.count("refill")
         return tried
 
-    # -- forwarding to the land executor (land_executor): this host judges nothing
+    # -- handing rows on to the fallbacks (LAND_EXECUTORS_KEY): the rows this host does not judge
 
-    def forward_tick(self, command: list[str]) -> None:
-        """One pass on a host that forwards its lands: apply here the requests for entries still open here, hand those
-        entries to the executor, and send the rest of requests/ there, in order, off the tick."""
+    def judges_here(self, row: dict) -> bool:
+        """Under the lock, on a host with fallbacks (LAND_EXECUTORS_KEY's comment): whether ROW, an entry or a request,
+        is judged in this queue: always with no fallbacks, else only with a land-judge here and an App source for its
+        owner (latch_free, asked once per owner per LAND_LATCH_FREE_EVERY)."""
+        if not land_fallbacks(self.config()):
+            return True
+        if self.land_judge()[0] is None:
+            return False
+        repo = row.get("repo")
+        if not isinstance(repo, str) or not repo:
+            try:
+                repo = land_key(str(row.get("target") or ""))[1]
+            except WatchError:
+                return True  # not a land: ingest drops it
+        return self.latch_free({"repo": repo})
+
+    def request_here(self, req: dict) -> bool:
+        """Under the lock, on a host with fallbacks: whether request REQ is applied in this queue (else forward_batch
+        sends it on). One for an entry open here is (forward_batch hands the entry on if it is not judged here), and a
+        cancel of one stopped here; one for a PR handed on before follows it (forward_route); a cancel of one this
+        queue does not hold goes to every fallback; a land is applied here when this host judges it (judges_here)."""
+        try:
+            key = land_key(str(req.get("target") or ""))[0]
+        except WatchError:
+            return True  # not a land: ingest drops it
+        e = self.entries.get(key)
+        if e and (e["state"] not in LAND_DONE or (e["state"] == "stopped" and req.get("op") == LAND_WITHDRAW)):
+            return True
+        if e and e["state"] == LAND_FORWARDED and e.get("forwardedTo"):
+            return False
+        if req.get("op") == LAND_WITHDRAW:
+            return False
+        return self.judges_here(req)
+
+    def forward_tick(self, fallbacks: list[list[str]]) -> None:
+        """One pass on a host with fallbacks, for the rows it does not judge (judges_here): apply here the requests for
+        such entries still open here, hand those entries to the fallbacks, and send them the rest of such requests/,
+        in order, off the tick (forward_send). The rows it judges are left to ingest and the queue."""
         self.reap()
         d = self.requests_dir()
         with self.lock:
@@ -14300,7 +14404,7 @@ class LandQueue:
         if not batch:
             return
         self.sending = {key for key, _ in handed}
-        args = (command, batch, files, handed)
+        args = (fallbacks, batch, files, handed)
         if self.inline:
             self.forward_send(*args)
         else:
@@ -14310,18 +14414,20 @@ class LandQueue:
 
     def forward_batch(self) -> tuple[list[dict], list[tuple[str, Path]], list[tuple[str, int]]]:
         """(the requests to send, (id, file) of each from requests/, (key, gen) of each entry handed off): the entries
-        open here first (none whose step still runs), then requests/ in order, at most LAND_FORWARD_BATCH."""
+        open here that this host does not judge first (none whose step still runs), then the requests/ not applied
+        here (request_here) in order, at most LAND_FORWARD_BATCH."""
         batch: list[dict] = []
         handed: list[tuple[str, int]] = []
         files: list[tuple[str, Path]] = []
         with self.lock:
             for key, e in sorted(self.entries.items(), key=lambda kv: float(kv[1].get("created") or 0)):
-                if e["state"] in LAND_DONE or key in self.jobs or len(batch) >= LAND_FORWARD_BATCH:
+                if e["state"] in LAND_DONE or key in self.jobs or len(batch) >= LAND_FORWARD_BATCH \
+                        or self.judges_here(e):
                     continue
                 batch.append(self.handoff_request(key, e))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
-            blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
+            blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE and not self.judges_here(e)}
             for path in sorted(d.glob("*.json")) if d.is_dir() else []:
                 if len(batch) >= LAND_FORWARD_BATCH:
                     break
@@ -14330,14 +14436,32 @@ class LandQueue:
                     continue
                 if req.get("key") in blocked:
                     break  # this key's entry is handed off first: what follows waits, so the order holds
+                if self.request_here(req):
+                    continue  # ingest applies it here
                 rid = str(req.get("id") or "")
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy", "lane", "laneHost", "override") if k in req}
+                                                      "queuedBy", "lane", "laneHost", "override", "sha") if k in req}
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
+
+    def forward_route(self, req: dict, names: list[str]) -> str | None:
+        """Under the lock: which fallback (of NAMES) REQ must go to: the one its PR was handed to before (a re-request
+        or a cancel of a row there), else the one its first --after was (a chain stays on one host), else "*" (every
+        fallback) for a cancel, else None: the first with room."""
+        def held(target: Any) -> str | None:
+            try:
+                e = self.entries.get(land_key(str(target or ""))[0]) or {}
+            except WatchError:
+                return None
+            to = e.get("forwardedTo") if e.get("state") == LAND_FORWARDED else None
+            return to if isinstance(to, str) and to in names else None
+        to = held(req.get("target")) or next((h for h in map(held, req.get("after") or []) if h), None)
+        if to:
+            return to
+        return "*" if req.get("op") == LAND_WITHDRAW else None
 
     @staticmethod
     def handoff_request(key: str, e: dict) -> dict:
@@ -14373,8 +14497,9 @@ class LandQueue:
 
     def overflow_tick(self, live: list[str]) -> None:
         """At most once per LAND_OVERFLOW_EVERY, off the tick: the rows overflow_due names go to the peers in
-        land.json "overflow" that have room (overflow_send); while they are in flight no worker here takes them."""
-        peers = land_overflow(self.config())
+        land.json "overflow" (else its fallbacks, LAND_EXECUTORS_KEY) that have room (overflow_send); while they are in
+        flight no worker here takes them."""
+        peers = land_overflow(self.config()) or land_fallbacks(self.config())
         if not peers or self.now < self.overflow_after:
             return
         if self.overflow_thread is not None and self.overflow_thread.is_alive():
@@ -14436,39 +14561,93 @@ class LandQueue:
             with self.lock:
                 self.overflowing = set()
 
-    def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
+    def forward_send(self, fallbacks: list[list[str]], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
-        name = land_forward_name(command)
-        try:
-            answer = self.forward(command, {"op": "batch", "requests": batch, "from": policy_host()},
-                                  LAND_FORWARD_DEADLINE)
-            if not answer.get("ok"):
-                raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
-            accepted = {str(a) for a in answer.get("accepted") or []}
-            refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
-                       if isinstance(r, dict) and r.get("id")}
-        except Exception as error:  # noqa: BLE001  an unreachable executor is retried, never fatal
-            why = str(error) if isinstance(error, WatchError) else describe(error)
+        """BATCH to the fallbacks in order (LAND_EXECUTORS_KEY's comment): each but the last takes what its "room"
+        answer has room for, the last what is left; one that is down or refuses the batch is skipped for the next. What
+        none took stays here (requests/, or the entry open here) and is sent again after a backoff."""
+        names = [land_forward_name(c) for c in fallbacks]
+        path_of = dict(files)
+        handed_of = {req["id"]: kg for kg, req in zip(handed, batch)}
+        with self.lock:
+            route = {req["id"]: self.forward_route(req, names) for req in batch}
+        pending, errors, sent, took = list(batch), [], 0, ""
+        everywhere = {rid for rid, to in route.items() if to == "*"}  # sent to each fallback (a cancel)
+        missed: set[str] = set()  # of those, the ones a fallback that was down did not get: sent again, to all
+        for i, (command, name) in enumerate(zip(fallbacks, names)):
+            mine = [r for r in pending if route[r["id"]] in (None, name, "*")]
+            if not mine:
+                continue
+            try:
+                if i < len(fallbacks) - 1 and any(route[r["id"]] is None for r in mine):
+                    answer = self.forward(command, {"op": "room"}, LAND_FORWARD_DEADLINE)
+                    room = answer.get("room") if answer.get("ok") else 0
+                    room = room if isinstance(room, int) and not isinstance(room, bool) else 0
+                    mine = [r for r in mine if route[r["id"]] is not None] + \
+                        [r for r in mine if route[r["id"]] is None][:max(0, room)]
+                    if not mine:
+                        log({"event": "land-forward-full", "executor": name, "pending": len(pending)})
+                        continue
+                answer = self.forward(command, {"op": "batch", "requests": mine, "from": policy_host()},
+                                      LAND_FORWARD_DEADLINE)
+                if not answer.get("ok"):
+                    raise WatchError(f"land executor {name}: "
+                                     f"{land_trim(answer.get('reason') or answer.get('code'), 200)}")
+                accepted = {str(a) for a in answer.get("accepted") or []}
+                refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
+                           if isinstance(r, dict) and r.get("id")}
+            except Exception as error:  # noqa: BLE001  an unreachable fallback: the next is tried, never fatal
+                why = str(error) if isinstance(error, WatchError) else describe(error)
+                errors.append((name, why))
+                missed |= {r["id"] for r in mine} & everywhere
+                log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(mine)})
+                continue
+            done = (accepted | set(refused)) - everywhere  # a cancel goes on to the next fallback too
+            pending = [r for r in pending if r["id"] not in done]
+            sent += len(accepted)
+            took = took or (name if accepted else "")
             with self.lock:
-                self.sending = set()
+                self.forward_done(name, [r for r in mine if r["id"] not in everywhere], accepted, refused, path_of,
+                                  handed_of)
+        with self.lock:
+            for rid in everywhere - missed:  # every fallback got it
+                path = path_of.get(rid)
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            pending = [r for r in pending if r["id"] not in everywhere or r["id"] in missed]
+            self.sending = set()
+            if pending:
+                errors = errors or [(names[-1], "no fallback took them")]
+                name, why = errors[-1] if len(errors) == 1 else (", ".join(n for n, _ in errors),
+                                                                   "; ".join(f"{n}: {w}" for n, w in errors))
                 self.forward_fails += 1
                 wait = min(LAND_FORWARD_RETRY_MAX, LAND_FORWARD_RETRY * 2 ** (self.forward_fails - 1))
                 self.forward_after = self.now + wait
                 write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "failing", "error": why,
-                                                            "at": self.now, "pending": len(batch),
-                                                            "retryAt": self.forward_after})
-            log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
-            if self.forward_fails == 1:
-                with contextlib.suppress(Exception):
-                    self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(batch)} request(s) "
-                                f"to its executor {name}: {why}; they stay queued here and are sent again",
-                                {"executor": name, "error": why})
-            return
-        with self.lock:
-            self.sending = set()
-            self.forward_fails = 0
-            self.forward_after = float("-inf")
-            for rid, path in files:
+                                                            "at": self.now, "pending": len(pending),
+                                                            "sent": sent, "retryAt": self.forward_after})
+                if self.forward_fails == 1:
+                    with contextlib.suppress(Exception):
+                        self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(pending)} "
+                                    f"request(s) to its fallback {name}: {why}; they stay queued here and are sent "
+                                    "again", {"executor": name, "error": why})
+            else:
+                self.forward_fails = 0
+                self.forward_after = float("-inf")
+                write_json(land_dir() / LAND_FORWARD_FILE, {"executor": took or names[-1], "state": "ok",
+                                                            "at": self.now, "sent": sent})
+        log({"event": "land-forwarded", "executor": took or names[-1], "sent": sent, "handedOff": len(handed),
+             "pending": len(pending)})
+
+    def forward_done(self, name: str, sent: list[dict], accepted: set[str], refused: dict[str, str],
+                     path_of: dict[str, Path], handed_of: dict[str, tuple[str, int]]) -> None:
+        """Under the lock: what fallback NAME answered for SENT. An accepted request leaves requests/, an accepted
+        handoff leaves its entry "forwarded" there; a refused one is kept (requests/NAME.refused) or stops its entry,
+        and said."""
+        for req in sent:
+            rid = req["id"]
+            path = path_of.get(rid)
+            if path is not None:
                 if rid in accepted:
                     path.unlink(missing_ok=True)
                 elif rid in refused:
@@ -14480,20 +14659,19 @@ class LandQueue:
                     with contextlib.suppress(Exception):
                         self.notice("land-forward-refused", "warn", f"glaeda land: {why}; kept in "
                                     f"{path.with_suffix('.refused')}", {"executor": name, "request": rid})
-            for (key, gen), req in zip(handed, batch):
-                e = self.entries.get(key)
-                if not e or e["state"] in LAND_DONE or int(e.get("gen") or 0) != gen:
-                    continue
-                if req["id"] in accepted:
-                    e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
-                    self.history(e, "handed_off", to=name, request=req["id"])
-                    self.save(e)
-                elif req["id"] in refused:
-                    self.stop(e, "forward_refused", f"the land executor {name} refused this PR's handoff: "
-                              f"{refused[req['id']]}", f"glaeda-gh land {key_name(key)} again with a valid --notify")
-            write_json(land_dir() / LAND_FORWARD_FILE, {"executor": name, "state": "ok", "at": self.now,
-                                                        "sent": len(accepted)})
-        log({"event": "land-forwarded", "executor": name, "sent": len(accepted), "handedOff": len(handed)})
+            if rid not in handed_of:
+                continue
+            key, gen = handed_of[rid]
+            e = self.entries.get(key)
+            if not e or e["state"] in LAND_DONE or int(e.get("gen") or 0) != gen:
+                continue
+            if rid in accepted:
+                e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                self.history(e, "handed_off", to=name, request=rid)
+                self.save(e)
+            elif rid in refused:
+                self.stop(e, "forward_refused", f"the land executor {name} refused this PR's handoff: "
+                          f"{refused[rid]}", f"glaeda-gh land {key_name(key)} again with a valid --notify")
 
     def latch_held(self) -> tuple[str, float] | None:
         """The login's latch (land_latch) before a judge pass; logged once when it starts holding and once when it
@@ -18291,17 +18469,29 @@ def land_holders_line(entries: list[dict], now: float) -> str:
 
 def cmd_land_status(target: str | None, as_json: bool) -> int:
     doc = land_status_doc(target)
-    executor = land_executor()
+    fallbacks = land_fallbacks()
+    executor = fallbacks[0] if fallbacks else None
+    judges = executor is not None and land_judge(land_config())[0] is not None
     if executor is not None:
-        # This host forwards its lands: the executor's queue, with what is still open or waiting here.
-        name = land_forward_name(executor)
+        # This host hands lands on (LAND_EXECUTORS_KEY): what is open here, with the queues of the fallbacks it handed
+        # rows to (a host with no land-judge, which hands every row on: its first fallback's queue as well).
+        names = [land_forward_name(c) for c in fallbacks]
         mine = [e for e in doc["entries"] if e.get("state") != LAND_FORWARDED]
-        try:
-            remote = land_forward(executor, {"op": "status", "target": target})
-            remote_entries = [e for e in remote.get("entries") or [] if isinstance(e, dict)]
-            doc = {**remote, "entries": mine + remote_entries, "executor": name}
-        except WatchError as error:
-            doc = {**doc, "entries": mine, "executor": name, "executorError": str(error)}
+        asked = {e.get("forwardedTo") for e in doc["entries"] if e.get("state") == LAND_FORWARDED}
+        ask = [c for c, n in zip(fallbacks, names) if n in asked or (not judges and c is executor)]
+        remote_entries, errors, first = [], [], None
+        for command in ask:
+            try:
+                remote = land_forward(command, {"op": "status", "target": target})
+            except WatchError as error:
+                errors.append(str(error))
+                continue
+            first = first or remote
+            remote_entries += [e for e in remote.get("entries") or [] if isinstance(e, dict)]
+        base = doc if judges or first is None else first
+        doc = {**base, "entries": mine + remote_entries, "executor": ", ".join(names), "judgesHere": judges}
+        if errors:
+            doc["executorError"] = "; ".join(errors)
         d = LandQueue.requests_dir()
         doc["pendingForward"] = len(list(d.glob("*.json"))) if d.is_dir() else 0
         doc["forward"] = read_json(land_dir() / LAND_FORWARD_FILE)
@@ -18312,7 +18502,8 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         return EXIT_OK if entries or not target else EXIT_FAIL
     now = time.time()
     if executor is not None:
-        print(f"glaeda land: this host forwards its lands to {doc['executor']}"
+        print((f"glaeda land: this host judges the lands it reads on an App token and hands the rest to "
+               f"{doc['executor']}" if judges else f"glaeda land: this host forwards its lands to {doc['executor']}")
               + (f"; {doc['pendingForward']} request(s) wait here to be sent" if doc["pendingForward"] else "")
               + (f"; the executor did not answer: {doc['executorError']}" if doc.get("executorError") else ""))
     stale = doc.get("stale")
@@ -18696,8 +18887,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         # Same place, same reason as the draft answer: a pin the head has already passed can only stop later.
         return land_request_refused(key, "land_pin_behind", *behind, as_json=as_json)
     requester, source = land_requester_from(notify)
-    executor = land_executor()
-    if executor is not None:
+    fallbacks = land_fallbacks()
+    executor = land_cli_route(key, repo, fallbacks) if fallbacks else None
+    if executor is not None:  # local first: only a land this host does not judge goes on (LAND_EXECUTORS_KEY)
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
                                   ceiling)
     mh, tried = land_judge(land_config())
@@ -18760,22 +18952,33 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
 
 def cmd_land_cancel(target: str, as_json: bool) -> int:
     key = land_key(target)[0]
-    executor = land_executor()
-    if executor is not None and not land_outbox_busy(key):
+    fallbacks = land_fallbacks()
+    here = read_json(LandQueue.entries_dir() / file_name(key))
+    here = here if isinstance(here, dict) else {}
+    if fallbacks and here.get("state") == LAND_FORWARDED:
+        # handed on from here: to that fallback alone; else (no entry here) to every fallback (forward_route)
+        names = [land_forward_name(c) for c in fallbacks]
+        fallbacks = [fallbacks[names.index(here["forwardedTo"])]] if here.get("forwardedTo") in names else fallbacks
+    if fallbacks and (not here.get("state") or here["state"] == LAND_FORWARDED) and not land_outbox_busy(key):
         rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
         staged = land_request_path(land_request(LAND_WITHDRAW, target, [], land_requester(None), rid=rid,
                                                 queued_by=land_queued_by()))  # before the forward (cmd_land_forwarded)
-        try:
-            got = land_forward(executor, {"op": LAND_WITHDRAW, "target": target, "after": [],
-                                          "requester": land_requester(None), "queuedBy": land_queued_by(), "id": rid})
-        except WatchError as error:
-            say_waiting(f"glaeda land: {error}; the cancel waits here and is forwarded when it answers")
-        else:
-            if got.get("ok"):
-                staged.unlink(missing_ok=True)
+        took = 0
+        for executor in fallbacks:
+            try:
+                got = land_forward(executor, {"op": LAND_WITHDRAW, "target": target, "after": [],
+                                              "requester": land_requester(None), "queuedBy": land_queued_by(),
+                                              "id": rid})
+            except WatchError as error:
+                say_waiting(f"glaeda land: {error}; the cancel waits here and is forwarded when it answers")
             else:
-                say_waiting(f"glaeda land: {land_trim(got.get('reason') or got.get('code'), 200)}; the cancel waits "
-                            "here and is forwarded when it answers")
+                if got.get("ok"):
+                    took += 1
+                else:
+                    say_waiting(f"glaeda land: {land_trim(got.get('reason') or got.get('code'), 200)}; the cancel "
+                                "waits here and is forwarded when it answers")
+        if took == len(fallbacks):
+            staged.unlink(missing_ok=True)
     else:
         land_request(LAND_WITHDRAW, target, [], land_requester(None))
     if as_json:
@@ -18825,8 +19028,9 @@ def cmd_land_serve(text: str) -> int:
         return EXIT_FAIL
     executor = land_executor()
     if executor is not None:
-        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
+        # a host that hands its own rows on takes none, so two hosts never pass a row back and forth
+        print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} hands its own lands to "
+                          f"{land_forward_name(executor)} (land.json executors); it serves none"}))
         return EXIT_FAIL
     op = req["op"]
     if op == "room":
