@@ -17068,7 +17068,12 @@ class LandQueue:
         recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
         if sum(recent) < LAND_EARLY_HANDOFF_BAD:
             return False
-        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")).lower()
+        # A PR this host has no read of yet (consider's no_data) is handed off at its full pin: it is the head the
+        # caller's merge is pinned to, so the broker host judges exactly what was asked. Without it every no_data
+        # entry was judged here first, and on a host whose reads time out that is a 300 s explain_failed: 140 of 355
+        # lane-VM judgments, 2026-11-22 14:11-17:42Z, 10 GCP and Freestyle lane VMs, were no_data, the median 300.1 s.
+        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")
+                or str(e.get("pinSha") or "")).lower()
         if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
             return False
         why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
