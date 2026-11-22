@@ -30423,6 +30423,22 @@ class AppPoolTest(Base):
             self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
         self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
 
+    def test_the_login_pace_never_defers_a_batch_the_app_answers(self) -> None:
+        """2026-11-22, one host: the PR batches all went on the App, but the login's head and check-page queries filled
+        the minute's 40 points, and 1,242 PR reads sat deferred behind "42 of 40 points this minute"."""
+        self.daemon.gql_log = [(self.daemon.clock() - 5, "head", 1)] * 42  # the login's minute, full
+        self.assertFalse(self.daemon.gql_room())
+        app_keys = [f"pr:manaflow-ai/cmux#{i}" for i in range(1, 4)]
+        login_keys = ["pr:o/r#1"]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in app_keys + login_keys]
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        left = self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual(sent, [app_keys], "the App's batch went out; the login's waits for its pace")
+        self.assertEqual(left, [])
+        self.assertIn("pr:o/r#1", self.daemon.deferred)
+        self.assertEqual(self.daemon.deferred & set(app_keys), set())
+
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
         """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has
         its own limits, so the daemon's App reads go on while the login waits, and a login read is still held."""

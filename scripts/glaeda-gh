@@ -8811,10 +8811,14 @@ class Daemon:
         to_rest: list[dict] = []
         while queue:
             chunk = queue.pop(0)
-            if ((self.mode("graphql") == "stop" and not self.app_entries_eligible(kind, chunk, "graphql"))
-                    or self.gql_down()):
+            on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
+            if (self.mode("graphql") == "stop" and not on_app) or self.gql_down():
                 return to_rest + chunk + [e for c in queue for e in c]
-            if not self.gql_room(self.gql_expected(kind)):
+            # The pace is the login's (gql_minute_points counts no App point), so a chunk the App answers is never
+            # held by it. One host, 2026-11-22: every PR batch went on the App (12,500 an hour, under 5% spent) while
+            # the login's head and check-page queries filled the minute, and 1,242 PR reads sat deferred behind
+            # "42 of 40 points this minute": a waited PR's data was 13,401 s old.
+            if not on_app and not self.gql_room(self.gql_expected(kind)):
                 # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
                 self.defer(chunk + [e for c in queue for e in c],
