@@ -12770,6 +12770,19 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # unfinished. A new head or a requeue starts it again (an "ok" whose merge is refused for running checks does not).
 # Past STRAGGLER_AFTER a check queued with no runner is a straggler to `wait`; four hours of nothing moving at all is
 # a check that will never start.
+# That bound keys progress on what the wait waits for -- the checks the cache shows unfinished at the head, and how
+# many checks its read held (land_wait_shape) -- not on every check's conclusion (land_check_fingerprint). Queue host,
+# 2026-11-22: cmux#49430 took 51 waits in 9.8 h at one head on a "webview" refusal that named the PR's own reds, every
+# one of them logged idle 0, while no check at that head was unfinished at all. Its check fingerprint flipped between
+# two values in reads 60 s apart (0d357b46 -> 7b1e99e0 -> 0d357b46) and its check page read 175 of 208 checks under
+# "API rate limit already exceeded"; cmux#48267's reads 500 s apart changed 50 of their 223 checks, every one a
+# completed check whose workflow was read as its run's name one time ("cmux-next · d1498b49d07a") and as its
+# workflow's the next ("cmux-next"). Each flip reset movedAt, so the 4 h bound could never fire: 5 rows were judged
+# 52 times in 24 h past the bound they should have stopped at (cmux#49430 23 of those, and still waiting), 4 of
+# them with no stop at all, each paying one land_judge every LAND_VERDICT_KEEP for as long as the row lived, and no
+# requester was ever told its reds. A completed check read differently and a check page a read could not finish are
+# not a wait making progress; a check finishing, starting, or appearing where the reads had held none (the count
+# rising) still is.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # What made a judgment run (judge's WHY, kept on the entry and counted with explain_unmoved_<why>): a bound of the
 # queue's own ran out (LAND_JUDGE_DUE) or some evidence changed. An "unmoved" judgment -- same head, same check
@@ -13003,6 +13016,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# land_judge's "quota" answer for one CI job that spent the repo installation's API limit ("base_red_excuse.py job
+# rate-limited at HEAD ...: run R; job J; no attempt before HH:MMZ. Rerun run R ... the repo installation's API limit
+# refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
+# installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
+# never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
@@ -13886,6 +13906,21 @@ def land_check_fingerprint(cache: dict | None) -> str:
     """What a kept verdict was judged on (LAND_VERDICT_KEEP): the head, its state, each check run and status, and
     mergeability only as CONFLICTING or not: UNKNOWN <-> MERGEABLE turns on every push to the base."""
     return land_fingerprint(cache, conflict_only=True)
+
+
+def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
+    """What a wait on the checks at HEAD waits for, as its stuck bound keys progress (LAND_WAIT_STUCK's comment): a
+    fingerprint of the checks CACHE shows unfinished at HEAD, by name and status, and how many checks its read held.
+    ("", 0) when the cache is not at HEAD, which says nothing about the wait either way. Not the workflow name: a
+    check read over REST carries its run's name where a GraphQL read carries its workflow's (rest_contexts), so the
+    same check names two workflows depending on the route the read took."""
+    data = (cache or {}).get("data") or {}
+    if not head or str(data.get("headRefOid") or "").lower() != head:
+        return "", 0
+    checks = data.get("checks") or []
+    unfinished = sorted((str(c.get("name") or ""), str(c.get("status") or ""))
+                        for c in checks if str(c.get("status") or "").upper() not in ("COMPLETED", ""))
+    return hashlib.sha256(json.dumps([head, unfinished], sort_keys=True).encode()).hexdigest()[:16], len(checks)
 
 
 def land_fetch_mirror_ok(mirror: str) -> bool:
@@ -15089,7 +15124,7 @@ class LandQueue:
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
             return False  # a copy older than the pin may predate the push the pin names
         e.pop("pinWait", None)
-        self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+        self.stop(e, "head_moved", land_moved_clause(head, pin),
                   f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
         return True
 
@@ -15183,9 +15218,10 @@ class LandQueue:
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
-    def park_quota(self, e: dict, text: str) -> None:
+    def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
-        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken. HOST False parks
+        only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
         self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
@@ -15197,7 +15233,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None:
+        if said is not None and host:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -16271,7 +16307,7 @@ class LandQueue:
             e.pop("pinWait", None)
             if land_base_merge_parent(pin, head, c.get("data") or {}):
                 return False  # maybe only a base merge on the pin: judge's worker reads whether it is
-            self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+            self.stop(e, "head_moved", land_moved_clause(head, pin),
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
         w = e.get("pinWait")
@@ -16650,8 +16686,8 @@ class LandQueue:
         with self.lock:
             self.check(e)
             if why:
-                self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for "
-                          f"(no update_branch of this queue's made it, and {why})",
+                self.stop(e, "head_moved", land_moved_clause(head, pin)
+                          + f" (no update_branch of this queue's made it, and {why})",
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
                 return False
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
@@ -16742,8 +16778,8 @@ class LandQueue:
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
                 and not self.base_merge_due(e, sha):
-            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for "
-                      f"({own})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+            self.stop(e, "head_moved", land_moved_clause(sha, str(e.get("pinSha") or "")) + f" ({own})",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
@@ -17059,7 +17095,8 @@ class LandQueue:
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
-                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}",
+                                host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
@@ -17286,12 +17323,13 @@ class LandQueue:
         LAND_WAIT_STUCK, and E is stopped naming the checks still unfinished."""
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
-        fp = land_check_fingerprint(c) if str(data.get("headRefOid") or "").lower() == head else ""
+        fp, seen = land_wait_shape(c, head)
         w = e.get("waitRefused") or {}
         if w.get("head") != head:
-            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "count": 0}
-        elif fp and fp != w.get("fp"):
-            w.update(fp=fp, movedAt=self.now)
+            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "checks": seen, "count": 0}
+        elif fp and (fp != w.get("fp") or seen > int(w.get("checks") or 0)):
+            # the unfinished checks changed, or a check appeared the reads at this head had not held yet
+            w.update(fp=fp, checks=max(seen, int(w.get("checks") or 0)), movedAt=self.now)
         w["count"] = int(w.get("count") or 0) + 1
         w["code"] = code
         e["waitRefused"] = w
@@ -18081,8 +18119,8 @@ class LandQueue:
         pin = str(e.get("pinSha") or "")
         if land_head_moved(pin, live):
             name = key_name(e["key"])
-            self.stop(e, "head_moved", f"the head is {live[:12]} (the broker read it from GitHub), not the --sha "
-                      f"{pin[:12]} it was queued for; nothing was handed off",
+            self.stop(e, "head_moved", land_moved_clause(live, pin, " (the broker read it from GitHub)")
+                      + "; nothing was handed off",
                       f"glaeda-gh land {name} --match-head-commit {live}")
             return None
         self.history(e, "handoff_repinned", head=live[:12], was=head[:12])
@@ -18637,6 +18675,24 @@ def land_full_pin(e: dict) -> str:
 def land_head_moved(pin: str, head: str) -> bool:
     """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
     return bool(pin and head) and not head.lower().startswith(pin)
+
+
+# A sha is abbreviated to 12 hex everywhere in this script, which is a name. In the one message whose whole subject
+# is that two shas differ, a name is not enough: a pin written out by hand from an abbreviated head
+# (land_pin_extends_head_refusal's shape) shares its first 12 hex with the head, so the refusal read "the head is
+# f40f866c791c, not the --sha f40f866c791c it was queued for" -- two identical strings, naming a difference it does
+# not show, and leaving its reader nothing to compare. Measured on this host 2026-11-22 landing
+# teamleaderleo/glaeda#2558, whose pin was the head's own first 12 hex with a typed tail.
+def land_moved_clause(head: str, pin: str, note: str = "") -> str:
+    """"the head is X, not the --sha Y it was queued for", with both shas abbreviated to the first width at which they
+    differ: 12 hex as everywhere else when that already differs, more when it does not, never past the whole sha. The
+    callers all reach this only through land_head_moved, which is false when the head starts with the pin, so the two
+    do differ inside the shorter of them and the width is always found. NOTE rides the head, for a caller that read it
+    somewhere the others do not."""
+    width, limit = 12, min(len(head), len(pin))
+    while width < limit and head[:width].lower() == pin[:width].lower():
+        width += 1
+    return f"the head is {head[:width]}{note}, not the --sha {pin[:width]} it was queued for"
 
 
 def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
@@ -19273,6 +19329,29 @@ def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[
             f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
 
 
+def land_pin_local_head(repo: str, git: Callable[[list[str]], str | None] | None = None) -> str:
+    """REPO's head as the directory the caller ran in holds it, when that directory is a checkout of REPO, else "".
+    One local git call, no GitHub read.
+
+    Only the invented-pin check takes this (land_pin_extends_head_refusal, whose judgement a wrong head cannot turn
+    into a false refusal: two commits sharing twelve hex is one chance in 2^48). The ancestor check must not: a
+    checkout routinely holds commits the PR's head does not have yet, so a pin that is an ancestor of this head is
+    ordinary and proves nothing. The cache is still preferred -- this answers the case the cache cannot, a PR opened
+    minutes ago and never read, which is exactly when a pin is written out by hand."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    here = cwd_repo()
+    if not here or here.lower() != repo.lower():
+        return ""
+    head = str(git(["rev-parse", "HEAD"]) or "").lower()
+    return head if SHA40.fullmatch(head) else ""
+
+
 def check_land_pin_shape(pin: str | None) -> None:
     """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
     request this host can answer from its cache (land_draft_refusal) is answered after this and before
@@ -19345,9 +19424,11 @@ def land_pin_behind_refusal(repo: str, number: int, pin: str, head: str,
 LAND_PIN_PREFIX = 12  # hex a pin must share with the cached head before a differing tail reads as hand-written
 
 
-def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str) -> tuple[str, str] | None:
-    """(why, the step that clears it) when PIN is a 40-hex sha that starts with this host's cached head and then
-    differs from it, else None. No read of any kind, local or remote: two strings.
+def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str,
+                                  source: str = "as this host last read it") -> tuple[str, str] | None:
+    """(why, the step that clears it) when PIN is a 40-hex sha that starts with HEAD, this host's cached head of the
+    PR (or SOURCE's, when the cache has none), and then differs from it, else None. No read of any kind, local or
+    remote: two strings.
 
     A pin is otherwise trusted as given (the comment above check_land_pin), and must be, because the cache's head is
     routinely older than the head an agent just pushed. This is the one shape that cannot be a real newer commit: a
@@ -19363,8 +19444,40 @@ def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str) -
     name = f"{repo}#{number}"
     return (f"--match-head-commit {pin[:12]} starts with {name}'s head {head[:12]} and then differs from it: that is "
             f"an abbreviated head written out by hand, not another commit, and {repo} has no such sha, so the land "
-            f"would wait out a head that cannot come. The whole head, as this host last read it, is {head}",
+            f"would wait out a head that cannot come. The whole head, {source}, is {head}",
             f"glaeda-gh land {name} --match-head-commit {head}")
+
+
+# The queue follows a pinned head forward by itself when the new head is only a base merge on the pin (the
+# pin_followed, repin_own_update and repin_base_merge events), and each of those records the pin it moved away from.
+# An agent watching from outside sees a head that is not its pin and re-pins by hand, and by then the hand-written
+# pin is the stale one. 2026-11-22: glaeda#2542 was queued pinned 27b86dab, followed to 3ec2af7c by
+# repin_own_update at 20:00Z, and the head was ed96f931 when a re-pin at 3ec2af7c reached the queue at 20:06Z, which
+# parked the row in pin_wait for a head that was already gone. NOW counts the class land-re-pin-loop (14 that day).
+# A pin this queue has already followed away from moves nothing: the row is live and pinned ahead of the request, so
+# the request is answered with the pin the row holds instead of replacing it with an older one.
+LAND_PIN_FOLLOW_EVENTS = ("pin_followed", "repin_own_update", "repin_base_merge")
+
+
+def land_pin_already_followed(entry: dict | None, pin: str, requester: str) -> str:
+    """The pin a live ENTRY holds, when PIN is a sha its own queue already followed away from (its history records a
+    follow whose old pin PIN starts with, since the history keeps 12 hex) and REQUESTER is who that entry was queued
+    for, else "". A finished entry (LAND_DONE), an unpinned one, one still pinned at PIN, one whose history records
+    no follow from PIN, and another requester's row all say nothing: those requests are queued as they always were."""
+    if not isinstance(entry, dict) or not pin or entry.get("state") in LAND_DONE:
+        return ""
+    held, pin = str(entry.get("pinSha") or "").lower(), pin.lower()
+    if not SHA40.fullmatch(held) or not land_head_moved(pin, held):
+        return ""
+    if str(entry.get("requester") or "") != requester:
+        return ""  # another session's row: its pin is not this requester's to read as a follow of their own
+    for h in entry.get("history") or []:
+        if not isinstance(h, dict) or h.get("event") not in LAND_PIN_FOLLOW_EVENTS:
+            continue
+        was = str(h.get("was") or h.get("pin") or "").lower()
+        if was and pin.startswith(was):
+            return held
+    return ""
 
 
 def land_cached_head(key: str, max_age: float) -> str:
@@ -19441,7 +19554,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
     cached = land_cached_head(key, LAND_PIN_BEHIND_AGE) if sha else ""
-    invented = land_pin_extends_head_refusal(repo, number, sha, cached) if sha else None
+    # The cache first; failing that, the caller's own checkout of this repository, which is the head the guidance
+    # tells them to pin and the only one a PR opened minutes ago has (land_pin_local_head).
+    local = "" if not sha or cached else land_pin_local_head(repo)
+    invented = land_pin_extends_head_refusal(repo, number, sha, cached or local,
+                                             "as this host last read it" if cached
+                                             else f"the HEAD of this checkout of {repo}") if sha else None
     if invented is not None:
         # Before the ancestor check, which would say nothing here: no checkout holds a commit that does not exist.
         return land_request_refused(key, "land_pin_invented", *invented, as_json=as_json)
@@ -19454,6 +19572,20 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if executor is not None:
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
                                   ceiling)
+    followed = land_pin_already_followed(read_json(LandQueue.entries_dir() / file_name(key)), sha, requester) \
+        if sha else ""
+    if followed:
+        # Not a refusal: the row is live, pinned ahead of this request, and keeps its place in the queue.
+        why = (f"{repo}#{number} is already queued and its pin followed {sha[:12]} forward here: the row holds "
+               f"{followed[:12]}, which is {sha[:12]} plus the base. Re-pinning {sha[:12]} would move it back to a "
+               f"head that is already gone and park it (pin_wait), so nothing was changed")
+        nxt = f"glaeda-gh wait pr {repo}#{number} --until merged --sha {followed} --timeout 1800"
+        if as_json:
+            print(json.dumps({"ok": True, "key": key, "code": "land_pin_followed", "reason": why, "next": nxt,
+                              "pin": followed, "was": sha}, sort_keys=True))
+        else:
+            say_waiting(f"glaeda-gh land: {why}\nnext: {nxt}")
+        return EXIT_OK
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -31972,6 +32104,66 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
+# A wait flag given with no value. `--wait` reads as a switch ("wait for it"), and this tool's own
+# `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
+# --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
+# first one's value -- exited 2 with argparse's "expected one argument" and nothing queued. Measured on this host 2026-11-22 landing teamleaderleo/glaeda#2559: the land was queued on
+# the retype, 67 s later. The value here is each flag's own documented default, so a bare flag means "wait,
+# the usual amount", which is what it reads as. "" drops the flag: its default is computed (--max is
+# WAIT_MAX_TIMES x the timeout), and absent is exactly that default.
+BARE_WAIT_VALUE: dict[tuple[str, str], str] = {
+    ("land", "--wait"): "3600",      # the flag's default is 0 (do not wait), which a typed --wait cannot mean
+    ("wait", "--timeout"): "3600",   # the parser's own default
+    ("checks", "--wait"): "30",      # the parser's own default
+    ("on-event", "--wait"): "30",    # its default is 0 (do not wait), same reading as land's
+    ("land", "--max"): "",
+    ("wait", "--max"): "",
+}
+
+
+def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A wait or ceiling flag typed with no number takes its own default: (argv, refusal lines, never any).
+
+    Only the flags in BARE_WAIT_VALUE, only when the next word is not a count of seconds this flag could
+    take (`seconds` decides, so 20m and 1800 are still values), and only in canonical spelling, which
+    `flag_spelling_synonym` has already made of every flag it recognises. Said on stderr with the whole
+    call, so the next one is typed with the number."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    fixed: list[str] = []
+    said: list[str] = []
+    i = 0
+    while i < len(raw):
+        word = raw[i]
+        if word == "--":
+            fixed.extend(raw[i:])
+            break
+        value = BARE_WAIT_VALUE.get((raw[0], word))
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
+        if value is None or has_value:
+            fixed.append(word)
+            i += 1
+            continue
+        said.append(f"`{word}` with no number is its default"
+                    + (f", {value} seconds" if value else " (the ceiling it computes from the timeout)"))
+        fixed.extend([word, value] if value else [])
+        i += 1
+    if said:
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
+
+def bare_wait_count(word: str) -> bool:
+    """Whether WORD is a count of seconds a wait flag could take (1800, 20m), rather than the next thing
+    typed (a target, another flag's name): `seconds` is the same reader the parser uses for these flags."""
+    try:
+        seconds(word)
+    except argparse.ArgumentTypeError:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
@@ -32005,11 +32197,13 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym, flag_spelling_synonym):
+    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym,
+                     flag_spelling_synonym, bare_wait_synonym):
         # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
         # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
         # sits between them: it only looks at a call that already leads with a real command, which is what the
-        # two before it have just made sure of, and it reads flags only by name.
+        # two before it have just made sure of, and it reads flags only by name. `bare_wait_synonym` last: it
+        # reads flags in canonical spelling, which the one before it has just produced.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
