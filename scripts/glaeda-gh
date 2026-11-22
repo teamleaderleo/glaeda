@@ -12197,6 +12197,16 @@ LAND_EXPLAIN_DEADLINE_CLIENT = 300.0
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
+# A land notice that acpmux refuses is sent again, LAND_NOTIFY_RETRY_S apart, up to LAND_NOTIFY_TRIES in all, off the
+# tick. One refused send used to be the only send: the merged or stopped word never reached its lane, which then
+# waited on a land that had ended. gcp-agent-lane-13, 2026-11-21 10:36Z-11-22 09:15Z: 58 land-notify-failed, 57 of
+# them "acpmux: runtime: empty prompt", spread over the day (about 2 an hour), none reproducible with the same argv on
+# a later acpmux; huge-blue logged 1,893 against 976 land-pool lines.
+LAND_NOTIFY_TRIES = 3
+LAND_NOTIFY_RETRY_S = 5.0
+# A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
+# "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
+LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -13143,9 +13153,12 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
     the environment is a session here: a sub-session's PARENT/CHILD gets this host too (acpmux send takes
     HOST/PARENT/CHILD), unless its first part is a fleet machine (a peer's session name, HOST/NAME)."""
     name, source = (given.strip(), "--notify") if given and given.strip() else ("", "")
+    if name.lower() in LAND_NO_REQUESTER:
+        return "", ""
     if not name:
         name, source = next(((os.environ[k].strip(), "$" + k) for k in LAND_REQUESTER_KEYS
-                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG), ("", ""))
+                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG
+                             and os.environ[k].strip().lower() not in LAND_NO_REQUESTER), ("", ""))
     if not name:
         return "", ""
     if source != "--notify":
@@ -13168,7 +13181,7 @@ def land_notify_target(e: dict, requester: str) -> str:
     empty so notify logs one land-unnotified event instead of retrying a bad
     destination.
     """
-    if requester:
+    if requester and requester.rsplit("/", 1)[-1].lower() not in LAND_NO_REQUESTER:  # an older entry's HOST/none
         return requester
     queued_by = str(e.get("queuedBy") or "")
     parent = queued_by.split(":agent:", 1)[0]
@@ -17691,13 +17704,21 @@ class LandQueue:
                 "--class", LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
-            got = self.call(argv, LAND_NOTIFY_DEADLINE)
-            if got.returncode != 0:
-                why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
-                log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why})
-                with contextlib.suppress(Exception):
-                    self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
-                                {"to": to, "why": why, "pr": self.url(e)})
+            whys: list[str] = []
+            for tried in range(1, LAND_NOTIFY_TRIES + 1):
+                got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                if got.returncode == 0:
+                    if whys:
+                        log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
+                    return
+                whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if tried < LAND_NOTIFY_TRIES:
+                    time.sleep(LAND_NOTIFY_RETRY_S)
+            why = whys[-1]
+            log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why, "tries": len(whys)})
+            with contextlib.suppress(Exception):
+                self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
+                            {"to": to, "why": why, "pr": self.url(e)})
         if self.inline:
             send()
         else:
