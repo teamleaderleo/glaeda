@@ -2173,15 +2173,28 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 FAST_TIER_CAPACITY_WAIT_S = 60.0
 
 
+# ISOLATED_WAIT: an isolated job whose need fills the mini (its units, with the idle reserve it must leave, are every
+# unit there) is admitted only when the mini is empty, and a mini that runs PR work is never empty: each job that ends
+# frees its units to a smaller one already waiting ahead (fair_turn ranks a DEV job, or one waiting FEED_JUMP_S, first)
+# or to a ci-step. generated-files (isolated; 6 units and the reserve on a 7-unit mini) on cmux13s, job 137308886591,
+# 2026-11-22: it waited in job-started from 18:39Z ("6 of 7 units free ... needs 7" to 18:55Z, "3 of 7" at 18:56Z,
+# "4 of 7" at 19:06Z) until its run was cancelled at 19:48Z, 4160 s, never seeing 7 free; of 11 generated-files jobs
+# in 15:40-18:40Z, 9 were cancelled while waiting so (106 min), 2 ran. Holding every smaller admission while it
+# waits would idle the mini for as long as its longest running job, so it is the job that gives way: past
+# ISOLATED_CAPACITY_WAIT_S it is refused, and cmux's owned-pool rescue (hook_refused()) places the re-run again,
+# where a mini with room can take it. A smaller isolated job keeps its unbounded wait (CAPACITY_WAIT): it fits
+# beside running work and the fair turn admits it. GLAEDA_RUNNER_ISOLATED_WAIT_S sets the bound on a runner; "off"
+# or 0 lifts it. 600 s, like GUEST_WAIT_S: in the job above no unit freed for its first 16 min.
 ISOLATED_WAIT_ENV = "GLAEDA_RUNNER_ISOLATED_WAIT_S"
-ISOLATED_CAPACITY_WAIT_S = 600.0  # ISOLATED_WAIT: placeholder, sized below from the hook logs
+ISOLATED_CAPACITY_WAIT_S = 600.0
 
 
 def isolated_capacity_wait(repo: str | None, home_repo: str, klass: str, tier: str,
                            env: str | None = None) -> float | None:
     """ISOLATED_CAPACITY_WAIT_S (or GLAEDA_RUNNER_ISOLATED_WAIT_S; "off" or 0 for no bound) for an ordinary home-repo
-    job of the isolated class, else None (ISOLATED_WAIT). A guest has GUEST_WAIT_S, and a nightly, stack or feed job
-    keeps its own bound or rank."""
+    job of the isolated class, else None (ISOLATED_WAIT). The wait loop applies it only while the job's need fills
+    the mini (isolated_need_fills). A guest has GUEST_WAIT_S, and a nightly, stack or feed job keeps its own bound or
+    rank."""
     if repo is None or repo.lower() != home_repo.lower() or klass != "isolated" or tier:
         return None
     raw = (os.environ.get(ISOLATED_WAIT_ENV) if env is None else env) or ""
@@ -2192,6 +2205,12 @@ def isolated_capacity_wait(repo: str | None, home_repo: str, klass: str, tier: s
     except ValueError:
         bound = ISOLATED_CAPACITY_WAIT_S  # a bad value keeps the default, never an unbounded wait by typo
     return bound if bound > 0 and math.isfinite(bound) else None
+
+
+def isolated_need_fills(need: Any, total: int) -> bool:
+    """Whether a waiting job's need (take_capacity's taken_out need: its units with the reserve it must leave) is
+    every unit of a total-unit mini, so it can start only on an empty one (ISOLATED_WAIT)."""
+    return isinstance(need, int) and not isinstance(need, bool) and total > 0 and need >= total
 
 
 def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
@@ -15494,11 +15513,9 @@ def main(argv: list[str] | None = None) -> int:
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                    job_workflow())[0]
             isolated_bound = isolated_capacity_wait(repo, args.home_repo, claim_class, tier)
-            if isolated_bound is not None and (cap is None or isolated_bound < cap):
-                cap = isolated_bound
-                print(f"{PREFIX}: an isolated job: it waits {isolated_bound:g} s at most for capacity "
-                      f"(ISOLATED_WAIT, {ISOLATED_WAIT_ENV}=off to lift it), then is refused so cmux's owned-pool "
-                      "rescue places it again", flush=True)
+            if isolated_bound is not None and cap is not None and cap <= isolated_bound:
+                isolated_bound = None  # a shorter bound already holds
+            isolated_noted = False
             if claim_class == EXCLUSIVE_CLASS and not is_guest(repo, args.home_repo):
                 hook = hook_sha256()
                 if signing_hook_listed(repo, os.environ.get("GITHUB_SHA"), hook) is False:
@@ -15587,6 +15604,15 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     if left <= 0:
                         break
+                    if isolated_bound is not None and isolated_need_fills(taken.get("need"), args.capacity_units):
+                        if not isolated_noted:
+                            isolated_noted = True
+                            print(f"{PREFIX}: an isolated job whose need fills this mini ({taken.get('need')} of "
+                                  f"{args.capacity_units} units) waits {isolated_bound:g} s at most for it to empty "
+                                  f"(ISOLATED_WAIT; {ISOLATED_WAIT_ENV}=off lifts it), then is refused so cmux's "
+                                  "owned-pool rescue places it again", flush=True)
+                        if waited >= isolated_bound:
+                            break
                     wants = list(taken.get("wants") or [])
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
                         write_want(marker, since, wants, tier,

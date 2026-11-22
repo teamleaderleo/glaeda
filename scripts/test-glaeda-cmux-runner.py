@@ -2937,26 +2937,28 @@ class HookTest(unittest.TestCase):
             self.addCleanup(os.close, fd)
         return fds
 
-    def test_an_isolated_job_on_a_full_mini_is_refused_at_its_bound_unless_switched_off(self) -> None:
-        """ISOLATED_WAIT end to end: generated-files (isolated, 6 units) on a 7-unit mini with 2 units held waits its
-        bound, not the explicit longer --gui-wait, then is refused and drops its waiter marker. With the switch off it
-        keeps the --gui-wait it was given."""
+    def test_an_isolated_job_whose_need_fills_the_mini_is_refused_at_its_bound(self) -> None:
+        """ISOLATED_WAIT end to end: generated-files (isolated, 6 units) on a 6-unit mini with 2 units held needs every
+        unit, so it waits its bound, not the explicit longer --gui-wait, then is refused and drops its waiter marker.
+        On a 7-unit mini its 6 do not fill it and it keeps the wait it was given; with the switch off too."""
         self.fleet()
         self.take_units(2)
         flow = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/x"}
         began = time.monotonic()
-        bounded = self.job("generated-files", "g0", 7, None, "--gui-wait", "600",
+        bounded = self.job("generated-files", "g0", 6, None, "--gui-wait", "600",
                            env={**flow, hook.ISOLATED_WAIT_ENV: "2"})
         self.assertLess(time.monotonic() - began, 60, "the bound, not --gui-wait 600")
         self.assertEqual(bounded.returncode, 1, bounded.stdout)
-        self.assertIn("an isolated job: it waits 2 s at most for capacity (ISOLATED_WAIT", bounded.stdout)
-        self.assertIn("refused: capacity: 5 of 7 units free, generated-files (isolated) needs 6", bounded.stdout)
+        self.assertIn("an isolated job whose need fills this mini (6 of 6 units) waits 2 s at most", bounded.stdout)
+        self.assertIn("refused: capacity: 4 of 6 units free, generated-files (isolated) needs 6", bounded.stdout)
         self.assertEqual(list((self.dir / "capacity").glob(f"{hook.ADMIT_WANT}*")), [])
-        off = self.job("generated-files", "g1", 7, None, "--gui-wait", "1", env={**flow, hook.ISOLATED_WAIT_ENV: "off"})
+        smaller = self.job("generated-files", "g1", 7, None, "--gui-wait", "3", env={**flow, hook.ISOLATED_WAIT_ENV: "1"})
+        self.assertEqual(smaller.returncode, 1, smaller.stdout)
+        self.assertIn("5 of 7 units free, generated-files (isolated) needs 6", smaller.stdout)
+        self.assertNotIn("ISOLATED_WAIT", smaller.stdout, "6 of 7 units fit beside running work: no bound")
+        off = self.job("generated-files", "g2", 6, None, "--gui-wait", "1", env={**flow, hook.ISOLATED_WAIT_ENV: "off"})
         self.assertEqual(off.returncode, 1, off.stdout)
         self.assertNotIn("ISOLATED_WAIT", off.stdout)
-        light = self.job("swift-package-tests", "g2", 7, None, "--gui-wait", "1", env={**flow, hook.ISOLATED_WAIT_ENV: "2"})
-        self.assertNotIn("ISOLATED_WAIT", light.stdout, "another class keeps its wait")
         for runner in ("g0", "g1", "g2"):
             self.finish(runner)
 
@@ -11975,8 +11977,9 @@ class GateTest(unittest.TestCase):
     def test_an_isolated_job_waits_a_bounded_time_for_capacity(self) -> None:
         """ISOLATED_WAIT: generated-files (isolated) needs all 7 units of a 7-unit mini; on cmux13s job 137308886591
         waited in job-started from 18:39Z to its cancel near 19:48Z ("N of 7 units free") while smaller jobs ran
-        beside it. An ordinary home-repo isolated job now waits ISOLATED_CAPACITY_WAIT_S at most and is refused, so
-        the owned-pool rescue places it again; GLAEDA_RUNNER_ISOLATED_WAIT_S sets the bound, "off" or 0 lifts it."""
+        beside it. An ordinary home-repo isolated job whose need fills the mini now waits ISOLATED_CAPACITY_WAIT_S at
+        most and is refused, so the owned-pool rescue places it again; GLAEDA_RUNNER_ISOLATED_WAIT_S sets the bound,
+        "off" or 0 lifts it."""
         home, bound = hook.DEFAULT_HOME_REPO, hook.ISOLATED_CAPACITY_WAIT_S
         self.assertEqual(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", "", env=""), bound)
         self.assertEqual(hook.isolated_capacity_wait("Manaflow-AI/cmux", home, "isolated", "", env=""), bound)
@@ -11996,6 +11999,12 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", ""))
         with mock.patch.dict(os.environ, {hook.ISOLATED_WAIT_ENV: ""}):
             self.assertEqual(hook.isolated_capacity_wait("manaflow-ai/cmux", home, "isolated", ""), bound)
+        # only a need that fills the mini is bounded: its units with the reserve it leaves, as taken_out reports it
+        self.assertTrue(hook.isolated_need_fills(7, 7))
+        self.assertTrue(hook.isolated_need_fills(8, 7))
+        for need, total in ((6, 7), (None, 7), (True, 1), ("7", 7), (0, 0)):
+            with self.subTest(need=need, total=total):
+                self.assertFalse(hook.isolated_need_fills(need, total))
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
