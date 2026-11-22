@@ -27509,6 +27509,85 @@ class LandTest(Base):
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
 
+    def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
+        """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an
+        unmoved head, another such re-read waits (gated, its status naming why), while a land that can move takes a
+        free worker. A lane VM, 2026-11-22: three such PRs held 3 of 4 workers for 40 min."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 4
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        for n in (90, 91):
+            k = self.stuck(n, 0, state="judging")
+            self.q.jobs[k] = Busy()
+        again = self.stuck(11, 3 * 3600)
+        moves = self.stuck(12, 1800)
+        self.q.entries[moves]["explain"]["code"] = "checks_pending"
+        self.retries(2)
+        self.tick(30)
+        self.assertEqual(self.explained(), ["12"])
+        e = self.q.entries[again]
+        late = [h for h in e["history"] if h["event"] == "due_late"]
+        self.assertEqual([h["why"] for h in late], ["re-reads of unreadable PRs hold their share of the workers"])
+        del self.q.jobs["pr:o/r#90"]
+        self.tick(30)
+        self.assertEqual(self.explained(), ["12", "11"])
+
+    def test_a_reread_sorts_behind_a_due_land_that_can_move(self):
+        """judge_order: a due entry judged "unreadable" at the head the cache still shows is never "one merge away" and
+        goes behind every other due entry, however long it has waited; once its head moves it is an ordinary row."""
+        again = self.stuck(11, 3 * 3600)
+        moves = self.stuck(12, 600)
+        self.q.entries[moves]["explain"]["code"] = "checks_pending"
+        self.assertGreater(self.q.judge_order(again), self.q.judge_order(moves))
+        self.assertTrue(self.q.reread(self.q.entries[again]))
+        self.w.set_pr(again, land_pr("b" * 40), self.t)  # a new head: the last answer no longer applies
+        self.assertFalse(self.q.reread(self.q.entries[again]))
+        self.assertLess(self.q.judge_order(again), self.q.judge_order(moves))
+
+    def test_a_job_holding_its_worker_past_the_bound_is_logged_named_and_freed(self):
+        """LAND_SLOT_HELD: a job holding its worker that long is logged once (land-slot-held), named in the land-pool
+        line (slotHeld) and in its status line, and land-slot-freed is logged when it ends."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+        class Busy:
+            finished = False
+
+            def done(self) -> bool:
+                return self.finished
+
+            def exception(self) -> None:
+                return None
+        key = self.stuck(11, 0, state="judging")
+        e = self.q.entries[key]
+        e["judging"] = {"sha": e["head"], "at": self.t}
+        job = Busy()
+        self.q.jobs[key] = job
+        self.q.job_started[key] = (self.t, "job")
+        self.tick(60)
+        self.assertEqual([r for r in logs if r.get("event") == "land-slot-held"], [])
+        self.tick(gg.LAND_SLOT_HELD)
+        self.tick(60)
+        held = [r for r in logs if r.get("event") == "land-slot-held"]
+        self.assertEqual([(r["key"], r["job"], r["state"]) for r in held], [(key, "job", "judging")])
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["slotHeld"]["pr"], pool["slotHeld"]["job"]), ("o/r#11", "job"))
+        self.assertGreaterEqual(pool["slotHeld"]["heldS"], gg.LAND_SLOT_HELD)
+        self.assertIn("holding a worker since", gg.land_line(self.q.entries[key], self.t))
+        job.finished = True
+        self.tick(30)
+        freed = [r for r in logs if r.get("event") == "land-slot-freed"]
+        self.assertEqual([(r["key"], r["job"]) for r in freed], [(key, "job")])
+        self.assertNotIn(key, self.q.job_started)
+
     def test_a_stopped_predecessor_merged_by_hand_is_still_read_for_its_follower(self):
         """Review: an --after PR whose own entry stopped is read by nothing else once only due entries hold watches; its
         follower must still read it (one peek per LAND_PEEK_EVERY), or a hand merge never shows and the follower stops
