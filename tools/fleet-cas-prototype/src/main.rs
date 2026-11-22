@@ -52,6 +52,14 @@ struct Stats {
     cas_get_miss: AtomicU64,
     kv_get_hit: AtomicU64,
     kv_get_miss: AtomicU64,
+    /// The part of the four lookup counters above (kv_get_*, cas_get_*) a
+    /// fleet store answered to a `--writers` peer. The writer looks up what
+    /// it is about to compile and write, so its misses are not readers'
+    /// misses: `/stats` reports reader traffic as the total less these.
+    writer_kv_get_hit: AtomicU64,
+    writer_kv_get_miss: AtomicU64,
+    writer_cas_get_hit: AtomicU64,
+    writer_cas_get_miss: AtomicU64,
     kv_put: AtomicU64,
     kv_put_refused: AtomicU64,
     kv_put_conflict: AtomicU64,
@@ -202,6 +210,10 @@ impl Stats {
             ("cas_get_miss", &self.cas_get_miss),
             ("kv_get_hit", &self.kv_get_hit),
             ("kv_get_miss", &self.kv_get_miss),
+            ("writer_kv_get_hit", &self.writer_kv_get_hit),
+            ("writer_kv_get_miss", &self.writer_kv_get_miss),
+            ("writer_cas_get_hit", &self.writer_cas_get_hit),
+            ("writer_cas_get_miss", &self.writer_cas_get_miss),
             ("kv_put", &self.kv_put),
             ("kv_put_refused", &self.kv_put_refused),
             ("kv_put_conflict", &self.kv_put_conflict),
@@ -262,6 +274,10 @@ impl Stats {
             v(&self.write_refused),
             v(&self.bytes_in),
             v(&self.bytes_out),
+            v(&self.writer_kv_get_hit),
+            v(&self.writer_kv_get_miss),
+            v(&self.writer_cas_get_hit),
+            v(&self.writer_cas_get_miss),
         ]
     }
 
@@ -582,6 +598,22 @@ impl Store {
             if let Ok(mut f) = log.lock() {
                 let _ = f.write_all(line.as_bytes());
             }
+        }
+    }
+
+    /// Whether a request comes from a `--writers` peer (a fleet store only;
+    /// a node has no writer list and counts every lookup as a reader's).
+    fn from_writer<T>(&self, r: &Request<T>) -> bool {
+        match (&self.writers, r.remote_addr()) {
+            (Some(allowed), Some(peer)) => allowed.contains(&peer.ip()),
+            _ => false,
+        }
+    }
+
+    /// Count a lookup a writer made, beside the total its path counted.
+    fn count_writer_lookup(&self, writer: bool, hit: &AtomicU64, miss: &AtomicU64, found: bool) {
+        if writer {
+            (if found { hit } else { miss }).fetch_add(1, Relaxed);
         }
     }
 
@@ -1043,8 +1075,17 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasGetRequest>,
     ) -> Result<Response<cas::CasGetResponse>, Status> {
+        let writer = self.0.from_writer(&r);
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
+        let found = self.0.counted_read(self.0.get_or_fetch(&id).await)?;
+        let st = &self.0.stats;
+        self.0.count_writer_lookup(
+            writer,
+            &st.writer_cas_get_hit,
+            &st.writer_cas_get_miss,
+            found.is_some(),
+        );
+        Ok(Response::new(match found {
             Some(obj) => cas::CasGetResponse {
                 outcome: cas::cas_get_response::Outcome::Success as i32,
                 contents: Some(cas::cas_get_response::Contents::Data(obj)),
@@ -1083,8 +1124,17 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasLoadRequest>,
     ) -> Result<Response<cas::CasLoadResponse>, Status> {
+        let writer = self.0.from_writer(&r);
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
+        let found = self.0.counted_read(self.0.get_or_fetch(&id).await)?;
+        let st = &self.0.stats;
+        self.0.count_writer_lookup(
+            writer,
+            &st.writer_cas_get_hit,
+            &st.writer_cas_get_miss,
+            found.is_some(),
+        );
+        Ok(Response::new(match found {
             Some(obj) => cas::CasLoadResponse {
                 outcome: cas::cas_load_response::Outcome::Success as i32,
                 contents: Some(cas::cas_load_response::Contents::Data(cas::CasBlob {
@@ -1118,6 +1168,7 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         &self,
         r: Request<kv::GetValueRequest>,
     ) -> Result<Response<kv::GetValueResponse>, Status> {
+        let writer = self.0.from_writer(&r);
         let key = r.into_inner().key;
         let s = &self.0;
         let answer = |v: kv::Value| {
@@ -1139,6 +1190,9 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
                             gc::touch_if_stale(&path);
                         }
                         s.stats.kv_get_hit.fetch_add(1, Relaxed);
+                        if writer {
+                            s.stats.writer_kv_get_hit.fetch_add(1, Relaxed);
+                        }
                         s.log_key(&key);
                         return Ok(answer(value));
                     }
@@ -1149,6 +1203,9 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             Err(e) => return s.counted_read(Err(Status::internal(e.to_string()))),
         }
         s.stats.kv_get_miss.fetch_add(1, Relaxed);
+        if writer {
+            s.stats.writer_kv_get_miss.fetch_add(1, Relaxed);
+        }
         let Some(up) = s.readable_upstream(UpstreamOperation::KvGet) else {
             return Ok(kv_response(None));
         };
@@ -1308,6 +1365,8 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
         &self,
         r: Request<fleet::ClosureRequest>,
     ) -> Result<Response<Self::GetClosureStream>, Status> {
+        // A writer's closure prefetch reads objects too (counted by `get`).
+        let writer = self.0.from_writer(&r);
         let mut queue = r.into_inner().roots;
         queue.sort();
         queue.dedup();
@@ -1325,7 +1384,17 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
             let mut seen: HashSet<Vec<u8>> = queue.iter().cloned().collect();
             while let Some(id) = queue.pop() {
                 // `get` verifies the object and treats damage as absence.
-                let Ok(Some(obj)) = store.get(&id) else {
+                let got = store.get(&id);
+                if let Ok(found) = &got {
+                    let st = &store.stats;
+                    store.count_writer_lookup(
+                        writer,
+                        &st.writer_cas_get_hit,
+                        &st.writer_cas_get_miss,
+                        found.is_some(),
+                    );
+                }
+                let Ok(Some(obj)) = got else {
                     continue;
                 };
                 for r in &obj.references {
@@ -1739,8 +1808,9 @@ fn app(store: Arc<Store>, monitor: Arc<Monitor>) -> axum::Router {
 /// What `GET /stats` serves: this process's role and configuration, and its
 /// request counters over 5 min, 1 h and 24 h windows kept across restarts
 /// (`window.rs`). The fleet status scraper reads
-/// `windows["1h"].kv_hit_rate` and `windows["1h"].requests`, `uptime_s`,
-/// `writers`.
+/// `windows["1h"].readers` (its `kv_hit_rate` and `requests`: lookups from
+/// every peer but `--writers`), else `windows["1h"].kv_hit_rate` and
+/// `windows["1h"].requests`, and `uptime_s`, `writers`.
 struct Monitor {
     store: Arc<Store>,
     history: std::sync::Mutex<window::History>,
@@ -1914,6 +1984,93 @@ mod tests {
         assert!(first.contains("\"up_calls\":1"));
         assert!(first.contains("\"up_micros\":"));
         assert!(!first.contains("fleet store"));
+    }
+
+    fn from_peer<T>(msg: T, ip: [u8; 4]) -> Request<T> {
+        let mut r = Request::new(msg);
+        r.extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(std::net::SocketAddr::from((ip, 50000))),
+            });
+        r
+    }
+
+    #[tokio::test]
+    async fn a_fleet_store_counts_its_writers_lookups_apart_from_readers() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-cas-writer-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store {
+            root: dir.clone(),
+            read_only_kv: false,
+            writers: Some(vec![std::net::IpAddr::from([10, 0, 0, 2])]),
+            allow_file_paths: false,
+            upstream: None,
+            sign_key: None,
+            trusted: None,
+            strip_signatures: false,
+            upstream_down_until: AtomicU64::new(0),
+            stats: Stats::default(),
+            key_log: None,
+        });
+        let kv = KvSvc(store.clone());
+        let get = |ip| from_peer(kv::GetValueRequest { key: vec![7; 32] }, ip);
+        // The writer misses, then writes the entry; a reader then hits it.
+        <KvSvc as kv::key_value_db_server::KeyValueDb>::get_value(&kv, get([10, 0, 0, 2]))
+            .await
+            .unwrap();
+        let put = from_peer(
+            kv::PutValueRequest {
+                key: vec![7; 32],
+                value: Some(kv::Value::default()),
+            },
+            [10, 0, 0, 2],
+        );
+        let put = <KvSvc as kv::key_value_db_server::KeyValueDb>::put_value(&kv, put)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(put.error.is_none(), "{:?}", put.error);
+        <KvSvc as kv::key_value_db_server::KeyValueDb>::get_value(&kv, get([10, 0, 0, 9]))
+            .await
+            .unwrap();
+        <KvSvc as kv::key_value_db_server::KeyValueDb>::get_value(&kv, get([10, 0, 0, 2]))
+            .await
+            .unwrap();
+        // An object the writer asks for and one a reader asks for, both absent.
+        let cas = CasSvc(store.clone());
+        for ip in [[10, 0, 0, 2], [10, 0, 0, 9]] {
+            let req = from_peer(
+                cas::CasGetRequest {
+                    cas_id: Some(cas::CasDataId { id: vec![1; 32] }),
+                    write_to_disk: false,
+                },
+                ip,
+            );
+            <CasSvc as cas::casdb_service_server::CasdbService>::get(&cas, req)
+                .await
+                .unwrap();
+        }
+
+        let st = &store.stats;
+        let load = |c: &AtomicU64| c.load(Relaxed);
+        assert_eq!((load(&st.kv_get_hit), load(&st.kv_get_miss)), (2, 1));
+        assert_eq!(
+            (load(&st.writer_kv_get_hit), load(&st.writer_kv_get_miss)),
+            (1, 1)
+        );
+        assert_eq!((load(&st.cas_get_hit), load(&st.cas_get_miss)), (0, 2));
+        assert_eq!(
+            (load(&st.writer_cas_get_hit), load(&st.writer_cas_get_miss)),
+            (0, 1)
+        );
+        let j = window::counts_json(&st.window_counts());
+        assert!(
+            j.contains("\"readers\":{\"kv_hits\":1,\"kv_misses\":0,\"requests\":2,"),
+            "{j}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
