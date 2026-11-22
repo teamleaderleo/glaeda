@@ -26138,6 +26138,106 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("api")), ("stopped", "teammate", []))
 
+    # land_judge's ci_never_ran refusal at HEAD, as it answers it: a "command" step whose text starts CI by hand.
+    CI_NEVER_NEXT = ("test \"$(git rev-parse HEAD)\" = %s && git commit --allow-empty --only -m "
+                     "'ci: start CI now that the base is set' && git push && glaeda-gh wait pr o/r#1 --until done "
+                     "--timeout 1800")
+
+    def ci_never_ran(self, head: str) -> tuple[int, dict]:
+        nxt = self.CI_NEVER_NEXT % head
+        return refusal("ci_never_ran", head, {"kind": "command", "text": nxt}, nxt=nxt,
+                       reason=f"land-judge: refused: the repo's own CI never ran at {head}: it has no pull_request "
+                              "Actions run (its only PR runs are pull_request_target: Test integrity), while PRs into "
+                              "main run Polling guard, Skills tests")
+
+    def updated_to(self, new_head: str, refused: bool = False) -> dict:
+        """A land whose own update-branch at LA made NEW_HEAD, judged there. REFUSED: GitHub's own update had made it
+        first, so the pinned send came back "expected head sha didn't match current head ref" (hq#16382's shape)."""
+        self.pr(LA)
+        self.land()
+        if refused:
+            self.w.gh_rc["update"] = 1
+            self.w.gh_err["update"] = ('{"message":"expected head sha didn\u2019t match current head ref.",'
+                                       '"status":"422"}')
+        self.w.answers.append(refusal("red_not_excused", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                              "needs_newer_base": ["ci"]}))
+        self.tick()
+        self.w.gh_rc.pop("update", None)
+        self.pr(new_head, checks=[])
+        self.w.answers.append(self.ci_never_ran(new_head))
+        return self.tick(60)
+
+    def test_ci_never_ran_at_the_head_this_land_made_waits_for_the_run_to_start(self):
+        # efficiency-standing-lane, 2026-11-21 08:39Z (LAND_CI_START's comment): `glaeda-gh land
+        # manaflow-ai/cmuxterm-hq#16382 --wait 2700` ran its own update-branch, judged the merge head it made 70 s
+        # later, and stopped ci_never_ran with ~45 min of the caller's wait unspent, for a PR that went green.
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                e = self.updated_to(LB, refused=refused)
+                self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB),
+                                 e.get("stop"))
+                self.assertAlmostEqual(e["wakeAt"] - self.t, gg.LAND_CI_START - 60, delta=5)
+                self.assertEqual([h["event"] for h in e["history"]][-1], "ci_start_wait")
+                # The refusal's own step is an empty commit, which would move this head and orphan the runs being
+                # created at it: never named while the wait stands.
+                self.assertNotIn("allow-empty", json.dumps(e))
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_the_base_merge_land_judge_itself_made_waits_too(self):
+        # manaflow-ai/cmuxterm-hq#19554, 2026-11-22 (LAND_CI_START's comment): the same race from the other producer
+        # -- this land's own base merge (land_judge's stale_main_update inside the judgment, recorded by
+        # note_judge_update, no update_branch step at all) made d3e8c81b5adf, the judgment at it refused ci_never_ran
+        # with only pull_request_target read, and minutes later four of the pull_request workflows that refusal named
+        # were in progress at that head. One predicate (land_own_head_at) answers for every producer.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(self.judge_merged_base(LA))
+        e = self.tick()
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIsNone((e.get("lastAction") or {}).get("kind"))  # no step of the queue's: the judgment merged it
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[]), self.t + 5)
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(self.ci_never_ran(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB), e.get("stop"))
+        self.assertIn("ci_start_wait", [h["event"] for h in e["history"]])
+        self.assertNotIn("allow-empty", json.dumps(e))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_the_run_appearing_at_that_head_is_judged_as_usual(self):
+        e = self.updated_to(LB)
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the repo's own pull_request run started
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 2))
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(30)
+        self.assert_merged_at(LB)
+
+    def test_ci_never_ran_stops_once_no_run_has_appeared_within_the_bound(self):
+        e = self.updated_to(LB)
+        e = self.run_hour(lambda: self.ci_never_ran(LB), seconds=gg.LAND_CI_START + 600, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "ci_never_ran"))
+        self.assertIn("none ever appeared at " + LB[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --wait", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_a_head_no_step_of_this_land_made_stops_at_once(self):
+        # hq#11655's shape (a head carrying only pull_request_target checks that nothing of this land's made):
+        # nothing is going to start the repo's CI for it, so the refusal stays one refusal, never a wait.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.ci_never_ran(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.explains())), ("stopped", "ci_never_ran", 1))
+        self.assertIn("no step of this land made " + LA[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_no_update_branch_while_the_heads_checks_run(self):
         self.pr(LA)
         self.land()
