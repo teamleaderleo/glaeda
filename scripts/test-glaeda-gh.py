@@ -11548,8 +11548,20 @@ class FileAndPidWaitTest(unittest.TestCase):
                                                  "--max", "9"]), ["log", "errors", "o/r", "7", "--max", "9"])
             self.assertEqual(gg.parser().parse_args(gg.log_job_synonym(["log", "job", "o/r/7"])).job, 7)
         self.assertEqual(err.getvalue().count("read as"), 3)
-        for same in (["log", "job", "o/r", "7"], ["log", "job", "o/r/7", "8"], ["log", "search", "o/r/7"]):
+        for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r/7"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_run_in_the_target_word_and_a_job_id_both_given(self) -> None:
+        """`log errors OWNER/REPO/RUN_ID --job JOB_ID` (called so 2026-11-22; refused because the repository word
+        held three segments) reads the given job id, in that repository: the run in the word only said where it is."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]),
+                             ["log", "errors", "o/r", "--job", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "job", "o/r/5", "7"]), ["log", "job", "o/r", "7"])
+            args = gg.parser().parse_args(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]))
+        self.assertEqual((args.repo, args.job), ("o/r", 7))
+        self.assertIn("5 in o/r/5 only says which run it is in", err.getvalue())
 
     def test_log_repo_job_flag_reads_as_log_job(self) -> None:
         """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
@@ -31386,7 +31398,9 @@ class LandForwardTest(Base):
         self.assertEqual(self.w.explains(), [])
 
     def test_serve_refuses_on_a_host_that_forwards_and_on_a_bad_line(self):
-        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "status"}), "not_executor"),
+        for config, line, code in (({"executor": ["reach", "x"]}, json.dumps({"op": "room"}), "not_executor"),
+                                   ({"executor": ["reach", "x"]}, json.dumps({"op": "land", "target": "o/r#1",
+                                                                              "relayedBy": "h"}), "not_executor"),
                                    ({}, "not json", "bad_request"),
                                    ({}, json.dumps({"op": "land", "target": "nope"}), "bad_request")):
             with self.subTest(code=code), mock.patch.object(gg, "land_config", return_value=config), \
@@ -31394,6 +31408,28 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_serve_on_a_forwarding_host_hands_a_land_to_its_executor_once(self):
+        """A lane VM's hand-off reaches the broker host's `land serve`; once that host forwarded its own lands it
+        refused them all (not_executor), and nothing could take the PR."""
+        sent: list = []
+
+        def forward(command, request, *a, **k):
+            sent.append((command, request))
+            return {"ok": True, "request": "r1", "host": "big-exec"}
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", forward), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1", "sha": LA})), gg.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue())["host"], "big-exec")
+        self.assertEqual(sent[0][0], ["reach", "big-exec"])
+        self.assertEqual((sent[0][1]["target"], sent[0][1]["sha"], bool(sent[0][1]["relayedBy"])), ("o/r#1", LA, True))
+
+        def down(command, request, *a, **k):
+            raise gg.WatchError("land executor: no answer within 60s")
+        with mock.patch.object(gg, "land_config", return_value={"executor": ["reach", "big-exec"]}), \
+                mock.patch.object(gg, "land_forward", down), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "land", "target": "o/r#1"})), gg.EXIT_FAIL)
+        self.assertEqual(json.loads(out.getvalue())["code"], "not_executor")
 
     def test_a_land_behind_an_earlier_request_says_it_is_normal_when_it_goes_and_not_to_reach_the_executor(self):
         """The bare "an earlier request is still waiting to be forwarded" read as a stall, and callers reached the
@@ -35276,6 +35312,44 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         """body_guard_args must name the call, or the guard judges an issue body by another write's rules."""
         said = gg.body_guard_args({"kind": "issue", "repo": "o/r", "title": "T", "body": "B"}, "/tmp/b.md")
         self.assertEqual(said, ["issue", "create", "-R", "o/r", "--title", "T", "--body-file", "/tmp/b.md"])
+
+    def test_an_issue_target_that_names_a_number_is_a_comment_on_it(self) -> None:
+        """No issue is created at a number, so `post issue o/r#5 --body B` can only mean a comment on issue 5.
+        Measured 2026-11-22 on this lane: `post issue manaflow-ai/cmuxterm-hq#15832 --body-file -` was refused
+        ("post issue takes OWNER/REPO ..."), and the row it carried cost a second call under `post comment`."""
+        for target in ("o/r#5", "o/r/5", "comment:o/r#5", "https://github.com/o/r/issues/5", "5"):
+            with self.subTest(target):
+                queued: list[dict] = []
+                with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                        mock.patch.object(gg, "cmd_gh", lambda gh: self.fail("a comment was made in one call")), \
+                        mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                        mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                        mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                        mock.patch.object(gg, "daemon_running", lambda *a, **k: True), \
+                        mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                        mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                        mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gg.main(["post", "issue", target, "--body", "B"]), 0)
+                self.assertEqual([(i["kind"], i["repo"], i["number"]) for i in queued], [("comment", "o/r", 5)])
+                self.assertIn("which exists: this is a comment on it", err.getvalue())
+                self.assertIn("a new issue takes OWNER/REPO and --title", err.getvalue())
+
+    def test_a_repository_target_still_files_a_new_issue_and_a_title_with_a_number_refuses(self) -> None:
+        """The number is the whole signal, and only without --title: `post issue o/r --title T` is untouched,
+        and a title *with* a number is the one ambiguous call, so it refuses naming both writes."""
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r"), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue(""), "")
+        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r#15832"), "15832")
+        self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B"]),
+                         ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B"])
+        lines: list[str] = []
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda text, *a, **k: lines.append(str(text))):
+            self.assertEqual(gg.main(["post", "issue", "o/r#5", "--title", "T", "--body", "B"]), 64)  # a refusal
+        said = "\n".join(lines)
+        self.assertIn("drop --title to comment on it", said)
+        self.assertIn("pass OWNER/REPO to file a new issue", said)
 
     def test_a_merge_is_named_not_made(self) -> None:
         """The one write still printed, and why: a merge is pinned to a head sha this parser does not take."""
