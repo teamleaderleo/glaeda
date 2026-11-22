@@ -31968,6 +31968,66 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
+# A wait flag given with no value. `--wait` reads as a switch ("wait for it"), and this tool's own
+# `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
+# --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
+# first one's value -- exited 2 with argparse's "expected one argument" and nothing queued. Measured on this host 2026-11-22 landing teamleaderleo/glaeda#2559: the land was queued on
+# the retype, 67 s later. The value here is each flag's own documented default, so a bare flag means "wait,
+# the usual amount", which is what it reads as. "" drops the flag: its default is computed (--max is
+# WAIT_MAX_TIMES x the timeout), and absent is exactly that default.
+BARE_WAIT_VALUE: dict[tuple[str, str], str] = {
+    ("land", "--wait"): "3600",      # the flag's default is 0 (do not wait), which a typed --wait cannot mean
+    ("wait", "--timeout"): "3600",   # the parser's own default
+    ("checks", "--wait"): "30",      # the parser's own default
+    ("on-event", "--wait"): "30",    # its default is 0 (do not wait), same reading as land's
+    ("land", "--max"): "",
+    ("wait", "--max"): "",
+}
+
+
+def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A wait or ceiling flag typed with no number takes its own default: (argv, refusal lines, never any).
+
+    Only the flags in BARE_WAIT_VALUE, only when the next word is not a count of seconds this flag could
+    take (`seconds` decides, so 20m and 1800 are still values), and only in canonical spelling, which
+    `flag_spelling_synonym` has already made of every flag it recognises. Said on stderr with the whole
+    call, so the next one is typed with the number."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    fixed: list[str] = []
+    said: list[str] = []
+    i = 0
+    while i < len(raw):
+        word = raw[i]
+        if word == "--":
+            fixed.extend(raw[i:])
+            break
+        value = BARE_WAIT_VALUE.get((raw[0], word))
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
+        if value is None or has_value:
+            fixed.append(word)
+            i += 1
+            continue
+        said.append(f"`{word}` with no number is its default"
+                    + (f", {value} seconds" if value else " (the ceiling it computes from the timeout)"))
+        fixed.extend([word, value] if value else [])
+        i += 1
+    if said:
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
+
+def bare_wait_count(word: str) -> bool:
+    """Whether WORD is a count of seconds a wait flag could take (1800, 20m), rather than the next thing
+    typed (a target, another flag's name): `seconds` is the same reader the parser uses for these flags."""
+    try:
+        seconds(word)
+    except argparse.ArgumentTypeError:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
@@ -32001,11 +32061,13 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym, flag_spelling_synonym):
+    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym,
+                     flag_spelling_synonym, bare_wait_synonym):
         # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
         # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
         # sits between them: it only looks at a call that already leads with a real command, which is what the
-        # two before it have just made sure of, and it reads flags only by name.
+        # two before it have just made sure of, and it reads flags only by name. `bare_wait_synonym` last: it
+        # reads flags in canonical spelling, which the one before it has just produced.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
