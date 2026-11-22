@@ -15991,6 +15991,31 @@ def land_pin_behind_refusal(repo: str, number: int, pin: str, head: str,
             f"glaeda-gh land {name} --match-head-commit {head}")
 
 
+LAND_PIN_PREFIX = 12  # hex a pin must share with the cached head before a differing tail reads as hand-written
+
+
+def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str) -> tuple[str, str] | None:
+    """(why, the step that clears it) when PIN is a 40-hex sha that starts with this host's cached head and then
+    differs from it, else None. No read of any kind, local or remote: two strings.
+
+    A pin is otherwise trusted as given (the comment above check_land_pin), and must be, because the cache's head is
+    routinely older than the head an agent just pushed. This is the one shape that cannot be a real newer commit: a
+    sha sharing LAND_PIN_PREFIX hex with the head and differing after it is one chance in 2^48 as two commits, and
+    the everyday way to write one is to take the abbreviated head a command printed and fill in the rest. Measured
+    twice on 2026-11-21: `71b0560d5f` plus zeros, for a head ending `ffc48103c984e90c77ec6672abaeac5`. Both requests
+    were accepted, and a row pinned to a sha no commit has can only wait out a head that will never come."""
+    if not pin or not SHA40.fullmatch(pin) or not SHA40.fullmatch(head or ""):
+        return None
+    pin, head = pin.lower(), head.lower()
+    if pin == head or pin[:LAND_PIN_PREFIX] != head[:LAND_PIN_PREFIX]:
+        return None
+    name = f"{repo}#{number}"
+    return (f"--match-head-commit {pin[:12]} starts with {name}'s head {head[:12]} and then differs from it: that is "
+            f"an abbreviated head written out by hand, not another commit, and {repo} has no such sha, so the land "
+            f"would wait out a head that cannot come. The whole head, as this host last read it, is {head}",
+            f"glaeda-gh land {name} --match-head-commit {head}")
+
+
 def land_cached_head(key: str, max_age: float) -> str:
     """The head this host's cache holds for KEY, when its read is at most MAX_AGE old and says the PR is open, else "".
     A failed, absent or stale read says nothing, as it does for land_draft_refusal."""
@@ -16006,7 +16031,7 @@ def land_cached_head(key: str, max_age: float) -> str:
 # The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
 # the executor unchanged (cmd_land_forwarded prints them and drops the staged copy, land_forward_exit fails on them),
 # because the executor is the host that holds the cache and the land-judge the answer came from.
-LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft", "land_pin_behind")
+LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft", "land_pin_behind", "land_pin_invented")
 
 
 def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple[str, str] | None:
@@ -16064,7 +16089,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
-    behind = land_pin_behind_refusal(repo, number, sha, land_cached_head(key, LAND_PIN_BEHIND_AGE)) if sha else None
+    cached = land_cached_head(key, LAND_PIN_BEHIND_AGE) if sha else ""
+    invented = land_pin_extends_head_refusal(repo, number, sha, cached) if sha else None
+    if invented is not None:
+        # Before the ancestor check, which would say nothing here: no checkout holds a commit that does not exist.
+        return land_request_refused(key, "land_pin_invented", *invented, as_json=as_json)
+    behind = land_pin_behind_refusal(repo, number, sha, cached) if sha else None
     if behind is not None:
         # Same place, same reason as the draft answer: a pin the head has already passed can only stop later.
         return land_request_refused(key, "land_pin_behind", *behind, as_json=as_json)
