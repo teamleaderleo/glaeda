@@ -3801,11 +3801,21 @@ def direct_env() -> dict:
     return {**os.environ, "LANE_GH_LANE": UPSTREAM_LANE}
 
 
+# One GET of a direct read through the broker (broker_transport) has at most this long, then is asked once more in what
+# is left of the read (if DIRECT_GET_RETRY_MIN is), never the whole read's budget. A lane VM, 2026-11-22: 503 land
+# refreshes answered "no answer within 60s" against 120 answered; one GET of a read (pulls/N, then the head's
+# check-suites and check-runs, the base's rules, each a lane-gh run) waited on the broker socket ("the broker dropped
+# a read's answer", "nothing listening on the broker socket ... waiting up to 180 s") and spent all 60 s itself.
+DIRECT_GET_SHARE = 25.0
+DIRECT_GET_RETRY_MIN = 5.0
+
+
 def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
     """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
     (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
-    time.monotonic() bound) and at most UPSTREAM_DEADLINE. Answers GitHub's status and JSON as http() does; a
-    refusal with no GitHub status is a 502 whose message is the refusal. GraphQL and writes are never sent."""
+    time.monotonic() bound), at most UPSTREAM_DEADLINE, and at most DIRECT_GET_SHARE a try (two tries). Answers
+    GitHub's status and JSON as http() does; a refusal with no GitHub status is a 502 whose message is the refusal.
+    GraphQL and writes are never sent."""
     exe = program_path(command[0])
 
     def send(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
@@ -3816,16 +3826,23 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
                                                    f"not {method} {parts.path}"}).encode()
         args = {"path": urllib.parse.unquote(m.group(2)),
                 "query": dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))}
-        left = min(UPSTREAM_DEADLINE, deadline() - time.monotonic())
-        if left <= 0:
-            raise OutOfTime
-        try:
-            result = run_bounded([exe, *command[1:], m.group(1), "-"], left, input_text=json.dumps(args),
-                                 env=direct_env())
-        except subprocess.TimeoutExpired:
-            raise OutOfTime from None
-        except OSError as error:
-            raise WatchError(f"direct: {type(error).__name__} running {command[0]}") from None
+        for attempt in range(2):
+            left = min(UPSTREAM_DEADLINE, deadline() - time.monotonic())
+            if left <= 0:
+                raise OutOfTime(f"no time left for GET {args['path']}")
+            share = min(left, DIRECT_GET_SHARE)
+            try:
+                result = run_bounded([exe, *command[1:], m.group(1), "-"], share, input_text=json.dumps(args),
+                                     env=direct_env())
+                break
+            except subprocess.TimeoutExpired:
+                # One GET's share is spent (a broker socket wait, a dropped answer): it is asked once more in what
+                # is left, never left to eat the whole read (DIRECT_GET_SHARE)
+                if attempt or deadline() - time.monotonic() < DIRECT_GET_RETRY_MIN:
+                    raise OutOfTime(f"GET {args['path']}: no answer in its {share:.0f}s share"
+                                    + (", twice" if attempt else "")) from None
+            except OSError as error:
+                raise WatchError(f"direct: {type(error).__name__} running {command[0]}") from None
         try:
             answer = json.loads(result.stdout) if result.stdout.strip() else None
         except ValueError:
@@ -11902,6 +11919,17 @@ LAND_STALE_CHECKOUT_FILE = "stale-checkout.json"  # LandQueue.check_behind's war
 # own update-branch, so it sat out LAND_HEAD_TIMEOUT and judged unpinned; cmux#44209's held 02:24Z data for hours.
 LAND_REFRESH_AFTER = float(UPSTREAM_DIRECT_AFTER)
 LAND_REFRESH_EVERY = float(STALE_DATA_AFTER)
+# A land refresh that fails on the broker (no answer within its budget, the socket dropped or not listening, the broker
+# busy: LAND_REFRESH_BROKER) holds this host's further refreshes for LAND_REFRESH_BROKER_HOLD, doubling per such failure
+# in a row up to LAND_REFRESH_BROKER_HOLD_MAX; past it one refresh probes (the others still held) and an answer ends
+# the hold. A quota refusal that names its reset (land_read_quota, land_quota_said) holds them until that reset, as
+# park_queue_quota holds the queue. Held, an entry is judged on the copy it has, as after a failed read. A lane VM,
+# 2026-11-22: 503 refreshes "no answer within 60s" against 120 answered, rows failing in pairs in the same second:
+# every worker spent its own 60 s on the same broker outage.
+LAND_REFRESH_BROKER = re.compile(r"^no answer within \d|\bdirect: (?:busy\b|.*\bbroker\b)")
+LAND_REFRESH_BROKER_HOLD = 30.0
+LAND_REFRESH_BROKER_HOLD_MAX = 600.0
+LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land status` names the entry's (count, error)
 # A host with its own login (the broker host) reads its landing PRs in the daemon's waited pass, and the land worker's
 # nudge only marks the PR waited there. With hundreds of waited PRs that pass ran hours behind, and nothing else read a
 # due entry's PR: 2026-11-22 01:00Z, a PR (157/157 green, three pinned land requests at one head) sat on a copy
@@ -14350,6 +14378,9 @@ class LandQueue:
         self.reads_upstream = reads_upstream
         self.refresh = refresh
         self.own_refreshed: list[float] = []  # this host's own-login refreshes in the last LAND_WINDOW_S (refresh_due)
+        # this host's shared refresh hold (LAND_REFRESH_BROKER_HOLD): {"kind": "broker"|"quota", "until", "n", "why"}
+        self.refresh_hold: dict | None = None
+        self.refresh_probe: str | None = None  # the key whose refresh probes past an ended broker hold, while it runs
         self.behind = behind
         self.behind_at = float("-inf")
         self.stale_checkout: tuple[str, str | None] | None = None  # check_behind's last finding, numbers out
@@ -16391,10 +16422,12 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif len(self.jobs) < self.workers():  # no free worker: read on a later pass
-                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
+            elif len(self.jobs) < self.workers() and not self.refresh_held():  # no free worker: a later pass
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
+                # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
                 w["readAt"] = w["directAt"] = self.now
-                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None}
+                e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
+                                **self.refresh_starting(e["key"])}
                 self.submit(e["key"], self.refresh_job, e["key"])
             self.save(e)
         return True
@@ -16521,22 +16554,81 @@ class LandQueue:
                 e["feedNoRefresh"] = at
                 self.count("feed_norefresh")
             return False  # nothing reached the PR since that copy was read: reading it again reads the same
+        if self.refresh_held():
+            self.count("refresh_held")
+            return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
         if len(self.jobs) >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
-        e["refresh"] = {"at": self.now, "age": round(self.now - at)}
+        e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
         self.save(e)
         self.submit(e["key"], self.refresh_job, e["key"])
         return True
 
-    def refresh_job(self, key: str) -> None:
-        error = self.refresh(key)
+    def refresh_held(self) -> bool:
+        """Whether this host's land refreshes are held (LAND_REFRESH_BROKER_HOLD): before the hold's end, or while the
+        one refresh probing past it runs."""
         with self.lock:
+            h = self.refresh_hold
+            return self.refresh_probe is not None or (h is not None and self.now < float(h["until"]))
+
+    def refresh_starting(self, key: str) -> dict:
+        """A refresh starts: past an ended hold it is the probe ({"probe": True}), the only one until it answers."""
+        with self.lock:
+            if self.refresh_hold is None:
+                return {}
+            self.refresh_probe = key
+            return {"probe": True}
+
+    def refresh_outcome(self, key: str, error: str | None) -> dict | None:
+        """The shared hold after KEY's refresh ended with ERROR (None: answered); the hold this refresh set or extended,
+        for its log row, else None. Under self.lock."""
+        now = self.now
+        probe, h = self.refresh_probe == key, self.refresh_hold
+        if probe:
+            self.refresh_probe = None
+        said = land_quota_said(error, now) if error and land_read_quota(error) else None
+        if said is not None and said > now:
+            if h is not None and float(h["until"]) >= said:
+                return None  # a later refusal never shortens a hold
+            self.refresh_hold = {"kind": "quota", "until": said, "n": int((h or {}).get("n") or 0),
+                                 "why": land_trim(error, 160)}
+        elif error and self.reads_upstream() and LAND_REFRESH_BROKER.search(error):
+            if h is not None and now < float(h["until"]) and not probe:
+                return None  # a read started before the hold: the outage is counted once
+            n = int((h or {}).get("n") or 0) + 1 if (h or {}).get("kind") == "broker" else 1
+            until = now + min(LAND_REFRESH_BROKER_HOLD_MAX, LAND_REFRESH_BROKER_HOLD * 2 ** (n - 1))
+            if h is not None and float(h["until"]) >= until:
+                return None
+            self.refresh_hold = {"kind": "broker", "until": until, "n": n, "why": land_trim(error, 160)}
+        else:
+            if h is not None and (error is None or h.get("kind") == "broker" or now >= float(h["until"])):
+                self.refresh_hold = None  # GitHub or the broker answered: the hold ends
+            return None
+        hold = self.refresh_hold
+        return {"kind": hold["kind"], "until": utc_clock(float(hold["until"])), "n": hold["n"]}
+
+    def refresh_job(self, key: str) -> None:
+        try:
+            error = self.refresh(key)
+        except BaseException:
+            with self.lock:
+                if self.refresh_probe == key:
+                    self.refresh_probe = None  # a probe that raised never holds every later refresh
+            raise
+        with self.lock:
+            hold = self.refresh_outcome(key, error)
             e = self.entries.get(key)
             if e is None:
                 return
+            probe = bool((e.get("refresh") or {}).get("probe"))
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
+            if error:  # in a row with no answer (LAND_REFRESH_UNANSWERED); ever answered, for `land status`
+                e["refreshUnanswered"] = int(e.get("refreshUnanswered") or 0) + 1
+            else:
+                e["refreshUnanswered"] = 0
+                e["refreshAnswered"] = True
             w = e.get("pinWait")
             if isinstance(w, dict) and w.get("directAt") is not None:  # a pinned land's direct read (pin_wait)
                 if error and land_read_quota(error):
@@ -16544,7 +16636,9 @@ class LandQueue:
                 else:
                     w["directFails"] = int(w.get("directFails") or 0) + 1 if error else 0
                 w["directError"] = land_trim(error, 160) if error else None
-            log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error})
+            log({"event": "land-refresh", "key": key, "age": e["refresh"].get("age"), "error": error,
+                 **({"probe": True} if probe else {}), **({"hold": hold} if hold else {}),
+                 **({"unanswered": e["refreshUnanswered"]} if error else {})})
             self.save(e)
 
     def comment_seen(self, w: dict) -> bool:
@@ -18944,6 +19038,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
     s = e.get("streak") or {}
     if s.get("count", 0) > 1:
         bits.append(f"refused {s['count']}x ({str(s.get('signature', '')).split('|')[0]})")
+    unanswered = int(e.get("refreshUnanswered") or 0)
+    if unanswered >= LAND_REFRESH_UNANSWERED and e["state"] in ("queued", "waiting", "judging"):
+        bits.append(f"refresh unanswered {unanswered}x{'' if e.get('refreshAnswered') else ' (never answered)'}: "
+                    f"{land_trim(str((e.get('refresh') or {}).get('error') or '?'), 120)}")
     if e["state"] == "merged" and e.get("mergeSha"):
         bits.append(f"merge {e['mergeSha'][:12]}")
     if e["state"] == "stopped":
@@ -23268,8 +23366,8 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             else:
                 daemon.fetch_run(entry)
                 error = None
-    except OutOfTime:
-        return f"no answer within {budget:g}s"
+    except OutOfTime as stop:
+        return f"no answer within {budget:g}s" + (f" ({stop})" if str(stop) else "")
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
     finally:
