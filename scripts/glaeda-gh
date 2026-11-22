@@ -22246,9 +22246,15 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                 raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never "
                                  "changes, and its run-name does not name that full commit as the one it tested")
             if not exact and not final:
+                # The full head, not an abbreviation, because the abbreviation is how a caller got
+                # here: every line this tool prints names a head as 10 or 12 hex digits, and that
+                # string passed back as --sha lands exactly here once the branch moves. Naming the
+                # commit in the form the flag accepts makes the next call a paste instead of a
+                # `gh pr view --json headRefOid` round trip.
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
-                                 f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
-                                 "GitHub has not seen yet")
+                                 f"({head[:12]}). The head GitHub shows now is {head}: that, as --sha, is the "
+                                 "wait that ends. To wait instead for a push GitHub has not seen yet, pass that "
+                                 "commit's own full id (git rev-parse HEAD)")
         elif head and not exact:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True

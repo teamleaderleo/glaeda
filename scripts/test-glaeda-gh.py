@@ -6398,6 +6398,10 @@ class ClientTest(Base):
             gg.git_rev_parse = lambda prefix: None  # not a commit in this checkout
             with self.assertRaisesRegex(gg.WatchError, "not the head GitHub shows \\(aaaaaaaaaaaa\\)"):
                 self.wait("pr", "o/r#1", fill=(green, {}), sha="abcdef1")
+            # the refusal names the head in the form --sha takes, since the abbreviation a printed
+            # line gave the caller is what brought them here
+            with self.assertRaisesRegex(gg.WatchError, f"head GitHub shows now is {'a' * 40}:"):
+                self.wait("pr", "o/r#1", fill=(green, {}), sha="abcdef1")
             self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="AAAAAAA")[0], 0)
             gg.git_rev_parse = lambda prefix: prefix + "0" * (40 - len(prefix))  # a local commit not pushed yet
             self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="bbbbbbb", timeout=0.3)[0], 2)
