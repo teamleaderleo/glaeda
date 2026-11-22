@@ -1976,6 +1976,28 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 6 * gg.TICK + gg.CONTROLLER_ABSENT + 1)
         self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
 
+    def test_the_feed_view_a_downstream_rules_with_is_kept_for_read(self) -> None:
+        """save_feed_view / feed_view (UPSTREAM_FEED_FILE): the view `read` gives a downstream host says what
+        land_feed_quiet says here, and says nothing once the feed is out."""
+        sha = "b" * 40
+        key, data = "pr:o/r#1", {"headRefOid": sha, "headRefName": "topic"}
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        view = gg.feed_view(key, data, gg.load_feed_view(), NOW + gg.TICK)
+        self.assertEqual((view["liveSince"], view["at"], view["eventAt"], view["head"]),
+                         (self.daemon.feed_live_since, NOW + gg.TICK, None, sha))
+        self.assertIsNone(gg.feed_view("pr:x/y#1", data, gg.load_feed_view(), NOW + gg.TICK), "a repo not covered")
+        self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), NOW + gg.TICK + gg.CONTROLLER_FRESH + 1),
+                          "a feed that stopped answering")
+        self.ctl.suites.append({"id": 6, "repo": "o/r", "head_sha": sha, "status": "completed"})
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        view = gg.feed_view(key, data, gg.load_feed_view(), NOW + 2 * gg.TICK)
+        self.assertEqual(view["eventAt"], NOW + 2 * gg.TICK)  # its head's checks
+        self.ctl.down = True
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), NOW + 3 * gg.TICK), "the feed is out")
+
     def test_a_new_controller_has_to_show_its_coverage_again(self) -> None:
         self.daemon.tick(NOW)
         self.feed_covers()
@@ -2438,6 +2460,48 @@ class UpstreamTest(Base):
                          [{"key": "pr:o/r#7", "jobs": False, "reader": f"{gg.policy_host()}/tool:test"}])
         self.assertEqual(gg.read_cache("pr:o/r#7")["data"], {"number": 7})
         self.assertEqual(self.gh.calls, [])
+
+    def test_an_upstream_hosts_feed_quiet_follows_the_upstreams_view(self) -> None:
+        """A lane VM follows no feed (controller "off"), so land_feed_quiet was always False there and every waited
+        or landing PR was re-read through the broker every UPSTREAM_DIRECT_AFTER (huge-blue, 2026-11-21 22Z: 11,673
+        of glaeda-upstream's 14,180 GETs a path the same VM had read before). The upstream's feed view rules instead."""
+        key, sha = "pr:o/r#7", "a" * 40
+        gg.register(key)
+        since = NOW - 300
+        view = {"liveSince": NOW - 3600, "at": NOW - 2, "eventAt": NOW - 900, "head": sha}
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since, "feed": view}
+        self.daemon.tick(now=NOW)
+        self.assertTrue(self.daemon.land_feed_quiet(key, "", since))
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        self.assertFalse(self.daemon.land_feed_quiet(key, "c" * 40, since), "a head the view was not taken for")
+        self.assertFalse(self.daemon.land_feed_quiet(key, "", NOW - 950), "an event after that copy")
+        self.assertFalse(self.daemon.land_feed_quiet(key, "", NOW + 10), "the feed has not answered past it")
+        self.assertTrue(self.daemon.wait_feed_quiet({"kind": "pr", "key": key}, gg.read_cache(key), NOW))
+        self.daemon.now = NOW + gg.UPSTREAM_FEED_FRESH + 1
+        self.assertFalse(self.daemon.land_feed_quiet(key, "", since), "a view the upstream has not renewed")
+        # an upstream that gives no view (an older glaeda-gh, a feed that is out) holds nothing quiet
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertFalse(self.daemon.land_feed_quiet(key, "", since))
+        self.answers[key] = {"data": self.pr_data(), "dataAt": since,
+                             "feed": {**view, "at": NOW + gg.UPSTREAM_EVERY, "liveSince": since + 1}}
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.assertFalse(self.daemon.land_feed_quiet(key, "", since), "the feed was not live before the copy")
+
+    def test_read_answers_a_prs_feed_view(self) -> None:
+        sha = "a" * 40
+        self.daemon.store("pr:o/r#7", None, data={"number": 7, "headRefOid": sha}, dataAt=NOW)
+        now = time.time()
+        gg.write_json(gg.BASE / gg.UPSTREAM_FEED_FILE, {"liveSince": now - 600, "okAt": now - 1,
+                                                        "fedRepos": {"o/r": now - 30},
+                                                        "marks": {f"sha:o/r@{sha}": now - 100, "pr:o/r#8": now - 5}})
+        out = io.StringIO()
+        req = json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}]})
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(req), 0)
+        self.assertEqual(json.loads(out.getvalue())["entries"]["pr:o/r#7"]["feed"],
+                         {"liveSince": now - 600, "at": now - 1, "eventAt": now - 100, "head": sha})
 
     def test_read_registers_and_answers_from_the_cache(self) -> None:
         self.daemon.store("pr:o/r#7", None, data={"number": 7}, dataAt=NOW)
