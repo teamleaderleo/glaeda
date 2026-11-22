@@ -57,6 +57,7 @@ loader.exec_module(gg)
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 LAND_WORKER_CEILING = gg.land_worker_ceiling  # the real one: Base pins it to 4
 LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
+LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -678,9 +679,9 @@ class Base(unittest.TestCase):
         self.addCleanup(execv.stop)
         # The land pool is sized from the host's cores and RAM (land_worker_ceiling): pinned to 4 workers on 8 cores
         # here, so a suite on any runner sizes the same; the load is reported only, pinned unknown, and the free RAM
-        # unreported (mem_room admits).
+        # and CPU unreported (headroom_left admits; the ceiling holds).
         for name, value in (("land_cores", 8), ("land_worker_ceiling", 4), ("land_load_per_core", None),
-                            ("land_mem_available", None)):
+                            ("land_mem_available", None), ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
             pin.start()
             self.addCleanup(pin.stop)
@@ -29468,24 +29469,69 @@ class LandTest(Base):
             self.assertEqual(gg.land_mem_total(), 16384)
             self.assertIsNone(LAND_MEM_AVAILABLE())
 
-    def test_past_the_first_judgment_none_starts_into_the_hosts_last_fifth_of_ram(self):
-        """The handbook's measured admission: a judgment past the first starts only while the host's free RAM stays over
-        the 80% line; the first always runs, and a host that does not report MemAvailable is held by the ceiling."""
+    def test_admission_reads_the_hosts_live_headroom_each_pass_and_charges_each_start(self):
+        """ci-217x ruling, 2026-11-22 10:15Z: the land host was 81% busy from other work (idle 18.5%, nice 33.8% of 32
+        cores, MemAvailable 39.0 of 65.8 GB) while its load read 0.3-0.46/core. So past the first running judgment a
+        pass starts only as many as the free CPU (idle+nice, which a judgment preempts) and MemAvailable hold over
+        the 80% line at a judgment's measured cost, re-read the next pass; the review's F1: each start this pass is
+        charged, so one read never admits the whole ceiling."""
         gib = 1 << 30
+        self.w.config["workers"] = 40  # land.json overrides the ceiling; admission applies under it
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        # 8 cores, 25% free: (0.25 - 0.2) * 8 / LAND_JUDGMENT_CORES = 2.3 starts; RAM ample
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.25), \
+                mock.patch.object(gg, "land_mem_total", return_value=64 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=60 * gib):
+            self.assertEqual(int(self.q.headroom_left()[0]), 2)
+            for _ in range(2):
+                self.assertIsNone(self.q.headroom_why())
+                self.q.headroom_take()
+            self.assertEqual(self.q.headroom_why(), "the host's free CPU is at the 80% line (/proc/stat idle+nice)")
+            self.q.now += 1  # the next pass reads the host again
+            self.assertIsNone(self.q.headroom_why())
+        # RAM: 16 GiB, 3.3 GiB free: under 20% after one more judgment
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.9), \
+                mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=3.3 * gib):
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_why(), "the host's free RAM is at the 80% line (MemAvailable)")
+        with mock.patch.object(gg, "land_mem_total", return_value=None):  # unreported: the ceiling holds
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_left(), (math.inf, math.inf))
+        self.q.jobs.clear()
+
+    def test_a_held_row_names_the_headroom_and_the_first_judgment_always_runs(self):
         self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
         self.land()
         self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
-        with mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
-                mock.patch.object(gg, "land_mem_available", return_value=3 * gib):
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
             self.tick()
             e = self.tick(gg.LAND_DUE_LATE + 1)
-        self.assertEqual((e.get("dueLate") or {}).get("why"), "the host's free RAM is at the 80% line (MemAvailable)")
+        self.assertEqual((e.get("dueLate") or {}).get("why"),
+                         "the host's free CPU is at the 80% line (/proc/stat idle+nice)")
         self.q.jobs.clear()
         self.w.answers.append(ok_answer(LA))
-        with mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
-                mock.patch.object(gg, "land_mem_available", return_value=3 * gib):
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
             e = self.tick(1)  # nothing else runs: the first always does
         self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+
+    def test_the_free_cpu_is_idle_plus_nice_over_a_bounded_window(self):
+        stats = iter([(100, 50, 50, 700, 0, 0, 0, 0), (110, 80, 60, 750, 0, 0, 0, 0),  # fresh: nice 30 + idle 50 of 100
+                      (200, 80, 60, 750, 0, 0, 0, 0)])  # 1.5 s later: 90 busy of 90
+        saved = list(gg._LAND_CPU)
+        self.addCleanup(lambda: gg._LAND_CPU.__setitem__(slice(None), saved))
+        gg._LAND_CPU[:] = [None, None, None]
+        with mock.patch.object(gg, "land_proc_stat", side_effect=lambda: next(stats)), \
+                mock.patch.object(gg.time, "sleep") as slept:
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.0), 0.8)
+            slept.assert_called_once_with(gg.LAND_CPU_FRESH)
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.5), 0.8)  # under LAND_CPU_WINDOW_MIN: the last share
+            self.assertAlmostEqual(LAND_CPU_FREE(1001.75), 0.0)  # the window since the last read
+        with mock.patch.object(gg, "land_proc_stat", return_value=None):
+            gg._LAND_CPU[:] = [None, None, None]
+            self.assertIsNone(LAND_CPU_FREE(1000.0))
+        with mock.patch("builtins.open", mock.mock_open(read_data="cpu 1 2\n")):
+            self.assertIsNone(gg.land_proc_stat())  # a short line reads as unknown, not an error
 
     def test_the_hosts_load_holds_no_judgment(self):
         """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
