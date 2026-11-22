@@ -29586,8 +29586,9 @@ class LandTest(Base):
     def test_the_pool_takes_a_raised_worker_count_without_a_restart(self):
         self.w.config["workers"] = 1
         self.q.inline = False
-        self.q.submit("pr:o/r#1", lambda: None)
-        self.assertEqual(self.q.pool._max_workers, 8)  # every core: a raised "workers" needs no new pool
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=10 * 1024):  # 20 judgments' worth
+            self.q.submit("pr:o/r#1", lambda: None)
+        self.assertEqual(self.q.pool._max_workers, 20)  # the adaptive ceiling: a raised "workers" needs no new pool
         self.w.config["workers"] = 4
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
@@ -29635,6 +29636,7 @@ class LandTest(Base):
             q.adapt_pool()
             self.assertEqual(q.workers(), 80)
             q.pass_gated = 3
+            q.now += 1
             q.park_quota({"key": "pr:o/r#1", "state": "judging", "history": []}, "API rate limit exceeded")
             q.now += gg.LAND_POOL_ADAPT_S
             q.adapt_pool()
