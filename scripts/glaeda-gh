@@ -12695,7 +12695,7 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
-                            "run_done", "comment_seen", "reran", "fp_moved", ""})
+                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
@@ -15979,6 +15979,8 @@ class LandQueue:
         if not data:
             since = e.setdefault("noDataSince", self.now)
             self.nudge(e["key"])
+            if self.no_data_backoff(e, woke):
+                return  # the last no-data judgment judged nothing: its retry's backoff, not LAND_NO_DATA_AFTER again
             # land_judge reads the head; a full pin (land_full_pin) is judged at once on the caller's own read
             if (self.now - since >= LAND_NO_DATA_AFTER or land_full_pin(e)) and self.judge(e, "", fp, why="no_data"):
                 e.pop("noDataSince", None)
@@ -16030,6 +16032,11 @@ class LandQueue:
                 self.judge(e, head, fp, why=("head_moved" if moved else "comment_seen") if seen else "woke")
             return
         if kind == "retry":
+            if head and not e.get("seenHead") and (e.get("explain") or {}).get("code") in LAND_NOT_JUDGED:
+                # The daemon's first read of a PR whose last judgment had no copy to go on and judged nothing
+                # (no_data_backoff): judged on it now, not at the end of the backoff that read was waited for
+                self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="data_seen")
+                return
             if (moved and not running) or woke:
                 if not moved and self.feed_holds(e, head):
                     return  # the wait judged before this could-not-judge answer stands (LAND_FEED_QUIET_MAX)
@@ -16234,6 +16241,25 @@ class LandQueue:
             e["feedVerdict"] = {"head": head, "at": at, "code": code, "kind": act.get("kind")}
         else:
             e.pop("feedVerdict", None)
+
+    def no_data_backoff(self, e: dict, woke: bool) -> bool:
+        """True while E, whose PR the daemon's cache still holds no copy of, waits out the backoff its last judgment
+        named: that judgment judged nothing (LAND_NOT_JUDGED: unreadable, host_cap, explain_failed) and took a retry
+        wait (take: LAND_RETRY_DEFAULT doubling per retry at the head, to LAND_RETRY_MAX), and the wait has not woken.
+
+        The no-data path judged again LAND_NO_DATA_AFTER after every answer, its retry's wake never read, so a PR the
+        daemon could not read was judged every ~120 s plus the judgment's own ~3 min, each time the same read the
+        daemon had just failed. Queue host, 2026-11-22 14:37-15:37Z (32/32 workers busy, ~700 lands due late):
+        212 unreadable judgments held 49,658 worker-seconds (59% of all), 118 of them why=no_data; 11 checks_running
+        and 20 merges were no_data too. Nothing is stranded: the wake is at most LAND_RETRY_MAX away (LAND_FEED_QUIET_MAX),
+        and the daemon's first copy of the PR (its read after a nudge, a feed event or its own pass) is judged at
+        once (consider's retry branch, why=data_seen)."""
+        x = e.get("explain") or {}
+        if woke or e["state"] != "waiting" or (e.get("wait") or {}).get("kind") != "retry" \
+                or str(x.get("code") or "") not in LAND_NOT_JUDGED:
+            return False
+        wake = e.get("wakeAt")
+        return isinstance(wake, (int, float)) and not isinstance(wake, bool) and wake - self.now <= LAND_RETRY_MAX
 
     def feed_holds(self, e: dict, head: str) -> bool:
         """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
