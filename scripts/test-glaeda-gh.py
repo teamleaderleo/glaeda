@@ -25517,11 +25517,10 @@ class LandTest(Base):
                 self.assertEqual(self.merge_envs(), [])
 
     def test_land_override_past_lane_gh_lands_limits_is_refused_at_enqueue(self):
+        # Only what no guess fixes is refused: one of the pair alone, or an empty one.
         bad = [["--override-reason", "r"], ["--override-receipt", "t"],
-               ["--override-reason", "r" * 201, "--override-receipt", "t"],
-               ["--override-reason", "r", "--override-receipt", "t" * 241],
-               ["--override-reason", "two\nlines", "--override-receipt", "t"],
-               ["--override-reason", "r", "--override-receipt", "two\nlines"]]
+               ["--override-reason", "  ", "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", ""]]
         for extra in bad:
             said: list[str] = []
             with self.subTest(extra=[w[:12] for w in extra]), \
@@ -25531,10 +25530,21 @@ class LandTest(Base):
                 self.assertRegex(" ".join(said), r"override-re(ason|ceipt)")
                 d = gg.LandQueue.requests_dir()
                 self.assertEqual(list(d.glob("*.json")) if d.is_dir() else [], [], "nothing queued")
-        # the limits themselves are allowed
+        # the limits themselves are allowed, unchanged
         self.assertEqual(gg.land_override("r" * 200, "t" * 240), {"reason": "r" * 200, "receipt": "t" * 240})
-        # a forwarded request past them carries no override into the queue
-        self.assertIsNone(gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}}))
+
+    def test_a_reason_two_characters_too_long_is_fitted_not_refused(self):
+        """2026-11-21: a 202-character reason cost a refusal and a second land call, for 2 characters."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            got = gg.land_override("r" * 202, "two\nlines  and   padding")
+        self.assertEqual(len(got["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
+        self.assertTrue(got["reason"].endswith("\u2026"), got["reason"][-8:])
+        self.assertTrue(got["reason"].startswith("r" * 199), "the head is what a reason names first")
+        self.assertEqual(got["receipt"], "two lines and padding")  # one line, no refusal
+        self.assertRegex(err.getvalue(), r"fitted to one line of (200|240)")
+        # a forwarded request past them is fitted too, so the queue still checks an override it can keep
+        kept = gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}})
+        self.assertEqual(len(kept["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
 
     def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
         self.broker = True
