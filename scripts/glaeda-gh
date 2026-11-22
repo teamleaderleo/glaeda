@@ -802,6 +802,16 @@ STALE_VALVE_COOLDOWN = 1800
 # valve answering "one_key" every tick, and a person running `glaeda-gh restart` each time. Above 3963 s, which the
 # 11-18 incident's rule was made for, and below the hours a person waited.
 STALE_ONE_KEY_MAX = 2 * 3600
+# And one key is a few keys: past this many waited keys over STALE_DATA_AFTER, one fresh waited key is no reason to hold
+# the valve. cmux-cp-1, 2026-11-22 19:15-20:19Z: 181 of 318 waited PRs past the bound, "backlog: 263 pr reads stored",
+# the valve answering "one_key" every tick for 64 minutes (21 repeats held) while a person ran `glaeda-gh restart`.
+STALE_ONE_KEY_COUNT = 3
+# When each waited key's wait began (Daemon.waited_since), kept in this file so a restart does not start the stale clock
+# over. A land's waited watch carries no waitBegan, so every restart set its blocked time to zero: cmux-cp-1,
+# 2026-11-22 20:19Z, `glaeda-gh restart` "cleared" a FIRE at 1,823 s, and nine minutes later 223 of 346 waited PRs still
+# had data over 600 s old (p50 1,234 s). The restart had reset the alarm, not read anything. A file older than
+# WAIT_INTEREST at start is a daemon down longer than any wait's interest: its waits lapsed, and it is not read.
+WAITED_SINCE_FILE = "waited-since.json"
 # Read progress (daemon.json "progress", Daemon.stall_cause): the reads this daemon stored per kind over this window,
 # where its ticks spent their time (each top-level phase, the waits for a GraphQL slot, GitHub's answers) and the
 # request in flight. huge-blue, 2026-11-18: pr data for waits 3088 s, then 748 s 18 min after a restart, old behind a
@@ -1768,6 +1778,19 @@ def outbox_dir() -> Path:
 
 def posted_dir() -> Path:
     return BASE / "posted"  # finished writes: the URL, or why it failed (kept POST_KEEP)
+
+
+def waited_since_load() -> dict[str, float]:
+    """The waited keys' wait starts a daemon before this one kept (WAITED_SINCE_FILE), unless it is older than
+    WAIT_INTEREST; never in the future."""
+    doc = read_json(BASE / WAITED_SINCE_FILE)
+    if not isinstance(doc, dict) or not isinstance(doc.get("since"), dict):
+        return {}
+    at, now = doc.get("at"), time.time()
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= now - at < WAIT_INTEREST:
+        return {}
+    return {str(k): min(float(v), now) for k, v in doc["since"].items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
 def file_name(key: str) -> str:
@@ -5440,6 +5463,8 @@ class Daemon:
         self.refresh_notes: dict[tuple[str, str], dict] = {}  # (source, error) -> rate-limit state (refresh_note)
         self.newest_data: dict[str, float | None] = {}  # oldest_data's: per kind, the freshest live watch's data age
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
+        self.waited_since = waited_since_load()  # key -> when a wait took it, kept across a restart (WAITED_SINCE_FILE)
+        self.waited_since_saved = dict(self.waited_since)
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
         self.explained_at: dict[str, float] = {}  # kind -> the last tick stale_explained(kind) explained its old data
         self.stale_streak = 0  # ticks in a row the stale alarm found starvation nothing explains (the valve)
@@ -6055,7 +6080,8 @@ class Daemon:
             return level, text, {**data, "valve": data["cause"]}
         age = data.get("age")
         stuck = isinstance(age, (int, float)) and age > STALE_ONE_KEY_MAX  # STALE_ONE_KEY_MAX's comment
-        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER and not stuck:
+        many = (getattr(self, "stale_count", None) or {}).get(data.get("kind"), 0) > STALE_ONE_KEY_COUNT
+        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER and not stuck and not many:
             # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
             # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
             # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
@@ -8681,6 +8707,10 @@ class Daemon:
         self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
+        if self.waited_since != self.waited_since_saved:
+            with contextlib.suppress(OSError):
+                write_json(BASE / WAITED_SINCE_FILE, {"at": self.clock(), "since": self.waited_since})
+            self.waited_since_saved = dict(self.waited_since)
         self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
         self.flush_refresh_notes()
         # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
@@ -8816,6 +8846,13 @@ class Daemon:
         finally:
             self.in_land = False
 
+    def land_read_room(self) -> int:
+        """How many due lands may hold a waited watch on their PR (LAND_WATCH_SHARE): a share of the PR reads this
+        daemon stored over the last READ_PROGRESS_WINDOW, so a slower GitHub narrows the window instead of leaving
+        every waited PR older than STALE_DATA_AFTER; at least LAND_WATCH_FLOOR."""
+        reads = sum(1 for t in self.read_done.get("pr", []) if self.now - t < READ_PROGRESS_WINDOW)
+        return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
+
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
         an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
@@ -8826,7 +8863,7 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
-                                        feed_quiet=self.land_feed_quiet)
+                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room)
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -9555,6 +9592,7 @@ class Daemon:
         self.blocked = {kind: 0 for kind in CYCLES}
         self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
+        self.stale_count = {kind: 0 for kind in CYCLES}  # waited keys blocked past STALE_DATA_AFTER (STALE_ONE_KEY_COUNT)
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
         # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
         # at zero, which capped its blocked time at zero and silenced the alarm (review of glaeda#1970, F1).
@@ -9584,6 +9622,8 @@ class Daemon:
             self.blocked[kind] += self.waited(e)
             if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
                 self.fresh_waited[kind] = age_s
+            if self.waited(e) and blocked > STALE_DATA_AFTER:
+                self.stale_count[kind] += 1
             if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
                 self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
@@ -13255,6 +13295,14 @@ LAND_PEEK_EVERY = 600.0
 # ago behind busy workers, and every one was waited: about 8,100 PR reads an hour the read loop cannot make, so even
 # the PRs a worker was about to judge went unread.
 LAND_WATCH_AHEAD = 2
+# And never more of them than the read loop can keep fresh: at most LAND_WATCH_SHARE of the PR reads this daemon stored
+# over the last READ_PROGRESS_WINDOW (one STALE_DATA_AFTER), and at least LAND_WATCH_FLOOR (a fresh daemon, or a lane VM
+# whose reads its upstream makes). The adaptive pool (adapt_pool) grows the workers, not the reads: cmux-cp-1,
+# 2026-11-22 19:15-20:19Z, 74 to 157 workers held 150-300 due lands waited, 318 waited PRs against 263-298 PR reads
+# stored per 600 s (each read 2+ s while GitHub answered 502 after 10.5 s), p50 waited data 1,034 s, and the stale alarm
+# FIRE'd twice in an hour. The rest are read like a parked entry, and the one a worker takes next is inside the window.
+LAND_WATCH_SHARE = 1 / 3
+LAND_WATCH_FLOOR = 16
 # A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
 # deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
 LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
@@ -14240,7 +14288,10 @@ class LandQueue:
                  peek: Callable[[str], None] | None = None,
                  head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading,
-                 feed_quiet: Callable[[str, str, float], bool] | None = None) -> None:
+                 feed_quiet: Callable[[str, str, float], bool] | None = None,
+                 read_room: Callable[[], int | None] | None = None) -> None:
+        # how many due lands may hold a waited PR watch, by the daemon's own read rate (LAND_WATCH_SHARE); None: no cap
+        self.read_room = read_room or (lambda: None)
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
@@ -14598,7 +14649,11 @@ class LandQueue:
         # Only the first LAND_WATCH_AHEAD per worker of the due entries, in the order workers take them, are read at
         # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
         due_keys = [k for k in order if self.due(self.entries[k])]
-        self.lean = set(due_keys[max(1, self.workers() * LAND_WATCH_AHEAD):])
+        window = max(1, self.workers() * LAND_WATCH_AHEAD)
+        room = self.read_room()
+        if room is not None:
+            window = max(1, min(window, int(room)))  # what the read loop keeps fresh (LAND_WATCH_SHARE)
+        self.lean = set(due_keys[window:])
         self.pass_wanted = []
         self.pass_ended = ended
         for key in order:

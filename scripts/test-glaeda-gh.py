@@ -6730,6 +6730,31 @@ class OverloadTest(Base):
         restarted.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old + 10, "waitBegan": old + 5}], set())
         self.assertEqual(restarted.waited_since[keys[0]], began)
 
+    def test_a_restart_keeps_the_stale_clock_of_a_wait_with_no_persisted_start(self) -> None:
+        """A land's waited watch carries no waitBegan, so a restart counted every one of them from zero: cmux-cp-1,
+        2026-11-22 20:19Z, a restart "cleared" a FIRE at 1823 s while 223 of 346 waited PRs stayed over 600 s old. The
+        daemon keeps waited_since in WAITED_SINCE_FILE, and the next one counts from it; a file older than WAIT_INTEREST
+        (a daemon down longer than any wait's interest) is not read."""
+        keys = self.watch(1)
+        gg.register(keys[0], waited=True, reader="tool:glaeda-land")  # a land's watch: no waitBegan
+        self.daemon.tick(NOW)
+        cache = gg.read_cache(keys[0])
+        begun = self.daemon.waited_since.get(keys[0])
+        self.assertIsNotNone(begun)
+        kept = gg.read_json(gg.BASE / gg.WAITED_SINCE_FILE)
+        self.assertEqual(kept["since"][keys[0]], begun)
+        old = begun + 3 * gg.STALE_DATA_AFTER
+        with mock.patch.object(gg.time, "time", return_value=kept["at"] + 5):
+            restarted = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        restarted.now = old
+        restarted.oldest_data([{"key": keys[0], "cache": {**cache, "dataAt": begun}, "waitedAt": old}], set())
+        self.assertEqual(restarted.waited_since[keys[0]], begun)
+        self.assertGreater(restarted.stale_waited["pr"], gg.STALE_DATA_AFTER)
+        self.assertIsNotNone(restarted.stale_alarm())
+        with mock.patch.object(gg.time, "time", return_value=kept["at"] + gg.WAIT_INTEREST + 1):
+            lapsed = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        self.assertEqual(lapsed.waited_since, {})
+
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
@@ -17962,6 +17987,26 @@ class SpendAlarmTest(AlarmBase):
             self.daemon.check_alarms()
         self.assertIsNotNone(self.daemon.valve_due, "an hours-old key is a read loop that cannot reach it")
         self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
+        self.assertIn("restarting itself now", self.told_lines()[-1])
+
+    def test_the_valve_restarts_for_a_backlog_of_many_stale_keys_though_some_are_fresh(self) -> None:
+        # cmux-cp-1, 2026-11-22 19:15-20:19Z: 181 of 318 waited PRs past the bound, "backlog: 263 pr reads stored",
+        # FIRE at 1823 s, and the valve answered one_key every tick because some waited PR was fresh
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 1823.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 30.0}
+        self.daemon.read_done = {**self.daemon.read_done, "pr": [NOW - 30] * 263}
+        self.daemon.stale_count = {"pr": gg.STALE_ONE_KEY_COUNT}  # a few: still one key's case
+        self.daemon.now = NOW
+        verdict = self.daemon.stale_valve(("warn", "x", {"kind": "pr", "key": "pr:o/r#5"}), self.daemon.policy["alarms"])
+        verdict = self.daemon.stale_valve(verdict, self.daemon.policy["alarms"])
+        self.assertEqual(verdict[2]["valve"], "one_key")
+        self.daemon.stale_count = {"pr": 181}
+        for i in range(2):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNotNone(self.daemon.valve_due, "181 stale waited keys are a backlog a restart is tried on")
         self.assertIn("restarting itself now", self.told_lines()[-1])
 
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
@@ -29754,6 +29799,45 @@ class LandTest(Base):
         self.retries(60)
         self.tick(30)
         self.assertEqual(self.explained()[:2], ["2000", "2001"])
+
+    def test_the_waited_window_is_no_wider_than_the_read_loop_keeps_fresh(self):
+        """cmux-cp-1, 2026-11-22 19:15-20:19Z: the adaptive pool at 74 to 157 workers held 150-300 due lands waited
+        (LAND_WATCH_AHEAD per worker) against 263-298 PR reads stored per 600 s, and p50 waited data was 1,034 s old.
+        The window is the workers' or the daemon's read room (LAND_WATCH_SHARE of its PR reads), whichever is less."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            if not key.startswith("head:"):
+                calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 10
+        room = [3]
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get,
+                              read_room=lambda: room[0])
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        for i in range(10):
+            self.q.jobs[f"pr:o/r#{90 + i}"] = Busy()
+        keys = [self.stuck(2000 + i, 3600 - 30 * i) for i in range(60)]  # due, oldest wake first
+        self.tick(30)
+        self.assertEqual({k for k, w, _ in calls if w}, set(keys[:3]))
+        self.assertEqual(self.q.lean, set(keys[3:]))
+        room[0] = 1000  # room past the workers' window: the workers' window holds
+        calls.clear()
+        self.tick(gg.LAND_TOUCH)
+        self.assertEqual(self.q.lean, set(keys[10 * gg.LAND_WATCH_AHEAD:]))
+        # the daemon's room: a share of its PR reads over the window, never under the floor
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.read_done = NOW, {"pr": [NOW - 30] * 300 + [NOW - gg.READ_PROGRESS_WINDOW - 1] * 500}
+        self.assertEqual(d.land_read_room(), int(300 * gg.LAND_WATCH_SHARE))
+        d.read_done = {"pr": []}
+        self.assertEqual(d.land_read_room(), gg.LAND_WATCH_FLOOR)
 
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
