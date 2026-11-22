@@ -5466,7 +5466,7 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = gd.HOME.stat().st_dev
         if self.root.stat().st_dev != dev:
             self.skipTest("the fake volume is HOME's; this temp dir is on another")
-        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
         dd = gd.Family("xcode-derived-data", self.root / "dd", True, "", min_idle_hours=12)
         dd.root.mkdir()
@@ -5512,7 +5512,7 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = gd.HOME.stat().st_dev
         if self.root.stat().st_dev != dev:
             self.skipTest("the fake volume is HOME's; this temp dir is on another")
-        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS"):
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
             self.addCleanup(setattr, gd, name, getattr(gd, name))
         root = self.root / "xcode"
         (root / "node-store/cas/00").mkdir(parents=True)
@@ -8610,7 +8610,7 @@ class GlaedaDiskTest(unittest.TestCase):
         nightly = gd.Family(gd.NIGHTLY_NEXT_FAMILY, self.root, True, "rebuild", build_output=True,
                             min_idle_hours=12.0, max_idle_hours=12.0)
         path = self.root / "x"
-        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True), mock.patch.object(gd, "job_starts",
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", "FLEET_CLAIMS_EXPIRE", True), mock.patch.object(gd, "job_starts",
                                                                                      return_value=[time.time()]):
             for mode in ("pressure", "sweep", None):
                 with mock.patch.object(gd, "ACTIVITY_MODE", mode):
@@ -8621,7 +8621,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual(gd.item_window(nightly, path, 1.0), 12.0)  # the queued nightly's warm inputs
             with mock.patch.object(gd, "cmux_next_ci_host_root", return_value=True):
                 self.assertNotEqual(gd.item_window(dd, path, 1.0), 0.0)  # one working cache per builder, by role
-        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", "FLEET_CLAIMS_EXPIRE", False):
             self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
 
     def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
@@ -8634,7 +8634,7 @@ class GlaedaDiskTest(unittest.TestCase):
                  gd.Item("ci-derived-data", os.fspath(held), 1024**2, 0.1, "in-use", ["open by a process"]),
                  gd.Item("tmp", os.fspath(loose), 1024**2, 0.1, "reclaimable")]
         fams = {"ci-derived-data": dd, "tmp": scratch}
-        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", "FLEET_CLAIMS_EXPIRE", True):
             out = gd.outlived_build_caches(items, fams)
         self.assertEqual((out["count"], out["bytes"]), (1, 2 * 1024**2))
         self.assertEqual(out["top"][0]["path"], os.fspath(left))
@@ -13379,7 +13379,7 @@ class ActivityClockTest(unittest.TestCase):
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
                 "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET",
-                "BUDGET_WARM_DEVS")
+                "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:
@@ -14540,6 +14540,7 @@ class TartLimaReferencesTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(gd, "HOME", self.home))
         stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
         stack.enter_context(mock.patch.dict(gd._LAUNCHD_INSTALLED, {}, clear=True))
+        stack.enter_context(mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False))  # a test turns it on itself
         gd._DISCOVERED.clear()
         self.addCleanup(gd._DISCOVERED.clear)
 
@@ -14615,6 +14616,31 @@ class TartLimaReferencesTest(unittest.TestCase):
             sizes = {os.fspath(build): 29 * gd.GIB, os.fspath(running): 30 * gd.GIB, os.fspath(bake): 40 * gd.GIB}
             fams = [self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)]
             self.assertEqual(gd._budget_dev_bytes(fams, sizes), {})
+
+    def test_a_persons_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """Leo, 2026-11-22: "it's the fleet. they dont have anything protected"."""
+        forever = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(forever, "leo", 26 * 24)
+        bare = self.lima_vm("no-owner", 26 * 24)
+        self.claim(bare, None, 26 * 24)
+        dated = self.lima_vm("leo-dated", 26 * 24)
+        (dated / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() + 3 * 3600}))
+        self.age(dated, 26 * 24)
+        lapsed = self.lima_vm("leo-lapsed", 26 * 24)
+        (lapsed / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() - 60}))
+        self.age(lapsed, 26 * 24)
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "reclaimable", items["leo-scratch"].reasons)
+        self.assertIn("claim by leo on a fleet mini is stale: it names no until", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["no-owner"].verdict, "reclaimable", items["no-owner"].reasons)
+        self.assertEqual(items["leo-dated"].verdict, "kept", items["leo-dated"].reasons)
+        self.assertIn("claimed by leo until", items["leo-dated"].reasons[-1])
+        self.assertEqual(items["leo-lapsed"].verdict, "reclaimable", items["leo-lapsed"].reasons)
+        self.assertIn("its until has passed", items["leo-lapsed"].reasons[-1])
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "off a fleet mini a person's claim still holds")
 
     def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
         base = self.tart_vm("ubase", 30 * 24, self.ECID)
