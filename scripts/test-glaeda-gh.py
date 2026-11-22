@@ -22685,7 +22685,9 @@ class LandWorld:
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
-            rc, out, err = self.handoff
+            # a list answers in order, its last answer for every call after
+            rc, out, err = (self.handoff.pop(0) if len(self.handoff) > 1 else self.handoff[0]) \
+                if isinstance(self.handoff, list) else self.handoff
             return subprocess.CompletedProcess(argv, rc, out + "\n", err)
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land"]:
             # the broker's land: the same merge knobs a host's `gh pr merge` reads, in lane-gh's envelope
@@ -26400,6 +26402,60 @@ class LandTest(Base):
         self.assertEqual(len(self.handoffs()), gg.LAND_STEP_STOP)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
         self.assertIn("unknown tool", e["stop"]["reason"])
+
+    STALE = "PR 1's head is " + LB + ", not " + LA + ": nothing was queued. The hand-off is for the PR's head now"
+
+    def stale_handoff(self) -> tuple[int, str, str]:
+        return (1, json.dumps({"ok": False, "error": "refused: " + self.STALE}, indent=1),
+                "lane-gh call land_handoff: refused: " + self.STALE)
+
+    def test_a_hand_off_at_a_stale_head_is_handed_again_at_the_head_the_broker_read(self):
+        # cmux#49708, 2026-11-22: the head a VM hands is its own copy's, which on a VM that cannot read GitHub can be
+        # hours old. The broker refuses it naming GitHub's head; the hand-off goes again at that head at once, never
+        # counted toward handoff_refused.
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        ok = self.w.handoff
+        self.w.handoff = [self.stale_handoff(), ok]
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
+        self.assertEqual((e["state"], e["handedOff"]["head"], e["head"]), ("forwarded", LB, LB))
+        self.assertTrue(any(h.get("event") == "handoff_repinned" for h in e["history"]), e["history"])
+        self.assertFalse(any(h.get("event") == "handoff_refused" for h in e["history"]), e["history"])
+
+    def test_a_stale_hand_off_is_chased_once_per_hand_off(self):
+        # the head moving again between the two reads is counted as any refusal, never a loop
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.handoff = self.stale_handoff()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
+        self.assertEqual((e["state"], e["handoffFail"]["head"], e["handoffFail"]["count"]), ("waiting", LB, 1))
+
+    def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
+        self.broker = True
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.handoff = self.stale_handoff()
+        self.w.answers.append(ok_answer(LA))
+        e = {}
+        for _ in range(3):
+            e = self.tick(5)
+            if e.get("state") == "stopped":
+                break
+        self.assertEqual(len(self.handoffs()), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--match-head-commit {LB}", e["stop"]["next"])
 
     def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
         # On the broker host the hand-off is a plain queued land: land_judge's teammate rule stops it there, nothing
