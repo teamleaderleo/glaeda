@@ -19568,6 +19568,306 @@ class DedicatedHookTest(unittest.TestCase):
             self.assertEqual(yielding.claimed(), "disk: 10 GiB free")
 
 
+POOL_USER = "cmuxpool"
+
+
+def pool_manifest(pool_user: str | None = POOL_USER, prefix: str | None = None) -> dict:
+    manifest = copy.deepcopy(MANIFEST)
+    manifest["ssh_user"] = "cmux"
+    if pool_user or prefix:
+        runner = manifest["hosts"]["mini-std"].setdefault("overrides", {}).setdefault("runner", {})
+        if pool_user:
+            runner["poolUser"] = pool_user
+        if prefix:
+            runner["poolPrefix"] = prefix
+    return manifest
+
+
+class PoolUserRunnerTest(unittest.TestCase):
+    """POOL_USER (cmuxterm-hq#18007): a member's runner.poolUser is the non-admin macOS account its pool runners install,
+    register and run as, so a PR job there cannot read the secrets an admin ec2-user's can."""
+
+    setUp, tearDown, build_release = RunnerTest.setUp, RunnerTest.tearDown, RunnerTest.build_release
+    invoke, log, by_kind, config_argvs = RunnerTest.invoke, RunnerTest.log, RunnerTest.by_kind, RunnerTest.config_argvs
+
+    def manifest(self, manifest: dict | None = None) -> str:
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(manifest or pool_manifest()))
+        return os.fspath(path)
+
+    @staticmethod
+    def pool_ctx(pool_user: str | None = POOL_USER) -> mock.Mock:
+        ctx = mock.Mock(spec=["pool_user", "uid", "dedicated"])
+        ctx.pool_user, ctx.uid, ctx.dedicated = pool_user, 4242, None
+        return ctx
+
+    def apply(self, me: str = POOL_USER, admin: str | None = None) -> dict:
+        with mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "current_user", return_value=me), \
+                mock.patch.object(cr, "admin_evidence", return_value=admin):
+            return self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+
+    def test_another_account_refuses_a_pool_apply_and_changes_nothing_but_uninstall_is_not_refused(self) -> None:
+        before = RunnerTest.tree(self)
+        for me in ("cmux", None):
+            with self.subTest(me=me), mock.patch.object(cr, "xcode_present", return_value=True), \
+                    mock.patch.object(cr, "current_user", return_value=me), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cr.main(["--output", "json", "--apply", "--manifest", self.manifest(), "--member", "mini-std"])
+            self.assertEqual(code, 2)
+            self.assertIn("poolUser", err.getvalue())
+            self.assertIn(POOL_USER, err.getvalue())
+            self.assertEqual(RunnerTest.tree(self), before, "nothing changed")
+        with mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "current_user", return_value="cmux"), \
+                contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()):
+            cr.main(["--output", "json", "--uninstall", "--manifest", self.manifest(), "--member", "mini-std"])
+        self.assertNotIn("poolUser", err.getvalue(), "--uninstall follows its receipt, never refused")
+        # the member user retiring its own old instance addresses gui/<uid>; the pool user's own uninstall user/<uid>
+        for me, domain in (("cmux", "gui"), (POOL_USER, "user")):
+            seen: list[str] = []
+            with self.subTest(uninstall_as=me), mock.patch.object(cr, "current_user", return_value=me), \
+                    mock.patch.object(cr, "install_or_uninstall",
+                                      side_effect=lambda ctx, *a: seen.append(cr.agent_domain(ctx)) or 0), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                cr.main(["--output", "json", "--uninstall", "--manifest", self.manifest(), "--member", "mini-std"])
+            self.assertEqual([d.split("/")[0] for d in seen], [domain])
+        ctx = self.pool_ctx()
+        with mock.patch.object(cr, "current_user", return_value="cmux"):
+            self.assertIsNone(cr.pool_user_refusal(ctx, pool_manifest(), "mini-std", True))
+            self.assertIn("poolUser", cr.pool_user_refusal(ctx, pool_manifest(), "mini-std", False))
+
+    def test_the_pool_user_must_be_no_admin(self) -> None:
+        manifest, ctx = pool_manifest(), self.pool_ctx()
+        with mock.patch.object(cr, "current_user", return_value=POOL_USER):
+            with mock.patch.object(cr, "admin_evidence", return_value=f"{POOL_USER} is in the admin group"):
+                self.assertIn("non-admin", cr.pool_user_refusal(ctx, manifest, "mini-std", False))
+            with mock.patch.object(cr, "admin_evidence", return_value=None):
+                self.assertIsNone(cr.pool_user_refusal(ctx, manifest, "mini-std", False))
+                self.assertIsNone(cr.pool_user_refusal(self.pool_ctx(None), manifest, "mini-std", False),
+                                  "a member without poolUser is never refused")
+        own = pool_manifest()
+        own["ssh_user"] = POOL_USER
+        with mock.patch.object(cr, "current_user", return_value=POOL_USER), \
+                mock.patch.object(cr, "admin_evidence", return_value=None):
+            self.assertIn("ssh_user", cr.pool_user_refusal(ctx, own, "mini-std", False))
+
+    def test_admin_evidence_reads_the_admin_group_and_sudo(self) -> None:
+        entry = mock.Mock(pw_gid=20)
+        groups = {20: "staff", 80: "admin", 701: "cmuxfleet"}
+        for gids, probe, want in (([20, 80], False, "admin group"), ([20, 701], True, "sudo"), ([20, 701], False, None)):
+            with self.subTest(gids=gids, probe=probe), mock.patch.object(cr.pwd, "getpwnam", return_value=entry), \
+                    mock.patch.object(cr.os, "getgrouplist", return_value=gids), \
+                    mock.patch.object(cr.grp, "getgrgid", side_effect=lambda g: mock.Mock(gr_name=groups[g])):
+                got = cr.admin_evidence(POOL_USER, lambda: probe)
+            if want is None:
+                self.assertIsNone(got)
+            else:
+                self.assertIn(want, got)
+        with mock.patch.object(cr.pwd, "getpwnam", side_effect=KeyError("x")):
+            self.assertIn("cannot read", cr.admin_evidence(POOL_USER, lambda: False), "unreadable counts as admin")
+
+    def test_the_launchd_domain_is_the_users_for_a_pool_user_and_gui_otherwise(self) -> None:
+        self.assertEqual(cr.agent_domain(self.pool_ctx()), "user/4242")
+        self.assertEqual(cr.agent_domain(self.pool_ctx(None)), "gui/4242")
+
+    def test_a_pool_user_install_is_private_and_its_plist_carries_the_node_view_and_umask(self) -> None:
+        receipt = self.apply()
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        kinds = self.by_kind(receipt)
+        self.assertEqual(kinds["private"]["state"], "create")
+        self.assertTrue(kinds["private"]["applied"])
+        self.assertEqual(kinds["private"]["user"], POOL_USER)
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.home / "actions-runner-glaeda").stat().st_mode & 0o777, 0o700)
+        plist = plistlib.loads(Path(kinds["agent"]["path"]).read_bytes())
+        self.assertEqual(plist["EnvironmentVariables"][cr.NODE_VIEW_ENV], cr.POOL_NODE_VIEW)
+        self.assertTrue(cr.POOL_NODE_VIEW.endswith("/pool-node"))
+        self.assertEqual(plist["Umask"], 2)
+        self.assertEqual(plist["LimitLoadToSessionType"], "Background")  # bootstrap into user/<uid> needs it
+        self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents")
+        self.assertEqual(self.by_kind(self.apply())["private"]["state"], "unchanged")
+
+    def test_a_member_without_pool_user_is_unchanged(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(pool_manifest(None)), "--member", "mini-std")
+        self.assertNotIn("private", self.by_kind(receipt))
+        plist = plistlib.loads(Path(self.by_kind(receipt)["agent"]["path"]).read_bytes())
+        self.assertNotIn("Umask", plist)
+        self.assertNotIn("LimitLoadToSessionType", plist)
+        self.assertNotIn(cr.NODE_VIEW_ENV, plist["EnvironmentVariables"])
+
+    def test_headless_is_ignored_for_a_pool_user(self) -> None:
+        """A pool user has no sudo: --headless (the system LaunchDaemon) never applies; the service stays the LaunchAgent."""
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_name=POOL_USER)  # not a sandbox: --headless would apply
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "current_user", return_value=POOL_USER), \
+                mock.patch.object(cr, "admin_evidence", return_value=None):
+            plan = self.invoke("--headless", "--manifest", self.manifest(pool_manifest()), "--member", "mini-std")
+        agent = self.by_kind(plan)["agent"]["path"]
+        self.assertFalse(agent.startswith(os.fspath(cr.SYSTEM_DAEMON_DIR)), agent)
+        self.assertEqual(Path(agent).parent, self.home / "Library/LaunchAgents")
+
+    def test_member_labels_carry_pool_user(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            plain, _ = cr.member_labels(pool_manifest(None), "mini-std")
+            default, why = cr.member_labels(pool_manifest(), "mini-std")
+            aws, why_aws = cr.member_labels(pool_manifest(prefix="aws-"), "mini-std")
+        self.assertIsNone(plain["poolUser"])
+        self.assertEqual(default["poolUser"], POOL_USER, why)
+        self.assertEqual(aws["poolUser"], POOL_USER, why_aws)
+        self.assertEqual(fleet_labels.member_pool_user(pool_manifest(), "mini-std"), (POOL_USER, None))
+        self.assertEqual(fleet_labels.member_pool_user(pool_manifest(None), "mini-std"), (None, None))
+        self.assertIsNone(fleet_labels.member_pool_user(pool_manifest("root"), "mini-std")[0])
+        self.assertIsNone(fleet_labels.member_pool_user(pool_manifest("cmux"), "mini-std")[0], "the ssh_user")
+        self.assertIn("glaeda-side-std-xcode-26.6", default["labels"] + default["sidePools"])
+
+
+class PoolNodeViewTest(unittest.TestCase):
+    """NODE_VIEW and SHARED_FLEET (POOL_USER, cmuxterm-hq#18007) in the hook."""
+
+    setUp, tearDown = HookTest.setUp, HookTest.tearDown
+    COMMIT, TOOLCHAIN, node = HookTest.COMMIT, HookTest.TOOLCHAIN, HookTest.node
+
+    def test_node_answer_reads_the_view_when_named_and_the_home_otherwise(self) -> None:
+        self.node()  # a fake node under HOME (self.dir): the same answer from the view
+        view = self.dir / "view"
+        view.mkdir()
+        shutil.move(os.fspath(self.dir / ".config/glaeda/cmux-fleet"), os.fspath(view / "cmux-fleet"))
+        shutil.move(os.fspath(self.dir / "Projects/glaeda-generations"), os.fspath(view / "glaeda-generations"))
+        env = {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": ""}
+        with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}):
+            why, want, timed_out = hook.node_answer("m4pro-48")
+            self.assertEqual(hook.node_paths(self.dir), (view / "cmux-fleet", view / "glaeda-generations"))
+        self.assertIsNone(why, why)
+        self.assertFalse(timed_out)
+        # no env: the (now empty) home is what it reads
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop(hook.NODE_VIEW_ENV, None)
+            why, _want, _ = hook.node_answer("m4pro-48")
+            self.assertIn("not eligible", why or "")
+            self.assertEqual(hook.node_paths(self.dir),
+                             (self.dir / ".config/glaeda/cmux-fleet", self.dir / "Projects/glaeda-generations"))
+
+    PRIVATE_STATUS = (
+        # the generation's own load() (cmux_fleet._read_private_document, 1f42f2e8742d): a regular file this euid owns,
+        # mode 0600 and one link, else {"error": "fleet document ownership or mode is unsafe"}
+        "import json, os, stat, sys\n"
+        "def validate_class_acceptance(doc):\n    return doc\n"
+        "def load(path):\n"
+        "    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n"
+        "    st = os.fstat(fd)\n"
+        "    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 \\\n"
+        "            or stat.S_IMODE(st.st_mode) != 0o600:\n"
+        "        print(json.dumps({'error': 'fleet document ownership or mode is unsafe'})); sys.exit(1)\n"
+        "    return json.loads(os.read(fd, 1 << 20))\n"
+        "if __name__ == '__main__':\n"
+        "    load(sys.argv[2]); load(sys.argv[4])\n"
+        "    print(json.dumps(STATUS))\n")
+
+    def test_the_view_is_judged_from_private_copies_the_generation_accepts(self) -> None:
+        """PRIVATE_VIEW_COPY: the node view is the member user's (0644, here also hard-linked), which the generation's
+        private-document reader refuses; the hook judges this account's own 0600 copies and removes them after."""
+        self.node()
+        view = self.dir / "view"
+        view.mkdir()
+        shutil.move(os.fspath(self.dir / ".config/glaeda/cmux-fleet"), os.fspath(view / "cmux-fleet"))
+        shutil.move(os.fspath(self.dir / "Projects/glaeda-generations"), os.fspath(view / "glaeda-generations"))
+        fleet_py = view / "glaeda-generations" / self.COMMIT[:12] / "scripts" / "cmux_fleet.py"
+        status = {"schema": "glaeda-cmux-fleet-node-status/v1", "state": "eligible", "routingCandidateEligible": True,
+                  "roles": [{"role": "cmux_macos_native_build", "eligible": True, "reason": "ok"}]}
+        fleet_py.write_text(f"STATUS = {status!r}\n" + self.PRIVATE_STATUS)
+        documents = [view / "cmux-fleet" / rel for rel in
+                     ("enrollment.json", "acceptance/cmux_macos_native_build.json", "class-acceptance/m4pro-48.json")]
+        for doc in documents:
+            doc.chmod(0o644)
+        os.link(documents[0], view / "enrollment-second-link.json")  # nlink 2: refused even at 0600
+        tmp = self.dir / "tmp"
+        tmp.mkdir()
+        env = {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": "", "TMPDIR": os.fspath(tmp)}
+        # the generation itself refuses the view's own files: this is what a pool runner met on the first EC2 Mac
+        direct = subprocess.run([sys.executable, "-B", os.fspath(fleet_py), "status", os.fspath(documents[0]),
+                                 "--acceptance", os.fspath(documents[1])], capture_output=True, text=True)
+        self.assertIn("ownership or mode is unsafe", direct.stdout)
+        with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}), \
+                mock.patch.object(tempfile, "tempdir", None):
+            why, _want, timed_out = hook.node_answer("m4pro-48")
+        self.assertIsNone(why, why)
+        self.assertFalse(timed_out)
+        self.assertEqual(list(tmp.iterdir()), [], "the private copies go with the answer")
+        for doc in documents:
+            self.assertEqual(doc.stat().st_mode & 0o777, 0o644, "the view itself is never changed")
+        copies = hook.private_view_copy(view / "cmux-fleet", tmp, "m4pro-48")
+        for rel in ("enrollment.json", "acceptance/cmux_macos_native_build.json", "class-acceptance/m4pro-48.json"):
+            st = (copies / rel).stat()
+            self.assertEqual((st.st_mode & 0o777, st.st_nlink, st.st_uid), (0o600, 1, os.geteuid()), rel)
+            self.assertEqual((copies / rel).read_bytes(), (view / "cmux-fleet" / rel).read_bytes(), rel)
+        # a document missing from the view is still named as missing
+        (view / "cmux-fleet" / "enrollment.json").unlink()
+        with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}):
+            why, _want, _ = hook.node_answer("m4pro-48")
+        self.assertIn("no Glaeda enrollment", why or "")
+
+    def other_group(self) -> int:
+        """A group of ours other than the one new files get (that one stands in for staff: SHARED_GROUP_EXCLUDED)."""
+        probe = self.dir / ".gid-probe"
+        probe.write_text("")
+        self.default_gid = probe.stat().st_gid
+        probe.unlink()
+        gids = [g for g in os.getgroups() if g not in {12, 20, self.default_gid}]
+        if not gids:
+            self.skipTest("no second group of ours to chgrp to")
+        return gids[0]
+
+    def excluded(self) -> "mock._patch":
+        return mock.patch.object(hook, "SHARED_GROUP_EXCLUDED", frozenset({12, 20, self.default_gid}))
+
+    def test_share_fleet_path_adds_group_write_only_where_it_is_ours_and_not_staff(self) -> None:
+        gid = self.other_group()
+        fleet, outside = self.dir / "fleet", self.dir / "outside"
+        for d in (fleet, outside):
+            d.mkdir()
+        shared, staff, elsewhere, link = fleet / "capacity", fleet / "staff", outside / "capacity", fleet / "link"
+        for d in (shared, staff, elsewhere):
+            d.mkdir()
+            d.chmod(0o700)
+        os.chown(shared, -1, gid)
+        os.chown(elsewhere, -1, gid)
+        link.symlink_to(shared)
+        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)), self.excluded():
+            self.assertTrue(hook.share_fleet_path(shared))
+            self.assertEqual(shared.stat().st_mode & 0o7777, 0o770)
+            self.assertEqual(shared.stat().st_mode & 0o007, 0, "never other")
+            self.assertTrue(hook.share_fleet_path(shared), "idempotent")
+            self.assertEqual(shared.stat().st_mode & 0o7777, 0o770)
+            self.assertFalse(hook.share_fleet_path(staff))
+            self.assertEqual(staff.stat().st_mode & 0o7777, 0o700, "staff group: nothing changes")
+            self.assertFalse(hook.share_fleet_path(elsewhere))
+            self.assertEqual(elsewhere.stat().st_mode & 0o7777, 0o700, "outside FLEET_DIR: untouched")
+            self.assertFalse(hook.share_fleet_path(link), "a symlink is never followed")
+            self.assertFalse(hook.share_fleet_path(fleet / "missing"))
+
+    def test_share_fleet_fd_adds_group_read_write_to_an_open_file(self) -> None:
+        gid = self.other_group()
+        fleet = self.dir / "fleet"
+        fleet.mkdir()
+        lock, staff, outside = fleet / "host.lock", fleet / "staff.lock", self.dir / "outside.lock"
+        for f in (lock, staff, outside):
+            f.write_text("")
+            f.chmod(0o600)
+        os.chown(lock, -1, gid)
+        os.chown(outside, -1, gid)
+        with mock.patch.object(hook, "FLEET_DIR", os.fspath(fleet)), self.excluded():
+            for path, want, mode in ((lock, True, 0o660), (staff, False, 0o600), (outside, False, 0o600)):
+                fd = os.open(path, os.O_RDWR)
+                try:
+                    self.assertEqual(hook.share_fleet_fd(fd, path), want, path)
+                finally:
+                    os.close(fd)
+                self.assertEqual(path.stat().st_mode & 0o7777, mode, path)
+
+
 class ManifestLabelsTest(unittest.TestCase):
     def test_side_labels_widen_to_every_class(self) -> None:
         S, X, L = ("glaeda-side-std-xcode-26.6", "glaeda-side-xl-xcode-26.6", "glaeda-side-light-xcode-26.6")
