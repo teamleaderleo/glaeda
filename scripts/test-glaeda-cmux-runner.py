@@ -12628,6 +12628,18 @@ class GateTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {hook.RUNNER_JOBS_HOLD_OFF_ENV: "1"}):
                 self.assertIsNone(gate.low_disk(), "the environment off switch")
             self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "switch gone: held again")
+            # A disk that fills while held: DISK_FULL_NO_LISTEN takes over, and the hold ends, logged, not left stale.
+            notes.clear()
+            free["gib"] = 2.0
+            self.assertIn("DISK_FULL_NO_LISTEN", gate.low_disk() or "")
+            ends = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD end")]
+            self.assertEqual(len(ends), 1, notes)
+            self.assertIn("free_gib=2.0", ends[0])
+            self.assertIsNone(gate.disk_held)
+            self.assertIsNone(gate.disk_hold_started)
+            free["gib"] = 25.0
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "a new hold after the full disk")
+            self.assertEqual(len([n for n in notes if n.startswith("RUNNER_JOBS_HOLD start")]), 1, notes)
 
     def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
         """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with
