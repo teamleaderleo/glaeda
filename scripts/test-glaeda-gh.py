@@ -22735,7 +22735,9 @@ class LandWorld:
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
-            rc, out, err = self.handoff
+            # a list answers in order, its last answer for every call after
+            rc, out, err = (self.handoff.pop(0) if len(self.handoff) > 1 else self.handoff[0]) \
+                if isinstance(self.handoff, list) else self.handoff
             return subprocess.CompletedProcess(argv, rc, out + "\n", err)
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land"]:
             # the broker's land: the same merge knobs a host's `gh pr merge` reads, in lane-gh's envelope
@@ -26450,6 +26452,60 @@ class LandTest(Base):
         self.assertEqual(len(self.handoffs()), gg.LAND_STEP_STOP)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
         self.assertIn("unknown tool", e["stop"]["reason"])
+
+    STALE = "PR 1's head is " + LB + ", not " + LA + ": nothing was queued. The hand-off is for the PR's head now"
+
+    def stale_handoff(self) -> tuple[int, str, str]:
+        return (1, json.dumps({"ok": False, "error": "refused: " + self.STALE}, indent=1),
+                "lane-gh call land_handoff: refused: " + self.STALE)
+
+    def test_a_hand_off_at_a_stale_head_is_handed_again_at_the_head_the_broker_read(self):
+        # cmux#49708, 2026-11-22: the head a VM hands is its own copy's, which on a VM that cannot read GitHub can be
+        # hours old. The broker refuses it naming GitHub's head; the hand-off goes again at that head at once, never
+        # counted toward handoff_refused.
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        ok = self.w.handoff
+        self.w.handoff = [self.stale_handoff(), ok]
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
+        self.assertEqual((e["state"], e["handedOff"]["head"], e["head"]), ("forwarded", LB, LB))
+        self.assertTrue(any(h.get("event") == "handoff_repinned" for h in e["history"]), e["history"])
+        self.assertFalse(any(h.get("event") == "handoff_refused" for h in e["history"]), e["history"])
+
+    def test_a_stale_hand_off_is_chased_once_per_hand_off(self):
+        # the head moving again between the two reads is counted as any refusal, never a loop
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.handoff = self.stale_handoff()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
+        self.assertEqual((e["state"], e["handoffFail"]["head"], e["handoffFail"]["count"]), ("waiting", LB, 1))
+
+    def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
+        self.broker = True
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.handoff = self.stale_handoff()
+        self.w.answers.append(ok_answer(LA))
+        e = {}
+        for _ in range(3):
+            e = self.tick(5)
+            if e.get("state") == "stopped":
+                break
+        self.assertEqual(len(self.handoffs()), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--match-head-commit {LB}", e["stop"]["next"])
 
     def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
         # On the broker host the hand-off is a plain queued land: land_judge's teammate rule stops it there, nothing
@@ -33576,50 +33632,122 @@ class PrintedTargetNotationTest(unittest.TestCase):
                 self.assertEqual((item["repo"], item["number"]), ("o/r", 5))
 
 
-class PostKindMadeElsewhereTest(unittest.TestCase):
-    """`post` queues the three writes a session makes in bulk; the other GitHub writes are one call away. A kind
-    this tool can name must not dead-end: argparse's own line lists the four kinds, which reads as "glaeda-gh
-    cannot file an issue" for a write it does file. Measured 2026-11-22: `glaeda-gh post issue --title ...
-    --body-file ...` was refused with a hint about target *shapes*, and `gh issue create` had to be worked out by
-    hand."""
+class PostKindMadeInOneCallTest(unittest.TestCase):
+    """`post` queues the three writes a session makes in bulk; the other GitHub writes are one call away, and
+    `post` makes them in *this* call rather than printing the line to type. Measured 2026-11-22: `post close`
+    printed `glaeda-gh gh issue close N --repo OWNER/REPO` and ran nothing, so the write cost the refusal plus
+    the same line typed back -- two tool calls for one write. A merge stays named: it is pinned to a head sha
+    (`land --match-head-commit`), and `post` carries no sha to pin it with."""
 
-    def test_each_word_an_agent_types_names_the_call_that_makes_it(self) -> None:
-        for word, inside in (("issue", "gh issue create --repo OWNER/REPO"), ("issues", "gh issue create"),
-                             ("new-issue", "gh issue create"), ("bug", "gh issue create"),
-                             ("issue-comment", "glaeda-gh post comment OWNER/REPO#N"),
-                             ("pr-comment", "glaeda-gh post comment OWNER/REPO#N"),
-                             ("label", "--add-label"), ("add_label", "--add-label"),
-                             ("close", "gh issue close"), ("merge", "glaeda-gh land OWNER/REPO#N")):
+    def one_call(self, argv: list[str]) -> list[str]:
+        """The gh argument vector `post` builds for a write it makes itself."""
+        args = gg.parser().parse_args(argv)
+        kind = gg.post_one_call_kind(args.kind)
+        self.assertIsNotNone(kind, f"{argv} is not a one-call write")
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            gh, _item = gg.post_one_call_args(kind, args)
+        return gh
+
+    def test_each_word_an_agent_types_reaches_the_write_it_means(self) -> None:
+        for word, kind in (("issue", "issue"), ("issues", "issue"), ("new-issue", "issue"), ("bug", "issue"),
+                           ("file_issue", "issue"), ("label", "label"), ("labels", "label"),
+                           ("add_label", "label"), ("tag", "label"), ("close", "close"), ("closed", "close"),
+                           ("close-issue", "close"), ("issue-comment", "comment"), ("pr-comment", "comment")):
+            with self.subTest(word):
+                with mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+                    args = gg.parser().parse_args(["post", word, "o/r#5", "--body", "b"])
+                self.assertEqual(gg.post_one_call_kind(args.kind), kind)
+
+    def test_the_gh_call_each_write_becomes(self) -> None:
+        self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B"]),
+                         ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B"])
+        self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B",
+                                        "--label", "a,b"]),
+                         ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B",
+                          "--label", "a", "--label", "b"])
+        self.assertEqual(self.one_call(["post", "label", "o/r#5", "--label", "ci", "--remove-label", "old"]),
+                         ["issue", "edit", "5", "-R", "o/r", "--add-label", "ci", "--remove-label", "old"])
+        self.assertEqual(self.one_call(["post", "close", "o/r#5"]), ["issue", "close", "5", "-R", "o/r"])
+        self.assertEqual(self.one_call(["post", "close", "o/r#5", "--body", "superseded by #7"]),
+                         ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
+
+    def test_the_write_is_made_here_and_nothing_is_queued(self) -> None:
+        """The whole point: one call. It goes through cmd_gh -- this tool's own quota shim -- and leaves no
+        outbox file, because nothing about an issue or a label needs the daemon's pacing."""
+        ran: list[list[str]] = []
+        with mock.patch.object(gg, "cmd_gh", lambda gh: ran.append(gh) or 0), \
+                mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                mock.patch.object(gg, "write_json", lambda *a, **k: self.fail("a one-call write was queued")), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            self.assertEqual(gg.main(["post", "close", "o/r#5", "--body", "done"]), 0)
+            self.assertEqual(gg.main(["post", "label", "o/r#5", "--label", "ci"]), 0)
+        self.assertEqual(ran, [["issue", "close", "5", "-R", "o/r", "--comment", "done"],
+                               ["issue", "edit", "5", "-R", "o/r", "--add-label", "ci"]])
+
+    def test_a_body_made_here_still_goes_through_the_public_text_guard(self) -> None:
+        """An issue body and a closing comment are public text, so the guard a queued post passes judges them
+        too: a refusal exits 3 and makes no call."""
+        for argv in (["post", "issue", "o/r", "--title", "T", "--body", "B"],
+                     ["post", "close", "o/r#5", "--body", "B"]):
+            with self.subTest(argv[1]):
+                with mock.patch.object(gg, "cmd_gh", lambda gh: self.fail("refused, yet gh ran")), \
+                        mock.patch.object(gg, "body_guard_refusal", lambda item: "a user id is in the body"), \
+                        mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gg.main(argv), 3)
+                self.assertIn("a user id is in the body", err.getvalue())
+
+    def test_the_guard_reads_an_issue_create_as_gh_arguments(self) -> None:
+        """body_guard_args must name the call, or the guard judges an issue body by another write's rules."""
+        said = gg.body_guard_args({"kind": "issue", "repo": "o/r", "title": "T", "body": "B"}, "/tmp/b.md")
+        self.assertEqual(said, ["issue", "create", "-R", "o/r", "--title", "T", "--body-file", "/tmp/b.md"])
+
+    def test_a_merge_is_named_not_made(self) -> None:
+        """The one write still printed, and why: a merge is pinned to a head sha this parser does not take."""
+        for word in ("merge", "land"):
             with self.subTest(word):
                 hand = gg.post_elsewhere(word)
-                self.assertIn(inside, hand)
-                self.assertIn("post queues comment, pr and review", hand)
-                # and it is what the refusal prints as its next step, from the post parser or the top-level one
+                self.assertIn("glaeda-gh land OWNER/REPO#N --match-head-commit SHA", hand)
                 for prog in ("glaeda-gh", "glaeda-gh post"):
                     self.assertEqual(gg.usage_next(["post", word, "--body", "b"], prog), hand)
+                self.assertIsNone(gg.post_one_call_kind(word))
 
-    def test_a_kind_post_does_take_is_left_to_its_own_refusal(self) -> None:
-        """Narrow by construction: a real kind, a typo of one and a target in the kind's place are other
+    def test_a_kind_post_queues_is_left_to_its_own_refusal(self) -> None:
+        """Narrow by construction: a real queued kind, a typo of one and a target in the kind's place are other
         mistakes, each with its own line. `pr` must never be answered with "made in one call"."""
         for word in ("pr", "comment", "review", "status", "revieww", "pr:o/r#5", ""):
             with self.subTest(word):
                 self.assertEqual(gg.post_elsewhere(word), "")
+                self.assertIsNone(gg.post_one_call_kind(word))
         self.assertEqual(gg.usage_next(["post", "pr", "--title", "t"], "glaeda-gh post"), "glaeda-gh post --help")
 
     def test_the_target_shape_hint_gives_way_to_the_call(self) -> None:
-        """The spelling hint answers "the kind and target were one word"; for a write made elsewhere no target
-        shape is the problem, so the refusal says one thing, not two."""
-        self.assertEqual(gg.kind_spellings("argument kind: invalid choice: 'issue' "
-                                           "(choose from comment, pr, review, status)"), "")
+        """The spelling hint answers "the kind and target were one word"; for the write that is only named, no
+        target shape is the problem, so the refusal says one thing, not two."""
+        self.assertEqual(gg.kind_spellings("argument kind: invalid choice: 'merge' "
+                                           f"(choose from {', '.join(gg.POST_KIND_CHOICES)})"), "")
         self.assertIn("a pr target is",
                       gg.kind_spellings("argument kind: invalid choice: 'pr:o/r/7241' "
-                                        "(choose from comment, pr, review, status)"))
+                                        f"(choose from {', '.join(gg.POST_KIND_CHOICES)})"))
 
     def test_a_word_that_starts_a_synonym_is_not_run_as_that_choice(self) -> None:
         """`issue` must not run as `comment` because "issue-comment" starts with it: posting an issue and
-        commenting on one are different writes. This is why neither spelling is a `comment` synonym."""
-        self.assertEqual(gg.close_choice("issue", ("comment", "pr", "review", "status")), ("", []))
-        self.assertEqual(gg.close_choice("reply", ("comment", "pr", "review", "status")), ("comment", []))
+        commenting on one are different writes. Both are choices of their own, so equality decides first, and
+        `pr` is not pulled towards `pr-comment` either."""
+        for word in ("issue", "pr", "comment", "close", "label"):
+            with self.subTest(word):
+                self.assertEqual(gg.close_choice(word, gg.POST_KIND_CHOICES), (word, []))
+        self.assertEqual(gg.close_choice("reply", gg.POST_KIND_CHOICES), ("comment", []))
+
+    def test_a_flag_for_another_kind_is_refused_not_ignored(self) -> None:
+        """`--label` on a queued comment used to be read by nothing at all."""
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            args = gg.parser().parse_args(["post", "comment", "o/r#5", "--body", "b", "--label", "ci"])
+            with self.assertRaises(gg.WatchError) as refused:
+                gg.post_item(args)
+        self.assertIn("post label", str(refused.exception))
 
 
 class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
@@ -33649,6 +33777,8 @@ class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
         "land cancel": lambda t: (gg.land_key(t)[1], gg.land_key(t)[2]),
         "post comment": lambda t: _post_target("comment", t),
         "post review": lambda t: _post_target("review", t),
+        "post close": lambda t: _post_one_call_target("close", t),
+        "post label": lambda t: _post_one_call_target("label", t),
     }
 
     def test_every_subcommand_takes_every_shared_form(self) -> None:
@@ -33675,7 +33805,8 @@ class EverySubcommandTakesTheSharedFormsTest(unittest.TestCase):
         """The enumeration itself, so the next subcommand cannot quietly skip the test above: every `pr` or
         `comment` kind reachable from the parser is named in RESOLVERS."""
         want = {f"status {k}" for k in ("pr", "comment")} | {f"wait {k}" for k in ("pr", "comment")} \
-            | {"land", "land status", "land cancel", "post comment", "post review"}
+            | {"land", "land status", "land cancel", "post comment", "post review",
+               "post close", "post label"}
         self.assertEqual(set(self.RESOLVERS), want,
                          "a subcommand takes a PR or issue target and is not asserted here")
 
@@ -33690,6 +33821,14 @@ def _post_target(kind: str, target: str) -> tuple[str, int]:
     args = gg.parser().parse_args(["post", kind, target, "--body", "hi"])
     item = gg.post_item(args)
     return item["repo"], item["number"]
+
+
+def _post_one_call_target(kind: str, target: str) -> tuple[str, str]:
+    """(OWNER/REPO, N) out of the gh call `post close` / `post label` builds, through the public boundary."""
+    argv = ["post", kind, target] + (["--label", "ci"] if kind == "label" else [])
+    args = gg.parser().parse_args(argv)
+    gh, _item = gg.post_one_call_args(kind, args)
+    return gh[gh.index("-R") + 1], gh[2]
 
 
 class ABranchTypedAsATargetTest(unittest.TestCase):
