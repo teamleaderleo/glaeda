@@ -13086,6 +13086,32 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A ci_never_ran refusal at a head this land itself made is a "not yet", not a refusal to act on. GitHub creates a
+# push's workflow runs asynchronously, and a fast pull_request_target run can be the only run at a head for minutes
+# after the push; land_judge's ci_never_ran compares the runs it reads at the head against what PRs into the base run
+# (its evidence is that comparison, which is how an unwired branch is told from a quiet one), and at a head pushed
+# seconds ago that comparison has no answer yet.
+# efficiency-standing-lane, 2026-11-21 08:39Z, `glaeda-gh land manaflow-ai/cmuxterm-hq#16382 --wait 2700`: the queue
+# sent the pinned update-branch at c46607e8da6f, GitHub's own update had already made the merge head 70420e0bfe85 (the
+# send was refused "expected head sha didn't match current head ref"), the entry judged that brand-new head, and
+# land_judge refused ci_never_ran because no pull_request run was behind it yet. The entry stopped with ~45 min of the
+# caller's wait budget unspent, and the caller had to notice, re-arm a wait and land again by hand: three calls for a
+# PR that was going to be green.
+# manaflow-ai/cmuxterm-hq#19554, 2026-11-22, the same failure from the other producer: this land's own base merge made
+# d3e8c81b5adf (a lander-bot merge commit, "Merge branch 'main' into ...", parents the PR head and main), the judgment
+# at it refused ci_never_ran with only "pull_request_target: Test integrity" read, and minutes later four of the
+# pull_request workflows the refusal itself named (lane-gh-broker tests, Skills tests, fleet-reconcilers tests,
+# Polling guard) were in progress at that same head. So the predicate is "this land made this head", by any way it
+# makes one (land_own_head_at), not "its update-branch step made it".
+# Such a refusal waits on the PR at that head for the repo's own pull_request run to appear (the run's checks move the
+# cache, and the judgment after it is the usual one, merge included) while the bound has time left, and stays terminal
+# where it should be: a head this land did not make (nothing is starting the repo's CI for it on its own, which is
+# what hq#11655 was about) stops at the first refusal, as before, and a head whose run never showed up stops at the
+# bound. Either stop says which case it is, how long was waited and the call that takes the PR from there. While the
+# bound has time left the refusal's own step is never named: it pushes an empty commit, which at a head whose runs are
+# being created moves the head, orphans them and starts the race again. The gate itself is untouched: a head with no
+# pull_request run is still never merged, here or in land_judge.
+LAND_CI_START = 600.0  # how long the repo's own pull_request run may take to appear at a head this land made
 # A judgment that merged the base into the PR itself: land_judge's stale_main_update and stale_ci_update (leo-workspace
 # tools/land_judge/engine.py) send update_branch pinned to the judged head inside the judgment and answer the running
 # checks' wait at that head ("checks still running at HEAD: main (TIP) was merged into the PR: ..."). The queue never
@@ -13989,6 +14015,70 @@ def land_fetch_origin(url: str) -> str:
     """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
     m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
     return m.group(1) if m else ""
+
+
+# The steps of this land that make a new head: the pinned update-branch (GitHub's base merge), the merge step whose
+# own land_judge run merged the base in first (stale_main_update, recorded by note_judge_update), and the local base
+# merge pushed when GitHub's update-branch refused a conflict (union_merge, claimed as update_branch).
+LAND_OWN_HEAD_STEPS = frozenset({"update_branch", "merge"})
+
+
+def land_when(value: object) -> float | None:
+    """VALUE as a time this queue wrote on an entry, or None for anything else (a bool is not a time)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def land_own_head_at(e: dict, head: str) -> float | None:
+    """When this land itself made HEAD, the head judged now -- the latest moment it is known to have pushed the base
+    merge HEAD can only be -- else None: nothing here shows HEAD is this land's own (LAND_CI_START's comment).
+
+    Every way this land makes a head records the send on the entry as e["updateSent"], naming the head it was sent AT
+    and never the head it makes: the queue's pinned update-branch (push_step), the local base merge it pushes when
+    GitHub refuses that update (union_merge), and the base merge land_judge made inside a judgment or a step's
+    refusal (note_judge_update). So a head that is not the head such a send was sent at is the head that send made.
+    e["updatedHead"], written once a read showed the new head is that base merge (its first parent is the pin:
+    pin_follow, base_merge_check, the head_change wait), is the same fact proven, and counts at the time it was read.
+    A send with no time, and an entry carrying neither, answer None. The caller bounds the answer in time
+    (LAND_CI_START), so a send from an hour ago decides nothing."""
+    head = str(head or "").lower()
+    if not SHA40.fullmatch(head):
+        return None
+    made: list[float] = []
+    sent = e.get("updateSent") or {}
+    if isinstance(sent, Mapping) and str(sent.get("head") or "").lower() not in ("", head):
+        at = land_when(sent.get("at"))
+        if at is not None:
+            made.append(at)
+    action = e.get("lastAction") or {}
+    kind = action.get("kind") if isinstance(action, Mapping) else None
+    if kind in LAND_OWN_HEAD_STEPS and str(action.get("before") or "").lower() not in ("", head):
+        # The step ended after its send was recorded, so its time is the one to wait from. The update-branch step
+        # makes the head whether GitHub took the send or refused it because its own update had already made that head
+        # (hq#16382: such a send is refused and no updateSent is kept), so that step counts on its own. A merge step
+        # counts only with the send recorded: land_judge merged the base inside it (note_judge_update), while a merge
+        # refused for any other reason made no head at all.
+        at = land_when(action.get("endedAt"))
+        if at is not None and (kind == "update_branch" or made):
+            made.append(at)
+    if str(e.get("updatedHead") or "").lower() == head:
+        at = land_when(e.get("updatedHeadAt"))
+        if at is not None:
+            made.append(at)
+    return max(made) if made else None
+
+
+def land_ci_start_left(e: dict, act: dict, answer: dict, head: str, now: float) -> float | None:
+    """Seconds left for the repo's own pull_request run to appear at HEAD when ANSWER is a ci_never_ran refusal of a
+    head this land made and the bound has time left, else None: the refusal is terminal (LAND_CI_START's comment).
+    Only the ci_never_ran code, so the conflicts_base shape of that same refusal -- a conflicted head, for which
+    GitHub builds no refs/pull/N/merge and no push starts a run at all -- keeps its own stop and its own step."""
+    if str(answer.get("code") or "") != "ci_never_ran" or act.get("kind") not in ("command", "stop"):
+        return None
+    at = land_own_head_at(e, head)
+    if at is None:
+        return None
+    left = at + LAND_CI_START - now
+    return left if left > 0 else None
 
 
 def land_fallback(answer: dict, head: str) -> dict:
