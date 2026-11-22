@@ -2572,6 +2572,29 @@ class UpstreamTest(Base):
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"))
 
+    def test_a_copy_newer_than_the_upstreams_keeps_its_feed_view(self) -> None:
+        """A wait's direct read here is newer than the upstream's copy, so the upstream's answer is not stored; its
+        feed view still is, when of the same head: else wait_starved saw no view and re-read every bound."""
+        key = "pr:o/r#7"
+        gg.register(key)
+        data = self.pr_data()
+        sha = str(data["headRefOid"]).lower()
+        self.daemon.store(key, None, data=data, dataAt=NOW - 200)  # the wait's own read
+        view = {"liveSince": NOW - 7200, "at": NOW - 2, "eventAt": None, "head": sha}
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": view}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["dataAt"], NOW - 200, "the newer copy stays")
+        self.assertEqual(entry["upstreamFeed"], {**view, "answeredAt": NOW})
+        req = {"key": key, "kind": "pr", "began": NOW - 600, "directAt": NOW - 200}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNone(gg.wait_starved(req, entry, NOW + 30), "the feed vouches for the newer copy")
+            self.assertIsNotNone(gg.wait_starved(req, {**entry, "upstreamFeed": None}, NOW + 30), "no view")
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": {**view, "head": "b" * 40}}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "a view of another head does not cover it")
+
     def test_read_answers_a_prs_feed_view(self) -> None:
         sha = "a" * 40
         self.daemon.store("pr:o/r#7", None, data={"number": 7, "headRefOid": sha}, dataAt=NOW)
@@ -20995,6 +21018,34 @@ class UpstreamDirectAfterTest(unittest.TestCase):
                 gg.write_json(config, {"command": ["/usr/local/bin/other-upstream"]})
                 self.assertIsNone(gg.wait_starved(req, old, now), "no own read there: the old bound")
 
+    def test_direct_reads_that_find_nothing_new_space_out(self) -> None:
+        """A wait on cmux#50040 (all checks done, --max 4800) re-read its PR through the broker every 120 s for the
+        whole wait. Each read in a row that finds nothing new doubles the gap, up to DIRECT_QUIET_MAX; a change
+        starts it over."""
+        bound = float(gg.UPSTREAM_DIRECT_AFTER)
+        req: dict = {}
+        self.assertEqual(gg.direct_gap(req, bound), bound)
+        gg.note_direct_quiet(req, "a", "a", None)
+        self.assertEqual(gg.direct_gap(req, bound), 2 * bound)
+        gg.note_direct_quiet(req, "a", "a", "no answer within 30s")
+        self.assertEqual(req["directQuiet"], 1, "a failed read changes nothing")
+        for _ in range(10):
+            gg.note_direct_quiet(req, "a", "a", None)
+        self.assertEqual(gg.direct_gap(req, bound), gg.DIRECT_QUIET_MAX)
+        self.assertEqual(gg.direct_gap(req, gg.STALE_DATA_AFTER), gg.STALE_DATA_AFTER, "never under the bound")
+        gg.note_direct_quiet(req, "a", "b", None)
+        self.assertNotIn("directQuiet", req, "a change starts it over")
+        gg.note_direct_quiet(req, None, "b", None)
+        self.assertNotIn("directQuiet", req, "a first read is not quiet")
+        now = time.time()
+        old = {"dataAt": now - bound - 10}
+        base = {"began": now - 3000, "directAt": now - bound - 5}
+        with mock.patch.object(gg, "upstream_command", return_value=["up"]), \
+                mock.patch.object(gg, "direct_command", return_value=["get"]):
+            self.assertIsNotNone(gg.wait_starved(base, old, now))
+            self.assertIsNone(gg.wait_starved({**base, "directQuiet": 1}, old, now), "the gap doubled")
+            self.assertIsNotNone(gg.wait_starved({**base, "directQuiet": 1, "directAt": now - 2 * bound - 5}, old, now))
+
 
 class StaleDataTest(Base):
     """huge-blue, 2026-11-11: a merged PR read OPEN for 50 minutes while `restart` called the daemon healthy. One
@@ -27445,6 +27496,58 @@ class LandTest(Base):
         self.assertGreaterEqual(w["rest"], gg.LAND_JUDGE_COST["rest"])
         self.assertGreater(3900 - reserve["rest"], gg.LAND_JUDGE_COST["rest"])
 
+    def test_graphql_spent_snapshot_waits_hold_no_room_so_a_pinned_land_takes_the_rest_route(self):
+        """huge-blue, 2026-11-22 08:04-08:38Z: GraphQL 0/5000, REST 3864/5000. 21-24 snapshot waits (each for a
+        GraphQL full read the daemon sends none of while GraphQL is spent) filled the 24 places ahead of 12 workers
+        with 1-2 busy, and glaeda#2461 (2/2 green, pinned) sat "every worker busy" 34 min without one judgment: the
+        REST route (LAND_REST_ROUTE) is decided after that room check, so it was never reached. With GraphQL spent to
+        its hard reserve no snapshot is waited for: the pinned land is judged over REST and merges."""
+        head = format(0xF3, "040x")
+        reset = self.t + 1200
+        self.q.reading = lambda pool: {"limit": 5000, "remaining": 0 if pool == "graphql" else 3900, "reset": reset,
+                                       "seenAt": self.t}
+        full = self.q.workers() * (1 + gg.LAND_SNAPSHOT_AHEAD)
+        others = {f"pr:o/r#{100 + n}": format(0x100 + n, "040x") for n in range(full)}
+        for key, other in others.items():
+            self.w.set_pr(key, land_pr(other), self.t)
+            self.w.cache[key].update(fp=f"read-{other[-3:]}", via="graphql")  # its snapshot is the next GraphQL read's
+            gg.land_request("land", key.removeprefix("pr:"), [], "host/lane", sha=other)
+        self.tick(0)
+
+        def fill() -> None:
+            # Other lands' snapshot waits, as many as the room ahead of the workers, renewed each pass as the 885 due
+            # that morning renewed them: each one that ran out was followed by the next
+            for key, other in others.items():
+                if self.q.entries[key].get("state") not in gg.LAND_DONE:
+                    self.q.entries[key]["snapshotWait"] = {"sha": other, "since": self.t}
+                    self.q.snapshot_waiting.add(key)
+        fill()
+        self.w.set_pr("pr:o/r#1", land_pr(head), self.t)
+        self.w.cache["pr:o/r#1"].update(fp="graphql-read-before-the-quota-ran-out", via="graphql")  # no snapshot kept
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        seen: list[str] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"]:
+                n = int(argv[argv.index("explain") + 2])
+                seen.append(n)
+                if n == 1 and "--cache-only" not in argv:
+                    rc, doc = ok_answer(head)
+                    doc["action"]["number"] = 1
+                    self.w.answers.append((rc, doc))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(20):
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            fill()
+            self.tick(30)
+        e = self.q.entries["pr:o/r#1"]
+        self.assertIn(1, seen, gg.land_line(e, self.t, latch=None))
+        self.assertEqual(e["state"], "merged", gg.land_line(e, self.t, latch=None))
+        self.assertGreaterEqual(gg.read_json(gg.land_dir() / "window.json")["rest"], gg.LAND_JUDGE_COST["rest"])
+
     def test_graphql_spent_with_rest_unread_still_waits_for_the_graphql_reset(self):
         """The REST route spends only what GitHub's count shows: with no fresh REST reading, a cache miss under a
         spent GraphQL pool keeps its place (host_cap) and sends no live judgment."""
@@ -29417,6 +29520,28 @@ class LandTest(Base):
             self.assertEqual(e["dueLate"]["why"], "the login's quota pace (rest)")  # LAND_LATE_WHY_EVERY
             e = self.tick(gg.LAND_LATE_WHY_EVERY)
         self.assertEqual(e["dueLate"]["why"], "the login's quota pace (graphql)")
+        self.q.jobs.clear()
+
+    def test_the_pool_line_counts_each_gate_holding_a_due_row(self):
+        """huge-blue, 2026-11-22 09:25Z: busy 2 of 12, gated 530, loadGated 0, 220 uncapped queued rows not taken, and
+        every row so held read "every worker busy". The login's share and the snapshot room now name themselves, and
+        the land-pool line counts this pass's due rows per gate (heldBy) and the due rows no gate in judge() saw."""
+        self.q.jobs["pr:p/r#9"] = mock.Mock(done=lambda: False)
+        self.q.entries["pr:p/r#9"] = {"key": "pr:p/r#9", "repo": "p/r", "state": "judging"}
+        self.w.config.update(workers=16, loginWorkers=1)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        with mock.patch.object(self.q, "latch_free", return_value=False):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+            self.assertEqual(self.q.pass_held_by, {"the login's share of the workers (loginWorkers) is busy": 1})
+            self.assertEqual(e["dueLate"]["why"], "the login's share of the workers (loginWorkers) is busy")
+            self.q.pool_logged = 0.0
+            with mock.patch.object(gg, "log") as logged:
+                self.q.log_pool()
+        line = next(c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "land-pool")
+        self.assertEqual(line["heldBy"], {"the login's share of the workers (loginWorkers) is busy": 1})
+        self.assertEqual(line["dueNoGate"], 0)
         self.q.jobs.clear()
 
     def test_land_status_names_what_holds_the_workers(self):
