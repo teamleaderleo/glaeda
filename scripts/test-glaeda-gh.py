@@ -22780,6 +22780,12 @@ class LandTest(Base):
         machines = mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
         machines.start()
         self.addCleanup(machines.stop)
+        # An infra-read stop (LAND_INFRA_STOPS) on a host that is no broker client is retried before it stops; the
+        # tests of what such a stop says, re-arms and counts see it past that bound at once. The retries themselves:
+        # test_an_infra_read_stop_retries_with_backoff_wakes_nobody_and_stops_quietly_past_its_cap.
+        cap = mock.patch.object(gg, "LAND_INFRA_RETRY_CAP", 0)
+        cap.start()
+        self.addCleanup(cap.stop)
         self.t = NOW
         self.github_head = {}
         self.q = self.queue()
@@ -24799,19 +24805,20 @@ class LandTest(Base):
 
     def test_a_rearmed_stop_that_repeats_its_stop_tells_the_requester_once(self):
         # efficiency-scout pass 6, 2026-11-21: cmux#47074's session was woken 3 times in 19 h by retry_deadline, each
-        # the same unreadable webview verdict. The first stop is told; the re-armed ones that stop the same are not.
+        # the same unreadable webview verdict. The re-armed ones that stop the same are marked repeats. This
+        # retry_deadline only says GitHub could not be read (LAND_INFRA_STOPS), so none of them is told at all.
         e = self.stop_retry_deadline()
         stops = lambda: [c for c in self.w.sent() if " stopped: " in " ".join(c)]  # noqa: E731
-        self.assertEqual(len(stops()), 1)
+        self.assertEqual(len(stops()), 0)
         for n in range(1, gg.LAND_REARM_CAP + 1):
             self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
             self.tick(gg.LAND_REARM_AFTER)
             e = self.tick()
             self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertEqual(len(stops()), 1)
+        self.assertEqual(len(stops()), 0)
         self.assertEqual([h.get("quiet") for h in e["history"] if h["event"] == "stopped"][-gg.LAND_REARM_CAP:],
                          ["repeat"] * gg.LAND_REARM_CAP)
-        # a land by hand is a new ask: its stop is told again
+        # a land by hand is a new ask: its stop is no repeat (and, an unread GitHub, still not told)
         self.land()
         self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 13
         e = self.tick()
@@ -24820,7 +24827,8 @@ class LandTest(Base):
                 break
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertEqual(len(stops()), 2)
+        self.assertNotEqual(e["history"][-1].get("quiet"), "repeat")
+        self.assertEqual(len(stops()), 0)
 
     def test_land_stop_repeats_reads_code_head_and_reason_without_counts(self):
         last = {"code": "retry_deadline", "head": "abc", "reason": "waited 10152 s (deadline 7200 s, 3 judgments)"}
@@ -27749,7 +27757,7 @@ class LandTest(Base):
     def test_the_same_raised_unreadable_three_times_stops_naming_it_to_its_requester(self):
         """gcp-agent-lane-1, 2026-11-21: 26 of 38 judgments in 2 h ended "unreadable" and were retried, each holding a
         worker to learn nothing new (cmux#49035: the same KeyError on every pass). The same raised error text at one
-        head LAND_UNREAD_SAME_STOP times in a row stops the entry, that error named to its requester; each judgment
+        head LAND_UNREAD_SAME_STOP times in a row stops the entry, that error named in its stop (no wake); each judgment
         between went to the caches first (they miss here), then live."""
         self.pr(LA)
         self.land()
@@ -27765,7 +27773,7 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["code"], "unreadable_repeated")
         self.assertIn("KeyError: 'statusCheckRollup'", e["stop"]["reason"])
         self.assertIn(f"{gg.LAND_UNREAD_SAME_STOP} times in a row", e["stop"]["reason"])
-        self.assertTrue(any("KeyError" in c[-1] for c in self.w.sent()), self.w.sent())
+        self.assertEqual(self.w.sent(), [])  # a read that failed: its requester cannot act on it (LAND_INFRA_STOPS)
         explains = [c for c in self.w.calls if c[1:3] == [self.w.mh, "explain"]]
         self.assertEqual(sum(1 for c in explains if "--cache-only" in c), gg.LAND_UNREAD_SAME_STOP - 1)
         self.assertEqual(sum(1 for c in explains if "--cache-only" not in c), gg.LAND_UNREAD_SAME_STOP)
@@ -28008,6 +28016,79 @@ class LandTest(Base):
             self.w.set_pr(key, land_pr(self.fresh_head), self.t)
             return None
         self.q.refresh = refresh
+
+    def pin_reads_fail(self, n: int = 1) -> dict:
+        """A pinned land (--sha LB, cache at LA) whose every direct read fails, ticked until its Nth infra retry, its
+        hand-off or its end."""
+        e = self.tick(1)
+        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+            e = self.tick(1)
+            if (e.get("infraRetry") or {}).get("n") == n or e.get("infraHandoff") or e["state"] in gg.LAND_DONE:
+                break
+        return e
+
+    def test_an_infra_read_stop_retries_with_backoff_wakes_nobody_and_stops_quietly_past_its_cap(self):
+        """Leo, 2026-11-22: "if huge-blue is so weak and liable to falling over, then don't put so much reliance on
+        it". huge-blue, 2026-11-21/22: 13 pin_unread stops of 6 lands and 3 retry_deadline stops ("still host_cap"),
+        each a wake of its requester for a GitHub it could not read. On the broker host such a stop is a backed-off
+        retry with no strike, no budget spent and no wake; past LAND_INFRA_RETRY_CAP it stops, still quietly."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append), mock.patch.object(gg, "LAND_INFRA_RETRY_CAP", 2):
+            e = self.pin_reads_fail()
+            self.assertEqual((e["state"], e["infraRetry"]["n"], e["infraRetry"]["code"]), ("waiting", 1, "pin_unread"))
+            self.assertEqual(e["wakeAt"] - self.t, gg.LAND_INFRA_RETRY_BASE)
+            self.assertIsNone(e.get("pinWait"))
+            [h] = [h for h in e["history"] if h.get("event") == "infra_retry"]
+            self.assertEqual((h["n"], h["after"]), (1, int(gg.LAND_INFRA_RETRY_BASE)))
+            reads = len(self.w.refreshed)
+            e = self.tick(gg.LAND_INFRA_RETRY_BASE - 10)
+            self.assertEqual(len(self.w.refreshed), reads)  # no read of the pin inside the backoff
+            self.tick(11)
+            e = self.pin_reads_fail(2)
+            self.assertEqual((e["state"], e["infraRetry"]["n"]), ("waiting", 2))
+            self.assertEqual(e["wakeAt"] - self.t, 2 * gg.LAND_INFRA_RETRY_BASE)
+            self.tick(2 * gg.LAND_INFRA_RETRY_BASE + 1)
+            for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+                e = self.tick(1)
+                if e["state"] == "stopped":
+                    break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pin_unread"))
+        self.assertEqual(self.w.sent(), [])  # never woken, not even by the stop past the cap
+        self.assertEqual([d["event"] for d in logged if d.get("event", "").startswith("land-infra")],
+                         ["land-infra-retry", "land-infra-retry"])
+        self.assertTrue([d for d in logged if d.get("event") == "land-notice-quiet" and "pin_unread" in d["message"]])
+        self.assertEqual(self.w.explains(), [])
+
+    def test_an_infra_read_stop_on_a_lane_vm_hands_the_land_to_the_broker_host_at_its_pin(self):
+        # A lane VM that cannot read the PR to see its pin hands it at that pin to the broker host, which reads it
+        # with its own login, instead of stopping pin_unread and waking the lane.
+        self.broker = True
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        self.pin_reads_fail()
+        e = self.tick(1)
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4])["sha"], LB)
+        self.assertEqual((e["state"], e.get("forwardedTo"), e.get("stop")), ("forwarded", "huge-blue", None))
+        [h] = [h for h in e["history"] if h.get("event") == "handoff_infra"]
+        self.assertTrue(h["why"].startswith("pin_unread: "), h)
+        self.assertFalse(any(h.get("event") == "stopped" for h in e["history"]), e["history"])
+        self.assertEqual(self.w.sent(), [])
+        self.assertEqual(self.w.explains(), [])
+        self.broker = False
+
+    def test_a_retry_deadline_on_the_prs_own_state_still_stops_and_tells(self):
+        # Only a wait on an answer that judged nothing (LAND_NOT_JUDGED) is GitHub's; a retry the PR's own state names
+        # (regen_retry, train_wait) is the requester's to act on, as before.
+        self.assertTrue(gg.land_infra_stop({"waitBudget": {"code": "host_cap"}}, "retry_deadline"))
+        self.assertTrue(gg.land_infra_stop({"waitBudget": {"code": "unreadable"}}, "retry_deadline"))
+        self.assertFalse(gg.land_infra_stop({"waitBudget": {"code": "train_wait"}}, "retry_deadline"))
+        self.assertTrue(gg.land_infra_stop({}, "webview_unreadable"))
+        self.assertFalse(gg.land_infra_stop({}, "own_red"))
 
     def test_a_pinned_land_whose_reads_are_refused_for_quota_holds_until_the_reset_and_reads_again(self):
         """cmuxterm-hq#16608, 2026-11-21 23:05Z and 23:15Z: stopped pin_unread on "3 direct reads of the PR failed, the
@@ -29671,22 +29752,70 @@ class LandTest(Base):
     def test_the_pool_takes_a_raised_worker_count_without_a_restart(self):
         self.w.config["workers"] = 1
         self.q.inline = False
-        self.q.submit("pr:o/r#1", lambda: None)
-        self.assertEqual(self.q.pool._max_workers, 8)  # every core: a raised "workers" needs no new pool
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=10 * 1024):  # 20 judgments' worth
+            self.q.submit("pr:o/r#1", lambda: None)
+        self.assertEqual(self.q.pool._max_workers, 20)  # the adaptive ceiling: a raised "workers" needs no new pool
         self.w.config["workers"] = 4
         self.assertEqual(self.q.workers(), 4)
         self.q.pool.shutdown(wait=True)
 
-    def test_the_pool_is_sized_from_the_hosts_cores_not_a_hand_set_four(self):
+    def test_the_pool_starts_from_the_hosts_cores_not_a_hand_set_four(self):
         """gcp-agent-lane-1, 2026-11-21 20:05Z: 28 lands past due, p50 82 min, each "every worker busy" (4 of 4) on a
-        32-core VM; LAND_WORKERS 4 was set by hand. The ceiling is one worker per LAND_CORES_EACH cores, read at each
-        call; land.json "workers" stays an operator's override."""
+        32-core VM; LAND_WORKERS 4 was set by hand. The pool starts at one worker per LAND_CORES_EACH cores
+        (land_worker_ceiling); land.json "workers" stays an operator's override."""
         for cores, want in ((1, 1), (2, 1), (8, 4), (16, 8), (32, 16)):
-            with mock.patch.object(gg, "land_cores", return_value=cores):
-                self.assertEqual(self.q.workers(), want, cores)
+            self.assertEqual(gg.land_worker_ceiling(cores), want, cores)
+        self.assertEqual(self.q.workers(), 4)  # 8 cores (setUp)
         self.w.config["workers"] = 3
         with mock.patch.object(gg, "land_cores", return_value=32):
             self.assertEqual(self.q.workers(), 3)
+
+    def test_a_full_pool_with_rows_waiting_grows_until_github_refuses(self):
+        """Leo: "you shouldnt need to set minimums in the first place". huge-blue, 2026-11-22 09:44-09:59Z: land.json
+        "workers": 12, 12 of 12 busy, ~1,000 due rows gated a pass, judgments 3-13 min of GitHub waits at about 65 MB
+        and a few % of a core each. A full pool with due rows waiting grows by a quarter a step up to its memory
+        ceiling; a quota refusal halves it; an idle or unfull pool stays; land.json "workers" fixes it."""
+        q = self.q
+        self.assertEqual(q.workers(), 4)
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            for n in range(4):
+                q.jobs[f"pr:o/r#{n + 100}"] = mock.Mock(done=lambda: False)
+            q.now, q.pass_gated = 1000.0, 7
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 5)
+            q.adapt_pool()  # within LAND_POOL_ADAPT_S: no step
+            self.assertEqual(q.workers(), 5)
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()  # 5 jobs needed to be full: 4 running, so it holds
+            self.assertEqual(q.workers(), 5)
+            sizes = []
+            for _ in range(20):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+                sizes.append(q.workers())
+            self.assertEqual(sizes[:4], [6, 7, 9, 12])
+            self.assertEqual(sizes[-1], 80)  # 40 GB available: half of it at LAND_JUDGE_MEM_MB each
+            q.pass_gated = 0  # nothing waits for a worker: no growth
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 80)
+            q.pass_gated = 3
+            q.now += 1
+            q.park_quota({"key": "pr:o/r#1", "state": "judging", "history": []}, "API rate limit exceeded")
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            self.assertEqual(q.workers(), 40)
+            self.w.config["workers"] = 12
+            self.assertEqual(q.workers(), 12)
+        q.jobs.clear()
+
+    def test_the_pool_ceiling_is_the_hosts_memory_not_its_cores(self):
+        self.assertEqual(gg.land_pool_max(40 * 1024), 80)
+        self.assertEqual(gg.land_pool_max(100), 4)  # never under the core-based start (8 cores in setUp)
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=None):
+            self.assertEqual(gg.land_pool_max(), 4)
 
     def test_the_hosts_load_holds_no_judgment(self):
         """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
@@ -29768,7 +29897,7 @@ class LandTest(Base):
                 mock.patch.object(gg, "land_worker_ceiling", return_value=12), \
                 mock.patch.object(gg, "land_config", return_value={}):
             line = gg.land_holders_line(rows, time.time())
-        self.assertIn("workers 2 busy of 12 (cores): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
+        self.assertIn("workers 2 busy of 12 (adaptive): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
                       line)
         self.assertIn("load 0.98/core; 1 due late", line)
         self.assertNotIn("line", line.split("load")[-1])
