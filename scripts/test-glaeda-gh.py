@@ -55,6 +55,10 @@ gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
+LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
+LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
+LAND_CPU_HELD = "the host's free CPU is at the 80% line (/proc/stat idle+nice; land.json \"headroomHold\": false turns this off)"
+LAND_RAM_HELD = "the host's free RAM is at the 80% line (MemAvailable; land.json \"headroomHold\": false turns this off)"
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -675,8 +679,10 @@ class Base(unittest.TestCase):
         execv.start()
         self.addCleanup(execv.stop)
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
-        # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown.
-        for name, value in (("land_cores", 8), ("land_load_per_core", None)):
+        # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
+        # CPU unreported (headroom_left admits; the pool's count holds).
+        for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
+                            ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
             pin.start()
             self.addCleanup(pin.stop)
@@ -5485,6 +5491,21 @@ class ClientTest(Base):
             gg.check_land_pin("o/r", 1, "a" * 40)
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
+
+    def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
+        """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
+        --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
+        here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
+        sha = "a" * 40
+        by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
+        for word in ("--pin", "--pinned", "--match-head-commit"):
+            args = gg.parser().parse_args(["land", "o/r#1", word, sha])
+            self.assertEqual(args.sha, sha, word)
+            self.assertEqual(vars(args), vars(by_sha), word)
+        for kind, target in (("pr", "o/r#1"), ("run", "o/r/12")):
+            waited = gg.parser().parse_args(["wait", kind, target, "--pin", sha])
+            self.assertEqual(waited.sha, sha)
+            self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
 
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
@@ -11393,6 +11414,61 @@ class FileAndPidWaitTest(unittest.TestCase):
         for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_word_for_a_command_runs_as_that_command(self) -> None:
+        """`pr-state o/r#1 o/r#2` (called so on gcp-agent-lane-2, 2026-11-21, and refused with the bare list of
+        commands) runs `status o/r#1 o/r#2`, and a case, a prefix or a typo of a command runs as it too."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for given, want in (("pr-state", "status"), ("pr_state", "status"), ("state", "status"),
+                                ("STATUS", "status"), ("stat", "status"), ("statsu", "status"),
+                                ("quota", "budget"), ("runner", "runners")):
+                self.assertEqual(gg.command_spelling_synonym([given, "o/r#1"]), ([want, "o/r#1"], []),
+                                 f"{given} -> {want}")
+        self.assertEqual(err.getvalue().count("read as"), 8)
+        self.assertIn("is no command", err.getvalue())
+        # The rewrite parses, and the kind a bare target implies is still inferred from it afterwards.
+        fixed, said = gg.infer_kind(gg.command_spelling_synonym(["pr-state", "o/r#1"])[0])
+        self.assertEqual(fixed[:2], ["status", "pr"])
+        self.assertTrue(said)
+        self.assertEqual(gg.parser().parse_args(fixed).command, "status")
+
+    def test_a_command_a_nesting_word_and_a_stranger_are_all_left_alone(self) -> None:
+        """A real command is never rewritten; a word nesting_synonym owns stays its; a word near nothing keeps
+        argparse's own refusal, with the commands in it."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for same in (["status", "pr", "o/r#1"], ["land", "o/r#1"], ["--help"], [],
+                         ["gh", "pr", "view", "1"], ["comment", "o/r#1"], ["job", "o/r", "7"],
+                         ["frobnicate", "o/r#1"], ["xyzzy"]):
+                self.assertEqual(gg.command_spelling_synonym(list(same)), (same, []), " ".join(same))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_only_the_first_word_is_read_as_a_command(self) -> None:
+        """`wait run o/r/1` keeps its kind: `run` is a prefix of `runners`, and a word after the command is a
+        kind or a target, never a command (which is why this is not in Parser._get_value)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["wait", "run", "o/r/1"]),
+                             (["wait", "run", "o/r/1"], []))
+            self.assertEqual(gg.parser().parse_args(["wait", "run", "o/r/1"]).kind, "run")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_word_as_close_to_two_commands_refuses_naming_both(self) -> None:
+        """Nothing is guessed between two commands: the refusal names each as a line that runs. No two real
+        commands are one edit apart, so the pair comes from a patched command set."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["seach", "cmux next"]),  # one edit from `search`
+                             (["search", "cmux next"], []))
+        self.assertEqual(err.getvalue().count("read as"), 1)
+        tops, table = gg.nesting_table()
+        with mock.patch.object(gg, "nesting_table", lambda: (frozenset({"read", "real"}), table)):
+            fixed, refusal = gg.command_spelling_synonym(["reat", "o/r#1"])
+        self.assertEqual(fixed, ["reat", "o/r#1"])
+        self.assertIn("is no command", refusal[0])
+        self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
+        self.assertIn("read", tops)  # the real table is untouched by the patch above
 
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
@@ -21031,6 +21107,9 @@ class ReexecDrainTest(Base):
         self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0), "reexec")
         self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=gg.REEXEC_UPDATE_GAP), "defer")
         self.assertEqual(gg.reexec_due(True, True, 50.0, 100.0, up=120.0), "defer", "a drain begun goes on")
+        # huge-blue, 2026-11-22: a merged fix waited 28 min under the 1800 s gap; busy, an update now serves within
+        # one gap and one drain, 10 min at most.
+        self.assertLessEqual(gg.REEXEC_UPDATE_GAP + gg.REEXEC_DRAIN_MAX, 600.0)
 
     def test_a_waiting_reexec_starts_no_land_step(self) -> None:
         queue = mock.Mock()
@@ -22648,6 +22727,8 @@ class LandWorld:
         self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
         Path(self.mirror).mkdir(parents=True, exist_ok=True)
         self.origin = "https://github.com/o/r.git"
+        self.real_git = False  # /fake/git runs the real git (LandTest.union_origin)
+        self.home = tmp
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
@@ -22682,6 +22763,11 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
+            return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=timeout,
+                                  env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
+                                       "GIT_CONFIG_NOSYSTEM": "1"})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
@@ -22756,6 +22842,9 @@ class LandTest(Base):
         super().setUp()
         self.snaps: dict[str, dict] = {}  # key -> the daemon's rollup snapshot (ROLLUP_DIR), as read_rollup gives it
         self.w = LandWorld(self.tmp.name)
+        retry = mock.patch.object(gg, "LAND_NOTIFY_RETRY_S", 0.0)  # a refused notice's resends, never a real sleep
+        retry.start()
+        self.addCleanup(retry.stop)
         # The CLI (`glaeda-gh land`) resolves land-judge from the host's land.json and defaults: pin the defaults to
         # the fake one, so the tests never depend on the host having a leo-workspace checkout (a CI runner has none).
         paths = mock.patch.object(gg, "LAND_JUDGE_PATHS", (Path(self.w.mh),))
@@ -24328,6 +24417,61 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def judge_merged_base(self, head: str) -> tuple[int, dict]:
+        """land_judge's stale_main_update answer: it sent update_branch pinned to HEAD in the judgment itself."""
+        return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": 600},
+                       reason=f"land-judge: refused: checks still running at {head}: main ({'e' * 12}) was merged "
+                              f"into the PR: since {'a' * 12}, the main its checks tested at most, it changed 1 file "
+                              f"the PR changes too (x.py), and the checks run again on the merged tree. Merge once "
+                              f"they finish; land_judge never merges past the classifier.")
+
+    def test_sha_pin_follows_the_base_merge_land_judge_itself_made(self):
+        # teamleaderleo/glaeda#2495, 2026-11-22: pinned at 5bc3ba9e; a judgment answered checks_running after merging
+        # main into the PR itself (stale_main_update), the lander bot's 0b53d1a3 (first parent 5bc3ba9e) appeared 31 s
+        # later, and the cache look stopped the land head_moved; hq#18096 the same at f2a95491 -> 1b282104. The queue
+        # now records that update as its own, so the pin follows the merge, which is judged in full and merged.
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA,
+                        override={"reason": "red on main too", "receipt": "main run 1 job 2"})
+        self.w.answers.append(self.judge_merged_base(LA))
+        e = self.tick()
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIn("update_by_judge", [h["event"] for h in e["history"]])
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[("ci", "IN_PROGRESS", "")]), self.t + 5)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]  # the bot's merge: the pin, then main
+        e = self.tick(10)
+        self.assertNotEqual(e["state"], "stopped")  # the cache look no longer stops it (stop_moved_pin)
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick()
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assertEqual(e["override"]["reason"], "red on main too")  # the request's override rides on
+        self.assert_merged_at(LB)
+        self.assertEqual(self.w.explains()[-1][-3:], ["--sha", LB, "--json"])  # judged again at the new head
+
+    def test_sha_pin_after_land_judge_merged_the_base_still_stops_on_someone_elses_push(self):
+        # The judgment's update is recorded at the pin, so only a head whose parents include the pin follows it.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(self.judge_merged_base(LA))
+        self.tick()
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"].update(headParents=[LC], headParent=LC)  # a push on top of something else
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_WAIT_DEFAULT + 60, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_judgment_that_names_another_head_or_no_base_merge_records_no_update(self):
+        e = {"key": self.KEY, "history": []}
+        with self.q.lock:
+            self.q.note_judge_update(e, self.judge_merged_base(LA)[1], LB)  # merged at another head than judged
+            self.q.note_judge_update(e, refusal("checks_running", LA, None,
+                                                reason=f"land-judge: refused: checks still running at {LA}: ci")[1], LA)
+        self.assertNotIn("updateSent", e)
+
     def test_land_takes_timeout_as_wait_and_a_sha(self):
         args = gg.parser().parse_args(["land", "o/r#1", "--sha", LA, "--timeout", "1400"])
         self.assertEqual((args.wait, args.sha), (1400, LA))
@@ -25060,6 +25204,21 @@ class LandTest(Base):
         nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
                        nxt=nxt, reason=f"land-judge: refused: checks still running at {head[:8]}")
+
+    def test_each_judgment_logs_its_wall_time(self):
+        # The entry pops judging after each judgment, so nothing else on the land host says how long one took.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.land()
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick()
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual(len(judged), 1, lines)
+        self.assertEqual((judged[0]["key"], judged[0]["code"], judged[0]["step"], judged[0]["head"]),
+                         (self.KEY, "ok", "merge", LA[:12]))
+        self.assertIsInstance(judged[0]["took_s"], float)
+        self.assertGreaterEqual(judged[0]["took_s"], 0.0)
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
@@ -26178,6 +26337,111 @@ class LandTest(Base):
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
                         'request-branch","status":"422"}')
 
+    def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md") -> tuple[str, str]:
+        """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
+        line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. (head, base)."""
+        origin = Path(self.tmp.name) / "origin"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(origin), *args], check=True, capture_output=True,
+                                  text=True, env=env).stdout.strip()
+        origin.mkdir()
+        git("init", "-q", "-b", "main")
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "receive.denyCurrentBranch", "ignore")
+        (origin / ".gitattributes").write_text(attrs)
+        (origin / path).parent.mkdir(parents=True, exist_ok=True)
+        (origin / path).write_text("- 10:00Z goal set\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("checkout", "-qb", "lane/x")
+        with open(origin / path, "a") as f:
+            f.write("- 11:00Z the lane's line\n")
+        git("commit", "-qam", "the lane appends")
+        head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        with open(origin / path, "a") as f:
+            f.write("- 11:05Z another PR's line, landed first\n")
+        git("commit", "-qam", "main appends")
+        base = git("rev-parse", "HEAD")
+        url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
+        url.start()
+        self.addCleanup(url.stop)
+        self.w.real_git = True
+        self.origin_git = git
+        return head, base
+
+    def union_conflict_tick(self, head: str) -> dict:
+        """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
+        conflict, as it does whatever .gitattributes says."""
+        data = {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}
+        self.w.set_pr(self.KEY, data, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        return self.tick()
+
+    def test_a_conflict_only_in_union_files_is_merged_here_and_the_pinned_land_goes_on(self):
+        """manaflow-ai/cmuxterm-hq#17917, 2026-11-21/22: its pinned land stopped update_branch_conflict three times on
+        goals/hot-verify-share.md, which .gitattributes marks merge=union, each hand-resolved by merging main: GitHub's
+        update-branch ignores .gitattributes. The queue now makes that merge itself and the land goes on."""
+        head, base = self.union_origin()
+        e = self.union_conflict_tick(head)
+        self.assertEqual(len([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertNotEqual(merged, head)
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("show", f"{merged}:goals/x.md"),
+                         "- 10:00Z goal set\n- 11:00Z the lane's line\n- 11:05Z another PR's line, landed first")
+        self.assertEqual(self.origin_git("diff", "--name-only", base, merged), "goals/x.md")  # the PR's own diff only
+        done = [h for h in e["history"] if h["event"] == "union_merged"]
+        self.assertEqual([(h["head"], h["merge"], h["paths"]) for h in done], [(head[:12], merged[:12], "goals/x.md")])
+        # GitHub shows the merge as the new head: the pin follows it (first parent the pin) and the land merges it.
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+        self.assert_merged_at(merged)
+
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertNotIn("unionMerge", e)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
+    def test_a_conflict_outside_union_files_still_stops_and_pushes_nothing(self):
+        head, _ = self.union_origin(attrs="docs/*.md merge=union\n")
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("not merge=union in main's .gitattributes: goals/x.md", e["stop"]["reason"])
+        self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # once per head: the same refusal again at this head stops at once, with no second merge attempt
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "union_merge_skipped"]), 1)
+
+    def test_a_union_merge_never_lands_on_a_branch_that_is_not_the_judged_head(self):
+        """A fork's PR whose branch name also exists on the base repository, or a push since the judgment: the branch
+        github.com holds is not the head, so nothing is merged or pushed onto it."""
+        head, base = self.union_origin()
+        self.origin_git("update-ref", "refs/heads/lane/x", base)  # someone else's lane/x
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn(f"is at {base[:12]}, not the head {head[:12]}", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), base)
+
     def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
         """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
         else. 2026-11-21, one host's queue: four `land status` rows stopped update_branch_refused after 6 identical
@@ -26580,6 +26844,57 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual(e["state"], "stopped")
         self.assertEqual(self.w.notices[-1][0], "land-notify-failed")
+
+    def test_a_refused_notice_is_sent_again_and_one_that_goes_through_is_not_a_failure(self):
+        # 57 of 58 land-notify-failed on one lane VM, 2026-11-21/22, were one refused send ("acpmux: runtime: empty
+        # prompt") and nothing more: the lane never heard its land had ended.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def flaky(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                if len(tries) == 1:
+                    return subprocess.CompletedProcess(argv, 1, "", "acpmux: runtime: empty prompt")
+            return real(argv, timeout, env)
+        self.q.run = flaky
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(tries[0], tries[1])
+        self.assertNotIn("land-notify-failed", [n[0] for n in self.w.notices])
+        retried = [ln for ln in lines if ln.get("event") == "land-notify-retried"]
+        self.assertEqual([(r["tries"], r["why"]) for r in retried], [(2, "acpmux: runtime: empty prompt")])
+
+    def test_a_notice_refused_every_time_is_one_failure_after_its_tries(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        real, tries = self.w.run, []
+
+        def failing(argv, timeout, env):
+            if argv[0] == "/fake/acpmux":
+                tries.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "no such session")
+            return real(argv, timeout, env)
+        self.q.run = failing
+        self.tick()
+        self.assertEqual(len(tries), gg.LAND_NOTIFY_TRIES)
+        self.assertEqual([n[0] for n in self.w.notices].count("land-notify-failed"), 1)
+
+    def test_a_requester_named_none_is_nobody(self):
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gg.land_requester_from("none"), ("", ""))
+            self.assertEqual(gg.land_requester_from("None"), ("", ""))
+        with mock.patch.object(gg, "policy_host", return_value="hostx"), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "none"}, clear=True):
+            self.assertEqual(gg.land_requester_from(None), ("", ""))
+        # An entry an older daemon stored as HOST/none falls to the queuing session, or to nobody (land-unnotified).
+        self.assertEqual(gg.land_notify_target({"queuedBy": "tool:ssh-from-x"}, "hostx/none"), "")
 
     def test_cli_land_status_and_cancel(self):
         with mock.patch.object(gg, "daemon_running", return_value=True), \
@@ -29843,11 +30158,138 @@ class LandTest(Base):
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
 
+    def test_a_restarted_queue_keeps_its_pool_size(self):
+        """hq#18502: huge-blue re-execs its daemon every 10-30 min. 2026-11-22, land.json's "workers" removed at 12:28Z:
+        the pool grew 16 -> 20 -> 25, a re-exec at 12:39Z put it back at 16 (land_worker_ceiling), under the fixed 32,
+        and the override went back. A new queue starts at the size the last one's pool line said, at once (not at its
+        next land-pool line), bounded by the memory ceiling; a stale or missing line starts from the cores."""
+        q = self.q
+        with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
+            q.now, q.pass_gated = self.t, 9
+            for _ in range(6):
+                while len(q.jobs) < q.workers():
+                    q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
+                q.now += gg.LAND_POOL_ADAPT_S
+                q.adapt_pool()
+            grown = q.workers()
+            self.assertGreater(grown, 4)
+            self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE)["workers"], grown)
+            q.jobs.clear()
+            with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                self.assertEqual(self.queue().workers(), grown)  # the re-exec keeps it
+            with mock.patch.object(gg, "land_mem_available_mb", return_value=4 * 1024):  # 8 workers' worth
+                with mock.patch.object(gg.time, "time", return_value=q.now + 30):
+                    self.assertEqual(self.queue().workers(), 8)  # never over the memory ceiling
+            with mock.patch.object(gg.time, "time", return_value=q.now + gg.LAND_ROOM_FRESH + 1):
+                self.assertEqual(self.queue().workers(), 4)  # a stale line: the cores (8 in setUp)
+            (gg.land_dir() / gg.LAND_POOL_FILE).unlink()
+            self.assertEqual(self.queue().workers(), 4)
+            # an operator's fixed size is where the pool goes on from once it is taken out
+            self.w.config["workers"] = 32
+            q.now += gg.LAND_POOL_ADAPT_S
+            q.adapt_pool()
+            del self.w.config["workers"]
+            self.assertEqual(q.workers(), 32)
+
     def test_the_pool_ceiling_is_the_hosts_memory_not_its_cores(self):
         self.assertEqual(gg.land_pool_max(40 * 1024), 80)
         self.assertEqual(gg.land_pool_max(100), 4)  # never under the core-based start (8 cores in setUp)
         with mock.patch.object(gg, "land_mem_available_mb", return_value=None):
             self.assertEqual(gg.land_pool_max(), 4)
+
+    def test_the_host_ram_is_read_from_meminfo_and_sysconf(self):
+        info = "MemTotal:       16384000 kB\nMemFree:  100 kB\nMemAvailable:    8192000 kB\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=info)):
+            self.assertEqual(gg.land_mem_total(), 16384000 * 1024)
+            self.assertEqual(LAND_MEM_AVAILABLE(), 8192000 * 1024)
+        with mock.patch("builtins.open", side_effect=OSError("no /proc")), \
+                mock.patch.object(gg.os, "sysconf", side_effect=lambda n: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[n]):
+            self.assertEqual(gg.land_mem_total(), 16384)
+            self.assertIsNone(LAND_MEM_AVAILABLE())
+
+    def test_admission_reads_the_hosts_live_headroom_each_pass_and_charges_each_start(self):
+        """ci-217x ruling, 2026-11-22 10:15Z: the land host was 81% busy from other work (idle 18.5%, nice 33.8% of 32
+        cores, MemAvailable 39.0 of 65.8 GB) while its load read 0.3-0.46/core. So past the first running judgment a
+        pass starts only as many as the free CPU (idle+nice, which a judgment preempts) and MemAvailable hold over
+        the 80% line at a judgment's measured cost, re-read the next pass; the review's F1: each start this pass is
+        charged, so one read never admits the whole ceiling."""
+        gib = 1 << 30
+        self.w.config["workers"] = 40  # land.json overrides the count; admission applies under it
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        # 8 cores, 25% free: (0.25 - 0.2) * 8 / LAND_JUDGMENT_CORES = 2.3 starts; RAM ample
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.25), \
+                mock.patch.object(gg, "land_mem_total", return_value=64 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=60 * gib):
+            self.assertEqual(int(self.q.headroom_left()[0]), 2)
+            for _ in range(2):
+                self.assertIsNone(self.q.headroom_why())
+                self.q.headroom_take()
+            self.assertEqual(self.q.headroom_why(), LAND_CPU_HELD)
+            self.q.now += 1  # the next pass reads the host again
+            self.assertIsNone(self.q.headroom_why())
+            self.q.now += 1
+            self.q.headroom_take()  # a pass's first start, nothing asked yet: charged all the same
+            self.assertEqual(int(self.q.headroom_left()[0]), 1)
+        # RAM: 16 GiB, 3.3 GiB free: under 20% after one more judgment
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.9), \
+                mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=3.3 * gib):
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_why(), LAND_RAM_HELD)
+        with mock.patch.object(gg, "land_mem_total", return_value=None):  # unreported: the count holds
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_left(), (math.inf, math.inf))
+        self.q.jobs.clear()
+
+    def test_a_held_row_names_the_headroom_and_the_first_judgment_always_runs(self):
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertEqual((e.get("dueLate") or {}).get("why"),
+                         LAND_CPU_HELD)
+        self.q.jobs.clear()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            e = self.tick(1)  # nothing else runs: the first always does
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+
+    def test_an_operator_turns_the_headroom_hold_off_in_land_json(self):
+        """ci-217x review of glaeda#2484: every guard gets an override. land.json "headroomHold": false lets a held
+        row start (the pool's count still holds it), and the hold's reason names that key."""
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            self.assertIn('"headroomHold": false', self.q.headroom_why())
+            self.w.config["headroomHold"] = False
+            self.assertIsNone(self.q.headroom_why())
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+        self.q.jobs.clear()
+
+    def test_the_free_cpu_is_idle_plus_nice_over_a_bounded_window(self):
+        stats = iter([(100, 50, 50, 700, 0, 0, 0, 0), (110, 80, 60, 750, 0, 0, 0, 0),  # fresh: nice 30 + idle 50 of 100
+                      (200, 80, 60, 750, 0, 0, 0, 0)])  # 1.5 s later: 90 busy of 90
+        saved = list(gg._LAND_CPU)
+        self.addCleanup(lambda: gg._LAND_CPU.__setitem__(slice(None), saved))
+        gg._LAND_CPU[:] = [None, None, None, None]
+        with mock.patch.object(gg, "land_proc_stat", side_effect=lambda: next(stats)), \
+                mock.patch.object(gg.time, "sleep") as slept:
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.0), 0.8)
+            self.assertAlmostEqual(gg._LAND_CPU[3], 0.3)  # the nice part, for the land-pool line
+            slept.assert_called_once_with(gg.LAND_CPU_FRESH)
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.5), 0.8)  # under LAND_CPU_WINDOW_MIN: the last share
+            self.assertAlmostEqual(LAND_CPU_FREE(1001.75), 0.0)  # the window since the last read
+        with mock.patch.object(gg, "land_proc_stat", return_value=None):
+            gg._LAND_CPU[:] = [None, None, None, None]
+            self.assertIsNone(LAND_CPU_FREE(1000.0))
+        with mock.patch("builtins.open", mock.mock_open(read_data="cpu 1 2\n")):
+            self.assertIsNone(gg.land_proc_stat())  # a short line reads as unknown, not an error
 
     def test_the_hosts_load_holds_no_judgment(self):
         """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
@@ -32507,6 +32949,265 @@ class AppPoolTest(Base):
         self.assertEqual(status["appPool"]["served"], 1)
         self.assertNotIn(APP_TOKEN, text)
 
+    IP_ALLOW_LIST = (b'{"errors":[{"type":"FORBIDDEN","message":"Although you appear to have the correct '
+                     b'authorization credentials, the `cursor` organization has an IP allow list enabled, and your '
+                     b'IP address is not permitted to access this resource."}]}')
+    CMUX_QUERY = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0)"
+                           "{pullRequest(number:$n0){number}}}",
+                  "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+
+    def refuse_cmux_graphql(self) -> None:
+        """Answer the next App GraphQL read the way this fleet's App is really answered for manaflow-ai/cmux."""
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 self.IP_ALLOW_LIST))
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+
+    def test_a_benched_scope_is_published_so_an_idle_app_is_not_read_as_a_routing_bug(self) -> None:
+        self.refuse_cmux_graphql()
+        self.assertEqual(self.pool.status()["unreadable"], {"graphql:manaflow-ai:cmux": round(NOW + gg.APP_POOL_ROUTE_REST)})
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.assertIsNone(self.pool.status()["unreadable"], "an hour on, nothing is benched")
+
+    def test_a_benched_scope_survives_the_re_exec_that_used_to_forget_it(self) -> None:
+        """One host, 2026-11-22: 23 doomed App queries for graphql:manaflow-ai:cmux in a day against an hour-long
+        bench, because 54 re-execs each dropped the bench with the process."""
+        self.refuse_cmux_graphql()
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 1, "the read went on the login")
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST})
+        self.daemon.app_pool = fresh
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 1, "the re-exec does not re-send the doomed query")
+        self.assertEqual(len(self.gh.calls), 2)
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 2, "the hour over, the App is asked again")
+
+    def test_a_bench_whose_hour_has_passed_is_not_restored(self) -> None:
+        self.refuse_cmux_graphql()
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {})
+
+    def test_one_role_s_bench_does_not_bench_another_role_s_app(self) -> None:
+        self.refuse_cmux_graphql()
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        spare.save_bench()
+        self.assertEqual(spare.restore_bench().unreadable, {})
+        self.assertEqual(gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                                    clock=lambda: self.daemon.clock()).restore_bench().unreadable,
+                         {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST},
+                         "the spare writing its own bench keeps ci-watch's")
+
+    # Another organization's IP allow list at one node's path (foreign_ip_refusal): that node leaves the App, never
+    # the repository. The path is the one GitHub gives a check suite's app another organization owns.
+    FOREIGN = ("Although you appear to have the correct authorization credentials, the `other-org` organization has "
+               "an IP allow list enabled, and your IP address is not permitted to access this resource.")
+    APP_PATH = ["p1", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 3,
+                "checkSuite", "app"]
+
+    def two_pr_query(self, *numbers: int) -> dict:
+        query, variables = gg.pr_query([f"pr:manaflow-ai/cmux#{n}" for n in numbers])
+        return {"query": query, "variables": variables}
+
+    def spare_pool(self) -> list[str]:
+        """A quota-goblin spare whose GraphQL calls are counted apart; it is refused the same way."""
+        spare_token = "ghs_" + "q" * 36
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: spare_token, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        calls: list[str] = []
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] == f"Bearer {spare_token}":
+                calls.append(url)
+                return 200, {"x-ratelimit-remaining": "12000"}, b'{"data": {}}'
+            return inner(method, url, headers, body)
+
+        self.daemon.transport = transport
+        return calls
+
+    def foreign_answer(self, path: Any = APP_PATH, org: str = "other-org", extra: list | None = None) -> None:
+        error = {"type": "FORBIDDEN", "message": self.FOREIGN.replace("other-org", org)}
+        if path is not None:
+            error["path"] = path
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 json.dumps({"data": {"p0": {"pullRequest": {"number": 1}},
+                                                      "p1": {"pullRequest": {"number": 2}}},
+                                             "errors": [error, *(extra or [])]}).encode()))
+
+    def test_another_orgs_ip_allow_list_benches_only_the_node_its_path_names(self) -> None:
+        spare_calls = self.spare_pool()
+        self.foreign_answer()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (1, 0, 1),
+                         "the refused query goes on the login once; the spare is not asked a doomed read")
+        cmux = self.pool.scope("manaflow-ai", "POST", "/graphql", self.two_pr_query(1))
+        self.assertTrue(self.pool.covers(cmux), "the repository stays on the App")
+        for pool in (self.pool, *self.pool.spares):
+            self.assertEqual(pool.unreadable, {"node:manaflow-ai/cmux#2": NOW + gg.APP_POOL_ROUTE_REST}, pool.role)
+        event = next(json.loads(l) for l in out.getvalue().splitlines() if '"app-pool-node-refused"' in l)
+        self.assertEqual(event["nodes"], ["manaflow-ai/cmux#2"])
+        self.assertEqual(event["paths"], [".".join(str(p) for p in self.APP_PATH)])
+        self.assertEqual(event["scope"], "graphql:manaflow-ai:cmux")
+        self.assertNotIn(APP_TOKEN, out.getvalue())
+        self.assertNotIn('"app-pool-refused"', out.getvalue(), "one line per refusal")
+        # the other PRs of the repository stay on the App; a query asking the refused PR goes on the login, unasked
+        self.daemon.request("POST", "/graphql", self.two_pr_query(1, 3))
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1))
+        self.daemon.request("POST", "/graphql", self.two_pr_query(2))
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (2, 0, 2))
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.daemon.request("POST", "/graphql", self.two_pr_query(2))
+        self.assertEqual(len(self.app_calls), 3, "the bench over, the App is asked again")
+
+    def test_a_node_bench_survives_a_re_exec(self) -> None:
+        self.foreign_answer()
+        self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {"node:manaflow-ai/cmux#2": NOW + gg.APP_POOL_ROUTE_REST})
+
+    def test_a_refusal_with_no_path_or_the_owners_own_list_or_beside_another_refusal_benches_the_repository(self):
+        scope = "graphql:manaflow-ai:cmux"
+        cases = {"no path": dict(path=None), "the owner's own list": dict(org="manaflow-ai"),
+                 "another refusal beside it": dict(extra=[{"type": "FORBIDDEN", "path": ["p0"],
+                                                           "message": "Resource not accessible by integration"}]),
+                 "a path naming no node": dict(path=["rateLimit"])}
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                self.pool.unreadable.clear()
+                self.foreign_answer(**kwargs)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+                self.assertEqual(set(self.pool.unreadable), {scope})
+                self.assertIn('"app-pool-refused"', out.getvalue())
+
+    def test_the_switch_off_benches_the_repository_as_before(self) -> None:
+        self.foreign_answer()
+        with mock.patch.object(gg, "APP_POOL_NODE_BENCH", False):
+            self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        self.assertEqual(set(self.pool.unreadable), {"graphql:manaflow-ai:cmux"})
+
+    def test_a_benched_node_is_read_apart_so_its_repositorys_rest_stay_on_the_app(self) -> None:
+        keys = [f"pr:manaflow-ai/cmux#{i}" for i in range(1, 6)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        self.pool.bench_nodes(["manaflow-ai/cmux#3"], NOW + 600)
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual(sorted(sent), sorted([[k for k in keys if k != keys[2]], [keys[2]]]))
+        got = self.daemon.app_eligible_by_owner("pr", entries, "graphql")
+        self.assertEqual([e["key"] for e in got], [k for k in keys if k != keys[2]])
+
+    def test_an_error_path_names_its_pr_run_head_or_listed_node(self) -> None:
+        body = self.two_pr_query(7, 9)
+        self.assertEqual(gg.graphql_error_node(body, ["p1", "pullRequest", "x"]), "manaflow-ai/cmux#9")
+        self.assertIsNone(gg.graphql_error_node(body, ["p5"]))
+        self.assertIsNone(gg.graphql_error_node(body, None))
+        query, variables = gg.run_query(["run:manaflow-ai/cmux#55"])
+        self.assertEqual(gg.graphql_error_node({"query": query, "variables": variables}, ["w0", "x"]),
+                         "manaflow-ai/cmux/runs/55")
+        sha = "ab" * 20
+        heads = {"query": gg.heads_query([f"head:teamleaderleo/glaeda@{sha}"]), "variables": {}}
+        self.assertEqual(gg.graphql_error_node(heads, ["h0", "object"]), f"teamleaderleo/glaeda@{sha}")
+        self.assertEqual(gg.graphql_error_node(heads, ["m0", "object"]), f"manaflow-ai/glaeda@{sha}")
+        self.assertEqual(gg.entry_nodes(f"head:teamleaderleo/glaeda@{sha}"),
+                         [f"teamleaderleo/glaeda@{sha}", f"manaflow-ai/glaeda@{sha}"])
+        suites = {"query": gg.SUITE_RUNS, "variables": {"suites": ["S1", "S2"]}}
+        self.assertEqual(gg.graphql_error_node(suites, ["suiteRuns", 1, "app"]), "id:S2")
+
+    def test_a_benched_suite_is_read_in_a_chunk_of_its_own(self) -> None:
+        self.pool.bench_nodes(["id:S2"], NOW + 600)
+        asked: list[list[str]] = []
+        with mock.patch.object(self.daemon, "graphql", lambda q, v, route=None: (asked.append(v["suites"]) or
+                                                                                  ({"data": {"suiteRuns": []}}, None))):
+            self.daemon.suite_runs(["S1", "S2", "S3"], paced=False, route=["manaflow-ai/cmux"])
+        self.assertEqual(asked, [["S1", "S3"], ["S2"]])
+
+    def test_a_missing_or_unreadable_bench_file_restores_nothing(self) -> None:
+        pool = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                          clock=lambda: self.daemon.clock())
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().parent.mkdir(parents=True, exist_ok=True)
+        pool.bench_file().write_text("not json at all")
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().write_text(json.dumps({"roles": {"ci-watch": {"graphql:x:y": "soon", "ok:z": NOW + 10}}}))
+        self.assertEqual(pool.restore_bench().unreadable, {"ok:z": NOW + 10}, "a bad entry drops, the good one stays")
+
+    def fallbacks(self, *reads: tuple) -> list[dict]:
+        """The login-fallback lines READS ((args, kwargs) to request) log, in order."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for args, kwargs in reads:
+                self.daemon.request(*args, **kwargs)
+        self.assertNotIn(APP_TOKEN, out.getvalue(), "a fallback line never carries a token")
+        self.assertNotIn(TOKEN, out.getvalue())
+        return [json.loads(l) for l in out.getvalue().splitlines() if '"login-fallback"' in l]
+
+    def test_every_read_on_the_login_logs_one_fallback_line_with_its_cause(self) -> None:
+        viewer = {"query": "query { viewer { login } }", "variables": {}}
+        mixed = {"query": "query($o0:String!,$r0:String!,$n0:Int!,$o1:String!,$r1:String!,$n1:Int!){x}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1, "o1": "other", "r1": "r", "n1": 1}}
+        lines = self.fallbacks((("GET", "/rate_limit"), {"free": True}),
+                               (("GET", "/repos/o/r/pulls/1"), {}),
+                               (("POST", "/graphql", viewer), {}),
+                               (("POST", "/graphql", mixed), {}),
+                               (("POST", "/repos/manaflow-ai/cmux/issues/1/comments", {"body": "x"}), {"content": True}),
+                               (("POST", "/graphql", {"query": "mutation { x }", "variables": {}}), {"content": True}),
+                               (("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        self.assertEqual([l["cause"] for l in lines], ["rate-limit-read", "owner-without-app", "graphql-no-owner",
+                                                       "graphql-many-owners"],
+                         "a write logs nothing, and a read the App answered logs nothing")
+        self.assertEqual(lines[1]["route"], "GET /repos/{owner}/{repo}/pulls/{id}")
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(self.pool.owner_why("GET", "/user"), (None, "not-a-repo-route"))
+        self.assertEqual(self.pool.owner_why("POST", "/graphql", {"query": "mutation { x }"}), (None, "write"))
+        self.daemon.writing = True
+        try:
+            lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        finally:
+            self.daemon.writing = False
+        self.assertEqual([l["cause"] for l in lines], ["outbox"], "a queued write's lookup stays on the login, named")
+
+    def test_a_refused_read_then_a_benched_route_name_their_causes(self) -> None:
+        self.app_answers.append((403, {}, b'{"message":"Resource not accessible by integration"}'))
+        path = "/repos/manaflow-ai/cmux/branches/main/protection"
+        lines = self.fallbacks((("GET", path), {}), (("GET", path), {}))
+        self.assertEqual([l["cause"] for l in lines], ["refused", "route-benched"])
+        self.assertEqual(lines[1]["pools"], {"ci-watch": "route-benched"})
+        self.assertEqual(lines[1]["owner"], "manaflow-ai")
+        self.assertEqual(lines[1]["scope"], "GET /repos/manaflow-ai/cmux/branches/*/protection")
+
+    def test_a_spent_pool_reads_as_resting_and_a_missing_app_as_no_token(self) -> None:
+        self.app_answers.append((403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 b'{"message":"API rate limit exceeded"}'))
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}),
+                               (("GET", "/repos/manaflow-ai/cmux/pulls/2"), {}))
+        self.assertEqual([l["cause"] for l in lines], ["refused", "pool-resting"])
+        self.ready = False
+        self.pool.rest_until.clear()
+        self.pool.tokens.clear()
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/3"), {}))
+        self.assertEqual([(l["cause"], l["pools"]) for l in lines], [("no-token", {"ci-watch": "no-token"})])
+
+    def test_a_chain_with_one_holder_resting_names_each_role(self) -> None:
+        spare = gg.AppPool(role="land-judge", mint=lambda owner: None, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: False, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        self.mint_token = None
+        lines = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/1"), {}))
+        self.assertEqual([(l["cause"], l["pools"]) for l in lines],
+                         [("pool-resting", {"ci-watch": "pool-resting", "land-judge": "no-token"})])
+
 
 class AppPoolHostTest(unittest.TestCase):
     """The default pool finds the App and gh_app_token.py on the host by itself: no agent sets anything."""
@@ -32605,6 +33306,53 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.owner_of("POST", "/graphql", mutation))
         query = {"query": "query($o0: String!) { x }", "variables": {"o0": "manaflow-ai"}}
         self.assertEqual(pool.owner_of("POST", "/graphql", query), "manaflow-ai")
+
+    def test_the_apps_first_chain_skips_a_role_this_host_holds_no_token_of(self) -> None:
+        """Leo, 2026-11-22: "use more of the apps then. go make more". land-judge and glaeda lead the chain; a host
+        without their tokens reads on ci-watch, as before, and says so only in passed_over."""
+        self.push_token(3600)
+        chain = gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(",")))
+        pool = gg.AppPool(role=chain[0]).with_spares(chain[1:])
+        scope = pool.scope("manaflow-ai", "GET", "/repos/manaflow-ai/cmux/pulls/1")
+        chosen = pool.pick("manaflow-ai", scope)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.role, "ci-watch")
+        self.assertEqual(chosen.token("manaflow-ai"), APP_TOKEN)
+        self.assertEqual([p.role for p in [pool, *pool.spares]], ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+        (self.creds / "ci-watch-token.json").unlink()
+        chosen.tokens.clear()
+        chosen.rest_until.clear()
+        self.assertIsNone(pool.pick("manaflow-ai", scope))
+        self.assertEqual(pool.passed_over("manaflow-ai", scope),
+                         ("no-token", dict.fromkeys(["land-judge", "glaeda", "ci-watch", "quota-goblin"], "no-token")))
+
+
+class AppPoolChainTest(unittest.TestCase):
+    """The order a read asks the Apps in (app_pool_chain) and its off switch, GLAEDA_GH_APP_SPARES."""
+
+    def test_the_default_chain_is_land_judge_glaeda_ci_watch_quota_goblin(self) -> None:
+        self.assertEqual(gg.APP_POOL_CHAIN, "land-judge,glaeda,ci-watch,quota-goblin")
+        self.assertEqual(gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(","))),
+                         ["land-judge", "glaeda", "ci-watch", "quota-goblin"])
+
+    def test_a_list_without_the_primary_is_the_spares_after_it_as_before(self) -> None:
+        self.assertEqual(gg.app_pool_chain(("quota-goblin",)), ["ci-watch", "quota-goblin"], "the chain before")
+        self.assertEqual(gg.app_pool_chain(()), ["ci-watch"], "GLAEDA_GH_APP_SPARES='' still turns the spares off")
+        self.assertEqual(gg.app_pool_chain(("glaeda", "ci-watch", "glaeda")), ["glaeda", "ci-watch"])
+
+    def test_the_daemon_builds_its_pool_in_the_chain_s_order(self) -> None:
+        saved = (gg.APP_POOL_SPARES, gg.BASE)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        gg.BASE = Path(tmp.name)
+        try:
+            for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), ["land-judge", "glaeda", "ci-watch", "quota-goblin"]),
+                                 (("quota-goblin",), ["ci-watch", "quota-goblin"])):
+                gg.APP_POOL_SPARES = spares
+                daemon = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
+                self.assertEqual([p.role for p in [daemon.app_pool, *daemon.app_pool.spares]], want)
+        finally:
+            gg.APP_POOL_SPARES, gg.BASE = saved
 
 
 class ShorthandFlagTest(unittest.TestCase):

@@ -6420,6 +6420,10 @@ class GlaedaDiskTest(unittest.TestCase):
         roots = sorted(os.fspath(f.root.relative_to(home)) for f in fams)
         self.assertEqual(roots, ["actions-runner-glaeda-ios-internal/_work/_temp",
                                  "actions-runner-glaeda-nightly-next/_work/_temp"], "a pool runner's _temp is not this")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            pool = [f for f in gd.default_families() if f.id == gd.RUNNER_TEMP_FAMILY]
+        # the pool runner's _temp is runner-temp; a linked runner or _temp is neither family's
+        self.assertEqual([os.fspath(f.root.relative_to(home)) for f in pool], ["actions-runner-glaeda-2/_work/_temp"])
         for fam in fams:  # at least DEFAULT_AGE_HOURS idle, however tight the disk (the pressure window is shorter)
             self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
             self.assertIsNone(fam.max_idle_hours)
@@ -6431,6 +6435,52 @@ class GlaedaDiskTest(unittest.TestCase):
             (big / f"f{i}").write_bytes(b"")
         self.assertTrue(gd.cmux_active(big), "the bounded search alone would call it busy")
         self.assertFalse(gd.job_busy(fams[0], big))
+
+    def test_a_pool_runners_temp_goes_by_age_only_while_its_runner_has_no_job(self) -> None:
+        """What a killed job left in a pool runner's _work/_temp (cmux17's actions-runner-glaeda-2, 2026-11-22: "No
+        space left on device" there) goes once idle DEFAULT_AGE_HOURS, on a pressure pass or a sweep, but never
+        while that runner has a Runner.Worker, and never the runner's own file-command or ci-derived-data entries."""
+        home = self.root / "home"
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            temp = runner / "_work/_temp"
+            make(temp / "killed-job-scratch", age_hours=8)
+            make(temp / "_runner_file_commands", age_hours=8)
+            make(temp / "cmux-derived-data-tests-1", age_hours=8)
+            make(temp / "fresh-job-scratch", age_hours=0.1)
+            (temp / "leftover.tar").write_bytes(b"\0" * (2 * 1024 * 1024))
+            t = time.time() - 8 * 3600
+            os.utime(temp / "leftover.tar", (t, t))
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            fams = [f for f in gd.default_families() if f.id == gd.RUNNER_TEMP_FAMILY]
+        self.assertEqual(sorted(os.fspath(f.root.relative_to(home)) for f in fams),
+                         ["actions-runner-glaeda-2/_work/_temp", "actions-runner-glaeda/_work/_temp"])
+        for fam in fams:
+            self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+            self.assertFalse(gd.job_busy(fam, fam.root / "killed-job-scratch"))
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+                                           f"{home}/actions-runner-glaeda/bin/Runner.Listener run\n")
+        idle, live = "actions-runner-glaeda/_work/_temp/", "actions-runner-glaeda-2/_work/_temp/"
+        for mode in ("pressure", "sweep"):
+            with self.subTest(mode=mode), mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                v = {os.fspath(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in gd.survey(fams, 6, 0)}
+                for rel in ("killed-job-scratch", "leftover.tar"):
+                    self.assertEqual(v[idle + rel][0], "reclaimable", rel)
+                    self.assertEqual(v[live + rel],
+                                     ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]), rel)
+                self.assertNotEqual(v[idle + "fresh-job-scratch"][0], "reclaimable")
+                for rel in ("_runner_file_commands", "cmux-derived-data-tests-1"):
+                    self.assertNotIn(idle + rel, v)
+        # apply: the runner that took a job since the survey keeps its _temp (a fresh ps before each delete)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        self.assertEqual(sorted(os.fspath(Path(i.path).relative_to(home)) for i in items),
+                         [idle + "killed-job-scratch", idle + "leftover.tar"])
+        with mock.patch.object(gd, "command_lines",
+                               lambda: f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            self.assertTrue(gd.runner_job_live(gd.runner_temp_runner(fams[0]), gd.command_lines()))
 
     @twelve_hour_ages
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
