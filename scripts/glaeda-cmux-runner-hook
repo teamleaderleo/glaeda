@@ -7733,6 +7733,21 @@ SIDE_FIT_JOBS = (("cmux-next.yml", "fast-tier"), ("cmux-next.yml", "swift-canary
                  ("cmux-next.yml", "release-compile"), ("cmux-next.yml", "cmux-scheme-compile"))
 
 
+# SIDE_FAST_FIT: a plain side runner listens with room for its side jobs' class need (SIDE_LISTEN_MEDIAN: the class
+# median, about 4 units), but the fast tier's admission asked for its own p90 (8 of 14, 9 of 12, 11 of 30) and
+# FAST_TIER_WAIT refuses it after 60 s. On 2026-11-22 00:06-01:36Z, 11 of 16 readable bad cmux-next fast tiers were
+# that refusal on glaeda-side-std runners (job 137053521754 on cmux14: 4 of 14 free at start, needs 8), and the
+# rescue's attempt 2 landed on side-std and was refused again (137057794165), so the refusal never turned green.
+# On a plain side runner the fast tier is admitted by its class (class_need), the room its listener listened with:
+# it runs beside the mini's other jobs instead of failing. Fast, root and every other role keep their admission.
+def plain_side_runner(args: argparse.Namespace) -> bool:
+    """Whether this job-started hook runs for a plain side runner: the roles side_fit_units gives the side fit."""
+    return (args.capacity_units > 0 and args.instance >= args.canonical_roots and not args.fast_runner
+            and not args.gui_runner and not args.session_runner and not args.dev_compile_runner
+            and not args.dedicated_admit and not args.nightly_runner and not args.gateway_runner
+            and not args.sim_runner and not args.small_runner)
+
+
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
@@ -15065,6 +15080,12 @@ def main(argv: list[str] | None = None) -> int:
         if (admit_class is None and args.fast_runner and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
+        if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
+            # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
+            admit_class = job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0]
+            print(f"{PREFIX}: the fast tier on a side runner: admitted at its class's need, the room this runner "
+                  "listened with (SIDE_FAST_FIT), not its own p90", flush=True)
         if args.fast_runner and admit_class != "fast":
             # It listens on a full mini (it needs no general units), so any other job would wait here for units
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
