@@ -13095,6 +13095,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# land_judge's "quota" answer for one CI job that spent the repo installation's API limit ("base_red_excuse.py job
+# rate-limited at HEAD ...: run R; job J; no attempt before HH:MMZ. Rerun run R ... the repo installation's API limit
+# refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
+# installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
+# never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
@@ -13610,16 +13617,33 @@ BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: land_judge could not
 # read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
 # mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
-# the fetch by hand. land_judge (mirror_fetch_argv) now names it {"kind": "fetch", "argv": [...]}, one of two shapes,
-# which this queue checks again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
+# the fetch by hand. A fetch step is {"kind": "fetch", "argv": [...]}, one of two shapes, which this queue checks
+# again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
 # - git --git-dir MIRROR.git fetch [LAND_FETCH_OPTIONS] origin REFSPEC..., MIRROR's origin being the PR's repository
 #   on github.com (LAND_FETCH_ORIGIN), run with the bare env (this host's own git login);
 # - lane-gh fetch OWNER/REPO --dir MIRROR.git [--branch B]..., OWNER/REPO the PR's (a broker read: land_lane).
 # Any other argv stops the entry as policy and runs nothing. A fetch that fails is a refused step (step_refused): it
 # backs off, and the LAND_STEP_STOP-th identical failure stops the entry and tells the requester.
+# The git form runs through git-fetch-once (LAND_FETCH_ONCE: one fetch per repository at a time, the guarded path of
+# hq docs/handbook/retry-repeats-a-deterministic-failure.md), its own bounds inside LAND_FETCH_DEADLINE.
+# land_judge's mirror fill (HeadNotInMirror, gh_mirror_reads.Unreadable: "...; fill it: git --git-dir M.git fetch
+# origin +refs/pull/N/head:..." or "lane-gh fetch R --dir M.git --branch pull/N/head") comes as a "command" step, so
+# the queue stopped on it. manaflow-ai/cmuxterm-hq#19115, 2026-11-22: a land stopped on that command on the executor
+# host and a person ran the printed fetch and queued it again ("The lander should run the fill it names itself (one
+# bounded fetch through git-fetch-once) and retry once, stopping only if the fetch fails."). land_command_fetch reads
+# such a command as this fetch step (from "command"): one fill per head (LAND_FILL_ONCE), then one judgment again; a
+# fill that fails, or a second fill asked at a head already filled, stops naming the fetch's error or the refusal.
 LAND_FETCH_DEADLINE = 300.0
 LAND_FETCH_CONFIG_DEADLINE = 10.0  # git config --get remote.origin.url
-LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head"})
+# gh_mirror_reads.MIRROR_FETCH_FLAGS (the flags its fill names) and this queue's own: none reads or runs anything else
+LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head", "--no-show-forced-updates",
+                                "--no-write-commit-graph", "--no-auto-gc"})
+LAND_FETCH_ONCE = Path.home() / ".local/bin/git-fetch-once"  # land.json "gitFetchOnce"; else PATH's; else plain git
+# git-fetch-once's own bounds (its waiting for another fetch of the mirror, the fetch, the refetch that heals a store),
+# summing under LAND_FETCH_DEADLINE so it ends its own git child before the queue's timeout would orphan it
+LAND_FETCH_ONCE_ENV = {"GIT_FETCH_ONCE_WAIT_S": "45", "GIT_FETCH_ONCE_TIMEOUT_S": "120",
+                       "GIT_FETCH_ONCE_REFETCH_TIMEOUT_S": "120"}
+LAND_FILL_ONCE = "fillAt"  # the entry's {"head", "at"} of the last fill land_command_fetch ran
 LAND_FETCH_REFSPEC = re.compile(r"\+?refs/(?:heads|pull)/[\w./-]+:refs/remotes/origin/[\w./-]+|[0-9a-f]{40}|\w[\w./-]*")
 LAND_FETCH_BRANCH = re.compile(r"\w[\w./-]*")
 LAND_FETCH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
@@ -14092,7 +14116,26 @@ def land_action(answer: dict, head: str) -> dict:
     act = answer.get("action")
     if not (isinstance(act, dict) and act.get("kind") in LAND_KINDS):
         act = land_fallback(answer, head)
-    return land_command_wait(act, answer, head) if act.get("kind") == "command" else act
+    if act.get("kind") != "command":
+        return act
+    return land_command_fetch(act, answer) or land_command_wait(act, answer, head)
+
+
+def land_command_fetch(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is land_judge's mirror fill (LAND_FETCH_DEADLINE's comment): one of the fetch step's two
+    shapes for the answer's repository, as that fetch step (from "command"); else None."""
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    text = str(act.get("text") or "").strip() or str(answer.get("next") or "").strip()
+    if not repo or not text.startswith(("git --git-dir ", "lane-gh fetch ")):
+        return None
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return None
+    if land_fetch_shape(argv, repo)[2]:
+        return None
+    return {"v": 1, **{k: act[k] for k in ("repo", "number", "head") if k in act}, "kind": "fetch", "argv": argv,
+            "from": "command"}
 
 
 def land_command_wait(act: dict, answer: dict, head: str) -> dict:
@@ -15316,9 +15359,10 @@ class LandQueue:
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
-    def park_quota(self, e: dict, text: str) -> None:
+    def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
-        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken. HOST False parks
+        only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
         self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
@@ -15330,7 +15374,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None:
+        if said is not None and host:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -17192,7 +17236,8 @@ class LandQueue:
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
-                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}",
+                                host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
@@ -17924,6 +17969,15 @@ class LandQueue:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
         that is not one of the two shapes, for this PR's repository and an existing mirror, stops as policy."""
         repo, argv = e["repo"], act.get("argv")
+        fill = act.get("from") == "command"  # land_judge's mirror fill, named as a command (land_command_fetch)
+        filled = e.get(LAND_FILL_ONCE) or {}
+        if fill and head and filled.get("head") == head:
+            # One fill per head, then one judgment: a mirror still unread after its fill is not a fill to repeat
+            with self.lock:
+                self.stop(e, "fill_unread", f"filled the mirror once at {head[:12]} ({land_trim(argv, 200)}) and "
+                          f"land_judge still could not read it: {land_reason(answer.get('reason'))}",
+                          land_trim(answer.get("next")))
+            return
         form, mirror, why = land_fetch_shape(argv, repo)
         if not why and not os.path.isdir(mirror):
             why = f"the fetch step's mirror {mirror} is not a directory on this host"
@@ -17939,13 +17993,18 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "policy", land_trim(why), land_trim(answer.get("next")))
             return
+        extra = None
         if form == "git":  # this host's own git login reads github.com: the bare env
-            run, step_env = [git, *argv[1:]], None
+            once = self.fetch_once()
+            if once:  # git --git-dir M fetch ARGS as git-fetch-once -C M ARGS: the guarded fetch, bounded
+                run, step_env, extra = [once, "-C", argv[2], *argv[4:]], None, LAND_FETCH_ONCE_ENV
+            else:
+                run, step_env = [git, *argv[1:]], None
         else:  # a broker read: the requester's lane only names it in the broker's audit log (land_lane)
             run, step_env = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), *argv[1:]], e
         with self.lock:
-            self.claim(e, "fetch", argv=list(argv), form=form)
-        got = self.call(run, LAND_FETCH_DEADLINE, step_env)
+            self.claim(e, "fetch", argv=list(argv), form=form, **({"fill": True} if fill else {}))
+        got = self.call(run, LAND_FETCH_DEADLINE, step_env, extra)
         named = None
         with self.lock:
             self.finish(e, got)
@@ -17953,11 +18012,27 @@ class LandQueue:
             if got.returncode == 0:
                 e.pop("stepFail", None)
                 e.pop("stepTransient", None)
+                if fill:
+                    e[LAND_FILL_ONCE] = {"head": head, "at": self.now}
                 self.wait(e, {"kind": "retry", "why": "filled the mirror land_judge could not read"}, NUDGE_MIN * 3)
+            elif fill and not LAND_STEP_QUOTA.search(said := f"{got.stderr or ''}\n{got.stdout or ''}"):
+                # the fill land_judge named failed: stopped at once, the fetch's own error named (a spent quota parks)
+                self.stop(e, "fill_failed", f"the mirror fill land_judge named failed (exit {got.returncode}): "
+                          f"{land_trim(land_tail(said), 300)}", shlex.join(argv))
             else:
                 named = self.step_refused(e, "fetch", head, got)
         if named == "update_branch":
             self.update_branch(e, head)
+
+    def fetch_once(self) -> str:
+        """git-fetch-once to run a git-form fetch step through: land.json's gitFetchOnce, LAND_FETCH_ONCE, PATH's; ""
+        when this host has none (the step runs plain git, as before)."""
+        given = self.config().get("gitFetchOnce")
+        if isinstance(given, str):  # "" turns it off
+            return os.path.expanduser(given)
+        if os.access(LAND_FETCH_ONCE, os.X_OK):
+            return LAND_FETCH_ONCE.as_posix()
+        return shutil.which("git-fetch-once") or ""
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
@@ -31914,6 +31989,32 @@ def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, st
     return hint, " ".join(["glaeda-gh"] + kept)
 
 
+NESTING_WRITE_INPUT = {("post", "comment"): ("--body", "--body-file"),
+                       ("post", "review"): ("--body", "--body-file"),
+                       ("post", "pr"): ("--head", "--base", "--title")}
+
+# Every command here only reads, in the order a caller who named no command would want them: the ones that
+# answer at once before `wait`, which blocks. A word whose commands are all in here can be routed without
+# choosing between reading and writing, because there is no write among them to choose.
+NESTING_READ_FIRST = ("status", "log", "search", "checks", "budget", "audit", "read", "wait")
+
+
+def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) -> bool:
+    """Whether `PARENT WORD TARGET` with the long flags TYPED is a call PARENT could carry out at all.
+
+    The caller's own evidence, not a guess about intent: `post pr` takes OWNER/REPO and refuses without
+    --head, --base and --title, so `glaeda-gh pr o/r#5` is no `post pr` on either count; `post comment`
+    refuses without a body, so a flagless `comment o/r#5` is no write either. Dropping a parent that could
+    only refuse is what leaves `nesting_synonym` with reads alone, and a word it may then route.
+    """
+    if parent != "post":
+        return True
+    if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
+        return False
+    needs = NESTING_WRITE_INPUT.get((parent, word))
+    return not needs or bool({normalized_flag(f) for f in needs} & typed)
+
+
 def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
 
@@ -31921,11 +32022,17 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
     one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
 
-    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    A word more than one command takes, where one of them writes, is *refused*, never guessed: `comment`, `pr` and `run` are each a word
     of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
     would pick between reading and writing. The refusal names every command that takes the word, each as a
     line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
-    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one.
+
+    Two narrowings keep that refusal for the calls it is really about. A parent that could only refuse the
+    call as typed is dropped (`nesting_parent_fits`), and when every parent left only reads there is no
+    read-or-write choice to protect, so the word is routed to the read that answers at once and the blocking
+    sibling is named: `glaeda-gh run o/r/123` and `glaeda-gh pr o/r#5` were each refused with three lines to
+    choose from until 2026-11-22, and each cost the refusal plus the same call typed again under `status`."""
     if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
         return raw, []
     tops, table = nesting_table()
@@ -31939,6 +32046,18 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
         if len(fits) == 1:
             parents = fits
+    if len(parents) > 1:
+        target = next((w for w in raw[1:] if not w.startswith("-")), "")
+        could = [p for p in parents if nesting_parent_fits(p, word, target, typed)]
+        if could:
+            parents = could
+    if len(parents) > 1 and set(parents) <= set(NESTING_READ_FIRST):
+        first = min(parents, key=NESTING_READ_FIRST.index)
+        rest = [p for p in parents if p != first]
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh', first, word] + raw[1:])}` (`{word}` is a word of "
+              f"{len(parents)} commands and every one of them only reads, so this is the one that answers at "
+              f"once; {', '.join(f'`glaeda-gh {p} {word}`' for p in rest)} also reads it)", file=sys.stderr)
+        return [first, word] + raw[1:], []  # said once, here: the single-parent line below would repeat it
     if len(parents) > 1:
         refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
                    f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
