@@ -1399,17 +1399,21 @@ def branch_target_step(kind: str, text: str, cwd: str | None = None) -> str:
     A PR is the thing an agent has in hand least often: what it has is the branch it just pushed. `glaeda-gh status
     pr --head BRANCH` and `status run --branch main` are both unrecognized arguments (two refused calls in this
     lane, 2026-11-21), and the refusal for a branch typed as a target said only what a target must look like, which
-    does not say how to get from the branch to the number. `--field target` prints `pr:owner/repo#5`, the spelling
-    this tool's own targets take, so the printed step's output is the next call's argument."""
+    does not say how to get from the branch to the number. `--field target` prints `owner/repo#5`, a target this
+    tool takes as it stands, so the printed step's output is the next call's argument."""
     if kind not in ("pr", "comment") or not text or "#" in text or "://" in text or text.startswith("-"):
         return ""
     repo, branch = "", text
     if "@" in text:
         left, branch = text.rsplit("@", 1)
-        if not re.fullmatch(r"[^/\s]+/[^/\s]+", left):
+        # NAME, not `[^/\s]+`: git allows `@` in a branch name, so `o/r@feat@v2` would otherwise print a step whose
+        # `--repo o/r@feat` the search refuses -- a printed command that does not run (Opus review of #2428).
+        if not re.fullmatch(rf"{NAME}/{NAME}", left):
             return ""
         repo = left
-    if not branch or BARE_NUMBER.fullmatch(branch) or "@" in branch or SHA40.fullmatch(branch):
+    # `HEAD` and friends resolve as refs in any clone but name no branch GitHub could search for.
+    if not branch or BARE_NUMBER.fullmatch(branch) or "@" in branch or SHA40.fullmatch(branch) \
+            or branch in ("HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD"):
         return ""  # `o/r@<40 hex>` is a head, which `parse_key("head", ...)` takes as it stands
     if not repo:
         if not local_branch(branch, cwd):

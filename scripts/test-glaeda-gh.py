@@ -31425,7 +31425,10 @@ class ABranchTypedAsATargetTest(unittest.TestCase):
             for text in ("my-branch", "feat/x"):
                 with self.subTest(text):
                     self.assertIn(f"--repo teamleaderleo/glaeda head:{text} --state open", self.step("pr", text))
-        with mock.patch.object(gg, "local_branch", return_value=False):
+        # cwd_repo is pinned here too: left real, this case passes wherever the cwd has no GitHub origin (the /tmp
+        # staging this suite runs from), so dropping the local_branch gate would survive it (Opus review of #2428).
+        with mock.patch.object(gg, "local_branch", return_value=False), \
+                mock.patch.object(gg, "cwd_repo", return_value="teamleaderleo/glaeda"):
             said = self.step("pr", "nonsense")
             self.assertIn("must be OWNER/REPO#N", said, "no branch of that name here: the old refusal stands")
             self.assertNotIn("search prs", said)
@@ -31438,6 +31441,11 @@ class ABranchTypedAsATargetTest(unittest.TestCase):
         for kind, text in (("pr", "teamleaderleo/glaeda@" + "a" * 40),  # a head, which `head` takes as it stands
                            ("pr", "teamleaderleo/glaeda@7"),            # a number: the PR form, said as such
                            ("pr", "not/a/repo@b"),
+                           # git allows `@` in a branch name; the step for this one would print a `--repo` the
+                           # search itself refuses, so there is no step to print (Opus review of #2428)
+                           ("pr", "teamleaderleo/glaeda@feat@v2"),
+                           ("pr", "HEAD"),                             # a ref in any clone, a branch in none
+                           ("pr", "FETCH_HEAD"),
                            ("run", "my-branch")):                       # a run id is never a branch
             with self.subTest(kind=kind, text=text), mock.patch.object(gg, "local_branch", return_value=True), \
                     mock.patch.object(gg, "cwd_repo", return_value="teamleaderleo/glaeda"):
