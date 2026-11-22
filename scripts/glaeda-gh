@@ -2964,7 +2964,8 @@ def gh_token() -> str:
 # caches it an hour), kept in memory, never written or logged. A host with no key (huge-blue: the role keys live only
 # on the key home) holds the App too while the key home's pushed one-hour read-only token,
 # ~/.config/gh-app-tokens/ci-watch-token.json, is unexpired: `token ci-watch` answers with it there. Only reads (a REST
-# GET, a GraphQL query, never a mutation, never the outbox) are offered to the pool, so a read-only token is enough. Writes, GraphQL, /rate_limit and every other repo stay
+# GET of a repository, a GraphQL query naming one owner, never a mutation, never the outbox) are offered to the pool,
+# so a read-only token is enough. Writes, the outbox's lookups, /rate_limit and every owner no App is installed on stay
 # on the login, so authorship (CLA, receipts) and the login's budget readings are as before. A host without the App,
 # a mint that fails, or an App answer that is refused (401, 403, 429) or under APP_POOL_FLOOR left sends the read on
 # the login at once, exactly as before, and rests the pool (APP_POOL_REST, or until the App's reset). App reads are
@@ -2974,7 +2975,23 @@ APP_POOL_ROLE = "ci-watch"
 # read goes to the first pool of the chain that holds a token, covers the route and is not resting, so a second App
 # (its role in machines/gh-app-roles.json, its token pushed by the key home) is another 12,500 an hour. Comma list of
 # roles after the primary; GLAEDA_GH_APP_SPARES="" turns the spares off.
-APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", "quota-goblin") or "").replace(" ", "").split(",") if r)
+# Apps first, the login last (Leo, 2026-11-22: "use more of the apps then. go make more"): every land-queue rate-limit
+# refusal on one host that day was the shared login at 0 of 5,000 GraphQL points, not an App, and the five daemons
+# sent about 2,730 of the login's 3,048 GraphQL calls an hour. The default chain is now land-judge (the land queue's
+# reads, its own 12,500 an hour), glaeda (this daemon's own App), ci-watch, quota-goblin (the most spent). A list that
+# names the primary (APP_POOL_ROLE) is the whole chain in its order (app_pool_chain); one that does not is the roles
+# after the primary, as before, so GLAEDA_GH_APP_SPARES=quota-goblin is the chain before this change. A role whose
+# token this host does not hold is passed over (held_here), as a spare always was.
+APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin"
+APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
+
+
+def app_pool_chain(roles: "tuple[str, ...] | list[str]", primary: str = APP_POOL_ROLE) -> list[str]:
+    """The App roles a read tries, in order: ROLES itself when it names PRIMARY, else PRIMARY then ROLES. Once each."""
+    order = list(roles) if primary in roles else [primary, *roles]
+    return list(dict.fromkeys(r for r in order if r))
+
+
 APP_POOL_DIR = Path(os.environ.get("GH_APP_TOKEN_DIR") or Path.home() / ".config/gh-app-tokens")
 APP_POOL_TTL = 300.0  # a token from gh_app_token.py is used this long (it hands out one with 10+ minutes left)
 APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not asked again for this long
@@ -3041,6 +3058,107 @@ def app_graphql_refused(message: str) -> bool:
     if re.search(r"FORBIDDEN", message):
         return True
     return "NOT_FOUND" in APP_POOL_ANSWERED_NOT_FOUND.sub("", message)
+
+
+# Another organization's IP allow list refuses one node of a batch, not the repository. Every hour both read Apps were
+# answered 200 with "FORBIDDEN Although you appear to have the correct authorization credentials, the `X` organization
+# has an IP allow list enabled, and your IP address is not permitted to access this resource." on a manaflow-ai/cmux
+# query (one host, 2026-11-22: 5, 6, 10 and 17 per App in the 10Z-13Z hours), and the single-repository scope was
+# benched APP_POOL_ROUTE_REST, so every cmux GraphQL read went on the login until its quota ran out (14:13-14:27Z: of
+# 91 land judgments, 8 unreadable and 9 quota). X is not the repository's owner: it owns something one node points at
+# (a check suite's app, a head repository), and GitHub names that node in the error's path. Such a refusal now benches
+# that node ("node:OWNER/REPO#N", "node:OWNER/REPO@SHA", "node:OWNER/REPO/runs/ID", "node:id:NODE_ID") in every pool
+# of the chain, for APP_POOL_ROUTE_REST: a query naming it goes on the login, batched() reads it apart from the rest,
+# and the rest stay on the App. One that names no path, or another error beside it, keeps the scope bench.
+# GLAEDA_GH_APP_NODE_BENCH=0 turns it off (the repository scope is benched, as before).
+APP_POOL_NODE_BENCH = (os.environ.get("GLAEDA_GH_APP_NODE_BENCH", "1") or "1").strip().lower() not in {"0", "off", "false", "no"}
+APP_POOL_IP_ALLOW_LIST = re.compile(r"the `([A-Za-z0-9][A-Za-z0-9-]{0,38})` organization has an IP allow list enabled", re.I)
+APP_POOL_ALIAS = re.compile(r"^[a-z](\d+)$")
+APP_POOL_RUN_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)/actions/runs/(\d+)",
+                              re.I)
+APP_POOL_HEAD_ALIAS = re.compile(r'(?<![\w$])([a-z]\d+): ?repository\(owner:"([A-Za-z0-9][A-Za-z0-9-]{0,38})",'
+                                 r'name:"([A-Za-z0-9._-]+)"\)\{object\(oid:"([0-9a-fA-F]{40})"\)')
+
+
+def graphql_body_nodes(body: dict | None) -> dict[str, str]:
+    """{alias or "FIELD.INDEX": node} for every node a GraphQL BODY asks: an aliased PR or issue (o/r/n variables),
+    run (u variable) or head (head_query's literal repository and commit), and each id of a nodes(ids:) list."""
+    if not isinstance(body, dict):
+        return {}
+    variables = body.get("variables") if isinstance(body.get("variables"), dict) else {}
+    out: dict[str, str] = {}
+    for key, value in variables.items():
+        m = re.fullmatch(r"o(\d+)", str(key))
+        if m and isinstance(value, str):
+            repo, number = variables.get(f"r{m.group(1)}"), variables.get(f"n{m.group(1)}")
+            if isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool):
+                out[m.group(1)] = f"{value.lower()}/{repo.lower()}#{number}"
+        m = re.fullmatch(r"u(\d+)", str(key))
+        run = APP_POOL_RUN_URL.match(value) if m and isinstance(value, str) else None
+        if m and run:
+            out[m.group(1)] = f"{run.group(1).lower()}/{run.group(2).lower()}/runs/{run.group(3)}"
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                if isinstance(item, str) and item:
+                    out[f"{key}.{i}"] = f"id:{item}"
+    for alias, owner, repo, sha in APP_POOL_HEAD_ALIAS.findall(str(body.get("query") or "")):
+        out[alias] = f"{owner.lower()}/{repo.lower()}@{sha.lower()}"
+    return out
+
+
+def graphql_error_node(body: dict | None, path: Any) -> str | None:
+    """The node of BODY an error's PATH is under (graphql_body_nodes), or None: an alias p3 is its o3/r3/n3 PR (or a
+    head's literal h3), a path ["suiteRuns", 4, ...] the fifth id of the body's one list variable."""
+    if not isinstance(path, list) or not path:
+        return None
+    nodes = graphql_body_nodes(body)
+    alias = APP_POOL_ALIAS.match(str(path[0]))
+    if alias:
+        return nodes.get(str(path[0])) or nodes.get(alias.group(1))
+    if len(path) > 1 and type(path[1]) is int:
+        variables = (body or {}).get("variables") if isinstance((body or {}).get("variables"), dict) else {}
+        lists = [k for k, v in variables.items() if isinstance(v, list)]
+        if len(lists) == 1:
+            return nodes.get(f"{lists[0]}.{path[1]}")
+    return None
+
+
+def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple[str, str]] | None:
+    """[(node, "path.as.text"), ...] when every error of a 200 App answer that refuses (app_graphql_refused) is
+    another organization's IP allow list (an organization that is not OWNER) at a path naming one node of BODY; else
+    None (no such error, one with no path, or any other refusal beside it: the scope is benched as before)."""
+    if not APP_POOL_NODE_BENCH or not isinstance(errors, list):
+        return None
+    found: list[tuple[str, str]] = []
+    for e in errors:
+        if not isinstance(e, dict) or protection_forbidden(e):
+            continue
+        text = str(e.get("type") or "") + " " + str(e.get("message") or "")
+        if not app_graphql_refused(text):
+            continue
+        org = APP_POOL_IP_ALLOW_LIST.search(text)
+        node = graphql_error_node(body, e.get("path"))
+        if not (str(e.get("type") or "") == "FORBIDDEN" and org and org.group(1).lower() != owner.lower() and node):
+            return None
+        found.append((node, ".".join(str(p) for p in e["path"])))
+    return found or None
+
+
+def entry_nodes(key: str) -> list[str]:
+    """The nodes (graphql_body_nodes) a watch KEY's GraphQL read asks: its PR, run or head, and a head's
+    CHECKS_OF_RECORD commit."""
+    try:
+        kind, owner, repo, value = split_key(key)
+    except ValueError:
+        return []
+    base = f"{owner.lower()}/{repo.lower()}"
+    if kind == "head":
+        nodes = [f"{base}@{value}"]
+        if (owner, repo) in CHECKS_OF_RECORD:
+            other = "/".join(CHECKS_OF_RECORD[(owner, repo)]).lower()
+            nodes.append(f"{other}@{value}")
+        return nodes
+    return [f"{base}/runs/{value}" if kind == "run" else f"{base}#{value}"]
 
 
 # A branch's rule or protection read is one route family of its repository: the App lacks administration for every
@@ -3135,12 +3253,32 @@ class AppPool:
         self.spares = [AppPool(role=r, clock=self.clock) for r in roles if r != self.role]
         return self
 
-    def pick(self, owner: str, scope: str) -> "AppPool | None":
-        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE."""
+    def pick(self, owner: str, scope: str, body: dict | None = None) -> "AppPool | None":
+        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE, nor
+        any node a GraphQL BODY asks (bench_nodes)."""
+        any_node = body is not None and any(k.startswith("node:") for p in [self, *self.spares] for k in p.unreadable)
+        nodes = list(graphql_body_nodes(body).values()) if any_node else []  # (no node benched: no parse per read)
         for pool in [self, *self.spares]:
-            if pool.covers(scope) and pool.token(owner):
+            if pool.covers(scope) and not pool.nodes_benched(nodes) and pool.token(owner):
                 return pool
         return None
+
+    def nodes_benched(self, nodes: "list[str]") -> bool:
+        """Whether this pool has benched any of NODES (bench_nodes)."""
+        now = self.clock()
+        return any(self.unreadable.get(f"node:{n}", 0.0) > now for n in nodes)
+
+    def chain_benched(self, nodes: "list[str]") -> bool:
+        """Whether any pool of the chain has benched any of NODES: batched() reads such an entry apart."""
+        return any(pool.nodes_benched(nodes) for pool in [self, *self.spares])
+
+    def bench_nodes(self, nodes: "list[str]", until: float) -> None:
+        """Keep NODES on the login until UNTIL in every pool of the chain: another organization's IP allow list
+        refuses this host's address (foreign_ip_refusal), whichever App asks."""
+        for pool in [self, *self.spares]:
+            for node in nodes:
+                pool.unreadable[f"node:{node}"] = until
+            pool.save_bench()
 
     def held_here(self) -> bool:
         """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
@@ -3185,6 +3323,11 @@ class AppPool:
         head_query's literal repositories, or in the daemon's route field (graphql_named_repos). An opaque query or
         one spanning owners stays on the login, so an App token can never change viewer or cross-owner semantics.
         """
+        return self.owner_why(method, path, body)[0]
+
+    def owner_why(self, method: str, path: str, body: dict | None = None) -> tuple[str | None, str]:
+        """(owner_of's owner, "") or (None, why the read is not offered to the pool): "not-a-repo-route",
+        "write", "graphql-no-owner", "graphql-many-owners" or "owner-without-app" (no App installed on it)."""
         owners: set[str] = set()
         if method == "GET":
             m = APP_POOL_REPO.match(path)
@@ -3203,13 +3346,36 @@ class AppPool:
                         if match:
                             owners.add(match.group(1).lower())
             owners.update(o for o, _ in graphql_named_repos(body))
+        elif method != "GET":
+            return None, "write"
         if len(owners) != 1:
-            return None
+            if path != "/graphql":
+                return None, "not-a-repo-route"
+            return None, "graphql-many-owners" if owners else "graphql-no-owner"
         now = self.clock()
         if self.owners_at[1] <= now:  # the config is read once per APP_POOL_TTL, not per request
             self.owners_at = (frozenset(self.owners_fn()), now + APP_POOL_TTL)
         owner = next(iter(owners))
-        return owner if owner in self.owners_at[0] else None
+        return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
+
+    def passed_over(self, owner: str, scope: str) -> tuple[str, dict[str, str]]:
+        """Why no pool of the chain answers OWNER's SCOPE after pick() found none, without a mint or a request:
+        (cause, {role: its own}). A role is "no-token" (this host holds none of it), "route-benched" (it refused
+        SCOPE lately, covers) or "pool-resting" (rate limited, under its floor, or a failed mint). The cause is
+        "no-token" when no role holds one, else "pool-resting" when any holder rests, else "route-benched"."""
+        now = self.clock()
+        each: dict[str, str] = {}
+        for pool in [self, *self.spares]:
+            if not pool.covers(scope):
+                each[pool.role] = "route-benched"
+            elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_fn():
+                each[pool.role] = "no-token"
+            else:
+                each[pool.role] = "pool-resting"
+        held = [c for c in each.values() if c != "no-token"]
+        if not held:
+            return "no-token", each
+        return ("pool-resting" if "pool-resting" in held else "route-benched"), each
 
     def token(self, owner: str) -> str | None:
         """OWNER's installation token, or None: the read then goes on the login, as it always did."""
@@ -3316,10 +3482,12 @@ class AppPool:
         _, repos = self.graphql_repos(scope)
         return [r for r in repos if re.search(rf"(?<![\w.-]){re.escape(r)}(?![\w.-])", message, re.I)]
 
-    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "",
+                 nodes: "list[str] | None" = None) -> bool:
         """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
         the pool; a 403 or 404 of one route (a permission or repository the App lacks: branch protection needs
-        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST."""
+        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST. NODES
+        (foreign_ip_refusal) are the only nodes a 200 answer's refusal names: they are benched, never SCOPE."""
         now = self.clock()
         try:
             remaining, reset = int(headers.get("x-ratelimit-remaining", "")), float(headers.get("x-ratelimit-reset", ""))
@@ -3334,6 +3502,10 @@ class AppPool:
             spent = remaining == 0 and reset is not None and reset > now
             self.rest_until[owner] = min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST
             self.why = f"the {self.role} App answered HTTP {status}"
+            self.fell_back += 1
+            return False
+        if status == 200 and nodes:
+            self.bench_nodes(nodes, now + APP_POOL_ROUTE_REST)
             self.fell_back += 1
             return False
         if status in {403, 404} or (status == 200 and app_graphql_refused(message)):
@@ -3516,8 +3688,9 @@ class ReadTokenPool(AppPool):
             self.keep(owner, pair)
         return pair[0]
 
-    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
-        ok = super().answered(owner, scope, status, headers, message)
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "",
+                 nodes: "list[str] | None" = None) -> bool:
+        ok = super().answered(owner, scope, status, headers, message, nodes)
         if status == 401:  # dead: the next read mints again, after the rest
             self.keep(owner, None)
         return ok
@@ -5113,10 +5286,11 @@ class Daemon:
         self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
-        # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
-        # the login.
+        # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
+        # every read on the login.
+        chain = app_pool_chain(APP_POOL_SPARES)
         self.app_pool: AppPool | None = (
-            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES).restore_bench()
+            AppPool(role=chain[0], clock=lambda: self.clock()).with_spares(chain[1:]).restore_bench()
             if app_pool == "auto" else app_pool)
         self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
@@ -6428,6 +6602,38 @@ class Daemon:
 
     # -- requests
 
+    def note_login_fallback(self, method: str, path: str, body: dict | None, free: bool, owner: str | None,
+                            scope: str, refused: bool) -> None:
+        """One "login-fallback" line for a read about to go on the shared login: its kind, route or scope and cause
+        (never a token). Before it, the log could not say why a read spent the login: spend.json counts the login's
+        requests by route, and app-pool-refused names only an App's refusal, not a read no App was asked for.
+        Causes: rate-limit-read (/rate_limit reads the login's own budget), outbox (a queued write's lookups),
+        no-app-pool, refused (the last App of the chain refused it just now), AppPool.owner_why's (write is never
+        logged: a write is the login's by design) and AppPool.passed_over's. A write logs nothing."""
+        query = str(body.get("query") or "") if isinstance(body, dict) else ""
+        if not (method == "GET" or (method == "POST" and path == "/graphql" and not re.match(r"\s*mutation\b", query))):
+            return
+        pool, pools = self.app_pool, None
+        if free:
+            cause = "rate-limit-read"
+        elif self.writing:
+            cause = "outbox"
+        elif pool is None:
+            cause = "no-app-pool"
+        elif refused:
+            cause = "refused"
+        elif owner is None:
+            cause = pool.owner_why(method, path, body)[1] or "other"
+        else:
+            cause, pools = pool.passed_over(owner, scope)
+        if cause == "write":
+            return
+        kind = (tuple(self.caller) + ("",))[0]
+        log({"event": "login-fallback", "kind": kind, "cause": cause, "route": route_of(method, path),
+             **({"query": self.gql_reason} if path == "/graphql" and self.gql_reason else {}),
+             **({"owner": owner} if owner else {}), **({"scope": scope} if scope else {}),
+             **({"pools": pools} if pools else {})})
+
     def request(self, method: str, path: str, body: dict | None = None, etag: str | None = None,
                 free: bool = False, content: bool = False) -> tuple[int, dict, Any]:
         """One GitHub request.
@@ -6454,7 +6660,8 @@ class Daemon:
                  and not self.writing else None)
         route = route_of(method, path)
         scope = pool.scope(owner, method, path, body) if owner else ""
-        chosen = pool.pick(owner, scope) if owner else None
+        graphql_body = body if path == "/graphql" else None
+        chosen = pool.pick(owner, scope, graphql_body) if owner else None
         app_token = chosen.token(owner) if chosen else None
         if app_token:
             pool = chosen
@@ -6491,13 +6698,26 @@ class Daemon:
                 message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
             else:
                 message = ""
-            if pool.answered(owner, scope, status, h, message):
+            errors = doc.get("errors") if isinstance(doc, dict) else None
+            # another organization's IP allow list at one node's path: that node is benched, never the repository
+            refused = foreign_ip_refusal(owner, graphql_body, errors) if status == 200 and graphql_body else None
+            nodes = sorted({node for node, _ in refused}) if refused else None
+            if pool.answered(owner, scope, status, h, message, nodes):
                 self.note_spend("rest", route, 0)
                 self.sent.append((self.now, "app"))
                 return status, h, doc
-            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status, "route": route,
-                 "scope": scope, "error": message[:200]})
-            if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
+            # each error's path, so a reader can tell a refused node from a refused repository (no token is in it)
+            paths = [".".join(str(p) for p in e["path"]) for e in errors or []
+                     if isinstance(e, dict) and isinstance(e.get("path"), list) and not protection_forbidden(e)][:5]
+            if nodes:
+                if self.app_pool is not None:
+                    self.app_pool.bench_nodes(nodes, self.clock() + APP_POOL_ROUTE_REST)
+                log({"event": "app-pool-node-refused", "role": pool.role, "owner": owner, "status": status,
+                     "route": route, "scope": scope, "nodes": nodes[:10], "paths": paths, "error": message[:200]})
+            else:
+                log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status, "route": route,
+                     "scope": scope, "error": message[:200], **({"paths": paths} if paths else {})})
+            if self.app_pool is not None and self.app_pool.pick(owner, scope, graphql_body) is not None:
                 # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
                 return self.request(method, path, body, etag, free, content)
             # refused: the same read goes on the login at once, as it would have without the App
@@ -6509,6 +6729,7 @@ class Daemon:
         if not self.secondary_admit(bucket, 1):
             # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
             raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
+        self.note_login_fallback(method, path, body, free, owner, scope, refused=bool(app_token))
         if self.token is None:
             self.token = self.token_source()
         headers = self.read_headers(self.token, etag, raw_body is not None)
@@ -9056,7 +9277,7 @@ class Daemon:
         if owner is None:
             return []
         scope = pool.scope(owner, method, path, body)
-        if pool.pick(owner, scope) is None:
+        if pool.pick(owner, scope, body if path == "/graphql" else None) is None:
             return []
         return entries
 
@@ -9083,8 +9304,10 @@ class Daemon:
         ineligible too, and under a login stop due() then read none of them. One dev host, 2026-11-21 11Z, watched 18
         manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
         groups: dict[str, list[dict]] = {}
-        for e in entries:
-            groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)  # owner/repo: a benched repo alone
+        pool = self.app_pool
+        for e in entries:  # owner/repo: a benched repo alone; a benched node (bench_nodes) apart from its repo's rest
+            benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
+            groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""), []).append(e)
         if len(groups) < 2:
             return self.app_entries_eligible(kind, entries, bucket)
         ok = {e["key"] for g in groups.values() for e in self.app_entries_eligible(kind, g, bucket)}
@@ -9132,9 +9355,14 @@ class Daemon:
             # owner (a query is a point at most, and an App's costs the login nothing).
             # And one repository per query: a refused query benches the repositories its errors name, and one that names
             # none benches nothing, so a mixed chunk's refusal would cost the App's whole set another try each tick.
+            # And an entry whose node an App refused (bench_nodes) apart: its chunk goes on the login, the rest stay on
+            # the App.
             groups: dict[str, list[dict]] = {}
+            pool = self.app_pool
             for e in rest:
-                groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)
+                benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
+                groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""),
+                                  []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
@@ -9645,7 +9873,7 @@ class Daemon:
         if route:
             body[APP_POOL_ROUTE_FIELD] = sorted(set(route))
         owner = pool.owner_of("POST", "/graphql", body)
-        return owner is not None and pool.pick(owner, pool.scope(owner, "POST", "/graphql", body)) is not None
+        return owner is not None and pool.pick(owner, pool.scope(owner, "POST", "/graphql", body), body) is not None
 
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
@@ -10069,11 +10297,19 @@ class Daemon:
         most GQL_BATCH PRs (or heads and their check-of-record commits) of at most 100 suites, so 2 * GQL_BATCH queries
         of one point each, and far fewer in practice (a cmux head has about 15 such suites)."""
         suites = list(dict.fromkeys(suites))
+        # A suite an App refused (bench_nodes) is read in chunks of its own, on the login; the rest stay on the App.
+        pool = self.app_pool
+        benched = [s for s in suites if pool is not None and pool.chain_benched([f"id:{s}"])]
+        held = frozenset(benched)
+        suites = [s for s in suites if s not in held] + benched
+        starts = (list(range(0, len(suites) - len(benched), SUITE_RUNS_BATCH))
+                  + list(range(len(suites) - len(benched), len(suites), SUITE_RUNS_BATCH)))
+        ends = starts[1:] + [len(suites)]
         out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
-        for start in range(0, len(suites), SUITE_RUNS_BATCH):
-            chunk = suites[start:start + SUITE_RUNS_BATCH]
+        for start, end in zip(starts, ends):
+            chunk = suites[start:end]
             if paced and not self.app_answers(SUITE_RUNS, {"suites": chunk}, route) and not self.gql_room():
                 for suite_id in suites[start:]:
                     out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
@@ -12257,7 +12493,7 @@ def land_worker_ceiling(cores: int | None = None) -> int:
 
 
 # The pool grows to what the queue needs and GitHub answers, never to a count set by hand (LandQueue.adapt_pool). It
-# starts at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
+# starts where the daemon before it left off (land_pool_start), else at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
 # (gated) grows by LAND_POOL_GROW (at least one worker), and a quota refusal since the last step (park_quota,
 # park_queue_quota) halves it, as TCP's congestion window does. A judgment is land_judge waiting on GitHub, not on the
 # host: huge-blue, 2026-11-22 09:58Z, 17 land_judge/classifier processes held 1,109 MB (about 65 MB each) at 0.1-11%
@@ -12294,6 +12530,24 @@ def land_pool_max(mem_mb: int | None = None) -> int:
     return max(floor, int(mem) // 2 // LAND_JUDGE_MEM_MB)
 
 
+def land_pool_start(pool: Any, now: float, ceiling: int | None = None) -> float:
+    """Where a new daemon's adaptive pool starts: the size its last land-pool line POOL (LAND_POOL_FILE) said, when
+    that line is at most LAND_ROOM_FRESH old, never over the memory ceiling (land_pool_max); else land_worker_ceiling.
+    A re-exec keeps the size the pool grew (or halved) to. huge-blue re-execs its daemon every 10-30 min (glaeda
+    updates): 2026-11-22, with land.json's "workers" removed at 12:28Z, the pool grew 16 -> 20 -> 25, a re-exec at
+    12:39Z put it back at 16, under the fixed 32 it replaced, and the override went back (hq#18502)."""
+    start = float(land_worker_ceiling())
+    if not isinstance(pool, dict):
+        return start
+    stamps = [float(v) for v in (pool.get("at"), pool.get("sizeAt"))
+              if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    size = pool.get("workers")
+    if (not stamps or now - max(stamps) > LAND_ROOM_FRESH or not isinstance(size, int) or isinstance(size, bool)
+            or size < 1):
+        return start
+    return float(min(size, land_pool_max() if ceiling is None else ceiling))
+
+
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
 # handbook's headroom line) held every judgment past the first while the host's load per core was over it, and later
 # (glaeda#2457) its busy CPU share. A judgment is land_judge waiting on GitHub: what it costs does not move with the
@@ -12316,6 +12570,16 @@ LAND_EXPLAIN_DEADLINE_CLIENT = 300.0
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
+# A land notice that acpmux refuses is sent again, LAND_NOTIFY_RETRY_S apart, up to LAND_NOTIFY_TRIES in all, off the
+# tick. One refused send used to be the only send: the merged or stopped word never reached its lane, which then
+# waited on a land that had ended. gcp-agent-lane-13, 2026-11-21 10:36Z-11-22 09:15Z: 58 land-notify-failed, 57 of
+# them "acpmux: runtime: empty prompt", spread over the day (about 2 an hour), none reproducible with the same argv on
+# a later acpmux; huge-blue logged 1,893 against 976 land-pool lines.
+LAND_NOTIFY_TRIES = 3
+LAND_NOTIFY_RETRY_S = 5.0
+# A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
+# "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
+LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -12688,6 +12952,16 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A judgment that merged the base into the PR itself: land_judge's stale_main_update and stale_ci_update (leo-workspace
+# tools/land_judge/engine.py) send update_branch pinned to the judged head inside the judgment and answer the running
+# checks' wait at that head ("checks still running at HEAD: main (TIP) was merged into the PR: ..."). The queue never
+# sent it, so nothing recorded it (updateSent), and the head the merge made stopped the pinned land head_moved:
+# teamleaderleo/glaeda#2495 (pinned 5bc3ba9e, base merge 0b53d1a3 by the lander bot at 12:03:42Z, 31 s after a
+# judgment) and manaflow-ai/cmuxterm-hq#18096 (pinned f2a95491, 1b282104 at 12:53:30Z, 21 s after one), 2026-11-22; each
+# re-queued by hand. note_judge_update records it as this queue's own (updateSent at HEAD), so follow_own_update's
+# parent check moves the pin to that merge and judges it in full, and any other head still stops head_moved.
+LAND_JUDGE_BASE_MERGED = re.compile(r"checks still running at ([0-9a-f]{40}): (?:the base )?\S+ \([0-9a-f]{7,40}\) "
+                                    r"was merged into the PR\b")
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
@@ -13262,9 +13536,12 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
     the environment is a session here: a sub-session's PARENT/CHILD gets this host too (acpmux send takes
     HOST/PARENT/CHILD), unless its first part is a fleet machine (a peer's session name, HOST/NAME)."""
     name, source = (given.strip(), "--notify") if given and given.strip() else ("", "")
+    if name.lower() in LAND_NO_REQUESTER:
+        return "", ""
     if not name:
         name, source = next(((os.environ[k].strip(), "$" + k) for k in LAND_REQUESTER_KEYS
-                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG), ("", ""))
+                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG
+                             and os.environ[k].strip().lower() not in LAND_NO_REQUESTER), ("", ""))
     if not name:
         return "", ""
     if source != "--notify":
@@ -13287,7 +13564,7 @@ def land_notify_target(e: dict, requester: str) -> str:
     empty so notify logs one land-unnotified event instead of retrying a bad
     destination.
     """
-    if requester:
+    if requester and requester.rsplit("/", 1)[-1].lower() not in LAND_NO_REQUESTER:  # an older entry's HOST/none
         return requester
     queued_by = str(e.get("queuedBy") or "")
     parent = queued_by.split(":agent:", 1)[0]
@@ -13914,7 +14191,8 @@ class LandQueue:
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
-        self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
+        # the adaptive pool's size (adapt_pool), unless land.json sets one: where the last daemon left it (land_pool_start)
+        self.pool_size = land_pool_start(read_json(land_dir() / LAND_POOL_FILE), time.time())
         self.pool_adapted = 0.0  # when adapt_pool last stepped
         self.quota_refused = float("-inf")  # the last quota refusal (park_quota, park_queue_quota): adapt_pool halves
         self.now = time.time()
@@ -15109,11 +15387,13 @@ class LandQueue:
     def adapt_pool(self) -> None:
         """Every LAND_POOL_ADAPT_S, step the adaptive pool (the comment above LAND_POOL_ADAPT_S): halve it after a
         quota refusal, else grow it while it is full and due rows waited for a worker this pass; logged as land-pool-
-        size when it moves. land.json "workers" fixes it instead."""
+        size when it moves, and kept in LAND_POOL_FILE at once, so a daemon started next takes it (land_pool_start).
+        land.json "workers" fixes it instead, and the adaptive size follows it: one taken out goes on from there."""
         if self.now - self.pool_adapted < LAND_POOL_ADAPT_S:
             return
         last, self.pool_adapted = self.pool_adapted, self.now
         if self.config().get("workers") is not None:
+            self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
         if self.quota_refused > last:
@@ -15125,6 +15405,10 @@ class LandQueue:
         if int(size) != int(self.pool_size):
             log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
                  "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
+            line = read_json(land_dir() / LAND_POOL_FILE)
+            with contextlib.suppress(OSError):  # the pool line says the new size now, not at its next LAND_POOL_LOG_EVERY
+                write_json(land_dir() / LAND_POOL_FILE, {**(line if isinstance(line, dict) else {}),
+                                                         "workers": max(1, int(size)), "sizeAt": self.now})
         self.pool_size = size
 
     def headroom_left(self) -> tuple[float, float]:
@@ -16465,7 +16749,12 @@ class LandQueue:
             counts = counts and not e.pop("stepQuotaParked", False)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
+        # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
+        # so without this line no log on the land host says how long a judgment took, and a change meant to make
+        # judgments faster (one mirror fetch per head) has no before or after to read.
+        started = time.monotonic()
         answer = self.explain(e, sha)
+        took = round(time.monotonic() - started, 1)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, land_judge read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
@@ -16500,7 +16789,11 @@ class LandQueue:
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
+            log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
+                 "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
+                 "why": why or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
+            self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
@@ -16550,6 +16843,19 @@ class LandQueue:
                 return
             self.save(e)
         self.take(e, act, answer)
+
+    def note_judge_update(self, e: dict, answer: dict, head: str) -> None:
+        """Under the lock: when the judgment of E at HEAD merged the base into the PR itself (LAND_JUDGE_BASE_MERGED,
+        sent pinned to HEAD), record it as this queue's own update at HEAD (updateSent), as update_branch does when it
+        sends one. The merge it makes then follows the pin (follow_own_update: its parents include HEAD) instead of
+        stopping head_moved, and no second update is sent at HEAD (LAND_UPDATE_ONCE)."""
+        m = LAND_JUDGE_BASE_MERGED.search(str(answer.get("reason") or ""))
+        if not m or m.group(1) != head or not SHA40.fullmatch(head or ""):
+            return
+        if str((e.get("updateSent") or {}).get("head") or "").lower() == head:
+            return
+        e["updateSent"] = {"head": head, "at": self.now, "by": "land_judge"}
+        self.history(e, "update_by_judge", head=head[:12])
 
     def unjudgeable_here(self, e: dict, answer: dict, act: dict, head: str) -> str:
         """Under the lock: why this lane VM should hand E at HEAD to the broker host's land queue instead of judging it
@@ -17868,13 +18174,21 @@ class LandQueue:
                 "--class", LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
-            got = self.call(argv, LAND_NOTIFY_DEADLINE)
-            if got.returncode != 0:
-                why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
-                log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why})
-                with contextlib.suppress(Exception):
-                    self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
-                                {"to": to, "why": why, "pr": self.url(e)})
+            whys: list[str] = []
+            for tried in range(1, LAND_NOTIFY_TRIES + 1):
+                got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                if got.returncode == 0:
+                    if whys:
+                        log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
+                    return
+                whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if tried < LAND_NOTIFY_TRIES:
+                    time.sleep(LAND_NOTIFY_RETRY_S)
+            why = whys[-1]
+            log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why, "tries": len(whys)})
+            with contextlib.suppress(Exception):
+                self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
+                            {"to": to, "why": why, "pr": self.url(e)})
         if self.inline:
             send()
         else:
@@ -24336,7 +24650,7 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                   f"REST answered 304 (free), {hour.get('graphql', 0)} GraphQL, "
                   f"{hour.get('free', 0)} rate_limit reads (free), {hour.get('write', 0)} REST for queued writes, "
                   f"{hour.get('kept', 0)} completed-attempt job lists answered from disk (no request)"
-                  + (f", {hour['app']} REST on the {APP_POOL_ROLE} App (not the login)" if hour.get("app") else ""))
+                  + (f", {hour['app']} REST on the App pools (not the login)" if hour.get("app") else ""))
         pool = status.get("appPool")
         for pool in ([pool, *(pool.get("spares") or [])] if isinstance(pool, dict) else []):
             seen = pool.get("seen") if isinstance(pool.get("seen"), dict) else {}
@@ -30020,6 +30334,12 @@ CHOICE_SYNONYMS = {
     "issue": ("issues", "new-issue", "newissue", "bug", "file-issue"),
     "label": ("labels", "add-label", "add-labels", "tag"),
     "close": ("close-issue", "close-pr"),
+    # Commands (command_spelling_synonym reads the same table for the first word). `status` reads the state of
+    # pull requests and runs, which is what every one of these words asks for; the words for a write are left
+    # refused, since a write nobody typed is the one rewrite that cannot be taken back.
+    "status": ("pr-state", "pr-status", "prstate", "run-state", "state", "states", "check-state"),
+    "budget": ("quota", "spend", "spent", "usage"),
+    "search": ("find", "query"),
 }
 CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
 
@@ -30418,9 +30738,9 @@ def parser() -> argparse.ArgumentParser:
             s.add_argument("--max", type=seconds, default=None, metavar="S",
                            help=f"the hard ceiling from the start, however much it changes (default "
                                 f"{WAIT_MAX_TIMES}x --timeout); --json's ended_by says which ended it")
-            s.add_argument("--sha", "--head", dest="sha", metavar="SHA",
+            s.add_argument("--sha", "--head", "--pin", "--pinned", dest="sha", metavar="SHA",
                            help="the commit you pushed (git rev-parse HEAD): other heads count as pending; "
-                                "--head is the same flag")
+                                "--head and --pin are the same flag")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",
                            help=f"hold a failure caused only by a glaeda runner refusing a job at setup this long "
                                 f"for a rescue re-run (default {RESCUE_GRACE}; 0 rules on each attempt)")
@@ -30571,10 +30891,12 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
                          "host/$ACPMUX_SESSION_NAME)")
-    ld.add_argument("--sha", "--match-head-commit", dest="sha", metavar="SHA",
+    # --pin: what the rulebook and every agent here call this ("land pinned <sha>", "glaeda-gh land --pin"), asked
+    # for so on gcp-agent-lane-2, 2026-11-22, and refused as an unrecognized argument with the land unqueued.
+    ld.add_argument("--sha", "--match-head-commit", "--pin", "--pinned", dest="sha", metavar="SHA",
                     help="land only this head (7 to 40 hex): refused now if the PR's head is another, and the land "
-                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) is "
-                         "the same")
+                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) "
+                         "and --pin (what the rulebook calls it) are the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
                     help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
                          "line, at most 200 characters; needs --override-receipt. Neither flag: the caller's own "
@@ -31077,6 +31399,37 @@ def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[s
         out.append(word)
         i += 1
     return out
+def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """The first word as the one command it means: (argv, refusal lines).
+
+    glaeda#2368 gave every choice *argument* a case, a synonym, a prefix and a typo of its choices, and
+    glaeda#2358 routes a word that lives under another command. The commands themselves got neither: argparse
+    keeps a subparsers action's choices as a mapping, and `Parser._get_value` reads only a list or tuple.
+    Measured on gcp-agent-lane-2, 2026-11-21: `glaeda-gh pr-state o/r#7547 o/r#7537 ...` -- the merge state of
+    four pull requests in one gather -- was refused with the bare list of commands, which names every command
+    and not which one answers the ask, and finding `status` cost another call.
+
+    So the first word goes through the same `close_choice` as every other choice, and a word as close to two
+    commands is refused naming both, as the other two rewriters refuse. Only the *first* word is read: for a
+    subparsers action argparse hands `_get_value` every word of the call, where `wait run o/r/1` would read
+    `run` as a prefix of `runners` -- which is why this lives here and not in `_get_value`."""
+    if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, table = nesting_table()
+    word = raw[0]
+    if word in tops or word in table:
+        return raw, []  # a command, or a word nesting_synonym owns and routes
+    meant, near = close_choice(word, sorted(tops))
+    if not meant:
+        if len(near) > 1:
+            return raw, [f"glaeda-gh: `{word}` is no command, and is as close to `{'` as to `'.join(near)}`: "
+                         f"which one decides what this does, so it is not guessed",
+                         *(f"next: {' '.join(['glaeda-gh', c] + raw[1:])}" for c in near)]
+        return raw, []  # nothing near it: argparse refuses it with the commands, as it always has
+    fixed = [meant] + raw[1:]
+    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` (`{word}` is no command; `{meant}` is the "
+          f"one it means)", file=sys.stderr)
+    return fixed, []
 
 
 def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
@@ -31159,10 +31512,11 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, doubled_kind_synonym, flag_spelling_synonym):
-        # The nesting first, then the flags: which options a command has depends on which command it is.
-        # `doubled_kind_synonym` sits between them: it only looks at a call that already leads with a real
-        # command, which is what `nesting_synonym` has just made sure of, and it reads flags only by name.
+    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym, flag_spelling_synonym):
+        # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
+        # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
+        # sits between them: it only looks at a call that already leads with a real command, which is what the
+        # two before it have just made sure of, and it reads flags only by name.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
