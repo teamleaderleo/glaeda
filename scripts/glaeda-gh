@@ -12215,10 +12215,28 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
     return answer
 
 
+# ssh's options that take an argument (OpenSSH ssh(1)): `-o X`, `-i X`, ... A forward named its host by the word
+# after ssh, so huge-blue's executor `ssh -o ... HOST` was said as "forwards its own lands to -o" (2026-11-22 17:24Z,
+# land_handoff of cmuxterm-hq#18951). The host is the first word that is no option or an option's argument.
+SSH_ARG_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
 def land_forward_name(command: list[str]) -> str:
-    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
-    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
-        return command[1]
+    """The executor as said in messages: `reach HOST ...` or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
+    words."""
+    if Path(command[0]).name in ("reach", "ssh"):
+        words = iter(command[1:])
+        for word in words:
+            if word == "--":
+                return next(words, " ".join(command)[:120])
+            if not word.startswith("-") or word == "-":
+                return word
+            flags = word[1:]
+            for i, flag in enumerate(flags):
+                if flag in SSH_ARG_OPTIONS:
+                    if i == len(flags) - 1:  # `-o X`: the next word is its argument; `-oX` carries it
+                        next(words, None)
+                    break
     return " ".join(command)[:120]
 
 
