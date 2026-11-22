@@ -2646,6 +2646,11 @@ class HookTest(unittest.TestCase):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), None, log))
             with mock.patch.object(hook, "free_gib", return_value=40.0):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+            # JOB_OWN_NEED_ALONE: a peak learned only beside other jobs counts their writes too: no refusal
+            crowded = self.peak_log([(100.0, 45.0, False)] * 20)
+            self.assertIn("p90 of 20 runs here", hook.learned_job_peaks(hook.job_log_tail(crowded))[self.PEAK_KEY][1])
+            with mock.patch.object(hook, "free_gib", return_value=17.2):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded))
             with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
             with mock.patch.object(hook, "free_gib", return_value=5.0), \
