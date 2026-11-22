@@ -654,6 +654,12 @@ UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [.
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
+# All of a tick's upstream runs together (the non-head part and the head part, UPSTREAM_DEADLINE each before): gcp-agent-
+# lane-1, 2026-11-21 23:0xZ, spent 643.0 s of a 600 s progress window in "read upstream" (huge-blue's daemon slow to
+# answer), so the VM's daemon did little but wait on it. A part with less than UPSTREAM_MIN_RUN left is not sent (its
+# keys are not stamped, so they go first next tick), and the part cut off goes first next tick.
+UPSTREAM_TICK_BUDGET = 60.0
+UPSTREAM_MIN_RUN = 5.0
 UPSTREAM_MAX_KEYS = 200  # keys per upstream read (and per `read`); a longer list waits for the next one
 UPSTREAM_KINDS = ("pr", "run", "comment", "head")  # a head is read for a named consumer, on its budget there
 CONSUMER_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a head consumer's name (checks --consumer, read's consumer)
@@ -3123,6 +3129,148 @@ class AppPool:
                 pass
 
 
+# ---------------------------------------------------------------- a lane VM's own read token
+# A lane VM reads through an upstream (huge-blue's daemon, `lane-gh glaeda-read`) because it holds no login. The
+# lane-gh broker now mints a read-only, single-repository, short-lived App token for a lane VM (cmuxterm-hq#17426's
+# read_token tool; leo-workspace#7651 is lane-gh's own direct GET). With it this daemon reads a PR or a run from GitHub
+# itself, in process: gcp-agent-lane-1 measured direct reads at p50 0.46 s against 2.44 s through the broker, and
+# a tick that spent 643 s of a 600 s window waiting on the upstream. Leo: "why the f*** are you centralizing on
+# f***ing huge blue anyway". Everything the token cannot read (heads, comments, a refused route, a repo the broker
+# mints nothing for) still goes upstream, and every write still goes through the broker. upstream.json
+# "readToken": [...] names the program (`ARGV OWNER/REPO {}` answering {token, expires_at}); false turns it off.
+# 0600 in APP_POOL_DIR beside the pushed read-only App tokens, never in BASE (the cache holds no token): one broker
+# mint per repo, shared by this host's processes (the daemon, a wait's or a land's direct read)
+READ_TOKEN_FILE = "lane-read-tokens.json"
+READ_TOKEN_MIN_LEFT = 600.0  # a token closer than this to expires_at is minted again (the broker's own margin)
+READ_TOKEN_REST = 900.0  # a repo the broker minted nothing for is not asked again for this long
+READ_TOKEN_DEADLINE = 30.0  # one mint through the broker
+READ_DIRECT_BUDGET = 60.0  # a tick's direct reads together; what is left goes upstream
+READ_DIRECT_KINDS = ("pr", "run")
+READ_TOKEN_REPO = re.compile(r"^/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]+)(?:/|\?|$)")
+
+
+def read_token_command() -> list[str] | None:
+    """The program that mints this host's read token, or None: upstream.json "readToken" (a list, or false for
+    none), else `lane-gh call read_token` of the lane-gh whose `glaeda-read` is the upstream."""
+    doc = read_json(UPSTREAM_CONFIG)
+    if not isinstance(doc, dict):
+        return None
+    given = doc.get("readToken")
+    if given is False:
+        return None
+    if isinstance(given, list) and given and all(isinstance(a, str) and a for a in given):
+        return given
+    command = upstream_command()
+    if command is not None and len(command) == 2 and Path(command[0]).name == "lane-gh" and command[1] == "glaeda-read":
+        return [command[0], "call", "read_token"]
+    return None
+
+
+def read_token_mint(command: list[str], repo: str) -> tuple[str, float] | None:
+    """(token, expires epoch) from one run of COMMAND for REPO, or None. The token is never logged."""
+    try:
+        result = run_bounded([program_path(command[0]), *command[1:], repo, "{}"], READ_TOKEN_DEADLINE)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        doc = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
+    except ValueError:
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("data"), dict) and "token" not in doc:
+        doc = doc["data"]
+    if not isinstance(doc, dict):
+        return None
+    token, expires = str(doc.get("token") or ""), iso_epoch(str(doc.get("expires_at") or ""))
+    if not TOKEN_RE.fullmatch(token) or expires is None:
+        return None
+    return token, expires
+
+
+class ReadTokenPool(AppPool):
+    """The broker's read tokens as an AppPool keyed by repository ("owner/repo", lowercase), for GETs of that
+    repository only: Daemon.request sends a read with it and, on a refusal, asks the login, which a lane VM has
+    none of (read_direct then leaves the key to the upstream). Kept in READ_TOKEN_FILE so a wait's direct read
+    (its own process) reuses the daemon's token instead of asking the broker again."""
+
+    def __init__(self, command: list[str], clock: Callable[[], float] = time.time,
+                 mint: Callable[[str], tuple[str, float] | None] | None = None) -> None:
+        super().__init__(role="lane-read-token", owners=lambda: [], ready=lambda: True, clock=clock)
+        self.command = command
+        self.mint_pair = mint or (lambda repo: read_token_mint(self.command, repo))
+        self.source = "broker"
+
+    def owner_of(self, method: str, path: str, body: dict | None = None) -> str | None:
+        m = READ_TOKEN_REPO.match(path) if method == "GET" else None
+        return m.group(1).lower() if m else None
+
+    def held(self) -> dict:
+        doc = read_json(APP_POOL_DIR / READ_TOKEN_FILE)
+        return doc if isinstance(doc, dict) else {}
+
+    def keep(self, repo: str, pair: tuple[str, float] | None) -> None:
+        with contextlib.suppress(OSError):
+            doc = self.held()
+            if pair is None:
+                doc.pop(repo, None)
+            else:
+                doc[repo] = {"token": pair[0], "expiresAt": pair[1]}
+            write_json(APP_POOL_DIR / READ_TOKEN_FILE, {k: v for k, v in doc.items() if isinstance(v, dict)
+                                                and float(v.get("expiresAt") or 0) > self.clock()})
+
+    def token(self, owner: str) -> str | None:
+        now = self.clock()
+        if self.rest_until.get(owner, 0.0) > now:
+            return None
+        held = self.tokens.get(owner)
+        if held and held[1] > now:
+            return held[0]
+        kept = self.held().get(owner)
+        if isinstance(kept, dict) and TOKEN_RE.fullmatch(str(kept.get("token") or "")) \
+                and float(kept.get("expiresAt") or 0) - READ_TOKEN_MIN_LEFT > now:
+            self.tokens[owner] = (str(kept["token"]), float(kept["expiresAt"]) - READ_TOKEN_MIN_LEFT)
+            return self.tokens[owner][0]
+        pair = self.mint_pair(owner)
+        if pair is None or pair[1] - READ_TOKEN_MIN_LEFT <= now:
+            self.why = f"the broker minted no read token for {owner}"
+            self.rest_until[owner] = now + READ_TOKEN_REST
+            return None
+        self.tokens[owner] = (pair[0], pair[1] - READ_TOKEN_MIN_LEFT)
+        self.keep(owner, pair)
+        return pair[0]
+
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
+        ok = super().answered(owner, scope, status, headers, message)
+        if status == 401:  # dead: the next read mints again, after the rest
+            self.keep(owner, None)
+        return ok
+
+
+def read_token_reader(key: str) -> "Daemon | None":
+    """A wait's or a land's direct read of KEY's repository with this host's read token (read_token_daemon), or None
+    when there is none: the read then goes through the broker's GET as before. A token the broker minted for the
+    daemon is reused (READ_TOKEN_FILE), so this asks the broker nothing then."""
+    command = read_token_command()
+    if command is None:
+        return None
+    _, owner, repo, _ = split_key(key)
+    pool = ReadTokenPool(command)
+    return read_token_daemon(pool) if pool.token(f"{owner}/{repo}".lower()) else None
+
+
+def no_login() -> str:
+    raise WatchError("this host has no GitHub login: it reads with the broker's read token or through its upstream")
+
+
+def read_token_daemon(pool: "ReadTokenPool") -> "Daemon":
+    """A Daemon that reads GitHub with POOL's tokens over plain HTTPS and has no login: a read the token cannot
+    make fails (no_login). Charged to no REST share (a token's reads are the App's, not the login's)."""
+    daemon = Daemon(transport=http, token=no_login, controller=None, upstream=None, app_pool=pool)
+    daemon.reads_protection = False  # a branch's classic protection needs administration, which the token lacks
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]
+    daemon.post_due = lambda: None  # type: ignore[method-assign]  # writes go through the broker, never from here
+    return daemon
+
+
 # ---------------------------------------------------------------- upstream (a host with no login)
 
 
@@ -3217,12 +3365,15 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
     return send
 
 
-def run_upstream(command: list[str], request: dict) -> dict:
+def run_upstream(command: list[str], request: dict, timeout: float = UPSTREAM_DEADLINE) -> dict:
+    """One run of the upstream command, within TIMEOUT (what is left of the tick's UPSTREAM_TICK_BUDGET), at most
+    UPSTREAM_DEADLINE."""
     exe = program_path(command[0])
+    timeout = max(1.0, min(UPSTREAM_DEADLINE, timeout))
     try:
-        result = run_bounded([exe, *command[1:]], UPSTREAM_DEADLINE, input_text=json.dumps(request) + "\n")
+        result = run_bounded([exe, *command[1:]], timeout, input_text=json.dumps(request) + "\n")
     except subprocess.TimeoutExpired:
-        raise WatchError(f"upstream: no answer within {UPSTREAM_DEADLINE}s") from None
+        raise WatchError(f"upstream: no answer within {timeout:.0f}s") from None
     except OSError as error:
         raise WatchError(f"upstream: {type(error).__name__} running {command[0]}") from None
     try:
@@ -4530,6 +4681,15 @@ class Daemon:
         # without a restart; a test passes a callable (request -> answer) or None.
         self.upstream_source = upstream
         self.upstream_at = float("-inf")  # the last full upstream read
+        self.upstream_end = float("inf")  # time.monotonic() past which this tick sends the upstream nothing more
+        self.upstream_cut: str | None = None  # the part ("keys" or "heads") the last tick's budget left unsent
+        # A lane VM's own read token (ReadTokenPool): "config" reads upstream.json; a test sets read_token_source to a
+        # pool and read_transport to its fake GitHub.
+        self.read_token_source: Any = None
+        self.read_transport: Callable | None = None
+        self.read_pool: ReadTokenPool | None = None
+        self.read_reader: Daemon | None = None
+        self.read_served = 0
         self.upstream_status: dict[str, Any] | None = None
         # "env" (or any callable) is re-read every tick, so a daemon follows a controller move
         # (cmux-fleet-client's client.json repointed) without a restart; an instance stays fixed.
@@ -7864,6 +8024,10 @@ class Daemon:
                              "pause": self.content_pause_status()}}
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
+        if self.read_pool is not None:  # never a token: how many keys it read, and why the last repo got none
+            status["readToken"] = {"served": self.read_served, "appServed": self.read_pool.served,
+                                   "fellBack": self.read_pool.fell_back, "why": self.read_pool.why or None,
+                                   "resting": sorted(o for o, t in self.read_pool.rest_until.items() if t > self.now)}
         # A fresh heartbeat over a refresh loop that reads nothing is not health: say so in the heartbeat itself, so
         # `budget`, `restart` and a wait's daemon_starved see it (stall_alarm; "held" when the quota explains it).
         stall = self.stall_alarm()
@@ -7923,8 +8087,73 @@ class Daemon:
         source = self.upstream_source
         if source == "config":
             command = upstream_command()
-            return None if command is None else (lambda req: run_upstream(command, req))
+            return None if command is None else (lambda req: run_upstream(command, req, self.upstream_left()))
         return source if callable(source) else None
+
+    def read_tokens(self) -> "ReadTokenPool | None":
+        """This host's ReadTokenPool while upstream.json names a way to mint (read_token_command), else None; kept
+        across ticks, and dropped when the config stops naming one."""
+        command = read_token_command() if self.upstream_source == "config" else self.read_token_source
+        if not command:
+            self.read_pool = self.read_reader = None
+            return None
+        if self.read_pool is None or (isinstance(command, list) and self.read_pool.command != command):
+            self.read_pool = command if isinstance(command, ReadTokenPool) else ReadTokenPool(command, clock=self.clock)
+            self.read_reader = None
+        return self.read_pool
+
+    def read_direct(self, due: list[dict]) -> set[str]:
+        """Read DUE's PRs and runs from GitHub with this host's read token, within READ_DIRECT_BUDGET: the keys read
+        and stored. A key whose repo has no token, a read the token is refused, or one cut off goes upstream."""
+        pool = self.read_tokens()
+        if pool is None:
+            return set()
+        if self.read_reader is None:
+            self.read_reader = read_token_daemon(pool)
+            if self.read_transport is not None:
+                self.read_reader.transport = self.read_transport
+        reader, done = self.read_reader, set()
+        reader.now, reader.clock_real = self.now, self.clock_real
+        reader.tick_deadline = min(self.tick_deadline, time.monotonic() + READ_DIRECT_BUDGET)
+        for e in due:
+            kind, owner, repo, _ = split_key(e["key"])
+            if kind not in READ_DIRECT_KINDS or pool.token(f"{owner}/{repo}".lower()) is None:
+                continue
+            path = cache_dir() / file_name(e["key"])
+            before = read_json(path) if path.exists() else None  # a failed direct read leaves the cache as it was
+            try:
+                with self.phase("read direct"), reader.calling(*caller_of(e["key"]), "tool:glaeda-gh serve (read token)"):
+                    reader.fetch_pr_rest(e) if kind == "pr" else reader.fetch_run(e)
+            except OutOfTime:
+                self.restore_cache(path, before)
+                break
+            except Exception as error:  # noqa: BLE001  the upstream reads it instead
+                self.errors.append(f"read direct {e['key']}: {describe(error)}"[:UPSTREAM_ERROR_MAX])
+                self.restore_cache(path, before)
+                continue
+            cached = read_cache(e["key"]) or {}
+            if not cached.get("error") and (cached.get("fetchedAt") or 0) >= self.now:
+                e["cache"] = cached
+                self.attempted[e["key"]] = self.now
+                done.add(e["key"])
+            else:
+                self.restore_cache(path, before)
+        self.read_served += len(done)
+        return done
+
+    @staticmethod
+    def restore_cache(path: Path, before: Any) -> None:
+        """Put back the cache file a failed direct read wrote over: the upstream's answer, not this host's
+        no-login error, is what the key keeps."""
+        with contextlib.suppress(OSError):
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_json(path, before)
+
+    def upstream_left(self) -> float:
+        """Seconds left of this tick's UPSTREAM_TICK_BUDGET for one upstream run, at most UPSTREAM_DEADLINE."""
+        return min(float(UPSTREAM_DEADLINE), self.upstream_end - time.monotonic())
 
     def upstream_tick(self, ask: Callable[[dict], dict]) -> dict:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
@@ -7952,18 +8181,32 @@ class Daemon:
         if full:
             self.upstream_at = self.now
         if due:
+            done = self.read_direct(due)  # read with this host's read token: those need no upstream
+            due = [e for e in due if e["key"] not in done]
+        if due:
             # Heads go in a request of their own: an upstream older than head keys refuses a whole request that has
             # one, and that must not stop the PRs' and runs' reads.
             # Each read sets upstream_status: a failing first read must not be called "ok" by a head read after it
             # (the stale alarm holds, and stale waits stay, only for an "ok" upstream). Either failing, the tick fails.
             failed = None
-            for part in ([e for e in due if not e["key"].startswith("head:")],
-                         [e for e in due if e["key"].startswith("head:")]):
-                if part:
-                    with self.phase("read upstream"):
-                        self.upstream_read(ask, part)
-                    if self.upstream_status.get("state") == "failing":
-                        failed = failed or self.upstream_status
+            parts = {"keys": [e for e in due if not e["key"].startswith("head:")],
+                     "heads": [e for e in due if e["key"].startswith("head:")]}
+            # The tick's upstream runs share UPSTREAM_TICK_BUDGET; the part a slow upstream cut off last time goes first.
+            self.upstream_end = time.monotonic() + UPSTREAM_TICK_BUDGET
+            order = ["heads", "keys"] if self.upstream_cut == "heads" else ["keys", "heads"]
+            self.upstream_cut = None
+            for name in order:
+                part = parts[name]
+                if not part:
+                    continue
+                if self.upstream_end - time.monotonic() < UPSTREAM_MIN_RUN:
+                    self.upstream_cut = name  # not sent and not stamped: first next tick
+                    log({"event": "upstream-budget", "cut": name, "keys": len(part), "budget": UPSTREAM_TICK_BUDGET})
+                    continue
+                with self.phase("read upstream"):
+                    self.upstream_read(ask, part)
+                if self.upstream_status.get("state") == "failing":
+                    failed = failed or self.upstream_status
             if failed is not None:
                 self.upstream_status = failed
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
@@ -17209,10 +17452,11 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
     if upstream_command() is not None and broker is None:
         return {p: DIRECT_UPSTREAM for p in paths}
     if broker is not None:
-        daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
-                        controller=None, upstream=None)
+        daemon = read_token_reader(f"pr:{repo}#0") or Daemon(
+            transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
+            controller=None, upstream=None)
         daemon.reads_protection = False
-        daemon.etags = False
+        daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
     else:
         daemon = Daemon(controller=None, upstream=None)
     modes = (read_json(BASE / "daemon.json") or {}).get("modes")
@@ -19367,6 +19611,16 @@ def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
 
 
 def _direct_read(req: dict) -> str | None:
+    """_read_one, with this host's read token first when it has one, then the broker's GET if that read failed: a
+    land's read keeps two routes (hq docs/handbook/read-with-one-quota-route.md)."""
+    used: list[bool] = []
+    why = _read_one(req, used)
+    if why is not None and any(used):
+        return _read_one(req, None)
+    return why
+
+
+def _read_one(req: dict, used: list[bool] | None) -> str | None:
     """One read of the wait's target from GitHub by this process, outside the daemon's queue, stored in the cache the
     way the daemon stores it (so wait_step rules on it): a PR over GraphQL, a run over REST. The fallback for a wait
     whose daemon heartbeats but has not refreshed this target (wait_starved). None, or why it could not read."""
@@ -19380,10 +19634,14 @@ def _direct_read(req: dict) -> str | None:
         if upstream_command() is not None and broker is None:
             return DIRECT_UPSTREAM
         if broker is not None:
-            daemon = Daemon(transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
-                            controller=None, upstream=None)
+            reader = read_token_reader(key) if used is not None else None
+            if used is not None:
+                used.append(reader is not None)  # the read token was tried: a failure goes again through the broker
+            daemon = reader or Daemon(
+                transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
+                controller=None, upstream=None)
             daemon.reads_protection = False
-            daemon.etags = False
+            daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
         else:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait

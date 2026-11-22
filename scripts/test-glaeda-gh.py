@@ -31633,5 +31633,127 @@ class WaitLeashReplayTest(Base):
         end = got["ends"][0]
         self.assertEqual((end["code"], end["ended_by"], end["waited_s"]), (gg.EXIT_TIMEOUT, "ceiling", 2400))
 
+
+class LaneReadTokenTest(UpstreamTest):
+    """A lane VM with the broker's read token reads its PRs and runs from GitHub itself; the rest goes upstream."""
+
+    READ = "ghs_" + "r" * 36
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.minted: list[str] = []
+        self.mint_answer: tuple[str, float] | None = (self.READ, NOW + 3600)
+        self.sent_with: list[str] = []
+
+        def mint(repo: str):
+            self.minted.append(repo)
+            return self.mint_answer
+
+        def github(method, url, headers, body):  # the fake answers as GitHub, under its own fixture token
+            self.sent_with.append(headers["Authorization"])
+            return self.gh(method, url, {**headers, "Authorization": f"Bearer {TOKEN}"}, body)
+
+        self.daemon.read_token_source = gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=mint)
+        self.daemon.read_transport = github
+        gg.APP_POOL_DIR.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: (gg.APP_POOL_DIR / gg.READ_TOKEN_FILE).unlink(missing_ok=True))
+
+    def upstream_keys(self) -> list[str]:
+        return sorted(k["key"] for r in self.asked for k in r["keys"])
+
+    def test_a_watched_run_is_read_with_the_read_token_and_not_sent_upstream(self) -> None:
+        self.gh.runs[9] = {"id": 9, "status": "in_progress"}
+        gg.register("run:o/r/9")
+        gg.register("comment:o/r#7")  # a comment has no direct read: it still goes upstream
+        status = self.daemon.tick(now=NOW)
+        self.assertEqual(self.upstream_keys(), ["comment:o/r#7"])
+        self.assertEqual(self.minted, ["o/r"])
+        self.assertTrue(self.sent_with and set(self.sent_with) == {f"Bearer {self.READ}"}, self.sent_with)
+        self.assertEqual(gg.read_cache("run:o/r/9")["data"]["status"], "in_progress")
+        self.assertEqual(status["readToken"]["served"], 1)
+        self.assertNotIn(self.READ, json.dumps(status))
+        for path in gg.BASE.rglob("*"):  # the token is kept beside the pushed App tokens, never in the cache
+            if path.is_file():
+                self.assertNotIn(self.READ, path.read_text(errors="replace"), path)
+        kept = gg.APP_POOL_DIR / gg.READ_TOKEN_FILE
+        self.assertEqual(stat.S_IMODE(kept.stat().st_mode), 0o600)
+        # a second process (a wait's direct read) takes the kept token: the broker is not asked again
+        again = gg.ReadTokenPool(["mint"], clock=lambda: NOW, mint=lambda repo: self.fail("minted twice"))
+        self.assertEqual(again.token("o/r"), self.READ)
+
+    def test_a_repo_the_broker_mints_nothing_for_reads_upstream_and_is_not_asked_again_at_once(self) -> None:
+        self.mint_answer = None
+        gg.register("run:o/r/9")
+        self.daemon.tick(now=NOW)
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
+        self.assertEqual(self.upstream_keys(), ["run:o/r/9", "run:o/r/9"])
+        self.assertEqual(self.minted, ["o/r"], "rested for READ_TOKEN_REST")
+        self.assertEqual(self.sent_with, [])
+
+    def test_a_read_the_token_is_refused_goes_upstream_and_never_on_a_login(self) -> None:
+        self.gh.runs[9] = {"id": 9, "status": "in_progress"}
+        self.gh.throttle["rest"] = (403, {}, json.dumps({"message": "Resource not accessible by integration"}).encode())
+        gg.register("run:o/r/9")
+        self.daemon.tick(now=NOW)  # the daemon's token callable fails the test if anything asks for a login
+        self.assertEqual(self.upstream_keys(), ["run:o/r/9"])
+        self.assertEqual(len(self.sent_with), 1)
+
+    def test_no_read_token_command_means_every_key_goes_upstream(self) -> None:
+        self.daemon.read_token_source = None
+        gg.register("run:o/r/9")
+        self.daemon.tick(now=NOW)
+        self.assertEqual(self.upstream_keys(), ["run:o/r/9"])
+        self.assertNotIn("readToken", self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1))
+
+    def test_read_token_command_comes_from_a_lane_gh_upstream_or_upstream_json(self) -> None:
+        config = gg.BASE / "upstream-test.json"
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+            gg.write_json(config, {"command": ["/x/lane-gh", "glaeda-read"]})
+            self.assertEqual(gg.read_token_command(), ["/x/lane-gh", "call", "read_token"])
+            gg.write_json(config, {"command": ["/x/lane-gh", "glaeda-read"], "readToken": False})
+            self.assertIsNone(gg.read_token_command())
+            gg.write_json(config, {"command": ["other"], "readToken": ["mint-it"]})
+            self.assertEqual(gg.read_token_command(), ["mint-it"])
+            gg.write_json(config, {"command": ["other"]})
+            self.assertIsNone(gg.read_token_command())
+
+
+class UpstreamTickBudgetTest(UpstreamTest):
+    """A tick's upstream runs share one budget (UPSTREAM_TICK_BUDGET): 643 s of a 600 s window on gcp-agent-lane-1."""
+
+    def test_a_slow_upstream_cuts_the_heads_part_and_it_goes_first_next_tick(self) -> None:
+        head = "head:o/r@" + "a" * 40
+        gg.register("pr:o/r#7")
+        gg.register(head, consumer="merge-guard")
+        real_ask = self.daemon.upstream_source
+
+        def slow(request):
+            time.sleep(0.2)
+            return real_ask(request)
+
+        self.daemon.upstream_source = slow
+        with mock.patch.object(gg, "UPSTREAM_TICK_BUDGET", 0.3), mock.patch.object(gg, "UPSTREAM_MIN_RUN", 0.15):
+            self.daemon.tick(now=NOW)
+            self.assertEqual([[k["key"] for k in r["keys"]] for r in self.asked], [["pr:o/r#7"]])
+            self.assertEqual(self.daemon.upstream_cut, "heads")
+            self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY + 1)
+        self.assertEqual([k["key"] for k in self.asked[1]["keys"]], [head], "the cut part went first")
+
+    def test_one_upstream_run_gets_what_is_left_of_the_budget(self) -> None:
+        script = Path(gg.BASE) / "slow-upstream"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.chmod(0o755)
+        began = time.monotonic()
+        with self.assertRaises(gg.WatchError) as caught:
+            gg.run_upstream([os.fspath(script)], {"keys": []}, 1.0)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertIn("no answer within 1s", str(caught.exception))
+
+
+for _case in (LaneReadTokenTest, UpstreamTickBudgetTest):  # UpstreamTest's own cases run once, under UpstreamTest
+    for _name in [n for n in vars(UpstreamTest) if n.startswith("test_") and n not in vars(_case)]:
+        setattr(_case, _name, None)
+
 if __name__ == "__main__":
     unittest.main()
