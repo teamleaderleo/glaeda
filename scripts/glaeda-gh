@@ -17600,6 +17600,12 @@ class LandQueue:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
         stops the entry; answers "update_branch" when the refusal names that step and the caller should take it now."""
         out = f"{got.stderr or ''}\n{got.stdout or ''}"
+        # The pinned merge runs land_judge again (the gh shim), and its stale_main_update can merge the base into the
+        # PR right there and refuse checks_running: the same base merge note_judge_update records from a judgment, but
+        # in a step's refusal, which nothing read. teamleaderleo/glaeda#2499, 2026-11-22: its merge step at 52240119
+        # (13:06:52Z to 13:10:40Z, refused checks_running) made the lander bot's 7044843d at 13:10:38Z, and the
+        # pinned land stopped head_moved at 13:20:55Z. Recorded the same way, the pin follows that merge.
+        self.note_judge_update(e, {"reason": out}, head)
         if LAND_NO_LANE.search(out):
             self.history(e, "step_refused", kind=kind, head=head[:12], why="no lane", n=1)
             self.stop(e, "no_lane", f"the {kind} at {head[:12]} was refused before the broker: "
