@@ -11,6 +11,16 @@
 //! answer is a down store, a low 1 h hit rate with enough requests is a cold
 //! or broken one.
 //!
+//! Readers and the writer: the writer looks up every key before it compiles
+//! and writes it, so its lookups are mostly misses by design. On 2026-11-22
+//! they were about 95% of a quarter hour's new misses on the fleet store,
+//! and with catch-up builds of a combination no fill writes, its 1 h kv hit
+//! rate read 4.3% while the 24 h one read 82.8%. Each window therefore
+//! also counts the lookups a `--writers` peer made (`writer_*`), and
+//! `readers` is the window less them: what a hit-rate floor should judge.
+//! Minutes kept by a build from before the split have no writer counts, so
+//! for the first hour after an upgrade `readers` can still include them.
+//!
 //! The process counters (`Stats`) stay the source: every sample turns their
 //! growth since the last sample into the current minute's bucket, so the hot
 //! paths change nothing.
@@ -19,7 +29,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// The windowed counters, in bucket order.
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 13] = [
     "kv_hits",
     "kv_misses",
     "cas_hits",
@@ -29,12 +39,20 @@ pub const KEYS: [&str; 9] = [
     "write_refused",
     "bytes_in",
     "bytes_out",
+    "writer_kv_hits",
+    "writer_kv_misses",
+    "writer_cas_hits",
+    "writer_cas_misses",
 ];
 pub const N: usize = KEYS.len();
 const KV_HITS: usize = 0;
 const KV_MISSES: usize = 1;
 const CAS_HITS: usize = 2;
 const CAS_MISSES: usize = 3;
+const WRITER_KV_HITS: usize = 9;
+const WRITER_KV_MISSES: usize = 10;
+const WRITER_CAS_HITS: usize = 11;
+const WRITER_CAS_MISSES: usize = 12;
 
 /// 24 h of minute buckets.
 pub const KEEP_MIN: u64 = 24 * 60;
@@ -231,25 +249,53 @@ fn rate(hits: u64, misses: u64) -> String {
     }
 }
 
+/// `requests`, `hits`, `misses`, `hit_rate` and `kv_hit_rate` of index
+/// and object lookups.
+fn lookup_fields(kv_hits: u64, kv_misses: u64, cas_hits: u64, cas_misses: u64) -> Vec<String> {
+    let hits = kv_hits + cas_hits;
+    let misses = kv_misses + cas_misses;
+    vec![
+        format!("\"requests\":{}", hits + misses),
+        format!("\"hits\":{hits}"),
+        format!("\"misses\":{misses}"),
+        format!("\"hit_rate\":{}", rate(hits, misses)),
+        format!("\"kv_hit_rate\":{}", rate(kv_hits, kv_misses)),
+    ]
+}
+
 /// One window as a JSON object: the counts, `requests` (lookups: index and
 /// object gets), `hit_rate` over all lookups and `kv_hit_rate` over index
-/// lookups (a compile replayed or not). Rates are null with no lookups.
+/// lookups (a compile replayed or not), all peers together; and `readers`,
+/// the same for every peer but the store's writers. Rates are null with no
+/// lookups.
 pub fn counts_json(c: &Counts) -> String {
     let mut fields: Vec<String> = KEYS
         .iter()
         .zip(c)
         .map(|(k, v)| format!("\"{k}\":{v}"))
         .collect();
-    let hits = c[KV_HITS] + c[CAS_HITS];
-    let misses = c[KV_MISSES] + c[CAS_MISSES];
-    fields.push(format!("\"requests\":{}", hits + misses));
-    fields.push(format!("\"hits\":{hits}"));
-    fields.push(format!("\"misses\":{misses}"));
-    fields.push(format!("\"hit_rate\":{}", rate(hits, misses)));
-    fields.push(format!(
-        "\"kv_hit_rate\":{}",
-        rate(c[KV_HITS], c[KV_MISSES])
+    fields.extend(lookup_fields(
+        c[KV_HITS],
+        c[KV_MISSES],
+        c[CAS_HITS],
+        c[CAS_MISSES],
     ));
+    let less = |all: usize, writer: usize| c[all].saturating_sub(c[writer]);
+    let (kv_hits, kv_misses) = (
+        less(KV_HITS, WRITER_KV_HITS),
+        less(KV_MISSES, WRITER_KV_MISSES),
+    );
+    let mut readers = vec![
+        format!("\"kv_hits\":{kv_hits}"),
+        format!("\"kv_misses\":{kv_misses}"),
+    ];
+    readers.extend(lookup_fields(
+        kv_hits,
+        kv_misses,
+        less(CAS_HITS, WRITER_CAS_HITS),
+        less(CAS_MISSES, WRITER_CAS_MISSES),
+    ));
+    fields.push(format!("\"readers\":{{{}}}", readers.join(",")));
     format!("{{{}}}", fields.join(","))
 }
 
@@ -364,11 +410,45 @@ mod tests {
     }
 
     #[test]
+    fn readers_are_the_window_less_the_writers_lookups() {
+        // 2026-11-22 on the fleet store, about: 44 kv hits and 651
+        // misses in the hour, 620 of those misses the writer's own.
+        let mut c = counts(44, 651, 0, 0);
+        c[CAS_HITS] = 21;
+        c[WRITER_KV_HITS] = 4;
+        c[WRITER_KV_MISSES] = 620;
+        c[WRITER_CAS_HITS] = 1;
+        let j = counts_json(&c);
+        assert!(j.contains("\"kv_hit_rate\":0.0633"), "{j}");
+        assert!(j.contains("\"writer_kv_misses\":620"), "{j}");
+        let readers = &j[j.find("\"readers\":").unwrap()..];
+        assert!(
+            readers.starts_with(
+                "\"readers\":{\"kv_hits\":40,\"kv_misses\":31,\"requests\":91,\"hits\":60,\"misses\":31,\"hit_rate\":0.6593,\"kv_hit_rate\":0.5634}"
+            ),
+            "{j}"
+        );
+        // A history from before the split has no writer columns: they read 0.
+        let h = History::parse(&format!("{HEADER}\nkeys kv_hits kv_misses\nm 10 1 2\n")).unwrap();
+        assert_eq!(h.buckets[0].1[WRITER_KV_MISSES], 0);
+        // And a new history keeps them across a restart.
+        let mut h = History::new(0);
+        h.sample(&c, 5 * MIN);
+        let back = History::parse(&h.render()).unwrap();
+        assert_eq!(back.buckets[0].1, c);
+    }
+
+    #[test]
     fn window_json_has_rates_and_null_without_lookups() {
         let j = counts_json(&counts(3, 1, 0, 0));
         assert!(j.contains("\"requests\":4"), "{j}");
         assert!(j.contains("\"kv_hit_rate\":0.7500"), "{j}");
         assert!(j.contains("\"hit_rate\":0.7500"), "{j}");
+        // Without writer lookups, readers are everyone.
+        assert!(
+            j.contains("\"readers\":{\"kv_hits\":3,\"kv_misses\":1,\"requests\":4,"),
+            "{j}"
+        );
         let j = counts_json(&[0; N]);
         assert!(j.contains("\"hit_rate\":null"), "{j}");
         assert_eq!(quote("a\"b\\\n"), "\"a\\\"b\\\\\\u000a\"");

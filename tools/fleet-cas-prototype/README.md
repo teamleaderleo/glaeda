@@ -33,15 +33,25 @@ http://<addr>/stats`, or `curl --unix-socket <socket> http://x/stats` on a
 node) serves JSON (`schema: fleet-cas-stats/v1`): `role`, `uptime_s`,
 `starts`, `writers` (a store's `--writers`, null on a node), `windows` (`5m`,
 `1h`, `24h`: `kv_hits`, `kv_misses`, `cas_hits`, `cas_misses`, `puts`,
-`errors`, `write_refused`, bytes, `requests`, `hit_rate`, `kv_hit_rate`;
-rates are null with no lookups), `lifetime` and the raw `counters` of
+`errors`, `write_refused`, bytes, `requests`, `hit_rate`, `kv_hit_rate`,
+the `writer_kv_hits`, `writer_kv_misses`, `writer_cas_hits` and
+`writer_cas_misses` of those lookups that came from a `--writers` peer, and
+`readers`: `kv_hits`, `kv_misses`, `requests`, `hits`, `misses`, `hit_rate`,
+`kv_hit_rate` of every other peer; rates are null with no lookups),
+`lifetime` and the raw `counters` of
 `stats.json`. The windows come from per-minute buckets kept for 24 h in
 `<store>/stats-history.txt` (written every minute and at shutdown), so a
 restart keeps them; the raw counters restart at 0 (`instance` changes). On
 2026-11-20/21 the store was down ~21 h and nothing on the network could say
 so: no answer from `/stats` is a down store, and a low 1 h `kv_hit_rate`
 over enough `requests` is a cold or broken one (the fleet status scraper reads
-it and pushes an alarm).
+it and pushes an alarm). Judge `readers`, not the total: the writer looks up
+every key before it compiles and writes it, so its lookups are mostly misses
+by design. On 2026-11-22 they were about 95% of a quarter hour's new misses
+on the fleet store, whose 1 h `kv_hit_rate` read 4.3% over 992 lookups
+while its 24 h one read 82.8%. Minutes kept by a build from before the split
+carry no writer counts, so for an hour after an upgrade `readers` can still
+include the writer's lookups.
 
 One binary plays two roles:
 
