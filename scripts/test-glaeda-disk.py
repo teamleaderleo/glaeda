@@ -9318,6 +9318,15 @@ class VolumeCensusTest(unittest.TestCase):
         if os.getuid():
             self.assertIn("--user", calls[0])
 
+    def test_a_scoped_census_has_a_hard_runtime_bound(self) -> None:
+        # outliving the unit must not mean running forever: systemd kills a slice past its budget and last du
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, subprocess.TimeoutExpired("systemd-run", 1))
+        bound = [a for a in calls[0][:calls[0].index("--")] if a.startswith("--property=RuntimeMaxSec=")]
+        self.assertEqual(len(bound), 1, calls[0])
+        seconds = int(bound[0].rsplit("=", 1)[1])
+        self.assertGreater(seconds, gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S)
+        self.assertLessEqual(seconds, 2 * (gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S))
+
     def test_a_scope_that_cannot_start_falls_back_to_the_plain_launch(self) -> None:
         calls = self.scoped_launch({"INVOCATION_ID": "abc"}, lambda timeout=None: 1)
         self.assertEqual(len(calls), 2)
