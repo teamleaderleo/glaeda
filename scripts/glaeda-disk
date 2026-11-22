@@ -1053,6 +1053,10 @@ PARKED_NO_LOG_IDLE_HOURS = DEFAULT_AGE_HOURS
 # turns it off on one host. build_cache_unwindowed decides it per item; outlived_build_caches reports what a pass
 # left behind (summary.json), which cmuxterm-hq's detector reads.
 BUILD_CACHES_UNWINDOWED = False  # set by main: a fleet-mini pass, not reserved, not the runner-cache profile
+# A person's VM claim (ROLE_KEEP_MARKER with no launchd owner) holds on a fleet mini only while its "until" is in
+# the future; with none, or past it, the VM is stale like any other (vm_claim). Off on a reserved host and where
+# disk-policy.json sets "fleet_claims_expire": false.
+FLEET_CLAIMS_EXPIRE = False  # set by main with BUILD_CACHES_UNWINDOWED
 BUILD_CACHE_FAMILY_NAMES = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
                             "ci-ios-derived-data", "cmux-ci-admission", "cmux-ci-runner-admission",
                             "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-next-ci-generated",
@@ -10839,6 +10843,18 @@ def vm_claim(path: Path) -> tuple[str, str]:
     owner = doc.get("owner") if isinstance(doc, dict) else None
     why = doc.get("why") if isinstance(doc, dict) else None
     note = f": {why.strip()[:120]}" if isinstance(why, str) and why.strip() else ""
+    person = not isinstance(owner, str) or not owner.strip() or not LAUNCHD_LABEL.fullmatch(owner.strip())
+    if person and FLEET_CLAIMS_EXPIRE:
+        # A fleet mini keeps nothing by hand (Leo, 2026-11-22: "it's the fleet. they dont have anything
+        # protected"): a person's claim, or a marker naming no owner, holds only until its "until" (epoch seconds).
+        until = doc.get("until") if isinstance(doc, dict) else None
+        who = owner.strip()[:80] if isinstance(owner, str) and owner.strip() else "no owner"
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and until > time.time():
+            left = (until - time.time()) / 3600
+            return f"claimed by {who} until {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(until))} " \
+                   f"({left:.0f} h left; {ROLE_KEEP_MARKER}{note})", ""
+        lapse = "its until has passed" if isinstance(until, (int, float)) else "it names no until"
+        return "", f"claim by {who} on a fleet mini is stale: {lapse} (a claim here must say until when)"
     if not isinstance(owner, str) or not owner.strip():
         return f"claimed ({ROLE_KEEP_MARKER} in it)", ""
     owner = owner.strip()
@@ -16252,10 +16268,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         reserved = ""
     if reserved:
         keep_legacy_ages()
-    global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED
+    global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED, FLEET_CLAIMS_EXPIRE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     BUILD_CACHES_UNWINDOWED = (role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
                                and bool(POLICY["build_caches_unwindowed"]))
+    FLEET_CLAIMS_EXPIRE = role == "fleet-mini" and not reserved and bool(POLICY.get("fleet_claims_expire", True))
     use_profile_state(RUNNER_CACHE_PROFILE)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
