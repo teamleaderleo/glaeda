@@ -24485,8 +24485,10 @@ class LandTest(Base):
 
     def test_sha_pin_stops_when_the_head_is_another(self):
         self.pr(LB)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC])  # the cache read no parents: one read says a push
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
-        e = self.tick()
+        self.tick()
+        e = self.tick(30)  # a worker read the head's parents first
         self.assertEqual((e["state"], e["stop"]["code"], self.w.explains(), self.w.gh_calls("pr", "merge")),
                          ("stopped", "head_moved", [], []))
         self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
@@ -24737,13 +24739,61 @@ class LandTest(Base):
         self.assertIn("not a merge of main", e["stop"]["reason"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
-    def test_a_base_merge_whose_compare_cannot_be_read_still_stops_head_moved(self):
+    def unread_events(self, e: dict) -> list[int]:
+        return [h["n"] for h in e["history"] if h["event"] == "base_merge_unread"]
+
+    def test_a_base_merge_whose_compare_cannot_be_read_waits_and_is_read_again(self):
+        # 2026-11-22 23:25Z: three pinned lands stopped head_moved on the lander's base merge with the rule live;
+        # one failed compare read stopped the land. It waits now, and the next read that answers moves the pin.
         self.pinned_and_waiting()
         self.base_merged(was=None)
         e = self.tick(30)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("waiting", None, LA))
+        self.assertEqual((e["wait"]["kind"], self.unread_events(e)), ("retry", [1]))
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+        self.base_merged()  # the compare answers now
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(gg.LAND_BASE_MERGE_UNREAD_WAIT + 1)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertNotIn("baseMergeUnread", e)
+        self.assert_merged_at(LB)
+
+    def test_a_base_merge_whose_compare_never_answers_stops_head_moved_after_its_reads(self):
+        self.pinned_and_waiting()
+        self.base_merged(was=None)
+        e = self.tick(30)
+        for _ in range(gg.LAND_BASE_MERGE_UNREAD_MAX + 2):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertIn("failed", e["stop"]["reason"])
-        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(self.unread_events(e), list(range(1, gg.LAND_BASE_MERGE_UNREAD_MAX + 1)))
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_head_the_cache_read_without_parents_has_them_read_and_is_followed(self):
+        # a probe or a REST read of the PR carries no parents (head_parents): the worker reads the head commit's
+        self.pinned_and_waiting()
+        self.base_merged()
+        del self.w.cache[self.KEY]["data"]["headParents"]
+        self.w.cache[self.KEY]["data"].pop("headParent", None)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, self.LD])
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual(len(self.compares()), 2)
+        self.assert_merged_at(LB)
+
+    def test_a_head_read_without_parents_that_is_a_push_stops_with_no_compare_read(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        del self.w.cache[self.KEY]["data"]["headParents"]
+        self.w.cache[self.KEY]["data"].pop("headParent", None)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA])  # one parent: a commit pushed on the pin
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("a push, not a base merge", e["stop"]["reason"])
+        self.assertEqual((self.compares(), self.w.explains()), ([], []))
 
     def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
         self.pinned_and_waiting()
@@ -29144,6 +29194,9 @@ class LandTest(Base):
         self.w.set_pr(self.KEY, land_pr(LC), self.t + 5)
         with self.q.lock:
             self.assertFalse(self.q.retire_from_cache({**e, "updateSent": {"head": LB}}))  # pin_follow's case
+            self.assertFalse(self.q.retire_from_cache(e))  # no parents read: maybe a base merge, a worker reads them
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA]  # a read that carried them: a push on another commit
+        with self.q.lock:
             self.assertTrue(self.q.retire_from_cache(e))
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--sha {LC}", e["stop"]["next"])
@@ -29453,8 +29506,10 @@ class LandTest(Base):
     def test_a_full_pin_the_cache_contradicts_still_stops(self):
         """The trust is in the pin, not over a read: a cached head that is not the pin still stops head_moved."""
         self.pr(LA)
+        self.w.api[f"repos/o/r/commits/{LA}"] = json.dumps([LC])  # the cache read no parents: one read says a push
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
-        e = self.tick(1)
+        self.tick(1)
+        e = self.tick(30)  # a worker read the head's parents first
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertEqual(e.get("state"), "stopped")
         self.assertIn("head_moved", json.dumps(e))
