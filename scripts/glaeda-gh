@@ -15125,10 +15125,12 @@ class LandQueue:
     def forwarded_at(self, e: dict) -> float:
         """When E was last forwarded: the newest of its hand-off's time, its forward's stamp and its last forwarding
         history event. handedOff is kept across a later forward (owner_refused reads it), so taking it first named
-        a row handed off at T1 and forwarded again at T2 by T1: told at once with the wrong age, or never."""
+        a row handed off at T1 and forwarded again at T2 by T1: told at once with the wrong age, or never. A re-queue
+        that owner_refused marks forwarded again with no call (handed_off_before) sent nothing, so it is not a forward:
+        counting it restarted the bound on every such re-queue, and a requester re-queuing often was never told."""
         ats = [(e.get("handedOff") or {}).get("at"), e.get("forwardedAt")]
         for h in reversed(e.get("history") or []):
-            if h.get("event") in ("handed_off", "overflowed", "handed_off_before"):
+            if h.get("event") in ("handed_off", "overflowed"):  # handed_off_before sends nothing: not a forward
                 ats.append(h.get("at"))
                 break
         return max([float(at) for at in ats if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0],

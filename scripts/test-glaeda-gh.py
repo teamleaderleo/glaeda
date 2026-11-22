@@ -27151,6 +27151,24 @@ class LandTest(Base):
             e = self.tick()
         self.assertEqual(len(self.handoffs()), 2)
 
+    def test_a_requeue_marked_handed_off_before_does_not_restart_the_bound(self):
+        # Review of glaeda#2540: forwarded_at counted handed_off_before (a re-queue owner_refused marks forwarded
+        # again with no call) as a new forward, so re-queues with no notice restarted the bound and nobody was told.
+        e = self.handed_off()
+        t1 = e["handedOff"]["at"]
+        self.tick(gg.LAND_FORWARD_QUIET / 2)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual(len(self.handoffs()), 1, "the re-queue is the one hand-off, no second call")
+        self.assertTrue(any(h.get("event") == "handed_off_before" for h in e["history"]), e["history"])
+        self.assertEqual(self.q.forwarded_at(e), t1, "timed from the hand-off, not the re-queue")
+        self.tick(gg.LAND_FORWARD_QUIET / 2)
+        self.pr(LA)
+        self.tick()
+        self.assertEqual(len(self.quiet_notices()), 1, "told at the hand-off's bound")
+
     def test_forward_reads_are_capped_per_tick_and_off_while_parked_on_quota_or_switched_off(self):
         keys = [f"pr:o/r#{n}" for n in range(1, gg.LAND_FORWARD_READS + 4)]
         for n, key in enumerate(keys, 1):
