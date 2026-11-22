@@ -24391,6 +24391,34 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def test_sha_pin_follows_the_base_merge_land_judge_made_in_the_merge_step(self):
+        # teamleaderleo/glaeda#2499, 2026-11-22: judged ok at 52240119, the pinned merge (the gh shim runs land_judge
+        # again) merged main into the PR and was refused checks_running, the lander bot's 7044843d appeared, and the
+        # land stopped head_moved. The step's refusal is now read like a judgment's: the pin follows that merge.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = (self.judge_merged_base(LA)[1]["reason"]
+                                  + f"; next: glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 900")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIn("update_by_judge", [h["event"] for h in e["history"]])
+        self.w.gh_rc["merge"] = 0
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[("ci", "IN_PROGRESS", "")]), self.t + 5)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]  # the bot's merge: the pin, then main
+        e = self.tick(10)
+        self.assertNotEqual(e["state"], "stopped")
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_WAIT_DEFAULT + 120, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assertEqual([m[-1] for m in self.w.gh_calls("pr", "merge")], [LA, LB])  # refused at the pin, then merged
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
     def test_a_judgment_that_names_another_head_or_no_base_merge_records_no_update(self):
         e = {"key": self.KEY, "history": []}
         with self.q.lock:
