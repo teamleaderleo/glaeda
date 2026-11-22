@@ -25686,7 +25686,8 @@ def cmd_restart(force: bool = False) -> int:
         if starved is not None and starved["quota"] and not overheld and not force:
             print(f"glaeda-gh: the daemon is running, but its {starved['kind']} data for waits is "
                   f"{int(starved['age'])}s old because {starved['why']}. "
-                  "A restart would not read any sooner; a wait reads its own target once (direct_read).")
+                  "A restart would not read any sooner; a wait reads its own target once (direct_read). "
+                  f"Not restarted until the data is {STALE_HELD_MAX}s old; --force to restart anyway.")
             return EXIT_OK
         if running and lag is None and starved is None and not force:
             status = read_json(BASE / "daemon.json")
@@ -25696,8 +25697,8 @@ def cmd_restart(force: bool = False) -> int:
                 cleared = (f" The daemon's last stale verdict, at {utc_clock(last['at'])} ({last.get('kind')} data "
                            f"{last.get('age')}s old: {last.get('reason') or last.get('state')}), cleared since.")
             print("glaeda-gh: the daemon is running, its heartbeat is fresh and the data its waits are blocked on is "
-                  f"under {STALE_DATA_AFTER}s old; nothing to restart.{cleared} If a wait printed an older warning, "
-                  "re-run it.")
+                  f"under {STALE_DATA_AFTER}s old; nothing to restart: healthy; --force to restart anyway.{cleared} "
+                  "If a wait printed an older warning, re-run it.")
             return EXIT_OK
         if starved is not None:
             slowed = f" The quota slows it ({starved['why']}), which alone should not leave it this old." \

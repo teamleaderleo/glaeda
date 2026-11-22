@@ -8742,6 +8742,7 @@ class RestartTest(Base):
         code, text = self.run_restart()
         self.assertEqual((code, self.calls), (0, []), text)
         self.assertIn("nothing to restart", text)
+        self.assertIn("healthy; --force to restart anyway", text)
 
     def test_quota_starvation_is_not_restarted(self) -> None:
         self.fresh({"pr": 3061.0}, modes={"rest": "lean", "graphql": "stop"}, capped=True)
@@ -8781,6 +8782,7 @@ class RestartTest(Base):
         code, text = self.run_restart()
         self.assertEqual((code, self.calls), (0, []), text)
         self.assertIn("would not read any sooner", text)
+        self.assertIn("--force to restart anyway", text)
 
 class LaunchdRestartTest(unittest.TestCase):
     # tests that drive the system-daemon probe through their own launchctl fake; the rest have no system daemon
