@@ -991,6 +991,8 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         # POOL_USER: what its jobs create in the shared fleet directory (cmux's persistent DerivedData under ci/, the
         # capacity ledger's markers) stays writable by the member user's controller worker through the shared group
         plist["Umask"] = POOL_UMASK
+        # a user/<uid> domain has no Aqua session: bootstrap refuses (error 5) an agent not limited to Background
+        plist["LimitLoadToSessionType"] = "Background"
     if ctx.headless:
         plist["UserName"] = pwd.getpwuid(ctx.uid).pw_name
     return plist

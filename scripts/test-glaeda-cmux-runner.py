@@ -19538,6 +19538,7 @@ class PoolUserRunnerTest(unittest.TestCase):
         self.assertEqual(plist["EnvironmentVariables"][cr.NODE_VIEW_ENV], cr.POOL_NODE_VIEW)
         self.assertTrue(cr.POOL_NODE_VIEW.endswith("/pool-node"))
         self.assertEqual(plist["Umask"], 2)
+        self.assertEqual(plist["LimitLoadToSessionType"], "Background")  # bootstrap into user/<uid> needs it
         self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents")
         self.assertEqual(self.by_kind(self.apply())["private"]["state"], "unchanged")
 
@@ -19547,6 +19548,7 @@ class PoolUserRunnerTest(unittest.TestCase):
         self.assertNotIn("private", self.by_kind(receipt))
         plist = plistlib.loads(Path(self.by_kind(receipt)["agent"]["path"]).read_bytes())
         self.assertNotIn("Umask", plist)
+        self.assertNotIn("LimitLoadToSessionType", plist)
         self.assertNotIn(cr.NODE_VIEW_ENV, plist["EnvironmentVariables"])
 
     def test_headless_is_ignored_for_a_pool_user(self) -> None:
