@@ -27526,13 +27526,18 @@ def gh_cache_writes() -> dict[str, float]:
 GH_RERUN_API_RE = re.compile(r"^/?repos/[^/]+/[^/]+/actions/runs/\d+/rerun(?:-failed-jobs)?/?$")
 
 
+def is_run_rerun(words: list[str]) -> bool:
+    """Either spelling of a rerun: `gh run rerun N` or a POST to its API path."""
+    return (words[:2] == ["run", "rerun"]
+            or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+
+
 def note_run_rerun(repo: str | None, scopes: list[str] | None, words: list[str], now: float) -> None:
     """A brokered `gh run rerun N` (or its API POST) on a run this host caches: stamp the entry rerunAt, so a wait
     and `Daemon.due` treat its cached finish as attempt-unknown until GitHub is read again (run_unconfirmed).
     Stamped when the write starts and again when it ends (gh_cache_write), so a read while it was in flight does not
     count; a rerun that fails costs one more read, never a wrong answer."""
-    rerun = (words[:2] == ["run", "rerun"]
-             or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+    rerun = is_run_rerun(words)
     run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
     if not rerun or not repo or not run_id:
         return
@@ -27857,6 +27862,25 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
+def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int) -> str | None:
+    """What to say when a brokered `gh run rerun` exits non-zero, else None.
+
+    GitHub refuses a rerun outright for a run it will not retry ("run N cannot be rerun; This workflow run cannot be
+    retried": the run is too old, its workflow file moved, or its attempts are used up), and gh names nothing that
+    does work. 2026-11-22 an hq run was refused that way after a cancelled job, and the refusal read as "the rerun
+    did nothing": the caller waited again on a red that a newer run had already replaced. Name the two steps that
+    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does."""
+    if rc == 0 or not is_run_rerun(words):
+        return None
+    run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
+    named = f"{repo}/{run_id}" if repo and run_id else (repo or "that run")
+    where = f" -R {repo}" if repo else ""
+    return (f"glaeda-gh: that rerun did not take (gh exited {rc}): a run GitHub will not retry (too old, its "
+            f"workflow file moved, every attempt used) needs a new run, not a rerun. "
+            f"next: glaeda-gh status run {named} --jobs # a newer run may already stand in for it; else push the "
+            f"head again, or `gh workflow run WORKFLOW --ref BRANCH{where}`")
+
+
 def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
                    scopes: list[str] | None = None, words: list[str] | None = None) -> int:
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
@@ -27864,6 +27888,9 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
     try:
         rc, _out, _err = gh_cache_child(real, args, False, None)
         ran.append(rc)
+        said = rerun_next_step(repo, scopes, words or [], rc)
+        if said:
+            print(said, file=sys.stderr)
     finally:
         if ran:
             with contextlib.suppress(Exception):
