@@ -21607,7 +21607,7 @@ class LogScanTest(Base):
         with self.diagnostics_in(said):
             code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, reads=0, rest=self.no_rest)
         self.assertEqual((code, out), (1, ""))
-        self.assertEqual(self.ctl_reads, [], "--reads 0 reads no log at all")
+        self.assertEqual(self.ctl_reads, [9], "only the id itself was probed: --reads 0 reads no failed job's log")
         self.assertIn("3 more failed job(s) past --reads 0", said.getvalue())
 
     def test_a_negative_reads_is_refused_by_name_on_either_command(self) -> None:
@@ -21617,7 +21617,9 @@ class LogScanTest(Base):
                      ["log", "search", "o/r", "pat", "--reads", "-1"]):
             err = io.StringIO()
             with mock.patch("sys.stderr", err), mock.patch.object(gg.Parser, "argv", argv):
-                self.assertEqual(gg.main(list(argv)), 64, argv)
+                with self.assertRaises(SystemExit) as exit_:
+                    gg.main(list(argv))
+            self.assertEqual(exit_.exception.code, 64, argv)
             self.assertIn("--reads", err.getvalue())
             self.assertIn("-1", err.getvalue())
 
