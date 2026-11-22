@@ -57,6 +57,8 @@ loader.exec_module(gg)
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
 LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
+LAND_CPU_HELD = "the host's free CPU is at the 80% line (/proc/stat idle+nice; land.json \"headroomHold\": false turns this off)"
+LAND_RAM_HELD = "the host's free RAM is at the 80% line (MemAvailable; land.json \"headroomHold\": false turns this off)"
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -29795,7 +29797,7 @@ class LandTest(Base):
             for _ in range(2):
                 self.assertIsNone(self.q.headroom_why())
                 self.q.headroom_take()
-            self.assertEqual(self.q.headroom_why(), "the host's free CPU is at the 80% line (/proc/stat idle+nice)")
+            self.assertEqual(self.q.headroom_why(), LAND_CPU_HELD)
             self.q.now += 1  # the next pass reads the host again
             self.assertIsNone(self.q.headroom_why())
             self.q.now += 1
@@ -29806,7 +29808,7 @@ class LandTest(Base):
                 mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
                 mock.patch.object(gg, "land_mem_available", return_value=3.3 * gib):
             self.q.now += 1
-            self.assertEqual(self.q.headroom_why(), "the host's free RAM is at the 80% line (MemAvailable)")
+            self.assertEqual(self.q.headroom_why(), LAND_RAM_HELD)
         with mock.patch.object(gg, "land_mem_total", return_value=None):  # unreported: the count holds
             self.q.now += 1
             self.assertEqual(self.q.headroom_left(), (math.inf, math.inf))
@@ -29820,12 +29822,28 @@ class LandTest(Base):
             self.tick()
             e = self.tick(gg.LAND_DUE_LATE + 1)
         self.assertEqual((e.get("dueLate") or {}).get("why"),
-                         "the host's free CPU is at the 80% line (/proc/stat idle+nice)")
+                         LAND_CPU_HELD)
         self.q.jobs.clear()
         self.w.answers.append(ok_answer(LA))
         with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
             e = self.tick(1)  # nothing else runs: the first always does
         self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+
+    def test_an_operator_turns_the_headroom_hold_off_in_land_json(self):
+        """ci-217x review of glaeda#2484: every guard gets an override. land.json "headroomHold": false lets a held
+        row start (the pool's count still holds it), and the hold's reason names that key."""
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            self.assertIn('"headroomHold": false', self.q.headroom_why())
+            self.w.config["headroomHold"] = False
+            self.assertIsNone(self.q.headroom_why())
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+        self.q.jobs.clear()
 
     def test_the_free_cpu_is_idle_plus_nice_over_a_bounded_window(self):
         stats = iter([(100, 50, 50, 700, 0, 0, 0, 0), (110, 80, 60, 750, 0, 0, 0, 0),  # fresh: nice 30 + idle 50 of 100

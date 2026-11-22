@@ -12107,6 +12107,7 @@ LAND_JUDGMENT_CORES = 4.6 / 27  # about 0.17 of a core
 LAND_JUDGMENT_RSS = 128.4e6  # bytes
 LAND_HEADROOM = 0.8  # the handbook's headroom line: lands take at most this share of the host's cores and RAM
 LAND_WORKER_MAX = 1024  # land_seconds' bound on the ceiling and on land.json "workers"
+LAND_HEADROOM_OFF = 'land.json "headroomHold": false'  # the headroom hold's override (LandQueue.headroom_why)
 LAND_CPU_WINDOW_MIN, LAND_CPU_WINDOW_MAX, LAND_CPU_FRESH = 1.0, 60.0, 0.25  # seconds (land_cpu_free)
 _LAND_CPU: list = [None, None, None, None]  # [monotonic at, /proc/stat counters, last free share, its nice part]
 _LAND_CPU_LOCK = threading.Lock()
@@ -14994,12 +14995,16 @@ class LandQueue:
         return self.headroom[1], self.headroom[2]
 
     def headroom_why(self) -> str | None:
-        """Why the host's headroom holds one more judgment this pass, or None when it does not."""
+        """Why the host's headroom holds one more judgment this pass, or None when it does not. land.json
+        "headroomHold": false turns the hold off (an operator's override, named in the reason); the pool's count
+        still holds."""
+        if self.config().get("headroomHold") is False:
+            return None
         cpu, mem = self.headroom_left()
         if cpu < 1:
-            return "the host's free CPU is at the 80% line (/proc/stat idle+nice)"
+            return f"the host's free CPU is at the 80% line (/proc/stat idle+nice; {LAND_HEADROOM_OFF} turns this off)"
         if mem < 1:
-            return "the host's free RAM is at the 80% line (MemAvailable)"
+            return f"the host's free RAM is at the 80% line (MemAvailable; {LAND_HEADROOM_OFF} turns this off)"
         return None
 
     def headroom_take(self) -> None:
