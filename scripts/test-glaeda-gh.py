@@ -22530,6 +22530,9 @@ class LandWorld:
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
+        # `gh api PATH --jq ...` reads by path prefix: what the jq answers (None: the read fails). Unset: exit 0, no
+        # output, which no reader can use (a run read before a rerun: rerun as before)
+        self.api: dict[str, str | None] = {}
         # `lane-gh call land_handoff`: the broker host's answer (rc, stdout, stderr)
         # as lane-gh prints it: the broker's whole envelope, indented over many lines
         self.handoff = (0, json.dumps({"ok": True, "status": 200, "data": {
@@ -22577,6 +22580,11 @@ class LandWorld:
             words = argv[1:]
             if words[:1] == ["api"] and "/files?" in words[1]:
                 return subprocess.CompletedProcess(argv, 0, "".join(json.dumps(f) + "\n" for f in self.files), "")
+            if words[:1] == ["api"] and len(words) > 1:
+                for prefix, out in self.api.items():
+                    if words[1].startswith(prefix):
+                        return subprocess.CompletedProcess(argv, 1 if out is None else 0, f"{out or ''}\n",
+                                                           "HTTP 502" if out is None else "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
             if words[:2] == ["pr", "view"]:
@@ -22713,7 +22721,8 @@ class LandTest(Base):
         self.assertIn("merged at " + "f" * 40, self.w.sent()[-1][-1])
         self.assertEqual(self.w.sent()[-1][2:4], ["--no-wait", "host/lane"])
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
-        self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
+        self.assertEqual(self.w.sent()[-1][4:12], ["--notice", "--severity", "info", "--sender", "glaeda-land",
+                                                   "--class", "block", "--title"])
 
     def test_land_notify_always_passes_prompt_after_notice_options(self):
         self.pr(LA)
@@ -22723,6 +22732,17 @@ class LandTest(Base):
         sent = self.w.sent()[-1]
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
+
+    def test_a_land_notice_that_is_sent_wakes_as_a_block(self):
+        # What a land sends is what its requester acts on (merged, stopped), so it wakes an idle lane at once; an
+        # unclassified notice is an FYI that waits for the inbox's 15-minute flush.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        sent = self.w.sent()[-1]
+        self.assertEqual(sent[sent.index("--class") + 1], "block")
+        self.assertIn("merged", sent[-1])
 
     def test_land_notify_uses_parent_session_from_queued_reader(self):
         self.pr(LA)
@@ -23602,6 +23622,83 @@ class LandTest(Base):
         self.tick()
         self.assert_merged_at(LA)
 
+    def stale_api(self, run: int, files: list[str], ahead: int = 3, event: str = "pull_request") -> None:
+        """RUN's merge was built on main at BASE_THEN; main is AHEAD commits past it now, changing FILES."""
+        self.w.api[f"repos/o/r/actions/runs/{run}"] = json.dumps(
+            {"id": run, "event": event, "created_at": "2026-11-22T00:05:00Z",
+             "pull_requests": [{"base": {"ref": "main"}}]})
+        self.w.api["repos/o/r/commits?"] = "b" * 40
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = json.dumps(
+            {"status": "ahead", "ahead_by": ahead, "files": files})
+
+    def test_a_rerun_of_a_merge_the_base_fixed_since_is_a_pinned_base_merge_instead(self):
+        # cmux run 44964926915 attempt 3 (2026-11-22 02:42Z) replayed a 00:05Z merge without base fix 27647ffd3ae
+        # (scripts/ci/api_call_log/env.sh) and failed again: only a new head gets a new merge commit.
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.stale_api(5, ["scripts/ci/api_call_log/env.sh"])
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
+        self.assertEqual(e["reruns"], {f"{LA}|5": 1})  # counted against LAND_RERUN_CAP as the rerun was
+        stale = [h for h in e["history"] if h["event"] == "stale_replay"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("scripts/ci/api_call_log/env.sh", stale[0]["why"])
+
+    def assert_rerun_as_before(self) -> None:
+        self.pr(LA, checks=[("ci", "COMPLETED", "CANCELLED")])
+        self.land()
+        self.w.answers.append(refusal("cancelled", LA, {"kind": "rerun_failed", "runs": [5]}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", "5", "--failed", "-R", "o/r"]])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "stale_replay"], [])
+
+    def test_a_fresh_run_is_rerun_as_before(self):
+        self.stale_api(5, ["src/a.ts"])  # the base moved, off the CI paths and under STALE_REPLAY_BEHIND
+        self.assert_rerun_as_before()
+
+    def test_a_push_run_is_rerun_as_before(self):
+        self.stale_api(5, [".github/workflows/ci.yml"], event="push")
+        self.assert_rerun_as_before()
+
+    def test_an_unread_run_is_rerun_as_before(self):
+        self.w.api["repos/o/r/actions/runs/5"] = None
+        self.assert_rerun_as_before()
+
+    def test_an_unread_compare_is_rerun_as_before(self):
+        self.stale_api(5, ["scripts/ci/x.sh"])
+        self.w.api[f"repos/o/r/compare/{'b' * 40}...main"] = None
+        self.assert_rerun_as_before()
+
+    def test_stale_replay_why_is_cmuxterm_hq_stale_replay(self):
+        run = {"id": 9, "event": "pull_request", "created_at": "2026-11-22T00:05:00Z",
+               "pull_requests": [{"base": {"ref": "main"}}]}
+        then = lambda ref, at: "c" * 40
+
+        def cmp(status: str = "ahead", ahead: int = 3, files: tuple = ()) -> Any:
+            return lambda that, ref: {"status": status, "ahead_by": ahead, "files": list(files)}
+
+        self.assertIn("51 commits behind main", gg.stale_replay_why(run, then, cmp(ahead=51)))
+        self.assertIn(".github/workflows/a.yml", gg.stale_replay_why(run, then, cmp(files=(".github/workflows/a.yml",))))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(ahead=50, files=("src/a.ts",))), "")
+        self.assertIn("src/a.ts", gg.stale_replay_why(run, then, cmp(files=("src/a.ts",)), patterns=("src/*",)))
+        self.assertEqual(gg.stale_replay_why(run, then, cmp(status="diverged", ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "event": "push"}, then, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99)), "")
+        self.assertIn("main", gg.stale_replay_why({**run, "pull_requests": []}, then, cmp(ahead=99), default_base="main"))
+        self.assertEqual(gg.stale_replay_why(run, lambda ref, at: None, cmp(ahead=99)), "")
+
+        def boom(*_: Any) -> Any:
+            raise RuntimeError("HTTP 502")
+
+        self.assertEqual(gg.stale_replay_why(run, boom, cmp(ahead=99)), "")
+        self.assertEqual(gg.stale_replay_why(run, then, boom), "")
+
     # cmux#45558 (2026-11-17): webviews/ and scripts/ only, stopped own_red on run 44118660533, whose rust workspaces
     # job failed a test on a local port; a hand rerun was the step.
     RUN = 44118660533
@@ -23649,6 +23746,20 @@ class LandTest(Base):
         self.w.answers.append(ok_answer(LA))
         self.tick()
         self.assert_merged_at(LA)
+
+    def test_an_unrelated_red_on_a_merge_the_base_fixed_since_is_a_pinned_base_merge_once(self):
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.stale_api(self.RUN, ["scripts/ci/api_call_log/env.sh"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual(self.w.gh_calls("api", "-X", "PUT"), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch",
+                                                                "-f", f"expected_head_sha={LA}"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["unrelatedReruns"]),
+                         ("waiting", "head_change", [f"{LA}|{self.RUN}"]))
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "stale_replay"], ["stale_replay"])
 
     def test_the_same_red_after_its_one_rerun_stops_own_red_even_after_a_restart(self):
         self.unrelated_world(["webviews/src/a.ts"])
@@ -24257,17 +24368,23 @@ class LandTest(Base):
         self.land("o/r#2", after=["o/r#3"], requester="host/two")
         self.land("o/r#1", after=["o/r#2"], requester="host/one")
         self.w.answers.append(numbered(refusal("block", LC, {"kind": "stop", "stop": "block", "why": "BLOCK"}), 3))
-        self.tick()
-        self.tick()
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick()
+            self.tick()
         es = self.q.entries
         self.assertEqual([es[f"pr:o/r#{n}"]["state"] for n in (3, 2, 1)], ["stopped", "waiting_after", "waiting_after"])
+        # #3's requester is woken by its stop; #2's wait behind it is a log line, never a wake (LandQueue.notify)
         told = {m[3]: m[-1] for m in self.w.sent()}
-        self.assertIn("o/r#3, which it lands after, stopped (block)", told["host/two"])
-        self.assertIn("next: glaeda-gh land o/r#3", told["host/two"])
-        self.assertNotIn("host/one", told)  # #1 waits on #2, which is still queued
+        self.assertEqual(list(told), ["host/three"])
+        quiet = {d["to"]: d["message"] for d in logged if d.get("event") == "land-notice-quiet"}
+        self.assertIn("o/r#3, which it lands after, stopped (block)", quiet["host/two"])
+        self.assertIn("next: glaeda-gh land o/r#3", quiet["host/two"])
+        self.assertNotIn("host/one", quiet)  # #1 waits on #2, which is still queued
+        self.assertIn("after_stopped_waiting", [h.get("event") for h in es["pr:o/r#2"]["history"]])
         for _ in range(5):
             self.tick(600)
-        self.assertEqual(len(self.w.sent()), 2)  # told once, never again while #3 stays stopped
+        self.assertEqual(len(self.w.sent()), 1)  # #3's stop, told once
         # #3 is fixed and landed again: the chain lands in order (one judged at a time, so answers in chain order)
         self.w.answers += [numbered(ok_answer(LC), 3), numbered(ok_answer(LB), 2), numbered(ok_answer(LA), 1)]
         self.land("o/r#3", requester="host/three")
@@ -24748,9 +24865,14 @@ class LandTest(Base):
         self.land("o/r#2", requester="host/two")
         self.land(after=["o/r#2"], requester="host/one")
         self.stop_o_r_2("BLOCK one")
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
         self.tick()
         self.tick(600)
-        to_one = lambda: [m for m in self.w.sent() if m[3] == "host/one"]
+        self.assertFalse([m for m in self.w.sent() if m[3] == "host/one"])  # a wait behind a stop wakes no one
+        to_one = lambda: [d for d in logs if d.get("event") == "land-notice-quiet" and d["to"] == "host/one"]
         self.assertEqual(len(to_one()), 1)
         self.stop_o_r_2("BLOCK two")  # landed again, and stopped again: a new stop
         self.land("o/r#2", requester="host/two")
@@ -25460,7 +25582,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
         self.assertEqual(e["handedOff"]["head"], LA)
         self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
-        self.assertTrue(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
+        # handed off is no wake: the requester hears from huge-blue's queue when it merges or stops
+        self.assertFalse(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
         # nothing more here: no judgment, no step, no second hand-off
         for _ in range(5):
             self.tick(600)
@@ -25982,12 +26105,15 @@ class LandTest(Base):
                 with mock.patch.object(gg, "policy_host", lambda: "host"):
                     self.land(requester="host/lane")
                     self.w.answers.append(refusal(code, LA, {"kind": "retry"}, reason=self.UNREAD))
-                    e = self.tick()
+                    logged: list[dict] = []
+                    with mock.patch.object(gg, "log", logged.append):
+                        e = self.tick()
                 [call] = self.handoffs()
                 self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
                 self.assertEqual((e["state"], e.get("forwardedTo")), ("forwarded", "huge-blue"))
-                said = [c[-1] for c in self.w.sent() if "handed to huge-blue" in c[-1]]
-                self.assertTrue(said and "could not judge it" in said[0], self.w.sent())
+                self.assertFalse([c for c in self.w.sent() if "handed to huge-blue" in c[-1]], self.w.sent())
+                said = [d["message"] for d in logged if d.get("event") == "land-notice-quiet"]
+                self.assertTrue(said and "handed to huge-blue" in said[0] and "could not judge it" in said[0], logged)
                 for _ in range(3):
                     self.tick(600)
                 self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
@@ -26693,6 +26819,29 @@ class LandTest(Base):
             self.q.reading = lambda p: (None if p not in readings else
                                         {**readings[p], "seenAt": self.t - readings[p]["ago"]})
         readings[pool] = {"limit": 5000, "remaining": remaining, "reset": reset, "ago": seen_ago}
+
+    def test_the_logins_pace_holds_only_owners_read_on_the_login(self):
+        """huge-blue, 2026-11-22 07:12-07:25Z: load 0.56-0.65/core, 12 workers, busy 1-2, capped 243-268 rows a pass,
+        dueLate 425 -> 520 in 13 min. A lander's reads go to the lander App pools: an owner the latch-free check says
+        so for is judged with the login's GraphQL and REST spent to the reserve, and the login's window is not
+        charged; the login's own owner still waits for its reset."""
+        reset = self.t + 1800
+        self.give_reading("graphql", 0, reset)
+        self.give_reading("rest", 0, reset)
+        self.q.latch_free_seen.update({"o": (self.t, False, "no App pool here serves o")})
+        self.pr(LA)
+        self.land()
+        self.tick(1)
+        self.assertEqual((self.w.explains(), self.q.pass_capped), ([], 1))
+        self.q.latch_free_seen.update({"o": (self.t, True, "")})
+        self.w.answers.append(ok_answer(LA))
+        for _ in range(3):
+            self.give_reading("graphql", 0, reset)
+            self.give_reading("rest", 0, reset)
+            self.tick(1)
+        self.assert_merged_at(LA)
+        w = self.q.window_now()
+        self.assertEqual((w["rest"], w["graphql"]), (0.0, 0.0))
 
     def test_a_fresh_reading_above_the_reserve_releases_a_retry_after_mark(self):
         logs: list[dict] = []
@@ -27932,13 +28081,15 @@ class LandTest(Base):
         self.tick(30)
         self.assertEqual(self.w.explains(), [])
         self.assertEqual([self.q.entries[k]["latchHeld"]["windows"] for k in keys], [2, 2, 2])
-        sent = self.w.sent()
-        self.assertEqual(sorted(s[3] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
-        # The notice quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
+        # "nothing to do" is a log line, never a wake (LandQueue.notify)
+        self.assertEqual(self.w.sent(), [])
+        sent = [(d["to"], d["message"]) for d in logs if d.get("event") == "land-notice-quiet"]
+        self.assertEqual(sorted(s[0] for s in sent), ["host/lane11", "host/lane12", "host/lane13"])
+        # The line quotes why the owner has no unlatched source (here: no check on this host), never a fixed PR
         self.assertTrue(all("latch" in s[-1] and "no latch-free check on this host" in s[-1]
                             and "leo-workspace#5944" not in s[-1] for s in sent), sent)
         self.tick(60)
-        self.assertEqual(len(self.w.sent()), 3, "told once")
+        self.assertEqual(len([d for d in logs if d.get("event") == "land-notice-quiet"]), 3, "said once")
         # The next clear: at once, past no spread, oldest wake first
         self.retries(3)
         self.tick(reset2 + 1 - self.t)
@@ -27979,6 +28130,103 @@ class LandTest(Base):
         e = self.q.entries[key]
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
+
+    def test_rows_this_hosts_gates_hold_late_overflow_to_a_peer_with_room(self):
+        """land.json "overflow": a due row held here LAND_OVERFLOW_AFTER past its due time (every worker busy) goes to
+        the first peer whose room answer has room, at most that many, oldest due first; a row due only a minute, or
+        landing --after another, stays. Here it is "forwarded", naming the peer, and no worker here judges it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "full-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "idle-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[tuple[str, dict]] = []
+        room = {"full-peer": 0, "idle-peer": 1}
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append((cmd[1], req))
+            if req["op"] == "room":
+                return {"ok": True, "room": room[cmd[1]], "host": cmd[1]}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        oldest, second = self.stuck(11, 3 * 3600), self.stuck(12, 2 * 3600)
+        fresh = self.stuck(13, 60)
+        chained = self.stuck(14, 4 * 3600, after=["o/r#12"])
+        self.tick(30)
+        sent = [(host, [r["target"] for r in req["requests"]]) for host, req in asked if req["op"] == "batch"]
+        self.assertEqual(sent, [("idle-peer", ["o/r#11"])])
+        self.assertEqual([h for h, req in asked if req["op"] == "room"], ["full-peer", "idle-peer"])
+        e = self.q.entries[oldest]
+        self.assertEqual((e["state"], e["forwardedTo"]), ("forwarded", "idle-peer"))
+        self.assertEqual([h["event"] for h in e["history"]].count("overflowed"), 1)
+        req = [r for _, q in asked if q["op"] == "batch" for r in q["requests"]][0]
+        self.assertEqual((req["requester"], req["handoff"]), ("host/lane11", True))
+        for key in (second, fresh, chained):
+            self.assertNotEqual(self.q.entries[key]["state"], "forwarded")
+        self.tick(30)  # within LAND_OVERFLOW_EVERY: no new pass
+        self.assertEqual(len([1 for _, q in asked if q["op"] == "batch"]), 1)
+        del self.q.jobs["pr:o/r#99"]
+        self.q.jobs["pr:o/r#98"] = Busy()
+        self.tick(gg.LAND_OVERFLOW_EVERY + 1)
+        sent = [[r["target"] for r in q["requests"]] for _, q in asked if q["op"] == "batch"]
+        self.assertEqual(sent, [["o/r#11"], ["o/r#12"]])
+        self.assertEqual(self.q.entries[second]["state"], "forwarded")
+        self.assertNotEqual(self.q.entries[fresh]["state"], "forwarded")
+        self.assertNotEqual(self.q.entries[chained]["state"], "forwarded")
+        self.assertEqual(self.explained(), [])  # nothing judged here: the one worker stayed busy throughout
+
+    def test_a_peer_that_refuses_or_is_down_leaves_the_rows_here(self):
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "down-peer", "glaeda-gh", "land", "serve"]]
+
+        def down(cmd: list[str], req: dict, deadline: float) -> dict:
+            raise gg.WatchError("ssh: connect to host down-peer port 22: Connection refused")
+        self.q.forward = down
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        e = self.q.entries[key]
+        self.assertEqual(e["state"], "waiting")
+        self.assertEqual(self.q.overflowing, set())
+
+    def test_a_hosts_room_is_its_idle_workers_less_its_due_rows_from_a_fresh_pool_line(self):
+        now = 1_000_000.0
+        pool = {"at": now - 60, "workers": 5, "busy": 1, "due": 1, "loadPerCore": 0.5, "latch": None,
+                "queueParked": False}
+        self.assertEqual(gg.land_room(pool, now), 3)
+        self.assertEqual(gg.land_room({**pool, "loadPerCore": 9.0}, now), 3)  # the load holds nothing
+        self.assertEqual(gg.land_room({**pool, "at": now - gg.LAND_ROOM_FRESH - 1}, now), 0)
+        self.assertEqual(gg.land_room({**pool, "latch": "rest"}, now), 0)
+        self.assertEqual(gg.land_room({**pool, "due": 9}, now), 0)
+        self.assertEqual(gg.land_room(None, now), 0)
+
+    def test_land_serve_answers_room_from_the_pool_line_the_queue_wrote(self):
+        logs: list[dict] = []
+        with mock.patch.object(gg, "log", logs.append):
+            self.tick(1)  # an empty queue's pass writes its pool line
+        pool = gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE)
+        self.assertEqual((pool["busy"], pool["due"]), (0, 0))
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "land_room", lambda doc, now: 3 if doc == pool else -1), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "room"})), 0)
+        self.assertEqual(json.loads(out.getvalue())["room"], 3)
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), contextlib.redirect_stdout(out):
+            gg.cmd_land_serve(json.dumps({"op": "room"}))
+        self.assertEqual(json.loads(out.getvalue())["room"], 0)
 
     def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
         """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an
@@ -29072,6 +29320,29 @@ class LandTest(Base):
             self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
         with mock.patch.object(gg.os, "getloadavg", side_effect=OSError("no loadavg")):
             self.assertIsNone(LAND_LOAD_PER_CORE(16))
+
+    def test_a_due_late_row_names_the_gate_holding_it_now_not_the_one_it_left(self):
+        """huge-blue, 2026-11-22 07:23Z: 1 of 12 workers busy, 449 due late, the rows still naming the gate that held
+        them at 05:41-06:46Z. A row another gate holds since says so, at most once per LAND_LATE_WHY_EVERY."""
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+
+        def capped(pool):
+            def cap(entry, sha=""):
+                entry["windowCapped"] = {"pool": pool}
+                return False
+            return cap
+        with mock.patch.object(self.q, "window_room", side_effect=capped("rest")):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertEqual(e["dueLate"]["why"], "the login's quota pace (rest)")
+        with mock.patch.object(self.q, "window_room", side_effect=capped("graphql")):
+            e = self.tick(1)
+            self.assertEqual(e["dueLate"]["why"], "the login's quota pace (rest)")  # LAND_LATE_WHY_EVERY
+            e = self.tick(gg.LAND_LATE_WHY_EVERY)
+        self.assertEqual(e["dueLate"]["why"], "the login's quota pace (graphql)")
+        self.q.jobs.clear()
 
     def test_land_status_names_what_holds_the_workers(self):
         """huge-blue, 2026-11-22: `land status` printed "every worker busy" while one worker of 12 ran; the line names
