@@ -5365,6 +5365,28 @@ class ClientTest(Base):
         for same in (["wait", "pr", "o/r#5", "7"], ["wait", "run", "o/r"], ["wait", "run", "o", "5"]):
             self.assertEqual(gg.infer_kind(list(same))[0], same)
 
+    def test_post_takes_the_repo_and_number_pair_its_siblings_take(self) -> None:
+        """Measured 2026-11-22: `glaeda-gh comment manaflow-ai/cmuxterm-hq 15832 --body-file -` reached `post
+        comment` (nesting_synonym) and then failed "unrecognized arguments: 15832", though `land o/r 8024` and
+        `status pr o/r 8024` both took that pair in the same session (fewer-tool-calls)."""
+        want = {
+            ("post", "comment", "manaflow-ai/cmuxterm-hq", "15832", "--body-file", "-"):
+                ["post", "comment", "manaflow-ai/cmuxterm-hq#15832", "--body-file", "-"],
+            ("post", "comment", "o/r", "#5"): ["post", "comment", "o/r#5"],
+            ("post", "review", "o/r", "5", "--body", "hi"): ["post", "review", "o/r#5", "--body", "hi"],
+        }
+        for given, fixed in want.items():
+            got, note = gg.infer_kind(list(given))
+            self.assertEqual(got, fixed)
+            self.assertEqual(note, f"glaeda-gh: ran as `glaeda-gh {' '.join(fixed)}`")
+            gg.parser().parse_args(got)
+        # `post pr OWNER/REPO` is a repository with no number, `post status` an id, and a target already
+        # joined is left alone: none of them is that shape.
+        for same in (["post", "pr", "o/r"], ["post", "pr", "o/r", "5"], ["post", "status", "17"],
+                     ["post", "comment", "o/r#5"], ["post", "comment", "o/r"],
+                     ["post", "comment", "https://github.com/o/r/pull/5"]):
+            self.assertEqual(gg.infer_kind(list(same)), (same, ""))
+
     def test_wait_takes_head_as_its_sha(self) -> None:
         """Coordinator, 2026-11-21: "add a `--head` alias for `--sha` on `glaeda-gh wait`"."""
         sha = "a" * 40
