@@ -274,6 +274,8 @@ jobs:
               Path("scripts/test-hot-observe.py"),
               Path("scripts/glaeda-disk"),
               Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-disk-registry"),
+              Path("scripts/test-glaeda-disk-registry.py"),
               Path("scripts/glaeda-runner-hygiene"),
               Path("scripts/test-glaeda-runner-hygiene.py"),
               Path("scripts/glaeda-procs"),
@@ -374,6 +376,7 @@ jobs:
           suite python3 scripts/test-benchmark-linker-throughput.py
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
+          suite python3 scripts/test-glaeda-disk-registry.py
           suite python3 scripts/test-glaeda-hook-pin.py
           suite python3 scripts/test-glaeda-cmux-tour-floor-check.py
           suite python3 scripts/test-glaeda-devbox.py

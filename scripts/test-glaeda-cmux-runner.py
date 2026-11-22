@@ -21648,6 +21648,49 @@ class StepBackfillTest(unittest.TestCase):
                 marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "need": bad}))
                 self.assertEqual([w["need"] for w in hook.admission_waiters(self.capacity)], [None])
 
+class DerivedDataSlotTest(unittest.TestCase):
+    """DERIVED_DATA_SLOT: job-started exports this stream's DerivedData slot only with GLAEDA_DISK_REGISTRY=1."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name) / "dd"
+        self.github_env = Path(tmp.name) / "github_env"
+        self.github_env.write_text("")
+        runner_temp = Path(tmp.name) / "runner_temp"
+        runner_temp.mkdir()
+        patch = mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(self.github_env),
+                                             "RUNNER_TEMP": os.fspath(runner_temp)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_off_by_default(self) -> None:
+        for flag in (None, "0", "true"):
+            env = {"GITHUB_REF_NAME": "main"} | ({"GLAEDA_DISK_REGISTRY": flag} if flag else {})
+            self.assertEqual(hook.derived_data_slot_start(env, self.base), [])
+        self.assertFalse(self.base.exists())
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_a_pr_uses_its_base_branch_slot_and_a_push_its_own(self) -> None:
+        notes = hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_BASE_REF": "feat/cmux-next",
+                                              "GITHUB_REF_NAME": "123/merge"}, self.base)
+        self.assertIn("derived data slot", notes[0])
+        self.assertTrue((self.base / "feat-cmux-next").is_dir())
+        self.assertIn(f"CMUX_DERIVED_DATA_SLOT={self.base / 'feat-cmux-next'}", self.github_env.read_text())
+        hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_REF_NAME": "main"}, self.base)
+        self.assertTrue((self.base / "main").is_dir())
+
+    def test_an_odd_ref_gets_no_slot(self) -> None:
+        for ref in ("", "..", "-x", "a..b"):
+            notes = hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_REF_NAME": ref}, self.base)
+            self.assertIn("skipped", notes[0])
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_slot_dir_matches_the_registry(self) -> None:
+        text = (ROOT / "config" / "disk-registry.toml").read_text()
+        self.assertIn(f'path = "{hook.DERIVED_DATA_SLOT_DIR}/{{stream}}"', text)
+
+
 class JobScratchTest(unittest.TestCase):
     """JOB_SCRATCH: a per-job sparse APFS image (hdiutil mocked), opt-in, best effort, scoped to this runner."""
 
