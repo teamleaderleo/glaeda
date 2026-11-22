@@ -11680,15 +11680,17 @@ def land_worker_ceiling(cores: int | None = None) -> int:
 # The line is measured CPU headroom (the handbook's 80% line), so on a host with /proc/stat it reads the share of CPU
 # time that was busy since the last read (LAND_CPU_SAMPLE_S apart at least), not the run queue: Linux's loadavg counts
 # threads blocked on IO (D state) too, so a host waiting on git and disk read over the line while its CPU sat idle.
-# huge-blue, 2026-11-22 07:00Z: 362 lands due late, 2 of 12 workers busy, load 1.11/core over the 0.8 line; a lane VM
-# read the same hour 0.66/core with its CPU 92% idle. Where /proc/stat is missing (macOS) or before the first two
-# samples, the 1-minute load average per core stands in, as before. The lane-gh broker's land slots read the same way.
+# CPU at nice is headroom as well: a judgment runs at nice 0 and niced work (the host's test suites) yields to it.
+# huge-blue, 2026-11-22 07:00Z: 362 lands due late, 2 of 12 workers busy, load 1.11/core over the 0.8 line, its CPU
+# 83% busy of which 34 points were niced. Where /proc/stat is missing (macOS) or before the first two samples, the
+# 1-minute load average per core stands in, as before. The lane-gh broker's land slots read the same way.
 LAND_CPU_SAMPLE_S = 1.0
 _LAND_CPU: dict[str, float] = {}
 
 
 def proc_stat_cpu(path: str = "/proc/stat") -> tuple[int, int] | None:
-    """(busy, total) CPU jiffies from /proc/stat's first line; idle and iowait count as not busy. None if unreadable."""
+    """(busy, total) CPU jiffies from /proc/stat's first line; idle, iowait and nice count as not busy. None if
+    unreadable."""
     try:
         with open(path, encoding="ascii") as f:
             parts = f.readline().split()
@@ -11701,7 +11703,8 @@ def proc_stat_cpu(path: str = "/proc/stat") -> tuple[int, int] | None:
     except ValueError:
         return None
     total = sum(vals)
-    return total - vals[3] - (vals[4] if len(vals) > 4 else 0), total
+    # nice (vals[1]) is not busy either: niced work (the host's test suites run at nice 10) yields to a judgment
+    return total - vals[1] - vals[3] - (vals[4] if len(vals) > 4 else 0), total
 
 
 def land_cpu_busy(read: Callable[[], tuple[int, int] | None] = proc_stat_cpu,

@@ -28896,12 +28896,12 @@ class LandTest(Base):
                 mock.patch.object(gg.os, "getloadavg", return_value=(8.0, 0, 0)):
             self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
 
-    def test_proc_stat_counts_idle_and_iowait_as_not_busy(self):
+    def test_proc_stat_counts_idle_iowait_and_nice_as_not_busy(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "stat")
             with open(p, "w") as f:
                 f.write("cpu  10 2 3 50 30 1 1 3 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n")
-            self.assertEqual(gg.proc_stat_cpu(p), (20, 100))
+            self.assertEqual(gg.proc_stat_cpu(p), (18, 100))  # 10 user + 3 system + 1 + 1 + 3 steal; nice 2 is not
             with open(p, "w") as f:
                 f.write("intr 1 2\n")
             self.assertIsNone(gg.proc_stat_cpu(p))
