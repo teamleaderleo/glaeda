@@ -5492,6 +5492,21 @@ class ClientTest(Base):
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
 
+    def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
+        """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
+        --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
+        here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
+        sha = "a" * 40
+        by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
+        for word in ("--pin", "--pinned", "--match-head-commit"):
+            args = gg.parser().parse_args(["land", "o/r#1", word, sha])
+            self.assertEqual(args.sha, sha, word)
+            self.assertEqual(vars(args), vars(by_sha), word)
+        for kind, target in (("pr", "o/r#1"), ("run", "o/r/12")):
+            waited = gg.parser().parse_args(["wait", kind, target, "--pin", sha])
+            self.assertEqual(waited.sha, sha)
+            self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
+
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
         --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
@@ -11399,6 +11414,61 @@ class FileAndPidWaitTest(unittest.TestCase):
         for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r", "--job", "x"], ["log", "o/r", "--job", "re"],
                      ["log", "flaky", "o/r"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_word_for_a_command_runs_as_that_command(self) -> None:
+        """`pr-state o/r#1 o/r#2` (called so on gcp-agent-lane-2, 2026-11-21, and refused with the bare list of
+        commands) runs `status o/r#1 o/r#2`, and a case, a prefix or a typo of a command runs as it too."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for given, want in (("pr-state", "status"), ("pr_state", "status"), ("state", "status"),
+                                ("STATUS", "status"), ("stat", "status"), ("statsu", "status"),
+                                ("quota", "budget"), ("runner", "runners")):
+                self.assertEqual(gg.command_spelling_synonym([given, "o/r#1"]), ([want, "o/r#1"], []),
+                                 f"{given} -> {want}")
+        self.assertEqual(err.getvalue().count("read as"), 8)
+        self.assertIn("is no command", err.getvalue())
+        # The rewrite parses, and the kind a bare target implies is still inferred from it afterwards.
+        fixed, said = gg.infer_kind(gg.command_spelling_synonym(["pr-state", "o/r#1"])[0])
+        self.assertEqual(fixed[:2], ["status", "pr"])
+        self.assertTrue(said)
+        self.assertEqual(gg.parser().parse_args(fixed).command, "status")
+
+    def test_a_command_a_nesting_word_and_a_stranger_are_all_left_alone(self) -> None:
+        """A real command is never rewritten; a word nesting_synonym owns stays its; a word near nothing keeps
+        argparse's own refusal, with the commands in it."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for same in (["status", "pr", "o/r#1"], ["land", "o/r#1"], ["--help"], [],
+                         ["gh", "pr", "view", "1"], ["comment", "o/r#1"], ["job", "o/r", "7"],
+                         ["frobnicate", "o/r#1"], ["xyzzy"]):
+                self.assertEqual(gg.command_spelling_synonym(list(same)), (same, []), " ".join(same))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_only_the_first_word_is_read_as_a_command(self) -> None:
+        """`wait run o/r/1` keeps its kind: `run` is a prefix of `runners`, and a word after the command is a
+        kind or a target, never a command (which is why this is not in Parser._get_value)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["wait", "run", "o/r/1"]),
+                             (["wait", "run", "o/r/1"], []))
+            self.assertEqual(gg.parser().parse_args(["wait", "run", "o/r/1"]).kind, "run")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_word_as_close_to_two_commands_refuses_naming_both(self) -> None:
+        """Nothing is guessed between two commands: the refusal names each as a line that runs. No two real
+        commands are one edit apart, so the pair comes from a patched command set."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.command_spelling_synonym(["seach", "cmux next"]),  # one edit from `search`
+                             (["search", "cmux next"], []))
+        self.assertEqual(err.getvalue().count("read as"), 1)
+        tops, table = gg.nesting_table()
+        with mock.patch.object(gg, "nesting_table", lambda: (frozenset({"read", "real"}), table)):
+            fixed, refusal = gg.command_spelling_synonym(["reat", "o/r#1"])
+        self.assertEqual(fixed, ["reat", "o/r#1"])
+        self.assertIn("is no command", refusal[0])
+        self.assertEqual(refusal[1:], ["next: glaeda-gh read o/r#1", "next: glaeda-gh real o/r#1"])
+        self.assertIn("read", tops)  # the real table is untouched by the patch above
 
     def test_bare_notify_and_the_flag_before_the_target_both_work(self) -> None:
         """A bare `--notify` means this session, and `land --notify o/r#1` runs `land o/r#1 --notify`
