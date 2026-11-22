@@ -2981,6 +2981,7 @@ APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not aske
 APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the login this long
 APP_POOL_PUSHED_MIN_LEFT = 120.0  # a pushed token this close to its end is not asked for (gh_app_token.py's own floor)
 APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
+APP_POOL_BENCH_FILE = "app-pool-benched.json"  # the scopes the App refused, kept across a re-exec (restore_bench)
 APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
 APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
 APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
@@ -3263,6 +3264,44 @@ class AppPool:
         owner, _, repos = scope[len("graphql:"):].partition(":")
         return owner, [r for r in repos.split(",") if r]
 
+    def bench(self, scope: str, until: float) -> None:
+        """Keep SCOPE on the login until UNTIL, and write the bench down.
+
+        The bench used to live only in this process. The daemon re-execs whenever a fix lands (one host, 2026-11-22:
+        54 re-execs in a day), and every refusal went with it, so a scope no retry can win was asked again after each
+        one: graphql:manaflow-ai:cmux, which the `cursor` organization's IP allow list forbids this App's address
+        ("FORBIDDEN ... your IP address is not permitted to access this resource"), cost 23 doomed App queries that
+        day on this host, each one a round trip on ci-watch and then quota-goblin before the same read went on the
+        login anyway. An hour's bench now means an hour.
+        """
+        self.unreadable[scope] = until
+        self.save_bench()
+
+    def bench_file(self) -> Path:
+        return BASE / APP_POOL_BENCH_FILE
+
+    def save_bench(self) -> None:
+        """Write this pool's live benches under its role, keeping the other roles' as they are."""
+        now = self.clock()
+        doc = read_json(self.bench_file())
+        roles = dict(doc["roles"]) if isinstance(doc, dict) and isinstance(doc.get("roles"), dict) else {}
+        roles[self.role] = {scope: round(until, 3) for scope, until in self.unreadable.items() if until > now}
+        with contextlib.suppress(OSError):
+            write_json(self.bench_file(), {"schema": "glaeda-gh-app-bench/v1", "roles": roles})
+
+    def restore_bench(self) -> "AppPool":
+        """Read the benches of this pool and its spares back (save_bench), dropping any whose hour has passed."""
+        now = self.clock()
+        doc = read_json(self.bench_file())
+        roles = doc.get("roles") if isinstance(doc, dict) else None
+        for pool in [self, *self.spares]:
+            kept = roles.get(pool.role) if isinstance(roles, dict) else None
+            for scope, until in (kept if isinstance(kept, dict) else {}).items():
+                if isinstance(scope, str) and isinstance(until, (int, float)) and not isinstance(until, bool) \
+                        and until > now:
+                    pool.unreadable[scope] = float(until)
+        return self
+
     def covers(self, scope: str) -> bool:
         """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks). A GraphQL chunk is
         covered unless one of its own repositories is benched (a set is never benched as a set)."""
@@ -3305,9 +3344,9 @@ class AppPool:
                 # asks the App again). The broker host, 2026-11-22: sets "cmux,cmuxterm-hq" and "cmuxterm-hq,cmux"
                 # were each benched an hour as sets while the App held 12,234 of 12,500 points.
                 for repo in self.named_repos(scope, message):
-                    self.unreadable[f"graphql:{owner_}:{repo}"] = now + APP_POOL_ROUTE_REST
+                    self.bench(f"graphql:{owner_}:{repo}", now + APP_POOL_ROUTE_REST)
             else:
-                self.unreadable[scope] = now + APP_POOL_ROUTE_REST
+                self.bench(scope, now + APP_POOL_ROUTE_REST)
             self.fell_back += 1
             return False
         if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
@@ -3321,6 +3360,9 @@ class AppPool:
         resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
         return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
+                # Published so a reader can tell an idle App from a benched one: with this unprinted, an App pool
+                # 97% unspent beside a login at 0 GraphQL points read as a routing bug for hours, 2026-11-22.
+                "unreadable": {scope: round(until) for scope, until in self.unreadable.items() if until > now} or None,
                 "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
                 "graphqlSeen": self.graphql_seen,
                 **({"spares": [p.status() for p in self.spares]} if self.spares else {})}
@@ -5065,12 +5107,17 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
+        # The clock comes first: the pool built below reads it (restore_bench), and a clock set afterwards
+        # made Daemon() raise AttributeError for every caller that did not pass its own app_pool.
+        self.now = time.time()
+        self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
         self.app_pool: AppPool | None = (
-            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES) if app_pool == "auto" else app_pool)
+            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES).restore_bench()
+            if app_pool == "auto" else app_pool)
         self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
@@ -5158,7 +5205,6 @@ class Daemon:
         self.budget_retry = 0.0  # /rate_limit is left alone until this time after a refusal
         self.rate_limit_at = float("-inf")  # when /rate_limit last answered (refresh_budget)
         self.last_cycle: dict[str, float] = {kind: 0.0 for kind in CYCLES}
-        self.now = time.time()
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.consumer_sent: dict[tuple[str, str], float] = {}  # (head, consumer): last sent upstream (upstream_read)
@@ -5221,7 +5267,6 @@ class Daemon:
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
-        self.clock_real = True  # tick(now=...) in tests pins the clock
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
         # GitHub's secondary limit holds the outbox until then
         self.post_hold = saved_hold(held.get("holdUntil"), time.time())
