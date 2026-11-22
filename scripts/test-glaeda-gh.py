@@ -25421,7 +25421,7 @@ class LandTest(Base):
         # gcp-agent-lane-10, 2026-11-22: cmux#48064 at 1ebd272819aa answered "unreadable" after 5m9s on the VM's slow
         # upstream; about 25 green lands sat behind such answers with all 8 workers busy, and none was ever handed off.
         # The first judgment that read nothing hands the PR to the broker host, which judges it with its own reads.
-        for code in ("unreadable", "explain_failed"):
+        for code in ("unreadable", "explain_failed", "webview_unreadable"):
             with self.subTest(code=code):
                 shutil.rmtree(gg.land_dir(), ignore_errors=True)
                 self.w = LandWorld(self.tmp.name)

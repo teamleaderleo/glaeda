@@ -11461,6 +11461,10 @@ LAND_WAIT_WHAT = {"wait_comment": "a review verdict at the head", "retry": "a ju
 # never completes stops retry_deadline at LAND_UNREAD_DEADLINE, and re-arms (LAND_REARM_*) as before.
 LAND_UNREAD_DEADLINE = 6 * 3600.0
 LAND_UNREAD_CODES = frozenset({"unreadable"})
+# Answers that read nothing about the PR, which a lane VM hands to the broker host's land queue (unjudgeable_here):
+# webview_unreadable is land_judge's stop after three live webview reads timed out, the same slow read
+# (gcp-agent-lane-10, 2026-11-22: cmux#48009, #49213, #48839 stopped on it, each read "took over 40 s").
+LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unreadable"})
 # An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
 # read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
 # (`explain --cache-only`, no read sent, no broker queue waited on, a local read of seconds); only a miss goes live,
@@ -14912,7 +14916,7 @@ class LandQueue:
 
     def unjudgeable_here(self, e: dict, answer: dict, act: dict, head: str) -> str:
         """Under the lock: why this lane VM should hand E at HEAD to the broker host's land queue instead of judging it
-        again here, or "". A judgment that read nothing about the PR ("unreadable", "explain_failed") on a broker
+        again here, or "". A judgment that read nothing about the PR (LAND_HANDOFF_UNREAD) on a broker
         client: the VM reads GitHub through the broker's upstream, and when that is slow every judgment here costs a
         worker for minutes and reads nothing again. gcp-agent-lane-10, 2026-11-22: manaflow-ai/cmux#48064 at
         1ebd272819aa answered "unreadable" after 5m9s (store 22 s, GraphQL and REST timed out), about 25 green lands
@@ -14920,7 +14924,7 @@ class LandQueue:
         fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. A host with its own login,
         a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
         code = str(answer.get("code") or "")
-        if code not in ("unreadable", "explain_failed") or answer.get("cacheOnly") or not SHA40.fullmatch(head):
+        if code not in LAND_HANDOFF_UNREAD or answer.get("cacheOnly") or not SHA40.fullmatch(head):
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
             return ""
