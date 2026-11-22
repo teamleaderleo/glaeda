@@ -3043,6 +3043,107 @@ def app_graphql_refused(message: str) -> bool:
     return "NOT_FOUND" in APP_POOL_ANSWERED_NOT_FOUND.sub("", message)
 
 
+# Another organization's IP allow list refuses one node of a batch, not the repository. Every hour both read Apps were
+# answered 200 with "FORBIDDEN Although you appear to have the correct authorization credentials, the `X` organization
+# has an IP allow list enabled, and your IP address is not permitted to access this resource." on a manaflow-ai/cmux
+# query (one host, 2026-11-22: 5, 6, 10 and 17 per App in the 10Z-13Z hours), and the single-repository scope was
+# benched APP_POOL_ROUTE_REST, so every cmux GraphQL read went on the login until its quota ran out (14:13-14:27Z: of
+# 91 land judgments, 8 unreadable and 9 quota). X is not the repository's owner: it owns something one node points at
+# (a check suite's app, a head repository), and GitHub names that node in the error's path. Such a refusal now benches
+# that node ("node:OWNER/REPO#N", "node:OWNER/REPO@SHA", "node:OWNER/REPO/runs/ID", "node:id:NODE_ID") in every pool
+# of the chain, for APP_POOL_ROUTE_REST: a query naming it goes on the login, batched() reads it apart from the rest,
+# and the rest stay on the App. One that names no path, or another error beside it, keeps the scope bench.
+# GLAEDA_GH_APP_NODE_BENCH=0 turns it off (the repository scope is benched, as before).
+APP_POOL_NODE_BENCH = (os.environ.get("GLAEDA_GH_APP_NODE_BENCH", "1") or "1").strip().lower() not in {"0", "off", "false", "no"}
+APP_POOL_IP_ALLOW_LIST = re.compile(r"the `([A-Za-z0-9][A-Za-z0-9-]{0,38})` organization has an IP allow list enabled", re.I)
+APP_POOL_ALIAS = re.compile(r"^[a-z](\d+)$")
+APP_POOL_RUN_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)/actions/runs/(\d+)",
+                              re.I)
+APP_POOL_HEAD_ALIAS = re.compile(r'(?<![\w$])([a-z]\d+): ?repository\(owner:"([A-Za-z0-9][A-Za-z0-9-]{0,38})",'
+                                 r'name:"([A-Za-z0-9._-]+)"\)\{object\(oid:"([0-9a-fA-F]{40})"\)')
+
+
+def graphql_body_nodes(body: dict | None) -> dict[str, str]:
+    """{alias or "FIELD.INDEX": node} for every node a GraphQL BODY asks: an aliased PR or issue (o/r/n variables),
+    run (u variable) or head (head_query's literal repository and commit), and each id of a nodes(ids:) list."""
+    if not isinstance(body, dict):
+        return {}
+    variables = body.get("variables") if isinstance(body.get("variables"), dict) else {}
+    out: dict[str, str] = {}
+    for key, value in variables.items():
+        m = re.fullmatch(r"o(\d+)", str(key))
+        if m and isinstance(value, str):
+            repo, number = variables.get(f"r{m.group(1)}"), variables.get(f"n{m.group(1)}")
+            if isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool):
+                out[m.group(1)] = f"{value.lower()}/{repo.lower()}#{number}"
+        m = re.fullmatch(r"u(\d+)", str(key))
+        run = APP_POOL_RUN_URL.match(value) if m and isinstance(value, str) else None
+        if m and run:
+            out[m.group(1)] = f"{run.group(1).lower()}/{run.group(2).lower()}/runs/{run.group(3)}"
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                if isinstance(item, str) and item:
+                    out[f"{key}.{i}"] = f"id:{item}"
+    for alias, owner, repo, sha in APP_POOL_HEAD_ALIAS.findall(str(body.get("query") or "")):
+        out[alias] = f"{owner.lower()}/{repo.lower()}@{sha.lower()}"
+    return out
+
+
+def graphql_error_node(body: dict | None, path: Any) -> str | None:
+    """The node of BODY an error's PATH is under (graphql_body_nodes), or None: an alias p3 is its o3/r3/n3 PR (or a
+    head's literal h3), a path ["suiteRuns", 4, ...] the fifth id of the body's one list variable."""
+    if not isinstance(path, list) or not path:
+        return None
+    nodes = graphql_body_nodes(body)
+    alias = APP_POOL_ALIAS.match(str(path[0]))
+    if alias:
+        return nodes.get(str(path[0])) or nodes.get(alias.group(1))
+    if len(path) > 1 and type(path[1]) is int:
+        variables = (body or {}).get("variables") if isinstance((body or {}).get("variables"), dict) else {}
+        lists = [k for k, v in variables.items() if isinstance(v, list)]
+        if len(lists) == 1:
+            return nodes.get(f"{lists[0]}.{path[1]}")
+    return None
+
+
+def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple[str, str]] | None:
+    """[(node, "path.as.text"), ...] when every error of a 200 App answer that refuses (app_graphql_refused) is
+    another organization's IP allow list (an organization that is not OWNER) at a path naming one node of BODY; else
+    None (no such error, one with no path, or any other refusal beside it: the scope is benched as before)."""
+    if not APP_POOL_NODE_BENCH or not isinstance(errors, list):
+        return None
+    found: list[tuple[str, str]] = []
+    for e in errors:
+        if not isinstance(e, dict) or protection_forbidden(e):
+            continue
+        text = str(e.get("type") or "") + " " + str(e.get("message") or "")
+        if not app_graphql_refused(text):
+            continue
+        org = APP_POOL_IP_ALLOW_LIST.search(text)
+        node = graphql_error_node(body, e.get("path"))
+        if not (str(e.get("type") or "") == "FORBIDDEN" and org and org.group(1).lower() != owner.lower() and node):
+            return None
+        found.append((node, ".".join(str(p) for p in e["path"])))
+    return found or None
+
+
+def entry_nodes(key: str) -> list[str]:
+    """The nodes (graphql_body_nodes) a watch KEY's GraphQL read asks: its PR, run or head, and a head's
+    CHECKS_OF_RECORD commit."""
+    try:
+        kind, owner, repo, value = split_key(key)
+    except ValueError:
+        return []
+    base = f"{owner.lower()}/{repo.lower()}"
+    if kind == "head":
+        nodes = [f"{base}@{value}"]
+        if (owner, repo) in CHECKS_OF_RECORD:
+            other = "/".join(CHECKS_OF_RECORD[(owner, repo)]).lower()
+            nodes.append(f"{other}@{value}")
+        return nodes
+    return [f"{base}/runs/{value}" if kind == "run" else f"{base}#{value}"]
+
+
 # A branch's rule or protection read is one route family of its repository: the App lacks administration for every
 # branch alike, and a lane branch has a path of its own (the broker host, 2026-11-22: a 403 for each of
 # rules/branches/main, .../lane/a, .../lane/b, each an App request and a login retry).
@@ -3135,12 +3236,32 @@ class AppPool:
         self.spares = [AppPool(role=r, clock=self.clock) for r in roles if r != self.role]
         return self
 
-    def pick(self, owner: str, scope: str) -> "AppPool | None":
-        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE."""
+    def pick(self, owner: str, scope: str, body: dict | None = None) -> "AppPool | None":
+        """The first pool of the chain (this, then its spares) with a token for OWNER that has not refused SCOPE, nor
+        any node a GraphQL BODY asks (bench_nodes)."""
+        any_node = body is not None and any(k.startswith("node:") for p in [self, *self.spares] for k in p.unreadable)
+        nodes = list(graphql_body_nodes(body).values()) if any_node else []  # (no node benched: no parse per read)
         for pool in [self, *self.spares]:
-            if pool.covers(scope) and pool.token(owner):
+            if pool.covers(scope) and not pool.nodes_benched(nodes) and pool.token(owner):
                 return pool
         return None
+
+    def nodes_benched(self, nodes: "list[str]") -> bool:
+        """Whether this pool has benched any of NODES (bench_nodes)."""
+        now = self.clock()
+        return any(self.unreadable.get(f"node:{n}", 0.0) > now for n in nodes)
+
+    def chain_benched(self, nodes: "list[str]") -> bool:
+        """Whether any pool of the chain has benched any of NODES: batched() reads such an entry apart."""
+        return any(pool.nodes_benched(nodes) for pool in [self, *self.spares])
+
+    def bench_nodes(self, nodes: "list[str]", until: float) -> None:
+        """Keep NODES on the login until UNTIL in every pool of the chain: another organization's IP allow list
+        refuses this host's address (foreign_ip_refusal), whichever App asks."""
+        for pool in [self, *self.spares]:
+            for node in nodes:
+                pool.unreadable[f"node:{node}"] = until
+            pool.save_bench()
 
     def held_here(self) -> bool:
         """Whether this host can get the role's token: its App metadata and key files, or a pushed read-only token
@@ -3316,10 +3437,12 @@ class AppPool:
         _, repos = self.graphql_repos(scope)
         return [r for r in repos if re.search(rf"(?<![\w.-]){re.escape(r)}(?![\w.-])", message, re.I)]
 
-    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "",
+                 nodes: "list[str] | None" = None) -> bool:
         """Note the App's answer; False when the read must go again on the login. A rate limit or a dead token rests
         the pool; a 403 or 404 of one route (a permission or repository the App lacks: branch protection needs
-        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST."""
+        administration, which ci-watch does not hold) keeps that route on the login for APP_POOL_ROUTE_REST. NODES
+        (foreign_ip_refusal) are the only nodes a 200 answer's refusal names: they are benched, never SCOPE."""
         now = self.clock()
         try:
             remaining, reset = int(headers.get("x-ratelimit-remaining", "")), float(headers.get("x-ratelimit-reset", ""))
@@ -3334,6 +3457,10 @@ class AppPool:
             spent = remaining == 0 and reset is not None and reset > now
             self.rest_until[owner] = min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST
             self.why = f"the {self.role} App answered HTTP {status}"
+            self.fell_back += 1
+            return False
+        if status == 200 and nodes:
+            self.bench_nodes(nodes, now + APP_POOL_ROUTE_REST)
             self.fell_back += 1
             return False
         if status in {403, 404} or (status == 200 and app_graphql_refused(message)):
@@ -3516,8 +3643,9 @@ class ReadTokenPool(AppPool):
             self.keep(owner, pair)
         return pair[0]
 
-    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "") -> bool:
-        ok = super().answered(owner, scope, status, headers, message)
+    def answered(self, owner: str, scope: str, status: int, headers: dict, message: str = "",
+                 nodes: "list[str] | None" = None) -> bool:
+        ok = super().answered(owner, scope, status, headers, message, nodes)
         if status == 401:  # dead: the next read mints again, after the rest
             self.keep(owner, None)
         return ok
@@ -6454,7 +6582,8 @@ class Daemon:
                  and not self.writing else None)
         route = route_of(method, path)
         scope = pool.scope(owner, method, path, body) if owner else ""
-        chosen = pool.pick(owner, scope) if owner else None
+        graphql_body = body if path == "/graphql" else None
+        chosen = pool.pick(owner, scope, graphql_body) if owner else None
         app_token = chosen.token(owner) if chosen else None
         if app_token:
             pool = chosen
@@ -6491,13 +6620,26 @@ class Daemon:
                 message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
             else:
                 message = ""
-            if pool.answered(owner, scope, status, h, message):
+            errors = doc.get("errors") if isinstance(doc, dict) else None
+            # another organization's IP allow list at one node's path: that node is benched, never the repository
+            refused = foreign_ip_refusal(owner, graphql_body, errors) if status == 200 and graphql_body else None
+            nodes = sorted({node for node, _ in refused}) if refused else None
+            if pool.answered(owner, scope, status, h, message, nodes):
                 self.note_spend("rest", route, 0)
                 self.sent.append((self.now, "app"))
                 return status, h, doc
-            log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status, "route": route,
-                 "scope": scope, "error": message[:200]})
-            if self.app_pool is not None and self.app_pool.pick(owner, scope) is not None:
+            # each error's path, so a reader can tell a refused node from a refused repository (no token is in it)
+            paths = [".".join(str(p) for p in e["path"]) for e in errors or []
+                     if isinstance(e, dict) and isinstance(e.get("path"), list) and not protection_forbidden(e)][:5]
+            if nodes:
+                if self.app_pool is not None:
+                    self.app_pool.bench_nodes(nodes, self.clock() + APP_POOL_ROUTE_REST)
+                log({"event": "app-pool-node-refused", "role": pool.role, "owner": owner, "status": status,
+                     "route": route, "scope": scope, "nodes": nodes[:10], "paths": paths, "error": message[:200]})
+            else:
+                log({"event": "app-pool-refused", "role": pool.role, "owner": owner, "status": status, "route": route,
+                     "scope": scope, "error": message[:200], **({"paths": paths} if paths else {})})
+            if self.app_pool is not None and self.app_pool.pick(owner, scope, graphql_body) is not None:
                 # the refused pool now rests (or has marked the route), so this asks the next pool of the chain
                 return self.request(method, path, body, etag, free, content)
             # refused: the same read goes on the login at once, as it would have without the App
@@ -9056,7 +9198,7 @@ class Daemon:
         if owner is None:
             return []
         scope = pool.scope(owner, method, path, body)
-        if pool.pick(owner, scope) is None:
+        if pool.pick(owner, scope, body if path == "/graphql" else None) is None:
             return []
         return entries
 
@@ -9083,8 +9225,10 @@ class Daemon:
         ineligible too, and under a login stop due() then read none of them. One dev host, 2026-11-21 11Z, watched 18
         manaflow-ai and 14 teamleaderleo keys, so the mixed set was never eligible."""
         groups: dict[str, list[dict]] = {}
-        for e in entries:
-            groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)  # owner/repo: a benched repo alone
+        pool = self.app_pool
+        for e in entries:  # owner/repo: a benched repo alone; a benched node (bench_nodes) apart from its repo's rest
+            benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
+            groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""), []).append(e)
         if len(groups) < 2:
             return self.app_entries_eligible(kind, entries, bucket)
         ok = {e["key"] for g in groups.values() for e in self.app_entries_eligible(kind, g, bucket)}
@@ -9132,9 +9276,14 @@ class Daemon:
             # owner (a query is a point at most, and an App's costs the login nothing).
             # And one repository per query: a refused query benches the repositories its errors name, and one that names
             # none benches nothing, so a mixed chunk's refusal would cost the App's whole set another try each tick.
+            # And an entry whose node an App refused (bench_nodes) apart: its chunk goes on the login, the rest stay on
+            # the App.
             groups: dict[str, list[dict]] = {}
+            pool = self.app_pool
             for e in rest:
-                groups.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)
+                benched = pool is not None and pool.chain_benched(entry_nodes(e["key"]))
+                groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""),
+                                  []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
@@ -9645,7 +9794,7 @@ class Daemon:
         if route:
             body[APP_POOL_ROUTE_FIELD] = sorted(set(route))
         owner = pool.owner_of("POST", "/graphql", body)
-        return owner is not None and pool.pick(owner, pool.scope(owner, "POST", "/graphql", body)) is not None
+        return owner is not None and pool.pick(owner, pool.scope(owner, "POST", "/graphql", body), body) is not None
 
     def pr_pages_points(self) -> int:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
@@ -10069,11 +10218,19 @@ class Daemon:
         most GQL_BATCH PRs (or heads and their check-of-record commits) of at most 100 suites, so 2 * GQL_BATCH queries
         of one point each, and far fewer in practice (a cmux head has about 15 such suites)."""
         suites = list(dict.fromkeys(suites))
+        # A suite an App refused (bench_nodes) is read in chunks of its own, on the login; the rest stay on the App.
+        pool = self.app_pool
+        benched = [s for s in suites if pool is not None and pool.chain_benched([f"id:{s}"])]
+        held = frozenset(benched)
+        suites = [s for s in suites if s not in held] + benched
+        starts = (list(range(0, len(suites) - len(benched), SUITE_RUNS_BATCH))
+                  + list(range(len(suites) - len(benched), len(suites), SUITE_RUNS_BATCH)))
+        ends = starts[1:] + [len(suites)]
         out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
-        for start in range(0, len(suites), SUITE_RUNS_BATCH):
-            chunk = suites[start:start + SUITE_RUNS_BATCH]
+        for start, end in zip(starts, ends):
+            chunk = suites[start:end]
             if paced and not self.app_answers(SUITE_RUNS, {"suites": chunk}, route) and not self.gql_room():
                 for suite_id in suites[start:]:
                     out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"

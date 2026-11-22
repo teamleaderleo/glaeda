@@ -32900,6 +32900,136 @@ class AppPoolTest(Base):
                          {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST},
                          "the spare writing its own bench keeps ci-watch's")
 
+    # Another organization's IP allow list at one node's path (foreign_ip_refusal): that node leaves the App, never
+    # the repository. The path is the one GitHub gives a check suite's app another organization owns.
+    FOREIGN = ("Although you appear to have the correct authorization credentials, the `other-org` organization has "
+               "an IP allow list enabled, and your IP address is not permitted to access this resource.")
+    APP_PATH = ["p1", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 3,
+                "checkSuite", "app"]
+
+    def two_pr_query(self, *numbers: int) -> dict:
+        query, variables = gg.pr_query([f"pr:manaflow-ai/cmux#{n}" for n in numbers])
+        return {"query": query, "variables": variables}
+
+    def spare_pool(self) -> list[str]:
+        """A quota-goblin spare whose GraphQL calls are counted apart; it is refused the same way."""
+        spare_token = "ghs_" + "q" * 36
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: spare_token, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        calls: list[str] = []
+        inner = self.transport
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] == f"Bearer {spare_token}":
+                calls.append(url)
+                return 200, {"x-ratelimit-remaining": "12000"}, b'{"data": {}}'
+            return inner(method, url, headers, body)
+
+        self.daemon.transport = transport
+        return calls
+
+    def foreign_answer(self, path: Any = APP_PATH, org: str = "other-org", extra: list | None = None) -> None:
+        error = {"type": "FORBIDDEN", "message": self.FOREIGN.replace("other-org", org)}
+        if path is not None:
+            error["path"] = path
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 json.dumps({"data": {"p0": {"pullRequest": {"number": 1}},
+                                                      "p1": {"pullRequest": {"number": 2}}},
+                                             "errors": [error, *(extra or [])]}).encode()))
+
+    def test_another_orgs_ip_allow_list_benches_only_the_node_its_path_names(self) -> None:
+        spare_calls = self.spare_pool()
+        self.foreign_answer()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (1, 0, 1),
+                         "the refused query goes on the login once; the spare is not asked a doomed read")
+        cmux = self.pool.scope("manaflow-ai", "POST", "/graphql", self.two_pr_query(1))
+        self.assertTrue(self.pool.covers(cmux), "the repository stays on the App")
+        for pool in (self.pool, *self.pool.spares):
+            self.assertEqual(pool.unreadable, {"node:manaflow-ai/cmux#2": NOW + gg.APP_POOL_ROUTE_REST}, pool.role)
+        event = next(json.loads(l) for l in out.getvalue().splitlines() if '"app-pool-node-refused"' in l)
+        self.assertEqual(event["nodes"], ["manaflow-ai/cmux#2"])
+        self.assertEqual(event["paths"], [".".join(str(p) for p in self.APP_PATH)])
+        self.assertEqual(event["scope"], "graphql:manaflow-ai:cmux")
+        self.assertNotIn(APP_TOKEN, out.getvalue())
+        self.assertNotIn('"app-pool-refused"', out.getvalue(), "one line per refusal")
+        # the other PRs of the repository stay on the App; a query asking the refused PR goes on the login, unasked
+        self.daemon.request("POST", "/graphql", self.two_pr_query(1, 3))
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1))
+        self.daemon.request("POST", "/graphql", self.two_pr_query(2))
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (2, 0, 2))
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.daemon.request("POST", "/graphql", self.two_pr_query(2))
+        self.assertEqual(len(self.app_calls), 3, "the bench over, the App is asked again")
+
+    def test_a_node_bench_survives_a_re_exec(self) -> None:
+        self.foreign_answer()
+        self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {"node:manaflow-ai/cmux#2": NOW + gg.APP_POOL_ROUTE_REST})
+
+    def test_a_refusal_with_no_path_or_the_owners_own_list_or_beside_another_refusal_benches_the_repository(self):
+        scope = "graphql:manaflow-ai:cmux"
+        cases = {"no path": dict(path=None), "the owner's own list": dict(org="manaflow-ai"),
+                 "another refusal beside it": dict(extra=[{"type": "FORBIDDEN", "path": ["p0"],
+                                                           "message": "Resource not accessible by integration"}]),
+                 "a path naming no node": dict(path=["rateLimit"])}
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                self.pool.unreadable.clear()
+                self.foreign_answer(**kwargs)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+                self.assertEqual(set(self.pool.unreadable), {scope})
+                self.assertIn('"app-pool-refused"', out.getvalue())
+
+    def test_the_switch_off_benches_the_repository_as_before(self) -> None:
+        self.foreign_answer()
+        with mock.patch.object(gg, "APP_POOL_NODE_BENCH", False):
+            self.daemon.request("POST", "/graphql", self.two_pr_query(1, 2))
+        self.assertEqual(set(self.pool.unreadable), {"graphql:manaflow-ai:cmux"})
+
+    def test_a_benched_node_is_read_apart_so_its_repositorys_rest_stay_on_the_app(self) -> None:
+        keys = [f"pr:manaflow-ai/cmux#{i}" for i in range(1, 6)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        self.pool.bench_nodes(["manaflow-ai/cmux#3"], NOW + 600)
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual(sorted(sent), sorted([[k for k in keys if k != keys[2]], [keys[2]]]))
+        got = self.daemon.app_eligible_by_owner("pr", entries, "graphql")
+        self.assertEqual([e["key"] for e in got], [k for k in keys if k != keys[2]])
+
+    def test_an_error_path_names_its_pr_run_head_or_listed_node(self) -> None:
+        body = self.two_pr_query(7, 9)
+        self.assertEqual(gg.graphql_error_node(body, ["p1", "pullRequest", "x"]), "manaflow-ai/cmux#9")
+        self.assertIsNone(gg.graphql_error_node(body, ["p5"]))
+        self.assertIsNone(gg.graphql_error_node(body, None))
+        query, variables = gg.run_query(["run:manaflow-ai/cmux#55"])
+        self.assertEqual(gg.graphql_error_node({"query": query, "variables": variables}, ["w0", "x"]),
+                         "manaflow-ai/cmux/runs/55")
+        sha = "ab" * 20
+        heads = {"query": gg.heads_query([f"head:teamleaderleo/glaeda@{sha}"]), "variables": {}}
+        self.assertEqual(gg.graphql_error_node(heads, ["h0", "object"]), f"teamleaderleo/glaeda@{sha}")
+        self.assertEqual(gg.graphql_error_node(heads, ["m0", "object"]), f"manaflow-ai/glaeda@{sha}")
+        self.assertEqual(gg.entry_nodes(f"head:teamleaderleo/glaeda@{sha}"),
+                         [f"teamleaderleo/glaeda@{sha}", f"manaflow-ai/glaeda@{sha}"])
+        suites = {"query": gg.SUITE_RUNS, "variables": {"suites": ["S1", "S2"]}}
+        self.assertEqual(gg.graphql_error_node(suites, ["suiteRuns", 1, "app"]), "id:S2")
+
+    def test_a_benched_suite_is_read_in_a_chunk_of_its_own(self) -> None:
+        self.pool.bench_nodes(["id:S2"], NOW + 600)
+        asked: list[list[str]] = []
+        with mock.patch.object(self.daemon, "graphql", lambda q, v, route=None: (asked.append(v["suites"]) or
+                                                                                  ({"data": {"suiteRuns": []}}, None))):
+            self.daemon.suite_runs(["S1", "S2", "S3"], paced=False, route=["manaflow-ai/cmux"])
+        self.assertEqual(asked, [["S1", "S3"], ["S2"]])
+
     def test_a_missing_or_unreadable_bench_file_restores_nothing(self) -> None:
         pool = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
                           clock=lambda: self.daemon.clock())
