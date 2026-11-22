@@ -31452,13 +31452,22 @@ LOG_JOB_ONE_WORD = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)/(?:ac
 def log_job_synonym(raw: list[str]) -> list[str]:
     """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that. So is
     `log job|errors OWNER/REPO/ID` or a job's URL in one word (the shape `status run` and a failed check print;
-    2026-11-21 it cost a usage error)."""
+    2026-11-21 it cost a usage error). A target word carrying a run id alongside an id given positionally or with
+    `--job` keeps the given id and drops the run from the word, instead of being refused on the repository."""
     given = [w for w in raw[3:4] if w.isdigit()] + [w for w in raw[3:] if w.startswith("--job")]  # an id already
     one = LOG_JOB_ONE_WORD.fullmatch(raw[2]) if len(raw) >= 3 and raw[:2] in (["log", "job"], ["log", "errors"]) \
-        and not given else None
-    if one:
+        else None
+    if one and not given:
         fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
         print(f"glaeda-gh: read as `{typed_line(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        return fixed
+    if one:
+        # Both at once: the run in the target word (the shape `status run` prints) and the id of the job inside it
+        # (`log errors OWNER/REPO/RUN_ID --job JOB_ID`, called so 2026-11-22 and refused on the repository word).
+        # The explicitly given id is the one asked for; the number in the target word only named where it came from.
+        fixed = raw[:2] + [one.group(1)] + raw[3:]
+        print(f"glaeda-gh: read as `{typed_line(fixed)}` (the id given is the one read; {one.group(2)} in "
+              f"{raw[2]} only says which run it is in)", file=sys.stderr)
         return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw

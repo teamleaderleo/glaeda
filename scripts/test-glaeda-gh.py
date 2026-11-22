@@ -11548,8 +11548,20 @@ class FileAndPidWaitTest(unittest.TestCase):
                                                  "--max", "9"]), ["log", "errors", "o/r", "7", "--max", "9"])
             self.assertEqual(gg.parser().parse_args(gg.log_job_synonym(["log", "job", "o/r/7"])).job, 7)
         self.assertEqual(err.getvalue().count("read as"), 3)
-        for same in (["log", "job", "o/r", "7"], ["log", "job", "o/r/7", "8"], ["log", "search", "o/r/7"]):
+        for same in (["log", "job", "o/r", "7"], ["log", "search", "o/r/7"]):
             self.assertEqual(gg.log_job_synonym(same), same)
+
+    def test_a_run_in_the_target_word_and_a_job_id_both_given(self) -> None:
+        """`log errors OWNER/REPO/RUN_ID --job JOB_ID` (called so 2026-11-22; refused because the repository word
+        held three segments) reads the given job id, in that repository: the run in the word only said where it is."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]),
+                             ["log", "errors", "o/r", "--job", "7"])
+            self.assertEqual(gg.log_job_synonym(["log", "job", "o/r/5", "7"]), ["log", "job", "o/r", "7"])
+            args = gg.parser().parse_args(gg.log_job_synonym(["log", "errors", "o/r/5", "--job", "7"]))
+        self.assertEqual((args.repo, args.job), ("o/r", 7))
+        self.assertIn("5 in o/r/5 only says which run it is in", err.getvalue())
 
     def test_log_repo_job_flag_reads_as_log_job(self) -> None:
         """`log OWNER/REPO --job ID` (called wrong, 2026-11-21) runs `log job OWNER/REPO ID`, saying so on stderr."""
