@@ -11677,8 +11677,60 @@ def land_worker_ceiling(cores: int | None = None) -> int:
     return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
 
 
+# The line is measured CPU headroom (the handbook's 80% line), so on a host with /proc/stat it reads the share of CPU
+# time that was busy since the last read (LAND_CPU_SAMPLE_S apart at least), not the run queue: Linux's loadavg counts
+# threads blocked on IO (D state) too, so a host waiting on git and disk read over the line while its CPU sat idle.
+# huge-blue, 2026-11-22 07:00Z: 362 lands due late, 2 of 12 workers busy, load 1.11/core over the 0.8 line; a lane VM
+# read the same hour 0.66/core with its CPU 92% idle. Where /proc/stat is missing (macOS) or before the first two
+# samples, the 1-minute load average per core stands in, as before. The lane-gh broker's land slots read the same way.
+LAND_CPU_SAMPLE_S = 1.0
+_LAND_CPU: dict[str, float] = {}
+
+
+def proc_stat_cpu(path: str = "/proc/stat") -> tuple[int, int] | None:
+    """(busy, total) CPU jiffies from /proc/stat's first line; idle and iowait count as not busy. None if unreadable."""
+    try:
+        with open(path, encoding="ascii") as f:
+            parts = f.readline().split()
+    except OSError:
+        return None
+    if len(parts) < 5 or parts[0] != "cpu":
+        return None
+    try:
+        vals = [int(x) for x in parts[1:9]]
+    except ValueError:
+        return None
+    total = sum(vals)
+    return total - vals[3] - (vals[4] if len(vals) > 4 else 0), total
+
+
+def land_cpu_busy(read: Callable[[], tuple[int, int] | None] = proc_stat_cpu,
+                  now: Callable[[], float] = time.monotonic) -> float | None:
+    """The busy CPU share (0-1) since the previous sample, reused until LAND_CPU_SAMPLE_S has passed; None until two
+    samples exist or where /proc/stat is unreadable."""
+    t = now()
+    if "share" in _LAND_CPU and t - _LAND_CPU.get("at", 0.0) < LAND_CPU_SAMPLE_S:
+        return _LAND_CPU["share"]
+    cur = read()
+    if cur is None:
+        return None
+    share = None
+    if "busy" in _LAND_CPU and cur[1] > _LAND_CPU["total"]:
+        share = max(0.0, min(1.0, (cur[0] - _LAND_CPU["busy"]) / (cur[1] - _LAND_CPU["total"])))
+    elif "share" in _LAND_CPU:
+        share = _LAND_CPU["share"]
+    _LAND_CPU.update(at=t, busy=float(cur[0]), total=float(cur[1]))
+    if share is not None:
+        _LAND_CPU["share"] = share
+    return share
+
+
 def land_load_per_core(cores: int | None = None) -> float | None:
-    """The 1-minute load average per core, or None where the host does not say (an unknown load admits)."""
+    """The host's measured busy CPU share (land_cpu_busy), else the 1-minute load average per core, or None where the
+    host says neither (an unknown load admits)."""
+    busy = land_cpu_busy()
+    if busy is not None:
+        return busy
     try:
         one = os.getloadavg()[0]
     except (AttributeError, OSError):

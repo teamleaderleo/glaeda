@@ -54,6 +54,7 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -28873,6 +28874,38 @@ class LandTest(Base):
         with mock.patch.object(gg, "land_load_per_core", return_value=None):
             self.assertTrue(self.q.load_room())  # a host that does not say its load admits
         self.q.jobs.clear()
+
+    def test_the_load_line_reads_busy_cpu_not_the_run_queue(self):
+        """huge-blue, 2026-11-22 07:00Z: load 1.11/core over the 0.8 line held 362 lands while a lane VM read
+        0.66/core at 92% idle: loadavg counts threads blocked on IO. Where /proc/stat reads, the line is the busy CPU
+        share since the last sample; before two samples, or with no /proc/stat, the load average stands in."""
+        samples = iter([(100, 1000), (110, 1100), (190, 1200)])
+        clock = iter([0.0, 2.0, 2.5, 5.0])
+        with mock.patch.dict(gg._LAND_CPU, clear=True):
+            read = lambda: next(samples)
+            now = lambda: next(clock)
+            self.assertIsNone(gg.land_cpu_busy(read, now))  # one sample: no share yet
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # 10 busy of 100: 10%, though the load is high
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # within LAND_CPU_SAMPLE_S: reused, not re-read
+            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.8)  # 80 of 100
+        with mock.patch.dict(gg._LAND_CPU, clear=True), \
+                mock.patch.object(gg, "land_cpu_busy", return_value=0.1), \
+                mock.patch.object(gg.os, "getloadavg", return_value=(40.0, 0, 0)):
+            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.1)
+        with mock.patch.object(gg, "land_cpu_busy", return_value=None), \
+                mock.patch.object(gg.os, "getloadavg", return_value=(8.0, 0, 0)):
+            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
+
+    def test_proc_stat_counts_idle_and_iowait_as_not_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "stat")
+            with open(p, "w") as f:
+                f.write("cpu  10 2 3 50 30 1 1 3 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n")
+            self.assertEqual(gg.proc_stat_cpu(p), (20, 100))
+            with open(p, "w") as f:
+                f.write("intr 1 2\n")
+            self.assertIsNone(gg.proc_stat_cpu(p))
+        self.assertIsNone(gg.proc_stat_cpu(os.path.join(d, "gone")))
 
     def test_a_row_one_merge_away_starts_over_the_load_line(self):
         """huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores, busy=1 of workers=12, and green pinned PRs sat "the
