@@ -22641,6 +22641,23 @@ class LandTest(Base):
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
         self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
 
+    def test_land_notify_always_passes_prompt_after_notice_options(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        sent = self.w.sent()[-1]
+        message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
+        self.assertEqual(sent[-2:], [message, message])
+
+    def test_land_notify_uses_parent_session_from_queued_reader(self):
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "", queued_by=
+                        "cosmic-gray/session:6e0bad7d-9798-49c2-8d14-00d3d5ffeb25:agent:helper")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.w.sent()[-1][3], "cosmic-gray/session:6e0bad7d-9798-49c2-8d14-00d3d5ffeb25")
+
     def test_a_queued_prs_head_is_registered_for_land_judge_when_queued_and_when_it_moves(self):
         heads: list[str] = []
         self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,

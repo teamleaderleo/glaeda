@@ -12452,6 +12452,21 @@ def land_requester(given: str | None) -> str:
     return land_requester_from(given)[0]
 
 
+def land_notify_target(e: dict, requester: str) -> str:
+    """Use the queued session's parent when the caller did not record a requester.
+
+    Reader identity adds ``:agent:<name>`` for helper processes, while acpmux
+    resolves the parent session id.  A target that cannot be derived is left
+    empty so notify logs one land-unnotified event instead of retrying a bad
+    destination.
+    """
+    if requester:
+        return requester
+    queued_by = str(e.get("queuedBy") or "")
+    parent = queued_by.split(":agent:", 1)[0]
+    return parent if READER_SAFE.fullmatch(parent) and "/session:" in parent else ""
+
+
 def land_day(at: float) -> str:
     return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%d")
 
@@ -16203,6 +16218,7 @@ class LandQueue:
     def notify(self, e: dict, to: str, message: str) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop."""
+        to = land_notify_target(e, to)
         if not to:
             # Nobody to tell (no --notify, no session in the queuing environment): still never silent.
             log({"event": "land-unnotified", "key": e["key"], "queuedBy": e.get("queuedBy"), "message": message})
@@ -16217,7 +16233,7 @@ class LandQueue:
         title = land_trim(message, 200)
         severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--title", title] + ([message] if title != message else [])
+                "--title", title, message]
 
         def send() -> None:
             got = self.call(argv, LAND_NOTIFY_DEADLINE)
