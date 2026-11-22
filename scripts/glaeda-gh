@@ -18978,7 +18978,29 @@ def land_status_doc(target: str | None) -> dict:
     return {"ok": True, "entries": entries, "steps": land_counts(), "refused": refused if isinstance(refused, dict)
             else None, "queueParked": land_queue_parked(time.time()), "stale": stale if land_stale_fresh(stale, time.time()) else None,
             "stoppedByCause": land_stopped_by_cause(entries),
-            "greenWait": land_green_waits(entries, read_cache, time.time())}
+            "greenWait": land_green_waits(entries, read_cache, time.time()),
+            "pool": land_pool_seen(read_json(land_dir() / LAND_POOL_FILE), time.time())}
+
+
+def land_pool_seen(line: Any, now: float) -> dict | None:
+    """The queue host's last land-pool line (LAND_POOL_FILE) for `land status`, with land.json's fixed size when one is
+    set, or None when it is older than LAND_ROOM_FRESH. A forwarding host prints the executor's (land serve's status
+    answer carries it), never its own: cosmic-gray, 2026-11-22 22:55Z, forwarding to cmux-cp-1, printed "workers 0 busy
+    of 7 (adaptive); load 11.10/core" -- its own Mac's load and a pool.json its last local queue left -- while cmux-cp-1
+    ran 9 jobs of 11 at 0.01/core."""
+    if not isinstance(line, dict):
+        return None
+    at = line.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or now - float(at) > LAND_ROOM_FRESH:
+        return None
+    given = land_config().get("workers")
+    out = {k: line.get(k) for k in ("at", "workers", "busy", "loadPerCore")}
+    out["host"] = policy_host()
+    if given is not None:
+        out["workers"], out["source"] = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX)), "land.json"
+    else:
+        out["source"] = "adaptive"
+    return out
 
 
 def land_stale_fresh(stale: Any, now: float) -> bool:
@@ -19124,10 +19146,12 @@ def land_green_alarm(g: dict | None, host: str, open_rows: int | None = None) ->
     return level, text, {k: g.get(k) for k in ("rows", "judged", "p50S", "p95S", "past", "oldest", "oldestS")}
 
 
-def land_holders_line(entries: list[dict], now: float) -> str:
+def land_holders_line(entries: list[dict], now: float, pool: Any = None) -> str:
     """What holds the land workers now: each judging or acting row (its PR, its step and for how long), the pool's
     ceiling and the host's load per core (reported, not a gate). "" while no row is due and none runs. huge-blue,
-    2026-11-22: `land status` said only "every worker busy" while one worker of 12 ran and the load line held the rest."""
+    2026-11-22: `land status` said only "every worker busy" while one worker of 12 ran and the load line held the rest.
+    POOL is the queue host's land-pool line (land_pool_seen; on a forwarding host, the executor's): its ceiling, its load
+    and its busy count, which also counts a worker re-reading a waiting row (a refresh job), not only judging rows."""
     running = []
     for e in entries:
         if e.get("state") not in ("judging", "acting"):
@@ -19142,17 +19166,27 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     late = sum(1 for e in entries if e.get("dueLate") and e.get("state") in ("queued", "waiting"))
     if not running and not late:
         return ""
-    load = land_load_per_core()
+    busy, where = len(running), ""
+    if isinstance(pool, dict):  # the queue host's own pool line (land_pool_seen)
+        load = pool.get("loadPerCore") if isinstance(pool.get("loadPerCore"), (int, float)) else None
+        size, source = pool.get("workers"), str(pool.get("source") or "adaptive")
+        ceiling = int(size) if isinstance(size, int) and not isinstance(size, bool) else "?"
+        jobs = pool.get("busy")
+        if isinstance(jobs, int) and not isinstance(jobs, bool):
+            busy = max(busy, jobs)
+        where = f" on {pool['host']}" if pool.get("host") else ""
+    else:
+        load = land_load_per_core()
+        given = land_config().get("workers")
+        if given is not None:
+            ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX)), "land.json"
+        else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
+            line = read_json(land_dir() / LAND_POOL_FILE)
+            size = line.get("workers") if isinstance(line, dict) else None
+            ceiling = int(size) if isinstance(size, int) and not isinstance(size, bool) else land_worker_ceiling()
+            source = "adaptive"
     loads = "unknown" if load is None else f"{load:.2f}/core"
-    given = land_config().get("workers")
-    if given is not None:
-        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX)), "land.json"
-    else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
-        line = read_json(land_dir() / LAND_POOL_FILE)
-        size = line.get("workers") if isinstance(line, dict) else None
-        ceiling = int(size) if isinstance(size, int) and not isinstance(size, bool) else land_worker_ceiling()
-        source = "adaptive"
-    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({source})"
+    return (f"glaeda land{where}: workers {busy} busy of {ceiling} ({source})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")
             + f"; load {loads}; {late} due late")
@@ -19209,7 +19243,11 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
               f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
               f"{land_reason(queue.get('reason'), 200)}")
-    holders = land_holders_line(entries, now)
+    pool = doc.get("pool")
+    if executor is not None and not isinstance(pool, dict):
+        # the executor sent no fresh pool line (an older one, or no answer): never this host's own load and pool
+        pool = {"host": doc["executor"], "source": "its pool line unread"}
+    holders = land_holders_line(entries, now, pool)
     if holders:
         print(holders)
     if not target:

@@ -31152,6 +31152,34 @@ class LandTest(Base):
         self.assertIn("1 due late", line)
         self.assertEqual(gg.land_holders_line([rows[3]], time.time()), "")
 
+    def test_land_status_prints_the_queue_hosts_pool_not_the_forwarders(self):
+        """cosmic-gray, 2026-11-22 22:55Z, forwarding to cmux-cp-1: `land status` printed "workers 0 busy of 7
+        (adaptive); load 11.10/core", its own load and a stale local pool.json, while cmux-cp-1 ran 9 jobs of 11 at
+        0.01/core (refresh jobs on waiting rows: no row read "judging"). The line is the queue host's pool line."""
+        rows = [{"key": "pr:o/r#1", "state": "judging", "judging": {"at": time.time() - 60}},
+                {"key": "pr:o/r#3", "state": "waiting", "dueLate": {"since": 1.0, "why": "every worker busy"}}]
+        pool = {"at": time.time(), "workers": 11, "busy": 9, "loadPerCore": 0.0119, "host": "cmux-cp-1",
+                "source": "adaptive"}
+        with mock.patch.object(gg, "land_load_per_core", return_value=11.1), \
+                mock.patch.object(gg, "land_worker_ceiling", return_value=7):
+            line = gg.land_holders_line(rows, time.time(), pool)
+            unread = gg.land_holders_line(rows, time.time(), {"host": "cmux-cp-1", "source": "its pool line unread"})
+        self.assertIn("glaeda land on cmux-cp-1: workers 9 busy of 11 (adaptive): o/r#1 judging", line)
+        self.assertIn("load 0.01/core; 1 due late", line)
+        self.assertIn("workers 1 busy of ? (its pool line unread)", unread)
+        self.assertIn("load unknown", unread)
+
+    def test_land_status_doc_carries_a_fresh_pool_line_only(self):
+        now = time.time()
+        gg.write_json(gg.land_dir() / gg.LAND_POOL_FILE, {"at": now - 10, "workers": 11, "busy": 9,
+                                                          "loadPerCore": 0.01, "due": 3})
+        with mock.patch.object(gg, "land_config", return_value={}):
+            seen = gg.land_pool_seen(gg.read_json(gg.land_dir() / gg.LAND_POOL_FILE), now)
+            self.assertEqual((seen["workers"], seen["busy"], seen["source"]), (11, 9, "adaptive"))
+            self.assertIsNone(gg.land_pool_seen({"at": now - gg.LAND_ROOM_FRESH - 1, "workers": 7}, now))
+        with mock.patch.object(gg, "land_config", return_value={"workers": 4}):
+            self.assertEqual(gg.land_pool_seen({"at": now, "workers": 11, "busy": 2}, now)["source"], "land.json")
+
     def test_login_workers_caps_only_lands_whose_reads_spend_the_login(self):
         # huge-blue, 2026-11-19: workers raised past 4 for the App-pool lands; the login's REST reserve, which landing
         # reads spend down to 0, must be spent no faster, so judgments read on the login keep their own cap.
