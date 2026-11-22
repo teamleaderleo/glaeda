@@ -2344,6 +2344,12 @@ def describe(error: BaseException) -> str:
     return str(error) if isinstance(error, WatchError) else type(error).__name__
 
 
+def describe_at(error: BaseException) -> str:
+    """describe(), and for anything not our own message where it was raised (error_site): values never, the site always."""
+    site = "" if isinstance(error, WatchError) else error_site(error)
+    return f"{describe(error)} at {site}" if site else describe(error)
+
+
 class DeadlineTimeout(TimeoutError):
     """A hard deadline passed (hard_deadline). A TimeoutError, so callers treat it as a slow answer."""
 
@@ -7886,8 +7892,11 @@ class Daemon:
                         self.cut_reads[e["key"]] = cut  # not sent this time: still resumable
                     break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
                 except Exception as error:  # noqa: BLE001
-                    self.errors.append(f"{e['key']}: {describe(error)}")
-                    self.refresh_note("rest", describe(error), key_name(e["key"]), "retry next cycle")
+                    # an error of ours says what failed; anything else names where it was raised, or a TypeError that
+                    # recurs on every REST tick reads as bare "TypeError" with nothing to find it by (2026-11-22)
+                    why = describe_at(error)
+                    self.errors.append(f"{e['key']}: {why}")
+                    self.refresh_note("rest", why, key_name(e["key"]), "retry next cycle")
                 else:
                     stored = read_cache(e["key"]) or {}
                     if stored.get("error") and stored.get("fetchedAt") == self.now:

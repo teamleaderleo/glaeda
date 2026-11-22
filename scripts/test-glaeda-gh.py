@@ -4585,6 +4585,25 @@ class FallbackTest(Base):
         self.assertIsNotNone(head["data"], head.get("error"))
         self.assertNotIn("restOversizedAt", head)
 
+    def test_an_unexpected_rest_read_error_names_where_it_was_raised(self) -> None:
+        """2026-11-21/22, one host: dozens of "rest: TypeError on manaflow-ai/cmux#N; next: retry next cycle" lines, on
+        PRs and heads, with no stack anywhere, so nothing said which line raised it and an offline read of the same PR
+        succeeded. A read that raises something not our own (a TypeError, a KeyError) now names its file, line and
+        function in the refresh line and the tick's errors, never the values; our own WatchError reads as before."""
+        self.force_low()
+        gg.register("pr:o/r#1", waited=True)
+
+        def broken_part(e: dict) -> None:
+            return None + 1  # type: ignore[operator]
+
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=broken_part):
+            self.daemon.tick(NOW)
+        log = (gg.BASE / gg.REFRESH_LOG).read_text()
+        line = next(x for x in log.splitlines() if "rest: TypeError" in x)
+        self.assertRegex(line, r"rest: TypeError at test-glaeda-gh\.py:\d+ broken_part on o/r#1; next: retry next cycle")
+        self.assertTrue(any("TypeError at test-glaeda-gh.py:" in x for x in self.daemon.errors), self.daemon.errors)
+        self.assertEqual(gg.describe_at(gg.WatchError("rest: HTTP 404")), "rest: HTTP 404")
+
     def test_a_write_refused_by_the_secondary_limit_holds_the_reads_too(self) -> None:
         self.daemon.now = NOW
         self.gh.throttle["rest"] = self.SECONDARY
