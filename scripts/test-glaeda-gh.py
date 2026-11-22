@@ -24620,6 +24620,34 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertEqual(self.compares(), [])
 
+    def test_a_lander_merge_over_the_pin_read_from_github_is_followed(self):
+        # hq#18897, gcp-agent-lane-14, 2026-11-22 19:27Z: pinned efbd3106, then cmux-agents-lander[bot]'s "Merge branch
+        # 'main'" 35d328d4 over it stopped head_moved, because PR_FIELDS asked for parents(first: 1) and the cache's
+        # headParents was one entry long, so land_base_merge_parent never saw a merge. Here the read goes through
+        # parse_pr, as the daemon's does, instead of a hand-set headParents.
+        self.assertTrue(all(int(n) >= 2 for n in re.findall(r"parents\(first: (\d+)\)", gg.PR_FIELDS)))
+        node = {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+            "oid": LB, "parents": {"nodes": [{"oid": LA}, {"oid": self.LD}]}}}]}}
+        data = gg.parse_pr(node)
+        self.assertEqual((data["headParents"], data["headParent"]), ([LA, self.LD], LA))
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, data), self.LD)
+        self.pinned_and_waiting()
+        self.base_merged(parents=data["headParents"])
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assert_merged_at(LB)
+
+    def test_a_human_commit_over_the_pin_stops_with_no_compare_read(self):
+        # one parent, the pin: a push on top of what was judged, not a base merge
+        self.pinned_and_waiting()
+        self.base_merged(parents=[LA])
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.compares(), [])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
