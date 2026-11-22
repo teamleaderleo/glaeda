@@ -15985,7 +15985,7 @@ class DarwinStaleTmpScratchTest(unittest.TestCase):
         gd.POLICY["stale_tmp_scratch_hours_macos"] = 0
         self.assertFalse(gd.stale_tmp_enabled())
 
-    def test_a_future_mtime_counts_as_its_ctime(self) -> None:
+    def test_an_mtime_stamped_past_its_ctime_counts_as_its_ctime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp) / "typing-bench"
             (d / "app").mkdir(parents=True)
@@ -15995,6 +15995,7 @@ class DarwinStaleTmpScratchTest(unittest.TestCase):
             os.utime(f, (ahead, ahead))
             newest = gd.deep_newest_mtime(d, ctime=True)
             self.assertLessEqual(newest, time.time() + 1)  # its ctime (the utime just now), not 8 h from now
+            self.assertGreaterEqual(newest, time.time() - 60)  # and a real change (that utime) still counts
             self.assertGreaterEqual(gd.deep_newest_mtime(d), ahead - 1)  # mtime alone still counts it
 
 

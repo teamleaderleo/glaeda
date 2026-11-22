@@ -7595,8 +7595,9 @@ _SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
 
 def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool = False) -> float:
     """The newest mtime of path and everything below it (lstat, never following a link), and with CTIME the newest
-    ctime too, where an mtime in the future counts as that entry's ctime: the kernel's time of the write or utime that
-    set it (cmux16, 2026-11-22: a built app in /private/tmp/typing-bench stamped 8 h ahead read as used 2 h from now).
+    ctime too, where an mtime later than its entry's ctime counts as that ctime: every write and every utime sets ctime
+    to the kernel's clock, so an mtime past it is a stamp, not a use (cmux16, 2026-11-22: a built app in
+    /private/tmp/typing-bench stamped 8 h ahead read as used 2 h from now, then as just used for 8 h more).
     Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it cannot list,
     another filesystem."""
     now = time.time()
@@ -7607,7 +7608,7 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool =
     except OSError:
         return now
     def used(s: os.stat_result) -> float:
-        return s.st_mtime if not ctime else max(s.st_ctime, s.st_mtime if s.st_mtime <= now else s.st_ctime)
+        return s.st_mtime if not ctime else max(s.st_ctime, min(s.st_mtime, s.st_ctime))
     newest, dev = used(st), st.st_dev
     if not stat.S_ISDIR(st.st_mode):
         return newest
