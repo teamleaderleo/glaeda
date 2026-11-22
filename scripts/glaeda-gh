@@ -16600,7 +16600,11 @@ class LandQueue:
             held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
-                          "why": why if why in LAND_JUDGE_WHY else "fp_moved"})
+                          "why": why if why in LAND_JUDGE_WHY else "fp_moved",
+                          # the wait this judgment ended (its kind, and the verdict that set it): "woke" alone does
+                          # not say which wait's timer ran
+                          "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
+                                                               str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
@@ -16846,7 +16850,7 @@ class LandQueue:
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
             log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
                  "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
-                 "why": why or None})
+                 "why": why or None, "from": judging.get("from") or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")

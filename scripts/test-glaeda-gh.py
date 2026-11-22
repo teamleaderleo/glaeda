@@ -25366,6 +25366,20 @@ class LandTest(Base):
                          (self.KEY, "ok", "merge", LA[:12]))
         self.assertIsInstance(judged[0]["took_s"], float)
         self.assertGreaterEqual(judged[0]["took_s"], 0.0)
+        self.assertIsNone(judged[0]["from"])  # its first judgment ended no wait
+
+    def test_a_judgment_logs_the_wait_it_ended(self):
+        # "woke" alone did not say which wait's timer ran (queue host, 2026-11-22: 42 checks_running rows why=woke).
+        self.pr(LA)
+        self.w.answers.append(self.queued_wait(timeout=120))
+        self.land()
+        self.tick()
+        self.w.answers.append(self.queued_wait(timeout=120))
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick(121)
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual([(j["why"], j["from"]) for j in judged], [("woke", "pr:checks_running")], lines)
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
