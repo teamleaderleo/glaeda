@@ -98,6 +98,11 @@ gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
+# Nor trim the Cargo targets of the host running the suite: only a test's own roots are swept.
+_sweep_cargo_targets = gd.sweep_cargo_targets
+gd.sweep_cargo_targets = (lambda receipt, roots=None, *args, **kw:
+                          {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
+                          if roots is None else _sweep_cargo_targets(receipt, roots, *args, **kw))
 # Nor repack the shared mirrors of the host running the suite: only a test's own home's.
 _compact_shared_mirrors = gd.compact_shared_mirrors
 gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
@@ -15884,6 +15889,155 @@ class CensusSudoTest(unittest.TestCase):
         with mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: subprocess.CompletedProcess(
                 argv, 1, stdout="", stderr="sudo: a password is required")):
             self.assertIsNone(gd._census_sudo_du(self.locked, 5))
+
+
+
+class CargoStaleArtifactsTest(unittest.TestCase):
+    """cargo-stale-artifacts: stale units inside a live Cargo target go, the newest per crate stem, open files,
+    build/ and the top-level binaries stay (an agent lane VM, 2026-11-22: a live worktree's target/debug at 137 GiB)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.receipt = self.root / "receipts.jsonl"
+        wt = self.root / ".wt/checkouts/cmux/lane--live/cmux-tui"
+        (wt / "src").mkdir(parents=True)
+        self.target = wt / "target"
+        self.debug = self.target / "debug"
+        for d in ("deps", "incremental", "build/foo-0123456789abcdef/out", ".fingerprint"):
+            (self.debug / d).mkdir(parents=True)
+        (self.target / "CACHEDIR.TAG").write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n")
+        (self.debug / ".cargo-lock").write_text("")
+        self.files: dict[str, Path] = {}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def put(self, rel: str, hours: float, data: bytes = b"x" * 8192) -> Path:
+        p = self.debug / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.name.startswith("s-") or rel.startswith("incremental/") and rel.count("/") == 1:
+            p.mkdir(exist_ok=True)
+            (p / "query-cache.bin").write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p / "query-cache.bin", (when, when))
+            os.utime(p, (when, when))
+        else:
+            p.write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p, (when, when))
+        return p
+
+    def sweep(self, apply: bool = True, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], apply=apply,
+                                          stale_hours=6.0, **kw)
+
+    def fixture(self) -> dict[str, Path]:
+        f = {}
+        # four test binaries of acpmux: the three past the window go, the newest (2h, "recent" below) stays
+        f["old_bin"] = self.put("deps/acpmux-1111111111111111", 30)
+        f["old_bin_d"] = self.put("deps/acpmux-1111111111111111.d", 30)
+        f["mid_bin"] = self.put("deps/acpmux-2222222222222222", 10)
+        f["new_bin"] = self.put("deps/acpmux-3333333333333333", 8)
+        # acpmux's library: one unit, old, but the newest of its stem (lib), so it stays
+        f["lib_rlib"] = self.put("deps/libacpmux-4444444444444444.rlib", 40)
+        f["lib_rmeta"] = self.put("deps/libacpmux-4444444444444444.rmeta", 40)
+        f["lib_d"] = self.put("deps/acpmux-4444444444444444.d", 40)
+        # a stale library unit of serde beside a newer one: the old one goes whole
+        f["serde_old"] = self.put("deps/libserde-5555555555555555.rlib", 20)
+        f["serde_old_meta"] = self.put("deps/libserde-5555555555555555.rmeta", 20)
+        f["serde_new"] = self.put("deps/libserde-6666666666666666.rlib", 1)
+        # the newest acpmux test binary
+        f["recent"] = self.put("deps/acpmux-7777777777777777", 2)
+        # incremental: two old crate dirs of acpmux, the newest stays
+        f["inc_old"] = self.put("incremental/acpmux-1abcdefgh2ij", 30)
+        f["inc_new"] = self.put("incremental/acpmux-3klmnopqr4st", 20)
+        # never touched: build/, the top-level binary, .fingerprint, a name no pattern matches
+        f["build"] = self.put("build/foo-0123456789abcdef/out/gen.rs", 99)
+        f["top"] = self.put("acpmux", 99)
+        f["fingerprint"] = self.put(".fingerprint/acpmux-1111111111111111", 99)
+        f["odd"] = self.put("deps/notes.txt", 99)
+        return f
+
+    def test_stale_units_go_and_the_newest_per_stem_stays(self) -> None:
+        f = self.fixture()
+        res = self.sweep()
+        gone = {n for n, p in f.items() if not p.exists()}
+        self.assertEqual(gone, {"old_bin", "old_bin_d", "mid_bin", "new_bin", "serde_old", "serde_old_meta",
+                                "inc_old"})
+        self.assertEqual((res["targets"], res["units"]), (1, 5))
+        self.assertGreater(res["bytes"], 0)
+        self.assertEqual(list(res["by_target"]), [os.fspath(self.target)])
+        rec = json.loads(self.receipt.read_text().splitlines()[-1])
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.CARGO_STALE_FAMILY, "reclaimed", 5))
+
+    def test_a_used_within_the_window_unit_stays_beside_a_newer_one(self) -> None:
+        f = self.fixture()
+        self.put("deps/acpmux-8888888888888888", 1)  # newest now; "recent" (2h) is inside the 6h window
+        self.sweep()
+        self.assertTrue(f["recent"].exists())
+        self.assertFalse(f["new_bin"].exists())
+
+    def test_a_dry_run_counts_and_removes_nothing(self) -> None:
+        f = self.fixture()
+        res = self.sweep(apply=False)
+        self.assertEqual(res["units"], 5)
+        self.assertTrue(all(p.exists() for p in f.values()))
+        self.assertFalse(self.receipt.exists())
+
+    def test_a_recent_atime_keeps_an_old_unit(self) -> None:
+        f = self.fixture()
+        old = time.time() - 30 * 3600
+        os.utime(f["old_bin"], (time.time(), old))  # read just now (a test run), written long ago
+        self.sweep()
+        self.assertTrue(f["old_bin"].exists())
+        self.assertTrue(f["old_bin_d"].exists(), "a unit goes whole or not at all")
+        self.assertFalse(f["mid_bin"].exists())
+
+    def test_an_open_file_keeps_its_unit(self) -> None:
+        f = self.fixture()
+        with f["mid_bin"].open("rb"):
+            res = self.sweep()
+            self.assertTrue(f["mid_bin"].exists())
+        self.assertEqual(res["kept"].get("open in a process"), 1)
+        self.assertFalse(f["old_bin"].exists())
+
+    def test_a_cargo_build_holding_the_lock_keeps_the_profile(self) -> None:
+        f = self.fixture()
+        with (self.debug / ".cargo-lock").open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            pid = os.fork()
+            if pid == 0:  # another process's flock, as cargo's would be
+                try:
+                    res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=6.0)
+                    os._exit(0 if res["units"] == 0 else 1)
+                except BaseException:
+                    os._exit(2)
+            _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
+
+    def test_targets_are_found_through_wt_checkouts_and_links_are_not_followed(self) -> None:
+        elsewhere = self.root / "elsewhere/target"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "CACHEDIR.TAG").write_text("# This file is a cache directory tag created by cargo.\n")
+        (self.root / ".wt/checkouts/cmux/lane--live/link").symlink_to(elsewhere.parent)
+        found = gd.find_cargo_targets([self.root / ".wt/checkouts"])
+        self.assertEqual(found, [self.target])
+
+    def test_policy_roots_reach_lane_worktrees(self) -> None:
+        self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])
+        self.assertIn(self.root / ".wt/checkouts", gd.cargo_stale_roots(self.root))
+        self.assertEqual(gd.POLICY_DEFAULTS["cargo_stale_hours"], 6.0)
+
+    def test_zero_hours_turns_it_off(self) -> None:
+        f = self.fixture()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=0)
+        self.assertEqual(res["units"], 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
 
 
 if __name__ == "__main__":

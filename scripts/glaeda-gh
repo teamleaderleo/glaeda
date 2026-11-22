@@ -568,6 +568,13 @@ GQL_DOWN_BACKOFF = 60
 GQL_DOWN_MAX = 600
 # GitHub failed the query (a 5xx, or no answer): split and retry, then REST. A 504 or a timeout is SLOW instead.
 GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
+# A 502 or 503 that came only after this long is GitHub giving up on a query past its time budget, not GraphQL down:
+# it is the batch's doing, so it shrinks the batch like a 504 (SLOW) and counts nothing toward GQL_DOWN_AFTER. The
+# broker host, 2026-11-22 04:08Z, the ci-watch App reading cmux PRs (each ~61 KB of checks) with the daemon's own
+# pr_query: 1 PR 4.0 and 5.8 s, 2 PRs 3.1 and 2.4 s, 4 PRs HTTP 502 after 14.1 and 10.9 s, 8 PRs HTTP 502 after 12.2
+# and 15.7 s. The batch sat at 8, every query 502'd, the 502s took GraphQL "down" and every PR went to REST one at a
+# time: 143 PR reads stored in 600 s against ~1,000 waited PRs, waited data 17,794 s old.
+GQL_SLOW_5XX_AFTER = 8.0
 GQL_NO_ANSWER = re.compile(r"request failed: (?!TimeoutError)")  # GQL_DOWN with no answer: REST reads it, unsplit
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
@@ -1272,6 +1279,12 @@ PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus head
                    f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
                    f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
 PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
+# ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
+# cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
+# 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
+# it, so none could be probed: ~1,000 waited PRs needed ~3,500 s of full reads a pass, about 100 PRs were stored per
+# 600 s, and waited PR data reached 16,000 s old. A backlog is now drained by probes, the changed PRs read in full.
+PR_FULL_BEHIND_EVERY = 3600
 PR_WHOLE_EVERY = 1800  # ... and a PR past one page of checks is read whole (pages and all) at least this often
 SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
@@ -2949,6 +2962,22 @@ APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
 APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
 
 
+# A GraphQL NOT_FOUND for a pull request or issue number that does not exist is GitHub's answer for that alias, the same
+# on the login: not the App lacking a permission or repository. Counted as a refusal, one closed-and-deleted PR number
+# in a batch put every batch of that repository set on the login for APP_POOL_ROUTE_REST (an hour), where the login's
+# pace and reserve hold it (the broker host, 2026-11-22: "app-pool-refused ... status 200" at 23:xx, 01:xx and 02:50Z).
+APP_POOL_ANSWERED_NOT_FOUND = re.compile(
+    r"NOT_FOUND Could not resolve to (?:a PullRequest|an Issue|an issue or pull request) with the number of \d+\.?", re.I)
+
+
+def app_graphql_refused(message: str) -> bool:
+    """Whether a 200 GraphQL answer's errors (request's "TYPE message ..." text) say the App may not read it: FORBIDDEN,
+    or a NOT_FOUND other than a missing PR or issue number (a repository the installation does not cover)."""
+    if re.search(r"FORBIDDEN", message):
+        return True
+    return "NOT_FOUND" in APP_POOL_ANSWERED_NOT_FOUND.sub("", message)
+
+
 def app_pool_tool() -> Path | None:
     """gh_app_token.py beside the gh-quota shim's gh_quota.py (leo-workspace tools/), or None."""
     with contextlib.suppress(OSError, RuntimeError):
@@ -3167,7 +3196,7 @@ class AppPool:
             self.why = f"the {self.role} App answered HTTP {status}"
             self.fell_back += 1
             return False
-        if status in {403, 404} or (status == 200 and bool(re.search(r"FORBIDDEN|NOT_FOUND", message))):
+        if status in {403, 404} or (status == 200 and app_graphql_refused(message)):
             self.unreadable[scope] = now + APP_POOL_ROUTE_REST
             self.fell_back += 1
             return False
@@ -8858,15 +8887,16 @@ class Daemon:
             # the login's head and check-page queries filled the minute, and 1,242 PR reads sat deferred behind
             # "42 of 40 points this minute": a waited PR's data was 13,401 s old.
             if not on_app and not self.gql_room(self.gql_expected(kind)):
-                # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
+                # Over the per-minute ceiling: this chunk waits, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
-                self.defer(chunk + [e for c in queue for e in c],
-                           f"the GraphQL pace: {self.gql_minute_points()} of "
-                           f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
+                # Only this chunk: an App-answered chunk queued behind a paced login chunk (an owner with no App, or a
+                # heavy entry read alone) still goes this tick, since the pace is not its to keep.
+                self.defer(chunk, f"the GraphQL pace: {self.gql_minute_points()} of "
+                                  f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
                 self.paced_at[kind] = self.now  # the evidence pace_short needs
-                return to_rest
+                continue
             self.gql_limited = False
             self.gql_reason = kind
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
@@ -9161,12 +9191,17 @@ class Daemon:
 
     def graphql(self, query: str, variables: dict) -> tuple[dict | None, str | None]:
         """(doc, None) or (None, error message). Notes the rateLimit field when the query asks for it."""
+        began = time.monotonic()
         try:
             status, _, doc = self.request("POST", "/graphql", {"query": query, "variables": variables})
         except (WatchError, OSError) as error:  # (a held or timed-out query is not counted: it may not have run)
             message = f"graphql: {describe(error)}"
             self.note_gql_health(message)
             return None, message
+        took = time.monotonic() - began
+        if status in (502, 503) and took >= GQL_SLOW_5XX_AFTER:
+            # past GitHub's time budget (GQL_SLOW_5XX_AFTER): SLOW, so batched() shrinks and splits; not GQL_DOWN
+            return None, f"graphql: timed out (GitHub answered {status} after {took:.1f}s)"
         self.note_gql_health(f"graphql: HTTP {status}" if status >= 500 else None)
         rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
@@ -9517,7 +9552,8 @@ class Daemon:
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
-        (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY, still open, and every
+        (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY (PR_FULL_BEHIND_EVERY while
+        PR reads are behind, pr_behind), still open, and every
         failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
         c = e.get("cache") or {}
         data = c.get("data")
@@ -9525,9 +9561,24 @@ class Daemon:
         return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
                 and c.get("source") != "upstream"
                 and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
-                and isinstance(c.get("fullAt"), (int, float)) and self.now - c["fullAt"] < PR_FULL_EVERY
+                and isinstance(c.get("fullAt"), (int, float))
+                and self.now - c["fullAt"] < (PR_FULL_BEHIND_EVERY if self.pr_behind(c) else PR_FULL_EVERY)
                 and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or [])
                 and not self.rollup_stale(e["key"], c))
+
+    def pr_behind(self, cache: dict) -> bool:
+        """Whether PR reads are behind, so probe_ok lets a probe stand in for a full read up to PR_FULL_BEHIND_EVERY:
+        the last tick deferred a PR read, or this PR's own data is already older than PR_FULL_EVERY (a restarted
+        daemon has no deferral to go by, and its first tick is the longest)."""
+        memo = getattr(self, "pr_deferred_memo", None)
+        if memo is None or memo[0] != self.now or memo[1] is not self.deferred_before:
+            # once a tick: probe_ok asks for every due PR, and a backlog defers about as many
+            memo = self.pr_deferred_memo = (self.now, self.deferred_before,
+                                            any(k.startswith("pr:") for k in self.deferred_before))
+        if memo[2]:
+            return True
+        at = cache.get("dataAt")
+        return isinstance(at, (int, float)) and self.now - at >= PR_FULL_EVERY
 
     def rollup_wanted(self) -> frozenset[str]:
         """The PRs the land queue holds (not done): a full read of one keeps its rollup snapshot. Once per tick."""
@@ -12797,6 +12848,7 @@ class LandQueue:
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pass_load_gated = 0  # ... of them, those the host's measured load held back (load_room)
+        self.pass_load_passed = 0  # rows one merge away load_room started over the line (merge_ready)
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
@@ -13012,7 +13064,7 @@ class LandQueue:
             self.retire_ended()
             self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
-            self.pass_load_gated = 0
+            self.pass_load_gated = self.pass_load_passed = 0
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.log_pool()
             return
@@ -13021,7 +13073,7 @@ class LandQueue:
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
         self.pass_gated, self.pass_first_gated = 0, None
-        self.pass_load_gated = 0
+        self.pass_load_gated = self.pass_load_passed = 0
         self.pass_latch = latch
         self.pass_latched = 0
         self.pass_staggered = 0
@@ -13819,14 +13871,34 @@ class LandQueue:
         this host's cores (land_worker_ceiling), read at each call. Past the first busy worker, load_room decides."""
         return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
 
-    def load_room(self) -> bool:
-        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs), else
-        only while the host's 1-minute load per core is under LAND_LOAD_LINE (an unknown load admits). Counted for the
-        pass's land-pool line ("loadGated")."""
+    def merge_ready(self, e: dict) -> bool:
+        """Whether E is one merge away: judged ok at the head the cache shows with its merge step next (judge_tier 0),
+        or the cache shows its PR open, CLEAN and with no check running at the head it is pinned to (any head when
+        unpinned). Its judgment is a short explain and the pinned merge, and it ends the row."""
+        if self.judge_tier(e) == 0:
+            return True
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        head = str(data.get("headRefOid") or "").lower()
+        pin = str(e.get("pinSha") or "").lower()
+        return bool(head) and (not pin or pin == head) and data.get("state") == "OPEN" \
+            and data.get("mergeStateStatus") == "CLEAN" and not land_checks_running(data, head)
+
+    def load_room(self, e: dict | None = None) -> bool:
+        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs) or when
+        E is one merge away (merge_ready), else only while the host's 1-minute load per core is under LAND_LOAD_LINE
+        (an unknown load admits). Counted for the pass's land-pool line ("loadGated", "loadPassed").
+        The line holds back judgments that may run a full land_judge explain with its reads; a green, clean row's
+        judgment is one explain and one `gh pr merge`, and every minute it waits its PR re-runs CI on each base push.
+        huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores (0.9/core, mostly the broker, acpmux, reviews and suites),
+        busy=1 of workers=12, and green pinned PRs (cmuxterm-hq#17398: waited=9168 s) sat "over the line" until merged
+        by hand; 7 merges that day against 998 in the 7 days before."""
         if not self.jobs:
             return True
         load = land_load_per_core()
         if load is None or load < LAND_LOAD_LINE:
+            return True
+        if e is not None and self.merge_ready(e):
+            self.pass_load_passed += 1
             return True
         self.pass_load_gated += 1
         return False
@@ -13860,9 +13932,17 @@ class LandQueue:
             self.pass_first_gated = e["key"]
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
-            e["dueLate"] = {"at": self.now, "since": self.due_since(e)}
+            load = land_load_per_core()
+            e["dueLate"] = {"at": self.now, "since": self.due_since(e), "why": why, "workers": self.workers(),
+                            "busy": len(self.jobs), "loadPerCore": None if load is None else round(load, 2)}
             self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
-                         workers=self.workers(), busy=len(self.jobs), loadPerCore=land_load_per_core())
+                         workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
+                         holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
+            self.save(e)
+        elif (dl := e.get("dueLate")) and dl.get("why") != why:
+            dl.update(why=why, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
+            load = land_load_per_core()
+            dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
 
     def log_pool(self) -> None:
@@ -13897,7 +13977,8 @@ class LandQueue:
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
-             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated, "busy": len(running),
+             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated,
+             "loadPassed": self.pass_load_passed, "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
@@ -14768,7 +14849,7 @@ class LandQueue:
         if not self.reread_room(e):
             self.gated(e, "re-reads of unreadable PRs hold their share of the workers")  # LAND_REREAD_SHARE
             return False
-        if not self.load_room():
+        if not self.load_room(e):
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e):
@@ -16242,7 +16323,13 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         # one host, 2026-11-21 12:08Z, 3 of them on rows whose next wake was past the park's own end).
         bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
-        bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
+        dl = e["dueLate"]
+        why = str(dl.get("why") or "every worker busy")
+        if isinstance(dl.get("busy"), int) and isinstance(dl.get("workers"), int):
+            why += f" (busy {dl['busy']} of {dl['workers']}"
+            why += f", load {dl['loadPerCore']}/core, line {LAND_LOAD_LINE})" \
+                if isinstance(dl.get("loadPerCore"), (int, float)) else ")"
+        bits.append(f"due since {utc_clock(float(dl.get('since') or 0))}: {why}")
     took = (e.get("judging") or {}).get("at") if e["state"] == "judging" else \
         (e.get("action") or {}).get("claimedAt") if e["state"] == "acting" else None
     if isinstance(took, (int, float)) and not isinstance(took, bool) and now - took >= LAND_SLOT_HELD:
@@ -16345,6 +16432,34 @@ def land_latch_note(note: dict) -> str:
     return f"glaeda land: {mark} holds ({why})"
 
 
+def land_holders_line(entries: list[dict], now: float) -> str:
+    """What holds the land workers now: each judging or acting row (its PR, its step and for how long), the pool's
+    ceiling and the host's load per core against LAND_LOAD_LINE. "" while no row is due and none runs. huge-blue,
+    2026-11-22: `land status` said only "every worker busy" while one worker of 12 ran and the load line held the rest."""
+    running = []
+    for e in entries:
+        if e.get("state") not in ("judging", "acting"):
+            continue
+        if e["state"] == "acting":
+            a = e.get("action") or {}
+            step, at = f"acting {a.get('kind') or '?'}", a.get("claimedAt")
+        else:
+            step, at = "judging", (e.get("judging") or {}).get("at")
+        since = f" started {age(float(at))}" if isinstance(at, (int, float)) and not isinstance(at, bool) else ""
+        running.append(f"{key_name(e['key'])} {step}{since}")
+    late = sum(1 for e in entries if e.get("dueLate") and e.get("state") in ("queued", "waiting"))
+    if not running and not late:
+        return ""
+    load = land_load_per_core()
+    loads = "unknown" if load is None else f"{load:.2f}/core"
+    given = land_config().get("workers")
+    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
+            + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
+               if running else "")
+            + f"; load {loads}, line {LAND_LOAD_LINE} (a row one merge away starts over it); {late} due late")
+
+
 def cmd_land_status(target: str | None, as_json: bool) -> int:
     doc = land_status_doc(target)
     executor = land_executor()
@@ -16396,6 +16511,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
               f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
               f"{land_reason(queue.get('reason'), 200)}")
+    holders = land_holders_line(entries, now)
+    if holders:
+        print(holders)
     for e in entries:
         print(land_line(e, now, latch, queue))
         if target:
