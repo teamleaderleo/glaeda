@@ -268,6 +268,7 @@ def disk_low_turn(capacity_dir: Path, worker: int, lock_wait_s: float | None = N
     remaining budget). Returns the refusal, or None (admitted, marker written)."""
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
         lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return f"cannot open the disk ledger ({type(error).__name__})"
@@ -361,6 +362,53 @@ PREJOB_POLL_S = 1.0
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
 HOST_LOCK = f"{FLEET_DIR}/host.lock"
+# SHARED_FLEET (POOL_USER, cmuxterm-hq#18007): on a member whose pool runners run as their own account (runner.poolUser)
+# two accounts share FLEET_DIR's host lock and capacity ledger: the member user's controller worker and the pool
+# account's hooks, through a group the host provisions (cmuxfleet, never staff). Every ledger lock is an O_RDONLY open
+# plus flock, which group read allows; creating, replacing and unlinking markers needs group write on the directory,
+# and job-completed's media cleanup opens host.lock O_RDWR. So what the hook creates there gets group write (never
+# other write) whatever its umask: a directory it made (capacity/) g+rwx, host.lock g+rw. Only a path this account owns,
+# under FLEET_DIR, whose group is neither staff nor everyone (every account is in those: group write there would hand
+# the ledger to any local user).
+SHARED_GROUP_EXCLUDED = frozenset({12, 20})  # everyone, staff
+
+
+def _shareable(st: os.stat_result, path: str) -> bool:
+    fleet = os.path.realpath(FLEET_DIR)
+    real = os.path.realpath(path)
+    return (st.st_uid == os.getuid() and st.st_gid not in SHARED_GROUP_EXCLUDED and not stat.S_ISLNK(st.st_mode)
+            and (real == fleet or real.startswith(fleet + os.sep)))
+
+
+def share_fleet_path(path: Path | str) -> bool:
+    """SHARED_FLEET: add group write (and search, for a directory) to a FLEET_DIR path this account owns. Best
+    effort: True when the mode now has it, False when it was not ours to change or could not be."""
+    try:
+        st = os.lstat(path)
+        if not _shareable(st, os.fspath(path)):
+            return False
+        want = st.st_mode & 0o7777 | (0o070 if stat.S_ISDIR(st.st_mode) else 0o060)
+        if want != st.st_mode & 0o7777:
+            os.chmod(path, want)
+        return True
+    except OSError:
+        return False
+
+
+def share_fleet_fd(fd: int, path: Path | str) -> bool:
+    """share_fleet_path for a file this process holds open (fchmod: no race with a rename of the path)."""
+    try:
+        st = os.fstat(fd)
+        if not _shareable(st, os.fspath(path)):
+            return False
+        want = st.st_mode & 0o7777 | 0o060
+        if want != st.st_mode & 0o7777:
+            os.fchmod(fd, want)
+        return True
+    except OSError:
+        return False
+
+
 RESERVATION = f"{FLEET_DIR}/reservation.json"
 HOLDER_FILE = "host-lock-holder"
 HOLDER_POLL_S = 2.0
@@ -3721,6 +3769,26 @@ def _probe_answer(argv: list[str], env: dict[str, str], cwd: Path, deadline: flo
     return (out.stdout.strip() if out.returncode == 0 else ""), False
 
 
+# NODE_VIEW (POOL_USER, cmuxterm-hq#18007): a pool runner in its own account (the member's runner.poolUser) cannot read
+# the member user's home, where the node's enrollment, class receipts and Glaeda generations live. glaeda-cmux-runner-fleet
+# --apply publishes a copy as the member user under FLEET_DIR/pool-node (cmux-fleet/ and glaeda-generations/<c12>/,
+# owned by that user, readable and never writable by the pool account), and the runner's LaunchAgent names it in
+# GLAEDA_NODE_VIEW. The checks are the same: the receipt still has to validate under its generation's validator, the
+# enrollment still has to reference it and the toolchain strings are still probed on this account's own job PATH.
+NODE_VIEW_ENV = "GLAEDA_NODE_VIEW"
+
+
+def node_paths(home: Path) -> tuple[Path, Path]:
+    """(the cmux-fleet config directory, the glaeda-generations directory) this runner's eligibility reads: the
+    NODE_VIEW when GLAEDA_NODE_VIEW names one, else this account's own ~/.config/glaeda/cmux-fleet (XDG_CONFIG_HOME)
+    and ~/Projects/glaeda-generations."""
+    view = os.environ.get(NODE_VIEW_ENV)
+    if view:
+        return Path(view) / "cmux-fleet", Path(view) / "glaeda-generations"
+    return (Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet",
+            home / "Projects" / "glaeda-generations")
+
+
 def node_refusal(fleet_class: str | None) -> tuple[str | None, dict[str, Any]]:
     """(why this node is not an eligible fleet node, {}) or (None, its class receipt's toolchain). No effects."""
     why, want, _timed_out = node_answer(fleet_class)
@@ -3734,7 +3802,7 @@ def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bo
     load ~275 read "does not validate" while the same validator said `valid` in 0.08 s by hand)."""
     home = Path.home()
     deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
-    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
+    config, generations = node_paths(home)
     if not fleet_class:
         return "node not eligible (no fleet class configured for this runner)", {}, False
     receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
@@ -3751,7 +3819,7 @@ def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bo
                  .get("commit") or "")
     if not re.fullmatch(r"[0-9a-f]{12,40}", commit):
         return "node not eligible (the class receipt names no Glaeda candidate)", {}, False
-    generation = home / "Projects" / "glaeda-generations" / commit[:12]
+    generation = generations / commit[:12]
     if not generation.is_dir():
         return f"node not eligible (no node status from generation {commit[:12]})", {}, False
     # The receipt's own sha is a claim; the generation's validator recomputes it from the content.
@@ -4861,6 +4929,7 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
     since, done, writing = time.time(), threading.Event(), threading.Lock()
     with contextlib.suppress(OSError):
         capacity_dir.mkdir(parents=True, exist_ok=True)
+    share_fleet_path(capacity_dir)
     write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
 
     def refresh() -> None:
@@ -7063,6 +7132,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
         admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return False, f"cannot open the capacity ledger ({type(error).__name__})"
@@ -7108,6 +7178,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if klass != GATEWAY_CLASS and os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+            share_fleet_fd(fd, host_lock)  # SHARED_FLEET: the other account's job-completed opens it O_RDWR
             for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it
                 try:
                     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
