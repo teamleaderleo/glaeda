@@ -12207,9 +12207,63 @@ def land_room(pool: Any, now: float) -> int:
         return 0
 
 
-def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
-                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
-    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError."""
+# The redirect: an executor that forwards its own lands names where. 2026-11-22 17:16-17:32Z: the executor's land.json
+# named an executor of its own (a cutover to a new host), so its `land serve` answered not_executor to every host
+# forwarding to it; one forwarder's outbox grew 4 -> 12 requests over 18 min, each retry backing off, with one warn
+# notice that named the next host as "-o" (land_forward_name read ssh's first option as the host). Now `land serve`'s
+# not_executor answer carries "executor": the host it forwards to, and a forwarder whose command is `reach HOST ...`
+# or `ssh ... HOST ...` sends the same request there, once (LAND_REDIRECT_HOPS: the far host's answer is final, so
+# two hosts never pass a request back and forth, and a host never redirects to itself). Every redirect says so (a
+# land-forward-redirected notice naming both hosts and the land.json to fix); a refusal with no usable redirect is a
+# "fire" notice at once, since a config that points at a non-executor never heals by retrying.
+LAND_REDIRECT_HOPS = 1
+LAND_HOST_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+# ssh's options that take a value (ssh(1)): their value is never the host
+SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+class LandNotExecutor(WatchError):
+    """The far host's `land serve` refused: it forwards its own lands (to REDIRECT, a host name, when it said one)."""
+
+    def __init__(self, text: str, redirect: str = "") -> None:
+        super().__init__(text)
+        self.redirect = redirect
+
+
+def land_command_host(command: list[str]) -> int | None:
+    """The index of the host word in COMMAND (`reach HOST ...`, `ssh [OPTIONS] HOST ...`), or None for another
+    program."""
+    if not command or Path(command[0]).name not in ("reach", "ssh"):
+        return None
+    i = 1
+    while i < len(command):
+        word = command[i]
+        if word == "--":
+            return i + 1 if i + 1 < len(command) else None
+        if word.startswith("-") and len(word) > 1:
+            # -o VALUE, or -oVALUE / a cluster of flags with no value
+            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
+                i += 2
+            else:
+                i += 1
+            continue
+        return i
+    return None
+
+
+def land_redirected(command: list[str], host: Any) -> list[str] | None:
+    """COMMAND aimed at HOST instead (the host word replaced), or None: no host word, HOST not a host name, the same
+    host, or this host itself."""
+    i = land_command_host(command)
+    if i is None or not isinstance(host, str) or not LAND_HOST_SHAPE.fullmatch(host):
+        return None
+    if host in (command[i], policy_host()):
+        return None
+    return [*command[:i], host, *command[i + 1:]]
+
+
+def land_forward_once(command: list[str], request: dict, deadline: float,
+                      run: Callable[..., subprocess.CompletedProcess] | None) -> dict:
     exe = program_path(command[0])
     try:
         result = (run or run_bounded)([exe, *command[1:]], deadline, input_text=json.dumps(request) + "\n")
@@ -12225,15 +12279,44 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
     if not isinstance(answer, dict):
         tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
         raise WatchError(f"land executor: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
-    if not answer.get("ok") and answer.get("code") in ("not_executor", "bad_request"):
+    if not answer.get("ok") and answer.get("code") == "not_executor":
+        to = answer.get("executor") if isinstance(answer.get("executor"), str) else ""
+        raise LandNotExecutor(f"land executor: not_executor: {land_trim(answer.get('reason'), 200)}", to)
+    if not answer.get("ok") and answer.get("code") == "bad_request":
         raise WatchError(f"land executor: {answer.get('code')}: {land_trim(answer.get('reason'), 200)}")
     return answer
 
 
+def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
+                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
+    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError.
+    An executor that forwards its own lands (not_executor) and names where gets the request sent there, at most
+    LAND_REDIRECT_HOPS times (LAND_REDIRECT_HOPS's comment); the answer then carries "redirectedTo", that host."""
+    hops: list[str] = []
+    while True:
+        try:
+            answer = land_forward_once(command, request, deadline, run)
+        except LandNotExecutor as error:
+            target = land_redirected(command, error.redirect) if len(hops) < LAND_REDIRECT_HOPS else None
+            if target is None or error.redirect in hops:
+                via = f" (redirected from {land_forward_name(command)} via {', '.join(hops)})" if hops else ""
+                raise LandNotExecutor(f"{error}{via}", error.redirect) from None
+            log({"event": "land-forward-redirect", "from": land_forward_name(command), "to": error.redirect,
+                 "op": request.get("op")})
+            hops.append(error.redirect)
+            command = target
+            continue
+        if hops:
+            answer["redirectedTo"] = hops[-1]
+        return answer
+
+
 def land_forward_name(command: list[str]) -> str:
-    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
-    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
-        return command[1]
+    """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
+    words."""
+    i = land_command_host(command)
+    if i is not None:
+        return command[i]
     return " ".join(command)[:120]
 
 
@@ -14169,6 +14252,8 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
+        self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
         self.overflow_after = float("-inf")
@@ -14641,6 +14726,18 @@ class LandQueue:
                                                    daemon=True)
             self.forward_thread.start()
 
+    def forward_redirected(self, name: str, to: str) -> None:
+        """A forward EXECUTOR NAME refused went on to TO (land_forward): said once per pair, so the land.json that
+        names NAME gets fixed."""
+        if (name, to) in self.forward_redirects:
+            return
+        self.forward_redirects.add((name, to))
+        with contextlib.suppress(Exception):
+            self.notice("land-forward-redirected", "warn", f"glaeda land on {policy_host()}: its executor {name} "
+                        f"forwards its lands to {to}, so this host's requests go to {to}; point "
+                        f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at {to}",
+                        {"executor": name, "to": to})
+
     def forward_batch(self) -> tuple[list[dict], list[tuple[str, Path]], list[tuple[str, int]]]:
         """(the requests to send, (id, file) of each from requests/, (key, gen) of each entry handed off): the entries
         open here first (none whose step still runs), then requests/ in order, at most LAND_FORWARD_BATCH."""
@@ -14777,6 +14874,9 @@ class LandQueue:
                                   LAND_FORWARD_DEADLINE)
             if not answer.get("ok"):
                 raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+            if isinstance(answer.get("redirectedTo"), str):
+                self.forward_redirected(name, answer["redirectedTo"])
+                name = answer["redirectedTo"]
             accepted = {str(a) for a in answer.get("accepted") or []}
             refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
                        if isinstance(r, dict) and r.get("id")}
@@ -14791,6 +14891,14 @@ class LandQueue:
                                                             "at": self.now, "pending": len(batch),
                                                             "retryAt": self.forward_after})
             log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
+            if isinstance(error, LandNotExecutor) and not self.forward_misrouted:
+                # never heals by retrying: land.json names a host that executes nothing (LAND_REDIRECT_HOPS)
+                self.forward_misrouted = True
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-misrouted", "fire", f"glaeda land on {policy_host()}: its executor "
+                                f"{name} executes no lands ({why}); {len(batch)} request(s) wait here. Point "
+                                f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at the live executor",
+                                {"executor": name, "error": why, "pending": len(batch)})
             if self.forward_fails == 1:
                 with contextlib.suppress(Exception):
                     self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(batch)} request(s) "
@@ -14800,6 +14908,7 @@ class LandQueue:
         with self.lock:
             self.sending = set()
             self.forward_fails = 0
+            self.forward_misrouted = False
             self.forward_after = float("-inf")
             for rid, path in files:
                 if rid in accepted:
@@ -19338,7 +19447,8 @@ def cmd_land_serve(text: str) -> int:
     executor = land_executor()
     if executor is not None:
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
+                          f"{land_forward_name(executor)} (land.json executor); it serves none",
+                          "executor": land_forward_name(executor)}))
         return EXIT_FAIL
     op = req["op"]
     if op == "room":
