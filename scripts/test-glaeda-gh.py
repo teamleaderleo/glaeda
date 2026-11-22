@@ -29055,6 +29055,8 @@ class LandTest(Base):
         with mock.patch.object(gg, "land_load_per_core", return_value=0.48), \
                 mock.patch.object(self.q, "window_room", side_effect=capped):
             e = self.tick(1)
+            self.assertEqual(e["dueLate"]["why"], "the host's load is over the line")  # LAND_LATE_WHY_EVERY
+            e = self.tick(gg.LAND_LATE_WHY_EVERY)
         self.assertEqual(e["dueLate"]["why"], "the login's quota pace (graphql)")
         self.assertNotIn("over the line", gg.land_line(e, self.t, latch=None))
         self.q.jobs.clear()

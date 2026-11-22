@@ -12235,6 +12235,7 @@ LAND_WINDOW_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
+LAND_LATE_WHY_EVERY = 60.0  # a due-late row's reason is rewritten at most this often (note_late)
 # A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
 # ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
 # slot held past it is seen where it is held, not only as a due count growing behind it. A lane VM,
@@ -14309,8 +14310,11 @@ class LandQueue:
                          workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
                          holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
             self.save(e)
-        elif (dl := e.get("dueLate")) and dl.get("why") != why:
-            dl.update(why=why, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
+        elif (dl := e.get("dueLate")) and dl.get("why") != why \
+                and self.now - float(dl.get("whyAt") or dl.get("at") or 0) >= LAND_LATE_WHY_EVERY:
+            # at most once per LAND_LATE_WHY_EVERY: a row whose gate flips each 2 s pass (a worker frees, a head read
+            # is asked) would rewrite its file every pass, ~450 rows at once in the 07:25Z queue
+            dl.update(why=why, whyAt=self.now, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
             load = land_load_per_core()
             dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
@@ -14464,8 +14468,9 @@ class LandQueue:
         e.pop("cacheOnlyJudge", None)
         e.pop("paceNext", None)
         first = e.pop("unreadCacheFirst", None)
-        if self.latch_free(e):
-            # Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
+        if self.latch_free(e) and not self.broker_client():
+            # (A broker client's latch-free owner has its REST reads answered by the broker's read App, its GraphQL by
+            # the login: paced as before.) Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
             # login this pace spreads: neither paced nor charged here, as the login's latch already does not hold it
             # (latch_free). huge-blue, 2026-11-22 07:12-07:25Z: load 0.56-0.65/core, 12 workers, busy 1-2, capped
             # 243-268 rows a pass, dueLate 425 -> 520 in 13 min: manaflow-ai rows waited on slots of the login's
@@ -14511,7 +14516,7 @@ class LandQueue:
         """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk; a cache-only judgment
         (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
-        if self.latch_free(e):  # read on the lander App pools: the login's window is not charged (window_room)
+        if self.latch_free(e) and not self.broker_client():  # read on the lander App pools: the login's window is not charged (window_room)
             e.pop("windowCapped", None)
             return
         if not isinstance(e.get("cacheOnlyJudge"), float):  # a pace slot's cache-only judgment sends nothing
