@@ -489,8 +489,11 @@ REACH_CMD = os.environ.get("GLAEDA_GH_REACH_CMD") or os.fspath(Path.home() / ".l
 LANE_GH_CMD = os.environ.get("GLAEDA_GH_LANE_GH_CMD") or os.fspath(Path.home() / ".local/bin/lane-gh")
 SPEND_VIEW_REPO = "manaflow-ai/cmuxterm-hq"
 SPEND_VIEW_TOP = 15
-# The calls gh-quota keeps back from every caller but lands (leo-workspace machines/gh-quota.json hard_reserve_calls,
-# {"rest": N, "graphql": N}); this default until the policy names it.
+# The calls gh-quota keeps back from every caller, lands included (leo-workspace machines/gh-quota.json
+# hard_reserve_calls, {"rest": N, "graphql": N}: "Calls per pool no agent caller ever spends, merges, landing writes and
+# merge preflights included"); this default until the policy names it. It is Leo's own share of the shared login, not
+# headroom a land may take: a land paced out with points still left (pace_next's spent case, "55 left" at a reserve of
+# 500) is this reserve holding it and is correct, so the lines that report it say which (land_line, host_cap_why).
 HARD_RESERVE_DEFAULT = {"rest": 500, "graphql": 500}
 # How fast one host spends the shared login: leo-workspace machines/gh-quota.json, read by tools/gh_pace.py for the gh
 # shim and here for the daemon and the land queue (the lane-gh broker reads the same keys). 2026-11-17: the login's REST
@@ -15437,7 +15440,8 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
     elif (e.get("windowCapped") or {}) and e["state"] in ("queued", "waiting") \
             and float(e["windowCapped"].get("next") or 0) > now:
         wc = e["windowCapped"]
-        left = f": {int(wc['remaining'])} left, resets {time.strftime('%H:%MZ', time.gmtime(float(wc['reset'])))}" \
+        left = f": {int(wc['remaining'])} left{host_cap_why(str(wc.get('pool')), wc.get('remaining'))}, resets " \
+            f"{time.strftime('%H:%MZ', time.gmtime(float(wc['reset'])))}" \
             if isinstance(wc.get("remaining"), (int, float)) and not isinstance(wc.get("remaining"), bool) \
             and isinstance(wc.get("reset"), (int, float)) else ""
         bits.append(f"not judged this window: host cap ({wc.get('pool')}{left}; next slot "
@@ -20193,6 +20197,24 @@ def hard_reserve_floor() -> dict:
     named = hard_reserve()
     return {pool: max(default, named.get(pool, default) if isinstance(named.get(pool), int) else default)
             for pool, default in HARD_RESERVE_DEFAULT.items()}
+
+
+def host_cap_why(pool: str, remaining: float | int | None) -> str:
+    """Why POOL's pace left a land out, when the login's live count is REMAINING: the words that say whether the pool
+    itself is spent or Leo's reserve is what is left. "host cap (graphql: 55 left)" reads as a pool with room and a
+    queue that will not use it; the 55 are under hard_reserve_floor's 500, which no agent caller spends (its comment),
+    so the pace is right and only the line was missing its reason. Measured 2026-11-22 00:04Z: teamleaderleo/glaeda#2411
+    sat "host cap (graphql: 55 left, resets 00:38Z)" and reading the pace to find out why cost four calls. Empty when
+    the pool has spendable room (another pool, or the per-judgment cost, is what held it)."""
+    if not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+        return ""
+    floor = hard_reserve_floor().get(pool)
+    cost = LAND_JUDGE_COST.get(pool)
+    if floor is None or cost is None:
+        return ""
+    if float(remaining) - float(floor) < float(cost):
+        return f", all of it under the {floor}-point reserve no caller spends"
+    return ""
 
 
 def quota_policy_path() -> Path:

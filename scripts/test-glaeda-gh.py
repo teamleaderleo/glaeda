@@ -25692,6 +25692,26 @@ class LandTest(Base):
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap (graphql:", gg.land_line(capped[0], self.t, latch=None))
 
+    def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
+        """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
+        The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the
+        line was missing its reason. teamleaderleo/glaeda#2411, 2026-11-22 00:04Z: finding that out cost four calls.
+        Above the reserve the pool itself is not why, and the line says nothing extra."""
+        floor = gg.hard_reserve_floor()["graphql"]
+        cost = gg.LAND_JUDGE_COST["graphql"]
+        self.assertIn(f"{floor}-point reserve", gg.host_cap_why("graphql", floor - 1))
+        self.assertIn(f"{floor}-point reserve", gg.host_cap_why("graphql", floor + cost - 1))
+        self.assertEqual(gg.host_cap_why("graphql", floor + cost), "")
+        self.assertEqual(gg.host_cap_why("graphql", None), "")
+        self.assertEqual(gg.host_cap_why("nosuchpool", floor - 1), "")
+        e = {"key": "pr:o/r#9", "repo": "o/r", "number": 9, "state": "waiting",
+             "windowCapped": {"pool": "graphql", "next": self.t + 600, "remaining": floor - 445,
+                              "reset": self.t + 600}}
+        line = gg.land_line(e, self.t, latch=None)
+        self.assertIn(f"host cap (graphql: {floor - 445} left, all of it under the {floor}-point reserve", line)
+        e["windowCapped"]["remaining"] = floor + 400
+        self.assertIn(f"host cap (graphql: {floor + 400} left, resets", gg.land_line(e, self.t, latch=None))
+
     def test_a_pool_with_no_reading_is_not_paced(self):
         """A broker client (gcp-agent-lane-1) reads no /rate_limit of its own: an unknown count is no fixed share
         either (missing-read-counted-as-a-value.md), so its judgments are not held by the pace; the latch, the quota
