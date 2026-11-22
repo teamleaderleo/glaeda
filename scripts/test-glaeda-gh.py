@@ -25467,6 +25467,20 @@ class LandTest(Base):
                          (self.KEY, "ok", "merge", LA[:12]))
         self.assertIsInstance(judged[0]["took_s"], float)
         self.assertGreaterEqual(judged[0]["took_s"], 0.0)
+        self.assertIsNone(judged[0]["from"])  # its first judgment ended no wait
+
+    def test_a_judgment_logs_the_wait_it_ended(self):
+        # "woke" alone did not say which wait's timer ran (queue host, 2026-11-22: 42 checks_running rows why=woke).
+        self.pr(LA)
+        self.w.answers.append(self.queued_wait(timeout=120))
+        self.land()
+        self.tick()
+        self.w.answers.append(self.queued_wait(timeout=120))
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick(121)
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual([(j["why"], j["from"]) for j in judged], [("woke", "pr:checks_running")], lines)
 
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
@@ -28958,6 +28972,31 @@ class LandTest(Base):
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(1)
         self.assertEqual(len(self.w.judgments()), 3)
+
+    def test_a_checks_running_waits_timer_is_held_while_the_feed_is_quiet(self):
+        """Queue host, 2026-11-22: 42 of 141 checks_running judgments were the wait's own timer answering
+        checks_running again. With no event for the PR since the verdict the timer asks nothing; the next event
+        judges at once, LAND_FEED_QUIET_MAX bounds the hold, and any other wait's timeout judges as always."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        for _ in range(5):
+            e = self.tick(121)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertIn("feed_quiet", [h.get("event") for h in e["history"]])
+        events.append(self.t)
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(gg.LAND_FEED_QUIET_MAX)  # the bound: judged
+        self.assertEqual(len(self.w.judgments()), 3)
+        self.w.answers.append(refusal("ws_check_missing", LA, wait))
+        self.tick(121)  # not a checks_running wait: its timeout judges
+        self.assertEqual(len(self.w.judgments()), 4)
 
     def test_a_feed_held_wait_is_judged_past_the_bound(self):
         self.feed()

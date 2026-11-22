@@ -12721,6 +12721,13 @@ LAND_VERDICT_KEEP = 600.0
 # base moving under a green head, mergeability, a PR merged or closed) is judged at most this late. A feed that is
 # down, reset, switched or not covering the repository holds nothing: every path reads as before.
 LAND_FEED_QUIET_MAX = 1800.0
+# The wait verdicts whose own timeout does not re-run land_judge either while the feed is quiet since them: what they
+# wait for (checks finishing at the head) reaches the feed as a run or suite event, which is judged at once. Queue
+# host, 2026-11-22 17:35-18:25Z: 42 of 141 checks_running judgments were a wait_pr's timer (why=woke) answering
+# checks_running again, a share of the 13,770 worker-seconds that code held. Still bounded by LAND_FEED_QUIET_MAX from
+# the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
+# never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
+LAND_TIMER_HELD = frozenset({"checks_running"})
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -16238,6 +16245,9 @@ class LandQueue:
         if woke or fp != e.get("seen") or reran:
             if not woke and not reran and (self.verdict_holds(e, c, head, fp) or self.feed_holds(e, head)):
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
+            if woke and not reran and (e.get("feedVerdict") or {}).get("code") in LAND_TIMER_HELD \
+                    and self.feed_holds(e, head):
+                return  # the wait's timer, with no check event since the verdict: the same answer (LAND_TIMER_HELD)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke, why="woke" if woke else ("reran" if reran else "fp_moved"))
@@ -16844,7 +16854,11 @@ class LandQueue:
             held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
-                          "why": why if why in LAND_JUDGE_WHY else "fp_moved"})
+                          "why": why if why in LAND_JUDGE_WHY else "fp_moved",
+                          # the wait this judgment ended (its kind, and the verdict that set it): "woke" alone does
+                          # not say which wait's timer ran
+                          "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
+                                                               str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
@@ -17098,7 +17112,7 @@ class LandQueue:
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
             log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
                  "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
-                 "why": why or None})
+                 "why": why or None, "from": judging.get("from") or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
