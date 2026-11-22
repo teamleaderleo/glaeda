@@ -30557,6 +30557,37 @@ class AppPoolTest(Base):
         self.assertIn("pr:o/r#1", self.daemon.deferred)
         self.assertEqual(self.daemon.deferred & set(app_keys), set())
 
+    def test_a_paced_login_chunk_defers_only_itself(self) -> None:
+        """A chunk the login's pace holds (an owner with no App) waits alone: the App-answered chunks queued behind it
+        are read this tick, since the login's pace is not theirs to keep."""
+        self.daemon.gql_log = [(self.daemon.clock() - 5, "head", 42)]
+        self.assertFalse(self.daemon.gql_room(1), "the login's minute is spent")
+        keys = ["pr:other/r#1"] + [f"pr:manaflow-ai/cmux#{i}" for i in range(1, 13)]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        entries[0]["waitedAt"] = NOW  # waited: its chunk goes first in the queue
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 10
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys[1:]), "every App chunk read")
+        self.assertIn("pr:other/r#1", self.daemon.deferred)
+        self.assertFalse(self.daemon.deferred & set(keys[1:]))
+
+    def test_a_missing_pr_number_is_the_apps_answer_not_a_refusal(self) -> None:
+        """GitHub's own words (asked with the ci-watch App, 2026-11-22): a missing PR is the alias's answer, the same on
+        the login; a repository the installation does not cover is a refusal that keeps the route on the login."""
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}", "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 9}}
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": {"pullRequest": None}}, "errors": [
+            {"type": "NOT_FOUND", "path": ["p0", "pullRequest"],
+             "message": "Could not resolve to a PullRequest with the number of 9."}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls), self.pool.unreadable), (1, 0, {}))
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": None}, "errors": [
+            {"type": "NOT_FOUND", "path": ["p0"],
+             "message": "Could not resolve to a Repository with the name 'manaflow-ai/cmux'."}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1), "a repository it lacks goes on the login")
+        self.assertTrue(self.pool.unreadable)
+
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
         """The login's secondary limit (or a latch mark another caller wrote) is the login's: an installation token has
         its own limits, so the daemon's App reads go on while the login waits, and a login read is still held."""

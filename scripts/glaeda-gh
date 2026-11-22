@@ -2941,6 +2941,22 @@ APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
 APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
 
 
+# A GraphQL NOT_FOUND for a pull request or issue number that does not exist is GitHub's answer for that alias, the same
+# on the login: not the App lacking a permission or repository. Counted as a refusal, one closed-and-deleted PR number
+# in a batch put every batch of that repository set on the login for APP_POOL_ROUTE_REST (an hour), where the login's
+# pace and reserve hold it (the broker host, 2026-11-22: "app-pool-refused ... status 200" at 23:xx, 01:xx and 02:50Z).
+APP_POOL_ANSWERED_NOT_FOUND = re.compile(
+    r"NOT_FOUND Could not resolve to (?:a PullRequest|an Issue|an issue or pull request) with the number of \d+\.?", re.I)
+
+
+def app_graphql_refused(message: str) -> bool:
+    """Whether a 200 GraphQL answer's errors (request's "TYPE message ..." text) say the App may not read it: FORBIDDEN,
+    or a NOT_FOUND other than a missing PR or issue number (a repository the installation does not cover)."""
+    if re.search(r"FORBIDDEN", message):
+        return True
+    return "NOT_FOUND" in APP_POOL_ANSWERED_NOT_FOUND.sub("", message)
+
+
 def app_pool_tool() -> Path | None:
     """gh_app_token.py beside the gh-quota shim's gh_quota.py (leo-workspace tools/), or None."""
     with contextlib.suppress(OSError, RuntimeError):
@@ -3159,7 +3175,7 @@ class AppPool:
             self.why = f"the {self.role} App answered HTTP {status}"
             self.fell_back += 1
             return False
-        if status in {403, 404} or (status == 200 and bool(re.search(r"FORBIDDEN|NOT_FOUND", message))):
+        if status in {403, 404} or (status == 200 and app_graphql_refused(message)):
             self.unreadable[scope] = now + APP_POOL_ROUTE_REST
             self.fell_back += 1
             return False
@@ -8848,15 +8864,16 @@ class Daemon:
             # the login's head and check-page queries filled the minute, and 1,242 PR reads sat deferred behind
             # "42 of 40 points this minute": a waited PR's data was 13,401 s old.
             if not on_app and not self.gql_room(self.gql_expected(kind)):
-                # Over the per-minute ceiling: the rest wait, first next tick. Not REST's to read: GraphQL is not
+                # Over the per-minute ceiling: this chunk waits, first next tick. Not REST's to read: GraphQL is not
                 # spent, only paced, and a REST spill of a whole post-reset refresh would be the same burst there.
-                self.defer(chunk + [e for c in queue for e in c],
-                           f"the GraphQL pace: {self.gql_minute_points()} of "
-                           f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
+                # Only this chunk: an App-answered chunk queued behind a paced login chunk (an owner with no App, or a
+                # heavy entry read alone) still goes this tick, since the pace is not its to keep.
+                self.defer(chunk, f"the GraphQL pace: {self.gql_minute_points()} of "
+                                  f"{self.policy.get('graphqlPerMinute', GRAPHQL_PER_MINUTE)} points this minute")
                 if getattr(self, "gql_paced", None) is None:
                     self.gql_paced = kind
                 self.paced_at[kind] = self.now  # the evidence pace_short needs
-                return to_rest
+                continue
             self.gql_limited = False
             self.gql_reason = kind
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
