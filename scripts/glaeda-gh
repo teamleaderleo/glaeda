@@ -12168,6 +12168,7 @@ class LandQueue:
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pass_load_gated = 0  # ... of them, those the host's measured load held back (load_room)
+        self.pass_load_passed = 0  # rows one merge away load_room started over the line (merge_ready)
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
@@ -12383,7 +12384,7 @@ class LandQueue:
             self.retire_ended()
             self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
-            self.pass_load_gated = 0
+            self.pass_load_gated = self.pass_load_passed = 0
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.log_pool()
             return
@@ -12392,7 +12393,7 @@ class LandQueue:
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
         self.pass_gated, self.pass_first_gated = 0, None
-        self.pass_load_gated = 0
+        self.pass_load_gated = self.pass_load_passed = 0
         self.pass_latch = latch
         self.pass_latched = 0
         self.pass_staggered = 0
@@ -13115,14 +13116,34 @@ class LandQueue:
         this host's cores (land_worker_ceiling), read at each call. Past the first busy worker, load_room decides."""
         return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
 
-    def load_room(self) -> bool:
-        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs), else
-        only while the host's 1-minute load per core is under LAND_LOAD_LINE (an unknown load admits). Counted for the
-        pass's land-pool line ("loadGated")."""
+    def merge_ready(self, e: dict) -> bool:
+        """Whether E is one merge away: judged ok at the head the cache shows with its merge step next (judge_tier 0),
+        or the cache shows its PR open, CLEAN and with no check running at the head it is pinned to (any head when
+        unpinned). Its judgment is a short explain and the pinned merge, and it ends the row."""
+        if self.judge_tier(e) == 0:
+            return True
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        head = str(data.get("headRefOid") or "").lower()
+        pin = str(e.get("pinSha") or "").lower()
+        return bool(head) and (not pin or pin == head) and data.get("state") == "OPEN" \
+            and data.get("mergeStateStatus") == "CLEAN" and not land_checks_running(data, head)
+
+    def load_room(self, e: dict | None = None) -> bool:
+        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs) or when
+        E is one merge away (merge_ready), else only while the host's 1-minute load per core is under LAND_LOAD_LINE
+        (an unknown load admits). Counted for the pass's land-pool line ("loadGated", "loadPassed").
+        The line holds back judgments that may run a full land_judge explain with its reads; a green, clean row's
+        judgment is one explain and one `gh pr merge`, and every minute it waits its PR re-runs CI on each base push.
+        huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores (0.9/core, mostly the broker, acpmux, reviews and suites),
+        busy=1 of workers=12, and green pinned PRs (cmuxterm-hq#17398: waited=9168 s) sat "over the line" until merged
+        by hand; 7 merges that day against 998 in the 7 days before."""
         if not self.jobs:
             return True
         load = land_load_per_core()
         if load is None or load < LAND_LOAD_LINE:
+            return True
+        if e is not None and self.merge_ready(e):
+            self.pass_load_passed += 1
             return True
         self.pass_load_gated += 1
         return False
@@ -13156,9 +13177,17 @@ class LandQueue:
             self.pass_first_gated = e["key"]
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
-            e["dueLate"] = {"at": self.now, "since": self.due_since(e)}
+            load = land_load_per_core()
+            e["dueLate"] = {"at": self.now, "since": self.due_since(e), "why": why, "workers": self.workers(),
+                            "busy": len(self.jobs), "loadPerCore": None if load is None else round(load, 2)}
             self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
-                         workers=self.workers(), busy=len(self.jobs), loadPerCore=land_load_per_core())
+                         workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
+                         holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
+            self.save(e)
+        elif (dl := e.get("dueLate")) and dl.get("why") != why:
+            dl.update(why=why, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
+            load = land_load_per_core()
+            dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
 
     def log_pool(self) -> None:
@@ -13193,7 +13222,8 @@ class LandQueue:
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
-             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated, "busy": len(running),
+             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated,
+             "loadPassed": self.pass_load_passed, "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
@@ -14033,7 +14063,7 @@ class LandQueue:
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
             return False
-        if not self.load_room():
+        if not self.load_room(e):
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e):
@@ -15492,7 +15522,13 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         # one host, 2026-11-21 12:08Z, 3 of them on rows whose next wake was past the park's own end).
         bits.append(f"held: the land queue is parked until {utc_clock(float(queue['until']))} (quota)")
     elif (e.get("dueLate") or {}) and e["state"] in ("queued", "waiting"):
-        bits.append(f"due since {utc_clock(float(e['dueLate'].get('since') or 0))}: every worker busy")
+        dl = e["dueLate"]
+        why = str(dl.get("why") or "every worker busy")
+        if isinstance(dl.get("busy"), int) and isinstance(dl.get("workers"), int):
+            why += f" (busy {dl['busy']} of {dl['workers']}"
+            why += f", load {dl['loadPerCore']}/core, line {LAND_LOAD_LINE})" \
+                if isinstance(dl.get("loadPerCore"), (int, float)) else ")"
+        bits.append(f"due since {utc_clock(float(dl.get('since') or 0))}: {why}")
     if e.get("after") and e["state"] == "waiting_after":
         bits.append("after " + ", ".join(key_name(a) for a in e["after"]))
     la = e.get("lastAction") or {}
@@ -15586,6 +15622,34 @@ def land_latch_note(note: dict) -> str:
     return f"glaeda land: {mark} holds ({why})"
 
 
+def land_holders_line(entries: list[dict], now: float) -> str:
+    """What holds the land workers now: each judging or acting row (its PR, its step and for how long), the pool's
+    ceiling and the host's load per core against LAND_LOAD_LINE. "" while no row is due and none runs. huge-blue,
+    2026-11-22: `land status` said only "every worker busy" while one worker of 12 ran and the load line held the rest."""
+    running = []
+    for e in entries:
+        if e.get("state") not in ("judging", "acting"):
+            continue
+        if e["state"] == "acting":
+            a = e.get("action") or {}
+            step, at = f"acting {a.get('kind') or '?'}", a.get("claimedAt")
+        else:
+            step, at = "judging", (e.get("judging") or {}).get("at")
+        since = f" started {age(float(at))}" if isinstance(at, (int, float)) and not isinstance(at, bool) else ""
+        running.append(f"{key_name(e['key'])} {step}{since}")
+    late = sum(1 for e in entries if e.get("dueLate") and e.get("state") in ("queued", "waiting"))
+    if not running and not late:
+        return ""
+    load = land_load_per_core()
+    loads = "unknown" if load is None else f"{load:.2f}/core"
+    given = land_config().get("workers")
+    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+    return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
+            + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
+               if running else "")
+            + f"; load {loads}, line {LAND_LOAD_LINE} (a row one merge away starts over it); {late} due late")
+
+
 def cmd_land_status(target: str | None, as_json: bool) -> int:
     doc = land_status_doc(target)
     executor = land_executor()
@@ -15637,6 +15701,9 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
         print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
               f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
               f"{land_reason(queue.get('reason'), 200)}")
+    holders = land_holders_line(entries, now)
+    if holders:
+        print(holders)
     for e in entries:
         print(land_line(e, now, latch, queue))
         if target:

@@ -27592,6 +27592,63 @@ class LandTest(Base):
             self.assertTrue(self.q.load_room())  # a host that does not say its load admits
         self.q.jobs.clear()
 
+    def test_a_row_one_merge_away_starts_over_the_load_line(self):
+        """huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores, busy=1 of workers=12, and green pinned PRs sat "the
+        host's load is over the line" for hours (cmuxterm-hq#17398 waited 9168 s) until merged by hand. A row the
+        cache shows open, CLEAN and with no check running at its pin is one explain and one merge: it starts; a row
+        with a check still running waits for the load as before."""
+        over = gg.LAND_LOAD_LINE + 0.18
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "land_load_per_core", return_value=over):
+            self.tick()
+        self.assert_merged_at(LA)
+        self.assertEqual((self.q.pass_load_passed, self.q.pass_load_gated), (1, 0))
+        self.q.jobs.clear()
+
+    def test_a_row_not_one_merge_away_still_waits_for_the_load_and_says_why(self):
+        over = gg.LAND_LOAD_LINE + 0.18
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)  # not one merge away
+        self.land()
+        self.assertFalse(self.q.merge_ready({"key": self.KEY}))
+        with mock.patch.object(gg, "land_load_per_core", return_value=over):
+            self.tick()
+            self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertGreaterEqual(self.q.pass_load_gated, 1)
+        self.assertEqual(e["dueLate"]["why"], "the host's load is over the line")
+        line = gg.land_line(e, self.t, latch=None)
+        self.assertIn("the host's load is over the line (busy 1 of", line)
+        self.assertIn(f"load {round(over, 2)}/core, line {gg.LAND_LOAD_LINE}", line)
+        self.assertNotIn("every worker busy", line)
+        self.q.jobs.clear()
+
+    def test_a_pinned_row_whose_head_moved_is_not_merge_ready(self):
+        self.pr(LB)
+        self.assertTrue(self.q.merge_ready({"key": self.KEY}))
+        self.assertTrue(self.q.merge_ready({"key": self.KEY, "pinSha": LB}))
+        self.assertFalse(self.q.merge_ready({"key": self.KEY, "pinSha": LA}))
+
+    def test_land_status_names_what_holds_the_workers(self):
+        """huge-blue, 2026-11-22: `land status` printed "every worker busy" while one worker of 12 ran; the line names
+        each judging or acting row, the ceiling and the load against the line."""
+        rows = [{"key": "pr:o/r#1", "state": "judging", "judging": {"at": time.time() - 300}},
+                {"key": "pr:o/r#2", "state": "acting", "action": {"kind": "merge", "claimedAt": time.time() - 30}},
+                {"key": "pr:o/r#3", "state": "queued", "dueLate": {"since": 1.0, "why": "every worker busy"}},
+                {"key": "pr:o/r#4", "state": "merged"}]
+        with mock.patch.object(gg, "land_load_per_core", return_value=0.98), \
+                mock.patch.object(gg, "land_worker_ceiling", return_value=12), \
+                mock.patch.object(gg, "land_config", return_value={}):
+            line = gg.land_holders_line(rows, time.time())
+        self.assertIn("workers 2 busy of 12 (cores): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
+                      line)
+        self.assertIn("load 0.98/core, line 0.8", line)
+        self.assertIn("1 due late", line)
+        self.assertEqual(gg.land_holders_line([rows[3]], time.time()), "")
+
     def test_login_workers_caps_only_lands_whose_reads_spend_the_login(self):
         # huge-blue, 2026-11-19: workers raised past 4 for the App-pool lands; the login's REST reserve, which landing
         # reads spend down to 0, must be spent no faster, so judgments read on the login keep their own cap.
