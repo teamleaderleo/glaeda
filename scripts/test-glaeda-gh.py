@@ -674,8 +674,8 @@ class Base(unittest.TestCase):
         execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
         execv.start()
         self.addCleanup(execv.stop)
-        # The land pool is sized from the host (land_worker_ceiling, land_load_room): pinned to 8 idle cores here, so
-        # a suite on a busy runner judges as one on an idle one (4 workers); LandSizingTest moves both.
+        # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
+        # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown.
         for name, value in (("land_cores", 8), ("land_load_per_core", None)):
             pin = mock.patch.object(gg, name, return_value=value)
             pin.start()
@@ -29049,95 +29049,33 @@ class LandTest(Base):
         with mock.patch.object(gg, "land_cores", return_value=32):
             self.assertEqual(self.q.workers(), 3)
 
-    def test_past_the_load_line_only_the_first_judgment_starts(self):
-        """Admission on the measured load (hand-set-concurrency-number.md): with no worker busy one judgment always
-        starts; past it, a worker is taken only while the 1-minute load per core is under LAND_LOAD_LINE."""
-        self.assertTrue(self.q.load_room())  # none busy: one always runs, whatever the load
-        self.q.jobs["pr:o/r#1"] = None
-        with mock.patch.object(gg, "land_load_per_core", return_value=gg.LAND_LOAD_LINE + 0.1):
-            self.assertFalse(self.q.load_room())
-            self.assertEqual(self.q.pass_load_gated, 1)
-        with mock.patch.object(gg, "land_load_per_core", return_value=gg.LAND_LOAD_LINE - 0.1):
-            self.assertTrue(self.q.load_room())
-        with mock.patch.object(gg, "land_load_per_core", return_value=None):
-            self.assertTrue(self.q.load_room())  # a host that does not say its load admits
-        self.q.jobs.clear()
-
-    def test_the_load_line_reads_busy_cpu_not_the_run_queue(self):
-        """huge-blue, 2026-11-22 07:00Z: load 1.11/core over the 0.8 line held 362 lands while a lane VM read
-        0.66/core at 92% idle: loadavg counts threads blocked on IO. Where /proc/stat reads, the line is the busy CPU
-        share since the last sample; before two samples, or with no /proc/stat, the load average stands in."""
-        samples = iter([(100, 1000), (110, 1100), (190, 1200)])
-        clock = iter([0.0, 2.0, 2.5, 5.0])
-        with mock.patch.dict(gg._LAND_CPU, clear=True):
-            read = lambda: next(samples)
-            now = lambda: next(clock)
-            self.assertIsNone(gg.land_cpu_busy(read, now))  # one sample: no share yet
-            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # 10 busy of 100: 10%, though the load is high
-            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.1)  # within LAND_CPU_SAMPLE_S: reused, not re-read
-            self.assertAlmostEqual(gg.land_cpu_busy(read, now), 0.8)  # 80 of 100
-        with mock.patch.dict(gg._LAND_CPU, clear=True), \
-                mock.patch.object(gg, "land_cpu_busy", return_value=0.1), \
-                mock.patch.object(gg.os, "getloadavg", return_value=(40.0, 0, 0)):
-            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.1)
-        with mock.patch.object(gg, "land_cpu_busy", return_value=None), \
-                mock.patch.object(gg.os, "getloadavg", return_value=(8.0, 0, 0)):
-            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
-
-    def test_proc_stat_counts_idle_iowait_and_nice_as_not_busy(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "stat")
-            with open(p, "w") as f:
-                f.write("cpu  10 2 3 50 30 1 1 3 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n")
-            self.assertEqual(gg.proc_stat_cpu(p), (18, 100))  # 10 user + 3 system + 1 + 1 + 3 steal; nice 2 is not
-            with open(p, "w") as f:
-                f.write("intr 1 2\n")
-            self.assertIsNone(gg.proc_stat_cpu(p))
-        self.assertIsNone(gg.proc_stat_cpu(os.path.join(d, "gone")))
-
-    def test_a_row_one_merge_away_starts_over_the_load_line(self):
-        """huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores, busy=1 of workers=12, and green pinned PRs sat "the
-        host's load is over the line" for hours (cmuxterm-hq#17398 waited 9168 s) until merged by hand. A row the
-        cache shows open, CLEAN and with no check running at its pin is one explain and one merge: it starts; a row
-        with a check still running waits for the load as before."""
-        over = gg.LAND_LOAD_LINE + 0.18
+    def test_the_hosts_load_holds_no_judgment(self):
+        """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
+        judgment past the first while the host's load per core was over 0.8: huge-blue 04:13-07:47Z, 12 workers, 1-2
+        busy, 265-305 due rows held each pass the load read 0.86-1.57/core. A judgment waits on GitHub, and its cost
+        does not move with the host's load, so no load line gates it: at any load, every free worker takes a due row."""
+        self.assertFalse(hasattr(gg, "LAND_LOAD_LINE"))
+        self.assertFalse(hasattr(self.q, "load_room"))
         self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
-        self.pr(LA)
-        self.land()
-        self.w.answers.append(ok_answer(LA))
-        with mock.patch.object(gg, "land_load_per_core", return_value=over):
-            self.tick()
-        self.assert_merged_at(LA)
-        self.assertEqual((self.q.pass_load_passed, self.q.pass_load_gated), (1, 0))
-        self.q.jobs.clear()
-
-    def test_a_row_not_one_merge_away_still_waits_for_the_load_and_says_why(self):
-        over = gg.LAND_LOAD_LINE + 0.18
-        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)
         self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)  # not one merge away
         self.land()
-        self.assertFalse(self.q.merge_ready({"key": self.KEY}))
-        with mock.patch.object(gg, "land_load_per_core", return_value=over):
-            self.tick()
-            self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "land_load_per_core", return_value=9.0):  # far past any line
             e = self.tick(gg.LAND_DUE_LATE + 1)
-        self.assertGreaterEqual(self.q.pass_load_gated, 1)
-        self.assertEqual(e["dueLate"]["why"], "the host's load is over the line")
-        line = gg.land_line(e, self.t, latch=None)
-        self.assertIn("the host's load is over the line (busy 1 of", line)
-        self.assertIn(f"load {round(over, 2)}/core, line {gg.LAND_LOAD_LINE}", line)
-        self.assertNotIn("every worker busy", line)
+        self.assertNotEqual((e.get("dueLate") or {}).get("why"), "the host's load is over the line")
+        self.assertNotIn("over the line", gg.land_line(e, self.t, latch=None))
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
         self.q.jobs.clear()
 
-    def test_a_pinned_row_whose_head_moved_is_not_merge_ready(self):
-        self.pr(LB)
-        self.assertTrue(self.q.merge_ready({"key": self.KEY}))
-        self.assertTrue(self.q.merge_ready({"key": self.KEY, "pinSha": LB}))
-        self.assertFalse(self.q.merge_ready({"key": self.KEY, "pinSha": LA}))
+    def test_the_load_per_core_is_reported_from_the_load_average(self):
+        with mock.patch.object(gg.os, "getloadavg", return_value=(8.0, 0, 0)):
+            self.assertAlmostEqual(LAND_LOAD_PER_CORE(16), 0.5)
+        with mock.patch.object(gg.os, "getloadavg", side_effect=OSError("no loadavg")):
+            self.assertIsNone(LAND_LOAD_PER_CORE(16))
 
     def test_land_status_names_what_holds_the_workers(self):
         """huge-blue, 2026-11-22: `land status` printed "every worker busy" while one worker of 12 ran; the line names
-        each judging or acting row, the ceiling and the load against the line."""
+        each judging or acting row, the ceiling and the host's load (reported, not a gate)."""
         rows = [{"key": "pr:o/r#1", "state": "judging", "judging": {"at": time.time() - 300}},
                 {"key": "pr:o/r#2", "state": "acting", "action": {"kind": "merge", "claimedAt": time.time() - 30}},
                 {"key": "pr:o/r#3", "state": "queued", "dueLate": {"since": 1.0, "why": "every worker busy"}},
@@ -29148,7 +29086,8 @@ class LandTest(Base):
             line = gg.land_holders_line(rows, time.time())
         self.assertIn("workers 2 busy of 12 (cores): o/r#1 judging started 5m ago; o/r#2 acting merge started 30s ago",
                       line)
-        self.assertIn("load 0.98/core, line 0.8", line)
+        self.assertIn("load 0.98/core; 1 due late", line)
+        self.assertNotIn("line", line.split("load")[-1])
         self.assertIn("1 due late", line)
         self.assertEqual(gg.land_holders_line([rows[3]], time.time()), "")
 

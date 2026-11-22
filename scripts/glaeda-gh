@@ -11743,12 +11743,11 @@ LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GL
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 # The land pool is sized by the host it runs on, read at every pass, never a hand-set count (cmuxterm-hq
 # docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): a ceiling
-# of one worker per LAND_CORES_EACH cores (land_worker_ceiling), and past the first worker a judgment starts only
-# while the 1-minute load per core is under LAND_LOAD_LINE (land_load_room). One judgment always runs. land.json
-# "workers" stays an operator's override of the ceiling. The 4 this replaced was set by hand; gcp-agent-lane-1,
+# of one worker per LAND_CORES_EACH cores (land_worker_ceiling). land.json "workers" stays an operator's override of
+# the ceiling. No host-load line admits or holds a judgment: LAND_LOAD_LINE (0.8 per core) is gone (see
+# land_load_per_core's comment for what it measured and why). The 4 this replaced was set by hand; gcp-agent-lane-1,
 # 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
 LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
-LAND_LOAD_LINE = 0.8  # the handbook's 80% headroom line
 
 
 def land_cores() -> int:
@@ -11763,63 +11762,14 @@ def land_worker_ceiling(cores: int | None = None) -> int:
     return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
 
 
-# The line is measured CPU headroom (the handbook's 80% line), so on a host with /proc/stat it reads the share of CPU
-# time that was busy since the last read (LAND_CPU_SAMPLE_S apart at least), not the run queue: Linux's loadavg counts
-# threads blocked on IO (D state) too, so a host waiting on git and disk read over the line while its CPU sat idle.
-# CPU at nice is headroom as well: a judgment runs at nice 0 and niced work (the host's test suites) yields to it.
-# huge-blue, 2026-11-22 07:00Z: 362 lands due late, 2 of 12 workers busy, load 1.11/core over the 0.8 line, its CPU
-# 83% busy of which 34 points were niced. Where /proc/stat is missing (macOS) or before the first two samples, the
-# 1-minute load average per core stands in, as before. The lane-gh broker's land slots read the same way.
-LAND_CPU_SAMPLE_S = 1.0
-_LAND_CPU: dict[str, float] = {}
-
-
-def proc_stat_cpu(path: str = "/proc/stat") -> tuple[int, int] | None:
-    """(busy, total) CPU jiffies from /proc/stat's first line; idle, iowait and nice count as not busy. None if
-    unreadable."""
-    try:
-        with open(path, encoding="ascii") as f:
-            parts = f.readline().split()
-    except OSError:
-        return None
-    if len(parts) < 5 or parts[0] != "cpu":
-        return None
-    try:
-        vals = [int(x) for x in parts[1:9]]
-    except ValueError:
-        return None
-    total = sum(vals)
-    # nice (vals[1]) is not busy either: niced work (the host's test suites run at nice 10) yields to a judgment
-    return total - vals[1] - vals[3] - (vals[4] if len(vals) > 4 else 0), total
-
-
-def land_cpu_busy(read: Callable[[], tuple[int, int] | None] = proc_stat_cpu,
-                  now: Callable[[], float] = time.monotonic) -> float | None:
-    """The busy CPU share (0-1) since the previous sample, reused until LAND_CPU_SAMPLE_S has passed; None until two
-    samples exist or where /proc/stat is unreadable."""
-    t = now()
-    if "share" in _LAND_CPU and t - _LAND_CPU.get("at", 0.0) < LAND_CPU_SAMPLE_S:
-        return _LAND_CPU["share"]
-    cur = read()
-    if cur is None:
-        return None
-    share = None
-    if "busy" in _LAND_CPU and cur[1] > _LAND_CPU["total"]:
-        share = max(0.0, min(1.0, (cur[0] - _LAND_CPU["busy"]) / (cur[1] - _LAND_CPU["total"])))
-    elif "share" in _LAND_CPU:
-        share = _LAND_CPU["share"]
-    _LAND_CPU.update(at=t, busy=float(cur[0]), total=float(cur[1]))
-    if share is not None:
-        _LAND_CPU["share"] = share
-    return share
-
-
+# The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
+# handbook's headroom line) held every judgment past the first while the host's load per core was over it, and later
+# (glaeda#2457) its busy CPU share. A judgment is land_judge waiting on GitHub: what it costs does not move with the
+# host's load (measured in the PR that removed the line), so the line held lands and protected nothing. huge-blue,
+# 2026-11-22 04:13-07:47Z: 12 workers, 1-2 busy, 265-305 due rows "over the line" every pass the 1-minute load read
+# 0.86-1.57/core (agents and reviews, not lands), 887 open rows, queue-to-merge p50 77 min.
 def land_load_per_core(cores: int | None = None) -> float | None:
-    """The host's measured busy CPU share (land_cpu_busy), else the 1-minute load average per core, or None where the
-    host says neither (an unknown load admits)."""
-    busy = land_cpu_busy()
-    if busy is not None:
-        return busy
+    """The 1-minute load average per core, for the record only (no gate reads it), or None where the host does not say."""
     try:
         one = os.getloadavg()[0]
     except (AttributeError, OSError):
@@ -13279,8 +13229,6 @@ class LandQueue:
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
-        self.pass_load_gated = 0  # ... of them, those the host's measured load held back (load_room)
-        self.pass_load_passed = 0  # rows one merge away load_room started over the line (merge_ready)
         self.pool_logged = float("-inf")
         self.pass_latch: tuple[str, float] | None = None  # the login's latch as this pass saw it (log_pool)
         self.pass_latched = 0  # open entries this pass skipped for it
@@ -13496,7 +13444,6 @@ class LandQueue:
             self.retire_ended()
             self.unpark_due()
             self.pass_gated, self.pass_first_gated, self.pass_latch = 0, None, None
-            self.pass_load_gated = self.pass_load_passed = 0
             self.pass_latched = self.pass_staggered = self.pass_capped = 0
             self.log_pool()
             return
@@ -13505,7 +13452,6 @@ class LandQueue:
         self.snapshot_waiting = {k for k, e in self.entries.items() if e.get("state") not in LAND_DONE
                                  and isinstance(e.get("snapshotWait"), dict)}
         self.pass_gated, self.pass_first_gated = 0, None
-        self.pass_load_gated = self.pass_load_passed = 0
         self.pass_latch = latch
         self.pass_latched = 0
         self.pass_staggered = 0
@@ -14328,40 +14274,8 @@ class LandQueue:
 
     def workers(self) -> int:
         """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
-        this host's cores (land_worker_ceiling), read at each call. Past the first busy worker, load_room decides."""
+        this host's cores (land_worker_ceiling), read at each call."""
         return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
-
-    def merge_ready(self, e: dict) -> bool:
-        """Whether E is one merge away: judged ok at the head the cache shows with its merge step next (judge_tier 0),
-        or the cache shows its PR open, CLEAN and with no check running at the head it is pinned to (any head when
-        unpinned). Its judgment is a short explain and the pinned merge, and it ends the row."""
-        if self.judge_tier(e) == 0:
-            return True
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        head = str(data.get("headRefOid") or "").lower()
-        pin = str(e.get("pinSha") or "").lower()
-        return bool(head) and (not pin or pin == head) and data.get("state") == "OPEN" \
-            and data.get("mergeStateStatus") == "CLEAN" and not land_checks_running(data, head)
-
-    def load_room(self, e: dict | None = None) -> bool:
-        """Whether one more judgment may start now: always while no worker is busy (one judgment always runs) or when
-        E is one merge away (merge_ready), else only while the host's 1-minute load per core is under LAND_LOAD_LINE
-        (an unknown load admits). Counted for the pass's land-pool line ("loadGated", "loadPassed").
-        The line holds back judgments that may run a full land_judge explain with its reads; a green, clean row's
-        judgment is one explain and one `gh pr merge`, and every minute it waits its PR re-runs CI on each base push.
-        huge-blue, 2026-11-22 00:47Z: load 28.7 on 32 cores (0.9/core, mostly the broker, acpmux, reviews and suites),
-        busy=1 of workers=12, and green pinned PRs (cmuxterm-hq#17398: waited=9168 s) sat "over the line" until merged
-        by hand; 7 merges that day against 998 in the 7 days before."""
-        if not self.jobs:
-            return True
-        load = land_load_per_core()
-        if load is None or load < LAND_LOAD_LINE:
-            return True
-        if e is not None and self.merge_ready(e):
-            self.pass_load_passed += 1
-            return True
-        self.pass_load_gated += 1
-        return False
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -14437,8 +14351,7 @@ class LandQueue:
         latch = self.pass_latch
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
-             "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated,
-             "loadPassed": self.pass_load_passed, "busy": len(running),
+             "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
              "firstGated": key_name(self.pass_first_gated) if self.pass_first_gated else None,
@@ -15328,9 +15241,6 @@ class LandQueue:
             return False
         if not self.reread_room(e):
             self.gated(e, "re-reads of unreadable PRs hold their share of the workers")  # LAND_REREAD_SHARE
-            return False
-        if not self.load_room(e):
-            self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e, sha):
             return False  # this window's share is spent: judged in a later one, its place kept
@@ -16873,8 +16783,7 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         why = str(dl.get("why") or "every worker busy")
         if isinstance(dl.get("busy"), int) and isinstance(dl.get("workers"), int):
             why += f" (busy {dl['busy']} of {dl['workers']}"
-            why += f", load {dl['loadPerCore']}/core, line {LAND_LOAD_LINE})" \
-                if isinstance(dl.get("loadPerCore"), (int, float)) else ")"
+            why += f", load {dl['loadPerCore']}/core)" if isinstance(dl.get("loadPerCore"), (int, float)) else ")"
         bits.append(f"due since {utc_clock(float(dl.get('since') or 0))}: {why}")
     took = (e.get("judging") or {}).get("at") if e["state"] == "judging" else \
         (e.get("action") or {}).get("claimedAt") if e["state"] == "acting" else None
@@ -16980,7 +16889,7 @@ def land_latch_note(note: dict) -> str:
 
 def land_holders_line(entries: list[dict], now: float) -> str:
     """What holds the land workers now: each judging or acting row (its PR, its step and for how long), the pool's
-    ceiling and the host's load per core against LAND_LOAD_LINE. "" while no row is due and none runs. huge-blue,
+    ceiling and the host's load per core (reported, not a gate). "" while no row is due and none runs. huge-blue,
     2026-11-22: `land status` said only "every worker busy" while one worker of 12 ran and the load line held the rest."""
     running = []
     for e in entries:
@@ -17003,7 +16912,7 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")
-            + f"; load {loads}, line {LAND_LOAD_LINE} (a row one merge away starts over it); {late} due late")
+            + f"; load {loads}; {late} due late")
 
 
 def cmd_land_status(target: str | None, as_json: bool) -> int:
