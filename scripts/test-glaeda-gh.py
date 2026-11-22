@@ -25474,7 +25474,66 @@ class LandTest(Base):
             e = self.tick()
         self.assertEqual((e["state"], e["streak"], e["waitRefused"]["count"], len(self.w.explains())),
                          ("waiting", None, 4, 4))
-        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # each change is the wait making progress
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # a check appearing is the wait making progress
+
+    def webview_wait(self, head: str = LA, timeout: int = 900) -> tuple[int, dict]:
+        """land_judge's "webview" refusal, whose step is a wait on the checks (LAND_FALLBACK) and whose reason names
+        the PR's own reds."""
+        nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
+        return refusal("webview", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
+                       nxt=nxt, reason="land-judge: refused: its per-test webview verdict names its own reds "
+                                       "(react-apps-base-check failed); fix them, or rerun if one is a flake")
+
+    def test_a_check_read_differently_is_not_the_wait_making_progress(self):
+        """A wait's stuck bound counts the checks it waits on, not every check's conclusion (LAND_WAIT_STUCK). Queue
+        host, 2026-11-22: cmux#48267's reads 500 s apart changed 50 of their 223 checks, each a completed check whose
+        workflow one read gave as its run's name and the next as its workflow's, and cmux#49430 read 175 of its 208
+        checks under GitHub's rate limit; every flip reset movedAt."""
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(self.webview_wait())
+        e = self.tick()
+        moved = e["waitRefused"]["movedAt"]
+        self.assertEqual(moved, self.t)
+        for checks in ([("ci", "COMPLETED", "SUCCESS")],  # a check page the read could not finish: one check less
+                       [("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "NEUTRAL")],  # read differently
+                       [("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS")]):
+            self.pr(LA, checks=checks)
+            self.w.answers.append(self.webview_wait())
+            e = self.tick(700)
+            self.assertEqual(e["waitRefused"]["movedAt"], moved, checks)
+        self.assertGreaterEqual(e["waitRefused"]["count"], 4)  # each was judged again: only the bound is unmoved
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("x", "COMPLETED", "SUCCESS"), ("y", "QUEUED", None)])
+        self.w.answers.append(self.webview_wait())
+        e = self.tick(1000)  # past the wait's own timeout, which judges it again
+        self.assertEqual(e["waitRefused"]["movedAt"], self.t)  # a check started: the wait moved
+
+    def test_a_wait_on_checks_that_never_move_stops_and_tells_its_requester(self):
+        """cmux#49430, 2026-11-22: a "webview" refusal naming the PR's own reds took 51 waits in 9.8 h at one head,
+        every one logged idle 0 while no check at that head was unfinished at all, because its check fingerprint
+        flipped between two values in reads 60 s apart. 5 such rows were judged 52 times in 24 h past the 4 h bound
+        they should have stopped at, 4 of them with no stop at all."""
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE"), ("x", "COMPLETED", "SUCCESS")])
+        self.land()
+        end = self.t + gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT
+        flip = 0
+        e: dict = {}
+        while self.t < end:
+            flip += 1
+            self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE"),
+                                ("x", "COMPLETED", "SUCCESS" if flip % 2 else "NEUTRAL")])
+            while len(self.w.answers) < 2:
+                self.w.answers.append(self.webview_wait())
+            e = self.tick(300)
+            if e.get("state") in gg.LAND_DONE:
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"), e.get("stop"))
+        self.assertIn("none the cache shows", e["stop"]["reason"])
+        self.assertIn("react-apps-base-check", e["stop"]["reason"])  # the requester is told what to fix
+        self.assertEqual(len(self.w.sent()), 1, self.w.sent())
+        # stopped on its own bound, not one flip later: nothing it waits for moved since its first refusal
+        waited = e["stop"]["at"] - e["waitRefused"]["since"]
+        self.assertLess(waited, gg.LAND_WAIT_STUCK + 600, waited)
 
     def queued_wait(self, head: str = LA, timeout: int = 1800) -> tuple[int, dict]:
         nxt = f"glaeda-gh wait pr o/r#1 --until done --sha {head} --timeout {timeout}"
