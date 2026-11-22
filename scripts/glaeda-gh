@@ -12262,6 +12262,30 @@ LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unread
 LAND_EARLY_HANDOFF_BAD = 3
 LAND_EARLY_HANDOFF_OF = 5
 LAND_EARLY_HANDOFF_WINDOW = 900.0
+# A stop that only says GitHub could not be read (LAND_INFRA_STOPS: quota, an App refusal, a timeout, the login's pace)
+# is no fact about the PR, and its requester can do nothing with it. So it is not a stop (infra_read_stop): a broker
+# client hands the entry at its full head to the broker host's land queue (hand_off_now, as early_hand_off does), and
+# any other host retries it after LAND_INFRA_RETRY_BASE s, doubled per retry at one head up to LAND_INFRA_RETRY_MAX,
+# its wait budget and streak cleared (the wait is no strike). Only after LAND_INFRA_RETRY_CAP retries at one head does
+# it stop, and even then the requester is not woken: a log line and the entry's history (`land status`), as glaeda#2468
+# does for every word a requester cannot act on. retry_deadline is one only when its wait was on an answer that judged
+# nothing (LAND_NOT_JUDGED, LAND_HANDOFF_UNREAD); a retry wait on the PR's own state (train_wait) still stops and tells.
+# Leo, 2026-11-22: "if huge-blue is so weak and liable to falling over, then don't put so much reliance on it".
+# huge-blue, 2026-11-21 10Z-11-22 10Z: 13 pin_unread stops of 6 lands (each "GitHub's quota for this read ..."), 3
+# retry_deadline stops of 3 lands (each "still host_cap"), every one an acpmux wake of its requester.
+LAND_INFRA_STOPS = frozenset({"retry_deadline", "pin_unread", "webview_unreadable", "unreadable_repeated"})
+LAND_INFRA_RETRY_BASE = 600.0
+LAND_INFRA_RETRY_MAX = 3600.0
+LAND_INFRA_RETRY_CAP = 6  # 600+1200+2400+3600+3600+3600 s: about 4 h more at one head before the quiet stop
+
+
+def land_infra_stop(e: dict, code: str) -> bool:
+    """Whether stopping E with CODE would only say GitHub could not be read (LAND_INFRA_STOPS' comment)."""
+    if code not in LAND_INFRA_STOPS:
+        return False
+    # retry_deadline: only when its wait was on an answer that judged nothing, not on the PR's own state (train_wait)
+    return code != "retry_deadline" or str((e.get("waitBudget") or {}).get("code") or "") \
+        in LAND_NOT_JUDGED | LAND_HANDOFF_UNREAD
 # An "unreadable" answer holds no worker to learn nothing again (hq docs/handbook/read-with-one-quota-route.md: every
 # read on the land path has two routes, the first costing no quota). Its next judgment runs from this host's caches
 # (`explain --cache-only`, no read sent, no broker queue waited on, a local read of seconds); only a miss goes live,
@@ -15227,6 +15251,15 @@ class LandQueue:
         data = (c or {}).get("data") or {}
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
+        infra = e.pop("infraHandoff", None)
+        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED:
+            # a stop that only said GitHub could not be read here (infra_read_stop): the broker host reads it instead,
+            # unless the cache shows the unpinned head moved since (then it is judged here, at the new head)
+            head = str(infra.get("head") or "")
+            cached = str(data.get("headRefOid") or "").lower()
+            if SHA40.fullmatch(head) and (e.get("pinSha") or not SHA40.fullmatch(cached) or cached == head):
+                self.hand_off_now(e, head, str(infra.get("why") or "GitHub could not be read here"), "handoff_infra")
+                return
         pending, stopped = [], None
         for a in e.get("after") or []:
             ad = (self.cache_of(a) or {}).get("data") or {}
@@ -15278,8 +15311,11 @@ class LandQueue:
                 e.pop("noDataSince", None)
             return
         e.pop("noDataSince", None)
-        if e.get("pinSha") and not e.get("pinSeen") and self.pin_wait(e, c or {}, head):
-            return
+        if e.get("pinSha") and not e.get("pinSeen"):
+            if e.get("infraRetry") and e["state"] == "waiting" and float(e.get("wakeAt") or 0) > self.now:
+                return  # pin_unread's backoff (infra_read_stop): no read of the pin before it runs out
+            if self.pin_wait(e, c or {}, head):
+                return
         running = land_checks_running(data, head)
         kind = w.get("kind")
         if e["state"] == "queued":
@@ -16184,14 +16220,54 @@ class LandQueue:
         if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
             return False
         why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
-        self.history(e, "handoff_early", head=head[:12], why=why)
+        self.hand_off_now(e, head, why, "handoff_early", fp)
+        return True
+
+    def hand_off_now(self, e: dict, head: str, why: str, event: str, fp: str | None = None) -> None:
+        """Under the lock: hand E at its full HEAD to the broker host's land queue on a job of its own (job's EARLY),
+        with no judgment here and no wait for a worker or a pace slot; EVENT and WHY name it in E's history."""
+        self.history(e, event, head=head[:12], why=why)
         e["handoffDue"] = {"kind": "judgment", "head": head, "why": why, "reason": why}
-        e.update(state="judging", seen=fp)
+        e.update(state="judging", wait=None, wakeAt=None)
+        if fp is not None:
+            e["seen"] = fp
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
         self.submit(e["key"], self.job, e["key"], head, int(e.get("gen") or 0), True)
         self.changed_entries.discard(e["key"])
+
+    def infra_read_stop(self, e: dict, code: str, reason: str) -> bool:
+        """Under the lock, from stop: when stop CODE only says GitHub could not be read (LAND_INFRA_STOPS' comment),
+        do not stop E. A broker client with E's full head marks it for the broker host's land queue (infraHandoff,
+        handed off by consider on the next pass, off any job this runs in); any other host waits and judges again,
+        backed off per retry at one head. True when E was not stopped; False past LAND_INFRA_RETRY_CAP (or for a
+        stop that is a fact about the PR), and the caller stops it."""
+        if not land_infra_stop(e, code):
+            return False
+        pin = str(e.get("pinSha") or "").lower()
+        head = (pin if code == "pin_unread" else "") or str(e.get("head") or "").lower() \
+            or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        why = land_trim(f"{code}: {land_reason(reason, 160)}", 200)
+        hand = self.broker_client() and e.get("state") != LAND_FORWARDED and bool(SHA40.fullmatch(head)) \
+            and not land_head_moved(pin, head)
+        r = e.get("infraRetry") or {}
+        n = int(r.get("n") or 0) + 1 if r.get("head") == head else 1
+        if not hand and n > LAND_INFRA_RETRY_CAP:
+            return False
+        for held in ("waitBudget", "streak", "unreadRun", "unreadCacheFirst", "pinWait"):
+            e.pop(held, None)  # the wait was GitHub's, not the PR's: no strike, no spent budget (LAND_INFRA_STOPS)
+        if hand:
+            e["infraHandoff"] = {"head": head, "why": why, "code": code}
+            self.wait(e, {"kind": "retry", "why": f"{why}: handed to the broker host's land queue"}, 0.0)
+            log({"event": "land-infra-handoff", "key": e["key"], "code": code, "head": head[:12]})
+            return True
+        after = min(LAND_INFRA_RETRY_MAX, LAND_INFRA_RETRY_BASE * (2 ** (n - 1)))
+        e["infraRetry"] = {"head": head, "n": n, "code": code, "at": self.now}
+        self.history(e, "infra_retry", code=code, n=n, after=int(after), reason=land_reason(reason, 160))
+        self.wait(e, {"kind": "retry", "why": f"{why}: GitHub could not be read, again in {after:.0f} s "
+                      f"({n} of {LAND_INFRA_RETRY_CAP})"}, after)
+        log({"event": "land-infra-retry", "key": e["key"], "code": code, "n": n, "after": after})
         return True
 
     def unread_repeated(self, e: dict, answer: dict, head: str) -> bool:
@@ -17198,6 +17274,9 @@ class LandQueue:
 
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)
+        infra = land_infra_stop(e, code)
+        if infra and self.infra_read_stop(e, code, reason):
+            return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
@@ -17214,7 +17293,8 @@ class LandQueue:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
-        self.notify(e, e.get("requester") or "", msg)
+        # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
+        self.notify(e, e.get("requester") or "", msg, wake=not infra)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never

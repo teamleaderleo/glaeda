@@ -22778,6 +22778,12 @@ class LandTest(Base):
         machines = mock.patch.object(gg, "fleet_machines", lambda: frozenset({"host", "other"}), create=True)
         machines.start()
         self.addCleanup(machines.stop)
+        # An infra-read stop (LAND_INFRA_STOPS) on a host that is no broker client is retried before it stops; the
+        # tests of what such a stop says, re-arms and counts see it past that bound at once. The retries themselves:
+        # test_an_infra_read_stop_retries_with_backoff_wakes_nobody_and_stops_quietly_past_its_cap.
+        cap = mock.patch.object(gg, "LAND_INFRA_RETRY_CAP", 0)
+        cap.start()
+        self.addCleanup(cap.stop)
         self.t = NOW
         self.github_head = {}
         self.q = self.queue()
@@ -24768,19 +24774,20 @@ class LandTest(Base):
 
     def test_a_rearmed_stop_that_repeats_its_stop_tells_the_requester_once(self):
         # efficiency-scout pass 6, 2026-11-21: cmux#47074's session was woken 3 times in 19 h by retry_deadline, each
-        # the same unreadable webview verdict. The first stop is told; the re-armed ones that stop the same are not.
+        # the same unreadable webview verdict. The re-armed ones that stop the same are marked repeats. This
+        # retry_deadline only says GitHub could not be read (LAND_INFRA_STOPS), so none of them is told at all.
         e = self.stop_retry_deadline()
         stops = lambda: [c for c in self.w.sent() if " stopped: " in " ".join(c)]  # noqa: E731
-        self.assertEqual(len(stops()), 1)
+        self.assertEqual(len(stops()), 0)
         for n in range(1, gg.LAND_REARM_CAP + 1):
             self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "after_s": 60}))
             self.tick(gg.LAND_REARM_AFTER)
             e = self.tick()
             self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertEqual(len(stops()), 1)
+        self.assertEqual(len(stops()), 0)
         self.assertEqual([h.get("quiet") for h in e["history"] if h["event"] == "stopped"][-gg.LAND_REARM_CAP:],
                          ["repeat"] * gg.LAND_REARM_CAP)
-        # a land by hand is a new ask: its stop is told again
+        # a land by hand is a new ask: its stop is no repeat (and, an unread GitHub, still not told)
         self.land()
         self.w.answers += [refusal("unreadable", LA, {"kind": "retry", "after_s": 60})] * 13
         e = self.tick()
@@ -24789,7 +24796,8 @@ class LandTest(Base):
                 break
             e = self.tick(gg.LAND_RETRY_MAX + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retry_deadline"))
-        self.assertEqual(len(stops()), 2)
+        self.assertNotEqual(e["history"][-1].get("quiet"), "repeat")
+        self.assertEqual(len(stops()), 0)
 
     def test_land_stop_repeats_reads_code_head_and_reason_without_counts(self):
         last = {"code": "retry_deadline", "head": "abc", "reason": "waited 10152 s (deadline 7200 s, 3 judgments)"}
@@ -27664,7 +27672,7 @@ class LandTest(Base):
     def test_the_same_raised_unreadable_three_times_stops_naming_it_to_its_requester(self):
         """gcp-agent-lane-1, 2026-11-21: 26 of 38 judgments in 2 h ended "unreadable" and were retried, each holding a
         worker to learn nothing new (cmux#49035: the same KeyError on every pass). The same raised error text at one
-        head LAND_UNREAD_SAME_STOP times in a row stops the entry, that error named to its requester; each judgment
+        head LAND_UNREAD_SAME_STOP times in a row stops the entry, that error named in its stop (no wake); each judgment
         between went to the caches first (they miss here), then live."""
         self.pr(LA)
         self.land()
@@ -27680,7 +27688,7 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["code"], "unreadable_repeated")
         self.assertIn("KeyError: 'statusCheckRollup'", e["stop"]["reason"])
         self.assertIn(f"{gg.LAND_UNREAD_SAME_STOP} times in a row", e["stop"]["reason"])
-        self.assertTrue(any("KeyError" in c[-1] for c in self.w.sent()), self.w.sent())
+        self.assertEqual(self.w.sent(), [])  # a read that failed: its requester cannot act on it (LAND_INFRA_STOPS)
         explains = [c for c in self.w.calls if c[1:3] == [self.w.mh, "explain"]]
         self.assertEqual(sum(1 for c in explains if "--cache-only" in c), gg.LAND_UNREAD_SAME_STOP - 1)
         self.assertEqual(sum(1 for c in explains if "--cache-only" not in c), gg.LAND_UNREAD_SAME_STOP)
@@ -27923,6 +27931,79 @@ class LandTest(Base):
             self.w.set_pr(key, land_pr(self.fresh_head), self.t)
             return None
         self.q.refresh = refresh
+
+    def pin_reads_fail(self, n: int = 1) -> dict:
+        """A pinned land (--sha LB, cache at LA) whose every direct read fails, ticked until its Nth infra retry, its
+        hand-off or its end."""
+        e = self.tick(1)
+        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+            e = self.tick(1)
+            if (e.get("infraRetry") or {}).get("n") == n or e.get("infraHandoff") or e["state"] in gg.LAND_DONE:
+                break
+        return e
+
+    def test_an_infra_read_stop_retries_with_backoff_wakes_nobody_and_stops_quietly_past_its_cap(self):
+        """Leo, 2026-11-22: "if huge-blue is so weak and liable to falling over, then don't put so much reliance on
+        it". huge-blue, 2026-11-21/22: 13 pin_unread stops of 6 lands and 3 retry_deadline stops ("still host_cap"),
+        each a wake of its requester for a GitHub it could not read. On the broker host such a stop is a backed-off
+        retry with no strike, no budget spent and no wake; past LAND_INFRA_RETRY_CAP it stops, still quietly."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append), mock.patch.object(gg, "LAND_INFRA_RETRY_CAP", 2):
+            e = self.pin_reads_fail()
+            self.assertEqual((e["state"], e["infraRetry"]["n"], e["infraRetry"]["code"]), ("waiting", 1, "pin_unread"))
+            self.assertEqual(e["wakeAt"] - self.t, gg.LAND_INFRA_RETRY_BASE)
+            self.assertIsNone(e.get("pinWait"))
+            [h] = [h for h in e["history"] if h.get("event") == "infra_retry"]
+            self.assertEqual((h["n"], h["after"]), (1, int(gg.LAND_INFRA_RETRY_BASE)))
+            reads = len(self.w.refreshed)
+            e = self.tick(gg.LAND_INFRA_RETRY_BASE - 10)
+            self.assertEqual(len(self.w.refreshed), reads)  # no read of the pin inside the backoff
+            self.tick(11)
+            e = self.pin_reads_fail(2)
+            self.assertEqual((e["state"], e["infraRetry"]["n"]), ("waiting", 2))
+            self.assertEqual(e["wakeAt"] - self.t, 2 * gg.LAND_INFRA_RETRY_BASE)
+            self.tick(2 * gg.LAND_INFRA_RETRY_BASE + 1)
+            for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+                e = self.tick(1)
+                if e["state"] == "stopped":
+                    break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pin_unread"))
+        self.assertEqual(self.w.sent(), [])  # never woken, not even by the stop past the cap
+        self.assertEqual([d["event"] for d in logged if d.get("event", "").startswith("land-infra")],
+                         ["land-infra-retry", "land-infra-retry"])
+        self.assertTrue([d for d in logged if d.get("event") == "land-notice-quiet" and "pin_unread" in d["message"]])
+        self.assertEqual(self.w.explains(), [])
+
+    def test_an_infra_read_stop_on_a_lane_vm_hands_the_land_to_the_broker_host_at_its_pin(self):
+        # A lane VM that cannot read the PR to see its pin hands it at that pin to the broker host, which reads it
+        # with its own login, instead of stopping pin_unread and waking the lane.
+        self.broker = True
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LB)
+        self.pin_reads_fail()
+        e = self.tick(1)
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4])["sha"], LB)
+        self.assertEqual((e["state"], e.get("forwardedTo"), e.get("stop")), ("forwarded", "huge-blue", None))
+        [h] = [h for h in e["history"] if h.get("event") == "handoff_infra"]
+        self.assertTrue(h["why"].startswith("pin_unread: "), h)
+        self.assertFalse(any(h.get("event") == "stopped" for h in e["history"]), e["history"])
+        self.assertEqual(self.w.sent(), [])
+        self.assertEqual(self.w.explains(), [])
+        self.broker = False
+
+    def test_a_retry_deadline_on_the_prs_own_state_still_stops_and_tells(self):
+        # Only a wait on an answer that judged nothing (LAND_NOT_JUDGED) is GitHub's; a retry the PR's own state names
+        # (regen_retry, train_wait) is the requester's to act on, as before.
+        self.assertTrue(gg.land_infra_stop({"waitBudget": {"code": "host_cap"}}, "retry_deadline"))
+        self.assertTrue(gg.land_infra_stop({"waitBudget": {"code": "unreadable"}}, "retry_deadline"))
+        self.assertFalse(gg.land_infra_stop({"waitBudget": {"code": "train_wait"}}, "retry_deadline"))
+        self.assertTrue(gg.land_infra_stop({}, "webview_unreadable"))
+        self.assertFalse(gg.land_infra_stop({}, "own_red"))
 
     def test_a_pinned_land_whose_reads_are_refused_for_quota_holds_until_the_reset_and_reads_again(self):
         """cmuxterm-hq#16608, 2026-11-21 23:05Z and 23:15Z: stopped pin_unread on "3 direct reads of the PR failed, the
