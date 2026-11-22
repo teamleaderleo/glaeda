@@ -26256,6 +26256,18 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
 
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertNotIn("unionMerge", e)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
     def test_a_conflict_outside_union_files_still_stops_and_pushes_nothing(self):
         head, _ = self.union_origin(attrs="docs/*.md merge=union\n")
         e = self.union_conflict_tick(head)

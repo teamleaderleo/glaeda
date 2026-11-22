@@ -16823,8 +16823,8 @@ class LandQueue:
     def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
                   e: dict | None = None) -> subprocess.CompletedProcess:
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
-        pre = [f"--attr-source={attrs}"] if attrs else []
-        return self.call([git, *pre, "--git-dir", gitdir, *args], timeout, e)
+        pre = [f"--attr-source={attrs}"] if attrs else []  # core.attributesFile off: only that tree's attributes
+        return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e)
 
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
         """(merge commit, the PR's branch, base sha, "") when HEAD's conflict with its base is in merge=union paths
@@ -16854,7 +16854,8 @@ class LandQueue:
         else:
             got = self.union_git(gitdir, "fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", *refs,
                                  timeout=LAND_FETCH_DEADLINE)
-        if got.returncode != 0:
+        if got.returncode != 0:  # decided nothing about the head: a re-land at it tries again (unionMerge dropped)
+            e["unionMerge"]["retry"] = True
             return "", "", "", f"the fetch of {base} and {branch} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
         got = self.union_git(gitdir, "rev-parse", f"refs/remotes/origin/{branch}^{{commit}}",
                              f"refs/remotes/origin/{base}^{{commit}}")
@@ -16869,24 +16870,24 @@ class LandQueue:
         if empty.returncode != 0 or not SHA40.fullmatch((empty.stdout or "").strip()):
             return "", "", "", f"no empty tree in {gitdir}: {land_trim(empty.stderr, 160)}"
         # What GitHub saw: the merge with no attributes. Its conflicted paths are the ones that must all be union.
-        bare = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", head, base_sha,
-                              attrs=empty.stdout.strip())
+        bare = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
+                              base_sha, attrs=empty.stdout.strip())
         if bare.returncode == 0:
             return "", "", "", "the merge with no attributes is clean here, so the conflict is not one union settles"
         if bare.returncode != 1:
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(bare.stderr or ''), 160)}"
-        paths = [p for p in (bare.stdout or "").split("\n")[1:] if p.strip()]
+        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p]  # -z: tree, then NUL-ended paths, unquoted
         if not paths:
             return "", "", "", "git merge-tree named no conflicted path"
-        attr = self.union_git(gitdir, "check-attr", "merge", "--", *paths, attrs=base_sha)
-        union = {line.rsplit(": merge: ", 1)[0] for line in (attr.stdout or "").splitlines()
-                 if line.endswith(": merge: union")}
+        attr = self.union_git(gitdir, "check-attr", "-z", "merge", "--", *paths, attrs=base_sha)
+        words = (attr.stdout or "").split("\0")  # -z: path NUL attribute NUL value NUL, per path
+        union = {words[i] for i in range(0, len(words) - 2, 3) if words[i + 1] == "merge" and words[i + 2] == "union"}
         other = [p for p in paths if p not in union]
         if attr.returncode != 0 or other:
             return "", "", "", (f"{len(other)} conflicted path(s) are not merge=union in {base}'s .gitattributes: "
                                 f"{land_trim(', '.join(other), 160)}")
         merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--no-messages", head, base_sha, attrs=base_sha)
-        tree = (merged.stdout or "").split("\n", 1)[0].strip()
+        tree = (merged.stdout or "").split("\0", 1)[0].split("\n", 1)[0].strip()
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"the merge honoring {base}'s .gitattributes still conflicts: {land_trim(merged.stdout, 160)}"
         msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a conflict in "
@@ -16897,7 +16898,7 @@ class LandQueue:
         sha = (commit.stdout or "").strip()
         if commit.returncode != 0 or not SHA40.fullmatch(sha):
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
-        e["unionMerge"].update(paths=paths[:20], base=base_sha, gitdir=gitdir)
+        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
         return sha, branch, base_sha, ""
 
     def union_merge(self, e: dict, head: str) -> None:
@@ -16912,6 +16913,8 @@ class LandQueue:
             sha, branch, base_sha, why = "", "", "", describe(error)
         if why:
             with self.lock:
+                if (e.get("unionMerge") or {}).get("retry") or why.startswith("git ") or "timed out" in why:
+                    e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, "update_branch", head, said, why)
             return
@@ -16921,8 +16924,9 @@ class LandQueue:
             e["updateSent"] = {"head": head, "at": self.now}
             self.save(e)
         if self.broker_client():
-            argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--rev", sha,
-                    "--dir", gitdir]
+            # The broker pushes only a branch this lane pushed before: another lane's PR is refused, and stops below.
+            argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--base",
+                    str(e["unionMerge"].get("baseRef") or ""), "--rev", sha, "--dir", gitdir]
             got = self.call(argv, LAND_GH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
@@ -16931,6 +16935,10 @@ class LandQueue:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             self.nudge(e["key"])
+            if got.returncode == 124:  # sent, unanswered: it may have reached GitHub (push_step keeps it sent too)
+                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12])
+                self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                return
             if got.returncode != 0:
                 e.pop("updateSent", None)
                 why = f"the push of the union merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
