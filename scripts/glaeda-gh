@@ -12257,7 +12257,7 @@ def land_worker_ceiling(cores: int | None = None) -> int:
 
 
 # The pool grows to what the queue needs and GitHub answers, never to a count set by hand (LandQueue.adapt_pool). It
-# starts at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
+# starts where the daemon before it left off (land_pool_start), else at land_worker_ceiling; every LAND_POOL_ADAPT_S a pool that was full with due rows left waiting for a worker
 # (gated) grows by LAND_POOL_GROW (at least one worker), and a quota refusal since the last step (park_quota,
 # park_queue_quota) halves it, as TCP's congestion window does. A judgment is land_judge waiting on GitHub, not on the
 # host: huge-blue, 2026-11-22 09:58Z, 17 land_judge/classifier processes held 1,109 MB (about 65 MB each) at 0.1-11%
@@ -12294,6 +12294,24 @@ def land_pool_max(mem_mb: int | None = None) -> int:
     return max(floor, int(mem) // 2 // LAND_JUDGE_MEM_MB)
 
 
+def land_pool_start(pool: Any, now: float, ceiling: int | None = None) -> float:
+    """Where a new daemon's adaptive pool starts: the size its last land-pool line POOL (LAND_POOL_FILE) said, when
+    that line is at most LAND_ROOM_FRESH old, never over the memory ceiling (land_pool_max); else land_worker_ceiling.
+    A re-exec keeps the size the pool grew (or halved) to. huge-blue re-execs its daemon every 10-30 min (glaeda
+    updates): 2026-11-22, with land.json's "workers" removed at 12:28Z, the pool grew 16 -> 20 -> 25, a re-exec at
+    12:39Z put it back at 16, under the fixed 32 it replaced, and the override went back (hq#18502)."""
+    start = float(land_worker_ceiling())
+    if not isinstance(pool, dict):
+        return start
+    stamps = [float(v) for v in (pool.get("at"), pool.get("sizeAt"))
+              if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    size = pool.get("workers")
+    if (not stamps or now - max(stamps) > LAND_ROOM_FRESH or not isinstance(size, int) or isinstance(size, bool)
+            or size < 1):
+        return start
+    return float(min(size, land_pool_max() if ceiling is None else ceiling))
+
+
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
 # handbook's headroom line) held every judgment past the first while the host's load per core was over it, and later
 # (glaeda#2457) its busy CPU share. A judgment is land_judge waiting on GitHub: what it costs does not move with the
@@ -12316,6 +12334,16 @@ LAND_EXPLAIN_DEADLINE_CLIENT = 300.0
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
+# A land notice that acpmux refuses is sent again, LAND_NOTIFY_RETRY_S apart, up to LAND_NOTIFY_TRIES in all, off the
+# tick. One refused send used to be the only send: the merged or stopped word never reached its lane, which then
+# waited on a land that had ended. gcp-agent-lane-13, 2026-11-21 10:36Z-11-22 09:15Z: 58 land-notify-failed, 57 of
+# them "acpmux: runtime: empty prompt", spread over the day (about 2 an hour), none reproducible with the same argv on
+# a later acpmux; huge-blue logged 1,893 against 976 land-pool lines.
+LAND_NOTIFY_TRIES = 3
+LAND_NOTIFY_RETRY_S = 5.0
+# A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
+# "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
+LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -12688,6 +12716,16 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A judgment that merged the base into the PR itself: land_judge's stale_main_update and stale_ci_update (leo-workspace
+# tools/land_judge/engine.py) send update_branch pinned to the judged head inside the judgment and answer the running
+# checks' wait at that head ("checks still running at HEAD: main (TIP) was merged into the PR: ..."). The queue never
+# sent it, so nothing recorded it (updateSent), and the head the merge made stopped the pinned land head_moved:
+# teamleaderleo/glaeda#2495 (pinned 5bc3ba9e, base merge 0b53d1a3 by the lander bot at 12:03:42Z, 31 s after a
+# judgment) and manaflow-ai/cmuxterm-hq#18096 (pinned f2a95491, 1b282104 at 12:53:30Z, 21 s after one), 2026-11-22; each
+# re-queued by hand. note_judge_update records it as this queue's own (updateSent at HEAD), so follow_own_update's
+# parent check moves the pin to that merge and judges it in full, and any other head still stops head_moved.
+LAND_JUDGE_BASE_MERGED = re.compile(r"checks still running at ([0-9a-f]{40}): (?:the base )?\S+ \([0-9a-f]{7,40}\) "
+                                    r"was merged into the PR\b")
 LAND_STEP_NEXT_UPDATE = re.compile(r"\bnext: (?:gh pr update-branch \d+|gh api -X PUT \S*/pulls/\d+/update-branch)")
 LAND_STEP_NEXT_WAIT = re.compile(r"\bnext: glaeda-gh wait pr \S+[^\n;]*?(?:--timeout (\d+))?(?=\s*(?:\(|$|\n|;))")
 LAND_STEP_CODE = re.compile(r"\brefused \[([a-z_]+)")
@@ -13262,9 +13300,12 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
     the environment is a session here: a sub-session's PARENT/CHILD gets this host too (acpmux send takes
     HOST/PARENT/CHILD), unless its first part is a fleet machine (a peer's session name, HOST/NAME)."""
     name, source = (given.strip(), "--notify") if given and given.strip() else ("", "")
+    if name.lower() in LAND_NO_REQUESTER:
+        return "", ""
     if not name:
         name, source = next(((os.environ[k].strip(), "$" + k) for k in LAND_REQUESTER_KEYS
-                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG), ("", ""))
+                             if os.environ.get(k, "").strip() and os.environ[k].strip() != LAND_TAG
+                             and os.environ[k].strip().lower() not in LAND_NO_REQUESTER), ("", ""))
     if not name:
         return "", ""
     if source != "--notify":
@@ -13287,7 +13328,7 @@ def land_notify_target(e: dict, requester: str) -> str:
     empty so notify logs one land-unnotified event instead of retrying a bad
     destination.
     """
-    if requester:
+    if requester and requester.rsplit("/", 1)[-1].lower() not in LAND_NO_REQUESTER:  # an older entry's HOST/none
         return requester
     queued_by = str(e.get("queuedBy") or "")
     parent = queued_by.split(":agent:", 1)[0]
@@ -13914,7 +13955,8 @@ class LandQueue:
         self.latch_free_seen: dict[str, tuple[float, bool, str]] = {}
         self.snapshot_waiting: set[str] = set()  # keys with a snapshot wait, run out or not (judge's cap)
         self.pool: Any = None
-        self.pool_size = float(land_worker_ceiling())  # the adaptive pool's size (adapt_pool), unless land.json sets one
+        # the adaptive pool's size (adapt_pool), unless land.json sets one: where the last daemon left it (land_pool_start)
+        self.pool_size = land_pool_start(read_json(land_dir() / LAND_POOL_FILE), time.time())
         self.pool_adapted = 0.0  # when adapt_pool last stepped
         self.quota_refused = float("-inf")  # the last quota refusal (park_quota, park_queue_quota): adapt_pool halves
         self.now = time.time()
@@ -15105,11 +15147,13 @@ class LandQueue:
     def adapt_pool(self) -> None:
         """Every LAND_POOL_ADAPT_S, step the adaptive pool (the comment above LAND_POOL_ADAPT_S): halve it after a
         quota refusal, else grow it while it is full and due rows waited for a worker this pass; logged as land-pool-
-        size when it moves. land.json "workers" fixes it instead."""
+        size when it moves, and kept in LAND_POOL_FILE at once, so a daemon started next takes it (land_pool_start).
+        land.json "workers" fixes it instead, and the adaptive size follows it: one taken out goes on from there."""
         if self.now - self.pool_adapted < LAND_POOL_ADAPT_S:
             return
         last, self.pool_adapted = self.pool_adapted, self.now
         if self.config().get("workers") is not None:
+            self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
         if self.quota_refused > last:
@@ -15121,6 +15165,10 @@ class LandQueue:
         if int(size) != int(self.pool_size):
             log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
                  "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
+            line = read_json(land_dir() / LAND_POOL_FILE)
+            with contextlib.suppress(OSError):  # the pool line says the new size now, not at its next LAND_POOL_LOG_EVERY
+                write_json(land_dir() / LAND_POOL_FILE, {**(line if isinstance(line, dict) else {}),
+                                                         "workers": max(1, int(size)), "sizeAt": self.now})
         self.pool_size = size
 
     def headroom_left(self) -> tuple[float, float]:
@@ -16458,7 +16506,12 @@ class LandQueue:
             counts = counts and not e.pop("stepQuotaParked", False)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
+        # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
+        # so without this line no log on the land host says how long a judgment took, and a change meant to make
+        # judgments faster (one mirror fetch per head) has no before or after to read.
+        started = time.monotonic()
         answer = self.explain(e, sha)
+        took = round(time.monotonic() - started, 1)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, land_judge read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
@@ -16493,7 +16546,11 @@ class LandQueue:
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
+            log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
+                 "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
+                 "why": why or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
+            self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
@@ -16543,6 +16600,19 @@ class LandQueue:
                 return
             self.save(e)
         self.take(e, act, answer)
+
+    def note_judge_update(self, e: dict, answer: dict, head: str) -> None:
+        """Under the lock: when the judgment of E at HEAD merged the base into the PR itself (LAND_JUDGE_BASE_MERGED,
+        sent pinned to HEAD), record it as this queue's own update at HEAD (updateSent), as update_branch does when it
+        sends one. The merge it makes then follows the pin (follow_own_update: its parents include HEAD) instead of
+        stopping head_moved, and no second update is sent at HEAD (LAND_UPDATE_ONCE)."""
+        m = LAND_JUDGE_BASE_MERGED.search(str(answer.get("reason") or ""))
+        if not m or m.group(1) != head or not SHA40.fullmatch(head or ""):
+            return
+        if str((e.get("updateSent") or {}).get("head") or "").lower() == head:
+            return
+        e["updateSent"] = {"head": head, "at": self.now, "by": "land_judge"}
+        self.history(e, "update_by_judge", head=head[:12])
 
     def unjudgeable_here(self, e: dict, answer: dict, act: dict, head: str) -> str:
         """Under the lock: why this lane VM should hand E at HEAD to the broker host's land queue instead of judging it
@@ -17857,13 +17927,21 @@ class LandQueue:
                 "--class", LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
-            got = self.call(argv, LAND_NOTIFY_DEADLINE)
-            if got.returncode != 0:
-                why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
-                log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why})
-                with contextlib.suppress(Exception):
-                    self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
-                                {"to": to, "why": why, "pr": self.url(e)})
+            whys: list[str] = []
+            for tried in range(1, LAND_NOTIFY_TRIES + 1):
+                got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                if got.returncode == 0:
+                    if whys:
+                        log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
+                    return
+                whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if tried < LAND_NOTIFY_TRIES:
+                    time.sleep(LAND_NOTIFY_RETRY_S)
+            why = whys[-1]
+            log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why, "tries": len(whys)})
+            with contextlib.suppress(Exception):
+                self.notice("land-notify-failed", "warn", f"glaeda land could not tell {to}: {message}",
+                            {"to": to, "why": why, "pr": self.url(e)})
         if self.inline:
             send()
         else:

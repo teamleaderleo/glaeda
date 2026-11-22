@@ -98,6 +98,9 @@ target_margin_gib. The runner's next job clones it again. Before that, on every 
 fleet mini, runner-checkout-repack folds a checkout's packs with `git repack -a -d -k -l` (keeps every object) once
 it has 40 or more, while its runner has no Runner.Worker and its git dir was quiet for 10 minutes: jobs fetch
 into it with gc.auto=0 (cmux's nightly.yml writes it), so git never consolidates them itself.
+A runner's own _work/_temp is emptied by the runner around each job, but a job it never finished (killed, a reboot
+mid-job) leaves its scratch there: runner-temp (a pool runner) and dedicated-runner-temp take each entry once idle an
+hour, runner-temp only while its runner has no Runner.Worker; the file-command dirs and ci-derived-data's stay.
 
 Tests leave one small scratch entry per case in the runner user's $TMPDIR (cmux-cli-socket-<uuid>,
 git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under the 50 MiB item floor, so no
@@ -859,6 +862,18 @@ def toolchain_held(path: Path, fresh: bool = False) -> bool:
 ROLE_KEEP_MARKER = ".glaeda-keep.json"
 # What a dedicated runner's jobs leave in its _work/_temp: goes once idle DEFAULT_AGE_HOURS (default_families)
 DEDICATED_RUNNER_TEMP = "dedicated-runner-temp"
+# What a pool runner's jobs leave in its _work/_temp: the runner empties it around each job, but a job the runner
+# never finished (killed, the host rebooted mid-job) leaves its scratch there, and every enrolled runner of a mini
+# shares one disk (cmux17's actions-runner-glaeda-2, 2026-11-22: "No space left on device" in _work/_temp). Goes
+# once idle DEFAULT_AGE_HOURS, only while that runner has no Runner.Worker (runner_job_live), like its checkout's
+# build output.
+RUNNER_TEMP_FAMILY = "runner-temp"
+RUNNER_TEMP_SKIP = ("_github_home", "_github_workflow", "_runner_file_commands")
+
+
+def runner_temp_runner(fam: "Family") -> Path:
+    """The runner directory whose _work/_temp is FAM's root."""
+    return fam.root.parent.parent
 
 
 def real_runner_dir(runner: Path) -> bool:
@@ -5782,14 +5797,22 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                 fams.append(Family("ci-derived-data", temp, True, "the CI test job rebuilds it",
                                    include=("cmux-derived-data-tests-",), build_output=True,
                                    owner="cmux CI test jobs", rebuild_minutes=6, platform="macos"))
-                if (runner.name.startswith("actions-runner-glaeda-") and real_runner_dir(runner)
-                        and not (runner / "_work").is_symlink() and not temp.is_symlink()
+                if not (real_runner_dir(runner) and not (runner / "_work").is_symlink() and not temp.is_symlink()):
+                    continue  # a _temp reached through a link is some other tree's
+                if (runner.name.startswith("actions-runner-glaeda-")
                         and (runner / "glaeda-hooks/dedicated-admit.sh").is_file()):
                     # a dedicated runner (its admission wrapper): what its jobs leave in _temp goes by age
                     fams.append(Family(DEDICATED_RUNNER_TEMP, temp, True, "the next job writes its own _temp",
-                                       files=True, skip=("_github_home", "_github_workflow", "_runner_file_commands"),
+                                       files=True, skip=RUNNER_TEMP_SKIP,
                                        skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's
                                        min_idle_hours=DEFAULT_AGE_HOURS, owner="the dedicated runner's jobs",
+                                       rebuild_minutes=0.1, platform="macos"))
+                else:
+                    # a pool runner: what an unfinished job left goes by age, never while the runner has a job
+                    fams.append(Family(RUNNER_TEMP_FAMILY, temp, True, "the next job writes its own _temp",
+                                       files=True, skip=RUNNER_TEMP_SKIP,
+                                       skip_prefixes=("cmux-derived-data-tests-",),  # ci-derived-data's
+                                       min_idle_hours=DEFAULT_AGE_HOURS, owner="the pool runner's jobs",
                                        rebuild_minutes=0.1, platform="macos"))
         # The runner mini's full cmux git mirror (glaeda-git-mirror), kept by role: jobs fetch their commit from it
         # instead of GitHub, and a reseed is a 2.4 GB bundle download. About 2.2 GiB, grown only by new commits.
@@ -10672,6 +10695,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == DEDICATED_RUNNER_TEMP:  # a job's scratch can be wider than the budget; a running job is seen by
         return False                     # its processes and open files, and nothing here is younger than 12 h
+    if fam.id == RUNNER_TEMP_FAMILY:  # as above; its runner's Runner.Worker is its in-use signal
+        return False
     if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)
                                          or cmux_next_ci_host_root(fam, path) or cmux_next_ci_tui_tree(fam, path)):
         return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
@@ -11788,6 +11813,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             if busy_reason := cmux_next_ci_busy(fam, path, opened, cmds):
                 reasons.append(busy_reason)
         if fam.id == RUNNER_BUILD_FAMILY and not blind and (why := runner_job_live(fam.root.parent, cmds)):
+            reasons.append(why)
+        if fam.id == RUNNER_TEMP_FAMILY and not blind and (why := runner_job_live(runner_temp_runner(fam), cmds)):
             reasons.append(why)
         if fam.id == RUNNER_ROOT_ADMISSION and not blind and (why := runner_root_job_live(path, cmds)):
             reasons.append(why)
@@ -14644,7 +14671,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             cwds = open_index(opened)
         if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
-        if fam.id in (RUNNER_BUILD_FAMILY, NIGHTLY_NEXT_FAMILY) or fam.app_clones:
+        if fam.id in (RUNNER_BUILD_FAMILY, RUNNER_TEMP_FAMILY, NIGHTLY_NEXT_FAMILY) or fam.app_clones:
             # the runner may have taken a job since the survey (its Runner.Worker shows in a fresh ps), or an
             # app may have started from a clone: a running app names only its installed path, so ps it is
             cmds = command_lines()
@@ -14690,6 +14717,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
                 or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
+                or (fam.id == RUNNER_TEMP_FAMILY and runner_job_live(runner_temp_runner(fam), cmds))
                 or (fam.id == RUNNER_ROOT_ADMISSION and runner_root_job_live(p, cmds))
                 or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
