@@ -10033,7 +10033,7 @@ class MemoryCapTest(unittest.TestCase):
         gib = 1 << 30
         cap = hook.MemoryCap(2560, 5120, 600.0)
         self.assertEqual((cap.swap_pct, cap.swap_resume_pct), (50.0, 35.0))
-        # 2026-11-21 cmux8s-mac-mini: 20.5 of 23.5 GB used with plenty "reclaimable" and pressure 1
+        # 2026-11-21 a 48 GiB mini: 20.5 of 23.5 GB used with plenty "reclaimable" and pressure 1
         busy = (int(20.5 * gib), int(23.5 * gib))
         self.assertIn("swap 20.5 of 23.5 GiB", hook.memory_short(cap, False, 9000, 1, busy) or "")
         self.assertIn("swap 16.0 of 16.4 GiB", hook.memory_short(cap, False, 9000, 1, (16 * gib, int(16.4 * gib))) or "")

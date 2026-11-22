@@ -533,7 +533,7 @@ What `--apply` does:
        are exempt; the gui and session runners are not, as they are held for memory pressure too.
        **Swap used** (2026-11-21): the same hold applies while swap used is `swapUsedPct` (50) of the swap total or more
        and at least `swapMinGiB` (2), and listens again under `resumeSwapUsedPct` (35); unreadable swap holds nothing, `swapUsedPct` 0 or
-       `GLAEDA_RUNNER_SWAP_USED_PCT=off` (or a percent) in the runner's environment turns it off or sets it. cmux8s-mac-mini (48 GiB, 14
+       `GLAEDA_RUNNER_SWAP_USED_PCT=off` (or a percent) in the runner's environment turns it off or sets it. a 48 GiB mini (14
        listeners) reached load 527 with 20.5 of 23.5 GB of swap used while pressure and reclaimable memory looked fine; macOS's
        out-of-application-memory alert then wedged the GUI. It changes no capacity (listeners, 90%/95% targets); it only defers new starts.
        `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needPct` or `needGiB`,

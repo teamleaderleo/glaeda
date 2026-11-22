@@ -9221,7 +9221,7 @@ MEMORY_CAP_STAGGER_S = float(os.environ.get("GLAEDA_RUNNER_MEMORY_CAP_STAGGER_S"
 MEMORY_CAP_START_FILE = "mem-cap-start"
 MEMORY_CAPPED = "a new job will not fit in this mini's memory"
 # SWAP_HOLD (2026-11-21, Leo 11-17: "don't pull back just add more"; 11-19: "stretch everything till it's at like...
-# 90% cpu/ram"): cmux8s-mac-mini (48 GiB, 14 listeners) hit load 527 with 20.5 of 23.5 GB of swap used, then 21.8 of
+# 90% cpu/ram"): a 48 GiB mini (14 listeners) hit load 527 with 20.5 of 23.5 GB of swap used, then 21.8 of
 # 23.5 GB, and macOS's out-of-application-memory alert wedged the GUI. Pressure level and reclaimable pages did not
 # say so in time. So the memory cap also holds a new job while swap USED is SWAP_USED_PCT of the swap total or more
 # (and at least SWAP_MIN_GIB, so a small swap file at idle never holds), and listens again below SWAP_RESUME_PCT.
