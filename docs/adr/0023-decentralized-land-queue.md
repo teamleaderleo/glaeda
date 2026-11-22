@@ -6,7 +6,7 @@ Proposed. Phase 0 (the per-PR lease store and the merge fence, off by default) s
 
 ## Context
 
-Leo, 2026-11-22 08:00Z: "then you guys should've never centralized a merge queue on huge-blue in the first place, and should have fixed this far in advance in the first place, and actually measured wtf refusing above cores even means."
+Leo, 2026-11-22 08:00Z: "then you guys should've never centralized a merge queue on huge-blue in the first place, and should have fixed this far in advance in the first place, and actually measured w\*\* refusing above cores even means."
 
 At 2026-11-22 07:59Z, huge-blue's own land entries showed this:
 
