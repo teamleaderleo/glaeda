@@ -4335,6 +4335,67 @@ class BalanceTest(Base):
         self.assertTrue(again and all(c[2].get("If-None-Match") for c in again if "/pulls/" in c[1] or sha in c[1]), again)
         self.assertEqual(self.gh.rest_remaining, spent)  # every one answered 304
 
+    def test_a_broker_answer_with_no_etag_keeps_the_kept_etag_while_it_says_the_same(self) -> None:
+        """broker_transport answers no ETag. A pulls/N, check-suites or check-runs answer through it stored etag None
+        over the kept ETag, so the next read-token read of that path asked unconditional (a counted 200). The same
+        slimmed answer keeps the kept ETag; a changed one still stores no ETag, which vouches for nothing."""
+        path = "/repos/o/r/commits/" + "a" * 40 + "/check-suites?per_page=100"
+        doc = {"total_count": 1, "check_suites": [{"id": 5, "status": "in_progress", "conclusion": None,
+                                                   "latest_check_runs_count": 2}]}
+        old = {path: {"etag": '"kept"', "doc": gg.slim_check_suites(doc)}}
+        new: dict = {}
+        with mock.patch.object(self.daemon, "get", return_value=("fresh", doc, None)):
+            self.daemon.rest_part(old, new, path, gg.slim_check_suites)
+        self.assertEqual(new[path]["etag"], '"kept"')
+        changed = {**doc, "check_suites": [{**doc["check_suites"][0], "status": "completed", "conclusion": "success"}]}
+        new = {}
+        with mock.patch.object(self.daemon, "get", return_value=("fresh", changed, None)):
+            self.daemon.rest_part(old, new, path, gg.slim_check_suites)
+        self.assertIsNone(new[path]["etag"])
+        self.assertEqual(new[path]["doc"], gg.slim_check_suites(changed))
+
+    def test_unchanged_check_suites_skip_the_check_run_read_within_the_full_read_bound(self) -> None:
+        """A full REST read (here after an upstream copy, as a lane VM's direct read finds it) whose check suites answer
+        304 takes the kept check-run pages and asks nothing for them, while those were read within PR_REST_FULL_EVERY;
+        a run that moves its suite, or the bound passing, reads them again."""
+        running = {**workflow_check("test", 11), "status": "IN_PROGRESS", "conclusion": None}
+        lint = {**workflow_check("lint", 12, workflow="Lint"), "status": "IN_PROGRESS", "conclusion": None}
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="PENDING", checks=[workflow_check("build", 11), running, lint])
+        sha = self.gh.prs[("o", "r", 4)]["headRefOid"]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        key = gg.parse_key("pr", "o/r#4")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        runs_reads = lambda: [c for c in self.gh.rest_calls() if f"/commits/{sha}/check-runs" in c[1]]  # noqa: E731
+        suite_reads = lambda: [c for c in self.gh.rest_calls() if f"/commits/{sha}/check-suites" in c[1]]  # noqa: E731
+        self.assertEqual(len(runs_reads()), 1)
+
+        def again(at: float) -> None:
+            self.daemon.store(key, gg.read_cache(key), via="upstream")  # not the gate's: a full read follows
+            gg.register(key)
+            os.utime(gg.watch_dir() / gg.file_name(key), (at, at))  # interest as of AT
+            self.daemon.tick(at)
+
+        before, spent = len(suite_reads()), self.gh.rest_remaining
+        again(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(suite_reads()), before + 1)
+        self.assertEqual(len(runs_reads()), 1, "the suites answered 304: the kept check runs stand")
+        self.assertEqual(self.gh.rest_remaining, spent)
+        self.assertEqual([c["status"] for c in gg.read_cache(key)["data"]["checks"]],
+                         ["COMPLETED", "IN_PROGRESS", "IN_PROGRESS"])
+        # the test run finishes: its suite moves, so the check runs are read at once
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="PENDING", checks=[workflow_check("build", 11),
+                                                                          workflow_check("test", 11), lint])
+        again(NOW + 4 * gg.CYCLE)
+        self.assertEqual(len(runs_reads()), 2)
+        self.assertEqual([c["status"] for c in gg.read_cache(key)["data"]["checks"]],
+                         ["COMPLETED", "COMPLETED", "IN_PROGRESS"])
+        # unchanged since, but those check runs were read PR_REST_FULL_EVERY ago: read again (a free 304)
+        spent = self.gh.rest_remaining
+        again(NOW + 4 * gg.CYCLE + gg.PR_REST_FULL_EVERY)
+        self.assertEqual(len(runs_reads()), 3)
+        self.assertEqual(self.gh.rest_remaining, spent)
+
     def merges_with_a_cached_refusal(self, rest: tuple, graphql: tuple) -> None:
         """Review, glaeda#1931: an OPEN to MERGED refresh dropped the cached failedSteps, so `wait pr --until green` on
         the merged PR failed at once on a runner refusal still inside the rescue grace. The cached steps carry forward."""

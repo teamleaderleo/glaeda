@@ -1236,7 +1236,7 @@ PULL_REUSE_MAX = 300
 PR_REST_FULL_EVERY = 300
 # A full REST read whose head's check suites are unchanged (a 304, or the same slimmed answer: the gate's test) takes
 # the check-run pages its last read kept, with no request, while those were read within PR_REST_FULL_EVERY: the gate's
-# own bound. gcp-agent-lane-11's direct ledger, 2026-11-22 14:36-19:52Z: glaeda-upstream asked check-suites 325 and
+# own bound. Never for `--jobs`, which the gate never takes either. gcp-agent-lane-11's direct ledger, 2026-11-22 14:36-19:52Z: glaeda-upstream asked check-suites 325 and
 # check-runs 291 times in 4 h, mostly the full read that follows a gate broken by the issue (a comment) on an
 # unchanged head. The check-runs part keeps "at", when it was last read or confirmed.
 # A failed head with every check finished (settled) passes the same gate for this long after its last full read: its
@@ -10817,7 +10817,8 @@ class Daemon:
                 with contextlib.suppress(WatchError):
                     self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha,
-                                                               self.runs_unchanged(old, parts, root, sha))
+                                                               not e.get("jobs")
+                                                               and self.runs_unchanged(old, parts, root, sha))
             if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
                 # every check finished, and something changed since the kept pull: the merge state is final now
                 pull, _ = self.rest_pull(old, parts, root, number, reuse=False)
