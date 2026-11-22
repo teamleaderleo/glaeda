@@ -1998,6 +1998,64 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 3 * gg.TICK)
         self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), NOW + 3 * gg.TICK), "the feed is out")
 
+    def test_a_controller_transport_failure_names_its_reason(self) -> None:
+        """transport_reason: "controller: URLError" alone could not tell a refused connection from a DNS miss."""
+        import urllib.error
+        ctl = gg.Controller("http://controller.invalid", None)
+        for raised, said in [
+                (urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+                 "controller: URLError (ConnectionRefusedError: [Errno 111] Connection refused)"),
+                (urllib.error.URLError(OSError("no strerror")), "controller: URLError (OSError)"),
+                (urllib.error.URLError("unknown url type"), "controller: URLError"),
+                (ConnectionResetError(104, "Connection reset by peer"),
+                 "controller: ConnectionResetError ([Errno 104] Connection reset by peer)")]:
+            def boom(*_a, raised=raised, **_k):
+                raise raised
+            with mock.patch.object(gg.CONTROLLER_OPENER, "open", boom):
+                with self.assertRaises(gg.WatchError) as caught:
+                    ctl.get("/v1/github/events")
+            self.assertEqual(str(caught.exception), said)
+            self.assertNotIn("controller.invalid", str(caught.exception))
+
+    def test_a_long_tick_reads_the_feed_between_its_reads_so_the_view_stays_fresh(self) -> None:
+        """feed_due / feed_between_reads, asked before every read request: a tick that runs past CONTROLLER_FRESH (a
+        read backlog: ~600 s on the broker host, hq#17503) still keeps the view a downstream rules with fresh; the
+        pages it read wait in feed_held for the next tick to apply, and only the tick's own thread reads them."""
+        sha = "b" * 40
+        key, data = "pr:o/r#1", {"headRefOid": sha, "headRefName": "topic"}
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        gg.CONTROLLER_FEED_EVERY = 20  # (setUp's 0 reads the feed each tick; its cleanup restores it)
+        feeds = len(self.ctl.feeds)
+        self.daemon.feed_due()  # no time has passed since the tick's own feed read
+        self.assertEqual(len(self.ctl.feeds), feeds)
+        late = NOW + gg.TICK + gg.CONTROLLER_FRESH + 5  # the same tick, still reading
+        self.daemon.clock = lambda: late
+        self.ctl.suites.append({"id": 6, "repo": "o/r", "head_sha": sha, "status": "completed"})
+        other = threading.Thread(target=self.daemon.feed_due)
+        other.start()
+        other.join()
+        self.assertEqual(len(self.ctl.feeds), feeds, "a land worker's request on another thread reads no feed")
+        self.daemon.feed_due()
+        self.assertEqual(len(self.ctl.feeds), feeds + 1)
+        view = gg.feed_view(key, data, gg.load_feed_view(), late)
+        self.assertIsNotNone(view, "the view is fresh though the tick began CONTROLLER_FRESH ago")
+        self.assertEqual((view["at"], view["eventAt"]), (late, late))
+        self.assertEqual(self.daemon.now, NOW + gg.TICK, "the tick's own clock is left as it was")
+        self.assertEqual(len(self.daemon.feed_held), 1)
+        self.daemon.feed_due()  # within CONTROLLER_FEED_EVERY: no second read
+        self.assertEqual(len(self.ctl.feeds), feeds + 1)
+        del self.daemon.clock
+        self.daemon.tick(late + 1)
+        self.assertEqual(self.daemon.feed_held, [], "the next tick applied the held pages")
+        self.ctl.down = True
+        self.daemon.feed_after_controller = True
+        self.daemon.clock = lambda: late + 1 + gg.CONTROLLER_FEED_EVERY
+        self.daemon.feed_due()
+        self.assertIsNone(gg.feed_view(key, data, gg.load_feed_view(), late + 1 + gg.CONTROLLER_FEED_EVERY),
+                          "a feed that failed between reads is out")
+
     def test_a_new_controller_has_to_show_its_coverage_again(self) -> None:
         self.daemon.tick(NOW)
         self.feed_covers()
@@ -3419,6 +3477,38 @@ class BalanceTest(Base):
         self.assertIn("404", missing["error"])  # REST decided it, after GraphQL's null
         # never shown by any read: missing (wait's not-found), as REST's 404 for such a run now is
         self.assertTrue(missing.get("missing"))
+
+    def test_a_forbidden_protection_rule_keeps_the_required_checks_it_last_read(self) -> None:
+        """The broker host, 2026-11-22: a read App's answer carries FORBIDDEN at baseRef.branchProtectionRule (classic
+        protection needs administration) beside every other field. The PR is read; the checks it last called required
+        stay required, so a required check that has not reported yet stays missing, never green."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[workflow_check("build", 11)])
+        self.gh.prs[("o", "r", 1)]["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["ci-status"]},
+                                                 "rules": {"nodes": []}}
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.assertIn("ci-status", gg.read_cache(key)["data"]["requiredMissing"])
+        gh = self.daemon.transport
+
+        def forbidden(method, url, headers, body):
+            status, h, out = gh(method, url, headers, body)
+            if url.endswith("/graphql") and b"pullRequest(number:" in (body or b""):
+                doc = json.loads(out)
+                doc["data"]["p0"]["pullRequest"]["baseRef"]["branchProtectionRule"] = None
+                doc["errors"] = [{"type": "FORBIDDEN", "message": "Resource not accessible by integration",
+                                  "path": ["p0", "pullRequest", "baseRef", "branchProtectionRule"]}]
+                out = json.dumps(doc).encode()
+            return status, h, out
+        self.daemon.transport = forbidden
+        self.gh.prs[("o", "r", 1)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].append(
+            workflow_check("test", 11))
+        self.gh.prs[("o", "r", 1)]["updatedAt"] = iso(NOW + gg.CYCLE)
+        self.daemon.tick(NOW + gg.CYCLE)
+        cached = gg.read_cache(key)
+        self.assertFalse(cached.get("error"))
+        self.assertIn("test", [c["name"] for c in cached["data"]["checks"]])
+        self.assertIn("ci-status", cached["data"]["requiredMissing"])
 
     def test_prs_over_rest_when_graphql_is_poorer_read_the_same(self) -> None:
         checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
@@ -22609,6 +22699,23 @@ class LandTest(Base):
         # A named sender's notice: a bare send reads as the person's words (leo-asks filed them as Leo's asks)
         self.assertEqual(self.w.sent()[-1][4:10], ["--notice", "--severity", "info", "--sender", "glaeda-land", "--title"])
 
+    def test_land_notify_always_passes_prompt_after_notice_options(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        sent = self.w.sent()[-1]
+        message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
+        self.assertEqual(sent[-2:], [message, message])
+
+    def test_land_notify_uses_parent_session_from_queued_reader(self):
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "", queued_by=
+                        "cosmic-gray/session:6e0bad7d-9798-49c2-8d14-00d3d5ffeb25:agent:helper")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(self.w.sent()[-1][3], "cosmic-gray/session:6e0bad7d-9798-49c2-8d14-00d3d5ffeb25")
+
     def test_a_queued_prs_head_is_registered_for_land_judge_when_queued_and_when_it_moves(self):
         heads: list[str] = []
         self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
@@ -25468,11 +25575,10 @@ class LandTest(Base):
                 self.assertEqual(self.merge_envs(), [])
 
     def test_land_override_past_lane_gh_lands_limits_is_refused_at_enqueue(self):
+        # Only what no guess fixes is refused: one of the pair alone, or an empty one.
         bad = [["--override-reason", "r"], ["--override-receipt", "t"],
-               ["--override-reason", "r" * 201, "--override-receipt", "t"],
-               ["--override-reason", "r", "--override-receipt", "t" * 241],
-               ["--override-reason", "two\nlines", "--override-receipt", "t"],
-               ["--override-reason", "r", "--override-receipt", "two\nlines"]]
+               ["--override-reason", "  ", "--override-receipt", "t"],
+               ["--override-reason", "r", "--override-receipt", ""]]
         for extra in bad:
             said: list[str] = []
             with self.subTest(extra=[w[:12] for w in extra]), \
@@ -25482,10 +25588,21 @@ class LandTest(Base):
                 self.assertRegex(" ".join(said), r"override-re(ason|ceipt)")
                 d = gg.LandQueue.requests_dir()
                 self.assertEqual(list(d.glob("*.json")) if d.is_dir() else [], [], "nothing queued")
-        # the limits themselves are allowed
+        # the limits themselves are allowed, unchanged
         self.assertEqual(gg.land_override("r" * 200, "t" * 240), {"reason": "r" * 200, "receipt": "t" * 240})
-        # a forwarded request past them carries no override into the queue
-        self.assertIsNone(gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}}))
+
+    def test_a_reason_two_characters_too_long_is_fitted_not_refused(self):
+        """2026-11-21: a 202-character reason cost a refusal and a second land call, for 2 characters."""
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            got = gg.land_override("r" * 202, "two\nlines  and   padding")
+        self.assertEqual(len(got["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
+        self.assertTrue(got["reason"].endswith("\u2026"), got["reason"][-8:])
+        self.assertTrue(got["reason"].startswith("r" * 199), "the head is what a reason names first")
+        self.assertEqual(got["receipt"], "two lines and padding")  # one line, no refusal
+        self.assertRegex(err.getvalue(), r"fitted to one line of (200|240)")
+        # a forwarded request past them is fitted too, so the queue still checks an override it can keep
+        kept = gg.land_request_override({"override": {"reason": "r" * 201, "receipt": "t"}})
+        self.assertEqual(len(kept["reason"]), gg.LAND_OVERRIDE_REASON_MAX)
 
     def test_a_lane_vms_merge_the_broker_refused_on_a_spent_login_is_parked_until_its_reset(self):
         self.broker = True
@@ -27779,6 +27896,123 @@ class LandTest(Base):
         self.assertEqual(self.explained(), ["11"])
         self.assertNotIn("dueLate", e)
 
+    def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
+        """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an
+        unmoved head, another such re-read waits (gated, its status naming why), while a land that can move takes a
+        free worker. A lane VM, 2026-11-22: three such PRs held 3 of 4 workers for 40 min."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 4
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        for n in (90, 91):
+            k = self.stuck(n, 0, state="judging")
+            self.q.jobs[k] = Busy()
+        again = self.stuck(11, 3 * 3600)
+        moves = self.stuck(12, 1800)
+        self.q.entries[moves]["explain"]["code"] = "checks_pending"
+        self.retries(2)
+        self.tick(30)
+        self.assertEqual(self.explained(), ["12"])
+        e = self.q.entries[again]
+        late = [h for h in e["history"] if h["event"] == "due_late"]
+        self.assertEqual([h["why"] for h in late], ["re-reads of unreadable PRs hold their share of the workers"])
+        del self.q.jobs["pr:o/r#90"]
+        self.tick(30)
+        self.assertEqual(self.explained(), ["12", "11"])
+
+    def test_a_reread_sorts_behind_a_due_land_that_can_move(self):
+        """judge_order: a due entry judged "unreadable" at the head the cache still shows is never "one merge away" and
+        goes behind every other due entry, however long it has waited; once its head moves it is an ordinary row."""
+        again = self.stuck(11, 3 * 3600)
+        moves = self.stuck(12, 600)
+        self.q.entries[moves]["explain"]["code"] = "checks_pending"
+        self.assertGreater(self.q.judge_order(again), self.q.judge_order(moves))
+        self.assertTrue(self.q.reread(self.q.entries[again]))
+        self.w.set_pr(again, land_pr("b" * 40), self.t)  # a new head: the last answer no longer applies
+        self.assertFalse(self.q.reread(self.q.entries[again]))
+        self.assertLess(self.q.judge_order(again), self.q.judge_order(moves))
+
+    def test_a_job_holding_its_worker_past_the_bound_is_logged_named_and_freed(self):
+        """LAND_SLOT_HELD: a job holding its worker that long is logged once (land-slot-held), named in the land-pool
+        line (slotHeld) and in its status line, and land-slot-freed is logged when it ends."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+        class Busy:
+            finished = False
+
+            def done(self) -> bool:
+                return self.finished
+
+            def exception(self) -> None:
+                return None
+        key = self.stuck(11, 0, state="judging")
+        e = self.q.entries[key]
+        e["judging"] = {"sha": e["head"], "at": self.t}
+        job = Busy()
+        self.q.jobs[key] = job
+        self.q.job_started[key] = (self.t, "job")
+        self.tick(60)
+        self.assertEqual([r for r in logs if r.get("event") == "land-slot-held"], [])
+        self.tick(gg.LAND_SLOT_HELD)
+        self.tick(60)
+        held = [r for r in logs if r.get("event") == "land-slot-held"]
+        self.assertEqual([(r["key"], r["job"], r["state"]) for r in held], [(key, "job", "judging")])
+        pool = [r for r in logs if r.get("event") == "land-pool"][-1]
+        self.assertEqual((pool["slotHeld"]["pr"], pool["slotHeld"]["job"]), ("o/r#11", "job"))
+        self.assertGreaterEqual(pool["slotHeld"]["heldS"], gg.LAND_SLOT_HELD)
+        self.assertIn("holding a worker since", gg.land_line(self.q.entries[key], self.t))
+        job.finished = True
+        self.tick(30)
+        freed = [r for r in logs if r.get("event") == "land-slot-freed"]
+        self.assertEqual([(r["key"], r["job"]) for r in freed], [(key, "job")])
+        self.assertNotIn(key, self.q.job_started)
+
+    def test_an_entry_that_held_its_workers_the_bound_judging_nothing_waits_out_its_window(self):
+        """LAND_HOLD_MAX: an entry whose jobs held workers that long in one LAND_HOLD_WINDOW, its last answer still
+        "unreadable", takes no worker until the window ends (logged once, named in its history and status), then is
+        judged again; an entry whose answer judged something is never held by it."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        key = self.stuck(11, 600)
+        e = self.q.entries[key]
+        e["holdWindow"] = {"since": self.t - 600, "heldS": gg.LAND_HOLD_MAX}
+        self.retries(1)
+        self.tick(30)
+        self.assertEqual(self.explained(), [])
+        e = self.q.entries[key]
+        self.assertEqual([h["event"] for h in e["history"]].count("hold_capped"), 1)
+        self.assertIn("judging nothing: no worker until", gg.land_line(e, self.t))
+        self.tick(30)
+        self.assertEqual(len([r for r in logs if r.get("event") == "land-hold-capped"]), 1)
+        self.tick(gg.LAND_HOLD_WINDOW - 600)
+        self.assertEqual(self.explained(), ["11"])
+        other = self.stuck(12, 600)
+        self.q.entries[other]["explain"]["code"] = "checks_pending"
+        self.q.entries[other]["holdWindow"] = {"since": self.t - 60, "heldS": gg.LAND_HOLD_MAX * 2}
+        self.assertFalse(self.q.hold_spent(self.q.entries[other]))
+
+    def test_a_finished_job_adds_its_time_to_its_entrys_hold_window(self):
+        key = self.stuck(11, 600)
+        self.q.now = self.t
+        self.q.count_hold(key, self.t - 300)
+        self.assertEqual(self.q.entries[key]["holdWindow"], {"since": self.t - 300, "heldS": 300.0})
+        self.q.now = self.t + 100
+        self.q.count_hold(key, self.t)
+        self.assertEqual(self.q.entries[key]["holdWindow"]["heldS"], 400.0)
+        self.q.now = self.t + gg.LAND_HOLD_WINDOW
+        self.q.count_hold(key, self.q.now - 50)
+        self.assertEqual(self.q.entries[key]["holdWindow"], {"since": self.q.now - 50, "heldS": 50.0})
+
     def test_a_stopped_predecessor_merged_by_hand_is_still_read_for_its_follower(self):
         """Review: an --after PR whose own entry stopped is read by nothing else once only due entries hold watches; its
         follower must still read it (one peek per LAND_PEEK_EVERY), or a hand merge never shows and the follower stops
@@ -27888,6 +28122,43 @@ class LandTest(Base):
         for _ in range(10):
             self.tick(30)
         self.assertEqual(calls, [])
+
+    def test_only_the_due_entries_workers_reach_next_hold_a_waited_pr_watch(self):
+        """The broker host, 2026-11-22 06:00Z: 1,349 pr watches waited on in 600 s, 1,200 the land queues', since every
+        due entry (queued, or past its wake) was waited however many stood ahead of it for a busy worker. With 1 worker
+        busy and 60 due entries, only the first LAND_WATCH_AHEAD in judge_order are waited; the rest get the parked
+        entry's unwaited read per LAND_PEEK_EVERY. When the worker frees, the next one is waited and judged."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            if not key.startswith("head:"):
+                calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        keys = [self.stuck(2000 + i, 3600 - 30 * i) for i in range(60)]  # due, oldest wake first
+        start = self.t
+        while self.t - start < 1800:
+            self.tick(30)
+        waited = {k for k, w, _ in calls if w}
+        self.assertEqual(waited, set(keys[:gg.LAND_WATCH_AHEAD]))
+        peeked = [k for k, w, once in calls if once and not w]
+        self.assertEqual(set(peeked), set(keys[gg.LAND_WATCH_AHEAD:]))
+        self.assertLessEqual(len(peeked), (60 - gg.LAND_WATCH_AHEAD) * (1800 / gg.LAND_PEEK_EVERY + 1))
+        # The worker frees: the entries are judged in the same order, the waited one first
+        del self.q.jobs["pr:o/r#99"]
+        self.retries(60)
+        self.tick(30)
+        self.assertEqual(self.explained()[:2], ["2000", "2001"])
 
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
@@ -30941,6 +31212,74 @@ class AppPoolTest(Base):
             self.assertEqual(len(owners), 1, f"one owner per query, got {owners}")
         self.assertEqual(sorted(k for chunk in sent for k in chunk), sorted(keys), "every entry still read")
 
+    @staticmethod
+    def gql_body(*repos: str) -> dict:
+        return {"query": "query { x }", "variables": {f"{p}{i}": v for i, r in enumerate(repos)
+                                                        for p, v in (("o", "manaflow-ai"), ("r", r), ("n", 1))}}
+
+    def refuse(self, scope: str, status: int, message: str) -> bool:
+        return self.pool.answered("manaflow-ai", scope, status, {"x-ratelimit-remaining": "12000",
+                                                                 "x-ratelimit-reset": str(int(NOW + 900))}, message)
+
+    def test_a_refused_multi_repo_graphql_chunk_benches_the_repos_its_errors_name_never_the_set(self) -> None:
+        """The broker host, 2026-11-22: "cmux,cmuxterm-hq" and "cmuxterm-hq,cmux" were each benched an hour as sets
+        while the App held 12,234 of 12,500 points, and every PR read went on the login's pace."""
+        scope = lambda *repos: self.pool.scope("manaflow-ai", "POST", "/graphql", self.gql_body(*repos))
+        self.assertEqual(scope("cmux", "cmuxterm-hq"), scope("cmuxterm-hq", "cmux"), "one key in any order")
+        self.assertFalse(self.refuse(scope("cmux", "cmuxterm-hq"), 200, "NOT_FOUND Could not resolve to a Repository "
+                                                                    "with the name 'manaflow-ai/cmuxterm-hq'."))
+        for mix in (("cmux",), ("cmux", "other"), ("other", "cmux")):
+            self.assertIs(self.pool.pick("manaflow-ai", scope(*mix)), self.pool, f"{mix} still on the App")
+        for mix in (("cmuxterm-hq",), ("cmux", "cmuxterm-hq"), ("cmuxterm-hq", "cmux"), ("other", "cmuxterm-hq")):
+            self.assertIsNone(self.pool.pick("manaflow-ai", scope(*mix)), f"{mix} holds the benched repo")
+
+    def test_a_refused_multi_repo_graphql_chunk_naming_no_repo_benches_nothing(self) -> None:
+        scope = lambda *repos: self.pool.scope("manaflow-ai", "POST", "/graphql", self.gql_body(*repos))
+        self.assertFalse(self.refuse(scope("cmux", "cmuxterm-hq"), 200, "FORBIDDEN Resource not accessible"))
+        for mix in (("cmux",), ("cmuxterm-hq",), ("cmux", "cmuxterm-hq"), ("cmuxterm-hq", "cmux")):
+            self.assertIs(self.pool.pick("manaflow-ai", scope(*mix)), self.pool, f"{mix} still on the App")
+        self.assertFalse(self.refuse(scope("cmux"), 200, "FORBIDDEN Resource not accessible"))
+        self.assertIsNone(self.pool.pick("manaflow-ai", scope("cmux")), "a one-repo refusal benches that repo")
+
+    def test_a_batch_is_one_repo_per_query_so_a_benched_repo_holds_only_its_own_entries(self) -> None:
+        keys = [f"pr:manaflow-ai/{r}#{i}" for i in range(1, 4) for r in ("cmux", "cmuxterm-hq")]
+        entries = [{"key": k, "cache": None, "touched": NOW} for k in keys]
+        sent: list[list[str]] = []
+        self.daemon.batch["pr"] = 15
+        self.daemon.batched("pr", entries, lambda chunk: sent.append([e["key"] for e in chunk]) or None)
+        for chunk in sent:
+            self.assertEqual(len({k.split("#")[0] for k in chunk}), 1, f"one repo per query: {chunk}")
+        self.assertEqual(sorted(k for c in sent for k in c), sorted(keys))
+        self.pool.unreadable["graphql:manaflow-ai:cmuxterm-hq"] = NOW + 600
+        got = self.daemon.app_eligible_by_owner("pr", entries, "graphql")
+        self.assertEqual([e["key"] for e in got], [k for k in keys if "/cmux#" in k])
+
+    def test_a_branch_rule_or_protection_refusal_is_one_route_family_of_its_repo(self) -> None:
+        """A 403 for each of rules/branches/main, .../lane/a, .../lane/b: each branch had its own scope, so each cost an
+        App request and a login retry."""
+        s = lambda path: self.pool.scope("manaflow-ai", "GET", path)
+        base = "/repos/manaflow-ai/cmuxterm-hq"
+        self.assertEqual(s(f"{base}/rules/branches/main"), s(f"{base}/rules/branches/lane/a?x=1"))
+        self.assertEqual(s(f"{base}/branches/main/protection"), s(f"{base}/branches/lane/b/protection/required_status_checks"))
+        self.assertNotEqual(s(f"{base}/rules/branches/main"), s(f"{base}/branches/main/protection"))
+        self.assertNotEqual(s(f"{base}/rules/branches/main"), s("/repos/manaflow-ai/cmux/rules/branches/main"))
+        self.assertFalse(self.refuse(s(f"{base}/rules/branches/main"), 403, "Resource not accessible by integration"))
+        self.assertIsNone(self.pool.pick("manaflow-ai", s(f"{base}/rules/branches/lane/other")))
+        self.assertIs(self.pool.pick("manaflow-ai", s(f"{base}/pulls/1")), self.pool)
+        self.assertIs(self.pool.pick("manaflow-ai", s("/repos/manaflow-ai/cmux/rules/branches/main")), self.pool)
+
+    def test_the_refusal_event_names_its_route_and_the_first_of_the_error(self) -> None:
+        self.app_answers.append((200, {}, json.dumps({"errors": [{"type": "NOT_FOUND", "message": "x" * 300}]}).encode()))
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}",
+                 "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.daemon.request("POST", "/graphql", query)
+        event = next(json.loads(l) for l in out.getvalue().splitlines() if '"app-pool-refused"' in l)
+        self.assertEqual(event["route"], "POST /graphql")
+        self.assertEqual(event["scope"], "graphql:manaflow-ai:cmux")
+        self.assertEqual(event["error"], "NOT_FOUND " + "x" * 190)
+
     def test_with_the_login_graphql_stopped_app_prs_still_go_on_the_app_graphql(self) -> None:
         """2026-11-22 03:26Z, one host: the login's GraphQL stopped, route() sent every PR over REST, one read each, and
         29 PRs were stored in 600 s while the App's GraphQL sat unspent. The App's PRs go to its GraphQL in batches;
@@ -31004,6 +31343,21 @@ class AppPoolTest(Base):
              "message": "Could not resolve to a Repository with the name 'manaflow-ai/cmux'."}]}).encode()))
         self.daemon.request("POST", "/graphql", query)
         self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1), "a repository it lacks goes on the login")
+        self.assertTrue(self.pool.unreadable)
+
+    def test_a_forbidden_protection_rule_alone_is_the_apps_answer_not_a_refusal(self) -> None:
+        """GitHub's own words (the ci-watch App, the broker host, 2026-11-22): a PR whose base has classic protection
+        answers FORBIDDEN at baseRef.branchProtectionRule only; any other FORBIDDEN still refuses."""
+        query = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}", "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 9}}
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": {"pullRequest": {"number": 9}}}, "errors": [
+            {"type": "FORBIDDEN", "path": ["p0", "pullRequest", "baseRef", "branchProtectionRule"],
+             "message": "Resource not accessible by integration"}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls), self.pool.unreadable), (1, 0, {}))
+        self.app_answers.append((200, {}, json.dumps({"data": {"p0": None}, "errors": [
+            {"type": "FORBIDDEN", "path": ["p0"], "message": "Resource not accessible by integration"}]}).encode()))
+        self.daemon.request("POST", "/graphql", query)
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 1))
         self.assertTrue(self.pool.unreadable)
 
     def test_a_login_secondary_hold_holds_the_login_but_not_the_app(self) -> None:
