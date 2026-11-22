@@ -1234,6 +1234,11 @@ PULL_REUSE_MAX = 300
 # required check passing before its workflow ends) shows within PR_REST_FULL_EVERY rather than the next cycle. Only
 # the REST route: GraphQL's rollup is one read already.
 PR_REST_FULL_EVERY = 300
+# A full REST read whose head's check suites are unchanged (a 304, or the same slimmed answer: the gate's test) takes
+# the check-run pages its last read kept, with no request, while those were read within PR_REST_FULL_EVERY: the gate's
+# own bound. gcp-agent-lane-11's direct ledger, 2026-11-22 14:36-19:52Z: glaeda-upstream asked check-suites 325 and
+# check-runs 291 times in 4 h, mostly the full read that follows a gate broken by the issue (a comment) on an
+# unchanged head. The check-runs part keeps "at", when it was last read or confirmed.
 # A failed head with every check finished (settled) passes the same gate for this long after its last full read: its
 # check runs can change only through a suite (a rerun queues the suite again, a new push is a new head the pull and
 # issue show), so the gate's three reads see every change a full read would. Under a backlog no read came within
@@ -4360,6 +4365,12 @@ def slim_check_suites(doc: dict) -> dict:
 
 def suites_path(root: str, sha: str) -> str:
     return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
+
+
+def check_runs_path(root: str, sha: str) -> str:
+    """A head's first check-run page (filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes
+    both alike); page N is this with &page=N."""
+    return f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
 
 
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
@@ -10730,6 +10741,11 @@ class Daemon:
             return new[path]["doc"]
         if state == "error":
             raise WatchError(doc)
+        if state == "fresh" and not etag and kept.get("etag") and "doc" in kept and slim(doc) == kept["doc"]:
+            # An answer with no ETag (broker_transport: the lane-gh broker answers none) that says what the kept one
+            # says keeps the kept ETag: a 304 on it vouches for that same slimmed answer. Storing None instead made
+            # the next read-token read of the path a counted 200 after every broker fallback.
+            state = "same"
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
         return new[path]["doc"]
 
@@ -10800,7 +10816,8 @@ class Daemon:
                 # (a settled failed head's too: PR_REST_SETTLED_FULL_EVERY gates it on its suites)
                 with contextlib.suppress(WatchError):
                     self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
-            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha,
+                                                               self.runs_unchanged(old, parts, root, sha))
             if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
                 # every check finished, and something changed since the kept pull: the merge state is final now
                 pull, _ = self.rest_pull(old, parts, root, number, reuse=False)
@@ -11082,15 +11099,45 @@ class Daemon:
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
 
-    def rest_head(self, old: dict, parts: dict, root: str, sha: str) -> tuple[dict, list, list, dict]:
+    def runs_unchanged(self, old: dict, parts: dict, root: str, sha: str) -> bool:
+        """Whether this read's check-suites answer for SHA (in PARTS) is the kept one (a 304, or the same slimmed
+        answer) and every check-run page the last read kept for SHA was read within PR_REST_FULL_EVERY: then rest_head
+        takes those pages and asks nothing. No request."""
+        suites = suites_path(root, sha)
+        now, was = parts.get(suites), old.get(suites)
+        if not isinstance(now, dict) or not isinstance(was, dict) or "doc" not in now or "doc" not in was:
+            return False
+        if now.get("unavailable") or now.get("gone") or now["doc"] != was["doc"]:
+            return False
+        path = check_runs_path(root, sha)
+        first = old.get(path)
+        at = first.get("at") if isinstance(first, dict) else None
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= self.now - at < PR_REST_FULL_EVERY \
+                or not isinstance(first.get("doc"), dict):
+            return False
+        pages = min(REST_CHECK_PAGES, -(-(first["doc"].get("total_count") or 0) // 100))
+        return all(isinstance(old.get(f"{path}&page={p}"), dict) and "doc" in old[f"{path}&page={p}"]
+                   for p in range(2, pages + 1))
+
+    def rest_head(self, old: dict, parts: dict, root: str, sha: str,
+                  runs_kept: bool = False) -> tuple[dict, list, list, dict]:
         """A commit's check runs (every attempt, up to REST_CHECK_PAGES pages), statuses, workflow runs and the
-        repository's workflow names, each a conditional read kept in `parts`. Raises WatchError."""
-        # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
-        path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
-        checks = self.head_part(old, parts, path, slim_check_runs)
+        repository's workflow names, each a conditional read kept in `parts`. RUNS_KEPT (runs_unchanged): the check
+        runs are the pages OLD keeps, not asked. Raises WatchError."""
+        path = check_runs_path(root, sha)
+        if runs_kept:
+            def run_page(page_path: str) -> dict:
+                parts[page_path] = old[page_path]
+                return old[page_path]["doc"]
+        else:
+            def run_page(page_path: str) -> dict:
+                return self.head_part(old, parts, page_path, slim_check_runs)
+        checks = run_page(path)
+        if not runs_kept:  # read (or confirmed by a 304) now: runs_unchanged's bound counts from here
+            parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}
         listed = list(checks.get("check_runs") or [])
         for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-            listed += self.head_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+            listed += run_page(f"{path}&page={page}").get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
         statuses: list[dict] = []
         total = 0
