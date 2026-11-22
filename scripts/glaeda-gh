@@ -11886,12 +11886,19 @@ LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GL
                  "GH_QUOTA_LANDING_READ": "land-judge"}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 # The land pool is sized by the host it runs on, read at every pass, never a hand-set count (cmuxterm-hq
-# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): a ceiling
-# of one worker per LAND_CORES_EACH cores (land_worker_ceiling). land.json "workers" stays an operator's override of
-# the ceiling. No host-load line admits or holds a judgment: LAND_LOAD_LINE (0.8 per core) is gone (see
-# land_load_per_core's comment for what it measured and why). The 4 this replaced was set by hand; gcp-agent-lane-1,
-# 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
-LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
+# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): the
+# ceiling is what the hardware holds at the 80% line (LAND_HEADROOM) of a judgment's measured cost, cores and RAM
+# (land_worker_ceiling), and past the first running judgment one starts only while the host's free RAM stays over that
+# line (LandQueue.mem_room). land.json "workers" stays an operator's override of the ceiling. No host-load line admits
+# or holds a judgment (glaeda#2472). The cores/2 this replaced (LAND_CORES_EACH, "about two cores at its peak") was a
+# guess: huge-blue, 2026-11-22 09:44-09:54Z, 12 of 12 busy (land.json) at load 0.36/core, 907 rows due late.
+# Measured (glaeda#2472, a live `land-judge explain` on a 16-core lane host, 3 runs at each of 3 loads): 3.9-4.6 s
+# CPU (user+sys), peak RSS 128.4 MB, wall 27-434 s, 85-99% of it waiting on GitHub and the quota. So at its densest a
+# judgment holds 4.6 s of CPU over its shortest 27 s wall: LAND_JUDGMENT_CORES.
+LAND_JUDGMENT_CORES = 4.6 / 27  # about 0.17 of a core
+LAND_JUDGMENT_RSS = 128.4e6  # bytes
+LAND_HEADROOM = 0.8  # the handbook's headroom line: lands take at most this share of the host's cores and RAM
+LAND_WORKER_MAX = 1024  # land_seconds' bound on the ceiling and on land.json "workers"
 
 
 def land_cores() -> int:
@@ -11901,9 +11908,39 @@ def land_cores() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def land_worker_ceiling(cores: int | None = None) -> int:
-    """One land worker per LAND_CORES_EACH cores, at least 1."""
-    return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
+def land_meminfo(field: str) -> float | None:
+    """FIELD of /proc/meminfo in bytes, or None where the host has none (macOS) or does not say."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return float(line.split()[1]) * 1024
+    return None
+
+
+def land_mem_total() -> float | None:
+    """The host's RAM in bytes (/proc/meminfo, else sysconf, which macOS answers), or None."""
+    total = land_meminfo("MemTotal")
+    if total is None:
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            total = float(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    return total if total and total > 0 else None
+
+
+def land_mem_available() -> float | None:
+    """The RAM the host can give a new process without swapping (MemAvailable), or None where it is not reported."""
+    return land_meminfo("MemAvailable")
+
+
+def land_worker_ceiling(cores: int | None = None, mem: float | None | bool = True) -> int:
+    """How many judgments the hardware holds at LAND_HEADROOM: the lesser of the cores over LAND_JUDGMENT_CORES and the
+    RAM over LAND_JUDGMENT_RSS (cores alone where the RAM is unknown), at least 1. MEM True reads the host's."""
+    cores = land_cores() if cores is None else max(1, int(cores))
+    total = land_mem_total() if mem is True else mem
+    ceiling = int(cores * LAND_HEADROOM / LAND_JUDGMENT_CORES)
+    if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
+        ceiling = min(ceiling, int(total * LAND_HEADROOM / LAND_JUDGMENT_RSS))
+    return max(1, min(LAND_WORKER_MAX, ceiling))
 
 
 # The host's load is reported (the land-pool line, `land status`), never gated on. LAND_LOAD_LINE (0.8 per core, the
@@ -13441,6 +13478,7 @@ class LandQueue:
         self.jobs: dict[str, Any] = {}
         self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
+        self.mem_read: tuple[float, bool] = (-1.0, True)  # (pass, mem_room) read once per pass
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         self.pool_logged = float("-inf")
@@ -14579,9 +14617,18 @@ class LandQueue:
         return [self.path("python", Path(sys.executable)).as_posix(), os.fspath(tool), "ready", "--owner", owner]
 
     def workers(self) -> int:
-        """The pool's ceiling: land.json "workers" (an operator's override), else one worker per LAND_CORES_EACH of
-        this host's cores (land_worker_ceiling), read at each call."""
-        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, 1024))
+        """The pool's ceiling: land.json "workers" (an operator's override), else what this host's cores and RAM hold
+        of a judgment's measured cost (land_worker_ceiling), read at each call."""
+        return int(land_seconds(self.config().get("workers"), land_worker_ceiling(), 1, LAND_WORKER_MAX))
+
+    def mem_room(self) -> bool:
+        """Whether one more judgment leaves the host's free RAM over the LAND_HEADROOM line; read once per pass, and
+        True where the host does not report MemAvailable (the ceiling, from its total RAM, still holds)."""
+        if self.mem_read[0] != self.now:
+            avail, total = land_mem_available(), land_mem_total()
+            ok = avail is None or total is None or avail - LAND_JUDGMENT_RSS >= total * (1 - LAND_HEADROOM)
+            self.mem_read = (self.now, ok)
+        return self.mem_read[1]
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -14673,6 +14720,7 @@ class LandQueue:
                 "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
+             "memFree": self.mem_read[1],
              "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -15584,6 +15632,9 @@ class LandQueue:
             return False  # judged on the daemon's next read of this head (one read, shared), not on land_judge's own
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
+            return False
+        if self.jobs and not self.mem_room():
+            self.gated(e, "the host's free RAM is at the 80% line (MemAvailable)")  # LAND_HEADROOM; one always runs
             return False
         if not self.login_room(e):
             self.gated(e)  # its reads spend the login: the login's share of the workers is busy
@@ -17341,7 +17392,7 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     load = land_load_per_core()
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
-    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+    ceiling = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX))
     return (f"glaeda land: workers {len(running)} busy of {ceiling} ({'land.json' if given is not None else 'cores'})"
             + (f": {'; '.join(running[:12])}" + (f" (+{len(running) - 12})" if len(running) > 12 else "")
                if running else "")
@@ -18230,7 +18281,10 @@ REEXEC_DRAIN_MAX = 300.0
 # A release update re-execs a daemon with land work running at most once per this many seconds of its uptime; until
 # then the update waits and the land queue works on ("hold"). huge-blue, 2026-11-18: glaeda main merges re-exec'd the
 # daemon at 14:51, 15:06, 15:09, 15:22 and 15:24Z, each dropping every judgment in flight. Idle, it re-execs at once.
-REEXEC_UPDATE_GAP = 1800.0
+# 300 s, not the 1800 s it was: huge-blue, 2026-11-22, a merged land fix (glaeda#2462, on disk 09:15Z) was held to
+# ~09:43Z while the queue it fixed stayed capped. The drain (REEXEC_DRAIN_MAX) already bounds what a re-exec drops (no
+# new step starts, a claimed step is judged again), so the gap only spaces re-execs: one per 5 min at most.
+REEXEC_UPDATE_GAP = 300.0
 
 
 def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,
