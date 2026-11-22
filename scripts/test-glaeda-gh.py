@@ -30656,7 +30656,8 @@ class LandForwardTest(Base):
                              ("big-exec", "waiting", "cosmic/coord"))
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(gg.main(["land", "status"]), 0)
-            self.assertIn("this host forwards its lands to big-exec", out.getvalue())
+            # land.json names a land-judge here: it judges what it reads on an App token, and hands the rest on
+            self.assertIn("hands the rest to big-exec", out.getvalue())
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(gg.main(["land", "cancel", "o/r#1"]), 0)
             self.exec_tick(x)
@@ -30783,6 +30784,193 @@ class LandForwardTest(Base):
             return subprocess.CompletedProcess(argv, 255, "", "ssh: Could not resolve hostname h\n")
         with self.assertRaisesRegex(gg.WatchError, "Could not resolve"):
             gg.land_forward(["reach", "h"], {"op": "batch"}, run=broken)
+
+
+class LandLocalFirstTest(LandForwardTest):
+    """land.json "executors": an ordered list of fallbacks, and local first. A host judges in its own queue every land
+    whose owner it reads off the login (an App source here, the latch-free check); only the rest go to the first
+    fallback with room, through the outbox. The old "executor" is a one-element list, no longer the whole host's route."""
+
+    A = ["reach", "peer-a", ".local/bin/glaeda-gh", "land", "serve"]
+    B = ["reach", "peer-b", ".local/bin/glaeda-gh", "land", "serve"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.down: set[str] = set()
+        self.room = {"peer-a": 5, "peer-b": 5, "big-exec": 5}
+        self.asked: list[tuple[str, dict]] = []
+        self.ready_owners: set[str] = set()
+
+    def serve_at(self, cmd: list[str], req: dict, deadline: float = gg.LAND_FORWARD_DEADLINE) -> dict:
+        host = cmd[1]
+        if host in self.down:
+            raise gg.WatchError(f"land executor: reach: ssh: connect to host {host}: Connection refused")
+        self.asked.append((host, copy.deepcopy(req)))
+        if req["op"] == "room":
+            return {"ok": True, "room": self.room[host], "host": host}
+        if req["op"] == "batch":
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": host}
+        return {"ok": True, "key": "pr:" + req["target"], "state": "requested", "entry": None, "host": host,
+                "requester": req.get("requester") or ""}
+
+    def batches(self) -> list[tuple[str, list[str]]]:
+        return [(h, [f"{r['op']}:{r['target']}" for r in q["requests"]]) for h, q in self.asked if q["op"] == "batch"]
+
+    def local_first(self, **config: Any) -> Any:
+        self.w.config.update(config, latchFreeCommand=["/fake/ready", "--owner", "{owner}"])
+        run = self.w.run
+
+        def ready(argv, timeout, env):
+            if argv[0] == "/fake/ready":
+                ok = argv[-1] in self.ready_owners
+                return subprocess.CompletedProcess(argv, 0 if ok else 1, "",
+                                                   "" if ok else f"gh-app-token: not ready for {argv[-1]}\n")
+            return run(argv, timeout, env)
+        return gg.LandQueue(run=ready, cache_of=self.w.cache.get, watch=self.w.watched.append,
+                            nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                            config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                            behind=lambda *a: None, forward=self.serve_at)
+
+    def requests_left(self) -> list[str]:
+        d = gg.LandQueue.requests_dir()
+        return sorted(gg.read_json(p)["target"] for p in d.glob("*.json")) if d.is_dir() else []
+
+    def test_fallbacks_are_executors_in_order_else_the_legacy_executor(self):
+        self.assertEqual(gg.land_fallbacks({"executors": [self.A, self.B, self.A, [], "x"], "executor": self.EXEC}),
+                         [self.A, self.B])
+        self.assertEqual(gg.land_fallbacks({"executor": self.EXEC}), [self.EXEC])
+        self.assertEqual(gg.land_fallbacks({"executors": [], "executor": self.EXEC}), [self.EXEC])
+        self.assertEqual(gg.land_fallbacks({}), [])
+        self.assertEqual(gg.land_executor({"executors": [self.A, self.B]}), self.A)
+
+    def test_a_host_with_an_app_source_judges_locally_and_forwards_nothing(self):
+        self.ready_owners = {"o"}
+        self.q = self.local_first(executors=[self.A, self.B])
+        self.pr(LA)
+        self.land(requester="mac/coord")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertTrue(self.w.explains())
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.requests_left(), [])
+
+    def test_a_host_without_an_app_source_forwards_to_the_first_fallback_with_room(self):
+        self.ready_owners = {"o"}  # o/r is judged here; p/r has no App source here
+        self.q = self.local_first(executors=[self.A, self.B])
+        self.pr(LA)
+        self.pr(LA, key="pr:p/r#2")
+        self.land(requester="mac/coord")
+        gg.land_request("land", "p/r#2", [], "mac/coord", sha=LA)
+        self.tick()
+        self.assertEqual(self.batches(), [("peer-a", ["land:p/r#2"])])
+        sent = [r for h, q in self.asked if q["op"] == "batch" for r in q["requests"]][0]
+        self.assertEqual((sent["requester"], sent["sha"]), ("mac/coord", LA))  # requester and pin kept
+        self.assertEqual(self.requests_left(), [])
+        self.assertIn(self.KEY, self.q.entries)  # o/r#1 judged here
+        self.assertNotIn("pr:p/r#2", self.q.entries)
+        # a first fallback with no room: the next one takes it
+        self.room["peer-a"] = 0
+        gg.land_request("land", "p/r#3", [], "mac/coord")
+        self.tick(gg.LAND_FORWARD_RETRY)
+        self.assertEqual(self.batches()[-1], ("peer-b", ["land:p/r#3"]))
+
+    def test_an_open_entry_with_no_app_source_is_handed_on_keeping_its_request_id(self):
+        self.q = self.local_first(executors=[self.A, self.B])
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="mac/coord")
+        self.ready_owners = {"o"}  # judged here first, then its App source goes away
+        self.tick()
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+        rid = self.q.entries[self.KEY]["requestId"]
+        self.ready_owners = set()
+        self.tick(gg.LAND_LATCH_FREE_EVERY + 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["forwardedTo"]), ("forwarded", "peer-a"))
+        self.assertEqual([r["id"] for _, q in self.asked if q["op"] == "batch" for r in q["requests"]], [rid])
+        # a cancel of it follows it there, and there alone
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "mac/coord")
+        self.tick(2)
+        self.assertEqual(self.batches()[-1], ("peer-a", ["withdraw:o/r#1"]))
+        self.assertEqual(self.requests_left(), [])
+
+    def test_with_the_first_fallback_down_the_outbox_keeps_the_row_and_the_next_gets_it(self):
+        self.q = self.local_first(executors=[self.A, self.B])
+        self.down = {"peer-a", "peer-b"}
+        self.land("o/r#1", requester="mac/coord")
+        self.tick()
+        self.assertEqual(self.requests_left(), ["o/r#1"])  # kept: nothing took it
+        self.assertEqual(self.w.notices[-1][0], "land-forward-failed")
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE)["state"], "failing")
+        self.assertEqual(self.w.explains(), [])  # not judged here meanwhile
+        self.down = {"peer-a"}
+        self.tick(10)  # inside the backoff: not sent
+        self.assertEqual(self.batches(), [])
+        self.tick(gg.LAND_FORWARD_RETRY)
+        self.assertEqual(self.batches(), [("peer-b", ["land:o/r#1"])])
+        self.assertEqual(self.requests_left(), [])
+        self.assertEqual(gg.read_json(gg.land_dir() / gg.LAND_FORWARD_FILE)["state"], "ok")
+
+    def test_a_cancel_of_a_row_held_nowhere_here_goes_to_every_fallback(self):
+        self.q = self.local_first(executors=[self.A, self.B])
+        self.down = {"peer-b"}
+        gg.land_request(gg.LAND_WITHDRAW, "p/r#2", [], "mac/coord")
+        self.tick()
+        self.assertEqual(self.batches(), [("peer-a", ["withdraw:p/r#2"])])
+        self.assertEqual(self.requests_left(), ["p/r#2"])  # peer-b has not had it yet
+        self.down = set()
+        self.tick(gg.LAND_FORWARD_RETRY + 1)
+        self.assertEqual([h for h, _ in self.batches()], ["peer-a", "peer-a", "peer-b"])
+        self.assertEqual(self.requests_left(), [])
+
+    def test_the_legacy_executor_key_still_forwards_with_no_app_source(self):
+        self.q = self.local_first(executor=list(self.EXEC))
+        self.pr(LA)
+        self.land("o/r#1", requester="mac/coord")
+        self.tick()
+        self.assertEqual(self.batches(), [("big-exec", ["land:o/r#1"])])
+        self.assertEqual([h for h, q in self.asked if q["op"] == "room"], [])  # the only fallback: never asked
+        self.assertEqual(self.w.explains(), [])
+        # with an App source the same host now judges in its own queue
+        self.ready_owners = {"o"}
+        self.q = self.local_first(executor=list(self.EXEC))
+        self.land("o/r#3", requester="mac/coord")
+        self.tick()
+        self.assertEqual(len(self.batches()), 1)
+        self.assertIn("pr:o/r#3", self.q.entries)
+
+    def test_a_late_row_judged_here_overflows_to_the_fallbacks(self):
+        self.ready_owners = {"o"}
+        self.q = self.local_first(executors=[self.A, self.B], workers=1)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        self.land("o/r#1", requester="mac/coord")
+        self.tick()
+        self.assertEqual(self.batches(), [])
+        self.tick(gg.LAND_OVERFLOW_AFTER + 1)
+        self.assertEqual(self.batches(), [("peer-a", ["land:o/r#1"])])
+        self.assertEqual(self.q.entries[self.KEY]["forwardedTo"], "peer-a")
+
+    def test_cli_land_judges_here_with_an_app_source_else_sends_to_the_first_with_room(self):
+        # a real latch-free check (the CLI builds its own queue): o has an App source here, p none
+        self.w.config.update(executors=[self.A, self.B], latchFreeCommand=[
+            sys.executable, "-c", "import sys; sys.exit(0 if sys.argv[1] == 'o' else 1)", "{owner}"])
+        fwd = lambda cmd, req, deadline=gg.LAND_FORWARD_DEADLINE, run=None: self.serve_at(cmd, req)  # noqa: E731
+        self.room["peer-a"] = 0
+        with mock.patch.object(gg, "land_config", return_value=self.w.config), \
+                mock.patch.object(gg, "land_forward", side_effect=fwd), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
+                mock.patch.object(gg, "policy_host", return_value="mac"):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                gg.main(["land", "o/r#1", "--notify", "mac/coord"])
+                gg.main(["land", "p/r#2", "--notify", "mac/coord"])
+        self.assertEqual(self.requests_left(), ["o/r#1"])  # queued here for this host's daemon
+        self.assertEqual([h for h, r in self.asked if r["op"] == "room"], ["peer-a"])
+        self.assertEqual([(h, r["target"]) for h, r in self.asked if r["op"] == "land"], [("peer-b", "p/r#2")])
 
 
 class WaitFromBytecodeTest(unittest.TestCase):
