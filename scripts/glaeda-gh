@@ -12122,6 +12122,30 @@ def land_update_branch_args(repo: str, number: str, head: str, needs: list[str],
 
 
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
+# A head_moved stop names the live head it read (its next step is `--sha LIVE`), so it also says the pin it stopped was
+# replaced. A row then re-pinned at LIVE whose copy still shows that replaced head is reading something older than the
+# stop's own read, not a new push: gcp-agent-lane-8, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
+# "the head is 383d1cd9dfe7 (the broker read it from GitHub)"; re-pinned at 383d1cd9dfe7 33 s later, pin_wait stopped
+# it "the head is 5bd7077339bc, not the --sha 383d1cd9dfe7" on the cache's copy (vouched fresh by an updatedAt probe,
+# not a head read), and the requester re-queued the same pin by hand, after which it was seen at once. Within this
+# bound such a copy never stops the row; pin_wait keeps reading (its nudge, direct read and LAND_PIN_READ_FAILS bound).
+# Past it the row stops head_moved as before, so a real force-push back to the replaced head still stops it.
+LAND_REPLACED_HEAD_WAIT = 300.0
+LAND_MOVED_NEXT = re.compile(r"--(?:sha|match-head-commit) ([0-9a-f]{40})\b")
+
+
+def land_replaced_head(e: dict, head: str, now: float) -> bool:
+    """True when HEAD is the pin E's last head_moved stop said GitHub had replaced, E is now pinned at the head that stop
+    read, and the re-pin is younger than LAND_REPLACED_HEAD_WAIT: a copy older than the stop's own read."""
+    moved = e.get("movedFrom")
+    if not isinstance(moved, dict):
+        return False
+    was, live = str(moved.get("was") or "").lower(), str(moved.get("head") or "").lower()
+    pin = str(e.get("pinSha") or "").lower()
+    since = e.get("pinSince")
+    return (bool(was and live and pin and head) and head.lower().startswith(was) and live.startswith(pin)
+            and isinstance(since, (int, float)) and not isinstance(since, bool)
+            and now - float(since) < LAND_REPLACED_HEAD_WAIT)
 
 
 def land_direct_read(key: str) -> str | None:
@@ -15151,6 +15175,8 @@ class LandQueue:
             return False  # this queue moved the head itself: pin_follow decides on the first parent
         if land_base_merge_parent(pin, head, data):
             return False  # maybe only a base merge on the pin: judge's worker reads whether it is (base_merge_check)
+        if land_replaced_head(e, head, self.now):
+            return False  # older than the last stop's own read: pin_wait keeps reading (LAND_REPLACED_HEAD_WAIT)
         since = float(e.get("pinSince") or e.get("created") or 0)
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
@@ -16334,7 +16360,9 @@ class LandQueue:
         since = float(e.get("pinSince") or 0)
         reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
                  and not isinstance(t, bool)]
-        if head and reads and max(reads) >= since:
+        # A copy showing the head the last head_moved stop said was replaced is older than that stop's own read
+        # (LAND_REPLACED_HEAD_WAIT): no stop on it, the wait below keeps reading.
+        if head and reads and max(reads) >= since and not land_replaced_head(e, head, self.now):
             # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
             e.pop("pinWait", None)
             if land_base_merge_parent(pin, head, c.get("data") or {}):
@@ -18491,6 +18519,9 @@ class LandQueue:
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
+        live = LAND_MOVED_NEXT.search(nxt or "") if code == "head_moved" else None
+        if live and e.get("pinSha"):
+            e["movedFrom"] = {"was": str(e["pinSha"]).lower(), "head": live.group(1), "at": self.now}
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
                      "holdWindow"):

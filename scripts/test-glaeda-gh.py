@@ -29152,6 +29152,47 @@ class LandTest(Base):
         self.tick(1)
         self.assert_merged_at(LB)
 
+    def replaced_then_repinned(self) -> dict:
+        """Pinned at LA, stopped head_moved naming LB as the live head, re-pinned at LB while the cache, read since
+        the re-pin, still shows LA (hq#18191, 2026-11-22: an updatedAt probe vouched the old copy fresh)."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land_pinned(LA)
+        e = self.tick(1)
+        self.q.stop(e, "head_moved", gg.land_moved_clause(LB, LA), f"glaeda-gh land o/r#1 --sha {LB}")
+        self.assertEqual(e["movedFrom"]["head"], LB)
+        self.land_pinned(LB)
+        self.tick(1)
+        self.pr(LA)  # a copy dated after the re-pin, showing the head the stop already read as replaced
+        return self.tick(1)
+
+    def test_a_copy_showing_the_head_the_last_stop_replaced_never_stops_the_repin(self):
+        """gcp-agent-lane-8, 2026-11-22 23:10Z: hq#18191 stopped "the head is 383d1cd9dfe7 (the broker read it from
+        GitHub), not the --sha 5bd7077339bc"; re-pinned at 383d1cd9dfe7, pin_wait stopped it 33 s later "the head is
+        5bd7077339bc" on a copy older than that stop's own read. That copy never stops the re-pin: pin_wait keeps
+        reading, and the read that shows the pin is judged and merged."""
+        e = self.replaced_then_repinned()
+        judged = len(self.w.explains())  # the first pin's own judgment at LA, before the stop
+        for _ in range(10):
+            e = self.tick(5)
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertEqual(self.w.explains()[judged:], [])
+        self.fresh_head = LB
+        self.w.answers.append(ok_answer(LB))
+        self.tick(gg.NUDGE_MIN)
+        self.tick(1)
+        self.assert_merged_at(LB)
+
+    def test_the_replaced_head_still_stops_the_repin_past_its_bound(self):
+        """A real force-push back to the replaced head still stops the row head_moved, once LAND_REPLACED_HEAD_WAIT
+        has passed since the re-pin."""
+        self.replaced_then_repinned()
+        self.t += gg.LAND_REPLACED_HEAD_WAIT
+        self.pr(LA)
+        e = self.tick(1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])
+
     def test_a_pinned_land_on_an_upstream_host_refreshes_the_pr(self):
         """A host that reads PRs through an upstream: the read is a refresh through it (the broker's quota-aware path),
         not a nudge, and the pinned head it shows is judged."""
