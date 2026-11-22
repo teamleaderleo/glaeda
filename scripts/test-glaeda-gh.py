@@ -27033,6 +27033,170 @@ class LandTest(Base):
         self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
         self.assertEqual((e["state"], e["handoffFail"]["head"], e["handoffFail"]["count"]), ("waiting", LB, 1))
 
+    def handed_off(self) -> dict:
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e["state"], "forwarded")
+        return e
+
+    def quiet_notices(self) -> list[list[str]]:
+        return [c for c in self.w.sent() if "no verdict has come back" in c[-1]]
+
+    def test_a_forward_with_no_verdict_past_its_bound_is_read_once_and_its_requester_told_once(self):
+        # efficiency-scout, 2026-11-22: cmuxterm-hq#16865 forwarded 433 min with no verdict and its owner not told. A
+        # forwarded row is terminal here, so nothing looked again. Past LAND_FORWARD_QUIET the PR is read once, and a
+        # read that shows it still open tells the requester where it went and what to run, once per forward.
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_QUIET - 10)
+        self.assertEqual(self.quiet_notices(), [])
+        watched = len(self.w.watched)
+        self.tick(20)
+        self.assertEqual(self.w.watched[watched:], [self.KEY], "one read is asked")
+        self.assertEqual(self.quiet_notices(), [], "and the notice waits on it")
+        self.pr(LA)  # the read lands: still open at the handed head
+        e = self.tick()
+        [sent] = self.quiet_notices()
+        self.assertEqual(sent[2:4], ["--no-wait", "host/lane"])
+        self.assertIn("handed to ", sent[-1])
+        self.assertIn(f"still reads open at {LA[:12]}", sent[-1])
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.assertTrue(any(h.get("event") == "forward_quiet" for h in e["history"]), e["history"])
+        self.assertEqual(e["state"], "forwarded")
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(len(self.quiet_notices()), 1, "told once per forward")
+
+    def test_a_forward_whose_pr_ended_tells_nobody_and_one_whose_read_never_lands_is_a_log_line(self):
+        e = self.handed_off()
+        self.pr(LA, state="MERGED")
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.tick()
+        self.assertEqual(self.quiet_notices(), [])
+        self.assertEqual(self.q.entries[self.KEY]["forwardQuiet"]["ended"], "MERGED")
+        # a fresh forward whose PR is never read again: once the read's wait is out it is said, but as a log line and
+        # its status, never a wake (review of glaeda#2518: "no verdict" with nothing to act on woke idle lanes)
+        self.w.cache.pop(self.KEY, None)
+        e = self.q.entries[self.KEY]
+        e.pop("forwardQuiet")
+        e["handedOff"]["at"] = self.t
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick(gg.LAND_FORWARD_QUIET + 10)
+            self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        self.assertEqual(self.quiet_notices(), [])
+        [said] = [d["message"] for d in logged if d.get("event") == "land-notice-quiet"]
+        self.assertIn("no read of the PR here says it ended", said)
+        self.assertFalse(self.q.entries[self.KEY]["forwardQuiet"]["read"])
+
+    def test_a_forward_read_as_closed_tells_nobody(self):
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_QUIET + 10)  # the one read is asked
+        self.pr(LA, state="CLOSED")  # and lands: closed
+        logged: list[dict] = []
+        with mock.patch.object(gg, "log", logged.append):
+            for _ in range(3):
+                self.tick(gg.LAND_FORWARD_READ_WAIT)
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["forwardQuiet"]["ended"]), ("forwarded", "CLOSED"))
+        self.assertEqual(self.quiet_notices(), [])
+        self.assertEqual([d for d in logged if d.get("event") in ("land-notice-quiet", "land-forward-quiet")], [])
+
+    def test_a_row_forwarded_again_after_its_hand_off_is_timed_from_the_newer_forward(self):
+        # Review of glaeda#2518, item 1: handedOff is never removed, and it was read before forwardedAt, so a row
+        # handed off at T1 and forwarded again at T2 was told at once with T1's age.
+        e = self.handed_off()
+        t1 = e["handedOff"]["at"]
+        self.tick(gg.LAND_FORWARD_QUIET)
+        e = self.q.entries[self.KEY]
+        e["forwardedAt"] = self.t  # forwarded again (an executor's forward or an overflow) at T2
+        self.assertEqual(self.q.forwarded_at(e), self.t)
+        self.assertGreater(self.q.forwarded_at(e), t1)
+        watched = len(self.w.watched)
+        self.tick(20)
+        self.assertEqual((self.w.watched[watched:], e.get("forwardQuiet")), ([], None), "not reported at T1's age")
+        self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(self.w.watched[watched:], [self.KEY], "reported once past the bound from T2")
+
+    def test_a_requeue_after_a_no_verdict_notice_hands_the_land_off_again(self):
+        # Review of glaeda#2518, item 2: the notice says "queue it again", but owner_refused saw the same head handed
+        # off before and marked the row forwarded with no call, so the re-queue did nothing and the bound was spent.
+        self.handed_off()
+        self.assertEqual(len(self.handoffs()), 1)
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.pr(LA)
+        self.tick()
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = {}
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual(len(self.handoffs()), 2, "handed off again")
+        self.assertEqual(e["state"], "forwarded")
+        self.assertEqual(e["handedOff"]["at"], self.q.forwarded_at(e))
+        # and the new hand-off gets its own bound and its own one notice
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.pr(LA)
+        self.tick()
+        self.assertEqual(len(self.quiet_notices()), 2)
+        # a re-queue with no notice since the hand-off is still the one call: marked forwarded again, no second call
+        self.land()
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual(len(self.handoffs()), 2)
+
+    def test_forward_reads_are_capped_per_tick_and_off_while_parked_on_quota_or_switched_off(self):
+        keys = [f"pr:o/r#{n}" for n in range(1, gg.LAND_FORWARD_READS + 4)]
+        for n, key in enumerate(keys, 1):
+            self.q.entries[key] = {"key": key, "repo": "o/r", "number": n, "state": "forwarded", "requester": "host/lane",
+                                   "forwardedTo": "far", "forwardedAt": self.t, "history": []}
+            self.q.save(self.q.entries[key])
+        self.q.queue_quota_until, self.q.queue_quota_at = self.t + 10 * gg.LAND_FORWARD_QUIET, self.t
+        with mock.patch.object(self.q, "queue_park_voided_by", return_value=None):
+            self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.assertEqual(self.w.watched, [], "no read while the queue is parked on quota")
+        self.q.clear_queue_park()
+        given = self.q.config_given
+        self.q.config_given = {**self.q.config(), "forwardQuiet": False}
+        self.tick()
+        self.assertEqual(self.w.watched, [], "land.json forwardQuiet: false turns it off")
+        self.q.config_given = given
+        self.tick()
+        self.assertEqual(len(self.w.watched), gg.LAND_FORWARD_READS, "LAND_FORWARD_READS a tick")
+        self.tick()
+        self.assertEqual(sorted(self.w.watched), sorted(keys), "the rest the next tick, each once")
+
+    def test_a_restart_neither_tells_a_told_forward_again_nor_loses_one_in_flight(self):
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.pr(LA)
+        self.tick()
+        self.assertEqual(len(self.quiet_notices()), 1)
+        self.q = self.queue()
+        self.q.load()
+        e = self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual((e["state"], len(self.quiet_notices())), ("forwarded", 1), "told once across a restart")
+        # one past its bound whose read was asked before the restart: asked again after it, then told
+        e.pop("forwardQuiet")
+        e["handedOff"]["at"] = self.t
+        self.q.save(e)
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        watched = len(self.w.watched)
+        self.q = self.queue()
+        self.q.load()
+        self.tick()
+        self.assertEqual(self.w.watched[watched:], [self.KEY], "the read is asked again after the restart")
+        self.pr(LA)
+        self.tick()
+        self.assertEqual(len(self.quiet_notices()), 2)
+
     def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
         self.broker = True
         self.pr(LA)
