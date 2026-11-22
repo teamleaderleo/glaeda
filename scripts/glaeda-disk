@@ -2507,6 +2507,12 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "dedupe_capture_settle_minutes": 30.0,
     # one pass stops here (walking, hashing and cloning); its hashes are kept, and the next pass resumes
     "dedupe_capture_budget_minutes": 20.0,
+    # cargo-stale-artifacts (sweep_cargo_targets): inside every Cargo target under these roots, live worktree or not,
+    # a <profile>/deps unit or <profile>/incremental crate dir whose files' mtime and atime are all older than
+    # cargo_stale_hours goes, the newest per crate stem always stays. [] or 0 turns it off.
+    "cargo_stale_roots": ["~/Projects", "~/.wt/checkouts", "~/.cache/cargo-target", "~/lanes", "~/lane-scratch",
+                          "~/lab-target"],
+    "cargo_stale_hours": 6.0,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
 # Why this run reclaims out of band (OUT_OF_BAND), "" for every other run. apply() reads it: such a run deletes
@@ -4667,6 +4673,303 @@ def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None,
     return released
 
 
+# A live Cargo target grows without bound: every rebuild of a changed crate leaves a new hashed unit in
+# <profile>/deps (a ~300 MB test binary per `cargo test` of acpmux) and a new crate dir in <profile>/incremental, and
+# Cargo never removes the old ones. An agent lane VM, 2026-11-22: one live worktree's cmux-tui/target/debug reached
+# 137 GiB (deps 107 GiB in 4,802 files, incremental 30 GiB) while the lane ran `cargo test -p acpmux` over and over,
+# / fell about 50 GiB/h to 17 GiB free, and `glaeda-disk --dead` found 0.0G: the worktree was live, so was its target.
+# The cargo-target family stays report-only (it names whole targets); this pass trims inside every target, live or
+# not, the way cargo-sweep --time does: a unit whose every file's mtime and atime are older than cargo_stale_hours goes,
+# except the newest unit of each crate stem (a library and a test binary of one crate are separate stems), and except
+# a unit a process holds open (/proc fds, cwds and exes, or lsof). Only deps/ and incremental/ are touched, never
+# build/ (build scripts' OUT_DIR), .fingerprint, or the top-level binaries. Cargo's own build lock
+# (<profile>/.cargo-lock) is taken without waiting while a profile is trimmed, so no build runs beside it: a profile a
+# build holds waits for the next pass. Cargo sees a removed unit's output missing and rebuilds it; nothing is lost.
+CARGO_STALE_FAMILY = "cargo-stale-artifacts"
+CARGO_DEPS_UNIT = re.compile(r"^(?P<crate>.+?)-(?P<hash>[0-9a-f]{16})(?:\..+)?$")  # <crate>-<16 hex>[.ext]
+CARGO_LIB_FILE = re.compile(r"^lib.+\.(?:rlib|rmeta|so|dylib|a)$")  # liblibc-H.rlib is crate libc's library
+CARGO_INCREMENTAL_UNIT = re.compile(r"^(?P<crate>.+)-(?P<hash>[0-9a-z]{8,16})$")  # <crate>-<base36 hash>
+CARGO_PART_DIRS = ("deps", "incremental")
+CARGO_STALE_DEPTH = 5  # ~/Projects/checkouts/<repo>/<worktree>/<crate dir>/target
+CARGO_STALE_SEARCH_BUDGET = 300_000  # directory entries listed per pass while finding targets
+CARGO_STALE_WALK_BUDGET = 50_000  # entries walked inside one unit; a bigger unit is not proven stale
+CARGO_STALE_BUDGET_S = 600.0  # one pass stops here; the next goes on
+CARGO_STALE_HOLD_S = 120.0  # at most this long holding one profile's Cargo lock
+CARGO_STALE_SEARCH_SKIP = frozenset({".git", "node_modules", ".build", "DerivedData", ".venv", "__pycache__",
+                                     ".gradle", "Pods", "src", "tests", "docs"})
+
+
+def cargo_target_dir(path: Path, names: set[str] | None = None) -> bool:
+    """PATH is a Cargo target directory: a real directory holding cargo's CACHEDIR.TAG."""
+    if names is not None and "CACHEDIR.TAG" not in names:
+        return False
+    return (not path.is_symlink() and path.is_dir()
+            and bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256))))
+
+
+def cargo_stale_roots(home: Path | None = None) -> list[Path]:
+    """The cargo_stale_roots disk-policy names, expanded (capture_dedupe_roots' rules)."""
+    return capture_dedupe_roots(list(POLICY.get("cargo_stale_roots") or []), home)
+
+
+def find_cargo_targets(roots: list[Path], depth: int = CARGO_STALE_DEPTH,
+                       budget: int = CARGO_STALE_SEARCH_BUDGET) -> list[Path]:
+    """Every Cargo target at or below ROOTS (up to DEPTH levels down), breadth first, links never followed, a
+    target's own tree never entered; each once, by its real path."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        level = [root]
+        for _ in range(depth + 1):
+            nxt: list[Path] = []
+            for d in level:
+                try:
+                    with os.scandir(d) as it:
+                        entries = list(it)
+                except OSError:
+                    continue
+                budget -= len(entries)
+                if cargo_target_dir(d, {e.name for e in entries}):
+                    real = os.path.realpath(d)
+                    if real not in seen:
+                        seen.add(real)
+                        found.append(Path(real))
+                    continue
+                for e in entries:
+                    if (e.name in CARGO_STALE_SEARCH_SKIP or DELETING_RE.fullmatch(e.name)
+                            or not e.is_dir(follow_symlinks=False)):
+                        continue
+                    nxt.append(Path(e.path))
+                if budget < 0:
+                    return found
+            level = nxt
+    return found
+
+
+def cargo_profiles(target: Path) -> list[Path]:
+    """The profile dirs of a target with deps or incremental below them: <target>/<profile> and, for a
+    --target build, <target>/<triple>/<profile>; links never followed."""
+    out: list[Path] = []
+    for c in _children(target):
+        if c.is_symlink() or not c.is_dir() or c.name in ("tmp", ".fingerprint", "doc", "package"):
+            continue
+        if any((c / p).is_dir() and not (c / p).is_symlink() for p in CARGO_PART_DIRS):
+            out.append(c)
+            continue
+        for g in _children(c):
+            if not g.is_symlink() and g.is_dir() and \
+                    any((g / p).is_dir() and not (g / p).is_symlink() for p in CARGO_PART_DIRS):
+                out.append(g)
+    return out
+
+
+def cargo_unit_last_use(paths: list[Path], dev: int) -> tuple[float, int] | None:
+    """The newest mtime or atime of any file in PATHS (a directory's mtime; never its atime, which listing it
+    moves) and their allocated bytes; None when a walk meets a link out, another filesystem, an unreadable
+    directory or more than CARGO_STALE_WALK_BUDGET entries: such a unit is not proven stale."""
+    newest, used, budget = 0.0, 0, CARGO_STALE_WALK_BUDGET
+    stack: list[str] = []
+    for p in paths:
+        try:
+            st = p.lstat()
+        except OSError:
+            return None
+        if st.st_dev != dev or stat.S_ISLNK(st.st_mode):
+            return None
+        used += st.st_blocks * 512
+        if stat.S_ISDIR(st.st_mode):
+            newest = max(newest, st.st_mtime)
+            stack.append(os.fspath(p))
+        else:
+            newest = max(newest, st.st_mtime, st.st_atime)
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return None
+                    est = e.stat(follow_symlinks=False)
+                    if est.st_dev != dev:
+                        return None
+                    used += est.st_blocks * 512
+                    if stat.S_ISDIR(est.st_mode):
+                        newest = max(newest, est.st_mtime)
+                        stack.append(e.path)
+                    else:
+                        newest = max(newest, est.st_mtime, est.st_atime)
+        except OSError:
+            return None
+    return newest, used
+
+
+def cargo_part_units(part: Path, sub: str) -> dict[tuple[str, str], dict[str, list[Path]]]:
+    """A deps or incremental folder's units by crate stem: {(crate, kind): {hash: [paths]}}. In deps a unit is
+    every file of one hash (libX-H.rlib, libX-H.rmeta and X-H.d are one library unit); a library and a binary or
+    test of one crate are separate stems. In incremental a unit is one <crate>-<hash> dir. Names neither pattern
+    matches are no unit and stay."""
+    out: dict[tuple[str, str], dict[str, list[Path]]] = {}
+    kinds: dict[tuple[str, str], str] = {}
+    pattern = CARGO_DEPS_UNIT if sub == "deps" else CARGO_INCREMENTAL_UNIT
+    groups: dict[tuple[str, str], list[Path]] = {}
+    for e in _children(part):
+        m = pattern.match(e.name)
+        if m is None or e.is_symlink():
+            continue
+        crate = m["crate"]
+        lib = sub == "deps" and CARGO_LIB_FILE.match(e.name) is not None
+        if lib:
+            crate = crate[3:]
+        key = (crate, m["hash"])
+        groups.setdefault(key, []).append(e)
+        if lib or sub != "deps":
+            kinds[key] = "lib" if lib else "incremental"
+    for (crate, h), paths in groups.items():
+        out.setdefault((crate, kinds.get((crate, h), "bin")), {})[h] = sorted(paths)
+    return out
+
+
+@contextlib.contextmanager
+def cargo_profile_lock(profile: Path):
+    """Cargo's build lock on PROFILE (flock LOCK_EX on .cargo-lock, held by every cargo build), taken without
+    waiting: yields True while held, False when a build holds it or there is none. Released when the block ends."""
+    try:
+        fd = os.open(profile / ".cargo-lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def sweep_cargo_targets(receipt: Path, roots: list[Path] | None = None, apply: bool = True, halt=None,
+                        now: float | None = None, stale_hours: float | None = None) -> dict[str, Any]:
+    """The cargo-stale-artifacts pass (see CARGO_STALE_FAMILY): in every Cargo target under ROOTS (the
+    cargo_stale_roots policy), each deps or incremental unit unused (mtime and atime) for STALE_HOURS
+    (cargo_stale_hours), other than its crate stem's newest unit and any a process holds open, is removed while
+    its profile's Cargo lock is held; with APPLY false it is only counted (no lock taken). Process evidence
+    missing stops the pass. One receipt line per pass that found a target. Returns {targets, units, bytes,
+    removed (when applied), kept: {why: n}, by_target: {path: bytes}, stopped}."""
+    stale_hours = float(POLICY.get("cargo_stale_hours") or 0) if stale_hours is None else stale_hours
+    roots = cargo_stale_roots() if roots is None else roots
+    out: dict[str, Any] = {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
+    if stale_hours <= 0 or not roots:
+        return out
+    start = time.time() if now is None else now
+    left = run_deadline_left()
+    budget_s = CARGO_STALE_BUDGET_S if left is None else max(0.0, min(CARGO_STALE_BUDGET_S, left))
+    kept: collections.Counter = collections.Counter()
+    targets = find_cargo_targets(roots)
+    out["targets"] = len(targets)
+    uid = os.getuid()
+    try:
+        opened, cmds = process_evidence()
+    except NoEvidence as e:
+        out["stopped"] = f"no process evidence: {e}"
+        print(f"refusing to trim cargo targets: {e}", file=sys.stderr)
+        targets = []
+    index, read_at = (open_index(opened), time.monotonic()) if targets else (frozenset(), 0.0)
+    for target in targets:
+        if time.time() - start > budget_s:
+            out["stopped"] = f"pass budget {budget_s:g}s reached"
+            break
+        if halt is not None and (why := halt()):
+            out["stopped"] = f"halted: {why}"
+            break
+        try:
+            tst = target.lstat()
+        except OSError:
+            continue
+        if tst.st_uid != uid or never_delete(target) or toolchain_held(target):
+            kept["another user's target, or protected"] += 1
+            continue
+        for profile in cargo_profiles(target):
+            lock = cargo_profile_lock(profile) if apply else contextlib.nullcontext(True)
+            with lock as locked:
+                if not locked:
+                    kept["a cargo build holds the profile (or it has no .cargo-lock)"] += 1
+                    continue
+                held_until = time.monotonic() + CARGO_STALE_HOLD_S
+                if time.monotonic() - read_at > TMP_TEST_RESIDUE_EVIDENCE_S:
+                    try:
+                        opened, cmds = process_evidence()
+                    except NoEvidence as e:
+                        out["stopped"] = f"no process evidence: {e}"
+                        break
+                    index, read_at = open_index(opened), time.monotonic()
+                cutoff = time.time() - stale_hours * 3600
+                for sub in CARGO_PART_DIRS:
+                    part = profile / sub
+                    if part.is_symlink() or not part.is_dir():
+                        continue
+                    for stem, units in cargo_part_units(part, sub).items():
+                        seen = {h: cargo_unit_last_use(paths, tst.st_dev) for h, paths in units.items()}
+                        newest = max(units, key=lambda h: (seen[h] or (float("inf"), 0))[0])
+                        for h, paths in units.items():
+                            last = seen[h]
+                            if h == newest:
+                                kept["the newest unit of its crate stem"] += 1
+                            elif last is None:
+                                kept["not proven stale (a link, mount, unreadable or too big)"] += 1
+                            elif last[0] > cutoff:
+                                kept[f"used within {stale_hours:g}h"] += 1
+                            elif any(in_cwd(os.fspath(p), index) for p in paths):
+                                kept["open in a process"] += 1
+                            elif any(named_by(os.fspath(p), cmds) for p in paths):
+                                kept["named by a running command"] += 1
+                            elif apply and time.monotonic() > held_until:
+                                kept["the Cargo lock hold's time is spent: next pass"] += 1
+                            else:
+                                if apply:
+                                    try:
+                                        for p in paths:
+                                            if p.is_dir() and not p.is_symlink():
+                                                shutil.rmtree(p, onerror=_chmod_retry)
+                                            else:
+                                                p.unlink()
+                                    except OSError as e:
+                                        kept[f"incomplete:{e.__class__.__name__}"] += 1
+                                        continue
+                                out["units"] += 1
+                                out["bytes"] += last[1]
+                                out["by_target"][os.fspath(target)] = \
+                                    out["by_target"].get(os.fspath(target), 0) + last[1]
+            if out["stopped"]:
+                break
+        if out["stopped"]:
+            break
+    out["kept"] = dict(kept)
+    if apply and targets:
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+               "outcome": "reclaimed" if out["units"] else "none", "family": CARGO_STALE_FAMILY,
+               "bytes": out["bytes"], "items": out["units"], "targets": out["targets"],
+               "by_target": out["by_target"], "kept": out["kept"], "stale_hours": stale_hours,
+               **({"stopped": out["stopped"]} if out["stopped"] else {})}
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+    return out
+
+
+def cargo_stale_text(res: dict[str, Any], applied: bool) -> str:
+    """One line for a cargo-stale-artifacts pass: what it freed (or would free) and where most of it was."""
+    top = sorted(res["by_target"].items(), key=lambda kv: -kv[1])[:3]
+    where = "; ".join(f"{gib(b).strip()} {p}" for p, b in top)
+    return (f"  {'reclaimed' if applied else 'would free'} {gib(res['bytes']).strip():>8s}  {res['units']} stale "
+            f"cargo units in {len(res['by_target'])} of {res['targets']} cargo targets ({CARGO_STALE_FAMILY})"
+            + (f": {where}" if where else "") + (f"; stopped: {res['stopped']}" if res["stopped"] else ""))
+
+
 def apple_build_verdict(path: Path) -> str:
     """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
     build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
@@ -5514,7 +5817,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
     # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
     fams.append(checkout_build_family(projects, role))
-    # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
+    # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so whole targets are visibility only; the stale
+    # units inside every target, live or not, are the cargo-stale-artifacts pass's (sweep_cargo_targets).
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
                        "report only: cargo clean; also counted in its checkout",
@@ -16746,6 +17050,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"\n$TMPDIR: {tmp_residue['entries']} entries, {tmp_residue['test_residue']} test scratch"
                   f" ({tmp_residue['idle']} untouched {TMP_TEST_RESIDUE_IDLE_HOURS:g}h+ at the top)"
                   f"{'; words-UUID test names count on this runner host' if tmp_residue['runner_host'] else ''}")
+        if (not a.apply and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not DEAD_MODE
+                and (not a.family or CARGO_STALE_FAMILY in a.family)):
+            print("\n" + cargo_stale_text(sweep_cargo_targets(a.receipt, apply=False), applied=False).strip())
         if tooling:
             print("\nXcode copies and simulator runtimes")
         for t in tooling:
@@ -16772,7 +17079,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
         def apply_pass(chosen: list[Item]) -> int:
             return apply(chosen, by_id, a.receipt, {fs.dev: fs.target for fs in shown} if a.pressure else None,
                          idle, halt, all_families=fams, receipt_sweep=sweep, taken=taken)
-        logical_released = stale_marker_released + cas_budget_freed + apply_pass([i for i in items if id(i) not in last])
+        # stale units inside every Cargo target, live worktree or not, first: garbage no build reads costs nothing to lose
+        cargo_stale_freed = 0
+        if ((a.pressure or sweep) and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
+                and not out_of_band and not DEAD_MODE and (not a.family or CARGO_STALE_FAMILY in a.family)):
+            cargo_stale = sweep_cargo_targets(a.receipt, halt=halt)
+            cargo_stale_freed = cargo_stale["bytes"]
+            RUN["cargo_stale_gib"] = round(cargo_stale_freed / GIB, 1)
+            if cargo_stale["units"] or cargo_stale["stopped"]:
+                print(cargo_stale_text(cargo_stale, applied=True))
+        logical_released = (stale_marker_released + cas_budget_freed + cargo_stale_freed
+                            + apply_pass([i for i in items if id(i) not in last]))
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE and not reserved and not out_of_band and not DEAD_MODE:  # job-owned _work
