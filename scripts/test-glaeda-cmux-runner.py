@@ -2550,6 +2550,145 @@ class HookTest(unittest.TestCase):
         self.assertIn("warning: 15.0 GiB free, 20 GiB required: admitted under the admission floor", text,
                       "warned under one job's measured disk growth")
 
+    # JOB_DISK_PEAK_LEARNED: each job's disk peak learned from this host's job log, held for at job start
+    PEAK_KEY = "manaflow-ai/cmux/ci.yml/build-app"
+
+    def peak_log(self, runs: list[tuple[float, float, bool]], started: dict[str, str] | None = None,
+                 key: str = PEAK_KEY) -> Path:
+        """A job log with one completed line per (start, min, alone) of key's job, and a started line per runner."""
+        repo, workflow, job = key.split("/", 2)[0] + "/" + key.split("/")[1], key.split("/")[2], key.split("/")[3]
+        log = self.dir / f"jobs-{len(runs)}-{len(started or {})}.jsonl"
+        lines = [{"schema": hook.JOB_SCHEMA, "event": "completed", "repository": repo, "workflow_file": workflow,
+                  "job": job, "runner": "old", "disk_free_start_gib": start, "disk_free_min_gib": low,
+                  "other_runner_jobs": [] if alone else [{"runner": "x", "core_seconds": 1}], "at": 1}
+                 for start, low, alone in runs]
+        lines += [{"schema": hook.JOB_SCHEMA, "event": "started", "repository": repo, "workflow_file": workflow,
+                   "job": job, "runner": runner, "at": 2} for runner, job in (started or {}).items()]
+        log.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        return log
+
+    def peak_runner(self, install: str, name: str, pid: int) -> dict[int, tuple[int, str]]:
+        """A runner install named name in self.dir with a Runner.Worker at pid, as a process table row."""
+        (self.dir / install).mkdir(exist_ok=True)
+        (self.dir / install / ".runner").write_text(json.dumps({"agentName": name}))
+        return {pid: (1, f"{self.dir}/{install}/bin/Runner.Worker spawnclient 1 2")}
+
+    def test_a_learned_job_peak_replaces_the_default(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            # three runs alone: their own growth, p90 rounded up to 0.1 GiB
+            peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(
+                [(100.0, 70.0, True), (100.0, 68.0, True), (100.0, 65.5, True), (100.0, 40.0, False)])))
+            self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY), (34.5, "p90 of 3 runs here alone"))
+            # fewer than JOB_PEAK_MIN_SAMPLES alone: every run counts (the safe side)
+            peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(
+                [(100.0, 95.0, True), (100.0, 94.0, False), (100.0, 92.0, False)])))
+            self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY), (8.0, "p90 of 3 runs here"))
+            # only the newest JOB_PEAK_RECENT runs count
+            runs = [(100.0, 10.0, True)] * 5 + [(100.0, 96.0, True)] * hook.JOB_PEAK_RECENT
+            peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(runs)))
+            self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY)[0], 4.0)
+
+    def test_no_history_falls_back_to_the_flat_job_peak(self) -> None:
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            for runs in ([], [(100.0, 50.0, True), (100.0, 50.0, True)], [(100.0, None, True)] * 5):
+                with self.subTest(runs=runs):
+                    peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(runs)))
+                    self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY), (20.0, "default, no history"))
+            self.assertEqual(hook.job_peak_gib({}, None), (20.0, "default, no history"))
+            empty = self.peak_log([])
+            with mock.patch.object(hook, "free_gib", return_value=30.0), \
+                    mock.patch.object(hook, "evict") as evict:
+                # 10 GiB margin + 20 GiB default, nothing in flight: 30 GiB is enough
+                self.assertIsNone(hook.job_disk_peak_hold(os.fspath(self.dir), self.dir / "state", None,
+                                                          self.PEAK_KEY, None, time.monotonic() + 30, empty,
+                                                          self.dir, {}))
+            evict.assert_not_called()
+
+    def test_jobs_in_flight_past_free_disk_hold_the_start_for_a_pressure_pass(self) -> None:
+        """Two jobs in flight whose learned peak is 30 GiB and this one's (default 20) need 10 + 30 + 30 + 20 = 90 GiB,
+        so at 70 GiB free a pressure pass runs to 90 and the start waits for it."""
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            log = self.peak_log([(100.0, 70.0, True)] * 3, {"mini-a": "build-app", "mini-b": "build-app"})
+            table = {**self.peak_runner("actions-runner-a", "mini-a", 4001),
+                     **self.peak_runner("actions-runner-b", "mini-b", 4002),
+                     **self.peak_runner("actions-runner-c", "mini-c", 4003)}  # this job's own Worker
+            deadline = time.monotonic() + 30
+            with mock.patch.object(hook, "free_gib", return_value=70.0), \
+                    mock.patch.object(hook, "evict", return_value="under the 90 GiB disk floor: freed 3.0 GiB") as ev:
+                note = hook.job_disk_peak_hold(os.fspath(self.dir), self.dir / "state", 4003, "other/x.yml/lint",
+                                               None, deadline, log, self.dir, table)
+            ev.assert_called_once_with(os.fspath(self.dir), 90.0, None, deadline)
+            self.assertIn("runner jobs' disk: 70.0 GiB free, 90 GiB needed (10 GiB margin + this job's 20 GiB "
+                          "(default, no history) + 2 in flight: build-app on mini-a 30 GiB, build-app on mini-b 30 GiB)",
+                          note)
+            self.assertIn("still short; started anyway (JOB_DISK_PEAK_LEARNED, never refuses)", note)
+            # free disk over the line: no pass, no hold
+            with mock.patch.object(hook, "free_gib", return_value=90.0), mock.patch.object(hook, "evict") as ev:
+                self.assertIsNone(hook.job_disk_peak_hold(os.fspath(self.dir), self.dir / "state", 4003, None,
+                                                          None, deadline, log, self.dir, table))
+            ev.assert_not_called()
+
+    def test_the_peak_hold_never_refuses_or_waits_past_the_disk_budget(self) -> None:
+        """A spent budget starts the job at once; job-started admits a job held for disk and passes the hold only
+        its own DISK_RECLAIM_WAIT_S deadline."""
+        log = self.peak_log([], {"mini-a": "build-app"})
+        table = self.peak_runner("actions-runner-a", "mini-a", 4001)
+        with mock.patch.object(hook, "free_gib", return_value=5.0), mock.patch.object(hook, "evict") as ev:
+            note = hook.job_disk_peak_hold(os.fspath(self.dir), self.dir / "state", None, None, None,
+                                           time.monotonic() - 1, log, self.dir, table)
+        ev.assert_not_called()
+        self.assertIn("the disk budget is spent; started without holding", note)
+        # this job-started's floor eviction already ran a pass to the line: no second pass
+        with mock.patch.object(hook, "free_gib", return_value=5.0), mock.patch.object(hook, "evict") as ev:
+            note = hook.job_disk_peak_hold(os.fspath(self.dir), self.dir / "state", None, None, None,
+                                           time.monotonic() + 30, log, self.dir, table, evicted_to=60.0)
+        ev.assert_not_called()
+        self.assertIn("this job's floor pass to 60 GiB already ran; started", note)
+        with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")), \
+                mock.patch.object(hook, "job_log_tail", side_effect=RuntimeError("boom")):
+            self.assertIsNone(hook.job_disk_peak_hold(os.fspath(self.dir), self.dir, None, None, None,
+                                                      time.monotonic() + 30, log, self.dir, table))
+        with mock.patch.object(hook, "free_gib", return_value=5.0), \
+                mock.patch.object(hook, "job_log_tail", side_effect=RuntimeError("boom")):
+            self.assertEqual(hook.job_disk_peak_hold(os.fspath(self.dir), self.dir, None, None, None,
+                                                     time.monotonic() + 30, log, self.dir, table),
+                             "runner jobs' disk check skipped: RuntimeError")
+
+        self.fleet()
+        job = self.worker_stand_in()
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        deadlines: list[float] = []
+
+        def slow_evict(_path, floor, _explicit, deadline):
+            deadlines.append(deadline)
+            return f"under the {floor:g} GiB disk floor: the eviction budget is spent"
+        begin = time.monotonic()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "free_gib", return_value=45.0), \
+                mock.patch.object(hook, "prejob_evict", return_value=None), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.object(hook, "evict", side_effect=slow_evict), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid),
+                              "--job-log", os.fspath(log), "--gui-wait", "0"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(len(deadlines), 1, out.getvalue())
+        self.assertLessEqual(deadlines[0], begin + hook.DISK_RECLAIM_WAIT_S + 1)
+        self.assertIn("runner jobs' disk: 45.0 GiB free, 50 GiB needed (10 GiB margin + this job's 20 GiB "
+                      "(default, no history) + 1 in flight: build-app on mini-a 20 GiB)", out.getvalue())
+        self.assertIn("never refuses", out.getvalue())
+        self.assertIn("admitted", out.getvalue())
+
     def test_prejob_margin_override_is_bounded(self) -> None:
         for value, want in (("5", 5.0), ("0", 0.0), ("-1", 20.0), ("501", 20.0), ("nan", 20.0), ("x", 20.0)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {hook.PREJOB_MARGIN_ENV: value}):
