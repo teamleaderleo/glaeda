@@ -13598,7 +13598,29 @@ LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
-LAND_HANDOFF_DEADLINE = 60.0
+# The broker's relay of land_handoff took 135 s and 439 s for the same call (relay_take, 2026-11-22 21:20-21:38Z) and
+# took the request both times (cmux-cp-1 accepted cmux#47528 and #49643), so a 60 s deadline cut every hand-off from a
+# lane VM short and counted it a refusal, until handoff_refused stopped six rows. The deadline is above the observed
+# take; it holds one land pool slot (a per-entry job, as explain's 1500 s does), never the queue.
+LAND_HANDOFF_DEADLINE = 600.0
+# A hand-off cut at the deadline is outcome unknown, not a refusal: the broker may have queued it. The broker applies a
+# repeated hand-off of one head once (idempotent), so it is sent again after this backoff (doubling to
+# LAND_STEP_BACKOFF_MAX) and never counted toward LAND_STEP_STOP.
+LAND_HANDOFF_TIMEOUT_BACKOFF = 60.0
+# A lane VM's name before its fleet rename: rows queued under it carry FREESTYLE-VM/SESSION as their requester, which
+# the broker refuses ("requester must be a session on <host>"); hand_off sends it as policy_host()/SESSION.
+LAND_OLD_IMAGE_HOSTS = ("freestyle-vm",)
+
+
+def land_handoff_requester(requester: str, host: str) -> str:
+    """The requester hand_off names to the broker for REQUESTER on HOST: itself when it is a session on HOST, the same
+    session on HOST when it was queued under the VM's old image name (LAND_OLD_IMAGE_HOSTS), else "" (none sent)."""
+    first, slash, rest = requester.partition("/")
+    if not slash or not rest or not host:
+        return ""
+    if first == host:
+        return requester
+    return f"{host}/{rest}" if first in LAND_OLD_IMAGE_HOSTS else ""
 
 
 def land_session_lane(name: str) -> str:
@@ -18042,7 +18064,8 @@ class LandQueue:
         """Hand E at HEAD to the broker host's land queue (`lane-gh call land_handoff`), after its owner check refused a
         step here (owner_refused) or this VM could not judge it (unjudgeable_here). Taken: the entry is forwarded, the requester told. Refused: counted per head like a
         step's refusal (backoff, then a stop at LAND_STEP_STOP), except a refusal naming the PR's live head
-        (LAND_HANDOFF_HEAD), which hands it off again at that head at once (REPINNED: this is that second call)."""
+        (LAND_HANDOFF_HEAD), which hands it off again at that head at once (REPINNED: this is that second call). Timed
+        out: outcome unknown, sent again after a backoff and never counted (LAND_HANDOFF_TIMEOUT_BACKOFF)."""
         due = e.get("handoffDue") or {}
         reason = str(due.get("reason") or "ownership")
         if due.get("kind") == "judgment":
@@ -18051,8 +18074,9 @@ class LandQueue:
             what = f"the broker refused this lane's {due.get('kind') or 'step'} at {head[:12]} ({due.get('why') or reason})"
         args: dict[str, Any] = {"number": int(e["number"]), "sha": head}
         requester = str(e.get("requester") or "")
-        if requester.startswith(f"{policy_host()}/"):
-            args["requester"] = requester  # the broker takes only a session on this VM; else it tells the VM's lane
+        named = land_handoff_requester(requester, policy_host())
+        if named:
+            args["requester"] = named  # the broker takes only a session on this VM; else it tells the VM's lane
         lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
         with self.lock:
             self.claim(e, "hand_off", head=head)
@@ -18072,6 +18096,7 @@ class LandQueue:
                 host = str(doc.get("host") or "the broker host")
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
+                e.pop("handoffTimeout", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
                                   "request": str(doc.get("request") or "")}
                 e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=host)
@@ -18081,6 +18106,16 @@ class LandQueue:
                             f"(glaeda-gh land status there)", wake=False)
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
+            if got.returncode == 124 and str(got.stderr or "").startswith("timed out after"):
+                # outcome unknown (LAND_HANDOFF_TIMEOUT_BACKOFF): sent again, never counted as a refusal
+                last = e.get("handoffTimeout") or {}
+                n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+                e["handoffTimeout"] = {"head": head, "count": n, "at": self.now}
+                self.history(e, "handoff_timed_out", head=head[:12], why=land_trim(said, 160), n=n)
+                after = min(LAND_STEP_BACKOFF_MAX, LAND_HANDOFF_TIMEOUT_BACKOFF * (2 ** (n - 1)))
+                self.wait(e, {"kind": "retry", "why": f"the hand-off to the broker host's land queue timed out "
+                              f"(outcome unknown; the broker applies it once): sent again after {after:.0f} s"}, after)
+                return
             live = self.handoff_head_moved(e, head, f"{got.stderr or ''} {got.stdout or ''}", repinned)
             if live is None:
                 return  # stopped: its pin is not the PR's head
