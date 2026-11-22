@@ -24464,6 +24464,34 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    def test_sha_pin_follows_the_base_merge_land_judge_made_in_the_merge_step(self):
+        # teamleaderleo/glaeda#2499, 2026-11-22: judged ok at 52240119, the pinned merge (the gh shim runs land_judge
+        # again) merged main into the PR and was refused checks_running, the lander bot's 7044843d appeared, and the
+        # land stopped head_moved. The step's refusal is now read like a judgment's: the pin follows that merge.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = (self.judge_merged_base(LA)[1]["reason"]
+                                  + f"; next: glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 900")
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIn("update_by_judge", [h["event"] for h in e["history"]])
+        self.w.gh_rc["merge"] = 0
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[("ci", "IN_PROGRESS", "")]), self.t + 5)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA, "d" * 40]  # the bot's merge: the pin, then main
+        e = self.tick(10)
+        self.assertNotEqual(e["state"], "stopped")
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_WAIT_DEFAULT + 120, step=30.0)
+        self.assertEqual((e.get("stop") or {}).get("code"), None)
+        self.assertEqual(e["pinSha"], LB)
+        self.assertEqual([m[-1] for m in self.w.gh_calls("pr", "merge")], [LA, LB])  # refused at the pin, then merged
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+
     def test_a_judgment_that_names_another_head_or_no_base_merge_records_no_update(self):
         e = {"key": self.KEY, "history": []}
         with self.q.lock:
@@ -33317,6 +33345,38 @@ class AppPoolTest(Base):
         self.assertEqual([(l["cause"], l["pools"]) for l in lines],
                          [("pool-resting", {"ci-watch": "pool-resting", "land-judge": "no-token"})])
 
+    def test_a_content_read_names_the_outbox_not_a_route_cause(self) -> None:
+        """A content=True read skips the pool by design: its line says outbox, not owner-without-app."""
+        query = {"query": "query($o:String!,$r:String!,$n:Int!){x}", "variables": {"o": "o", "r": "r", "n": 1}}
+        lines = self.fallbacks((("GET", "/repos/o/r/pulls/1"), {"content": True}),
+                               (("POST", "/graphql", query), {"content": True}))
+        self.assertEqual([l["cause"] for l in lines], ["outbox", "outbox"])
+        self.assertEqual(self.app_calls, [])
+
+    def test_passed_over_asks_each_role_s_files_once_per_ttl(self) -> None:
+        asked: list[str] = []
+        spare = gg.AppPool(role="land-judge", mint=lambda owner: None, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: asked.append("land-judge") or False, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        self.ready = False
+        lines = self.fallbacks(*[(("GET", f"/repos/manaflow-ai/cmux/pulls/{n}"), {}) for n in range(1, 6)])
+        self.assertEqual([l["cause"] for l in lines], ["no-token"] * 5)
+        self.assertEqual(asked, ["land-judge"], "one directory scan for five reads, not five")
+        self.daemon.now += gg.APP_POOL_TTL + 1
+        self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/6"), {}))
+        self.assertEqual(asked, ["land-judge", "land-judge"], "and again once the TTL has passed")
+
+    def test_an_expired_node_bench_is_dropped_at_the_next_bench(self) -> None:
+        self.pool.bench_nodes(["manaflow-ai/cmux#3"], NOW + 600)
+        self.daemon.now = NOW + 601
+        body = {"query": "query($o0:String!,$r0:String!,$n0:Int!){x}",
+                "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 3}}
+        with mock.patch.object(gg, "graphql_body_nodes", side_effect=AssertionError("parsed")):
+            self.assertIs(self.pool.pick("manaflow-ai", "graphql:manaflow-ai:cmux", body), self.pool,
+                          "an expired node bench costs a read no parse")
+        self.pool.bench_nodes(["manaflow-ai/cmux#4"], NOW + 1200)
+        self.assertEqual([k for k in self.pool.unreadable if k.startswith("node:")], ["node:manaflow-ai/cmux#4"])
+
 
 class AppPoolHostTest(unittest.TestCase):
     """The default pool finds the App and gh_app_token.py on the host by itself: no agent sets anything."""
@@ -33434,6 +33494,27 @@ class AppPoolHostTest(unittest.TestCase):
         self.assertIsNone(pool.pick("manaflow-ai", scope))
         self.assertEqual(pool.passed_over("manaflow-ai", scope),
                          ("no-token", dict.fromkeys(["land-judge", "glaeda", "ci-watch", "quota-goblin"], "no-token")))
+
+    def test_a_pushed_only_host_reads_an_owner_only_a_later_role_holds(self) -> None:
+        """A host with pushed tokens and no helper or config: land-judge, first in the chain, holds none for
+        teamleaderleo, ci-watch does. The owner is the chain's, so its reads go on ci-watch, not the login."""
+        gg.PACE_CLI = Path(self.tmp.name) / "missing/gh"
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        for role, owner in (("land-judge", "manaflow-ai"), ("ci-watch", "teamleaderleo")):
+            path = gg.app_pool_pushed_path(role, owner)
+            path.write_text(json.dumps({"app_id": 1, "owner": owner, "token": APP_TOKEN, "expires_at": at}))
+            path.chmod(0o600)
+        chain = gg.app_pool_chain(tuple(gg.APP_POOL_CHAIN.split(",")))
+        pool = gg.AppPool(role=chain[0]).with_spares(chain[1:])
+        self.assertEqual(pool.owner_why("GET", "/repos/teamleaderleo/glaeda/pulls/1"), ("teamleaderleo", ""))
+        scope = pool.scope("teamleaderleo", "GET", "/repos/teamleaderleo/glaeda/pulls/1")
+        chosen = pool.pick("teamleaderleo", scope)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.role, "ci-watch")
+        self.assertEqual(pool.owner_of("GET", "/repos/manaflow-ai/cmux/pulls/1"), "manaflow-ai")
+        self.assertEqual(pool.pick("manaflow-ai", pool.scope("manaflow-ai", "GET", "/repos/manaflow-ai/cmux/pulls/1")),
+                         pool, "the first role still serves the owner it holds")
+        self.assertEqual(pool.owner_why("GET", "/repos/nobody/x/pulls/1"), (None, "owner-without-app"))
 
 
 class AppPoolChainTest(unittest.TestCase):
