@@ -18445,5 +18445,27 @@ def main(argv: list[str] | None = None) -> int:
             release_refresh_lock(_REFRESH_HANDLE)
 
 
+def install_intent(prog: str) -> None:
+    """The shared intent layer (leo-workspace tools/intent.py, vendored as scripts/intent.py; glaeda-mini-setup installs
+    it in ~/.local/share/glaeda/intent/ for the copy in ~/.local/bin): a refused call runs as the one form it meant and
+    says so (`glaeda-disk status` is `glaeda-disk report`), lists two or three, or for a destructive form (--apply)
+    names the exact form and runs nothing. Leo, 2026-11-23: "we need to have really powerful aliasing for intent."
+    Only for the program itself, never at import (tests load this file); failing to load costs nothing."""
+    for folder in (Path(__file__).resolve().parent, Path.home() / ".local/share/glaeda/intent"):
+        path = folder / "intent.py"
+        if not path.is_file():
+            continue
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("intent", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.install(prog)
+        except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            continue
+        return
+
+
 if __name__ == "__main__":
+    install_intent("glaeda-disk")
     sys.exit(main())
