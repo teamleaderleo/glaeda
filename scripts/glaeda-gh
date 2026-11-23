@@ -15413,7 +15413,8 @@ class LandQueue:
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
-                     stepTransient=None, lastStop=None)  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     forwardFirst=None)  # and its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e))
         else:
