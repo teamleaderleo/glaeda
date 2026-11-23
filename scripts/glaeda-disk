@@ -352,7 +352,8 @@ EVICT_YIELD_MARK = "evict.lock yielded to a waiting eviction"  # the hook's DISK
 FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_UNTIL"
 
 RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
-UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
+HOST_SATURATED = "host_saturated"  # an apply skipped before its walks: saturation_halt would hold every delete
+UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci", HOST_SATURATED)  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
@@ -17397,6 +17398,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
+    # A saturated host deletes nothing: the apply's halt (saturation_halt) stops it at its first item. So ask the halt
+    # before the walks, not after them: on an agent host held at load 21-29 (cosmic-gray, 2026-11-23 08:40Z) the
+    # 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU sizing trees it then never touched, and its walks'
+    # reads and the snapshot rewrites competed with the sessions that saturated it. Below the emergency floor (the
+    # floor-lifted one) the halt is None, so that pass runs as before; a skipped idle sweep leaves its stamp, so the
+    # next pass that finds the host unsaturated sweeps.
+    if (a.apply and (a.pressure or sweep) and not a.cmux_next_drain
+            and not (sweep and POLICY["defer_during_ci"])
+            and (saturated := saturation_halt(fss, a.emergency, floor_gib)) is not None
+            and (why := saturated())):
+        return deferred(HOST_SATURATED, f"{why}: an apply would delete nothing; skipped before measuring")
     # One plain pressure apply per host at a time (pressure_pass_lock), taken as soon as the run knows it is under
     # pressure: before the floor and evict.lock queue waits, the cap's du and the hook-pass branch that narrows
     # --family. The evict.lock queue serves one deletion at a time but lets its waiters pile up: on one mini
