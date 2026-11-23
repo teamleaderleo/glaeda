@@ -24834,6 +24834,38 @@ class LandTest(Base):
         self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
         self.assert_merged_at(LB)
 
+    def test_a_copy_showing_a_pin_already_followed_away_from_is_a_stale_read_not_a_moved_head(self):
+        # glaeda#2540, 2026-11-22 22:08Z: followed 023cd7fc -> f745a168, then stopped on a copy still showing 023cd7fc
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("waiting", LB))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # a lagging copy: the pin it left
+        e = self.tick(700)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.assertIn("old_pin_seen", [h["event"] for h in e["history"]])
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, self.LD], headParent=LA, baseRefName="main")
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(60)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LB)
+
+    def test_a_branch_left_on_a_pin_already_followed_away_from_stops_after_the_wait(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        self.tick(30)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        e = self.tick(700)
+        self.assertIsNone(e.get("stop"))
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
         # pin_wait's stop (a read since the request shows another head) defers to the same check
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)

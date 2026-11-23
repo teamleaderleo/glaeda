@@ -15192,6 +15192,8 @@ class LandQueue:
             return False
         if e.get("updateSent") or e.get("preStepHead") or e.get("pinFollow"):
             return False  # this queue moved the head itself: pin_follow decides on the first parent
+        if self.old_pin_wait(e, head):
+            return False  # a copy still showing a pin it followed away from: a stale read, read again
         if self.base_merge_maybe(pin, head, data):
             return False  # maybe only a base merge on the pin: judge's worker reads whether it is (base_merge_check)
         since = float(e.get("pinSince") or e.get("created") or 0)
@@ -16388,6 +16390,8 @@ class LandQueue:
         if head and reads and max(reads) >= since:
             # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
             e.pop("pinWait", None)
+            if self.old_pin_wait(e, head):
+                return True  # a copy still showing a pin it followed away from: a stale read, read again
             if self.base_merge_maybe(pin, head, c.get("data") or {}):
                 return False  # maybe only a base merge on the pin: judge's worker reads whether it is
             self.stop(e, "head_moved", land_moved_clause(head, pin),
@@ -16793,6 +16797,37 @@ class LandQueue:
         self.save(e)
         return None
 
+    def old_pin_wait(self, e: dict, head: str) -> bool:
+        """Under the lock. True while HEAD, which is not E's pin, is a pin E's own queue already followed away from
+        (LAND_PIN_FOLLOW_EVENTS in its history): the copy that shows it was read before the follow's head reached
+        this host (a lagging upstream, an older cached answer), so it is a stale read and not a moved head. The PR is
+        read again (nudged, at most every NUDGE_MIN) and nothing stops. False once LAND_HEAD_TIMEOUT has passed with
+        the old pin still shown (somebody may have pushed the branch back to it): the caller stops it as before.
+        2026-11-22 22:08Z, glaeda#2540: pinned 023cd7fc, followed to f745a168 by repin_own_update at 21:30Z, judged
+        there at 21:38Z, then stopped "the head is 023cd7fc0c87, not the --sha f745a168dca3 it was queued for" on a
+        copy that still showed the pin it had left; its owner re-pinned by hand."""
+        head = str(head or "").lower()
+        if not SHA40.fullmatch(head) or not any(
+                isinstance(h, dict) and h.get("event") in LAND_PIN_FOLLOW_EVENTS
+                and (was := str(h.get("was") or h.get("pin") or "").lower()) and head.startswith(was)
+                for h in e.get("history") or []):
+            e.pop("oldPinWait", None)
+            return False
+        w = e.get("oldPinWait")
+        if not isinstance(w, dict) or w.get("head") != head:
+            w = e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
+            self.history(e, "old_pin_seen", head=head[:12], pin=str(e.get("pinSha") or "")[:12])
+            self.nudge(e["key"])
+            self.save(e)
+            return True
+        if self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
+            return False  # kept: a later look does not start the wait again
+        if self.now - float(w.get("nudgedAt") or 0) >= NUDGE_MIN:
+            w["nudgedAt"] = self.now
+            self.nudge(e["key"])
+            self.save(e)
+        return True
+
     def base_merge_due(self, e: dict, head: str) -> bool:
         """Under the lock, from judge. True when HEAD, which no update of this queue's made, may be only a base merge on
         E's pin (land_base_merge_parent): the judgment goes ahead, and its worker reads first whether it is
@@ -16979,6 +17014,9 @@ class LandQueue:
             self.note_late(e, "waiting for the daemon's read of its head")
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
+        if land_head_moved(str(e.get("pinSha") or ""), sha) and self.old_pin_wait(e, sha):
+            self.note_late(e, "waiting for a read newer than the pin it already followed away from")
+            return False
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
                 and not self.base_merge_due(e, sha):
             self.stop(e, "head_moved", land_moved_clause(sha, str(e.get("pinSha") or "")) + f" ({own})",
