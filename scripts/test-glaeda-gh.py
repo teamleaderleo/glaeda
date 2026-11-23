@@ -34867,6 +34867,36 @@ class AppPoolTest(Base):
         self.assertEqual([l["cause"] for l in lines], ["outbox", "outbox"])
         self.assertEqual(self.app_calls, [])
 
+    def test_the_login_s_graphql_points_are_booked_by_why_no_app_took_them(self) -> None:
+        """spendBy.graphqlLoginWhy: the login's GraphQL points by note_login_fallback's cause and query, the App's
+        answers never in it; `budget` prints the rows. The detector for a daemon whose GraphQL stays on the login
+        while its Apps have their hour."""
+        one = "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0){pullRequest(number:$n0){number}}}"
+        mixed = "query($o0:String!,$r0:String!,$n0:Int!,$o1:String!,$r1:String!,$n1:Int!){x}"
+        reads = [("pr", one, {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}),
+                 ("suite-runs", "query { viewer { login } }", {}),
+                 ("suite-runs", "query { viewer { login } }", {}),
+                 ("pr", mixed, {"o0": "manaflow-ai", "r0": "cmux", "n0": 1, "o1": "other", "r1": "r", "n1": 1})]
+        with contextlib.redirect_stdout(io.StringIO()):
+            for reason, query, variables in reads:
+                self.daemon.gql_reason = reason
+                self.daemon.graphql(query, variables)
+        spend = self.daemon.spend_by()
+        self.assertEqual(len(self.app_calls), 1, "the single-owner read went on the App")
+        self.assertEqual(spend["graphqlLoginWhy"],
+                         [{"why": "graphql-no-owner", "query": "suite-runs", "queries": 2, "points": 2},
+                          {"why": "graphql-many-owners", "query": "pr", "queries": 1, "points": 1}])
+        self.assertEqual(sum(r["points"] for r in spend["graphqlLoginWhy"]), spend["graphql"]["points"],
+                         "every login point is booked under a why, and no App point is")
+        self.assertEqual([q["query"] for q in spend["graphqlByQuery"]], ["suite-runs", "pr"],
+                         "the why is a sixth key field: the query table is as before")
+        lines = gg.spend_lines(spend)
+        self.assertTrue(any("suite-runs  on the login: graphql-no-owner" in l for l in lines), lines)
+        self.daemon.save_spend(force=True)
+        again = gg.Daemon(transport=self.transport, token=lambda: TOKEN, controller=None, app_pool=self.pool)
+        again.clock_real, again.now = False, NOW
+        self.assertEqual(again.spend_by()["graphqlLoginWhy"], spend["graphqlLoginWhy"], "it survives a restart")
+
     def test_passed_over_asks_each_role_s_files_once_per_ttl(self) -> None:
         asked: list[str] = []
         spare = gg.AppPool(role="land-judge", mint=lambda owner: None, owners=lambda: ["manaflow-ai"],

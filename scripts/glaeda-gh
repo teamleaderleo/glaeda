@@ -1611,7 +1611,25 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
             "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
                               "counted": r["counted"], "waiters": r["waiters"]} for r in by_caller(rest, "counted")],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
-                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")]}
+                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")],
+            "graphqlLoginWhy": login_why_rows(gql, top)}
+
+
+def login_why_rows(gql: list[dict], top: int = SPEND_TOP) -> list[dict]:
+    """The login's GraphQL points by why no App took them (note_login_fallback's cause) and query, most first: the
+    detector for a daemon whose GraphQL stays on the login while its Apps have their hour. Every point graphql()
+    books is the login's (an App's answer is never in spend), so these rows sum to graphql.points less rows an older
+    build wrote without a cause. Before, spendBy said which query spent the login (graphqlByQuery) but not why: the
+    login carried 26% of an hour's GraphQL with the Apps at 11.4k-12.5k of 12.5k left, the daemons on three hosts
+    spending 173-274 points/h of it, and nothing on the census could tell an owner no App serves from a resting pool."""
+    merged: dict[tuple, dict] = {}
+    for r in gql:
+        if not r.get("why"):
+            continue
+        row = merged.setdefault((r["why"], r["name"]), {"why": r["why"], "query": r["name"], "queries": 0, "points": 0})
+        row["queries"] += r["requests"]
+        row["points"] += r["points"]
+    return sorted(merged.values(), key=lambda r: (-r["points"], -r["queries"], r["why"], r["query"]))[:top]
 
 
 def waiters_text(r: dict, field: str) -> str:
@@ -5525,6 +5543,7 @@ class Daemon:
         self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
+        self.login_cause = ""  # why the most recent request went on the login (note_login_fallback's cause), or ""
         # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
         # every read on the login.
         chain = app_pool_chain(APP_POOL_SPARES)
@@ -5952,11 +5971,14 @@ class Daemon:
              **{k: cause[k] for k in ("verdict", "reads", "top", "slotS", "githubS", "inCall", "lastCall", "deferral",
                                       "text")}})
 
-    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0) -> None:
+    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0, why: str = "") -> None:
         """One request in the spend log: NAME is a REST route template or a GraphQL query name; COUNTED is 1 when
-        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged."""
+        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged. WHY is a
+        login GraphQL query's note_login_fallback cause: the key's sixth field, so spendBy.graphqlLoginWhy can say
+        why the login's points went there and not to an App."""
         kind, repo, waiter = (tuple(self.caller) + ("", "", ""))[:3]
-        key = "\t".join((bucket, name, kind, repo) + ((waiter.replace("\t", " "),) if waiter else ()))
+        tail = (waiter.replace("\t", " "),) if waiter or why else ()
+        key = "\t".join((bucket, name, kind, repo) + tail + ((why,) if why else ()))
         row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
         row[0] += 1
         row[1] += counted
@@ -5976,9 +5998,9 @@ class Daemon:
                     mine[2] += points
         out = []
         for key, (requests, counted, points) in total.items():
-            bucket, name, kind, repo, waiter = (key.split("\t") + ["", "", "", "", ""])[:5]
+            bucket, name, kind, repo, waiter, why = (key.split("\t") + ["", "", "", "", "", ""])[:6]
             out.append({"bucket": bucket, "name": name, "kind": kind, "repo": repo, "waiter": waiter, "requests": requests,
-                        "counted": counted, "points": points})
+                        "counted": counted, "points": points, **({"why": why} if why else {})})
         return out
 
     def spend_by(self, seconds: float = 3600.0) -> dict:
@@ -6868,6 +6890,7 @@ class Daemon:
         logged: a write is the login's by design) and AppPool.passed_over's. A write logs nothing."""
         query = str(body.get("query") or "") if isinstance(body, dict) else ""
         if not (method == "GET" or (method == "POST" and path == "/graphql" and not re.match(r"\s*mutation\b", query))):
+            self.login_cause = "write"  # the login's by design: logged nothing, booked as such
             return
         pool, pools = self.app_pool, None
         if free:
@@ -6884,6 +6907,7 @@ class Daemon:
             cause, pools = pool.passed_over(owner, scope)
         if cause == "write":
             return
+        self.login_cause = cause  # graphql() books the login's points under it (spendBy.graphqlLoginWhy)
         kind = (tuple(self.caller) + ("",))[0]
         log({"event": "login-fallback", "kind": kind, "cause": cause, "route": route_of(method, path),
              **({"query": self.gql_reason} if path == "/graphql" and self.gql_reason else {}),
@@ -6899,6 +6923,7 @@ class Daemon:
         free: /rate_limit, which counts against no primary limit. Counting it as a REST request
         would overstate the spend of the very call that reads the spend."""
         self.last_request_source = "login"
+        self.login_cause = ""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         self.land_refill()  # between two of the read phase's requests: a freed land worker takes its next row
@@ -9983,7 +10008,7 @@ class Daemon:
                 self.last_app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
             self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
-            self.note_spend("graphql", self.gql_reason, 1, points)
+            self.note_spend("graphql", self.gql_reason, 1, points, why=self.login_cause or "unlogged")
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
         if rate and self.last_request_source != "app":
@@ -25192,6 +25217,9 @@ def spend_lines(spend: Any) -> list[str]:
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
                    f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "points"))
+    for r in spend.get("graphqlLoginWhy") or []:
+        out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
+                   f"on the login: {r.get('why')}")
     return out
 
 
