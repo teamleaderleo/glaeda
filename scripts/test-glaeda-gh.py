@@ -24708,6 +24708,18 @@ class LandTest(Base):
         self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
 
+    def test_the_pr_read_asks_for_enough_parents_to_see_a_base_merge_on_the_pin(self):
+        # 2026-11-22 22:55-23:55Z: the read asked parents(first: 1), so every cached head had one parent, a base merge
+        # on the pin was never seen as one (0 repin_base_merge, 22 of 31 head_moved stops were such merges).
+        asked = re.search(r"parents\(first: (\d+)\)", gg.PR_FIELDS)
+        self.assertGreaterEqual(int(asked.group(1)), 3)  # three, so an octopus merge is not taken for a two-parent one
+        node = {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+            "oid": LB, "parents": {"nodes": [{"oid": LA}, {"oid": LC}]}}}]}}
+        parents = gg.head_parents(node)
+        self.assertEqual(parents, [LA, LC])
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": parents}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA, LC, "d" * 40]}), "")
+
     def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
         # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
         # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read
@@ -24833,6 +24845,38 @@ class LandTest(Base):
         self.assertEqual(len(self.compares()), 2)  # once per head
         self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
         self.assert_merged_at(LB)
+
+    def test_a_copy_showing_a_pin_already_followed_away_from_is_a_stale_read_not_a_moved_head(self):
+        # glaeda#2540, 2026-11-22 22:08Z: followed 023cd7fc -> f745a168, then stopped on a copy still showing 023cd7fc
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("waiting", LB))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # a lagging copy: the pin it left
+        e = self.tick(700)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.assertIn("old_pin_seen", [h["event"] for h in e["history"]])
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, self.LD], headParent=LA, baseRefName="main")
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(60)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LB)
+
+    def test_a_branch_left_on_a_pin_already_followed_away_from_stops_after_the_wait(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        self.tick(30)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        e = self.tick(700)
+        self.assertIsNone(e.get("stop"))
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
         # pin_wait's stop (a read since the request shows another head) defers to the same check
