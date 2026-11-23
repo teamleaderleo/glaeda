@@ -7195,7 +7195,7 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
 
     def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
-        """cosmic-gray at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
+        """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
         sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""
         saturated = mock.patch.object(gd.os, "getloadavg", return_value=(64.0, 64.0, 64.0))
         cores = mock.patch.object(gd.os, "cpu_count", return_value=16)

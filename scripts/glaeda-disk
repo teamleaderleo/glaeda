@@ -17399,7 +17399,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
     # A saturated host deletes nothing: the apply's halt (saturation_halt) stops it at its first item. So ask the halt
-    # before the walks, not after them: on an agent host held at load 21-29 (cosmic-gray, 2026-11-23 08:40Z) the
+    # before the walks, not after them: on an agent host held at load 21-29 (2026-11-23 08:40Z) the
     # 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU sizing trees it then never touched, and its walks'
     # reads and the snapshot rewrites competed with the sessions that saturated it. Below the emergency floor (the
     # floor-lifted one) the halt is None, so that pass runs as before; a skipped idle sweep leaves its stamp, so the
