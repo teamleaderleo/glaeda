@@ -1283,7 +1283,11 @@ LONG_WAIT_FACTOR = 2
 REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5, "run": 2, "comment": 3,
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
-# NUM is the alias's PR-number variable: isRequired needs it
+# NUM is the alias's PR-number variable: isRequired needs it. parents(first: 3), at least 2: a base merge's second parent is what
+# land_base_merge_parent reads to follow a pin over it (glaeda#2508). With first: 1 every read carried one parent, so
+# that follow never fired: hq#18897 (pinned efbd3106) and hq#18838 (pinned f7643e61), gcp-agent-lane-14, 2026-11-22
+# 19:22Z-19:27Z, stopped head_moved on cmux-agents-lander[bot]'s "Merge branch 'main'" over the pin, the cache's
+# headParents [efbd3106...] one entry long.
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
@@ -4966,8 +4970,8 @@ def null_contexts_error(count: int) -> str:
 
 
 def head_parents(node: dict) -> list[str] | None:
-    """The PR head commit's parent oids, lowercased, or None when the read did not carry them (a probe, REST, an older
-    query) or its commit is not the head. The land queue reads them to tell its own update_branch's base merge (the
+    """The PR head commit's parent oids (PR_FIELDS reads up to three: a merge's first and second at least), lowercased, or None when the
+    read did not carry them (a probe, REST, an older query) or its commit is not the head. The land queue reads them to tell its own update_branch's base merge (the
     pinned head plus the base) from someone's push (LandQueue.follow_own_update)."""
     commits = (node.get("commits") or {}).get("nodes") if isinstance(node.get("commits"), dict) else None
     commit = ((commits or [{}])[0] or {}).get("commit") if isinstance(commits, list) else None
