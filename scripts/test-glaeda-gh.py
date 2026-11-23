@@ -104,6 +104,26 @@ os.environ.setdefault("GLAEDA_GH_LANE_CHAIN", os.fspath(Path(tempfile.gettempdir
 POST_ROUTE_MISSING = gg.post_route_missing
 gg.post_route_missing = lambda: None
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
+# Nor may a test exec for real: an exec replaces this process, the run ends with the exec'd program's exit code and
+# no unittest summary, and every test after it never runs. From 2026-11-21 the create hand-off used os.execve
+# (glaeda#2376) while BrokerMergeGuardTest mocked only os.execv: its stand-in guard (`exit 0`) replaced the run at
+# about test 298, so CI passed this suite green without running PostTest or any class after it. A test that means
+# to see an exec patches it (mock.patch.object(os, "execv", ...)) over this.
+
+
+class RealExec(BaseException):
+    """Not an Exception: the code under test catches Exception around its execs (broker_merge_handoff) and would
+    swallow the refusal, falling through to a route the test never meant to see."""
+
+
+def _no_real_exec(name: str):
+    def refuse(path, *_args, **_kw):
+        raise RealExec(f"a test reached a real os.{name}({path!r}): patch it, or this run would end here")
+    return refuse
+
+
+for _name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
+    setattr(os, _name, _no_real_exec(_name))
 
 
 def no_head_runs(repo: str, paths: list[str], budget: float = 0) -> dict:
@@ -12764,8 +12784,12 @@ class BrokerBase(Base):
             execed.append((path, argv))
             raise SystemExit(0)
 
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the create hand-off execs with its own environment (broker_create_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
@@ -13591,8 +13615,12 @@ class BrokerMergeGuardTest(BrokerBase):
             execed.append((path, argv))
             raise SystemExit(0)
 
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the create hand-off execs with its own environment (broker_create_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
@@ -13684,7 +13712,10 @@ class BrokerMergeGuardTest(BrokerBase):
                 self.assertIsNone(code)
                 self.assertEqual(path, str(self.guard))
                 self.assertEqual(passed, args)
-                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                # The guard's directory leads the PATH the hand-off execs with (glaeda#2376: execve, so this
+                # process's own PATH is left as it was).
+                self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                self.assertNotEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
 
     def test_a_comment_in_combined_short_flags_is_a_create(self) -> None:
         # `-dc x` is --delete-branch then --comment x; `-cx` is --comment x: both close with a comment, which creates.
@@ -14854,8 +14885,12 @@ class BrokerQuotaGuardTest(BrokerBase):
         for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
             if name not in self.kept:
                 os.environ.pop(name, None)
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the guard hand-off execs with its own environment (broker_merge_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 gg.cmd_gh(list(args if args is not None else self.READ))
         return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
@@ -14869,10 +14904,11 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
         self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
                          "the line it is handed is the line that was typed")
-        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+        self.assertEqual(self.exec_env.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
                          "the pass back here knows it has been round")
-        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(guard.parent),
                          "led by the guard's own directory, so it finds the gh after it as usual")
+        self.assertIsNone(os.environ.get("GLAEDA_GH_QUOTA_HOP"), "and this process keeps its own environment")
 
     def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
         """One hop, not a loop: the guard exports GH_QUOTA_CHECKED, and this hand-off's own mark carries the pid in
@@ -20188,7 +20224,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
     def test_a_queued_post_stamps_its_repository(self) -> None:
         no_guard(self)
         args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+                         head=None, base=None, title=None, reviewer=None, label=None, remove_label=None, event="comment")
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
@@ -20200,7 +20236,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
         nothing was wrong. The broker writes it with a token minted for the call."""
         no_guard(self)
         args = mock.Mock(kind="pr", target="O/R", body="why", body_file=None, wait=0, json=False,
-                         head="lane/x", base="main", title="a title", reviewer=None, event="comment")
+                         head="lane/x", base="main", title="a title", reviewer=None, label=None, remove_label=None, event="comment")
         ran: list[list[str]] = []
 
         def answer(argv, **_kw):
@@ -20221,7 +20257,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
     def test_a_write_the_broker_cannot_make_is_refused_with_its_body_and_the_command_for_it(self) -> None:
         no_guard(self)
         args = mock.Mock(kind="review", target="O/R#7", body="the review body", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+                         head=None, base=None, title=None, reviewer=None, label=None, remove_label=None, event="comment")
         err = io.StringIO()
         with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
                 mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no call for a review")), \
@@ -20251,7 +20287,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
                 made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
                     "head": None, "base": None, "title": None}
                 args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
-                                 reviewer=None, event="comment", **made)
+                                 reviewer=None, label=None, remove_label=None, event="comment", **made)
                 err = io.StringIO()
                 with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
                         contextlib.redirect_stderr(err):
@@ -39817,11 +39853,13 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
         read that blocks) and of `post` (a write on a public thread). Guessing for the caller would guess
         between reading and writing, so it refuses and names all three, each as a line that runs.
 
-        The vectors carry evidence for a read *and* for the write (`--body` is `post`'s, `--timeout` is
-        `wait`'s), which is what leaves the write in the running: with neither kind of evidence the write
-        could only refuse and the word routes to the read instead (the two tests below)."""
-        for argv in (["comment", "o/r#1", "--body", "hi", "--timeout", "60"],
-                     ["pr", "o/r", "--title", "T", "--timeout", "60"]):
+        The vectors carry evidence for a read *and* for the write (`--body` and `--title` are `post`'s,
+        `--contains` is `wait`'s), which is what leaves the write in the running: with neither kind of evidence
+        the write could only refuse and the word routes to the read instead (the two tests below). Not
+        `--timeout`: `post` takes it too (its write deadline), so `--body hi --timeout 60` fits `post` alone
+        and routes there."""
+        for argv in (["comment", "o/r#1", "--body", "hi", "--contains", "x"],
+                     ["pr", "o/r", "--title", "T", "--contains", "x"]):
             word = argv[0]
             fixed, refusal = gg.nesting_synonym(list(argv))
             self.assertEqual(fixed, argv, "argv is never half-rewritten when it refuses")
@@ -39860,7 +39898,7 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
     def test_the_refusal_is_the_whole_call_and_nothing_runs(self) -> None:
         """The exit code a usage error already has, and no request queued: an ambiguous write must not post."""
         with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
-            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1", "--body", "hi", "--timeout", "60"]), 64)
+            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1", "--body", "hi", "--contains", "x"]), 64)
         self.assertIn("not a command of its own", self.err.getvalue())
 
     def test_the_callers_own_flags_narrow_an_ambiguous_word_to_one_command(self) -> None:
@@ -40311,7 +40349,11 @@ class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
     def test_every_command_that_waits_answers_to_both_spellings(self) -> None:
         """The structural claim, so a command added later cannot take only one of them: the set of commands
         owning `--wait` is the set owning `--timeout`."""
-        self.assertEqual(gg.flag_commands("--wait"), gg.flag_commands("--timeout"))
+        # `log errors --timeout` is that command's whole-command budget (`--budget`, glaeda#2680): it bounds an
+        # answer, it waits for nothing to end, so it takes no `--wait`.
+        budgets = ["log errors"]
+        self.assertEqual(gg.flag_commands("--wait"), [c for c in gg.flag_commands("--timeout") if c not in budgets])
+        self.assertTrue(set(budgets) <= set(gg.flag_commands("--budget")), "each one is a budget, by its other name")
         self.assertIn("post", gg.flag_commands("--timeout"))  # the fixture: the command that was refused
 
     def test_a_timeout_on_a_command_that_spelled_it_wait_is_that_wait(self) -> None:
