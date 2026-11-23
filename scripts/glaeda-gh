@@ -32192,8 +32192,9 @@ def parser() -> argparse.ArgumentParser:
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
-            s.add_argument("--timeout", type=seconds, default=3600,
-                           help="seconds with no change in what it waits on (default 3600): every change it sees "
+            s.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=3600,
+                           help="seconds with no change in what it waits on (default 3600; --wait is the same): "
+                                "every change it sees "
                                 "(a check or job started or finished, a comment, a file growing, CPU used) moves "
                                 "the deadline; exit 2 once nothing changed for this long, or at --max. `wait "
                                 "until` alone counts it from the start")
@@ -32225,8 +32226,9 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--max-age", type=float, default=HEAD_PENDING_TTL * 2, metavar="S",
                    help=f"checks still running are served from the cache if read this recently (default {HEAD_PENDING_TTL * 2}s); "
                         "finished heads are good for 12 minutes")
-    c.add_argument("--wait", type=float, default=30, metavar="S",
-                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
+    c.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=30, metavar="S",
+                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is); "
+                        "--timeout is the same")
     c.add_argument("--pr", type=int, metavar="N",
                    help="the PR whose head this is: a head with no entry is served from that PR's cached rollup "
                         "when it is of this head and all green (route pr-rollup)")
@@ -32244,8 +32246,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--reviewer", action="append", metavar="LOGIN", help="pr: request a review (repeatable)")
     po.add_argument("--event", choices=("comment", "approve", "request-changes"), default="comment",
                     help="review: the verdict (default comment)")
-    po.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session)")
+    po.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session); "
+                         "--timeout is the same")
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
@@ -32340,8 +32343,9 @@ def parser() -> argparse.ArgumentParser:
                     help="replay: one finished run, as the controller's feed (/v1/github/events) or GitHub serves it")
     oe.add_argument("--jobs-file", type=Path, metavar="PATH",
                     help="replay: its attempt's jobs ({\"jobs\": [...]}, run-jobs' or GitHub's), instead of reading them")
-    oe.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="replay: wait up to S seconds for the command to end, to print its exit code")
+    oe.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="replay: wait up to S seconds for the command to end, to print its exit code; "
+                         "--timeout is the same")
     oe.add_argument("--json", action="store_true")
     ld = sub.add_parser("land", help="land a PR: the daemon takes each step land_judge names until it merges or stops "
                                      "(land status, land cancel)")
