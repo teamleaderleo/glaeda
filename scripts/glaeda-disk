@@ -352,7 +352,8 @@ EVICT_YIELD_MARK = "evict.lock yielded to a waiting eviction"  # the hook's DISK
 FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_UNTIL"
 
 RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
-UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
+HOST_SATURATED = "host_saturated"  # an apply skipped before its walks: saturation_halt would hold every delete
+UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci", HOST_SATURATED)  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
@@ -17492,6 +17493,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
+    # A saturated host deletes nothing: the apply's halt (saturation_halt) stops it at its first item. So ask the halt
+    # before the walks, not after them: on an agent host held at load 21-29 (2026-11-23 08:40Z) the
+    # 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU sizing trees it then never touched, and its walks'
+    # reads and the snapshot rewrites competed with the sessions that saturated it. Below the emergency floor (the
+    # floor-lifted one) the halt is None, so that pass runs as before; a skipped idle sweep leaves its stamp, so the
+    # next pass that finds the host unsaturated sweeps.
+    if (a.apply and (a.pressure or sweep) and not a.cmux_next_drain
+            and not (sweep and POLICY["defer_during_ci"])
+            and (saturated := saturation_halt(fss, a.emergency, floor_gib)) is not None
+            and (why := saturated())):
+        return deferred(HOST_SATURATED, f"{why}: an apply would delete nothing; skipped before measuring")
     # One plain pressure apply per host at a time (pressure_pass_lock), taken as soon as the run knows it is under
     # pressure: before the floor and evict.lock queue waits, the cap's du and the hook-pass branch that narrows
     # --family. The evict.lock queue serves one deletion at a time but lets its waiters pile up: on one mini
@@ -18542,5 +18554,29 @@ def main(argv: list[str] | None = None) -> int:
             release_refresh_lock(_REFRESH_HANDLE)
 
 
+def install_intent(prog: str) -> None:
+    """The shared intent layer (leo-workspace tools/intent.py, vendored as scripts/intent.py; glaeda-mini-setup installs
+    it in ~/.local/share/glaeda/intent/ for the copy in ~/.local/bin): a refused call runs as the one form it meant and
+    says so (`glaeda-disk status` is `glaeda-disk report`), lists two or three, or for a destructive form (--apply)
+    names the exact form and runs nothing. Leo, 2026-11-23: "we need to have really powerful aliasing for intent."
+    Only for the program itself, never at import (tests load this file); failing to load costs nothing."""
+    for folder in (Path(__file__).resolve().parent, Path.home() / ".local/share/glaeda/intent"):
+        path = folder / "intent.py"
+        if not path.is_file():
+            continue
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("intent", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module  # registered before it runs, as a normal import does
+            spec.loader.exec_module(module)
+            module.install(prog)
+        except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            sys.modules.pop("intent", None)
+            continue
+        return
+
+
 if __name__ == "__main__":
+    install_intent("glaeda-disk")
     sys.exit(main())
