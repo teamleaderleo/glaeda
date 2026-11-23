@@ -14323,7 +14323,8 @@ LAND_HANDOFF_DEADLINE = 60.0
 # (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
 # median 8.6 h; 9 had MERGED on GitHub while still "forwarded" here, and 61 had gone to an executor that later
 # answered not_executor and were never sent again. Now each such row is looked at from the daemon's cache (no GitHub
-# read of its own) at most once per LAND_FORWARD_LOOK_EVERY (forwards_follow): MERGED ends it merged and tells its
+# read of its own, until its give-up spends one: give_up_read) at most once per LAND_FORWARD_LOOK_EVERY
+# (forwards_follow): MERGED ends it merged and tells its
 # requester as a merge here does, CLOSED stops it, a moved pin stops it head_moved, and one still OPEN this long past
 # its last hand-off is handed off again, once per LAND_FORWARD_RESEND (the far host applies a repeated request once).
 LAND_FORWARD_RESEND = 1800.0
@@ -14336,6 +14337,14 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
 # what to do, and its requester is told as any stop tells it.
 LAND_FORWARD_GIVE_UP = 7200.0
+# A row handed off before this host ever read its PR keeps an empty cache for good: refresh_due declines a copy that
+# was never read (its no-data path judges a *queued* row unpinned), and no judge runs on a forwarded row. So the
+# give-up below blamed that empty cache for not knowing an outcome GitHub had held for hours. huge-blue, 2026-11-23:
+# of 12 rows stopped forward_no_outcome, 9 had MERGED, the oldest 23 h before its warning, and two of those threads
+# already held this host's own earlier "merged" notice. Now such a row spends one read of its own first
+# (give_up_read) and gives up only on what that read says, or after LAND_GIVE_UP_READ_WAIT with no answer from it,
+# naming the read instead of the unread cache.
+LAND_GIVE_UP_READ_WAIT = 300.0
 
 
 def land_session_lane(name: str) -> str:
@@ -16095,6 +16104,8 @@ class LandQueue:
             e["forwardFirst"] = first
             self.save(e)
         if self.now - first > LAND_FORWARD_GIVE_UP:
+            if self.give_up_read(e):
+                return  # one read of its own before it blames an unread cache (give_up_read)
             self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
             return
         if state != "OPEN":
@@ -16127,6 +16138,33 @@ class LandQueue:
         log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
         self.hand_off_now(e, head, why, "forward_resent")
 
+    def give_up_read(self, e: dict) -> bool:
+        """Under the lock, where a forwarded E would stop forward_no_outcome knowing nothing about its PR: True while
+        the one read that could end it properly has not answered, so the caller leaves the row for a later pass.
+
+        Nothing else reads a forwarded row's PR (LAND_GIVE_UP_READ_WAIT's comment), so the stop below used to name a
+        cause no read could ever clear. The read is the land path's own refresh (refresh_job: the cache's route
+        first, live only on a miss, hq docs/handbook/read-with-one-quota-route.md), spent at most once per row.
+        What it reads ends the row merged or closed on the next pass (forward_follow's own branches); only a read
+        that failed, or that no worker or hold let start inside the wait, reaches the give-up."""
+        r = dict(e.get("giveUpRead") or {})
+        if not r:
+            r = {"since": self.now}
+            e["giveUpRead"] = r
+            self.save(e)
+        if self.now - float(r.get("since") or self.now) > LAND_GIVE_UP_READ_WAIT:
+            return False  # its read never started, or never answered: the stop names that
+        if r.get("at"):
+            return True  # in flight: a later pass judges what it read, or gives up past the wait
+        if self.refresh_held() or self.busy() >= self.workers():
+            return True  # reads held, or every worker busy: this row's read waits for one, inside the wait above
+        r["at"] = self.now
+        e["giveUpRead"] = r
+        e["refresh"] = {"at": self.now, "giveUp": True, **self.refresh_starting(e["key"])}
+        self.save(e)
+        self.submit(e["key"], self.refresh_job, e["key"])
+        return True
+
     def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool) -> None:
         """Under the lock. A forwarded E with no outcome LAND_FORWARD_GIVE_UP after it was first forwarded stops
         forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on."""
@@ -16134,6 +16172,17 @@ class LandQueue:
             cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
         else:
             cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
+            r, ref = e.get("giveUpRead") or {}, e.get("refresh") or {}
+            spent = bool(r.get("at")) and float(ref.get("at") or 0) == float(r["at"])  # this row's own read, not an older one
+            if spent and ref.get("error"):  # its own words, not "could not be read" (handbook failure-drops-its-reason)
+                cause = f"this host read the PR to tell whether it ended and that read failed: {ref['error']}"
+            elif spent:
+                cause = (f"this host read the PR to tell whether it ended and that read answered nothing in "
+                         f"{LAND_GIVE_UP_READ_WAIT:.0f} s, so its cache still holds none")
+            elif r:
+                cause = (f"this host's cache holds no read of the PR, and for {LAND_GIVE_UP_READ_WAIT:.0f} s no "
+                         f"worker was free to read it (or this host's reads were held), so it cannot tell whether "
+                         f"it ended")
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
         elif not executor and not ((e.get("handedOff") or {}).get("key") and self.broker_client()):

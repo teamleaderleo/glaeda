@@ -28707,16 +28707,65 @@ class LandTest(Base):
         [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
         self.assertEqual(said[3], "host/lane")
 
-    def test_a_forwarded_land_the_cache_never_read_stops_at_the_give_up_instead_of_staying_forwarded(self):
-        # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on
+    def give_up_due(self) -> dict:
+        """A forwarded row of a PR this host never read, one pass short of its give-up (the rows huge-blue warned
+        about: nothing reads a forwarded row, so its cache stays empty and the give-up blamed that)."""
         self.forwarded_row()
         self.w.cache.pop(self.KEY, None)
-        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - gg.LAND_FORWARD_LOOK_EVERY)  # one pass short of the give-up
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
-        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
-        self.assertIn("holds no read of the PR", e["stop"]["reason"])
+        return self.q.entries[self.KEY]
+
+    def test_a_forwarded_land_at_its_give_up_reads_the_pr_once_before_it_blames_its_empty_cache(self):
+        # huge-blue, 2026-11-23: of 12 rows stopped forward_no_outcome ("holds no read of the PR"), 9 had MERGED,
+        # the oldest 23 h before its warning. The read that would have told it was never spent.
+        self.give_up_due()
+        self.fresh_head = LA  # the read answers: the row is still here, now with a copy to judge
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], self.w.refreshed), ("forwarded", [self.KEY]))
+        self.pr(LA, state="MERGED")
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))  # ended by what it read, not warned
         self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_forwarded_lands_give_up_read_is_spent_once_however_many_passes_reach_it(self):
+        self.give_up_due()
+        self.fresh_head = None  # every read refused: the row must not read once per pass
+        for _ in range(int(2 * gg.LAND_GIVE_UP_READ_WAIT // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+                break
+        self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def test_a_forwarded_lands_give_up_names_the_failed_read_instead_of_the_unread_cache(self):
+        self.give_up_due()
+        self.fresh_head = None  # "lane-gh call get: quota"
+        for _ in range(int(2 * gg.LAND_GIVE_UP_READ_WAIT // (gg.LAND_FORWARD_LOOK_EVERY + 1)) + 2):
+            if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+                break
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("that read failed: lane-gh call get: quota", e["stop"]["reason"])
+        self.assertNotIn("holds no read of the PR", e["stop"]["reason"])
+        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+        self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_forwarded_lands_give_up_read_no_worker_could_start_says_that_and_still_stops(self):
+        # the read never ran, so the stop may not claim one failed: it names why none was spent
+        e = self.give_up_due()
+        with mock.patch.object(self.q, "busy", lambda: self.q.workers()):
+            for _ in range(int(2 * gg.LAND_GIVE_UP_READ_WAIT // (gg.LAND_FORWARD_LOOK_EVERY + 1)) + 2):
+                if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+                    break
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"], self.w.refreshed), ("stopped", "forward_no_outcome", []))
+        self.assertIn("no worker was free to read it", e["stop"]["reason"])
+
+    def test_a_forwarded_land_still_inside_its_give_up_spends_no_read(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - gg.LAND_FORWARD_LOOK_EVERY)
+        self.assertEqual((self.q.entries[self.KEY]["state"], self.w.refreshed), ("forwarded", []))
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
