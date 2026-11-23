@@ -77,8 +77,8 @@ safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
 by its own timeout, so the runner takes its next job at once) and always exits 0. One such pass runs at a time per
-host: a start/listener trigger at or above glaeda-disk's target is skipped; completion always requests cleanup.
-A trigger that arrives while a pass runs is coalesced
+host: admission triggers at or above glaeda-disk's target are skipped, but job completion always requests cleanup
+of finished build caches. A trigger that arrives while a pass runs is coalesced
 into that pass's single follow-up (both logged in glaeda-disk's run log as "runner hook" skips). A
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
@@ -15476,7 +15476,7 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
                            *, job_completed: bool = False) -> str:
     """job-completed's pass: glaeda-disk --pressure in a detached process (DISK_BOUND), each pass bounded by
     BACKGROUND_DISK_TIMEOUT_S, so the runner takes its next job at once ("Complete runner" took 121-124 s on main's
-    macOS jobs while job-completed waited on it). One pass at a time per host: a start/listener trigger above the
+    macOS jobs while job-completed waited on it). One pass at a time per host: an admission trigger above glaeda-disk's
     target is skipped (a stat and a log read). Completion always writes a pending trigger: finished caches go even
     with plenty of free disk. While a pass runs the trigger is coalesced
     into it (the running pass does one more for every batch of triggers), so no trigger is lost and none queues.
