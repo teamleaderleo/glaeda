@@ -18050,9 +18050,15 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
-                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
-                # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
+            elif self.refresh_held():
+                pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
+            elif self.busy() >= self.workers():
+                # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
+                # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
+                # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
+                self.gated(e, ready=True)
+            else:
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
                                 **self.refresh_starting(e["key"])}
@@ -18243,7 +18249,8 @@ class LandQueue:
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
         if self.busy() >= self.workers():
-            return True  # read on a free worker, a later tick; judged after it
+            self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
+            return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
