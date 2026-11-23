@@ -15275,6 +15275,14 @@ class LandQueue:
                     e["wait"] = {"kind": "head_change", "before": before, "since": self.now}
                     e["wakeAt"] = self.now + LAND_HEAD_TIMEOUT
                 self.save(e)
+            elif e.get("state") == "waiting" and not isinstance(e.get("wakeAt"), (int, float)):
+                # A wait saved with no wake (the repin wait before it had one) is never due: it wakes when it would
+                # have under LAND_HEAD_TIMEOUT from its last judgment, so it keeps its place among the due rows.
+                at = (e.get("explain") or {}).get("at")
+                at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else self.now
+                e["wakeAt"] = min(self.now, at + LAND_HEAD_TIMEOUT)
+                self.history(e, "wake_set", kind=(e.get("wait") or {}).get("kind"))
+                self.save(e)
             self.entries[e["key"]] = e
 
     def save(self, e: dict) -> None:
@@ -17509,7 +17517,7 @@ class LandQueue:
         at = (c or {}).get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
-        urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
+        urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") in ("head_change", "repin")
         last = (e.get("refresh") or {}).get("at")
         own = not self.reads_upstream()
         every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
@@ -18761,11 +18769,14 @@ class LandQueue:
         e["action"] = None
         self.history(e, "step", kind=a.get("kind"), exit=None if got is None else got.returncode)
 
-    def wait(self, e: dict, w: dict, seconds: float | None) -> None:
+    def wait(self, e: dict, w: dict, seconds: float) -> None:
+        """E waits on W until something it watches moves, or at most SECONDS: every wait has a wake, so every waiting
+        row becomes due (due) and gets a worker in its turn. A wait with none was never due and starved under a busy
+        pool (the repin wait, cmux-cp-1 2026-11-23)."""
         self.check(e)
         e["state"] = "waiting"
         e["wait"] = w
-        e["wakeAt"] = None if seconds is None else self.now + seconds
+        e["wakeAt"] = self.now + float(seconds)
         self.save(e)
 
     def take(self, e: dict, act: dict, answer: dict) -> None:
@@ -18938,7 +18949,15 @@ class LandQueue:
                 sha = str(act.get("sha") or "").lower()
                 cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
-                    self.wait(e, {"kind": "repin", "sha": sha}, None)
+                    # A head land_judge read that the cache does not show yet: its read is asked for now (nudged, and
+                    # refresh_due treats the wait as urgent), and the wait has a wake, so past LAND_HEAD_TIMEOUT the row
+                    # is due and is judged at SHA whether or not the cache ever showed it. With no wake it was never
+                    # due: due rows sort ahead of it and refill hands workers only to due rows, so under a full pool it
+                    # never got one. cmux-cp-1, 2026-11-23: glaeda#2615 sat in repin 03:58-04:42Z, CI green, its copy
+                    # 48 min old, judged in under 3 min once re-queued; 307 rows waited on repin, every one with no
+                    # wake, the oldest 7.9 h.
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "repin", "sha": sha, "since": self.now}, LAND_HEAD_TIMEOUT)
                 elif SHA40.fullmatch(sha) and sha == head == cached:
                     # land_judge's judge_again(), its fallback for a refusal with no step of its own: judge this same
                     # head again. Nothing is stale (the cache holds it), so no head_change wait: that one nudged reads
