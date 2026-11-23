@@ -16144,8 +16144,11 @@ class PostTest(unittest.TestCase):
         tool.write_text("")
         state = Path(self.tmp.name) / "latch"
         state.mkdir(exist_ok=True)
-        def run(argv, timeout=None, **_):
-            asked.append(list(argv[3:]))
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "broker-actor" not in argv:
+                return real(argv, timeout, **kw)
+            asked.append(list(argv[argv.index("broker-actor"):]))
             if role is None:
                 return subprocess.CompletedProcess(argv, 1, "", "")
             return subprocess.CompletedProcess(argv, 0, json.dumps({"role": role, "token": self.APP_TOKEN,
@@ -16155,7 +16158,6 @@ class PostTest(unittest.TestCase):
                       mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(state)})):
             patch.start()
             self.addCleanup(patch.stop)
-        os.environ.pop("GH_TOKEN", None) if False else None
         return asked
 
     def authed(self, transport: Scripted) -> tuple[Any, list]:
@@ -16218,8 +16220,7 @@ class PostTest(unittest.TestCase):
         self.assertEqual(gg.read_json(gg.outbox_dir() / (item["id"] + ".json")).get("appRefused"), "issues")
         self.step(d, NOW + gg.POST_SPACING)
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues", "/repos/o/r/issues"])
-        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN, "token " + TOKEN] if seen[1].startswith("token")
-                         else ["Bearer " + self.APP_TOKEN, "Bearer " + TOKEN])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN, "Bearer " + TOKEN])
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
     def test_an_apps_throttle_is_its_own_cooldown_never_the_logins_pause(self) -> None:
@@ -16236,7 +16237,7 @@ class PostTest(unittest.TestCase):
         self.assertEqual(d.app_create_hold["issues"], NOW + 600)
         self.assertLessEqual(d.post_hold, NOW)  # the login's hold is not set
         self.assertEqual(d.pause_until, 0.0)  # nor is its pause
-        self.assertFalse(any("--hold" in line for line in calls.read_text().splitlines()))  # nor reported
+        self.assertNotIn("--hold", calls.read_text() if calls.exists() else "")  # nor reported
         self.step(d, NOW + gg.POST_SPACING)  # the App rests: the login, which is free, makes it
         self.assertEqual(len(t.calls), 2)
         self.assertNotIn(self.APP_TOKEN, seen[1])
@@ -16880,7 +16881,7 @@ class PostTest(unittest.TestCase):
     def test_a_bad_entry_fails_alone(self) -> None:
         broken = self.queue("comment", "o/r#7", "--body", "x")
         doc = gg.read_json(gg.outbox_dir() / f"{broken['id']}.json")
-        doc["kind"] = "issue"
+        doc["kind"] = "gist"
         gg.write_json(gg.outbox_dir() / f"{broken['id']}.json", doc)
         good = self.queue("comment", "o/r#8", "--body", "y")
         d, t = self.daemon((201, {}, {"html_url": "u"}))

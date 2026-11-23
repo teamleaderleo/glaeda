@@ -9318,9 +9318,10 @@ class Daemon:
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None,
-                             "pause": self.content_pause_status(),
-                             "appHolds": {r: round(t, 3) for r, t in self.app_create_hold.items() if t > self.now}
-                             or None}}
+                             "pause": self.content_pause_status()}}
+        app_holds = {r: round(t, 3) for r, t in self.app_create_hold.items() if t > self.now}
+        if app_holds:  # an App resting from creates: its own cooldown, never the login's holdUntil or pause
+            status["outbox"]["appHolds"] = app_holds
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
         if self.read_pool is not None:  # never a token: how many keys it read, and why the last repo got none
