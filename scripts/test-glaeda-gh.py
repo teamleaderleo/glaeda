@@ -25165,6 +25165,111 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertEqual(self.compares(), [])
 
+    # A copy of the PR showing an older commit of the pin (one of its ancestors) is a stale read, not a moved head (the
+    # host that executes forwarded lands, 2026-11-23 00:38-01:38Z: 11 of 26 head_moved stops in one hour were on a head
+    # GitHub's compare said is behind the pin, ahead 0; LAND_ANCESTRY_JQ's comment).
+    LE = "e" * 40
+
+    def older_copy(self, status: str | None = "ahead", behind: int = 0, parents: list | None = None) -> str:
+        """The cache shows LE, read since the pin; its compare with the pin LA answers STATUS (None: the read fails)."""
+        self.pr(self.LE, checks=[("ci", "COMPLETED", "SUCCESS")])
+        if parents is not None:
+            self.w.cache[self.KEY]["data"].update(headParents=parents, headParent=parents[0])
+        path = f"repos/o/r/compare/{self.LE}...{LA}"
+        self.w.api[path] = None if status is None else json.dumps({"s": status, "b": behind})
+        return path
+
+    def ancestry_reads(self, path: str) -> int:
+        return len([c for c in self.w.gh_calls("api") if c[1] == path])
+
+    def test_a_copy_showing_an_older_commit_of_the_pin_is_read_again_and_lands_at_the_pin(self):
+        self.pinned_and_waiting()
+        path = self.older_copy(parents=[self.LD])  # parents read, not the pin: no base merge (stop_moved_pin's case)
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertIn("ancestor_head_seen", [h["event"] for h in e["history"]])
+        self.assertEqual((self.ancestry_reads(path), self.w.explains()), (1, []))
+        e = self.tick(60)
+        self.assertEqual((e.get("stop"), self.ancestry_reads(path)), (None, 1))  # read once per head and pin
+        self.assertIn(self.KEY, self.w.nudged)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
+
+    def test_an_older_commit_read_without_parents_waits_instead_of_base_merge_checks_stop(self):
+        # 7 of the 11 stopped in base_merge_check ("no update_branch of this queue's made it, and ..."): no parents
+        self.pinned_and_waiting()
+        path = self.older_copy()
+        self.w.cache[self.KEY]["data"]["baseRefName"] = "main"
+        self.w.api[f"repos/o/r/commits/{self.LE}"] = json.dumps([self.LD])
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertEqual((self.ancestry_reads(path), len(self.compares())), (1, 1))  # no base merge compare
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (no update_branch of this queue's "
+                         f"made it, and its parents ({self.LD[:12]}) are not the pinned head and then one more "
+                         "commit: a push, not a base merge on it)")
+        self.assertEqual((len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")), (2, []))  # nothing read again
+
+    def test_a_pin_wait_on_an_older_commit_of_the_pin_waits_for_the_pin(self):
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        path = self.older_copy(parents=[self.LD])
+        e = self.tick(1)
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), self.ancestry_reads(path)), (None, 1))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
+
+    def test_a_head_that_is_no_older_commit_of_the_pin_still_stops_head_moved_as_before(self):
+        self.pinned_and_waiting()
+        path = self.older_copy(status="diverged", behind=3, parents=[self.LD])
+        e = self.tick(30)
+        e = self.tick(2)  # the look after the read stops it, with its own words
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(e["stop"]["reason"], f"the head is {self.LE[:12]}, not the --sha {LA[:12]} it was queued for")
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {self.LE}", e["stop"]["next"])
+        self.assertEqual((self.ancestry_reads(path), self.w.explains(), self.w.gh_calls("pr", "merge")), (1, [], []))
+
+    def test_a_head_made_on_the_pin_stops_head_moved_with_no_ancestry_read(self):
+        self.pinned_and_waiting()
+        path = self.older_copy(parents=[LA])  # the pin is its parent: proven no ancestor of it from the cache
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(self.ancestry_reads(path), 0)
+
+    def test_an_older_commit_of_the_pin_still_shown_stops_after_the_wait(self):
+        self.pinned_and_waiting()
+        path = self.older_copy(parents=[self.LD])
+        e = self.tick(30)
+        self.assertIsNone(e.get("stop"))
+        e = self.tick(gg.LAND_HEAD_TIMEOUT - 30)
+        self.assertIsNone(e.get("stop"))
+        e = self.tick(31)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA))
+        self.assertEqual((self.ancestry_reads(path), self.w.gh_calls("pr", "merge")), (1, []))
+
+    def test_an_ancestry_read_that_never_answers_stops_head_moved_after_its_reads(self):
+        self.pinned_and_waiting()
+        path = self.older_copy(status=None, parents=[self.LD])
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["wait"]["kind"]), ("waiting", None, "retry"))
+        for _ in range(gg.LAND_BASE_MERGE_UNREAD_MAX + 3):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA))
+        self.assertEqual(self.unread_events(e), list(range(1, gg.LAND_BASE_MERGE_UNREAD_MAX + 1)))
+        self.assertEqual(self.ancestry_reads(path), gg.LAND_BASE_MERGE_UNREAD_MAX + 1)
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
         moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}

@@ -15604,6 +15604,8 @@ class LandQueue:
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
             return False  # a copy older than the pin may predate the push the pin names
+        if self.ancestry_due(e, head, data):
+            return False  # maybe an older commit of the pin, a stale copy: judge's worker reads it (LAND_ANCESTRY_JQ)
         e.pop("pinWait", None)
         self.stop(e, "head_moved", land_moved_clause(head, pin),
                   f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
@@ -16879,6 +16881,8 @@ class LandQueue:
                 return True  # a copy still showing a pin it followed away from: a stale read, read again
             if self.base_merge_maybe(pin, head, c.get("data") or {}):
                 return False  # maybe only a base merge on the pin: judge's worker reads whether it is
+            if self.ancestry_due(e, head, c.get("data") or {}):
+                return False  # maybe an older commit of the pin, a stale copy: judge's worker reads it
             self.stop(e, "head_moved", land_moved_clause(head, pin),
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
@@ -17290,18 +17294,23 @@ class LandQueue:
         the old pin still shown (somebody may have pushed the branch back to it): the caller stops it as before.
         2026-11-22 22:08Z, glaeda#2540: pinned 023cd7fc, followed to f745a168 by repin_own_update at 21:30Z, judged
         there at 21:38Z, then stopped "the head is 023cd7fc0c87, not the --sha f745a168dca3 it was queued for" on a
-        copy that still showed the pin it had left; its owner re-pinned by hand."""
+        copy that still showed the pin it had left; its owner re-pinned by hand.
+
+        The same wait holds a HEAD that base_merge_check read to be an older commit of the pin (head_ancestry: an
+        ancestor of it, LAND_ANCESTRY_JQ's comment), which is a stale copy the same way (ancestor_head_seen)."""
         head = str(head or "").lower()
-        if not SHA40.fullmatch(head) or not any(
-                isinstance(h, dict) and h.get("event") in LAND_PIN_FOLLOW_EVENTS
-                and (was := str(h.get("was") or h.get("pin") or "").lower()) and head.startswith(was)
-                for h in e.get("history") or []):
+        pin = str(e.get("pinSha") or "")
+        followed = SHA40.fullmatch(head) is not None and any(
+            isinstance(h, dict) and h.get("event") in LAND_PIN_FOLLOW_EVENTS
+            and (was := str(h.get("was") or h.get("pin") or "").lower()) and head.startswith(was)
+            for h in e.get("history") or [])
+        if not followed and not (SHA40.fullmatch(head) and pin and self.head_ancestry(e, head, pin) is True):
             e.pop("oldPinWait", None)
             return False
         w = e.get("oldPinWait")
         if not isinstance(w, dict) or w.get("head") != head:
             w = e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
-            self.history(e, "old_pin_seen", head=head[:12], pin=str(e.get("pinSha") or "")[:12])
+            self.history(e, "old_pin_seen" if followed else "ancestor_head_seen", head=head[:12], pin=pin[:12])
             self.nudge(e["key"])
             self.save(e)
             return True
@@ -17313,18 +17322,62 @@ class LandQueue:
             self.save(e)
         return True
 
+    def head_ancestry(self, e: dict, head: str, pin: str, data: dict | None = None) -> bool | None:
+        """Whether HEAD is an older commit of PIN (one of its ancestors): the answer recorded on E for this head and
+        pin (headAncestry, which base_merge_check reads once), False when DATA's read of HEAD lists the pin among its
+        parents (a commit made on the pin is not one of its ancestors), else None: not known."""
+        head = str(head or "").lower()
+        rec = (e.get("headAncestry") or {}).get(f"{head}...{pin}")
+        if isinstance(rec, dict) and isinstance(rec.get("ancestor"), bool):
+            return rec["ancestor"]
+        data = data or {}
+        if str(data.get("headRefOid") or "").lower() == head:
+            parents = data.get("headParents")
+            if not isinstance(parents, list):
+                parents = [data["headParent"]] if data.get("headParent") else []
+            if land_parents_have(pin, parents):
+                return False
+        return None
+
+    def ancestry_due(self, e: dict, head: str, data: dict) -> bool:
+        """Under the lock, at a would-be head_moved stop: True when HEAD, which is not E's pin, is not known to be or not
+        to be an older commit of it (head_ancestry) and this host has the gh-quota shim to read it with. The caller
+        does not stop it: judge's worker reads it (base_merge_check) and records the answer, and the next look either
+        waits (old_pin_wait: a stale copy) or stops it as before."""
+        pin = str(e.get("pinSha") or "")
+        head = str(head or "").lower()
+        return bool(pin) and SHA40.fullmatch(head) is not None and land_head_moved(pin, head) \
+            and self.head_ancestry(e, head, pin, data) is None and self.gh() is not None
+
+    def ancestry_record(self, e: dict, head: str, pin: str, ancestor: bool | None, why: str = "") -> None:
+        """Under the lock: record whether HEAD is an ancestor of PIN on E (headAncestry; None: not read yet), with
+        base_merge_check's own answer WHY when it read one, so neither is read again for this head and pin; answers
+        for other pins go."""
+        keep = {k: v for k, v in (e.get("headAncestry") or {}).items() if k.endswith(f"...{pin}")}
+        keep[f"{head}...{pin}"] = {**({"ancestor": ancestor} if ancestor is not None else {}), "at": self.now,
+                                   **({"why": why} if why else {})}
+        e["headAncestry"] = keep
+
+    def requeue(self, e: dict) -> None:
+        """Under the lock: E, whose worker judged nothing, is looked at again on the next pass (its head checks first)."""
+        e.update(state="queued", wait=None, wakeAt=None)
+        self.save(e)
+
     def base_merge_due(self, e: dict, head: str) -> bool:
         """Under the lock, from judge. True when HEAD, which no update of this queue's made, may be only a base merge on
         E's pin (land_base_merge_parent): the judgment goes ahead, and its worker reads first whether it is
         (base_merge_check), which repins or stops it. True as well when the cache's read of HEAD carried no parents (a
-        probe, REST, an older query: head_parents): the worker reads them (parent ""). False: judge stops it
-        head_moved, as before."""
+        probe, REST, an older query: head_parents): the worker reads them (parent ""). True as well, with maybe False,
+        when HEAD is not known to be or not to be an older commit of the pin (ancestry_due): the worker reads only that.
+        False: judge stops it head_moved, as before."""
         pin = str(e.get("pinSha") or "")
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        if not self.base_merge_maybe(pin, head, data):
+        maybe = self.base_merge_maybe(pin, head, data)
+        if not maybe and not self.ancestry_due(e, head, data):
             e.pop("baseMergeCheck", None)
             return False
-        e["baseMergeCheck"] = {"head": head, "pin": pin, "parent": land_base_merge_parent(pin, head, data)}
+        e["baseMergeCheck"] = {"head": head, "pin": pin, "parent": land_base_merge_parent(pin, head, data),
+                               "maybe": maybe}
         return True
 
     def base_merge_maybe(self, pin: str, head: str, data: dict) -> bool:
@@ -17349,13 +17402,20 @@ class LandQueue:
         stopped head_moved on a base merge of the lander's; #2548's two compares, read again afterwards, show the same
         diff, so the rule held and only its read (the cache's parents, or a compare) was missing at that moment."""
         head, pin, parent = str(check["head"]), str(check.get("pin") or ""), str(check.get("parent") or "")
+        maybe = check.get("maybe", True) is not False  # False: only whether HEAD is an older commit of the pin
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         base = str(data.get("baseRefName") or "")
         gh = self.gh()
         docs: list[dict] = []
+        with self.lock:
+            ancestor = self.head_ancestry(e, head, pin, data)
+            kept = str(((e.get("headAncestry") or {}).get(f"{head}...{pin}") or {}).get("why") or "")
         why = "" if gh and base else "no gh-quota shim or base branch to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
-        if not why and not parent:
+        parents: Any = None
+        if not maybe or kept:
+            why = kept  # read before, for this head and pin (ancestry_record): not read again
+        elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
             got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
             try:
@@ -17371,7 +17431,7 @@ class LandQueue:
                     why = (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) are not the pinned head "
                            "and then one more commit: a push, not a base merge on it")
         for path in ([f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{head}",
-                      f"repos/{e['repo']}/compare/{parent}...{pin}"] if not why else []):
+                      f"repos/{e['repo']}/compare/{parent}...{pin}"] if maybe and not why else []):
             got = self.call([gh, "api", path, "--jq", LAND_BASE_MERGE_JQ], LAND_GH_DEADLINE)
             try:
                 doc = json.loads(got.stdout or "") if got.returncode == 0 else None
@@ -17382,10 +17442,46 @@ class LandQueue:
                 unread, said = True, f"{got.stdout or ''}\n{got.stderr or ''}"
                 break
             docs.append(doc)
-        if not why:
+        if maybe and not why:
             why = land_base_merge_why(pin, head, parent, base, docs[1], docs[0])
+        if isinstance(parents, list) and land_parents_have(pin, parents):
+            ancestor = False  # a commit made on the pin is not one of its ancestors: no compare
+        # Not only a base merge (or not asked): before it stops head_moved, whether HEAD is an older commit of the pin,
+        # a stale copy of the PR (LAND_ANCESTRY_JQ's comment). One compare, recorded per head and pin.
+        older, older_why, older_said = None, "", ""
+        if ancestor is None and gh and (why or not maybe) and not unread:
+            path = f"repos/{e['repo']}/compare/{head}...{pin}"
+            got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+            try:
+                doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                doc = None
+            if isinstance(doc, dict) and isinstance(doc.get("s"), str):
+                older = doc.get("s") == "ahead" and doc.get("b") == 0
+            else:
+                older_why = f"the read of {path} failed (exit {got.returncode}), so it is not known to be an older commit"
+                older_said = f"{got.stdout or ''}\n{got.stderr or ''}"
         with self.lock:
             self.check(e)
+            if older_why:
+                if self.base_merge_unread(e, head, older_why, older_said):
+                    if maybe and why:
+                        self.ancestry_record(e, head, pin, None, why)  # its base merge answer is not read again
+                    return False
+                older = False  # read too often without an answer: neither proof, so it stops as before
+            if older is not None:
+                self.ancestry_record(e, head, pin, older, why if maybe else "")
+                ancestor = older
+            if ancestor and self.old_pin_wait(e, head):
+                # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
+                e.pop("baseMergeUnread", None)
+                self.requeue(e)
+                return False
+            if not maybe:
+                # not an older commit of the pin: the look that asked stops it head_moved, with its own words
+                e.pop("baseMergeUnread", None)
+                self.requeue(e)
+                return False
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
             e.pop("baseMergeUnread", None)
@@ -17500,7 +17596,9 @@ class LandQueue:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and self.old_pin_wait(e, sha):
-            self.note_late(e, "waiting for a read newer than the pin it already followed away from")
+            self.note_late(e, "waiting for a read that shows the pin, not an older commit of it"
+                           if self.head_ancestry(e, sha, str(e.get("pinSha") or "")) is True
+                           else "waiting for a read newer than the pin it already followed away from")
             return False
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
                 and not self.base_merge_due(e, sha):
@@ -19694,6 +19792,24 @@ LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: 
 # (doubled each time: 30 s to 16 min, about half an hour in all). A failed read stopped the land at once before.
 LAND_BASE_MERGE_UNREAD_MAX = 6
 LAND_BASE_MERGE_UNREAD_WAIT = 30.0
+# A head_moved stop on a head that is an older commit of the pin (one of its ancestors) stops on a stale copy of the
+# PR, not on a moved head: a requester pins the head it just pushed, or that just got a base merge, and a branch goes
+# back to its own ancestor only by a force-push back, which is rare. The host that executes forwarded lands,
+# 2026-11-23 00:38-01:38Z: 26 head_moved stops in one hour; for 11 of them GitHub's compare of the pin with the head
+# the stop named said "behind", ahead 0, 1 to 233 commits back (cmux#50827 -81, #47369 -58, #48669 -2, #50734 -1,
+# #44463 -153, #50844 -138, #50889 -233; hq#16608 -120, hq#19217 -185; glaeda#2538 -8, glaeda#2561 -4), and each cost
+# its requester a re-land by hand. 7 of the 11 stopped in base_merge_check, the other 4 in stop_moved_pin, pin_wait or
+# judge. Before any of them stops a head the cache does not prove is no ancestor (head_ancestry), judge's worker reads
+# one compare of HEAD...PIN (base_merge_check; "ahead" with behind_by 0: HEAD is an ancestor of PIN), once per head and
+# pin; an ancestor waits as a pin already followed away from does (old_pin_wait, LAND_HEAD_TIMEOUT), then stops as
+# before; a read that fails is bounded like a base merge's (base_merge_unread), then stops as before.
+LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
+
+
+def land_parents_have(pin: str, parents: Any) -> bool:
+    """Whether PARENTS, a commit's parents as a read listed them, include the pinned PIN (a prefix pin matches)."""
+    return bool(pin) and isinstance(parents, list) and any(
+        SHA40.fullmatch(str(p or "").lower()) and not land_head_moved(pin, str(p).lower()) for p in parents)
 
 
 def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
