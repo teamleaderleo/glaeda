@@ -16451,7 +16451,8 @@ class LandQueue:
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
                   f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="fyi")
+                  f"{key_name(e['key'])} --match-head-commit HEAD (HEAD pins the PR's head, read with git "
+                  f"ls-remote, and says which sha)", tell="fyi")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -21549,6 +21550,57 @@ def check_land_pin_shape(pin: str | None) -> None:
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
 
 
+LAND_PIN_LS_REMOTE_DEADLINE = 20.0  # one `git ls-remote` of refs/pull/N/head; it reads no GitHub API quota
+
+
+def land_pin_remote_head(repo: str, number: int,
+                         git: Callable[[list[str]], str | None] | None = None) -> str:
+    """REPO#NUMBER's head as `git ls-remote https://github.com/REPO.git refs/pull/NUMBER/head` reads it (git
+    transport, no API quota), or "" when that fails or prints no whole sha. GIT runs git and returns its stdout or
+    None."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], LAND_PIN_LS_REMOTE_DEADLINE,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout if got.returncode == 0 else None
+    git = git or real
+    out = git(["ls-remote", f"https://github.com/{repo}.git", f"refs/pull/{number}/head"]) or ""
+    for line in out.splitlines():
+        sha, _, ref = line.strip().partition("\t")
+        if ref.strip() == f"refs/pull/{number}/head" and SHA40.fullmatch(sha.lower()):
+            return sha.lower()
+    return ""
+
+
+def land_resolve_pin(key: str, repo: str, number: int, pin: str | None,
+                     git: Callable[[list[str]], str | None] | None = None) -> tuple[str | None, str]:
+    """(the pin to keep, what was said about it). A pin that is 7 to 40 hex is kept as given, unsaid. Any other
+    (`HEAD`, `head`, a branch name) means "the PR's head now": it is resolved to that head's sha from this host's
+    cache when its read is at most LAND_DRAFT_AGE old, else from `git ls-remote ... refs/pull/N/head`, neither of
+    which spends API quota, and the note names the sha and its source. Refused (WatchError) only when neither yields
+    a sha.
+
+    2026-11-23: forward_no_outcome's own notice said "land it again: glaeda-gh land R#N (--sha HEAD to pin it)", and
+    that form was refused "--match-head-commit takes a commit SHA, not 'HEAD'" (leo-workspace#8511, #7740): the
+    tool's hint was a form the tool rejected."""
+    if not pin or re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
+        return pin, ""
+    name = f"{repo}#{number}"
+    cached = land_cached_head(key, LAND_DRAFT_AGE)
+    if SHA40.fullmatch(cached):
+        return cached, f"--match-head-commit {pin} pinned {cached}, {name}'s head as this host's cache last read it"
+    remote = land_pin_remote_head(repo, number, git)
+    if remote:
+        return remote, f"--match-head-commit {pin} pinned {remote}, {name}'s head as git ls-remote reads it"
+    raise WatchError(f"--match-head-commit {pin!r} is not a commit SHA, and {name}'s head could not be read to pin "
+                     f"it (no fresh cache read, and git ls-remote https://github.com/{repo}.git "
+                     f"refs/pull/{number}/head gave no sha)\n"
+                     f"next: git ls-remote https://github.com/{repo}.git refs/pull/{number}/head, then glaeda-gh "
+                     f"land {name} --match-head-commit THAT")
+
+
 def check_land_pin(repo: str, number: int, pin: str | None,
                    git: Callable[[list[str]], str | None] | None = None) -> None:
     """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): its shape, and the one wrong source
@@ -21730,6 +21782,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     try."""
     key, repo, number = land_key(target)
     after = land_after_in(repo, after)
+    pin, pinned = land_resolve_pin(key, repo, number, pin)
+    if pinned:
+        say_waiting(f"glaeda-gh land: {pinned}")  # fd 2, so a --json caller's stdout stays one document
     check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
