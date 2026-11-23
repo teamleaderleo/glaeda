@@ -15681,6 +15681,7 @@ class GateTest(unittest.TestCase):
         brew, shim, root = self.tmp / "brew-python3", self.tmp / "shim-python3", self.tmp / "root-python3.13"
         home = self.tmp / "home"
         user = home / cr.USER_PYTHON
+        user.parent.mkdir(parents=True)
         for exe in (brew, shim, root, user):
             make_executable(exe, "#!/bin/sh\n")
         clt = "/Library/Developer/CommandLineTools/usr/bin/python3"
@@ -19219,9 +19220,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         on its toolchain step (nothing applied: the installed runner keeps running) and says root_python_missing and
         the fix, rather than falling back to Apple's /usr/bin/python3."""
         ctx = mock.Mock(python=cr.ROOT_PYTHON, dedicated={"user": "cmuxci-gui-01"}, home=self.home,
-                        runner_dir=self.runner, show=lambda p: os.fspath(p))
-        with mock.patch.object(cr, "ROOT_PYTHON", os.fspath(self.tmp / "no-glaeda-python/bin/python3.13")), \
-                mock.patch.object(cr, "PROTECTED_PYTHON", os.fspath(self.tmp / "no-glaeda-python/bin/python3.13")):
+                        runner_dir=self.home / "actions-runner-glaeda-hq-two-mac-a", show=lambda p: os.fspath(p))
+        with mock.patch.object(cr, "ROOT_PYTHON", os.fspath(self.home / "no-glaeda-python/bin/python3.13")), \
+                mock.patch.object(cr, "PROTECTED_PYTHON", os.fspath(self.home / "no-glaeda-python/bin/python3.13")):
             ctx.python = cr.ROOT_PYTHON
             with mock.patch.object(cr, "toolchain_paths", return_value=[cr.ROOT_PYTHON]):
                 act = cr.plan_toolchain(ctx)
