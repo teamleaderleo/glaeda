@@ -40,6 +40,17 @@ macOS installs a pressure/idle LaunchAgent and a daily devbox Projects tidy agen
 the equivalent user systemd units. Reports and apply receipts remain under the owning user's
 Glaeda state directories.
 
+## Undeclared growth (the checker)
+
+On a fleet mini, `glaeda-disk report` reads `config/disk-registry.toml` (through `scripts/glaeda-disk-registry`,
+the copy beside it or in the installed release) and prints, per volume, `used - [base] - registered caches - live
+cmux-job-* volumes` as undeclared growth with its top paths, taken from rows the accounting already measured. Past
+the registry's `[checker] undeclared_alarm_gib` (5 GiB; a `[hosts.<name>.checker]` table overrides it) it is the
+`undeclared_growth` finding in `summary.json`, which `glaeda-mini-health` raises. It deletes nothing: the fix is a
+registry entry or a scratch redirect, never a new deletion rule. `GLAEDA_DISK_CHECKER=0` turns it off, `=1` runs it
+off a mini. The family rules stay as the fallback until undeclared growth stays near zero on every host for a week,
+then they are deleted (cmuxterm-hq `docs/design/declared-disk-persistence.md`, section 3).
+
 ## Read-only checkout evidence
 
 Two compiled tools (`src/bin/`) answer exact questions about a checkout without catalog,

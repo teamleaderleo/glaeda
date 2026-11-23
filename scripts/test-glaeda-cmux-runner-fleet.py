@@ -126,7 +126,8 @@ if dest.endswith("mini-fleet.json"):
 """
 FAKE_GH = """#!{python}
 import json, os, sys
-open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:],
+                                                     "gh_token": os.environ.get("GH_TOKEN", "")}}) + "\\n")
 path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
 if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
     groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
@@ -137,11 +138,11 @@ elif path == "repos/actions/runner/releases/latest":
     print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
                       "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
                                   "browser_download_url": "https://example.invalid/x"}}]}}))
-elif "/actions/runners?name=" in path:  # the operator's read of a runner's labels; FAKE_NO_RUNNERS: none listed
-    import urllib.parse
-    name = urllib.parse.unquote(path.split("name=", 1)[1].split("&", 1)[0])
-    listed = [] if os.environ.get("FAKE_NO_RUNNERS") else [{{"name": name, "labels": [{{"name": "self-hosted"}}, {{"name": "glaeda-mini"}}]}}]
-    print(json.dumps({{"total_count": len(listed), "runners": listed}}))
+elif path.endswith("/actions/runners?per_page=100"):  # the operator's one list of a scope's runners; FAKE_NO_RUNNERS: none
+    hosts = ("mini-a", "mini-b", "mini-light")
+    names = [h + "-glaeda" + s for h in hosts for s in [""] + ["-" + str(k) for k in range(1, 16)] + ["-nightly-next"]]
+    for name in [] if os.environ.get("FAKE_NO_RUNNERS") else names:  # gh --jq prints one tojson line per runner
+        print(json.dumps([name, ["self-hosted", "glaeda-mini"]]))
 elif "/repositories" in path:
     print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
 elif path.startswith("repos/") and path.count("/") == 2:
@@ -227,6 +228,31 @@ class FleetTest(unittest.TestCase):
                                "--output", "json", *args], capture_output=True, text=True, timeout=120,
                               env={**self.env, **env}, check=False)
 
+    def test_runner_calls_go_on_the_fleet_app_not_the_login(self) -> None:
+        """A direct --apply mints the fleet runner App's token (fleet_app_token.py) for the runner reads and mints,
+        so they stop spending the operator's gh login; other calls, a caller's GH_TOKEN and a host with no App
+        (exit 3) keep the login."""
+        tool = self.dir / "fleet_app_token.py"
+        tool.write_text("import os, sys\n"
+                        "open(os.environ['FAKE_LOG'] + '.mints', 'a').write(sys.argv[2] + '\\n')\n"
+                        "sys.exit(int(os.environ.get('FAKE_APP_RC', '0')) or print('ghs_apptoken' + sys.argv[2]))\n")
+        result = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        gh = [c for c in self.calls() if c["tool"] == "gh"]
+        runner_calls = [c for c in gh if any("actions/runners" in a for a in c["argv"])]
+        self.assertTrue(runner_calls)
+        self.assertTrue(all(c["gh_token"] == "ghs_apptokenrepo" for c in runner_calls), runner_calls)
+        release = [c for c in gh if "repos/actions/runner/releases/latest" in c["argv"]]
+        self.assertEqual([c["gh_token"] for c in release], [""], "the release read keeps the login")
+        self.assertEqual((self.dir / "calls.jsonl.mints").read_text().split(), ["repo"], "one mint per scope")
+        self.log.unlink()
+        self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), GH_TOKEN="ghs_caller")
+        self.assertTrue(all(c["gh_token"] == "ghs_caller" for c in self.calls() if c["tool"] == "gh"))
+        self.log.unlink()
+        none = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), FAKE_APP_RC="3")
+        self.assertEqual(none.returncode, 0, none.stdout + none.stderr)
+        self.assertTrue(all(c["gh_token"] == "" for c in self.calls() if c["tool"] == "gh"))
+
     def calls(self) -> list[dict]:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
@@ -290,13 +316,14 @@ class FleetTest(unittest.TestCase):
         # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
         releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
         self.assertEqual(len(releases), 1)
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 10,
-                         "one token, eight label reads and one release read")
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 3,
+                         "one token, one runner list for the scope and one release read")
         # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
         self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
-        reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
-                       and any("runners?name=" in a for a in c["argv"]))
-        self.assertIn("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-3&per_page=100", reads)
+        reads = [c["argv"] for c in calls if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertEqual(len(reads), 1, "eight instances on one scope read its runners once, not once each")
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners?per_page=100", reads[0])
+        self.assertIn("--paginate", reads[0])
         unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
         self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
         self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
@@ -445,8 +472,7 @@ class FleetTest(unittest.TestCase):
         tokens = [c["argv"] for c in self.calls() if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
         self.assertIn("repos/manaflow-ai/cmux/actions/runners/registration-token", [a for t in tokens for a in t])
         lists = [c["argv"] for c in self.calls() if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
-        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-nightly-next" in " ".join(a)
-                            for a in lists),
+        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?per_page=100" in a for a in lists),
                         "its labels are read from its own scope, so a mini without gh never re-registers it")
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
