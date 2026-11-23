@@ -24577,6 +24577,52 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
     return entry
 
 
+# A `wait pr` on a PR this host's land queue already holds is a second watcher on a row the land daemon owns. The
+# daemon reads that PR, judges it on its own schedule and ends the row itself; the wait beside it reads nothing the
+# daemon does not already read, and it is not free. A parked row's PR gets one unwaited read per LAND_PEEK_EVERY
+# (600 s, keep_watching); a wait promotes the same key to waited, read every WAITED_FRESH (45 s, read_waited). So a
+# redundant watcher turns 6 reads an hour into 80 of the shared GraphQL pool -- the pool whose last 1000 points the
+# daemon keeps back precisely so lands stay readable. Measured on this host 2026-11-17..23: 414 of 842 `wait pr`
+# invocations (49%) overlapped an active land row for the same PR, 197 redundant watcher-hours. One of them polled
+# 1465 s and then ended "ended_by: blocked ... the shared GraphQL quota for this login is spent (911 of 5000 left,
+# under the 1000 this daemon keeps back for lands)" on a PR that had been `waiting ... wakes 02:47:21Z` the whole
+# time: the watcher and the thing it starved were the same system. The queue is local state, so this costs no read.
+def land_row_watched_here(key: str, sha: str | None = None) -> dict | None:
+    """The active row in this host's land queue for KEY, when one holds it, else None. Active means a state the land
+    daemon still works: a row already merged, stopped, cancelled or forwarded away (LAND_DONE) is nobody's watcher,
+    and a PR with no row here never was -- both wait exactly as they did before. With SHA, only a row whose head or
+    pin is that commit: a wait pinned to another commit asks a question this row's end does not answer, so it waits.
+    Reads land/entries only (land_entries): no GitHub call, nothing registered, no watcher started."""
+    want = (sha or "").lower()
+    for e in land_entries():
+        if e.get("key") != key or e.get("state") in LAND_DONE:
+            continue
+        if want and want not in {str(e.get(k) or "").lower() for k in ("head", "pinSha")}:
+            continue
+        return e
+    return None
+
+
+def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) -> tuple[int, str, str]:
+    """What `wait pr` says instead of becoming the second watcher of ROW: (exit code, its --json object or "", its
+    stderr lines). The row's own words, as `land status` prints them (land_line), so the caller can match the two.
+    The `next:` is a wait that ends and changes the state it waits on: `land --wait` blocks on this row in the local
+    queue (exit 0 merged, 1 stopped, 2 still going) and, re-requesting the land, re-arms the row it blocks on --
+    it starts no GitHub watcher, so it is the wait this one was trying to be. Never "done": the caller still has no
+    verdict, and this says so."""
+    name = key_name(key)
+    reason = (f"{name} is already an active row in this host's land queue ({land_trim(land_line(row, time.time()), 240)}): "
+              f"the land daemon reads that PR, judges it on its own schedule and ends the row itself, and it tells "
+              f"the row's requester when it does. A second watcher here reads nothing the daemon does not already "
+              f"read and spends the shared GraphQL pool the land's own reserve keeps back for lands")
+    nxt = f"glaeda-gh land {name} --wait {max(1, int(timeout)):d}"
+    out = json.dumps({"ok": False, "code": "land_row_watching", "reason": reason, "next": nxt,
+                      "landRow": {"key": key, "state": row.get("state"), "head": row.get("head"),
+                                  "wakeAt": row.get("wakeAt"), "requester": row.get("requester")}}) + "\n" \
+        if as_json else ""
+    return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
+
+
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
     """A daemon-ruled wait that cannot be ruled on: ((64, its --json object or nothing), its stderr lines)."""
     out = json.dumps({"ok": False, "code": code, "reason": reason, "next": nxt}) + "\n" if req.get("json") else ""
@@ -33479,6 +33525,19 @@ def main(argv: list[str] | None = None) -> int:
                                     args.max)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
+        if args.kind == "pr":
+            # Before any waiting line, any interest registered and any watcher: a new `wait pr` only. A wait already
+            # running (resume_wait, poll_wait) never comes back through here, so a row queued mid-wait never cuts one
+            # off -- the wait it is already in goes on to its own verdict.
+            row = land_row_watched_here(parse_key("pr", args.target), args.sha)
+            if row is not None:
+                code, out, lines = land_row_wait_refusal(parse_key("pr", args.target), row, args.timeout, args.json)
+                say_waiting(lines.rstrip("\n"))
+                if out:
+                    with contextlib.suppress(OSError, ValueError):
+                        sys.stdout.write(out)
+                        sys.stdout.flush()
+                return code
         until, chosen = (wait_until_chosen("pr", parse_key("pr", args.target), None)
                          if args.kind == "pr" and args.until is None else (args.until or "green", None))
         if chosen:
