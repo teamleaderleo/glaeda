@@ -4610,6 +4610,7 @@ class HookTest(unittest.TestCase):
         self.fleet()
         capacity = self.dir / "capacity"
         other = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"}
+        ios_kit = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next-ios-kit.yml@refs/heads/x"}
         gallery = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/native-sidebar-gallery.yml@refs/heads/x"}
         guest_gallery = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmuxterm-hq/.github/workflows/native-sidebar-gallery.yml@refs/heads/x"}
         cases = (("swift-package-tests", {}, "manaflow-ai/cmux"),
@@ -4623,6 +4624,8 @@ class HookTest(unittest.TestCase):
                  # an eval's job id from another workflow is not its client
                  ("bench", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("eval", other, "manaflow-ai/cmux"),
+                 ("animation-frames", other, "manaflow-ai/cmux"),
+                 ("kit-tests", ios_kit, "manaflow-ai/cmux"),
                  ("look", self.FAST_TIER, "manaflow-ai/cmux"),
                  # Only the exact home-repository gallery client is admitted, not its job id or workflow alone.
                  ("capture", other, "manaflow-ai/cmux"),
@@ -4649,7 +4652,7 @@ class HookTest(unittest.TestCase):
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                              ("fleet-rd-host-macos.yml", "check")):
+                              ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-kit.yml", "animation-frames")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
