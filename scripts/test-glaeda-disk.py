@@ -8879,6 +8879,19 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
             self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
 
+    def test_a_fresh_xcode_build_is_never_due_even_unwindowed_under_pressure(self) -> None:
+        # air-blue, 2026-11-23: a pressure pass deleted a live check's 14.5 GB DerivedData 0.1 h after its build
+        xcode = gd.Family("xcode-derived-data", self.root, True, "rebuild", build_output=True)
+        path = self.root / "cmux-try48231"
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True), mock.patch.object(gd, "job_starts",
+                                                                                     return_value=[]):
+            for mode in ("pressure", "sweep", None):
+                with mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                    window = gd.item_window(xcode, path, 1.0)
+                    self.assertEqual(gd.item_due(xcode, 0.1, window), (False, None), mode)
+                    self.assertFalse(gd.item_due(xcode, gd.FRESH_BUILD_HOURS - 0.01, window)[0], mode)
+                    self.assertTrue(gd.item_due(xcode, gd.FRESH_BUILD_HOURS + 0.5, window)[0], mode)
+
     def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
         dd = gd.Family("ci-derived-data", self.root, True, "rebuild")
         scratch = gd.Family("tmp", self.root, True, "rebuild")
