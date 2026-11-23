@@ -15500,7 +15500,7 @@ class LandQueue:
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
-                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
+                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None, forwardQuiet=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
@@ -16157,9 +16157,8 @@ class LandQueue:
         since = self.forwarded_at(e)
         if not since or self.now - since < LAND_FORWARD_QUIET:
             return
-        quiet = e.get("forwardQuiet") or {}
-        if float(quiet.get("since") or 0) == since:
-            return  # this forward was told (or seen ended) once
+        if e.get("forwardQuiet"):
+            return  # told (or seen ended) once per request: a 30-min resend moves the hand-off's time but is not a new forward
         key = e["key"]
         c = self.cache_of(key) or {}
         data = c.get("data") or {}
@@ -16182,12 +16181,14 @@ class LandQueue:
                 return
             if self.now - peeked < LAND_FORWARD_READ_WAIT:
                 return  # the one read is asked; tell once it lands, or once its wait is out
+        if not (read and state == "OPEN"):
+            return  # no read says the PR is still open: tell nobody; the give-up's state read (forwards_follow)
+            # settles the row, silently if it ended, as one fyi if it never reads; a later cache read of it open tells
         to = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
         head = str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "")
         live = str(data.get("headRefOid") or "").lower()
         mins = round((self.now - since) / 60)
-        seen = (f"the PR still reads open at {live[:12]}" if read and state == "OPEN" and live
-                else "no read of the PR here says it ended")
+        seen = f"the PR still reads open at {live[:12]}" if live else "the PR still reads open"
         nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
         e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read)}
         self.history(e, "forward_quiet", to=to, head=head[:12], waited=round(self.now - since), read=bool(read))
@@ -16197,7 +16198,11 @@ class LandQueue:
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} was handed to {to} {mins} min ago"
                     + (f" at {head[:12]}" if head else "") + f" and no verdict has come back ({seen}); "
-                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}")
+                    f"`glaeda-gh land status` on {to} says where it is, or queue it again: {nxt}",
+                    # an inbox fyi, never a [blocker]: nothing has stopped, and the far host may still land it (2026-11-23
+                    # 09:14Z: cmux#45417 and #49910 woke their requester as [blocker]s 56 min after a hand-off;
+                    # cmuxterm-hq docs/handbook/notice-flood.md: a program's message is an inbox fyi)
+                    cls=LAND_FORWARD_FYI_CLASS)
 
     def retire_ended(self) -> None:
         """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""

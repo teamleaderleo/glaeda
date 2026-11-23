@@ -28777,6 +28777,7 @@ class LandTest(Base):
         e = self.tick()
         [sent] = self.quiet_notices()
         self.assertEqual(sent[2:4], ["--no-wait", "host/lane"])
+        self.assertEqual(sent[sent.index("--class") + 1], "fyi")  # an inbox fyi, never a [blocker]
         self.assertIn("handed to ", sent[-1])
         self.assertIn(f"still reads open at {LA[:12]}", sent[-1])
         self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
