@@ -1,7 +1,8 @@
 #!/bin/bash
 # Read-only probe for one cmux build mini. Emits "key<TAB>value" lines; repeated keys form lists.
-# Runs as the login user with no privileged command and no Python (a mini without an accepted Xcode licence
-# has only stub /usr/bin/python3). Never prints key material, tokens, or log contents.
+# Runs as the login user with no privileged command and no Python: it must read a mini glaeda-python has not
+# set up yet (and Apple's python3, which glaeda never runs, is a stub without an accepted Xcode licence).
+# Never prints key material, tokens, or log contents.
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 e() { printf '%s\t%s\n' "$1" "$2"; }
 e user "$(id -un)"

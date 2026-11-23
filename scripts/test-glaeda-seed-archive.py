@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -269,16 +270,38 @@ class ArchiveTest(unittest.TestCase):
         finally:
             archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = saved
 
-    def test_the_launch_agent_runs_apples_python(self):
+    def test_the_daemon_runs_the_users_python_313_under_the_lan_parent(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
+        self.assertEqual(archive.USER_PYTHON, archive.HOME / ".local/bin/python3.13")
         self.assertEqual(plist["ProgramArguments"][:len(archive.LAN_PARENT) + 2],
-                         [*archive.LAN_PARENT, "/usr/bin/python3", "-I"])
+                         [*archive.LAN_PARENT, os.fspath(archive.USER_PYTHON), "-I"])
+        self.assertNotIn("/usr/bin/python3", plistlib.dumps(plist).decode())
         self.assertEqual(plist["ProgramArguments"][0], "/bin/sh")
         # The archive installs itself without glaeda-mini-setup, so it keeps its own copy of the wrapper.
         setup = load("glaeda_mini_setup_for_archive", ROOT / "scripts/glaeda-mini-setup")
         self.assertEqual(archive.LAN_PARENT, setup.LAN_PARENT)
         self.assertEqual(plist["StartInterval"], 15)
         self.assertEqual(plist["StandardOutPath"], "/dev/null")
+
+    def test_install_without_the_users_python_writes_nothing_and_names_the_fix(self):
+        base = Path(self.tmp.name)
+        daemons = base / "no-python-daemons"
+        daemons.mkdir()
+        installed = daemons / f"{archive.LABEL}.plist"
+        installed.write_bytes(b"the plist already there")
+        saved = (archive.USER_PYTHON, archive.DAEMON_DIR, archive.install_daemon)
+        archive.USER_PYTHON, archive.DAEMON_DIR = base / "missing/python3.13", daemons
+        archive.install_daemon = lambda *a: self.fail("must not install a daemon without USER_PYTHON")
+        try:
+            plan = archive.install(False)
+            self.assertEqual(plan["python"], "missing")
+            self.assertIn("glaeda-python --install", plan["user_python_missing"])
+            self.assertNotIn("error", plan)
+            report = archive.install(True)
+            self.assertIn("glaeda-python --install", report["error"])
+            self.assertEqual(installed.read_bytes(), b"the plist already there")  # it keeps its interpreter
+        finally:
+            archive.USER_PYTHON, archive.DAEMON_DIR, archive.install_daemon = saved
 
     def test_only_a_run_that_did_something_is_logged(self):
         self.keep(KEYS[0], 100)

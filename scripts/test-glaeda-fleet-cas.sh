@@ -377,10 +377,18 @@ eval "$(sed -n '/^root_run()/,/^health_failed()/p' "$script" | sed '$d')"
 unset -f bootstrap
 unset -f say; say() { :; }
 gc=com.teamleaderleo.glaeda.fleet-cas-store-gc
+gc_plist=$LAUNCH_DAEMONS/$gc.plist
+# Without the login user's Python 3.13 it writes nothing and names the fix; the installed daemon stays.
+: >"$relay_root/sudo.log"
+GLAEDA_USER_PYTHON=$relay_root/no-python PATH="$stub_bin:$PATH" apply=1 write_store_prune 2>"$relay_root/nopy.err"
+grep -q 'user_python_missing: .*glaeda-python --install' "$relay_root/nopy.err"
+test ! -e "$gc_plist"
+if grep -q bootstrap "$relay_root/sudo.log"; then exit 1; fi
+export GLAEDA_USER_PYTHON=$relay_root/home-python3.13
+printf '#!/bin/sh\n' >"$GLAEDA_USER_PYTHON"; chmod +x "$GLAEDA_USER_PYTHON"
 : >"$AGENTS/$gc.plist"   # the old agent
 : >"$relay_root/sudo.log"
 PATH="$stub_bin:$PATH" apply=1 write_store_prune
-gc_plist=$LAUNCH_DAEMONS/$gc.plist
 test ! -e "$AGENTS/$gc.plist"
 grep -q "bootout gui/.*/$gc" "$temporary_root/launchctl.log"
 grep -q "launchctl bootstrap system $gc_plist" "$relay_root/sudo.log"
@@ -388,6 +396,8 @@ tr -d ' \n' <"$gc_plist" >"$relay_root/gc.flat"
 grep -q "<key>UserName</key><string>$(id -un)</string>" "$relay_root/gc.flat"
 grep -q "<key>HOME</key><string>$HOME</string>" "$relay_root/gc.flat"
 grep -q "<string>$relay_root/launch/glaeda-fleet-cas-prune</string><string>--apply</string><string>--store-gc-only</string>" "$relay_root/gc.flat"
+grep -q "<key>ProgramArguments</key><array><string>$GLAEDA_USER_PYTHON</string><string>-I</string>" "$relay_root/gc.flat"
+if grep -q /usr/bin/python3 "$gc_plist"; then exit 1; fi
 grep -q '<key>GLAEDA_FLEET_CAS_ROOT</key><string>/Volumes/glaeda-fleet-cas</string>' "$relay_root/gc.flat"
 grep -q '<key>StartInterval</key><integer>3600</integer>' "$relay_root/gc.flat"
 cmp "$repo_root/scripts/glaeda-fleet-cas-prune" "$relay_root/launch/glaeda-fleet-cas-prune"

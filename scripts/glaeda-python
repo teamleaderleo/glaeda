@@ -1,0 +1,135 @@
+#!/bin/sh
+# glaeda-python: the one Python every glaeda LaunchAgent, LaunchDaemon, shebang and installer runs.
+#
+#     glaeda-python --path            print the login user's interpreter (USER_PYTHON) when it runs; exit 1 if not
+#     glaeda-python --install         make USER_PYTHON: uv (the one on PATH or ~/.local/bin, else Homebrew's when
+#                                     this user owns Homebrew, else astral's installer with UV_NO_MODIFY_PATH=1),
+#                                     then `uv python install 3.13`; prints the path
+#     glaeda-python --root-path       print ROOT_PYTHON when it runs and every directory from / down to it is
+#                                     root-owned and not group- or other-writable; exit 1 if not
+#     glaeda-python --install-root    as root (sudo -n glaeda-python --install-root): copy the login user's
+#                                     uv-installed 3.13 to ROOT_DIR, root:wheel, go-w, and link ROOT_PYTHON to it
+#
+# USER_PYTHON (~/.local/bin/python3.13) is what the login user's LaunchAgents and ssh commands run. ROOT_PYTHON
+# (/opt/glaeda-python/bin/python3.13) is what root LaunchDaemons and anything run as the runner user run: a copy no
+# account but root can write, which is why Apple's SIP-protected python3 was used before. Apple's python3
+# (Xcode's or the Command Line Tools' 3.9) is not used by glaeda anywhere. Local Network privacy no longer tells
+# Apple's python from this one (cmux15, macOS 27.0.1, 2026-11-23: both get EHOSTUNREACH in-process, both let a
+# /usr/bin/nc child connect), so the LAN agents keep their /bin/sh parent (glaeda-mini-setup LAN_PARENT) and run
+# this interpreter under it.
+#
+# POSIX sh, no python of its own: it is what makes the python. Idempotent: a second --install or --install-root
+# with nothing to change changes nothing.
+set -eu
+
+VERSION=3.13
+USER_PYTHON="${GLAEDA_USER_PYTHON:-$HOME/.local/bin/python$VERSION}"
+ROOT_DIR="${GLAEDA_ROOT_PYTHON_DIR:-/opt/glaeda-python}"
+ROOT_PYTHON="$ROOT_DIR/bin/python$VERSION"
+UV_INSTALLER=https://astral.sh/uv/install.sh
+
+say() { printf 'glaeda-python: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+runs() { [ -x "$1" ] && "$1" -I -c 'import sys; sys.exit(sys.version_info[:2] != (3, 13))' >/dev/null 2>&1; }
+
+find_uv() {
+  for c in "$(command -v uv 2>/dev/null || true)" "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+    if [ -n "$c" ] && [ -x "$c" ]; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 1
+}
+
+install_uv() {
+  if uv=$(find_uv); then printf '%s\n' "$uv"; return 0; fi
+  brew=$(command -v brew 2>/dev/null || true)
+  [ -n "$brew" ] || for c in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$c" ] && brew=$c && break; done
+  # Homebrew only when this account owns it: shared minis often have another account's.
+  if [ -n "$brew" ] && [ -O "$("$brew" --prefix 2>/dev/null)/Cellar" ]; then
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 "$brew" install uv >&2 || say "brew install uv failed"
+  fi
+  if ! find_uv >/dev/null; then
+    command -v curl >/dev/null 2>&1 || die "no uv and no curl to install it"
+    curl -LsSf --max-time 120 "$UV_INSTALLER" | env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$HOME/.local/bin" sh >&2 \
+      || die "astral's uv installer failed"
+  fi
+  find_uv || die "uv is still missing after install"
+}
+
+user_install() {
+  if runs "$USER_PYTHON"; then printf '%s\n' "$USER_PYTHON"; return 0; fi
+  uv=$(install_uv)
+  mkdir -p "$(dirname "$USER_PYTHON")"
+  UV_PYTHON_BIN_DIR="$(dirname "$USER_PYTHON")" "$uv" python install "$VERSION" >&2 || die "uv python install $VERSION failed"
+  if ! runs "$USER_PYTHON"; then
+    # an older uv installs no executable into the bin directory: link the managed install it just made
+    found=$("$uv" python find --managed-python "$VERSION" 2>/dev/null || true)
+    [ -n "$found" ] && ln -sfn "$found" "$USER_PYTHON"
+  fi
+  runs "$USER_PYTHON" || die "$USER_PYTHON does not run Python $VERSION after uv python install"
+  printf '%s\n' "$USER_PYTHON"
+}
+
+# Every directory from / to PATH's real file: root-owned and writable by nobody else. WHY names the first that is not.
+WHY=
+root_owned_chain() {
+  p=$1
+  while :; do
+    [ -e "$p" ] || { WHY="$p is missing"; return 1; }
+    if [ -h "$p" ]; then
+      [ "$(stat -c %u "$p" 2>/dev/null || stat -f %u "$p")" = 0 ] || { WHY="$p is a link not owned by root"; return 1; }
+    else
+      set -- $(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p")
+      [ "$1" = 0 ] || { WHY="$p is owned by uid $1, not root"; return 1; }
+      # writable by others only with the sticky bit (/tmp): then only root may rename what root owns there
+      case $2 in *[2367]?|*[2367]) [ -k "$p" ] || { WHY="$p is writable by group or other (mode $2)"; return 1; } ;; esac
+    fi
+    [ "$p" = / ] && return 0
+    p=$(dirname "$p")
+  done
+}
+
+root_ok() {
+  runs "$ROOT_PYTHON" || { WHY="$ROOT_PYTHON does not run Python $VERSION"; return 1; }
+  real=$(cd "$(dirname "$ROOT_PYTHON")" && cd "$(dirname "$(readlink "$ROOT_PYTHON" || echo "$ROOT_PYTHON")")" && pwd -P)
+  root_owned_chain "$ROOT_PYTHON" && root_owned_chain "$real"
+}
+
+root_install() {
+  [ "$(id -u)" = 0 ] || die "--install-root runs as root: sudo -n $0 --install-root"
+  if root_ok; then printf '%s\n' "$ROOT_PYTHON"; return 0; fi
+  # The login user's uv install is the source (sudo keeps HOME as that user's unless -H); its prefix is copied, not
+  # linked, so nothing that account can write is what root runs.
+  owner_home=${SUDO_USER:+$(eval echo "~$SUDO_USER")}
+  src="${GLAEDA_ROOT_PYTHON_SOURCE:-${owner_home:-$HOME}/.local/bin/python$VERSION}"
+  # Root never runs the source (another account's file) before it is a root-owned copy: the prefix comes from the
+  # link's target, and only the copy is run, after chown.
+  [ -e "$src" ] || die "$src is missing: run glaeda-python --install as the login user first"
+  real=$(readlink -f "$src" 2>/dev/null) || die "cannot resolve $src"
+  prefix=$(dirname "$(dirname "$real")")
+  name=$(basename "$prefix")
+  case $name in cpython-3.13.*) ;; *) die "$src is not a uv-managed CPython 3.13 ($real)" ;; esac
+  [ -x "$prefix/bin/python$VERSION" ] || die "$prefix has no bin/python$VERSION"
+  umask 022
+  mkdir -p "$ROOT_DIR/bin"
+  stage="$ROOT_DIR/.$name.$$"
+  rm -rf "$stage"
+  if command -v ditto >/dev/null 2>&1; then ditto "$prefix" "$stage"; else cp -R "$prefix" "$stage"; fi
+  chown -R 0:0 "$stage" "$ROOT_DIR" 2>/dev/null || chown -R root:wheel "$stage" "$ROOT_DIR"
+  chmod -R go-w "$stage" "$ROOT_DIR"
+  rm -rf "${ROOT_DIR:?}/$name"
+  mv "$stage" "$ROOT_DIR/$name"
+  ln -sfn "../$name/bin/python$VERSION" "$ROOT_PYTHON.new"
+  mv -f "$ROOT_PYTHON.new" "$ROOT_PYTHON"
+  root_ok || die "$ROOT_PYTHON is not a root-owned, runnable Python $VERSION after install: $WHY"
+  printf '%s\n' "$ROOT_PYTHON"
+}
+
+case "${1:-}" in
+  --path) runs "$USER_PYTHON" && printf '%s\n' "$USER_PYTHON" ;;
+  --install) user_install ;;
+  --root-path) if root_ok; then printf '%s\n' "$ROOT_PYTHON"; else say "$WHY"; exit 1; fi ;;
+  --install-root) root_install ;;
+  -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
+  *) die "usage: glaeda-python --path | --install | --root-path | --install-root" ;;
+esac

@@ -248,8 +248,39 @@ def run(argv: list[str], timeout: float, stdin: str | None = None) -> tuple[int,
                 time.sleep(EMFILE_BACKOFF_S)  # the launch never started; another child's pipes free up meanwhile
                 continue
             return 127, "", str(error)
-        return out.returncode, out.stdout, out.stderr
+        return out.returncode, out.stdout, python_fix(out.returncode, out.stderr)
     raise AssertionError("unreachable")
+
+
+# glaeda-python (scripts/glaeda-python): the one Python a remote command runs glaeda code with, never Apple's
+# python3 (the xcrun shim). As the member's own (login) user: its uv-installed USER_PYTHON, written for the remote shell to
+# expand. As another account (a runner.poolUser, a runner.dedicated user): ROOT_PYTHON, the root-owned copy no account
+# but root can write (glaeda-cmux-runner PROTECTED_TOOLCHAIN). glaeda-mini-setup --apply installs both, hourly.
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"  # glaeda-cmux-runner ROOT_PYTHON
+USER_PYTHON = "~/.local/bin/python3.13"
+PYTHON_FIXES = ((ROOT_PYTHON, "root_python_missing", "sudo -n glaeda-python --install-root"),
+                ("/.local/bin/python3.13", "user_python_missing", "glaeda-python --install"))
+
+
+def remote_python(user: str | None) -> str:
+    """The interpreter for a remote command run as `user` (None or "": the member's own user)."""
+    return ROOT_PYTHON if user else USER_PYTHON
+
+
+def pool_python(member: str, user: str | None = None) -> str:
+    """remote_python for a pool step (pool_ssh's account)."""
+    return remote_python(pool_login(member) if user is None else user)
+
+
+def python_fix(code: int, err: str) -> str:
+    """err, naming the fix when the remote shell could not find a glaeda-python interpreter (exit 127): a mini that has
+    not run the new glaeda-mini-setup yet."""
+    if code != 127:
+        return err
+    for path, finding, fix in PYTHON_FIXES:
+        if path in err:
+            return f"{err.rstrip()}\n{finding}: run {fix} on the member (glaeda-mini-setup --apply runs it)"
+    return err
 
 
 def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
@@ -285,10 +316,11 @@ def trimmed(manifest: dict[str, Any], member: str) -> dict[str, Any]:
 def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
     """The member's own gate, read-only: the hook runs from stdin with the workload PATH. (True, line) when
     eligible, (False, line) when the hook refused, (None, why) when the member could not be asked."""
-    argv = ["python3", "-", "check", "--fleet-class", summary["hardware"]]
+    argv = ["-", "check", "--fleet-class", summary["hardware"]]
     if summary.get("xcodeApps"):
         argv += ["--toolchain-xcode", summary["xcodeApps"][0]]
-    remote = f"PATH={WORKLOAD_PATH} {node_view_env(summary)}/usr/bin/" + " ".join(_quote(a) for a in argv)
+    python = remote_python(summary.get("poolUser"))
+    remote = f"PATH={WORKLOAD_PATH} {node_view_env(summary)}{python} " + " ".join(_quote(a) for a in argv)
     code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [err.strip() or f"ssh exited {code}"])[-1]
@@ -301,7 +333,8 @@ def disk_shape(member: str, summary: dict[str, Any]) -> tuple[dict[str, Any] | N
     """LISTENER_DISK: the member's `glaeda-cmux-runner-hook disk-shape`, read-only over SSH like check(): (the JSON
     answer, "") or (None, why)."""
     floor = summary.get("minFreeGib") or 0
-    remote = f"PATH={WORKLOAD_PATH} /usr/bin/python3 - disk-shape --min-free-gib {_quote(f'{floor:g}')}"
+    python = remote_python(summary.get("poolUser"))
+    remote = f"PATH={WORKLOAD_PATH} {python} - disk-shape --min-free-gib {_quote(f'{floor:g}')}"
     code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [""])[-1]
@@ -823,14 +856,16 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
     return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
-def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False, token: bool = True) -> str:
+def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False, token: bool = True,
+                   user: str | None = None) -> str:
     # --token-stdin even for the plan: without gh on the mini, a plan lacking it reads "blocked", and a plan
     # never reads stdin. receipt_only: no --manifest (a dedicatedOnly member declares no pool instance to name);
     # an uninstall acts only on what the instance's receipt recorded anyway.
     named = "" if receipt_only else f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} "
     # token=False: an instance with no registration to deregister (an interrupted install) takes no token
-    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}"
-            f"{'--token-stdin ' if token else ''}{named}--instance {instance} --output json")
+    # user: pool_ssh's account, whose interpreter runs it (pool_python)
+    return (f"{pool_python(member, user)} ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall "
+            f"{'--apply ' if apply else ''}{'--token-stdin ' if token else ''}{named}--instance {instance} --output json")
 
 
 def _failed_note(out: str, err: str, code: int) -> str:
@@ -846,7 +881,7 @@ def registered_scope(member: str, instance: int, receipt_only: bool = False,
                      user: str | None = None) -> tuple[str | None, str | None]:
     """(scope the instance is registered to, "" when none; or None and why it could not be read). Read-only:
     the single-mini uninstall plan, which follows the instance's receipt."""
-    code, out, err = run([*pool_ssh(member, user), _uninstall_cmd(member, instance, False, receipt_only)],
+    code, out, err = run([*pool_ssh(member, user), _uninstall_cmd(member, instance, False, receipt_only, user=user)],
                          CHECK_TIMEOUT_S)
     try:
         acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
@@ -950,7 +985,7 @@ def retire_instance(member: str, instance: int, held: str = "dedicated runners h
     if token is None:
         return {"instance": instance, "exit": None, "state": f"retire: no remove token for {scope}; nothing changed"}
     code, out, err = run([*pool_ssh(member, user),
-                          _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope))],
+                          _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope), user=user)],
                          APPLY_TIMEOUT_S, stdin=token + "\n" if scope else None)
     del token
     if code != 0:
@@ -1039,7 +1074,7 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     labels = None if deregistered else github_labels(scope_api(repo, org),
                                                      f"{member}-glaeda" + (f"-{instance}" if instance else ""))
     observed = f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
-    remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
+    remote = (f"{pool_python(member)} ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
               f"{observed}--output json " + " ".join(_quote(a) for a in extra))
@@ -1089,9 +1124,11 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
               + " ".join(_quote(a) for a in extra if a != "--headless"))
     if entry.get("user"):
-        # PROTECTED_TOOLCHAIN (glaeda-cmux-runner): the installer runs on Apple's python3 against the root-owned Command
-        # Line Tools with only the system PATH, never a Homebrew python the member user can replace
-        remote = f"PATH={USER_PATH} DEVELOPER_DIR={USER_DEVELOPER_DIR} {USER_PYTHON} {remote}"
+        # PROTECTED_TOOLCHAIN (glaeda-cmux-runner): the installer runs on the root-owned ROOT_PYTHON with only the system
+        # PATH and its xcrun shims on the root-owned Command Line Tools, never a python the member user can replace
+        remote = f"PATH={USER_PATH} DEVELOPER_DIR={USER_DEVELOPER_DIR} {PROTECTED_PYTHON} {remote}"
+    else:
+        remote = f"{USER_PYTHON} {remote}"
     code, out, err = run([*ssh_argv(member, entry.get("user")), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
@@ -1110,7 +1147,7 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
 # host): that account reachable over ssh with the operator's key. Typed, so the operator sees the missing step.
 USER_SSH_MISSING = "user-ssh"
 USER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"  # glaeda-cmux-runner PROTECTED_PATH
-USER_PYTHON = "/usr/bin/python3"  # PROTECTED_PYTHON
+PROTECTED_PYTHON = ROOT_PYTHON  # glaeda-cmux-runner PROTECTED_PYTHON
 USER_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"  # PROTECTED_DEVELOPER_DIR
 
 
@@ -1148,7 +1185,7 @@ def publish_node_view(member: str, summary: dict[str, Any]) -> str | None:
     and 0644, so the pool account reads and never writes them), and point FLEET_DIR/bin/glaeda-canonical-root at the
     pool account's instance-0 hook shim (the link cmux's restore step calls; the pool account cannot write bin/, which
     holds the member user's tools). Why it failed, or None."""
-    remote = (f"/usr/bin/python3 - {_quote(summary['hardware'])} {_quote(summary['poolUser'])} "
+    remote = (f"{USER_PYTHON} - {_quote(summary['hardware'])} {_quote(summary['poolUser'])} "
               f"{_quote(POOL_NODE_VIEW)}")
     code, out, err = run([*ssh_argv(member), remote], APPLY_TIMEOUT_S, stdin=NODE_VIEW_PUBLISH)
     line = (out.strip().splitlines() or [""])[-1]
@@ -1157,7 +1194,7 @@ def publish_node_view(member: str, summary: dict[str, Any]) -> str | None:
     return f"exit {code}: {(err.strip() or line)[-240:]}"
 
 
-# Run by the member user's Apple python3 (stdin; argv: hardware class, pool user, view path). Builds the view in a fresh
+# Run by the member user's USER_PYTHON (stdin; argv: hardware class, pool user, view path). Builds the view in a fresh
 # directory beside the link and swaps the link atomically, so a hook reading it never sees half a copy, then removes
 # the views the link no longer names. A missing source file is left out (the hook then refuses, naming it).
 NODE_VIEW_PUBLISH = r"""

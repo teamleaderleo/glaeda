@@ -32,7 +32,7 @@ sys.modules["glaeda_mini_setup"] = ms
 loader.exec_module(ms)
 ms.DARWIN_REQUIRED = False
 ms.HOST_PLATFORM = "macos"  # CI runs these on Linux; the Linux profile has its own tests below
-REAL_ENROLL_PYTHON = ms.enroll_python
+PY = "/opt/test/bin/python3.13"  # an explicit --python; no test runs it
 
 PMSET_SLEEPY = """Battery Power:
  sleep                1
@@ -87,8 +87,7 @@ class MiniSetupTest(unittest.TestCase):
             mock.patch.object(ms, "preflight", fake_preflight()),
             mock.patch.object(ms, "run", recording_run),
             mock.patch.dict(os.environ, {"HOME": os.fspath(self.home)}),
-            mock.patch.object(ms, "enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"),
-            mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: None),  # never probe the real host
+            mock.patch.object(ms, "root_python_ok", mock.Mock(side_effect=AssertionError("never probe the real host"))),
             mock.patch.object(ms, "brew_install", mock.Mock(side_effect=AssertionError("brew must not run"))),
         ]
         for p in self.patches:
@@ -102,7 +101,7 @@ class MiniSetupTest(unittest.TestCase):
     def invoke(self, *args: str) -> dict:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = ms.main(["--output", "json", "--python", "/usr/bin/python3",
+            code = ms.main(["--output", "json", "--python", PY,
                             "--reclaim-binary", os.fspath(self.reclaim), *args])
         self.assertEqual(code, 0, out.getvalue()[-2000:])
         return json.loads(out.getvalue())
@@ -127,30 +126,35 @@ class MiniSetupTest(unittest.TestCase):
             steps = ms.operator_steps(mock.Mock(xcode_app=ms.CMUX_XCODE_APP), pre, None)
             self.assertEqual(any(s["command"] == "xcode-select --install" for s in steps), wanted, level)
 
-    def test_pick_python_trusts_the_shim_beside_a_versioned_xcode(self) -> None:
-        def fake_glob(self, pattern):
-            return iter([Path("/Applications/Xcode_26.6.app")]) if pattern == "Xcode*.app" else iter([])
-        with mock.patch.object(ms.os, "access", return_value=False), \
-             mock.patch.object(ms.Path, "exists", return_value=False), \
-             mock.patch.object(ms.Path, "glob", fake_glob):
-            self.assertEqual(ms.pick_python(), "/usr/bin/python3")
-        with mock.patch.object(ms.os, "access", return_value=False), \
-             mock.patch.object(ms.Path, "exists", return_value=False), \
-             mock.patch.object(ms.Path, "glob", lambda self, pattern: iter([])):
-            self.assertIsNone(ms.pick_python())
+    def test_pick_python_is_only_the_pinned_uv_python(self) -> None:
+        # Never Apple's python3 (the xcrun shim, Xcode's or the Command Line Tools' 3.9), never whichever
+        # Homebrew python3 is there: only ~/.local/bin/python3.13 from glaeda-python --install.
+        self.assertIsNone(ms.pick_python(self.home, "macos"))
+        pinned = self.home / ".local/bin/python3.13"
+        pinned.parent.mkdir(parents=True)
+        pinned.write_text("#!/bin/sh\n")
+        pinned.chmod(0o755)
+        self.assertEqual(ms.pick_python(self.home, "macos"), os.fspath(pinned))
+        self.assertEqual(ms.user_python(self.home), pinned)
 
-    def test_seed_prefetch_runs_apples_python_for_local_network_privacy(self) -> None:
+    def test_no_agent_runs_apples_python(self) -> None:
+        self.invoke("--apply")
+        for plist in (self.home / "Library/LaunchAgents").glob("*.plist"):
+            with self.subTest(plist=plist.name):
+                self.assertNotIn(b"/usr/bin/python3", plist.read_bytes())
+        source = (ROOT / "scripts/glaeda-mini-setup").read_text()
+        self.assertNotIn("apple_python", source)
+
+    def test_seed_prefetch_runs_the_pinned_python_under_the_lan_parent(self) -> None:
         agents = self.home / "Library/LaunchAgents"
-        for apple, wanted in (("/usr/bin/python3", "/usr/bin/python3"), (None, "/opt/x/python3")):
-            with self.subTest(apple=apple), mock.patch.object(ms, "apple_python", return_value=apple):
-                self.invoke("--apply", "--python", "/opt/x/python3")
-                seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
-                disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
-                self.assertEqual(seed["ProgramArguments"],
-                                 [*ms.LAN_PARENT, wanted, os.fspath(self.home / ".local/bin/glaeda-seed-prefetch"), "--apply"])
-                self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
-                self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
-        self.assertIsNone(ms.apple_python("linux"))
+        self.invoke("--apply", "--python", "/opt/x/python3.13")
+        seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
+        disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
+        self.assertEqual(seed["ProgramArguments"],
+                         [*ms.LAN_PARENT, "/opt/x/python3.13", os.fspath(self.home / ".local/bin/glaeda-seed-prefetch"),
+                          "--apply"])
+        self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
+        self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3.13")
 
     def test_the_lan_parent_stays_the_jobs_process_and_passes_argv_and_status(self) -> None:
         # Local Network Privacy judges the job's own process, so the shell must outlive the python3 it starts
@@ -193,12 +197,11 @@ class MiniSetupTest(unittest.TestCase):
             shell.stdout.close()
         self.assertEqual(done.read_text(), "TERM")
 
-    def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
-        with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
-            self.invoke("--apply")
+    def test_the_lan_fetch_broker_runs_the_pinned_python_and_asks_for_a_root_owned_copy(self) -> None:
+        self.invoke("--apply")
         agent = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.lan-fetch.plist").read_bytes())
         self.assertEqual(agent["ProgramArguments"],
-                         [*ms.LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"),
+                         [*ms.LAN_PARENT, PY, "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"),
                           "serve-local"])
         self.assertTrue(agent["KeepAlive"])
         self.assertEqual((self.home / ".local/bin/glaeda-lan-fetch").read_bytes(),
@@ -220,40 +223,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue(any("helper-install" in s["command"] for s in steps))
 
     def ctx_for_steps(self):
-        return ms.Context(self.home, False, "/usr/bin/python3", True, None, None, None, ms.CMUX_XCODE_APP, 50)
-
-    def test_apple_python_falls_back_when_it_does_not_run(self) -> None:
-        def fake_glob(self, pattern):
-            return iter([Path("/Applications/Xcode_26.6.app")]) if pattern == "Xcode*.app" else iter([])
-        runs = []
-
-        def fake_run(argv, **kwargs):
-            runs.append(argv)
-            code = fake_run.codes.pop(0) if fake_run.codes else fake_run.code
-            return subprocess.CompletedProcess(argv, code, b"", b"")
-
-        with mock.patch.object(ms.Path, "glob", fake_glob), mock.patch.object(ms.subprocess, "run", fake_run), \
-             mock.patch.object(ms.time, "sleep") as sleep:
-            fake_run.code, fake_run.codes = 0, []
-            ms.apple_python.cache_clear()
-            self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
-            fake_run.code = 69  # xcrun: Xcode licence not accepted, on every attempt
-            runs.clear()
-            ms.apple_python.cache_clear()
-            self.assertIsNone(ms.apple_python("macos"))
-            self.assertEqual(len(runs), ms.APPLE_PYTHON_PROBES)
-            # One failed probe (a job switching Xcode, a cold xcrun cache) is asked again, not believed.
-            fake_run.code, fake_run.codes = 0, [1]
-            ms.apple_python.cache_clear()
-            self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
-            self.assertTrue(sleep.called)
-        # A slow probe beside a compile is Apple's python3 under load, not a broken one (mini-3, 2026-09-28).
-        with mock.patch.object(ms.Path, "glob", fake_glob), \
-             mock.patch.object(ms.subprocess, "run", side_effect=subprocess.TimeoutExpired("python3", 30)):
-            ms.apple_python.cache_clear()
-            self.assertEqual(ms.apple_python("macos"), "/usr/bin/python3")
-        ms.apple_python.cache_clear()
-        self.assertEqual(runs[0][:3], ["/usr/bin/python3", "-I", "-c"])
+        return ms.Context(self.home, False, PY, True, None, None, None, ms.CMUX_XCODE_APP, 50)
 
     def test_default_xcode_pin_matches_the_cmux_pull_request_lane(self) -> None:
         self.assertEqual(ms.CMUX_XCODE_APP, "/Applications/Xcode_26.6.app")
@@ -301,7 +271,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual((bin_dir / "glaeda-disk-registry").read_bytes(), (ROOT / "scripts/glaeda-disk-registry").read_bytes())
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
         repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
-        self.assertEqual(repair["ProgramArguments"], ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])
+        self.assertEqual(repair["ProgramArguments"], [PY, os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])
         self.assertEqual(repair["StartInterval"], 60)
         self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
         self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
@@ -450,7 +420,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertNotIn("fetchJobs", text)
 
     def alert_ctx(self, hygiene_only: bool = False, headless: bool = False) -> object:
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=hygiene_only)
         ctx.sandbox = False  # a real HOME, as on a mini; every command goes to fake_prefs instead
         ctx.headless = headless
@@ -659,7 +629,7 @@ class MiniSetupTest(unittest.TestCase):
                 mock.patch.object(ms, "build_reclaim", lambda ctx: builds.append(1) or (1, "")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3", "--apply"]), 0)
+                self.assertEqual(ms.main(["--output", "json", "--python", PY, "--apply"]), 0)
         self.assertEqual(builds, [])
         act = next(a for a in json.loads(out.getvalue())["actions"] if a.get("path") == os.fspath(installed))
         self.assertEqual(act["state"], "unchanged")
@@ -719,7 +689,8 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(receipt["reserved"], {})
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertNotIn("git", kinds)
-        self.assertNotIn("python", kinds)
+        # the agents run the pinned Python on a personal Mac too; only a build host gets the root copy
+        self.assertEqual([a["key"] for a in receipt["actions"] if a["kind"] == "python"], ["python3.13"])
         self.assertNotIn("defaults", kinds)  # a personal Mac never loses its alert sounds
         self.assertFalse((self.home / ".cache/glaeda/cmux-native-cache").exists())
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
@@ -732,7 +703,7 @@ class MiniSetupTest(unittest.TestCase):
         # the build-host profile still blocks on the same machine
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ms.main(["--output", "json", "--python", "/usr/bin/python3",
+            ms.main(["--output", "json", "--python", PY,
                      "--reclaim-binary", os.fspath(self.reclaim)])
         self.assertIn("diskFree", json.loads(out.getvalue())["blocking"])
 
@@ -774,7 +745,7 @@ class MiniSetupTest(unittest.TestCase):
         self.patches[0].start()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ms.main(["--output", "json", "--python", "/usr/bin/python3",
+            ms.main(["--output", "json", "--python", PY,
                      "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
         self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
 
@@ -873,89 +844,97 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(receipt["role"], "devbox")
         self.assertTrue((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
 
-    def python_action(self, receipt: dict) -> dict:
-        return next(a for a in receipt["actions"] if a["kind"] == "python")
+    def python_action(self, receipt: dict, key: str = "python3.13") -> dict:
+        return next(a for a in receipt["actions"] if a["kind"] == "python" and a["key"] == key)
 
-    def test_enroll_python_present_is_unchanged(self) -> None:
+    def test_an_explicit_python_is_kept(self) -> None:
         act = self.python_action(self.invoke())
-        self.assertEqual((act["state"], act["value"]), ("unchanged", "/opt/homebrew/bin/python3.13"))
+        self.assertEqual((act["state"], act["value"]), ("unchanged", PY))
 
-    def test_missing_enroll_python_blocks_with_the_fix_when_brew_is_not_ours(self) -> None:
-        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
-                mock.patch.object(ms, "owned_brew", lambda: None):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
-                                          "--reclaim-binary", os.fspath(self.reclaim), "--apply"]), 0)
+    def test_the_pinned_python_present_is_unchanged(self) -> None:
+        pinned = os.fspath(self.home / ".local/bin/python3.13")
+        out = io.StringIO()
+        with mock.patch.object(ms, "pick_python", lambda home=None, platform_name="macos": pinned), \
+                contextlib.redirect_stdout(out):
+            ms.main(["--output", "json", "--reclaim-binary", os.fspath(self.reclaim)])
+        act = self.python_action(json.loads(out.getvalue()))
+        self.assertEqual((act["state"], act["value"]), ("unchanged", pinned))
+
+    def plan_ctx(self, **kwargs):
+        ctx = ms.Context(self.home, True, None, True, self.reclaim, None, None, ms.CMUX_XCODE_APP, 50, **kwargs)
+        ctx.sandbox = False  # as on a real host; every command below is stubbed
+        return ctx
+
+    def test_apply_installs_the_pinned_python_with_glaeda_python_first(self) -> None:
+        ctx = self.plan_ctx()
+        ctx.python = None
+        pinned = os.fspath(self.home / ".local/bin/python3.13")
+        calls = []
+
+        def fake_run(argv, timeout=0, env=None):
+            calls.append(list(argv))
+            if argv[0] == ms.SUDO and argv[2] == "true":
+                return 1, "a password is required"
+            return 0, pinned
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "root_python_ok", lambda: False), \
+                mock.patch.object(ms, "pick_python", lambda home=None, platform_name="macos": pinned):
+            actions = ms.plan_pythons(ctx)
+            self.assertEqual([(a["key"], a["state"]) for a in actions],
+                             [("python3.13", "create"), ("root-python", "create")])
+            ms.apply_pythons(ctx, actions)
+        self.assertEqual(calls[0], ["/bin/sh", os.fspath(ms.GLAEDA_PYTHON_TOOL), "--install"])
+        self.assertEqual(ctx.python, pinned)
+        self.assertEqual((actions[0]["applied"], actions[0]["value"]), (True, pinned))
+        # sudo -n refused: the root copy is an operator step, never a failed run (glaeda-update would roll back)
+        self.assertEqual(actions[1]["state"], "skipped")
+        steps = ms.operator_steps(ctx, fake_preflight()(None), None, actions)
+        self.assertTrue(any(s["command"].endswith("glaeda-python --install-root") for s in steps), steps)
+
+    def test_the_root_copy_is_made_with_sudo_n_where_it_works(self) -> None:
+        ctx = self.plan_ctx()
+        ctx.python = os.fspath(self.home / ".local/bin/python3.13")
+        calls = []
+        ok = iter([False, True])
+
+        def fake_run(argv, timeout=0, env=None):
+            calls.append(list(argv))
+            return 0, ""
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "root_python_ok", lambda: next(ok)):
+            actions = [a for a in ms.plan_pythons(ctx) if a["key"] == "root-python"]
+            ms.apply_pythons(ctx, actions)
+        self.assertIn([ms.SUDO, "-n", "/bin/sh", os.fspath(ms.GLAEDA_PYTHON_TOOL), "--install-root"], calls)
+        self.assertEqual((actions[0]["applied"], actions[0]["value"]), (True, ms.ROOT_PYTHON))
+        self.assertEqual(ms.ROOT_PYTHON, "/opt/glaeda-python/bin/python3.13")
+
+    def test_hygiene_only_and_linux_hosts_get_no_root_copy(self) -> None:
+        with mock.patch.object(ms, "root_python_ok", lambda: False):
+            self.assertEqual([a["key"] for a in ms.plan_pythons(self.plan_ctx(hygiene_only=True))], ["python3.13"])
+            self.assertEqual(ms.plan_pythons(self.plan_ctx(platform_name="linux")), [])
+
+    def test_a_failed_python_install_fails_the_run_and_writes_no_agent(self) -> None:
+        ctx = self.plan_ctx()
+        ctx.python = None
+        with mock.patch.object(ms, "run", lambda argv, timeout=0, env=None: (1, "uv: network unreachable")), \
+                mock.patch.object(ms, "pick_python", lambda home=None, platform_name="macos": None), \
+                mock.patch.object(ms, "root_python_ok", lambda: False):
+            actions = ms.plan_pythons(ctx)
+            ms.apply_pythons(ctx, actions)
+        self.assertEqual(actions[0]["state"], "failed")
+        self.assertIn("network unreachable", actions[0]["note"])
+        self.assertEqual(actions[1]["state"], "blocked")
+        self.assertIsNone(ctx.python)
+
+    def test_sandbox_home_never_installs_a_python(self) -> None:
+        out = io.StringIO()
+        with mock.patch.object(ms, "pick_python", lambda home=None, platform_name="macos": None), \
+                contextlib.redirect_stdout(out):
+            ms.main(["--output", "json", "--reclaim-binary", os.fspath(self.reclaim), "--apply"])
         receipt = json.loads(out.getvalue())
         act = self.python_action(receipt)
         self.assertEqual(act["state"], "blocked")
-        self.assertIn("~/.local/bin/python3", act["note"])
-        self.assertFalse(receipt["ready"])
-        self.assertIn("action:enroll-python", receipt["blocking"])
-        self.assertTrue(any("~/.local/bin/python3" in s["command"] for s in receipt["operatorSteps"]))
-        ms.brew_install.assert_not_called()
-
-    def test_missing_enroll_python_is_installed_with_our_brew(self) -> None:
-        found = iter([None, "/opt/homebrew/bin/python3.13"])
-        ms.brew_install.side_effect = None
-        ms.brew_install.return_value = (0, "installed")
-        with mock.patch.object(ms, "enroll_python", lambda ctx: next(found)), \
-                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
-                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
-            receipt = self.invoke("--apply")
-        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13", no_auto_update=True)
-        act = self.python_action(receipt)
-        self.assertEqual((act["state"], act["applied"], act["value"]), ("create", True, "/opt/homebrew/bin/python3.13"))
-        self.assertTrue(receipt["ready"], receipt["blocking"])
-
-    def test_a_python_too_slow_to_answer_is_never_reinstalled(self) -> None:
-        """A loaded host (load 130) missed the 10 s version probe; setup then ran brew install python@3.13, whose
-        auto-update held the update agent for half an hour while Python 3.13 was there all along."""
-        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
-                mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"), \
-                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
-                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
-            receipt = self.invoke("--apply")
-        act = self.python_action(receipt)
-        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/python3.13"))
-        ms.brew_install.assert_not_called()
-        self.assertNotIn("action:enroll-python", receipt["blocking"])
-
-    def test_plan_only_names_the_brew_install(self) -> None:
-        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
-                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
-                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
-            receipt = self.invoke()
-        self.assertEqual(self.python_action(receipt)["state"], "create")
-        ms.brew_install.assert_not_called()
-
-    def test_failed_brew_install_fails_the_run(self) -> None:
-        ms.brew_install.side_effect = None
-        ms.brew_install.return_value = (1, "Error: permission denied")
-        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
-                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
-                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                code = ms.main(["--output", "json", "--python", "/usr/bin/python3",
-                                "--reclaim-binary", os.fspath(self.reclaim), "--apply"])
-        self.assertEqual(code, 1)
-        act = self.python_action(json.loads(out.getvalue()))
-        self.assertEqual(act["state"], "failed")
-        self.assertIn("permission denied", act["note"])
-
-    def test_sandbox_home_never_runs_brew(self) -> None:
-        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
-                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                ms.main(["--output", "json", "--python", "/usr/bin/python3",
-                         "--reclaim-binary", os.fspath(self.reclaim), "--apply"])
-        act = self.python_action(json.loads(out.getvalue()))
-        self.assertEqual(act["state"], "blocked")
         self.assertIn("sandbox HOME", act["note"])
-        ms.brew_install.assert_not_called()
+        self.assertFalse(any(a["kind"] == "python" and a["key"] == "root-python" for a in receipt["actions"]))
+        self.assertFalse(any("glaeda-python" in " ".join(c) for c in self.calls))
 
     def test_owned_brew_needs_ownership_not_write_access(self) -> None:
         stat = mock.Mock(st_uid=os.getuid() + 1)
@@ -966,11 +945,10 @@ class MiniSetupTest(unittest.TestCase):
             stat.st_uid = os.getuid()
             self.assertEqual(ms.owned_brew(), "/opt/homebrew/bin/brew")
 
-    def test_setup_and_enroll_share_one_python_rule(self) -> None:
+    def test_enroll_picks_the_pinned_python_first(self) -> None:
         enroll = ms.enroll_module()
-        with mock.patch.object(enroll, "pick_python", return_value="/x/python3.13") as pick:
-            self.assertEqual(REAL_ENROLL_PYTHON(mock.Mock(home=self.home)), "/x/python3.13")
-        pick.assert_called_once_with(None, self.home)
+        self.assertEqual(enroll.python_candidates(None, self.home)[0], os.fspath(self.home / ".local/bin/python3.13"))
+        self.assertIn("glaeda-python --install", enroll.PYTHON_FIX)
 
     def linux(self) -> None:
         """Run the rest of the test as a Linux host with a stub preflight."""
@@ -998,7 +976,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertFalse((self.home / "Library").exists())
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertNotIn("git", kinds)
-        self.assertNotIn("python", kinds)
+        self.assertNotIn("python", kinds)  # Linux units keep systemd's python3; no uv install there
         self.assertEqual(receipt["operatorSteps"], [])
         again = self.invoke("--apply")
         self.assertEqual(self.states(again), {"unchanged"})
@@ -1065,7 +1043,7 @@ class MiniSetupTest(unittest.TestCase):
         self.linux()
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
+            self.assertEqual(ms.main(["--output", "json", "--python", PY,
                                       "--reclaim-binary", os.fspath(self.reclaim), "--role", "fleet-mini",
                                       "--apply"]), 0)
         units = self.home / ".config/systemd/user"
@@ -1098,7 +1076,7 @@ class MiniSetupTest(unittest.TestCase):
         self.linux()
         out = io.StringIO()
         with mock.patch.object(ms, "find_cargo", lambda ctx: None), contextlib.redirect_stdout(out):
-            ms.main(["--output", "json", "--python", "/usr/bin/python3", "--apply"])
+            ms.main(["--output", "json", "--python", PY, "--apply"])
         receipt = json.loads(out.getvalue())
         states = {a.get("label"): a["state"] for a in receipt["actions"] if a["kind"] == "agent"}
         self.assertEqual(states["glaeda-worktree-reclaim.timer"], "blocked")
@@ -1106,7 +1084,7 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_linux_activation_reloads_then_enables_or_restarts_timers(self) -> None:
         self.linux()
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, False, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 1, True, "linux")
         ctx.skip_launchctl = False  # the real path, with systemctl stubbed below
         commands: list[list[str]] = []
@@ -1146,7 +1124,7 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_linux_activation_failure_fails_the_run(self) -> None:
         self.linux()
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, False, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 1, True, "linux")
         ctx.skip_launchctl = False
 
@@ -1166,7 +1144,7 @@ class MiniSetupTest(unittest.TestCase):
     def test_linux_uninstall_disables_timers_whatever_their_state(self) -> None:
         self.linux()
         self.invoke("--apply")
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, False, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 1, True, "linux")
         ctx.skip_launchctl = False
         commands: list[list[str]] = []
@@ -1222,7 +1200,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertFalse((self.home / ".local/bin/glaeda-update").exists())
 
     def test_update_agent_is_not_unloaded_under_glaeda_update(self) -> None:
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", False, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, False, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
         ctx.sandbox = False
         ctx.skip_launchctl = False
@@ -1242,7 +1220,7 @@ class MiniSetupTest(unittest.TestCase):
     def test_headless_agents_use_system_domain_and_persist_for_ota(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"
         with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
-            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+            ctx = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                              ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
             # This test has a sandbox HOME, so Context deliberately disables the real
             # headless side effect. Model the post-preflight context without touching
@@ -1275,7 +1253,7 @@ class MiniSetupTest(unittest.TestCase):
         """A macOS host with a GitHub Actions runner gets glaeda-git-mirror's source config (direct) when it has none;
         an existing one (an operator's lan config) is never rewritten, and a host without a runner, a --gh-only
         host and Linux get none."""
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="macos")
         self.assertIsNone(ms.git_mirror_source_action(ctx))
         runner = self.home / "actions-runner-glaeda-2"
@@ -1293,17 +1271,17 @@ class MiniSetupTest(unittest.TestCase):
         ms.apply_install(ctx, [ms.git_mirror_source_action(ctx)])
         self.assertEqual(json.loads(path.read_text()), lan)
         path.unlink()
-        gh_only = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+        gh_only = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                              ms.CMUX_XCODE_APP, 50, gh_only=True, platform_name="macos")
         self.assertIsNone(ms.git_mirror_source_action(gh_only))
-        linux = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+        linux = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                            ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
         self.assertIsNone(ms.git_mirror_source_action(linux))
 
     def test_headless_install_stages_and_installs_a_plist(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"
         with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
-            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+            ctx = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                              ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
             ctx.sandbox = False
             ctx.headless = True
@@ -1328,7 +1306,7 @@ class MiniSetupTest(unittest.TestCase):
                 ("macos", "Library/LaunchAgents/ai.leo-workspace.hygiene-reconciler.plist",
                  {"com.teamleaderleo.glaeda.worktree-reclaim"})):
             with self.subTest(platform=platform):
-                ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                ctx = ms.Context(self.home, False, PY, True, self.reclaim, None, None,
                                  ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name=platform)
                 with mock.patch.object(ms, "has_glaeda_runner", lambda *_: True):
                     self.assertTrue(reclaim <= set(ms.agent_names(ctx)))
@@ -1343,7 +1321,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn("TimeoutStartSec=", unit)
 
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
-        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+        ctx = ms.Context(self.home, False, PY, True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
         with mock.patch.object(ms, "probe_gits", lambda: ("/usr/bin/git", (2, 55, 0), [])):
             self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
@@ -1355,7 +1333,7 @@ class MiniSetupTest(unittest.TestCase):
             self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
         with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: None):
             self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
-            linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+            linux = ms.Context(self.home, False, PY, True, self.reclaim, None, None,
                                ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
             self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
 
@@ -1364,7 +1342,7 @@ class MiniSetupTest(unittest.TestCase):
         answered, and setup ran brew install git, which timed out at 600 s inside the update agent and the
         release update rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer;
         a git that fails or prints no version is not a slow answer and never holds an upgrade back."""
-        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+        ctx = ms.Context(self.home, False, PY, True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
         ctx.sandbox = False
         answers = {"/opt/homebrew/bin/git": "slow", "/usr/local/bin/git": "broken", "/usr/bin/git": "git version 2.50.1"}
@@ -1391,7 +1369,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual((act["state"], act["value"]), ("create", "/usr/bin/git 2.50.1"))
 
     def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
-        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+        ctx = ms.Context(self.home, True, PY, True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
         versions = iter([(2, 50, 1), (2, 55, 0)])  # install leaves the old keg; upgrade fixes it
         act = {"kind": "gitpkg", "state": "create", "brew": "/opt/homebrew/bin/brew", "note": ""}

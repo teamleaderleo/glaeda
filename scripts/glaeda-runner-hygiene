@@ -63,6 +63,10 @@ CENSUS_DIR_NAME = "root-census"
 CENSUS_INTERVAL = 30 * 60
 CENSUS_COMMENT = "glaeda-runner-hygiene managed root census v1"
 OK_INSTALL = {"missing", "managed", "repairable"}  # _managed_install notes --apply may proceed from
+# The interpreter the jobs run: glaeda-python's ROOT_PYTHON, the root-owned copy of the pinned uv Python (a link into
+# its prefix, every directory to both root-owned). Never Apple's stock python3 and never the login user's ~/.local
+# copy, which a non-root account can write.
+ROOT_PYTHON = Path("/opt/glaeda-python/bin/python3.13")
 
 
 class HygieneError(RuntimeError):
@@ -184,6 +188,9 @@ def _validate_home(name: str) -> Account:
 
 
 def _safe_executable(path: Path, label: str) -> Path:
+    """path, unchanged, when only root can change what it runs: a root-owned regular executable closed to group and
+    others. A link (ROOT_PYTHON is one, into its copied prefix) is followed hop by hop, and each hop and every
+    directory above it and above the file must be root-owned too, so no other account can repoint or replace it."""
     if not path.is_absolute():
         raise HygieneError(f"{label} must be an absolute executable: {path}")
     try:
@@ -191,8 +198,6 @@ def _safe_executable(path: Path, label: str) -> Path:
         st = resolved.stat()
     except OSError as exc:
         raise HygieneError(f"{label} is not executable: {path}: {exc}") from exc
-    if resolved != path or path.is_symlink():
-        raise HygieneError(f"{label} must not be a symlink: {path}")
     if not stat.S_ISREG(st.st_mode) or not os.access(path, os.X_OK):
         raise HygieneError(f"{label} is not a regular executable: {path}")
     if st.st_uid != 0:
@@ -200,22 +205,29 @@ def _safe_executable(path: Path, label: str) -> Path:
     # A launchd executable must not be replaceable by the enrolled user.
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise HygieneError(f"{label} is writable by another account: {path}")
-    for parent in path.parents:
-        if not parent.exists():
-            continue
-        pst = parent.stat()
-        if pst.st_uid != 0 or pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise HygieneError(f"{label} has an unsafe parent: {parent}")
+    hops = [path]
+    while hops[-1].is_symlink() and len(hops) < 40:
+        hops.append(hops[-1].parent / os.readlink(hops[-1]))
+    for hop in hops[:-1]:
+        if hop.lstat().st_uid != 0:
+            raise HygieneError(f"{label} goes through a link root does not own: {hop}")
+    for start in hops + [resolved]:
+        for parent in Path(os.path.normpath(start)).parents:
+            if not parent.exists():
+                continue
+            pst = parent.stat()
+            if pst.st_uid != 0 or pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise HygieneError(f"{label} has an unsafe parent: {parent}")
     return path
 
 
-def resolve_python(explicit: Path | None) -> Path:
+def resolve_python(explicit: Path | None, keep: Path | None = None) -> Path:
+    """The interpreter to pin: an explicit --python, else ROOT_PYTHON, else (a host glaeda-mini-setup has not given
+    ROOT_PYTHON yet) the one the installed job already names (keep), else this process's own. Each must pass
+    _safe_executable. Apple's python3 or PATH's python3 is never chosen here."""
     candidates = [explicit] if explicit else []
     if not explicit:
-        candidates.extend([Path("/usr/bin/python3"), Path(sys.executable)])
-        found = shutil.which("python3")
-        if found:
-            candidates.append(Path(found))
+        candidates.extend([ROOT_PYTHON, keep, Path(sys.executable)])
     seen: set[Path] = set()
     errors: list[str] = []
     for candidate in candidates:
@@ -282,7 +294,6 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
                   launchctl: Path | None = None, uninstall: bool = False) -> Install:
     account = _validate_home(account_name)
     source_path = _source(source or DEFAULT_SOURCE) if not uninstall else None
-    python_path = resolve_python(python) if not uninstall else None
     root = _absolute_real(root, "install root") if root.exists() else root
     if root.exists() and root.is_symlink():
         raise HygieneError(f"install root must not be a symlink: {root}")
@@ -293,34 +304,47 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
     daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
     plist = daemons / f"{LABEL_PREFIX}.{account.uid}.plist"
     snapshot = uid_dir / DISK_NAME
+    python_path = resolve_python(python, _saved_python(uid_dir / MANIFEST_NAME)) if not uninstall else None
     # Uninstall does not depend on a checkout or a working Python. Recover the
     # pinned interpreter from the existing plist solely to verify its exact
     # managed bytes; a missing plist is a no-op plan.
     if uninstall:
         source_path = snapshot if snapshot.is_file() else Path("/dev/null")
-        python_path = Path("/usr/bin/python3")
-        manifest_path = uid_dir / MANIFEST_NAME
-        if manifest_path.is_file():
-            with contextlib.suppress(OSError, ValueError):
-                saved = json.loads(manifest_path.read_text())
-                if isinstance(saved, dict) and isinstance(saved.get("python"), str):
-                    python_path = Path(saved["python"])
+        python_path = _saved_python(uid_dir / MANIFEST_NAME) or ROOT_PYTHON
     assert source_path is not None and python_path is not None
     return Install(account, python_path, source_path, root, uid_dir, snapshot,
                    uid_dir / MANIFEST_NAME, plist, f"{LABEL_PREFIX}.{account.uid}",
                    _launchctl(launchctl))
 
 
+def _saved_python(manifest_path: Path) -> Path | None:
+    """The interpreter an installed account job's manifest pins, when it names an absolute one."""
+    with contextlib.suppress(OSError, ValueError):
+        saved = json.loads(manifest_path.read_text())
+        if isinstance(saved, dict) and isinstance(saved.get("python"), str) and os.path.isabs(saved["python"]):
+            return Path(saved["python"])
+    return None
+
+
+def _plist_python(plist: Path) -> Path | None:
+    """ProgramArguments[0] of an installed plist, when it names an absolute path."""
+    with contextlib.suppress(Exception):
+        args = plistlib.loads(plist.read_bytes()).get("ProgramArguments")
+        if isinstance(args, list) and args and isinstance(args[0], str) and os.path.isabs(args[0]):
+            return Path(args[0])
+    return None
+
+
 def build_census(source: Path | None = None, python: Path | None = None, root: Path = INSTALL_ROOT,
                  daemons: Path = LAUNCH_DAEMONS, launchctl: Path | None = None) -> Census:
     """The host's root census with no account: the same source, python, path and launchctl checks as an account's."""
     source_path = _source(source or DEFAULT_SOURCE)
-    python_path = resolve_python(python)
     root = _absolute_real(root, "install root") if root.exists() else root
     if root.exists() and root.is_symlink():
         raise HygieneError(f"install root must not be a symlink: {root}")
     _existing_parent_chain(root)
     daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
+    python_path = resolve_python(python, _plist_python(daemons / f"{CENSUS_LABEL}.plist"))
     return Census(python_path, source_path, root, daemons, _launchctl(launchctl))
 
 

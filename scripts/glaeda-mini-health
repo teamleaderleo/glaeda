@@ -132,7 +132,7 @@ Each run checks, as the runner user and without sudo:
                                      DEVELOPER_DIR on the job-started hook's --toolchain-xcode), resolves an SDK
                                      outside that Xcode, a swiftc of another Swift version than its toolchain's, an
                                      SDK of a newer major than its own, a cmux tool `xcrun --find` cannot find, or a
-                                     python3 (PATH's, the /usr/bin/python3 shim) that does not start (the runner
+                                     python3 (PATH's, Apple's python3 shim) that does not start (the runner
                                      hook's xcode_refusal): cmux21,
                                      2026-10-21, Command Line Tools 27 on macOS 27 past Xcode_26.6. job-started refuses
                                      every job and the gate holds the listener off. Root's: reported only.
@@ -160,7 +160,14 @@ Each run checks, as the runner user and without sudo:
                                      report says it is not running its passes or has not kept itself on the stable
                                      release (glaeda-daemon-heal judge). Healed where `sudo -n` works (headless AWS
                                      hosts) by reinstalling it; elsewhere the root command is the note. Also run on a
-                                     host without glaeda runners.
+                                     host without glaeda runners. Where ROOT_PYTHON is missing the reinstall first
+                                     runs `sudo -n glaeda-python --install-root`; it never names Apple's python3.
+  root_python_missing                a fleet runner mini has no trusted ROOT_PYTHON (/opt/glaeda-python/bin/python3.13:
+                                     root-owned, with every directory above it and its link's target closed to other
+                                     accounts; glaeda-daemon-heal's trusted_root_python), so its root LaunchDaemons
+                                     keep the interpreter they ran before. Healed where `sudo -n` works by
+                                     `sudo -n ~/.local/bin/glaeda-python --install-root` (which glaeda-mini-setup
+                                     --apply also runs hourly); elsewhere the note is `sudo glaeda-python --install-root`.
   daemon_hot:<name>                  a macOS daemon from config/macos-daemons.json has held hot_cores (fseventsd,
                                      audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
                                      daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
@@ -314,7 +321,12 @@ TESTMANAGERD = "/usr/libexec/testmanagerd"
 SCHEMA = "glaeda-mini-health/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DAEMON_HEAL = SCRIPT_DIR / "glaeda-daemon-heal"  # beside this file in the repo, a release and ~/.local/bin
-SYSTEM_PYTHON = "/usr/bin/python3"  # what the root LaunchDaemon runs; never a user-writable interpreter
+# What the root LaunchDaemon runs: glaeda-python's ROOT_PYTHON, a root-owned copy of the pinned uv Python; never a
+# user-writable interpreter (the login user's ~/.local/bin/python3.13) and never Apple's stock python3.
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+GLAEDA_PYTHON = ".local/bin/glaeda-python"  # under the login user's home: glaeda-mini-setup installs it
+ROOT_PYTHON_FIX = "sudo glaeda-python --install-root"
+INSTALL_ROOT_TIMEOUT = 300  # it copies the uv Python prefix (~100 MiB)
 
 HEAL_EVERY_S = 600
 HEAL_TRIES = 3
@@ -1137,18 +1149,58 @@ class Mini:
     def sudo_ok(self) -> bool:
         return sh(["/usr/bin/sudo", "-n", "/usr/bin/true"])[0] == 0
 
+    _daemon_heal_module: Any = None
+
+    def root_python_missing(self) -> str | None:
+        """Why ROOT_PYTHON is not a trusted root interpreter here, by glaeda-daemon-heal's own check (the one that
+        decides what its LaunchDaemon runs); "" when it is; None where it is not judged (off macOS, a personal Mac,
+        no glaeda-daemon-heal beside this script)."""
+        if sys.platform != "darwin" or not DAEMON_HEAL.is_file() or not self.fleet_host():
+            return None
+        if self._daemon_heal_module is None:
+            sys.dont_write_bytecode = True
+            try:
+                loader = importlib.machinery.SourceFileLoader("glaeda_daemon_heal_for_health", os.fspath(DAEMON_HEAL))
+                module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                sys.modules[loader.name] = module
+                loader.exec_module(module)
+                self._daemon_heal_module = module
+            except Exception:  # noqa: BLE001 (an unreadable copy judges nothing)
+                self._daemon_heal_module = False
+        if not self._daemon_heal_module:
+            return None
+        return self._daemon_heal_module.trusted_root_python(ROOT_PYTHON)
+
+    def install_root_python(self) -> tuple[bool, str]:
+        """sudo -n ~/.local/bin/glaeda-python --install-root: copy the login user's uv 3.13 to ROOT_PYTHON."""
+        tool = self.home / GLAEDA_PYTHON
+        if not os.access(tool, os.X_OK):
+            return False, f"no ~/{GLAEDA_PYTHON}: glaeda-mini-setup --apply installs it"
+        code, out = sh(["/usr/bin/sudo", "-n", os.fspath(tool), "--install-root"], timeout=INSTALL_ROOT_TIMEOUT)
+        why = self.root_python_missing()
+        if code == 0 and not why:
+            return True, f"sudo -n glaeda-python --install-root: {ROOT_PYTHON}"
+        return False, f"sudo -n glaeda-python --install-root: exit {code}" + (f"; {why}" if why else "")
+
     def install_daemon_heal(self) -> tuple[bool, str]:
+        """sudo -n ROOT_PYTHON glaeda-daemon-heal --install --apply, making ROOT_PYTHON first when it is missing."""
         policy = self.daemon_policy()
         if policy is None:
             return False, "no config/macos-daemons.json"
-        code, out = sh(["/usr/bin/sudo", "-n", SYSTEM_PYTHON, "-I", os.fspath(DAEMON_HEAL), "--install",
+        steps = []
+        if self.root_python_missing():
+            ok, what = self.install_root_python()
+            if not ok:
+                return False, what
+            steps.append(what)
+        code, out = sh(["/usr/bin/sudo", "-n", ROOT_PYTHON, "-I", os.fspath(DAEMON_HEAL), "--install",
                         "--policy", os.fspath(policy), "--apply"], timeout=60)
         try:
             state = json.loads(out).get("state")
         except (ValueError, AttributeError):
             state = None
         ok = code == 0 and state in {"applied", "unchanged"}
-        return ok, f"sudo -n glaeda-daemon-heal --install --apply: {state or f'exit {code}'}"
+        return ok, "; ".join(steps + [f"sudo -n glaeda-daemon-heal --install --apply: {state or f'exit {code}'}"])
 
     def disk_summary(self) -> dict[str, Any]:
         path = self.home / ".local/state/glaeda/disk/summary.json"
@@ -2173,9 +2225,27 @@ def check_ota(mini: Mini, now: float) -> list[dict[str, Any]]:
 def daemon_heal_command(mini: Mini) -> str:
     """The operator's root step. The hashes come from the release, not this host: the runner user can edit these files."""
     policy = mini.daemon_policy()
-    return (f"sudo {SYSTEM_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
+    first = f"{ROOT_PYTHON_FIX} && " if mini.root_python_missing() else ""
+    return (f"{first}sudo {ROOT_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
             "--expect-sha256 $(git show <release commit this host runs>:scripts/glaeda-daemon-heal | shasum -a 256) "
             "--expect-policy-sha256 $(git show <that commit>:config/macos-daemons.json | shasum -a 256)")
+
+
+def check_root_python(mini: Mini) -> list[dict[str, Any]]:
+    """root_python_missing: a fleet runner mini without a trusted ROOT_PYTHON (its root daemons keep their old one)."""
+    why = mini.root_python_missing()
+    if not why:
+        return []
+    sudo = mini.sudo_ok()
+    return [finding("root_python_missing", "warn",
+                    f"{ROOT_PYTHON} is not a trusted root python: {why[:200]}; root LaunchDaemons keep the "
+                    "interpreter they ran before until it is", "pending" if sudo else "impossible",
+                    f"healed with sudo -n ~/{GLAEDA_PYTHON} --install-root" if sudo else
+                    f"no passwordless sudo here; root: {ROOT_PYTHON_FIX} (glaeda-python is ~/{GLAEDA_PYTHON})")]
+
+
+def heal_root_python(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    return mini.install_root_python()
 
 
 def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
@@ -2878,6 +2948,7 @@ REPORT_AFTER = {"tailscale_no_route": 2}
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
     "daemon_heal_stale": (heal_daemon_heal, 1),
+    "root_python_missing": (heal_root_python, 1),
     "testmanagerd_wedged": (heal_testmanagerd, 1),
     "tailscale_down": (heal_tailscale, 2),
     "runner_stopped": (heal_runner, 2),
@@ -2977,7 +3048,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
                  + check_disk_accounting(mini) + check_disk_pass(mini, now) + check_git_mirror(mini, now)
-                 + check_daemon_heal(mini) + check_ota(mini, now)
+                 + check_root_python(mini) + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:
             clear_restart_failures(restart_state_path(state_path), now)

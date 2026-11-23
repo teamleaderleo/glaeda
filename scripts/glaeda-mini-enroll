@@ -135,23 +135,23 @@ def python_version(path: str) -> tuple[int, int] | None:
 
 # A user-local CPython (uv, python.org build, a copy from another Mac) lands here when the
 # login user does not own Homebrew, which is the case on most shared build minis.
-USER_PYTHONS = ("python3.14", "python3.13", "python3")
+USER_PYTHONS = ("python3.13", "python3.14", "python3")  # python3.13 first: glaeda-python's pinned one
 # What follows an eligible enrollment. cmux scripts/persistent-compile up is retired; a runner and the routing
 # that sends jobs to its label are glaeda#1174.
 NEXT_STEP = ("Next: register its runner (~/glaeda/scripts/glaeda-cmux-runner --apply, docs/CMUX_MINI_RUNNER.md); "
              "jobs reach it only once routing points at its label (glaeda#1174).")
-PYTHON_FIX = ("brew install python@3.13 (as the account that owns Homebrew), "
-              "or put a CPython 3.13+ at ~/.local/bin/python3")
+PYTHON_FIX = "scripts/glaeda-python --install (uv's CPython 3.13 at ~/.local/bin/python3.13; glaeda-mini-setup --apply runs it)"
 
 
 def python_candidates(explicit: str | None, home: Path | None = None) -> list[str]:
     """Where pick_python looks, in order."""
     local = (home or Path.home()) / ".local/bin"
-    # /usr/bin/python3 is Apple's 3.9 at best, and before the Command Line Tools exist running it
-    # opens an install dialog, so a PATH lookup that lands there is never probed.
+    # Apple's python3 in /usr/bin is 3.9 at best, and before the Command Line Tools exist running it
+    # opens an install dialog, so a PATH lookup that lands there is never probed. The pinned interpreter
+    # (glaeda-python: uv's CPython 3.13 at ~/.local/bin/python3.13) comes first, so enroll and setup run one Python.
     found = [w for w in (shutil.which(n) for n in ("python3.14", "python3.13", "python3"))
              if w and not w.startswith("/usr/bin/")]
-    return [explicit] if explicit else [*PYTHON_CANDIDATES, *(os.fspath(local / n) for n in USER_PYTHONS), *found]
+    return [explicit] if explicit else [*(os.fspath(local / n) for n in USER_PYTHONS), *PYTHON_CANDIDATES, *found]
 
 
 def unanswered_python(home: Path | None = None) -> str | None:

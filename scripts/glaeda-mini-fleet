@@ -286,13 +286,16 @@ IOS_BUILD_RE = re.compile(r"[0-9]{2}[A-Z][0-9]{1,5}[a-z]?\Z")
 IOS_DEVICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ().-]{0,63}\Z")
 # glaeda-mini-enroll's accept-local needs os.waitid, which CPython on macOS has from 3.13.
 ENROLL_PYTHON_MIN = "3.13"
+# glaeda-python's ROOT_PYTHON (root-owned): what the preflight's read as a runner.poolUser runs (cmux_mini_preflight.sh)
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"
 # The glaeda-mini-enroll options onboard, repair and upgrade pass; a ~/glaeda without them fails with
 # "unrecognized arguments", so preflight asks for them and fix moves ~/glaeda until it has them.
 ENROLL_FLAGS = ("--renew", "--class-receipt", "--class-receipt-sha256", "--fleet-class")
 # The Homebrew formulas fix installs, all pinned afterwards: class receipts pin toolchain strings, and the
 # reference host (cmux14) runs `brew pin zig rustup python@3.13`.
 BREW_FORMULAS = ("rustup", "zig", "python@3.13")
-# The workload PATH's python3: brew's python@3.13 installs only python3.13, so /usr/bin/python3 (3.9) would win.
+# The workload PATH's python3 (cmux's jobs', not glaeda's): brew's python@3.13 installs only python3.13, so Apple's
+# python3 (the 3.9 xcrun shim) would win.
 BREW_PYTHON = ("python@3.13", "python3.13")
 # Homebrew formulas fix installs and never pins: cmux CI jobs call gh (authenticated by GH_TOKEN, so no gh auth),
 # and no class receipt names it (cmux_fleet_bootstrap's toolchain observations and MACOS_WORKLOAD_TOOLS omit it).
@@ -1027,6 +1030,8 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "pool_secrets": [{"path": path, "state": state} for path, _, state in
                          (v.rpartition("|") for v in out["pf_pool_secret"])],
         "pool_secrets_done": out.get("pf_pool_secret_done") or None,
+        # "missing": the host has no glaeda-python ROOT_PYTHON yet, so the read as the pool user did not run
+        "pool_python": out.get("pf_pool_python") or None,
     }
 
 
@@ -2402,9 +2407,14 @@ def pool_secrets_check(put: Any, pf: dict[str, Any], pool: str, user: str, host:
            "hosts.<host>.accepted_secrets")
     login_fix = ("make them root-only or move them to a host with no PR runners (cmuxterm-hq#595), or accept the "
                  "risk in the manifest's hosts.<host>.accepted_secrets")
+    if pf.get("pool_secrets_done") != pool and pf.get("pool_python") == "missing":
+        put("secrets", "unknown", f"could not read the secret files as {pool}: root_python_missing ({ROOT_PYTHON})",
+            "run `sudo -n glaeda-python --install-root` (glaeda-mini-setup --apply runs it), then rerun preflight "
+            "(cmuxterm-hq#18007)", "password")
+        return
     if pf.get("pool_secrets_done") != pool:
         put("secrets", "unknown", f"could not read the secret files as {pool} (sudo -n -u {pool} failed?)",
-            f"give {user} passwordless sudo to {pool} (sudo -n -u {pool} /usr/bin/python3) and check the account "
+            f"give {user} passwordless sudo to {pool} (sudo -n -u {pool} {ROOT_PYTHON}) and check the account "
             "exists, then rerun preflight (cmuxterm-hq#18007)", "person")
         return
     pool_home = pf.get("pool_home") or f"/Users/{pool}"

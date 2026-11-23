@@ -281,7 +281,7 @@ artifact and a watcher workflow per run.
 <plist version="1.0"><dict>
   <key>Label</key><string>com.teamleaderleo.glaeda.route-agent</string>
   <key>ProgramArguments</key><array>
-    <string>/usr/bin/python3</string><string>/Users/USER/glaeda/scripts/glaeda-route</string>
+    <string>/Users/USER/.local/bin/python3.13</string><string>/Users/USER/glaeda/scripts/glaeda-route</string>
     <string>agent</string>
     <string>--app-id</string><string>AGENT_APP_ID</string>
     <string>--app-key-file</string><string>/Users/USER/.config/glaeda/route/agent.pem</string>

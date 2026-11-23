@@ -254,6 +254,16 @@ class FakeMini(health.Mini):
     def sudo_ok(self):
         return self.sudo
 
+    root_python_why: str | None = ""  # ROOT_PYTHON is trusted unless a test says why not
+
+    def root_python_missing(self):
+        return self.root_python_why
+
+    def install_root_python(self):
+        self.did.append("install root python")
+        self.root_python_why = ""
+        return True, "sudo -n glaeda-python --install-root: /opt/glaeda-python/bin/python3.13"
+
     def fleet_host(self):
         return self.fleet
 
@@ -2740,6 +2750,95 @@ class DaemonHeal(Base):
         for census in ({"state": "current"}, {"state": "skipped", "why": "not a CI mini"}):
             root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": census}}))
             self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"], [])
+
+
+class RootPython(Base):
+    """A runner mini without a trusted ROOT_PYTHON says so; its root daemons keep their old interpreter until then."""
+
+    def test_a_trusted_or_unjudged_root_python_is_no_finding(self) -> None:
+        for why in ("", None):
+            self.mini.root_python_why = why
+            self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_without_sudo_the_note_is_the_root_command(self) -> None:
+        self.mini.root_python_why = "/opt/glaeda-python/bin/python3.13 is missing (FileNotFoundError)"
+        f = self.run_once()["findings"][0]
+        self.assertEqual((f["id"], f["severity"], f["auto_fix"]), ("root_python_missing", "warn", "impossible"))
+        self.assertIn("is missing", f["evidence"])
+        self.assertIn("sudo glaeda-python --install-root", f["note"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_where_sudo_n_works_it_is_installed(self) -> None:
+        self.mini.sudo = True
+        self.mini.root_python_why = "/opt/glaeda-python/bin/python3.13 is missing (FileNotFoundError)"
+        r = self.run_once()
+        self.assertEqual(self.mini.did, ["install root python"])
+        self.assertEqual(self.ids(r), [])
+        self.assertEqual([h["id"] for h in r["healed"]], ["root_python_missing"])
+
+    def test_the_operator_command_makes_root_python_first_and_never_names_apples(self) -> None:
+        self.mini.heal_status = {"installed": True, "current": False, "stale": ["/x"], "report": "/none"}
+        self.mini.root_python_why = "missing"
+        note = [f for f in self.run_once()["findings"] if f["code"] == "daemon_heal_stale"][0]["note"]
+        self.assertIn("sudo glaeda-python --install-root && sudo /opt/glaeda-python/bin/python3.13 -I ", note)
+        self.assertNotIn("/usr/bin/python3", note)
+
+
+class InstallDaemonHeal(unittest.TestCase):
+    """The real Mini.install_daemon_heal: ROOT_PYTHON, made first with glaeda-python --install-root when missing."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        tool = self.home / health.GLAEDA_PYTHON
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+        self.tool = tool
+        self.ran: list[list[str]] = []
+        self.why = ["missing", ""]  # before --install-root, after it
+
+    def install(self, install_root_code: int = 0) -> tuple[bool, str]:
+        def sh(argv, timeout=15, env=None, cwd=None):
+            self.ran.append(argv)
+            if argv[-1] == "--install-root":
+                if install_root_code == 0:
+                    self.why = [""]
+                return install_root_code, ""
+            return 0, json.dumps({"state": "applied"})
+
+        mini = health.Mini(self.home)
+        with mock.patch.object(health, "sh", side_effect=sh), \
+                mock.patch.object(health.Mini, "daemon_policy", return_value=Path("/p/macos-daemons.json")), \
+                mock.patch.object(health.Mini, "root_python_missing", side_effect=lambda: self.why[0]):
+            return mini.install_daemon_heal()
+
+    def test_a_trusted_root_python_installs_with_it(self) -> None:
+        self.why = [""]
+        ok, what = self.install()
+        self.assertTrue(ok, what)
+        self.assertEqual(self.ran, [["/usr/bin/sudo", "-n", health.ROOT_PYTHON, "-I", os.fspath(health.DAEMON_HEAL),
+                                     "--install", "--policy", "/p/macos-daemons.json", "--apply"]])
+        self.assertEqual(health.ROOT_PYTHON, "/opt/glaeda-python/bin/python3.13")
+
+    def test_a_missing_one_is_made_first_with_the_login_users_glaeda_python(self) -> None:
+        ok, what = self.install()
+        self.assertTrue(ok, what)
+        self.assertEqual(self.ran[0], ["/usr/bin/sudo", "-n", os.fspath(self.tool), "--install-root"])
+        self.assertEqual(self.ran[1][:3], ["/usr/bin/sudo", "-n", health.ROOT_PYTHON])
+        self.assertIn("--install-root", what)
+
+    def test_when_it_cannot_be_made_nothing_is_installed_with_another_python(self) -> None:
+        ok, what = self.install(install_root_code=1)
+        self.assertFalse(ok)
+        self.assertEqual(self.ran, [["/usr/bin/sudo", "-n", os.fspath(self.tool), "--install-root"]])
+        self.assertIn("exit 1", what)
+        self.tool.unlink()
+        self.ran.clear()
+        ok, what = self.install()
+        self.assertEqual((ok, self.ran), (False, []))
+        self.assertIn("glaeda-mini-setup --apply", what)
 
 
 class DaemonHealLiveness(Base):

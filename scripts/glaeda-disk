@@ -1346,6 +1346,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "774a28dc9143a1f0496954a1500a53b9a41026d193a859a2b2d1a3206f5bd844",
     "f7e6ab44787e5a3cff88b4a053705a853a92b13a557242f71ef9579734bcbd09",
     "1ce4c03ed98484700e221db0067a56f18c74b2627503afe198871db040984e53",
+    "cc1d112cf28fd65ee6326316064622793c3ebf62186f0f8e89e818a1b867efd7",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5633,7 +5634,9 @@ def sudo_proc_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str
     if not sudo_reads():
         return None
     code = _PROC_LINKS_SRC + "\nimport json, sys\nl, d = proc_links()\nsys.stdout.write(json.dumps([l, len(d)]))\n"
-    python = sys.executable or "/usr/bin/python3"
+    python = sys.executable  # this interpreter, never a system python picked by name
+    if not python:
+        return None
     try:
         out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)), python, "-I", "-c", code],
                              capture_output=True, text=True, timeout=timeout + 15)
@@ -18194,11 +18197,20 @@ def runner_account_argv(args: list[str]) -> list[str]:
     return [RUNNER_ACCOUNT_FLAG, *out]
 
 
-def _runner_account_python() -> str:
-    """An interpreter the other account can run: this one unless it lives in this account's home."""
-    exe = os.path.abspath(sys.executable or "/usr/bin/python3")
-    own = os.path.abspath(HOME)
-    return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
+# glaeda-python --install-root: the root-owned copy of the one pinned Python, which every account can run
+RUNNER_ACCOUNT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+
+
+def _runner_account_python(executable: str | None = None, home: str | None = None) -> str:
+    """An interpreter the other account can run: this one unless it lives in this account's home (uv's
+    ~/.local/bin/python3.13), else the root-owned pinned copy; never Apple's python3. On Linux, the distro's."""
+    exe = os.path.abspath(executable or sys.executable or RUNNER_ACCOUNT_PYTHON)
+    own = os.path.abspath(home or HOME)
+    if not (exe == own or exe.startswith(own.rstrip("/") + "/")):
+        return exe
+    if sys.platform.startswith("linux") and not os.access(RUNNER_ACCOUNT_PYTHON, os.X_OK):
+        return "/usr/bin/python3"  # PY_PIN_EXEMPT: Linux, the distro python3
+    return RUNNER_ACCOUNT_PYTHON
 
 
 def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:

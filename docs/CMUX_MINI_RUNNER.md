@@ -2121,8 +2121,8 @@ takes 190 to 280 s.
   seed already kept (and prunes), or downloads a nearer one. A miss or any error is today's behaviour.
 - **Local Network Privacy.** A LaunchAgent whose program is not Apple's cannot reach LAN addresses, and
   neither can its children: a Homebrew python3 agent and its `/usr/bin/ssh` got "No route to host", while
-  a `/usr/bin/python3` agent connected (2026-09-25, `launchctl submit` probe on cmux12s). So
-  glaeda-mini-setup runs the seed-prefetch agent with `/usr/bin/python3`, and the client uses
+  an Apple python3 agent connected (2026-09-25, `launchctl submit` probe on cmux12s). The
+  client uses
   `/usr/bin/ssh` and `/usr/bin/tar` (plus Homebrew zstd to decompress a pipe). The tailnet address of
   cmux15 was not reachable from the PR minis, so the config lists LAN addresses. On macOS 27 a
   `/usr/bin/python3` job program is refused too: with `xcode-select` on an Xcode the shim runs Xcode's
@@ -2130,7 +2130,10 @@ takes 190 to 280 s.
   parent that stays the job's process fixes it (`launchctl submit` probes on cmux14, macOS 27.0.1,
   2026-10-19: `/usr/bin/python3` -> `/usr/bin/ssh` "No route to host"; `/bin/sh` -> `/usr/bin/python3` ->
   `/usr/bin/ssh` answered). So the agent's program is `LAN_PARENT` in glaeda-mini-setup: `/bin/sh`, which
-  forwards TERM to the python3 and waits for it.
+  forwards TERM to the python3 and waits for it. Since 2026-11-23 that python3 is the one pinned Python,
+  `~/.local/bin/python3.13` (uv's CPython 3.13, `scripts/glaeda-python`), never Apple's: on cmux15 (macOS 27.0.1)
+  jobs rooted on Apple's python3, on uv's python3.13 and on `/bin/sh` all got EHOSTUNREACH in-process and all let
+  a `/usr/bin/nc` child connect, so the interpreter no longer matters and the `/bin/sh` parent stays.
 
 Set up, from a checkout at `origin/main` on the operator Mac (plan first, then `--apply`):
 
@@ -2149,7 +2152,7 @@ launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.seed-prefetch
 tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl   # results.<root>.lan: fetched true, or its reason
 ```
 
-A `lan.reason` with "No route to host" means the agent is not yet running `/usr/bin/python3` under the
+A `lan.reason` with "No route to host" means the agent is not yet running the pinned python3.13 under the
 `/bin/sh` parent (glaeda-update rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-serve/serve.jsonl` records
 each request. Roll back with `scripts/glaeda-seed-lan remove --seeder cmux15 [HOST...] --apply`: without a
 config a mini skips the LAN step.
@@ -2164,7 +2167,7 @@ cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps,
 
 - **Fill.** The `glaeda-seed-archive` system LaunchDaemon (`/Library/LaunchDaemons`, `UserName` the archive user, installed
   by `glaeda-seed-archive install --apply` through `sudo -n`, which also boots out and removes the old gui/UID agent; a
-  login-session agent died with the 2026-11-20 reboot) runs every 15 seconds as `/bin/sh` running `/usr/bin/python3`
+  login-session agent died with the 2026-11-20 reboot) runs every 15 seconds as `/bin/sh` running `~/.local/bin/python3.13`
   (`LAN_PARENT`), so Local Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
   `seed-list-v1` and streams every seed the archive lacks, newest first, so a seed is here about a minute
   after cmux15 keeps it. At every 5 minutes, PR minis that prefetched in between missed here and fell back
@@ -2231,7 +2234,7 @@ over the LAN, including sha256 on arrival, in 5.9 s (~110 MB/s).
   ancestor in its launchd job is refused (probes 2026-09-25: `/bin/bash` -> Homebrew python3 ->
   `/usr/bin/nc` got "No route to host"; `/bin/bash` -> `/usr/bin/python3` connected), and a runner job
   descends from the listener gate's `~/.local/bin/python3` and `Runner.Listener`. So `glaeda-lan-fetch
-  product` hands the request to the `lan-fetch` LaunchAgent (program `/bin/sh` running `/usr/bin/python3 -I`;
+  product` hands the request to the `lan-fetch` LaunchAgent (program `/bin/sh` running `~/.local/bin/python3.13 -I`;
   see Local Network Privacy under the seed LAN path for macOS 27) over a Unix
   socket in `~/.local/state/glaeda/lan-fetch/` (0700). The broker makes the ssh connections.
 - **Helper.** cmux calls `/Library/Application Support/glaeda/bin/glaeda-lan-fetch` only when the file and
@@ -2512,8 +2515,10 @@ Integrity Protection is engaged"). A reboot clears it: on austin-0 (2026-10-28) 
 `scripts/glaeda-daemon-heal` is a root LaunchDaemon (`com.teamleaderleo.glaeda.daemon-heal`) that restarts a
 macOS system daemon stuck hot or bloated (fseventsd's swap filled cmuxs-mac-mini-6's disk, 2026-10-25). Its
 desired state is `config/macos-daemons.json`. Root runs a root-owned snapshot of both under
-`/Library/Application Support/glaeda/daemon-heal` with `/usr/bin/python3 -I`, never a file the runner user can
-write.
+`/Library/Application Support/glaeda/daemon-heal` with the root-owned pinned Python
+`/opt/glaeda-python/bin/python3.13 -I` (`scripts/glaeda-python --install-root`: a copy of uv's CPython 3.13, root:wheel,
+writable by root only), never a file the runner user can write. Until that copy exists the job keeps the interpreter
+its plist already names and reports `rootPython.missing` (glaeda-mini-health: `root_python_missing`).
 
 That snapshot follows the stable release on its own. Every `release.every_s` an apply pass reads
 `ota-channels/control.json` and `stable.json` from the first of `release.sources` that answers, over HTTPS
@@ -2532,7 +2537,8 @@ fleet sudo password (section 1), pin the hashes from the release commit, not fro
 
 ```bash
 gen=~/.local/state/glaeda/update/generations/<stable tag>/glaeda
-sudo /usr/bin/python3 -I $gen/scripts/glaeda-daemon-heal --install --policy $gen/config/macos-daemons.json --apply \
+sudo sh $gen/scripts/glaeda-python --install-root   # once per mini; glaeda-mini-setup --apply does it where sudo -n works
+sudo /opt/glaeda-python/bin/python3.13 -I $gen/scripts/glaeda-daemon-heal --install --policy $gen/config/macos-daemons.json --apply \
   --expect-sha256 $(git show <its commit>:scripts/glaeda-daemon-heal | shasum -a 256) \
   --expect-policy-sha256 $(git show <its commit>:config/macos-daemons.json | shasum -a 256)
 ```

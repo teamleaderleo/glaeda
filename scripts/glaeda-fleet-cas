@@ -438,7 +438,9 @@ check_relay() {  # LAN_IP:PORT
 }
 
 # The store host's prune (custom store roots only; the minis get theirs from glaeda-mini-setup).
+# It runs as this user, so under this user's Python 3.13 (scripts/glaeda-python USER_PYTHON), never Apple's.
 PRUNE_LABEL=com.teamleaderleo.glaeda.fleet-cas-store-gc
+user_python() { printf '%s\n' "${GLAEDA_USER_PYTHON:-$HOME/.local/bin/python3.13}"; }
 prune_plist() {
   local log=$LOGS/glaeda-fleet-cas-store-gc.jsonl
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -447,7 +449,7 @@ prune_plist() {
     '    <key>Label</key>' "    <string>$PRUNE_LABEL</string>" \
     '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>" \
     '    <key>ProgramArguments</key>' '    <array>' \
-    '        <string>/usr/bin/python3</string>' '        <string>-I</string>' \
+    "        <string>$(xml "$(user_python)")</string>" '        <string>-I</string>' \
     "        <string>$(xml "$launch_root/glaeda-fleet-cas-prune")</string>" \
     '        <string>--apply</string>' '        <string>--store-gc-only</string>' '    </array>' \
     '    <key>EnvironmentVariables</key>' '    <dict>' \
@@ -465,6 +467,8 @@ write_store_prune() {
   say "prune $PRUNE_LABEL: hourly $launch_root/glaeda-fleet-cas-prune --apply --store-gc-only (GLAEDA_FLEET_CAS_ROOT=$ROOT), system LaunchDaemon"
   [ -n "$apply" ] || return 0
   [ -f "$src" ] && [ ! -L "$src" ] || { echo "missing $src" >&2; exit 1; }
+  # Without USER_PYTHON the installed daemon stays as it is (it keeps the interpreter it names) until it exists.
+  [ -x "$(user_python)" ] || { echo "user_python_missing: no $(user_python), so $PRUNE_LABEL keeps its installed plist: run glaeda-python --install (or glaeda-mini-setup --apply), then rerun" >&2; return 0; }
   mkdir -p "$LOGS" "$launch_root/launchd"
   install -m 0755 "$src" "$launch_root/glaeda-fleet-cas-prune.new"
   mv "$launch_root/glaeda-fleet-cas-prune.new" "$launch_root/glaeda-fleet-cas-prune"

@@ -55,7 +55,7 @@ if host in os.environ.get("FAKE_DOWN", "").split(","):
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
-if remote.startswith("/usr/bin/python3 - ") and "pool-node" in remote:  # POOL_USER: publish_node_view
+if remote.startswith("~/.local/bin/python3.13 - ") and "pool-node" in remote:  # POOL_USER: publish_node_view
     if host in os.environ.get("FAKE_PUBLISH_FAILS", "").split(","):
         sys.stderr.write("refusing: not a link this step made\\n"); sys.exit(1)
     print("published /Users/Shared/cmux-build-fleet/pool-node.d/1-2 generation abcdef012345"); sys.exit(0)
@@ -506,8 +506,9 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(applies), 1)
         self.assertIn("--dedicated hq-two-mac-a", applies[0]["remote"])
         self.assertTrue(applies[0]["remote"].startswith(
-            "PATH=/usr/bin:/bin:/usr/sbin:/sbin DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 "
-            "~/glaeda-runner/scripts/glaeda-cmux-runner "), "a protected interpreter, never Homebrew's")
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin DEVELOPER_DIR=/Library/Developer/CommandLineTools "
+            "/opt/glaeda-python/bin/python3.13 ~/glaeda-runner/scripts/glaeda-cmux-runner "),
+            "the root-owned ROOT_PYTHON, never Homebrew's or the user-writable ~/.local copy")
         self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
         self.assertNotIn("--org", applies[0]["remote"])
         self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
@@ -556,7 +557,7 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         row = json.loads(result.stdout)["members"][0]
         calls = [c for c in self.calls() if c["tool"] == "ssh"]
-        publish = [i for i, c in enumerate(calls) if c["remote"].startswith("/usr/bin/python3 - ")]
+        publish = [i for i, c in enumerate(calls) if c["remote"].startswith("~/.local/bin/python3.13 - ")]
         self.assertEqual(len(publish), 1)
         self.assertIsNone(calls[publish[0]]["user"], "published as the member user")
         self.assertIn("m4pro-48 cmux-pr-runner /Users/Shared/cmux-build-fleet/pool-node", calls[publish[0]]["remote"])
@@ -567,7 +568,8 @@ class FleetTest(unittest.TestCase):
         for call in applies:
             self.assertEqual(call["user"], "cmux-pr-runner")
             self.assertTrue(call["remote"].startswith(
-                "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin ~/glaeda-runner/scripts/"))
+                "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin /opt/glaeda-python/bin/python3.13 "
+                "~/glaeda-runner/scripts/"), "as the pool user: the root-owned ROOT_PYTHON")
             self.assertNotIn("--headless", call["remote"])
         self.assertTrue([c for c in calls if c["user"] == "cmux-pr-runner" and "mkdir -p ~/glaeda-runner" in c["remote"]])
         self.assertTrue([c for c in calls if c["user"] is None and "mkdir -p ~/glaeda-runner" in c["remote"]])
@@ -1118,6 +1120,39 @@ def load_fleet_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+class RemotePythonTest(unittest.TestCase):
+    """glaeda-python: every remote command runs glaeda code on USER_PYTHON as the member's own user and on the
+    root-owned ROOT_PYTHON as any other account; never Apple's /usr/bin/python3."""
+
+    def test_each_account_gets_its_interpreter(self) -> None:
+        fleet = load_fleet_module()
+        self.assertEqual(fleet.remote_python(None), "~/.local/bin/python3.13")
+        self.assertEqual(fleet.remote_python(""), "~/.local/bin/python3.13")
+        self.assertEqual(fleet.remote_python("cmux-pr-runner"), "/opt/glaeda-python/bin/python3.13")
+        runner = load_runner_module()
+        self.assertEqual(fleet.ROOT_PYTHON, runner.ROOT_PYTHON)
+        self.assertEqual(fleet.PROTECTED_PYTHON, runner.PROTECTED_PYTHON)
+        self.assertEqual(fleet.USER_PATH, runner.PROTECTED_PATH)
+        with mock.patch.object(fleet, "pool_login", return_value="cmux-pr-runner"):
+            self.assertTrue(fleet._uninstall_cmd("mini-a", 1, True).startswith(
+                "/opt/glaeda-python/bin/python3.13 ~/glaeda-runner/scripts/glaeda-cmux-runner --uninstall --apply "))
+            self.assertTrue(fleet._uninstall_cmd("mini-a", 0, False, user="").startswith(
+                "~/.local/bin/python3.13 ~/glaeda-runner/scripts/glaeda-cmux-runner --uninstall "))
+        source = TOOL.read_text()
+        self.assertNotIn('"/usr/bin/python3', source)
+        self.assertNotIn("/usr/bin/python3 -", source)
+
+    def test_a_missing_interpreter_names_the_fix(self) -> None:
+        """Rollout: a mini that has not run the new glaeda-mini-setup lacks both; the remote shell's exit 127 says so."""
+        fleet = load_fleet_module()
+        err = fleet.python_fix(127, "zsh:1: no such file or directory: /opt/glaeda-python/bin/python3.13\n")
+        self.assertIn("root_python_missing: run sudo -n glaeda-python --install-root", err)
+        err = fleet.python_fix(127, "zsh:1: no such file or directory: /Users/cmux/.local/bin/python3.13\n")
+        self.assertIn("user_python_missing: run glaeda-python --install", err)
+        self.assertEqual(fleet.python_fix(1, "/opt/glaeda-python/bin/python3.13: boom"),
+                         "/opt/glaeda-python/bin/python3.13: boom", "only a shell's not-found")
 
 
 class ProcessBoundTest(unittest.TestCase):

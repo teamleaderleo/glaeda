@@ -4518,7 +4518,7 @@ def controller_run(run: dict) -> dict:
 # ~/.config/glaeda/on-event.json (GLAEDA_GH_ON_EVENT_CONFIG):
 #   {"hooks": [{"name": "cloud-probe-promote", "repo": "manaflow-ai/cmux", "workflow": "backend.yml",
 #               "branch": "feat-cmux-next", "job": "promote-production", "conclusion": "success",
-#               "command": ["/usr/bin/python3", "/abs/probe.py", "run", "--sha", "{head_sha}"], "cwd": "/abs"}]}
+#               "command": ["/abs/.local/bin/python3.13", "/abs/probe.py", "run", "--sha", "{head_sha}"], "cwd": "/abs"}]}
 # The daemon matches each finished run its controller feed delivers (no GitHub read): repo, branch, and workflow by
 # file name or display name. With `job`, that job of the run's attempt must have `conclusion` (read from the
 # controller's run-jobs); without it, the run's own conclusion. Each (hook, repo, run, attempt) runs at most once:

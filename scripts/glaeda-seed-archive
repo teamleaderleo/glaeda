@@ -1,9 +1,10 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """glaeda-seed-archive: keep the fleet's seed archive (cmux-lawrence) filled from the trusted seeder.
 
     glaeda-seed-archive                    plan: the seeds the seeder keeps that the archive lacks
     glaeda-seed-archive --apply            fetch them newest first, then prune (the LaunchDaemon, every 15 s)
-    glaeda-seed-archive install [--apply]  write and load that LaunchDaemon (run on the archive host)
+    glaeda-seed-archive install [--apply]  write and load that LaunchDaemon (run on the archive host, as
+                                           ~/.local/bin/python3.13 ~/.local/libexec/glaeda-seed-archive install)
     glaeda-seed-archive uninstall [--apply]  boot out and remove the daemon and any old LaunchAgent
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
@@ -29,8 +30,8 @@ as it was: the archive asks the trusted seeder, which never connects to the arch
 Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
 tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
 sparse bundle on the (ExFAT) X10 Pro, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
-/usr/bin/python3 write into an attached disk image but not onto the external volume itself (measured on
-cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
+a python write into an attached disk image but not onto the external volume itself (measured with Apple's
+python on cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
 same way). Each run attaches the image if it is not mounted; `install --apply`, run over SSH, creates it. The
 archive is a client of the seeder like any mini (glaeda-seed-lan install --seeder cmux15 ... cmux-lawrence
 writes SEED_LAN_CONFIG); it asks `seed-list-v1` for the seeder's kept seeds and `seed-v1 zstd KEY` for each
@@ -45,10 +46,15 @@ Prune: oldest mtime first (glaeda-seed-serve touches a seed it serves) while the
 BUDGET bytes or HOST_VOLUME has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
 anything touched in the last GRACE seconds stay.
 
+The job runs as this user, so its interpreter is this user's Python 3.13 (USER_PYTHON, ~/.local/bin/python3.13,
+from glaeda-python --install / glaeda-mini-setup --apply), never Apple's python3; `install` refuses to
+write the daemon while USER_PYTHON is missing, naming that fix. The shebang (env python3) is only for a hand
+run; glaeda always names the interpreter.
+
 Local Network Privacy: the job's program is /bin/sh (an Apple platform binary that stays the job's
-process) running /usr/bin/python3, whose children are /usr/bin/ssh and Homebrew zstd (which only reads a
-pipe), so the LAN connection is allowed. On macOS 27 a /usr/bin/python3 program alone is refused: it runs
-Xcode's python3 (glaeda-mini-setup LAN_PARENT).
+process) running USER_PYTHON, whose children are /usr/bin/ssh and Homebrew zstd (which only reads a
+pipe), so the LAN connection is allowed. On macOS 27 no python program alone gets the LAN, Apple's or
+uv's (cmux15, 2026-11-23), but its /usr/bin children under a /bin/sh parent do (glaeda-mini-setup LAN_PARENT).
 Prints one JSON line, also appended to LOG.
 """
 
@@ -78,6 +84,9 @@ ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
 # The first version kept the files directly on the X10 Pro, where launchd jobs cannot write; install moves them.
 OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
 HDIUTIL = "/usr/bin/hdiutil"
+# The login user's Python 3.13 (scripts/glaeda-python USER_PYTHON): the daemon runs as this user, so its own copy.
+USER_PYTHON = HOME / ".local/bin/python3.13"
+PYTHON_FIX = "run glaeda-python --install (or glaeda-mini-setup --apply) on this host, then install again"
 SUFFIX = ".tar.zst"
 STATE = HOME / ".local/state/glaeda/seed-archive"
 LOG = HOME / "Library/Logs/glaeda-seed-archive.jsonl"
@@ -405,9 +414,9 @@ def plist(program: Path) -> dict:
         "Label": LABEL,
         # A system daemon runs as the user that owns the archive and its keys, with that user's HOME.
         "UserName": pwd.getpwuid(os.getuid()).pw_name,
-        # /bin/sh as the job's process, /usr/bin/python3 under it: Local Network Privacy then lets its
+        # /bin/sh as the job's process, USER_PYTHON under it: Local Network Privacy then lets its
         # /usr/bin/ssh reach the LAN on macOS 27 too (glaeda-mini-setup LAN_PARENT, the same wrapper).
-        "ProgramArguments": [*LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(program), "--apply"],
+        "ProgramArguments": [*LAN_PARENT, os.fspath(USER_PYTHON), "-I", os.fspath(program), "--apply"],
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
         # hdiutil attach leaves diskimages-helper serving the mount. launchd ends what a finished job left in its
@@ -418,6 +427,10 @@ def plist(program: Path) -> dict:
         "StandardOutPath": "/dev/null",
         "StandardErrorPath": os.fspath(HOME / "Library/Logs/glaeda-seed-archive.err"),
     }
+
+
+def user_python_runs() -> bool:
+    return os.path.isfile(USER_PYTHON) and os.access(USER_PYTHON, os.X_OK)
 
 
 def root(*argv: str) -> subprocess.CompletedProcess:
@@ -490,7 +503,13 @@ def install(apply: bool) -> dict:
     current = path.read_bytes() if path.exists() else b""
     report = {"tool": "glaeda-seed-archive", "mode": "install", "apply": apply, "plist": os.fspath(path),
               "state": "current" if current == want else ("stale" if current else "missing"),
-              "image": "present" if IMAGE.is_dir() else "missing", "mounted": os.path.ismount(MOUNT)}
+              "image": "present" if IMAGE.is_dir() else "missing", "mounted": os.path.ismount(MOUNT),
+              "python": os.fspath(USER_PYTHON) if user_python_runs() else "missing"}
+    if report["python"] == "missing":
+        # The installed daemon keeps the interpreter it names until this user has USER_PYTHON.
+        report["user_python_missing"] = f"no {USER_PYTHON}: {PYTHON_FIX}"
+        if apply:
+            return {**report, "error": report["user_python_missing"]}
     if apply and not IMAGE.is_dir():
         if not os.path.ismount(HOST_VOLUME):
             return {**report, "error": f"{HOST_VOLUME} is not mounted"}

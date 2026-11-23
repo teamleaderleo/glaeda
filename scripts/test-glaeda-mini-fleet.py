@@ -1665,6 +1665,20 @@ class PreflightTests(unittest.TestCase):
             self.assertFalse(result["ready"], result)
         self.assertIn("secrets", mf.UNKNOWN_BLOCKS)
 
+    def test_a_pool_read_without_root_python_names_the_fix(self) -> None:
+        """Rollout: a host without glaeda-python's ROOT_PYTHON skips the read as the pool user (never Apple's python);
+        the check is unknown, blocks, and names the install, not a sudoers change."""
+        self.set_pool()
+        text = preflight_text(runners=()) + f"pf_pool_user\t{self.POOL}\npf_pool_python\tmissing\n"
+        result = self.result(text)
+        check = result["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("unknown", "password"))
+        self.assertIn("root_python_missing", check["detail"])
+        self.assertIn(mf.ROOT_PYTHON, check["detail"])
+        self.assertIn("glaeda-python --install-root", check["fix"])
+        self.assertNotIn("/usr/bin/python3", check["fix"] + check["detail"])
+        self.assertFalse(result["ready"], result)
+
     def test_accepted_secrets_cover_the_pool_users_home(self) -> None:
         self.set_pool()
         own, shared = "/Users/cmux-pr-runner/.config/gh/hosts.yml", "/Users/Shared/x.token"
@@ -2174,10 +2188,12 @@ class PreflightScriptTests(unittest.TestCase):
         # The update check reports the softwareupdate command line, not the sudo wrapper around it.
         body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body if not line.startswith("applying='")]
         # The poolUser read (cmuxterm-hq#18007) is the one escalation: sudo -n (never a prompt) down to a
-        # non-admin account, running a read-only Python that opens and closes files.
+        # non-admin account, running a read-only Python that opens and closes files: glaeda-python's root-owned
+        # ROOT_PYTHON, never Apple's.
         pool = [line for line in body if "sudo" in line]
         self.assertEqual(pool, ["(cd / && printf '%s\\0' \"${login_secrets[@]}\" | sudo -n -u \"$POOL_USER\" -H "
-                                "/usr/bin/python3 -I -c '"])
+                                "\"$ROOT_PYTHON\" -I -c '"])
+        self.assertIn(f"ROOT_PYTHON={mf.ROOT_PYTHON}", body)
         body = [line for line in body if line not in pool]
         for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
             self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
@@ -2312,6 +2328,9 @@ class PreflightSecretsScriptTests(unittest.TestCase):
             body = mf.PREFLIGHT_PROBE.read_text()
             self.assertEqual(body.count("| sudo -n -u"), 1)
             body = body.replace("| sudo -n -u", f"| {bin_dir}/fake-sudo -n -u")
+            # ROOT_PYTHON stands in as this interpreter (no /opt/glaeda-python here)
+            self.assertEqual(body.count(f"ROOT_PYTHON={mf.ROOT_PYTHON}\n"), 1)
+            body = body.replace(f"ROOT_PYTHON={mf.ROOT_PYTHON}\n", f"ROOT_PYTHON={sys.executable}\n")
             # The login user reads locked.env during its walk; the pool user does not, by the time it looks.
             body = body.replace('  login_secrets+=("$f")\n',
                                 f'  login_secrets+=("$f")\n  case "$f" in */locked.env) chmod 000 "$f" ;; esac\n')
@@ -2321,8 +2340,8 @@ class PreflightSecretsScriptTests(unittest.TestCase):
             (login / ".secrets/locked.env").chmod(0o600)
             pf = mf.parse_probe(run.stdout)["preflight"]
             ran = calls.read_text() if calls.exists() else ""
-        if not ran:
-            self.skipTest("no developer directory: the probe skips /usr/bin/python3")
+        self.assertTrue(ran, run.stdout + run.stderr)
+        self.assertIsNone(pf["pool_python"])
         self.assertEqual(pf["pool_user"], "cmux-pr-runner")
         self.assertEqual(pf["pool_home"], os.fspath(pool))
         import pwd

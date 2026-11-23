@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I
+#!/opt/glaeda-python/bin/python3.13 -I
 """glaeda-lan-fetch: fetch a compiled product from another PR mini over the LAN, verified by sha256.
 
     glaeda-lan-fetch product SHA256 DEST [--max-bytes N]
@@ -22,7 +22,9 @@ cmux CI (scripts/ci/peer_product_source.py) calls the root-owned copy at
 "/Library/Application Support/glaeda/bin/glaeda-lan-fetch" (every directory up to / root-owned and not
 group- or other-writable, so a job can neither rewrite nor rename it) before GitHub, with the digest
 GitHub recorded for
-the artifact. Peers are the other PR minis in the glaeda-owned mesh config (glaeda-seed-lan mesh writes
+the artifact. CI execs that copy directly, so its shebang is the root-owned Python 3.13
+(/opt/glaeda-python/bin/python3.13, glaeda-python ROOT_PYTHON: no account but root can write it); the
+lan-fetch agent runs the login user's ~/.local/bin copy under the login user's Python 3.13. Peers are the other PR minis in the glaeda-owned mesh config (glaeda-seed-lan mesh writes
 LAN_CONFIG: each peer's name and LAN address, this mini's mesh key, and known_hosts pinning each peer's
 host key under its name). Each peer runs glaeda-seed-serve --role product as a forced command.
 
@@ -32,12 +34,13 @@ against SHA256 and the announced size, and only then linked to DEST. The caller 
 
 Why a broker: macOS Local Network Privacy blocks LAN connections from every process with a non-Apple
 ancestor in its launchd job (2026-09-25, launchctl submit probes on cmux12s: /bin/bash -> Homebrew
-python3 -> /usr/bin/nc was refused; /bin/bash -> /usr/bin/python3 and /bin/bash -> /usr/bin/nc
+python3 -> /usr/bin/nc was refused; /bin/bash -> Apple's python3 and /bin/bash -> /usr/bin/nc
 connected). A runner job descends from the listener gate (~/.local/bin/python3) and Runner.Listener,
 so a CI step cannot reach a peer itself. `product` therefore asks the broker over a Unix socket in a
-private directory; the broker is its own LaunchAgent whose program is /bin/sh running /usr/bin/python3
-(on macOS 27 /usr/bin/python3 alone is refused: it runs Xcode's python3; glaeda-mini-setup LAN_PARENT),
-so its ssh reaches the LAN. Without a broker, `product` fetches directly (that works from an SSH shell).
+private directory; the broker is its own LaunchAgent whose program is /bin/sh running the login user's
+Python 3.13 (glaeda-mini-setup LAN_PARENT). On macOS 27 no python is let onto the LAN in-process, Apple's
+or uv's alike, but a /usr/bin child of one under a /bin/sh parent is (cmux15, 2026-11-23), so its
+/usr/bin/ssh reaches the LAN. Without a broker, `product` fetches directly (that works from an SSH shell).
 
 Build mesh (cmuxterm-hq#661). The broker also keeps INDEX, the fleet index: every peer's inventory-v1
 (glaeda-seed-serve --role product), which lists the kept compile-admission states per canonical root with

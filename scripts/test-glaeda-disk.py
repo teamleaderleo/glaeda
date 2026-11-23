@@ -16902,6 +16902,15 @@ class RunnerAccountsTest(unittest.TestCase):
 
 
 
+class RunnerAccountPythonTest(unittest.TestCase):
+    def test_another_account_runs_the_pinned_root_copy_not_apples_python(self) -> None:
+        home = "/Users/cmux"
+        self.assertEqual(gd._runner_account_python("/opt/glaeda-python/bin/python3.13", home),
+                         "/opt/glaeda-python/bin/python3.13")
+        self.assertEqual(gd._runner_account_python("/opt/homebrew/bin/python3.13", home), "/opt/homebrew/bin/python3.13")
+        with mock.patch.object(gd.sys, "platform", "darwin"):
+            self.assertEqual(gd._runner_account_python(home + "/.local/bin/python3.13", home),
+                             gd.RUNNER_ACCOUNT_PYTHON)
 class UndeclaredGrowthTest(unittest.TestCase):
     """The checker (declared-disk-persistence design section 3): used - base - registered caches - job volumes."""
 
