@@ -19786,8 +19786,15 @@ class LandQueue:
     def handoff_head_moved(self, e: dict, head: str, out: str, repinned: bool) -> str | None:
         """Under the lock, after the broker refused E's hand-off at HEAD with OUT: the PR's live head to hand it off at
         instead when OUT names one (LAND_HANDOFF_HEAD) and E may land it, else "" (counted as any refusal); None when E
-        was stopped because its pin is not that head. A second refusal of this kind in one hand-off (REPINNED: the
-        head moved again between two reads) is counted, never chased."""
+        was stopped because its pin is not that head, or re-queued to be judged on a fresh read first. A second
+        refusal of this kind in one hand-off (REPINNED: the head moved again between two reads) is counted, never chased.
+
+        A pinned E whose pin is not the broker's head is judged once more before it stops: that head may be only the
+        lander's base merge on the pin, which judge's base_merge_check follows (repin_base_merge) and every other head
+        stops head_moved there, as here. manaflow-ai/cmuxterm-hq#15729, 2026-11-23 08:29Z: pinned c87ae6aa, the
+        lander's "Merge branch 'main' into ..." 51a62dd9 (first parent c87ae6aa) at 08:00Z, and the hand-off stopped
+        it head_moved with no parent read. Once per head (handoffPinMoved): a judgment that reads nothing newer hands
+        off at the old head again, and the second refusal naming the same head stops it."""
         m = LAND_HANDOFF_HEAD.search(out)
         if not m or m.group(2) != head or m.group(1) == head or repinned:
             return ""
@@ -19795,6 +19802,11 @@ class LandQueue:
         self.nudge(e["key"])  # this host's copy of the head is stale: the daemon reads it again
         pin = str(e.get("pinSha") or "")
         if land_head_moved(pin, live):
+            if e.get("handoffPinMoved") != live:
+                e["handoffPinMoved"] = live
+                self.history(e, "handoff_pin_moved", pin=pin[:12], head=live[:12])
+                self.requeue(e)  # judge reads it again: a base merge on the pin is followed, anything else stops
+                return None
             name = key_name(e["key"])
             self.stop(e, "head_moved", land_moved_clause(live, pin, " (the broker read it from GitHub)")
                       + "; nothing was handed off",

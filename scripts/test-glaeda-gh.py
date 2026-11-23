@@ -28727,21 +28727,43 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["handoffFail"]["head"], e["handoffFail"]["count"]), ("waiting", LB, 1))
 
     def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
+        # judged once more first (no newer read here, so it hands off at the pin again), then stopped
         self.broker = True
         self.pr(LA)
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.w.gh_rc["merge"] = 1
         self.w.gh_err["merge"] = self.NOT_OWNER
         self.w.handoff = self.stale_handoff()
-        self.w.answers.append(ok_answer(LA))
         e = {}
-        for _ in range(3):
+        for _ in range(6):
+            self.w.answers.append(ok_answer(LA))
             e = self.tick(5)
             if e.get("state") == "stopped":
                 break
-        self.assertEqual(len(self.handoffs()), 1)
+        self.assertEqual(len(self.handoffs()), 2)
+        self.assertEqual([h["event"] for h in e["history"]].count("handoff_pin_moved"), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--match-head-commit {LB}", e["stop"]["next"])
+
+    def test_a_pinned_hand_off_the_broker_refuses_on_the_landers_base_merge_follows_it(self):
+        # hq#15729, 2026-11-23: the lander merged main into the pin; the broker named that head and the land stopped
+        self.broker = True
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        ok = self.w.handoff
+        self.w.handoff = [self.stale_handoff(), ok]
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"]), ("queued", LA))
+        self.base_merged()  # the fresh read: LB, a merge whose first parent is the pin
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual(e["pinSha"], LB)
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
 
     def forwarded_row(self, sha: str = "") -> dict:
         """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
