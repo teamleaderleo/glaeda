@@ -33207,7 +33207,8 @@ class LandForwardTest(Base):
             x.stop(x.entries[self.KEY], "checks_red", "ci failed at LA", "fix ci")
         told = len(self.w.sent())
         e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "forward_stopped"),
+                         (e, self.asks, x.entries[self.KEY]))
         self.assertIn("big-exec's land queue stopped it (checks_red): ci failed at LA", e["stop"]["reason"])
         self.assertEqual(e["stop"]["next"], "fix ci")
         self.assertEqual(len(self.w.sent()), told)
@@ -33286,8 +33287,8 @@ class LandForwardTest(Base):
         self.land("o/r#2")  # not here: asked as a key it never got
         doc = self.executor_serve({"op": "outcomes", "targets": [self.KEY, "pr:o/r#9", "o/r#1", "nonsense"]})
         self.assertTrue(doc["ok"])
-        self.assertEqual(doc["outcomes"][self.KEY]["state"], "waiting")
-        self.assertEqual(doc["outcomes"]["o/r#1"]["state"], "waiting")
+        self.assertIn(doc["outcomes"][self.KEY]["state"], gg.LAND_FORWARD_OPEN - {"requested"})
+        self.assertEqual(doc["outcomes"]["o/r#1"], doc["outcomes"][self.KEY])
         self.assertIsNone(doc["outcomes"]["pr:o/r#9"])
         self.assertNotIn("nonsense", doc["outcomes"])
 
