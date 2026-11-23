@@ -16003,6 +16003,54 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
+        """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
+        login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
+        acquisition requires a lane session". lane-gh takes the lease in the lane its environment names (LANE_GH_LANE,
+        ACPMUX_SESSION_NAME, ACPMUX_SESSION, ACPMUX_FROM) and the daemon runs as no session. A fake lane-gh with the
+        real one's rule replays each write kind the broker carries (BROKER_POST_TOOLS) in an environment that names no
+        lane: each is made, in the queuing session's lane."""
+        lane_gh = Path(self.tmp.name) / "lane-gh"
+        lane_gh.write_text(
+            "#!/bin/sh\n"
+            "lane=${LANE_GH_LANE:-${ACPMUX_SESSION_NAME:-${ACPMUX_SESSION:-$ACPMUX_FROM}}}\n"
+            "lane=${lane##*/}\n"
+            "if [ -z \"$lane\" ]; then echo \"lane-gh: $2: lease acquisition requires a lane session\" >&2; exit 1; fi\n"
+            "printf '{\"ok\": true, \"data\": {\"url\": \"https://github.com/o/r/pull/9\", \"number\": 9, "
+            "\"lane\": \"%s\"}}\\n' \"$lane\" > \"$0.$2\"\n"
+            "cat \"$0.$2\"\n")
+        lane_gh.chmod(0o755)
+        argvs = {"pr": ("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why"),
+                 "comment": ("comment", "o/r#7", "--body", "x")}
+        self.assertEqual(set(argvs), set(gg.BROKER_POST_TOOLS))  # every kind the broker makes
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        bare = {k: v for k, v in os.environ.items() if k not in lanes}
+        for kind, argv in argvs.items():
+            with self.subTest(kind=kind):
+                d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)  # no spacing between kinds
+                with mock.patch.dict(os.environ, {**bare, "ACPMUX_SESSION_NAME": "gcp-agent-lane-11/quiet-lane"},
+                                     clear=True):
+                    item = self.queue(*argv)
+                with mock.patch.dict(os.environ, bare, clear=True), \
+                        mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                        mock.patch.object(gg, "LANE_GH_CMD", str(lane_gh)):
+                    self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual(state["state"], "posted", state)
+                made = json.loads(Path(f"{lane_gh}.{gg.BROKER_POST_TOOLS[kind]}").read_text())
+                self.assertEqual(made["data"]["lane"], "quiet-lane")
+                self.assertEqual(d.transport.calls, [])
+
+    def test_a_queued_write_with_no_lane_runs_lane_gh_as_before(self) -> None:
+        """No session at queue time: nothing is recorded and the replay's environment is the daemon's own."""
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in lanes}, clear=True):
+            item = self.queue("comment", "o/r#7", "--body", "x")
+        self.assertNotIn("lane", item)
+        self.assertIsNone(gg.post_lane_env(item))
+        self.assertEqual(gg.post_queue_lane({"ACPMUX_FROM": "ws-sync"}), "ws-sync")  # a timer's sending name
+        self.assertEqual(gg.post_queue_lane({"LANE_GH_LANE": "a", "ACPMUX_SESSION_NAME": "h/b"}), "a")
+
     def test_a_lane_vm_write_the_broker_rate_limits_waits_its_retry_after_and_then_goes(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
         d, ran = self.lane_vm((75, {"ok": False, "status": 403, "retry_after": 90, "error": "secondary"}),

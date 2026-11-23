@@ -33230,6 +33230,9 @@ def post_item(args: argparse.Namespace) -> dict:
     item: dict[str, Any] = {"kind": args.kind, "body": read_body(args.body, args.body_file), "queuedAt": time.time(),
                             "attempts": 0, "by": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("ACPMUX_SESSION")
                             or os.getcwd()}
+    lane = post_queue_lane()
+    if lane:
+        item["lane"] = lane  # the lane a lane VM's daemon writes it as (post_lane_env): the caller's, not its own
     if args.kind == "pr":
         if not re.fullmatch(rf"{NAME}/{NAME}", args.target):
             raise WatchError("post pr takes OWNER/REPO")
@@ -33503,13 +33506,39 @@ def lane_vm_poster() -> bool:
         os.access(LANE_GH_CMD, os.X_OK)
 
 
+# The lane a queued write is made as. lane-gh fences every broker write (pr_create, comment: BROKER_POST_TOOLS) with a
+# lease taken in the calling lane's name (leo-workspace tools/lane-gh lease_for_write, from LANE_GH_LANE or the acpmux
+# session: tools/lease_client.py owner()) and refuses with none: "lease acquisition requires a lane session", before
+# the broker. The daemon that replays a queued write runs as no session, so until 2026-11-23 every write gh-quota
+# queued on the login's create pause (queue_paced_write) and this daemon later sent through the broker failed that
+# way: on gcp-agent-lane-11 3 of 3 queued creates of lane/quiet-connect-cloud-carry in manaflow-ai/cmux, from two
+# sessions, while the same create sent directly was made. So `post` records the caller's lane in the entry ("lane",
+# post_queue_lane, read as lane-gh reads its own: LANE_GH_LANE, the acpmux session's name, else ACPMUX_FROM, a timer's
+# sending name) and the replay names it (post_lane_env). The land queue does the same for its steps (LAND_LANE_ENV).
+# An entry with no lane (queued before this, or by a process with no session) is sent as before, and lane-gh says so.
+POST_LANE_KEYS = (*LAND_LANE_KEYS, "ACPMUX_FROM")  # lease_client.owner()'s order
+
+
+def post_queue_lane(env: dict | None = None) -> str:
+    """The lane of the process queuing a write, as lane-gh would name it for its own write, or "" with none."""
+    env = os.environ if env is None else env
+    return land_session_lane(next((env[k] for k in POST_LANE_KEYS if str(env.get(k) or "").strip()), ""))
+
+
+def post_lane_env(item: dict) -> dict[str, str] | None:
+    """The environment a queued ITEM's `lane-gh call` runs with: this process's, with ITEM's recorded lane as
+    LANE_GH_LANE (lane-gh's first key), or None (this process's as is) when it recorded none."""
+    lane = land_session_lane(str(item.get("lane") or ""))
+    return {**os.environ, LAND_LANE_ENV: lane} if lane else None
+
+
 def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
     """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
     nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
     tool, call_args = chosen
     argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
     try:
-        done = run_bounded(argv, timeout=timeout)
+        done = run_bounded(argv, timeout=timeout, env=post_lane_env(item))
     except subprocess.TimeoutExpired:
         return "lost", f"the lane-gh broker gave no answer in {timeout:g}s"
     except (OSError, subprocess.SubprocessError) as error:
