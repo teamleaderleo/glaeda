@@ -8,7 +8,9 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
                                                         reuses the repository before it); --json gives a list
     A target takes whichever form you typed, in every subcommand that takes one (status, wait, post, land):
     OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, a GitHub URL, or a bare N in the
-    repository of the directory you are in (it says which repository it read).
+    repository of the directory you are in (it says which repository it read). It is also taken as the flags
+    gh itself takes: `--repo OWNER/REPO --pr N` (--issue N, -R, or `--pr OWNER/REPO#N` alone); naming it both
+    ways at once is refused, never guessed.
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
     glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
@@ -34651,6 +34653,160 @@ def bare_wait_count(word: str) -> bool:
     return True
 
 
+# The target, named by flags, in every command whose own form is a positional OWNER/REPO#N. `--sha` has
+# carried `--match-head-commit` (gh pr merge's own spelling), `--pin` and `--pinned` since 2026-11-22; the
+# target itself had no such courtesy. Measured 2026-11-23, `glaeda-gh land --repo
+# teamleaderleo/leo-workspace --pr 9106 --match-head-commit <sha>` answered "unrecognized arguments: --repo
+# --pr 9106" and exited 64 with the land unqueued, so a correct, unambiguous call cost a `--help` round trip
+# and a retry. The pair is what `gh` itself takes (`gh pr merge N -R OWNER/REPO`) and what the sibling tools
+# here take, so it is read as the one target the command does take -- in one rewriter for every such
+# command, rather than a flag declared per subcommand, because a flag declared here would also have to be
+# refused wherever it cannot mean a target.
+TARGET_FLAG_COMMANDS = ("land", "status", "wait", "checks", "post", "log")
+
+# `land`'s words are one free `nargs="+"` positional rather than `choices`, so its own first-slot words
+# cannot be read off the parser the way `first_slot_words` reads `status`'s and `post`'s.
+LAND_WORDS = ("status", "cancel", "serve")
+
+
+def target_flag_key(name: str) -> str:
+    """`--repo`, `--pr`, `--issue` (and `-R`, gh's own spelling of `--repo`) as the key `repo`, `pr` or
+    `issue`; "" for every other word. Case and separator spellings are one key here as everywhere else, so
+    `--PR` and `--Repo` name the same things."""
+    if name == "-R":
+        return "repo"
+    key = normalized_flag(name)
+    return key if key in ("repo", "pr", "issue") else ""
+
+
+def target_flag_parts(target: str) -> tuple[str, str]:
+    """(OWNER/REPO, N) of a target in any form this tool takes, each "" when the form does not name it:
+    `o/r#5` is both, `o/r` is the repository alone, `5` or `#5` the number alone."""
+    whole = target.strip()
+    pr = PR_RE.fullmatch(whole)
+    if pr:
+        return f"{pr.group(1)}/{pr.group(2)}", pr.group(3)
+    loose = re.fullmatch(rf"({NAME})/({NAME})/(\d+)", whole)
+    if loose:
+        return f"{loose.group(1)}/{loose.group(2)}", loose.group(3)
+    if REPO_ONLY_RE.fullmatch(whole):
+        return whole, ""
+    bare = BARE_NUMBER.fullmatch(whole)
+    return ("", bare.group(1)) if bare else ("", "")
+
+
+def target_flag_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """`--repo OWNER/REPO --pr N` (or `--issue N`, or `--pr OWNER/REPO#N` alone) read as the positional
+    target the command takes: (argv, refusal lines).
+
+    Only a flag this command does not declare itself is read, so each one that really exists keeps its own
+    meaning: `checks --pr N` is still the PR a head belongs to and `search --repo` its repository filter.
+    The positional form is untouched -- a call that works today is left exactly as typed -- and a call that
+    names a target both ways is refused naming both readings, never guessed, because which repository or
+    PR was meant decides what merges."""
+    if not raw or raw[0] not in TARGET_FLAG_COMMANDS:
+        return raw, []
+    options = flag_options(raw)
+    named: dict[str, str] = {}
+    rest: list[str] = [raw[0]]
+    i = 1
+    while i < len(raw):
+        word = raw[i]
+        if word == "--":
+            rest.extend(raw[i:])  # nothing past a bare -- is this tool's own flag
+            break
+        if not word.startswith("-") or word == "-":
+            rest.append(word)
+            i += 1
+            continue
+        name, joined, value = word.partition("=")
+        canonical = spelled_long_flag(name, options)
+        if canonical:
+            if options[canonical] and not joined and i + 1 < len(raw):
+                rest.extend(raw[i:i + 2])  # that word is this flag's value, whatever it is spelled like
+                i += 2
+            else:
+                rest.append(word)
+                i += 1
+            continue
+        key = target_flag_key(name)
+        if not key:
+            rest.append(word)
+            i += 1
+            continue
+        if joined:
+            got = value
+        elif i + 1 < len(raw) and (not raw[i + 1].startswith("-") or raw[i + 1] == "-"):
+            got = raw[i + 1]
+            i += 1
+        else:
+            got = ""
+        i += 1
+        if not got:
+            return raw, [f"glaeda-gh: `{name}` names no target: it takes "
+                         + ("OWNER/REPO" if key == "repo" else f"N or OWNER/REPO#N ({key})"),
+                         f"next: {typed_line(['glaeda-gh'] + rest + [name, 'OWNER/REPO' if key == 'repo' else 'N']
+                                             + raw[i:])}"]
+        if key in named and named[key].lower() != got.lower():
+            return raw, [f"glaeda-gh: `{name}` is given twice, as {named[key]!r} and {got!r}, and they do not "
+                         f"name the same thing: it is not guessed",
+                         f"next: one `{name}`"]
+        named[key] = got
+    if not named:
+        return raw, []
+    if "pr" in named and "issue" in named and target_flag_parts(named["pr"]) != target_flag_parts(named["issue"]):
+        return raw, [f"glaeda-gh: `--pr {named['pr']}` and `--issue {named['issue']}` name two different "
+                     f"targets: it is not guessed",
+                     f"next: one of `--pr {named['pr']}` or `--issue {named['issue']}`"]
+    number_flag = named.get("pr") or named.get("issue") or ""
+    repo, number = target_flag_parts(number_flag) if number_flag else ("", "")
+    if number_flag and not number:
+        spelling = "--pr" if named.get("pr") else "--issue"
+        return raw, [f"glaeda-gh: `{spelling} {number_flag}` is no PR or issue: it takes N or OWNER/REPO#N",
+                     f"next: glaeda-gh {typed_command(raw)} OWNER/REPO#N"]
+    if "repo" in named:
+        if repo and repo.lower() != named["repo"].lower():
+            return raw, [f"glaeda-gh: `--repo {named['repo']}` and `{number_flag}` name two different "
+                         f"repositories: it is not guessed",
+                         f"next: {typed_line(['glaeda-gh'] + rest + [named['repo'] + '#' + number])}",
+                         f"next: {typed_line(['glaeda-gh'] + rest + [repo + '#' + number])}"]
+        if not REPO_ONLY_RE.fullmatch(named["repo"].strip()):
+            return raw, [f"glaeda-gh: `--repo {named['repo']}` is no repository: it takes OWNER/REPO",
+                         f"next: glaeda-gh {typed_command(raw)} OWNER/REPO#N"]
+        repo = named["repo"].strip()
+    target = f"{repo}#{number}" if repo and number else (repo or number)
+    # A target already typed as an argument wins nothing and loses nothing: it is kept when the flags say
+    # the same thing (the flags are dropped, said on stderr), and the call is refused naming both readings
+    # when they differ. A bare number argument with `--repo` is the pair `infer_kind` already joins.
+    found = positional_words(rest)
+    words = LAND_WORDS if raw[0] == "land" else first_slot_words(child_parser(parser(), raw[0]))
+    # The target goes where it is typed: after the command, and after the command's own word when there is
+    # one (`status pr`, `post comment`, `log job`, `land cancel`), which is the order every `next:` line and
+    # every doc line here prints.
+    lead = 1 + (1 if found and found[0][1] in words else 0)
+    typed_target = next(((at, word) for at, word in found if at >= lead and target_flag_parts(word) != ("", "")),
+                        None)
+    if typed_target is not None:
+        at, word = typed_target
+        was_repo, was_number = target_flag_parts(word)
+        if (was_repo and repo and was_repo.lower() != repo.lower()) or (was_number and number
+                                                                        and was_number != number):
+            return raw, [f"glaeda-gh: this call names two targets, `{word}` as an argument and "
+                         f"`{' '.join(f'--{k} {v}' for k, v in sorted(named.items()))}` as flags, and they are "
+                         f"not the same target: it is not guessed",
+                         f"next: {typed_line(['glaeda-gh'] + rest)}",
+                         f"next: {typed_line(['glaeda-gh'] + rest[:at] + [target] + rest[at + 1:])}"]
+        merged = f"{was_repo or repo}#{was_number or number}" if (was_repo or repo) and (was_number or number) \
+            else (was_repo or repo or was_number or number)
+        fixed = rest[:at] + [merged] + rest[at + 1:]
+    else:
+        fixed = rest[:lead] + [target] + rest[lead:]
+    print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` "
+          f"({', '.join(f'--{k} {v}' for k, v in sorted(named.items()))} is the target "
+          f"`{fixed[lead]}`)", file=sys.stderr)
+    return fixed, []
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     for rewriter in (nesting_synonym, command_spelling_synonym):
@@ -34696,7 +34852,8 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, flag_near_miss_synonym, bare_wait_synonym):
+    for rewriter in (target_flag_synonym, doubled_kind_synonym, flag_spelling_synonym, flag_near_miss_synonym,
+                     bare_wait_synonym):
         # The nesting and the command's own spelling ran at the top (a word a command owns is that command's,
         # and which options a command has depends on which command it is); the flags come after them.
         # `doubled_kind_synonym` first here: it only looks at a call that already leads with a real command,
