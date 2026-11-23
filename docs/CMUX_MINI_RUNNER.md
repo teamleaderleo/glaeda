@@ -345,9 +345,11 @@ What `--apply` does:
      runner's and glaeda's own processes, git maintenance, multiplexer and agent sessions with
      everything under them, and `~/.cache/git-repair/protected` are spared), runs the same
      disk pressure pass detached and always exits 0. One pass runs at a time per host
-     (`~/.cache/glaeda-disk/hook-pass.lock`): a trigger at or above glaeda-disk's target is
-     skipped, and triggers that arrive while a pass runs leave one `hook-pass.pending` the
-     running pass serves with a single follow-up; both skips get a line in glaeda-disk's run log.
+     (`~/.cache/glaeda-disk/hook-pass.lock`): completion always requests cleanup, including above
+     glaeda-disk's free-space target, so unused build caches go on finish. Start and listener
+     triggers may skip above the target. Triggers that arrive while a pass runs leave one
+     `hook-pass.pending` the running pass serves with a single follow-up; skips and coalescing
+     get a line in glaeda-disk's run log. The disk policy still checks live use and role keeps.
      Only that queued pass waits for a running job: every other `--pressure --apply` run (a manual
      one, the disk-pressure LaunchAgent's, idle-repair's, the hook's own floor evictions) reclaims
      out of band instead of queueing behind it -- the families no job owns

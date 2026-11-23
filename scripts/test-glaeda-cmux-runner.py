@@ -1669,6 +1669,27 @@ class HookTest(unittest.TestCase):
         self.assertEqual(again.returncode, 0)
         self.assertTrue(wait_for_path(marker), "the refusal's note is used once")
 
+    def test_job_completed_runs_disk_cleanup_above_target(self) -> None:
+        """A finished build's caches go even when the host has plenty of free disk."""
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk", f"import pathlib\npathlib.Path({os.fspath(marker)!r}).touch()\n")
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}):
+            log = hook.disk_run_log()
+            log.parent.mkdir(parents=True, exist_ok=True)
+            targets = {os.fspath(self.dir): 1}
+            log.write_text(json.dumps({
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "mode": "pressure",
+                "targets": targets, "default_targets": True, "floor_gib": 1000000,
+                "config_sha256": hook.disk_config_sha256(os.fspath(disk)),
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(hook.disk_targets(config=hook.disk_config_sha256(os.fspath(disk))), targets)
+            self.assertEqual(hook.disk_short(targets), "")
+        result = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk),
+                               "--state-dir", os.fspath(self.dir / "state"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("started in the background", result.stdout)
+        self.assertTrue(wait_for_path(marker), "completion skipped cleanup above the free-space target")
+
     def test_job_completed_disk_pass_runs_detached_and_bounded(self) -> None:
         """job-completed held its runner up to DISK_TIMEOUT_S (120 s) on glaeda-disk: "Complete runner" took 121-124 s
         on main's macOS jobs, and dependent jobs waited for it. The pass now runs detached, still bounded, by its own
@@ -8168,8 +8189,8 @@ class MirrorBorrowTest(unittest.TestCase):
 
 
 class DiskPassCoalesceTest(unittest.TestCase):
-    """job-completed's disk passes: one at a time per host, triggers coalesced into one follow-up, none started above
-    glaeda-disk's target. On cmux14, 2889 of 2986 passes (2026-10-24..26) skipped as eviction_busy: every job started
+    """Disk passes: one at a time per host, triggers coalesced into one follow-up, completion runs above the target.
+    On cmux14, 2889 of 2986 passes (2026-10-24..26) skipped as eviction_busy: every job started
     a pass while one (11-28 min) still held evict.lock."""
 
     def setUp(self) -> None:
@@ -8379,6 +8400,20 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertEqual(self.bound(disk).wait(30), 0)
         self.assertEqual(self.run_count(), 1)
         self.assertFalse(self.waiting())
+
+    def test_completions_above_target_coalesce_into_one_follow_up(self) -> None:
+        disk = self.fake_disk()
+        self.write_target(0.001)
+        with self.lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for _ in range(5):
+                self.assertIn("coalesced", hook.disk_pressure_detached(os.fspath(disk), job_completed=True))
+            self.assertTrue(self.pending.exists())
+            self.assertEqual(self.run_count(), 0)
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertFalse(self.waiting())
+        self.assertFalse(self.overlap.exists())
 
     def test_triggers_during_a_pass_get_exactly_one_follow_up(self) -> None:
         disk = self.fake_disk(triggers_on_first=3)
