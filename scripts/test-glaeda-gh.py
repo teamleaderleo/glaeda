@@ -26173,6 +26173,39 @@ class LandTest(Base):
         self.assertEqual((judged[-1].get("why"), judged[-1].get("code")), ("woke", "checks_running"))
         self.assertEqual((e["state"], e["wait"]["kind"], self.w.sent()), ("waiting", "pr", []))
 
+    def test_a_skipped_mergeability_keeps_the_row_read_and_an_unknown_to_mergeable_settle_is_judged_at_once(self):
+        # The skip must never be the step that leaves a row with nothing scheduled: it is a `return` out of the
+        # fingerprint-moved branch that writes no scheduling state, and it is reached only with a wake still ahead.
+        # So through the skip the row stays waiting, stays read by the daemon (keep_watching runs before consider,
+        # every pass), and keeps the fingerprint its last judgment was made on -- which is what makes the settle a
+        # move again. UNKNOWN -> MERGEABLE is therefore judged on the pass the cache says it, not at the wake.
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                      "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
+        peeks: list[str] = []
+        self.q.peek = peeks.append
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(wait())
+        e = self.tick()
+        first, seen = len(self.w.judgments()), e["seen"]
+        # mergeability goes uncomputed: skipped, and the row is left waiting, woken and read as it was
+        self.pr(LA, mergeable="UNKNOWN")
+        peeks.clear()
+        e = self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.judgments()), first)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
+        self.assertGreater(e["wakeAt"], self.t, "the wake it would have been judged at is still ahead")
+        self.assertIn(self.KEY, peeks, "the daemon keeps reading the PR, so the settle reaches the cache")
+        self.assertEqual(e["seen"], seen, "the baseline stays the fingerprint judged, so a settle is a move")
+        # UNKNOWN -> MERGEABLE, with a check moved under it: judged on this pass, long before the wake
+        self.w.answers.append(wait())
+        self.pr(LA, mergeable="MERGEABLE", checks=[("ci", "COMPLETED", "SUCCESS"), ("lint", "COMPLETED", "SUCCESS")])
+        e = self.tick(60.0)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        self.assertEqual(len(self.w.judgments()), first + 1, "the settle is judged, not parked")
+        self.assertEqual(judged[-1].get("why"), "fp_moved")
+        self.assertGreater(e["wakeAt"], self.t)
+
     def test_mergeability_arriving_or_a_row_with_no_wake_is_judged_as_before(self):
         # The skip's own bounds: it answers False unless the last judgment had a computed mergeability, was a wait on
         # the PR that read something, and the row has a wake ahead of it to be judged at.
