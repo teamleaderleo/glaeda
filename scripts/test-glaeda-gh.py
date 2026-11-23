@@ -5820,6 +5820,69 @@ class ClientTest(Base):
             self.assertEqual(waited.sha, sha)
             self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
 
+    def land_with_pin(self, pin: str, remote: str = "", cached: str = ""):
+        """cmd_land(o/r#1, PIN) with the daemon down, ls-remote answering REMOTE ("" fails), the cache CACHED:
+        (exit code, land_request mock, what went to stderr, ls-remote mock)."""
+        said: list[str] = []
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ, {"GLAEDA_STATE_DIR": str(tmp), "GH_QUOTA_STATE": str(tmp / "q")}), \
+                mock.patch.object(gg, "land_pin_remote_head", return_value=remote) as ls_remote, \
+                mock.patch.object(gg, "land_cached_head", return_value=cached), \
+                mock.patch.object(gg, "land_pin_local_head", return_value=""), \
+                mock.patch.object(gg, "land_pin_is_another_checkouts_head", return_value=""), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_judge", return_value=("/bin/true", [])), \
+                mock.patch.object(gg, "land_queue_lane", return_value=""), \
+                mock.patch.object(gg, "land_broker_client", return_value=False), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
+                mock.patch.object(gg, "land_request", return_value="rid-1") as req, \
+                mock.patch.object(gg, "say_waiting", said.append), mock.patch("sys.stdout", io.StringIO()):
+            try:
+                code: int | str = gg.cmd_land("o/r#1", [], "host/lane", 0, True, pin)
+            except gg.WatchError as error:
+                code = str(error)
+        return code, req, "\n".join(said), ls_remote
+
+    def test_land_pin_head_resolves_to_the_prs_head(self):
+        """2026-11-23: forward_no_outcome said "land it again: glaeda-gh land R#N (--sha HEAD to pin it)" and `land
+        --match-head-commit HEAD` was refused "takes a commit SHA, not 'HEAD'" (leo-workspace#8511, #7740). HEAD (or
+        any ref that is not hex) now pins the PR's head: git ls-remote's refs/pull/N/head, no API quota, the sha
+        named; a fresh cache read answers first, with no git call."""
+        head = "c" * 40
+        code, req, said, _ = self.land_with_pin("HEAD", remote=head)
+        self.assertEqual(code, gg.EXIT_DOWN)  # queued for the daemon (down in this test), not refused
+        self.assertEqual(req.call_args.kwargs["sha"], head)
+        self.assertIn(f"--match-head-commit HEAD pinned {head}", said)
+        self.assertIn("git ls-remote", said)
+        cached = "d" * 40
+        code, req, said, ls_remote = self.land_with_pin("head", remote=head, cached=cached)
+        self.assertEqual((code, req.call_args.kwargs["sha"]), (gg.EXIT_DOWN, cached))
+        self.assertIn("cache", said)
+        ls_remote.assert_not_called()
+        code, req, said, ls_remote = self.land_with_pin("b" * 40, remote=head)  # a sha is kept as given
+        self.assertEqual((code, req.call_args.kwargs["sha"], said), (gg.EXIT_DOWN, "b" * 40, ""))
+        ls_remote.assert_not_called()
+        # the ls-remote read itself: the one line for refs/pull/N/head, lowercased
+        calls: list[list[str]] = []
+
+        def git(args: list[str]) -> str | None:
+            calls.append(args)
+            return f"{head.upper()}\trefs/pull/7/head\n"
+        self.assertEqual(gg.land_pin_remote_head("o/r", 7, git), head)
+        self.assertEqual(calls, [["ls-remote", "https://github.com/o/r.git", "refs/pull/7/head"]])
+
+    def test_land_pin_ref_that_cannot_be_resolved_refuses(self):
+        """HEAD with no fresh cache read and an ls-remote that fails (or prints no sha) is refused, naming the read
+        that would give the sha, and nothing is queued."""
+        code, req, _, _ = self.land_with_pin("HEAD", remote="")
+        self.assertIsInstance(code, str)
+        self.assertIn("could not be read", code)
+        self.assertIn("next: git ls-remote https://github.com/o/r.git refs/pull/1/head", code)
+        req.assert_not_called()
+        for out in (None, "", "garbage\trefs/pull/1/head\n", f"{'c' * 40}\trefs/heads/main\n"):
+            self.assertEqual(gg.land_pin_remote_head("o/r", 1, lambda args, out=out: out), "")
+
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
         --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
@@ -28969,7 +29032,11 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("landed again here", e["stop"]["reason"])
         self.assertIn("huge-blue", e["stop"]["reason"])
-        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --match-head-commit HEAD", e["stop"]["next"])
+        self.assertNotIn("--sha HEAD to pin it", e["stop"]["next"])  # 2026-11-23: a form the tool refused
+        named = re.search(r"glaeda-gh (land \S+ --match-head-commit HEAD)", e["stop"]["next"]).group(1).split()
+        self.assertEqual(gg.parser().parse_args(named).sha, "HEAD")  # the form it names parses, and cmd_land
+        # resolves it (test_land_pin_head_resolves_to_the_prs_head)
         [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
         self.assertEqual(said[3], "host/lane")
         self.assertEqual(said[said.index("--class") + 1], "fyi")
