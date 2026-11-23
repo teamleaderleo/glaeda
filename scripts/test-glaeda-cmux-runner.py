@@ -9599,6 +9599,35 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIsNone(hook.head_fit_units(stale, side, now, need), "a stale feed keeps today's rule")
         self.assertIsNone(hook.head_fit_units(dict(summary, jobs=[]), side, now, need), "an empty queue too")
 
+    def test_head_fit_listens_for_the_largest_queued_job_not_only_the_oldest(self) -> None:
+        # 2026-11-22: 133 of 145 Mac side-class PR jobs were picked while an older one of their class still waited
+        # (controller timing feed), so a listener sized for the oldest took a larger job and held it in "Set up
+        # runner" ("N of 14 units free, generated-files (isolated) needs 8"): 24% of the pool's job minutes.
+        side = frozenset(["glaeda-mini", "glaeda-side-std-xcode-26.6"])
+        now = time.time()
+
+        def queued(name, ago):
+            return {"labels": sorted(side), "status": "queued", "created": now - ago, "host": None,
+                    "urgent": False, "name": name}
+        units = {("cmux-next.yml", "cmux-scheme-compile"): 3, ("cmux-next.yml", "generated-files"): 8,
+                 ("cmux-next.yml", "daemon-test"): 6}
+
+        def need(workflow, job):
+            return units[(workflow, job)]
+        summary = {"at": now, "delivery": now, "jobs": [
+            queued("cmux app scheme compile (Debug)", 1200), queued("cmux-next generated files", 60),
+            queued("some job the hook does not know", 3000), queued("cmux-next daemon tests", 600)]}
+        self.assertEqual(hook.head_fit_units(summary, side, now, need), (8, "cmux-next generated files"),
+                         "the newer, larger job sets the room, not the oldest")
+        other = dict(queued("cmux-next generated files", 30), labels=["glaeda-mini", "glaeda-side-std-xcode-26.4"])
+        smaller = dict(summary, jobs=[summary["jobs"][0], summary["jobs"][3], other])
+        self.assertEqual(hook.head_fit_units(smaller, side, now, need), (6, "cmux-next daemon tests"),
+                         "a job on labels this runner lacks is not one it could take")
+        tie = dict(summary, jobs=[queued("cmux-next daemon tests", 60), queued("cmux-next daemon tests", 900)])
+        self.assertEqual(hook.head_fit_units(tie, side, now, need), (6, "cmux-next daemon tests"))
+        only_unknown = dict(summary, jobs=[queued("some job the hook does not know", 60)])
+        self.assertIsNone(hook.head_fit_units(only_unknown, side, now, need), "no known job keeps today's rule")
+
 
     SIDE_LIGHT = "glaeda-side-light-xcode-26.6"
 

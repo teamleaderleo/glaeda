@@ -9105,6 +9105,13 @@ def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None
 # own tables know (JOB_CORES, WORKFLOW_JOB_CLASSES) of a cmux-next workflow is read from its display name, so a
 # renamed or newly measured job ("macOS fast tier", cmux#44472, run 44024082059, cancelled by its timeout while
 # waiting for units) is covered without a name edit.
+# The premise above does not hold: GitHub does not hand an idle runner its label's oldest queued job. On 2026-11-22
+# (controller timing feed, Mac PR jobs of the side classes, 6 h to 01:30Z) 133 of 145 were picked while an older one
+# of their class still waited, and "Set up runner" holds took 6,860 of the pool's 28,584 job minutes (24%), with
+# 9,275 more in jobs cancelled near their 60-min timeout after a median 34-40 min there ("N of 14 units free,
+# generated-files (isolated) needs 8", "daemon-test needs 6"): a listener sized for the oldest job took a larger one.
+# So it listens with room for the largest need among every queued job it could take (queue_jobs), not only the
+# oldest's; each name is read the same way and one the hook does not know is skipped.
 HEAD_FIT_ALIASES = {  # display names that do not slug to their job id
     "cmux app scheme compile (debug)": ("cmux-next.yml", "cmux-scheme-compile"),
     "cmux next dev release compile": ("cmux-next.yml", "cmux-scheme-compile"),
@@ -9140,35 +9147,40 @@ def head_job_key(name: str) -> tuple[str, str] | None:
     return None
 
 
-def queue_head(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
-               max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> dict[str, Any] | None:
-    """HEAD_FIT: the oldest queued job in a fresh feed whose labels are all this runner's, or None."""
+def queue_jobs(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+               max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> list[dict[str, Any]]:
+    """HEAD_FIT: every queued job in a fresh feed whose labels are all this runner's, oldest first ([] when the feed
+    is missing or stale)."""
     if not isinstance(summary, dict) or not labels:
-        return None
+        return []
     delivery = summary.get("delivery")
     if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
-        return None
+        return []
     queued = [job for job in (summary.get("jobs") if isinstance(summary.get("jobs"), list) else [])
               if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
               and set(job["labels"]) <= labels and job.get("status") in IOS_SIM_QUEUED
               and isinstance(job.get("created"), (int, float))
               and (max_age is None or now - job["created"] <= max_age)]
-    return min(queued, key=lambda job: job["created"]) if queued else None
+    return sorted(queued, key=lambda job: job["created"])
 
 
 def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
                    need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
-    """HEAD_FIT: (units, job name) the head of this runner's queue needs, or None when it cannot say."""
-    head = queue_head(summary, labels, now)
-    known = head_job_key(str((head or {}).get("name") or ""))
-    if known is None:
-        return None
-    workflow, job = known
+    """HEAD_FIT: (units, job name) of the largest need among the queued jobs this runner could take (GitHub may hand
+    it any of them), or None when it cannot say for any. On a tie the oldest names it."""
     if need is None:
         def need(workflow: str, job: str) -> int:
             return job_need(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO,
                             workflow=workflow).cores
-    return max(1, int(need(workflow, job))), str(head["name"])
+    best: tuple[int, str] | None = None
+    for queued in queue_jobs(summary, labels, now):
+        known = head_job_key(str(queued.get("name") or ""))
+        if known is None:
+            continue
+        units = max(1, int(need(*known)))
+        if best is None or units > best[0]:
+            best = (units, str(queued["name"]))
+    return best
 
 
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
@@ -11358,7 +11370,7 @@ class Gate:
             found = None
             gate_log(f"the queue-head look failed ({type(error).__name__}); listening at the side fit")
         if found != self.head_fit_seen and found is not None:
-            gate_log(f"the oldest queued job it could take, {found[1]}, needs {found[0]} units: listening only "
+            gate_log(f"the largest queued job it could take, {found[1]}, needs {found[0]} units: listening only "
                      "with room for it, so it never waits here for units against its timeout")
         self.head_fit_seen = found
         return found[0] if found else 1
