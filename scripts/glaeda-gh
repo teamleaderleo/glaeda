@@ -25156,12 +25156,30 @@ def render_fields(keys: list[str], entries: dict[str, dict | None], fields: list
     return "".join(f"{line}\n" for line in lines)
 
 
-def parse_fields(text: str | None) -> list[str] | None:
+def parse_fields(text: "str | list[str] | None") -> list[str] | None:
+    """The field paths a --field flag (or several) asks for, in the order given, each one once.
+
+    --field is repeatable as well as comma-separated: `--field title --field mergeCommit` reads the same as
+    `--field title,mergeCommit`. It took the last flag and dropped the rest without a word until 2026-11-23, and
+    the [never-poll] guard keys a status read by the UNION of its --field flags -- so a read written that way
+    printed one field, the session was recorded as having been given both, and the corrective read the refusal
+    itself names ("the same read with --field PATHS it left out runs now") was refused as a repeat. Four read
+    routes in a row then failed to give one merged PR's title.
+    """
     if text is None:
         return None
-    fields = [f.strip() for f in text.split(",")]
-    if not fields or any(not f or any(not part for part in f.split(".")) for f in fields):
-        raise WatchError(f"--field takes a comma list of dotted names (head,checks.failed), not {text!r}")
+    texts = [text] if isinstance(text, str) else list(text)
+    fields, seen = [], set()
+    for one in texts:
+        for f in (part.strip() for part in one.split(",")):
+            if not f or any(not part for part in f.split(".")):
+                raise WatchError(
+                    f"--field takes a comma list of dotted names (head,checks.failed), not {one!r}")
+            if f not in seen:
+                seen.add(f)
+                fields.append(f)
+    if not fields:
+        raise WatchError(f"--field takes a comma list of dotted names (head,checks.failed), not {texts!r}")
     return fields
 
 
@@ -34132,10 +34150,10 @@ def parser() -> argparse.ArgumentParser:
                                 "several are read in one gather, "
                                 "and a bare #N or N is that number in the repository of the target before it, "
                                 "or of the directory you are in")
-            s.add_argument("--field", metavar="F,G",
+            s.add_argument("--field", metavar="F,G", action="append",
                            help="print just these values of the --json object, tab-separated, one line per target "
                                 "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
-                                "lists print comma-joined")
+                                "lists print comma-joined; repeatable, and every flag's fields are printed")
         else:
             s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, a GitHub URL, or the KIND:TARGET "
                                                  "form this tool prints (pr:OWNER/REPO#N, run:OWNER/REPO/RUN_ID), "
@@ -34293,9 +34311,10 @@ def parser() -> argparse.ArgumentParser:
     sr.add_argument("--author", metavar="LOGIN", help="only this author")
     sr.add_argument("--limit", type=int, default=20, metavar="N",
                     help=f"rows at most (default 20, at most {SEARCH_LIMIT_MAX}: GraphQL search's page)")
-    sr.add_argument("--field", metavar="F,G",
+    sr.add_argument("--field", metavar="F,G", action="append",
                     help="print just these values of each row, tab-separated, one line per row (the `status pr` "
-                         "names: target,head,state,checks.state,merged,url,title,number)")
+                         "names: target,head,state,checks.state,merged,url,title,number); repeatable, and every "
+                         "flag's fields are printed")
     sr.add_argument("--json", action="store_true")
     rn = sub.add_parser("runners", help="busy and idle self-hosted runners per label, from one shared read")
     rn.add_argument("scope", metavar="OWNER[/REPO]")

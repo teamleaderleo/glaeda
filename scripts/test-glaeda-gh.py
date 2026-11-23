@@ -6229,6 +6229,30 @@ class ClientTest(Base):
             with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
                 gg.parse_fields(bad)
 
+    def test_a_repeated_field_flag_prints_every_flags_fields(self) -> None:
+        """`--field` is repeatable as well as comma-separated. It was a plain `store`, so
+        `--field title --field mergeCommit` printed only `mergeCommit` and said nothing about the
+        flag it dropped -- while the [never-poll] guard keys a status read by the UNION of its
+        --field flags. So the read was recorded as having been given both fields, printed one, and
+        the corrective read the refusal itself names ("the same read with --field PATHS it left
+        out runs now") came back refused as a repeat: four read routes in a row failed to give one
+        merged PR's title."""
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["status", "pr", "o/r#1", "--field", "title",
+                                      "--field", "state,checks.state"]), 0)
+        self.assertEqual(out.getvalue(), "t\tOPEN\tSUCCESS\n")
+        # order is the order given, each field once, across flags and inside one
+        self.assertEqual(gg.parse_fields(["title", "mergeCommit"]), ["title", "mergeCommit"])
+        self.assertEqual(gg.parse_fields("title,mergeCommit"), ["title", "mergeCommit"])
+        self.assertEqual(gg.parse_fields(["state", "title,state", "state"]), ["state", "title"])
+        self.assertIsNone(gg.parse_fields(None))
+        for bad in (["head", ""], ["head", "checks..failed"], [""]):
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                    gg.WatchError, r"--field takes a comma list of dotted names"):
+                gg.parse_fields(bad)
+
     def test_status_cli_takes_several_targets_and_a_field(self) -> None:
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
         self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="SUCCESS", checks=[check_run("a")])))
