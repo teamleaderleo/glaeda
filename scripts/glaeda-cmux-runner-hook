@@ -10267,8 +10267,8 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
     cmux17 and mac-mini-6 failed daemon tests with ENOSPC at 33-38 GiB free after "the disk budget is spent; started
     without holding"); refused at setup, the owned pool's rescue places it on a mini with room. The in-flight jobs'
     peaks stay a warning (job_disk_peak_hold): they may finish first, and counting them would refuse every start on a
-    busy mini. A job with no learned peak here (job_disk_gib's flat guess) and an unreadable disk or job log never
-    refuse."""
+    busy mini. A job with no learned peak here (job_disk_gib's flat guess), a peak learned only beside other jobs
+    (JOB_OWN_NEED_ALONE) and an unreadable disk or job log never refuse."""
     try:
         free = free_or_none(path)
         if free is None:
@@ -10277,6 +10277,13 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
         if key is None or key not in peaks:
             return None  # no history here: the flat default is a guess, not this job's need
         own, source = peaks[key]
+        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks' "alone") is its own need. The
+        # fallback p90 over every run measures free_start - free_min, which counts the jobs writing beside it: a fast
+        # tier learned 54.7 GiB ("p90 of 20 runs here", 2026-11-22 22:02Z, refused at 17.2 GiB free on cmux23 against a
+        # fleet-measured 5.3 GiB p95 per job), a need no carrier of its label had, so the rescue's re-runs never
+        # found a runner. Such a peak stays the in-flight warning (job_disk_peak_hold) and never refuses.
+        if not source.endswith(" alone"):
+            return None
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
