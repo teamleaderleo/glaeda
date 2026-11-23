@@ -16035,6 +16035,90 @@ class PostTest(unittest.TestCase):
         self.assertEqual(state["state"], "failed")
         self.assertIn("read o/r before sending it again", state["error"])
 
+    def test_a_paced_write_on_an_upstream_lane_vm_is_queued_with_a_receipt_and_the_daemon_makes_it(self) -> None:
+        """gcp-agent-lane-4 2026-11-23 16:18Z: `post pr` answered "the lane-gh broker did not make this pr: rate
+        limited, retry after 430s" (exit 1) four times over 50 minutes, and the caller retried each by hand. Every
+        lane VM reads through `lane-gh glaeda-read`, so it was no lane_vm_poster and its daemon refused every queued
+        write. A paced write is queued, exit 0, and the upstream daemon makes it through the broker after the pause."""
+        no_guard(self)
+        args = gg.parser().parse_args(["post", "pr", "O/R", "--head", "lane/x", "--base", "main", "--title", "a title",
+                                       "--body", "why"])
+        out = io.StringIO()
+        limited = subprocess.CompletedProcess([], 75, json.dumps({"ok": False, "retry_after": 430,
+                                                                   "error": "content writes are paced"}), "")
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "run_bounded", return_value=limited), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_post(args), 0)
+        queued = list(gg.outbox_dir().glob("*.json"))
+        self.assertEqual(len(queued), 1)
+        self.assertRegex(out.getvalue(), rf"^queued as {queued[0].stem}; ")  # the gh shim reads "queued as ID;"
+        self.assertIn("nothing to retry", out.getvalue())
+        item = gg.read_json(queued[0])
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"number": 9, "url": "https://github.com/O/R/pull/9"}}))
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]):
+            self.step(d, item["notBefore"] - 10)
+            self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (0, "queued"))  # inside the pause
+            self.step(d, item["notBefore"] + 1)
+        self.assertEqual(ran[0][1:4], ["call", "pr_create", "O/R"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_a_paced_write_with_wait_on_an_upstream_lane_vm_waits_for_its_url_like_any_host(self) -> None:
+        """The gh shim queues a paced `gh pr create` as `post pr ... --wait 300` and reads the URL from stdout
+        (leo-workspace tools/gh_quota.py queue_paced_write). A write the broker's pause held waits as on a host with
+        a login: still queued when the wait runs out is exit 2 with the queued line, not a refusal."""
+        no_guard(self)
+        args = gg.parser().parse_args(["post", "comment", "O/R#4", "--body", "hello", "--wait", "1"])
+        out = io.StringIO()
+        limited = subprocess.CompletedProcess([], 75, json.dumps({"ok": False, "retry_after": 430,
+                                                                   "error": "content writes are paced"}), "")
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg.time, "sleep"), \
+                mock.patch.object(gg, "run_bounded", return_value=limited), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_post(args), 2)
+        queued = list(gg.outbox_dir().glob("*.json"))
+        self.assertEqual(len(queued), 1)
+        self.assertIn(f"queued as {queued[0].stem};", out.getvalue())
+
+    def test_an_upstream_lane_vm_daemon_makes_its_queued_writes_instead_of_refusing_them(self) -> None:
+        """upstream_tick ran upstream_refuse_posts on every lane VM (each reads through `lane-gh glaeda-read`), so a
+        queued write there failed a tick later with "has no login to post with". With the broker as its write route
+        the upstream tick runs the outbox, and only a host with neither still refuses."""
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        ran: list = []
+
+        def run(argv, timeout=None, **_kw):
+            ran.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "data": {"url": "u/7"}}), "")
+        d = gg.Daemon(transport=Scripted(), token=lambda: self.fail("a lane VM has no login"), controller=None,
+                      upstream=lambda req: {"entries": {}})
+        d.now = NOW
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "run_bounded", side_effect=run):
+            d.upstream_tick(d.upstream())
+        self.assertEqual(ran[0][1:4], ["call", "comment", "o/r"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        other = self.queue("comment", "o/r#8", "--body", "y")
+        with mock.patch.object(gg, "lane_vm_poster", return_value=False):
+            d.upstream_tick(d.upstream())
+        self.assertIn("has no login to post with", gg.post_state(other["id"])["error"])
+
+    def test_a_paced_write_with_no_daemon_to_make_it_still_says_the_retry(self) -> None:
+        no_guard(self)
+        args = gg.parser().parse_args(["post", "comment", "O/R#7", "--body", "hi"])
+        err = io.StringIO()
+        limited = subprocess.CompletedProcess([], 75, json.dumps({"ok": False, "retry_after": 60}), "")
+        with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "daemon_running", return_value=False), \
+                mock.patch.object(gg, "run_bounded", return_value=limited), contextlib.redirect_stderr(err):
+            self.assertEqual(gg.cmd_post(args), 1)
+        self.assertIn("retry after 60s", err.getvalue())
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
     def test_a_lane_vm_review_is_refused_at_accept_naming_what_posts_it(self) -> None:
         args = gg.parser().parse_args(["post", "review", "o/r#7", "--body", "r"])
         err = io.StringIO()

@@ -9440,7 +9440,14 @@ class Daemon:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
-        self.upstream_refuse_posts()
+        if lane_vm_poster():
+            try:  # a lane VM's queued writes go through the broker (post_through_broker), paced by its pause
+                with self.phase("outbox"):
+                    self.post_tick()
+            except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
+                self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        else:
+            self.upstream_refuse_posts()
         with self.phase("watches"):
             entries = self.watches()
         due = []
@@ -33350,11 +33357,14 @@ BROKER_RATE_LIMITED_EXIT = 75  # lane-gh's exit for a write GitHub's or the brok
 
 
 def lane_vm_poster() -> bool:
-    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream
-    and a runnable lane-gh. Such a host holds no login, so the daemon's own `gh auth token` post can never succeed:
-    fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh
-    signed in?" while the caller had been told the daemon posts it."""
-    return upstream_command() is None and lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
+    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with a runnable
+    lane-gh, whether or not it reads through an upstream (every lane VM's upstream is `lane-gh glaeda-read`). Such a
+    host holds no login, so the daemon's own `gh auth token` post can never succeed: fs-agent-lane-10 2026-11-23
+    07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh signed in?" while the caller
+    had been told the daemon posts it. Until 2026-11-23 an upstream host was excluded, so its daemon refused every
+    queued write (upstream_refuse_posts) and `post` handed the broker's "rate limited, retry after Ns" back to the
+    caller, who retried it: cmuxterm-hq goal github-writes-never-pause."""
+    return lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
 
 
 def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
@@ -33398,7 +33408,28 @@ def broker_made_where(data: Any) -> tuple[str | None, Any]:
     return data.get("url") or data.get("html_url"), data.get("number")
 
 
-def broker_post(item: dict) -> int:
+def broker_post_queue(item: dict, wait: float, args: argparse.Namespace | None = None) -> int:
+    """A write the broker's limit refused (nothing was made), queued for this host's daemon to make through the broker
+    once WAIT has passed (post_through_broker), and the receipt said: exit 0, as a queued `post` is on a host with a
+    login. Until 2026-11-23 the caller got "rate limited, retry after Ns" and exit 1, and retried it by hand: 1,248
+    refusals on 34 hosts in 24 h (cmuxterm-hq goal github-writes-never-pause). A caller's --wait waits for the write
+    as on any host (cmd_post_status: its URL on stdout once made, exit 2 still queued), so `url=$(... --wait 300)`
+    and the gh shim's queued `pr create` get the URL they read."""
+    now = time.time()
+    hold = min(float(wait), float(PACE_HOLD_MAX))
+    write_json(outbox_dir() / f"{item['id']}.json", {**item, "notBefore": now + hold, "holdUntil": now + hold,
+                                                     "throttled": 1,
+                                                     "lastError": f"the broker's limit held it; it goes out in "
+                                                                  f"{hold:.0f}s"})
+    if args is not None and float(getattr(args, "wait", 0) or 0) > 0:
+        return cmd_post_status(item["id"], args.wait, bool(getattr(args, "json", False)), queued=True)
+    # "queued as ID;" is the line the gh shim reads (leo-workspace tools/gh_quota.py queue_paced_write)
+    print(f"queued as {item['id']}; the login's create pause holds it {hold:.0f}s, then this host's daemon makes it "
+          f"through the lane-gh broker; nothing to retry (glaeda-gh post status {item['id']}, or --wait S)")
+    return 0
+
+
+def broker_post(item: dict, args: argparse.Namespace | None = None) -> int:
     """Make a queued write through the lane-gh broker and say what it did. Exit 0 written, 1 the broker said no or
     gave no answer, 3 not sent at all (its body and the command that sends it are named)."""
     chosen = broker_post_args(item)
@@ -33411,6 +33442,8 @@ def broker_post(item: dict) -> int:
         print(f"glaeda-gh: {value}; the write may still have been made, so read {item['repo']} before sending it "
               "again", file=sys.stderr)
         return 1
+    if outcome == "limited" and lane_vm_poster() and daemon_running(DOWN_GRACE):
+        return broker_post_queue(item, float(value), args)
     if outcome != "made":
         said = f"rate limited, retry after {value:g}s" if outcome == "limited" else value
         print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {said}", file=sys.stderr)
@@ -33548,7 +33581,7 @@ def cmd_post(args: argparse.Namespace) -> int:
         print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
         return 3
     if upstream_command() is not None:
-        return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
+        return broker_post(item, args)  # this host has no login: the broker writes, or says what does (broker_post)
     if lane_vm_poster() and broker_post_args(item) is None:
         return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
     missing = post_route_missing()
