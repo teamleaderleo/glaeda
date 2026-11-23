@@ -1,5 +1,11 @@
 # What may persist on a fleet host across jobs (cmuxterm-hq docs/design/declared-disk-persistence.md, section 2).
-# Everything not declared here, and not in [base], is garbage by definition: per-job scratch (glaeda#2297) keeps a
+# Everything not declared here, and not in [checker]
+# glaeda-disk's checker (design section 3): df used - [base] - these caches - live cmux-job-* volumes is undeclared
+# growth; past this on a volume it is an alarm (summary.json finding undeclared_growth) naming the top paths. The fix is
+# a cache entry here or a scratch redirect, never a new deletion rule.
+undeclared_alarm_gib = 5
+
+[base], is garbage by definition: per-job scratch (glaeda#2297) keeps a
 # job's own writes off the host disk, and this list says what is allowed to outlive a job.
 #
 # Read by scripts/glaeda-disk-registry. Each cache names its owner, whether it regenerates, and a size budget.

@@ -14009,6 +14009,9 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
                  "container": apfs_container_capacity(fs.mount, now),
                  "coverage": coverage, "coverage_at": coverage_at,
                  "coverage_note": "coverage rows overlap and incomplete rows are lower bounds"}
+        checked = undeclared_for_volume(used, outermost, volumes, gap, str(residual))
+        if checked is not None:
+            entry["undeclared"] = checked
         out.append(entry)
         cache_records[str(fs.dev)] = {**entry, "at": top_at}
     if not RUNNER_CACHE_PROFILE:
@@ -14017,6 +14020,165 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             ACCOUNTING.write_text(json.dumps(cache_records))
         except OSError:
             pass
+    return out
+
+
+# The checker: cmuxterm-hq docs/design/declared-disk-persistence.md, section 3 (PR 3 of 3). Leo, the ask: "man glaeda
+# needs to be more aggressive... again!"; approving the design: "i guess it's aboute seeing if we can detect deletable
+# before vs deciding after. this seems good." config/disk-registry.toml declares what may persist (glaeda-disk-registry
+# loads it). Per volume: df used - [base] - the registered caches - live per-job volumes (glaeda#2297's cmux-job-*
+# APFS volumes) is undeclared growth. It is report-only: it names the top undeclared paths, from the rows the
+# accounting above already measured (catalogue items, fixed roots, the census), and past the registry's
+# [checker] undeclared_alarm_gib it is the summary.json finding undeclared_growth, which glaeda-mini-health raises.
+# The fix it asks for is a registry entry or a scratch redirect, never a new deletion rule.
+#
+# The family rules (FAMILIES and the per-host family lists) are marked for deletion: they stay as the fallback until
+# undeclared growth stays near zero on every host for a week (the design's section 3), then they are deleted.
+CHECKER_ENV = "GLAEDA_DISK_CHECKER"  # 1 runs the checker off a macOS mini (tests, a Linux host with a registry); 0 skips it
+UNDECLARED_TOP = 10
+JOB_VOLUME_PREFIX = "cmux-job-"  # glaeda-cmux-runner-hook's per-job scratch volume names
+_DISK_REGISTRY_MEM: dict[str, Any] = {}
+
+
+def disk_registry_module() -> Any | None:
+    """glaeda-disk-registry as a module: beside this script (a checkout, the release tree), else in the release
+    glaeda-update installed (~/.local/bin holds only glaeda-disk itself). None when neither is there."""
+    if "module" in _DISK_REGISTRY_MEM:
+        return _DISK_REGISTRY_MEM["module"]
+    import importlib.machinery
+    import importlib.util
+    candidates = [Path(__file__).resolve().with_name("glaeda-disk-registry")]
+    update = HOME / ".local/state/glaeda/update"
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+        tag = json.loads((update / "state.json").read_text()).get("current")
+        if isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", tag):
+            candidates.append(update / "generations" / tag / "glaeda" / "scripts" / "glaeda-disk-registry")
+    module = None
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            loader = importlib.machinery.SourceFileLoader("glaeda_disk_registry", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            if spec is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            break
+        except Exception:  # a broken copy must not break the disk pass: the checker just does not run
+            module = None
+    _DISK_REGISTRY_MEM["module"] = module
+    return module
+
+
+def disk_registry() -> tuple[Any | None, Any | None, str]:
+    """(module, registry, error): the loaded registry, or None and why. Loaded once per run."""
+    if "registry" in _DISK_REGISTRY_MEM:
+        return _DISK_REGISTRY_MEM["registry"]
+    module = disk_registry_module()
+    if module is None:
+        got: tuple[Any | None, Any | None, str] = (None, None, "glaeda-disk-registry not found")
+    else:
+        try:
+            got = (module, module.load(module.registry_file()), "")
+        except Exception as error:  # RegistryError, or anything a malformed file raises
+            got = (module, None, f"registry not loaded: {error}")
+    _DISK_REGISTRY_MEM["registry"] = got
+    return got
+
+
+def checker_enabled() -> bool:
+    flag = os.environ.get(CHECKER_ENV, "")
+    if flag in ("0", "1"):
+        return flag == "1"
+    return DARWIN and not RUNNER_CACHE_PROFILE
+
+
+def _shown_path(path: Path) -> str:
+    """A path for the report, with another account's home redacted the way the census labels are."""
+    parts = path.parts
+    if parts[:4] == ("/", "System", "Volumes", "Data"):
+        parts = ("/", *parts[4:])
+    if len(parts) >= 3 and parts[1] == "Users" and parts[2] not in {HOME.name, "Shared"}:
+        return "private-user-data"
+    return str(Path(*parts)) if parts else str(path)
+
+
+def undeclared_growth(used: int, rows: list[tuple[Path, int, str]], volumes: list[dict[str, Any]] | None,
+                      gap: int, residual: str, base_bytes: int, caches: list[tuple[str, Path]],
+                      size_of: Any, alarm_bytes: int) -> dict[str, Any]:
+    """One volume's undeclared growth: used - base - registered caches - live job volumes (never below 0), the top
+    undeclared paths and whether it is past the alarm line. rows are the accounting's outermost measured rows (no row
+    inside another); caches are (name, root) pairs; size_of(root) sizes a root a row holds whole (None: unknown)."""
+    def under(path: Path, root: Path) -> bool:
+        return path == root or root in path.parents
+
+    cache_bytes: dict[str, int] = {}
+    root_bytes: dict[Path, int] = {}
+    unsized: list[str] = []
+    for name, root in caches:
+        canon = Path(census_canon(str(root)))
+        if any(canon in path.parents for path, _, _ in rows):
+            # a row holds the whole root (the census sized its parent as one tree): size the root itself
+            size = size_of(root)
+            if size is None:
+                unsized.append(name)
+                size = 0
+        else:
+            size = sum(n for path, n, _ in rows if under(path, canon))
+        root_bytes[canon] = size
+        cache_bytes[name] = cache_bytes.get(name, 0) + size
+    jobs = [v for v in volumes or [] if str(v.get("name", "")).startswith(JOB_VOLUME_PREFIX)]
+    job_bytes = sum(int(v.get("bytes", 0)) for v in jobs)
+    declared = sum(cache_bytes.values())
+    undeclared = max(0, used - base_bytes - declared - job_bytes)
+    top: list[dict[str, Any]] = []
+    for path, size, _ in rows:
+        if any(under(path, root) for root in root_bytes):
+            continue
+        size -= sum(n for root, n in root_bytes.items() if path in root.parents)
+        if size > 0:
+            top.append({"path": _shown_path(path), "bytes": size, "owner": census_owner(str(path))})
+    if gap > 0:
+        top.append({"path": f"(no directory: {residual})", "bytes": gap, "owner": ""})
+    top.sort(key=lambda row: -row["bytes"])
+    return {"used": used, "base": base_bytes, "declared": declared, "caches": cache_bytes,
+            "job_volumes": job_bytes, "job_volume_count": len(jobs), "undeclared": undeclared,
+            "alarm_bytes": alarm_bytes, "alarm": undeclared > alarm_bytes, "unsized_caches": unsized,
+            "top": top[:UNDECLARED_TOP]}
+
+
+def undeclared_for_volume(used: int, rows: list[tuple[Path, int, str]], volumes: list[dict[str, Any]] | None,
+                          gap: int, residual: str) -> dict[str, Any] | None:
+    """The checker's row for one volume, or None when it does not run here (or the registry cannot be read: then the
+    row is {"error": ...}, so a broken registry shows instead of passing as zero growth)."""
+    if not checker_enabled():
+        return None
+    module, registry, error = disk_registry()
+    if registry is None:
+        return {"error": error}
+    caches = [(cache.name, root) for cache in registry.caches for root in module.roots(cache)]
+    base = int((registry.base_gib or 0) * GIB)
+    return undeclared_growth(used, rows, volumes, gap, residual, base, caches,
+                             lambda root: du_bytes(root, record_timeout=False),
+                             int(registry.undeclared_alarm_gib * GIB))
+
+
+def undeclared_findings(accounting: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """summary.json findings for volumes past the checker's alarm line (glaeda-mini-health raises them as is)."""
+    out = []
+    for row in accounting:
+        checked = row.get("undeclared") if isinstance(row, dict) else None
+        if not isinstance(checked, dict) or not checked.get("alarm"):
+            continue
+        top = ", ".join(f"{t['path']} {t['bytes'] / GIB:.1f}G" for t in checked.get("top", [])[:5])
+        out.append({"id": "undeclared_growth", "severity": "warn", "auto_fix": "impossible",
+                    "path": (checked.get("top") or [{}])[0].get("path", row.get("mount", "")),
+                    "evidence": (f"{checked['undeclared'] / GIB:.1f} GiB undeclared growth on {row.get('mount')} "
+                                 f"(over {checked['alarm_bytes'] / GIB:.0f} GiB): used {checked['used'] / GIB:.1f}G "
+                                 f"- base {checked['base'] / GIB:.1f}G - registered caches "
+                                 f"{checked['declared'] / GIB:.1f}G - job volumes {checked['job_volumes'] / GIB:.1f}G; "
+                                 f"top: {top}; fix: a config/disk-registry.toml entry or a scratch redirect")})
     return out
 
 
@@ -14173,7 +14335,7 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
         payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
                    "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
                    "accounting_gap": accounting_gap,
-                   "findings": list(EVICTION_STUCK),
+                   "findings": [*EVICTION_STUCK, *undeclared_findings(accounting)],
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
@@ -14499,6 +14661,17 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
         if isinstance(a.get("residual"), dict):
             print(f"  accounting gap {gib(a['residual'].get('bytes', 0)).strip()}: {a['residual'].get('category')}")
+        checked = a.get("undeclared")
+        if isinstance(checked, dict) and checked.get("error"):
+            print(f"  undeclared growth: not checked ({checked['error']})")
+        elif isinstance(checked, dict):
+            print(f"  undeclared growth {gib(checked['undeclared']).strip()}"
+                  f"{' ALARM over ' + gib(checked['alarm_bytes']).strip() if checked['alarm'] else ''}: "
+                  f"used {gib(checked['used']).strip()} - base {gib(checked['base']).strip()} - registered caches "
+                  f"{gib(checked['declared']).strip()} - job volumes {gib(checked['job_volumes']).strip()}"
+                  f"{' (unsized: ' + ', '.join(checked['unsized_caches']) + ')' if checked['unsized_caches'] else ''}")
+            for t in checked.get("top", []):
+                print(f"    {gib(t['bytes'])} {t['path']}{'  (' + t['owner'] + ')' if t['owner'] else ''}")
         container = a.get("container") or {}
         if container.get("free") is not None:
             print(f"  APFS container free {gib(container['free']).strip()} of "
