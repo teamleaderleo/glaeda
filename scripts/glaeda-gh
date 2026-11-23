@@ -19763,6 +19763,12 @@ class LandQueue:
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
+        with self.lock:
+            # Tried from here on: only a merge that began ends the once-per-head retry (the refusal path's check). A
+            # restart between the refusal and this line once stopped cmux#51491 as a conflict with no merge tried
+            # (2026-11-23 09:34Z), where git merged its base cleanly.
+            e.setdefault("unionMerge", {"head": head, "at": self.now})["tried"] = True
+            self.save(e)
         try:
             sha, branch, base_sha, why = self.union_plan(e, head)
         except OSError as error:
@@ -19959,7 +19965,8 @@ class LandQueue:
             # A conflict refusal that names a step this queue runs (an update-branch that could still merge the base
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
-            if kind == "update_branch" and (e.get("unionMerge") or {}).get("head") != head:
+            tried = e.get("unionMerge") or {}
+            if kind == "update_branch" and (tried.get("head") != head or not tried.get("tried")):
                 # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
                 # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
                 e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
