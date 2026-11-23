@@ -16056,10 +16056,31 @@ class LandQueue:
         for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
                     and k not in self.sending and k not in self.overflowing]:
             try:
+                self.forward_read_before_give_up(self.entries[key])
                 with self.lock:
                     self.forward_follow(self.entries[key], executor)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def forward_read_before_give_up(self, e: dict) -> None:
+        """Outside the lock. A forwarded E about to give up (LAND_FORWARD_GIVE_UP) while this host's cache holds no
+        state for its PR gets one read of it (REFRESH: the broker on a lane VM), so forward_follow then ends it by
+        what GitHub says. Without it every such row stopped forward_no_outcome, a blocker notice to its requester,
+        though GitHub had merged it: fs-agent-lane-2, 2026-11-23 07:51Z, five in a row (cmuxterm-hq#19653, #18843,
+        #18955, #18716, leo-workspace#8395), each merged hours before. The read's error, if any, is named in the
+        stop (forward_give_up)."""
+        if e.get("forwardGiveUpRead") is not None:
+            return  # read once per row: a failed read is said in the stop, never retried every look
+        first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
+        if self.now - first <= LAND_FORWARD_GIVE_UP:
+            return
+        if str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("state") or ""):
+            return
+        try:
+            error = self.refresh(e["key"])
+        except Exception as caught:  # noqa: BLE001  a failed read is reported in the stop, not raised
+            error = describe(caught)
+        e["forwardGiveUpRead"] = {"at": self.now, "error": land_trim(error, 200) if error else ""}
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -16138,6 +16159,9 @@ class LandQueue:
             cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
         else:
             cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
+            read_error = (e.get("forwardGiveUpRead") or {}).get("error")
+            if read_error:
+                cause += f" (a direct read of it just now failed: {read_error})"
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
         elif not executor and not ((e.get("handedOff") or {}).get("key") and self.broker_client()):
