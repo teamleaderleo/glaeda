@@ -24081,12 +24081,19 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.w.explains()[-1][-2:], [LB, "--json"])
         self.assertEqual(len(self.w.explains()), 4)
-        # Past LAND_VERDICT_KEEP the change it held back is judged, though head and checks still hold.
+        # Past LAND_VERDICT_KEEP a change it held back is judged, though head and checks still hold -- but not this
+        # one: GitHub no longer saying whether the PR merges is less than the value already judged, so it is never
+        # judged at all, here or at the keep's end (mergeability_lost). The row's own wake still judges it.
         self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
         self.tick(30)
         self.assertEqual(len(self.w.explains()), 4)
-        self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
         self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.explains()), 4, "a mergeability the cache lost is judged at the wake, not here")
+        self.assertGreater(self.q.entries[self.KEY]["wakeAt"], self.t)
+        # a change the verdict can depend on, past the keep, is judged at once as before
+        self.w.cache[self.KEY]["data"]["mergeable"] = "CONFLICTING"
+        self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
+        self.tick(30)
         self.assertEqual(len(self.w.explains()), 5)
 
     def test_a_kept_wait_verdict_still_judges_at_its_own_timeout(self):
