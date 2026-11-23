@@ -15674,20 +15674,39 @@ class GateTest(unittest.TestCase):
         self.assertLess(text.index("unset SDKROOT"), text.index("listen --runner-dir"))
         self.assertLess(text.index("unset SDKROOT"), text.index("exec ./run.sh"), "the fallback run.sh is clean too")
 
-    def test_hooks_prefer_a_python_that_is_not_the_xcrun_shim(self) -> None:
+    def test_hooks_never_run_apples_python(self) -> None:
+        """The hooks run glaeda-python's ROOT_PYTHON when it is root-owned, else python3 on PATH unless it is Apple's,
+        else Homebrew's, else this account's USER_PYTHON; never the /usr/bin/python3 xcrun shim, not even last."""
         # a stand-in shim, so the test means the same on a Mac (where /usr/bin/python3 is the shim) and on Linux CI
-        brew, shim = self.tmp / "brew-python3", self.tmp / "shim-python3"
-        make_executable(brew, "#!/bin/sh\n")
-        make_executable(shim, "#!/bin/sh\n")
-        with mock.patch.object(cr, "XCRUN_SHIM_PYTHON", os.path.realpath(shim)):
-            with mock.patch.object(cr.shutil, "which", return_value=os.fspath(shim)), \
-                    mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew), os.fspath(shim))):
-                self.assertEqual(cr.hook_python(), os.fspath(brew))
-            with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
-                self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH that is not the shim")
-            with mock.patch.object(cr.shutil, "which", return_value=None), \
-                    mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", os.fspath(shim))):
-                self.assertEqual(cr.hook_python(), os.path.realpath(shim), "the shim only when nothing else runs")
+        brew, shim, root = self.tmp / "brew-python3", self.tmp / "shim-python3", self.tmp / "root-python3.13"
+        home = self.tmp / "home"
+        user = home / cr.USER_PYTHON
+        for exe in (brew, shim, root, user):
+            make_executable(exe, "#!/bin/sh\n")
+        clt = "/Library/Developer/CommandLineTools/usr/bin/python3"
+        self.assertTrue(cr.apple_python(clt))
+        self.assertTrue(cr.apple_python("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/python3"))
+        self.assertFalse(cr.apple_python(cr.ROOT_PYTHON))
+        self.assertNotIn("/usr/bin/python3", cr.HOOK_PYTHONS)
+        with mock.patch.object(cr, "XCRUN_SHIM_PYTHON", os.path.realpath(shim)), \
+                mock.patch.object(cr, "ROOT_PYTHON", os.fspath(root)), \
+                mock.patch.object(cr.Path, "home", return_value=home):
+            with mock.patch.object(cr, "untrusted_exec", return_value=None), \
+                    mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
+                self.assertEqual(cr.hook_python(), os.fspath(root), "a root-owned ROOT_PYTHON comes first")
+            with mock.patch.object(cr, "untrusted_exec", return_value="owned by uid 501, not root or this account"):
+                with mock.patch.object(cr.shutil, "which", return_value=os.fspath(shim)), \
+                        mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew),)):
+                    self.assertEqual(cr.hook_python(), os.fspath(brew), "an untrusted ROOT_PYTHON is passed over")
+                with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
+                    self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH, not Apple's")
+                with mock.patch.object(cr.shutil, "which", return_value=clt), \
+                        mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", os.fspath(shim))):
+                    self.assertEqual(cr.hook_python(), os.fspath(user), "this account's uv python, never Apple's")
+                user.unlink()
+                with mock.patch.object(cr.shutil, "which", return_value=os.fspath(shim)), \
+                        mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", os.fspath(shim))):
+                    self.assertIsNone(cr.hook_python(), "nothing (a typed preflight failure) rather than the shim")
 
     def test_listen_sh_runs_the_runner_without_a_gate_that_cannot_start(self) -> None:
         (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")
@@ -19141,7 +19160,7 @@ class DedicatedRunnerTest(unittest.TestCase):
             self.assertIn("owned by uid 501", cr.untrusted_exec("/usr/bin/python3", me, lstat))
 
     def test_a_user_entry_runs_a_protected_toolchain_and_refuses_an_unprotected_one(self) -> None:
-        """PROTECTED_TOOLCHAIN: with no --python a user entry's hooks run Apple's /usr/bin/python3; its agent, watch,
+        """PROTECTED_TOOLCHAIN: with no --python a user entry's hooks run the root-owned ROOT_PYTHON; its agent, watch,
         listener gate and .path hold only the system PATH and DEVELOPER_DIR is the Command Line Tools. A declared PATH
         entry, an admit command or an interpreter that fails the check blocks the whole install, typed."""
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
@@ -19161,7 +19180,7 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertEqual(receipt["actions"][0]["state"], "unchanged")
         runner = self.home / "actions-runner-glaeda-hq-two-mac-a"
         hooks = runner / cr.HOOK_DIR
-        self.assertTrue((hooks / "job-started.sh").read_text().splitlines()[-1].startswith("exec /usr/bin/python3 "))
+        self.assertTrue((hooks / "job-started.sh").read_text().splitlines()[-1].startswith(f"exec {cr.ROOT_PYTHON} "))
         listen = (hooks / "listen.sh").read_text()
         self.assertIn(f"export DEVELOPER_DIR={cr.PROTECTED_DEVELOPER_DIR}\nexport PATH={cr.PROTECTED_PATH}\n", listen)
         label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.hq-two-mac-a"
@@ -19174,7 +19193,7 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertEqual(dot_path, [f"{self.home}/.local/bin", *cr.PROTECTED_PATH.split(":")])
         for dirs in (dot_path, watch["EnvironmentVariables"]["PATH"].split(":"), agent["EnvironmentVariables"]["PATH"].split(":")):
             self.assertFalse([e for e in dirs if e.startswith(("/opt/homebrew", "/usr/local"))])
-        # the checked set: the interpreters, the Command Line Tools' python3, each PATH dir, the admit and watch commands
+        # the checked set: the interpreters, each PATH dir, the admit and watch commands; no Apple python3
         with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
                 mock.patch.object(cr, "current_user", return_value="cmuxci-gui-01"):
             checked = []
@@ -19190,10 +19209,26 @@ class DedicatedRunnerTest(unittest.TestCase):
         tool = doc["actions"][0]
         self.assertEqual((tool["kind"], tool["state"], tool["missing"]), ("toolchain", "blocked", "protected-toolchain"))
         self.assertIn(".local/bin", tool["note"])
-        for want in ("/usr/bin/python3", f"{cr.PROTECTED_DEVELOPER_DIR}/usr/bin/python3", "/usr/bin", "/sbin",
-                     "/usr/bin/true", sys.executable):
+        for want in (cr.ROOT_PYTHON, "/usr/bin", "/sbin", "/usr/bin/true", sys.executable):
             self.assertIn(want, checked)
+        self.assertFalse([p for p in checked if p.endswith("/python3") and cr.apple_python(p)], checked)
         self.assertFalse([a for a in doc["actions"][1:] if a.get("applied")], "nothing applied past a blocked toolchain")
+
+    def test_a_user_entry_on_a_mini_without_root_python_blocks_naming_the_fix(self) -> None:
+        """Rollout: a mini that has not run the new glaeda-mini-setup has no ROOT_PYTHON. A user entry's install blocks
+        on its toolchain step (nothing applied: the installed runner keeps running) and says root_python_missing and
+        the fix, rather than falling back to Apple's /usr/bin/python3."""
+        ctx = mock.Mock(python=cr.ROOT_PYTHON, dedicated={"user": "cmuxci-gui-01"}, home=self.home,
+                        runner_dir=self.runner, show=lambda p: os.fspath(p))
+        with mock.patch.object(cr, "ROOT_PYTHON", os.fspath(self.tmp / "no-glaeda-python/bin/python3.13")), \
+                mock.patch.object(cr, "PROTECTED_PYTHON", os.fspath(self.tmp / "no-glaeda-python/bin/python3.13")):
+            ctx.python = cr.ROOT_PYTHON
+            with mock.patch.object(cr, "toolchain_paths", return_value=[cr.ROOT_PYTHON]):
+                act = cr.plan_toolchain(ctx)
+        self.assertEqual((act["state"], act["missing"], act["rootPython"]), ("blocked", "protected-toolchain", "missing"))
+        self.assertTrue(act["note"].startswith("root_python_missing: "), act["note"])
+        self.assertIn("glaeda-python --install-root", act["note"])
+        self.assertNotIn("/usr/bin/python3", json.dumps(act))
 
     def test_an_entry_without_a_user_refuses_another_account(self) -> None:
         """An entry with no user is the member user's: run as another account (a hidden GUI user) it refuses."""

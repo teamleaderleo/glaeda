@@ -21,15 +21,22 @@ reads only. `install --apply`:
    alias glaeda-seeder (read over this Mac's authenticated SSH session to the seeder, never scanned), and
    config.json (the seeder's addresses and login user), which glaeda-seed-prefetch reads;
 3. on the seeder, authorizes each mini's key with
-   restrict,from="CIDRS",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve"
-   (no shell, pty, port, agent or X11 forwarding), after copying authorized_keys aside;
+   restrict,from="CIDRS",command="~/.local/bin/python3.13 -I ~/.local/libexec/glaeda-seed-serve"
+   (no shell, pty, port, agent or X11 forwarding; ~ is the seeder's home, written out), after copying
+   authorized_keys aside;
 4. asks each HOST to ping the seeder with that key (ping-v1) and reports the answer.
 
 It prints the glaeda-mini-fleet manifest key entries for the seeder's authorized_keys policy, which is
 exclusive: add them to ~/.config/glaeda/mini-fleet.json, or `glaeda-mini-fleet check` reports drift.
 
 Only glaeda-seed-lan's own lines (comment glaeda-seed-lan@HOST with this forced command) are ever replaced
-or removed. The seeder must be trusted-only: its glaeda runner receipt must name a trusted ref, and
+or removed. A line with the former forced command (Apple's python3 -I ..., written before glaeda ran
+its own Python 3.13, scripts/glaeda-python) still counts as its own: it keeps serving until the next --apply
+rewrites it in place with the current command.
+
+Every program run on a host (the forced command, and the probes this command sends over SSH) runs under the
+login user's ~/.local/bin/python3.13 (glaeda-python USER_PYTHON); a host without it fails with the fix:
+glaeda-python --install (or glaeda-mini-setup --apply). The seeder must be trusted-only: its glaeda runner receipt must name a trusted ref, and
 cmuxs-mac-mini-6 (PR code as the same user) is refused outright. Verification here runs from an SSH
 shell, where Local Network Privacy does not apply; docs/CMUX_MINI_RUNNER.md shows how to check under launchd.
 
@@ -43,7 +50,7 @@ glaeda-seed-archive uses to fill it.
 ~/.config/glaeda/lan-mesh/ with its own key, config.json naming every other HOST and its LAN address
 (probed with ipconfig, or --address), and known_hosts pinning each HOST's host key under its name. Each
 HOST authorizes every other HOST's mesh key as
-restrict,from="CIDRS",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve --role product",
+restrict,from="CIDRS",command="~/.local/bin/python3.13 -I ~/.local/libexec/glaeda-seed-serve --role product",
 which answers product verbs only, from that mini's product cache. Any PR mini may serve: the consumer
 verifies the sha256 GitHub recorded, never the server. Keys are validated and deduplicated as for seeds;
 it adds and replaces only its own lines (comment glaeda-lan-mesh@HOST). mesh-remove takes the mesh off
@@ -64,7 +71,10 @@ directory chain over plain SSH. It never runs sudo or sends a password: a passwo
 cmux account's login shell could be read by a ~/.zshenv a PR job planted. --apply writes the root script
 (this checkout's helper bytes and sha256, never the mini's user-writable copy) and prints the commands
 that run it from a non-cmux admin account (--admin) or at the console. The script fails closed unless
-every existing path component is a root-owned non-symlink without group or other write.
+every existing path component is a root-owned non-symlink without group or other write. CI execs that copy
+directly, so its shebang names the root-owned Python 3.13 (HELPER_PYTHON, glaeda-python ROOT_PYTHON):
+helper-install reports root_python per host, and the script refuses to install while that interpreter is
+missing (the copy already there keeps running under the interpreter its own shebang names).
 """
 
 from __future__ import annotations
@@ -98,6 +108,12 @@ REMOTE_TIMEOUT = 120
 KEEP_BACKUPS = 5
 # The serve script's place on every host; the forced command is built from these, never read back.
 SERVE_RELATIVE = ".local/libexec/glaeda-seed-serve"
+# The login user's Python 3.13 on every host (scripts/glaeda-python USER_PYTHON): what the forced command and every
+# program sent over SSH run. Apple's python3 is never used: SEEDER_REMOTE only recognises the forced
+# command earlier versions wrote with it, so --apply replaces those lines instead of leaving them beside the new ones.
+USER_PYTHON_RELATIVE = ".local/bin/python3.13"
+REMOTE_PYTHON = "~/" + USER_PYTHON_RELATIVE
+PYTHON_FIX = "run glaeda-python --install there (or glaeda-mini-setup --apply)"
 HOME_RE = re.compile(r"/[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*){0,15}")
 # The trusted seeder serves seeds and never joins the product mesh (it would then hold PR minis' keys).
 TRUSTED_SEEDERS = {"cmux15"}
@@ -113,14 +129,16 @@ def prefetch_module():
     return module
 
 
-# Runs on the seeder under /usr/bin/python3 (3.9). Prints one JSON object.
+# Runs on the seeder under REMOTE_PYTHON (kept parseable by 3.9 for one more pass). Prints one JSON object.
 SEEDER_REMOTE = r'''
 import base64, hashlib, json, os, subprocess, sys, time
 args = json.loads(sys.argv[1])
 home = os.path.expanduser("~")
 serve = os.path.join(home, ".local/libexec/glaeda-seed-serve")
 ak = os.path.join(home, ".ssh/authorized_keys")
-command = "/usr/bin/python3 -I " + serve + args.get("command_suffix", "")
+command = os.path.join(home, ".local/bin/python3.13") + " -I " + serve + args.get("command_suffix", "")
+# The forced command earlier versions wrote (Apple's python): still ours, so apply replaces it in place.
+legacy = "/usr/bin/python3 -I " + serve + args.get("command_suffix", "")  # PY_PIN_EXEMPT: matches old key lines, never runs
 out = {"home": home, "command": command, "ak_symlink": os.path.islink(ak)}
 out["address"] = ""
 for interface in ("en0", "en1"):
@@ -164,7 +182,8 @@ except OSError:
     lines = []
 def ours(line):
     words = line.split()
-    return bool(words) and words[-1].startswith(args["tag"]) and ('command="' + command + '"') in line
+    return bool(words) and words[-1].startswith(args["tag"]) and any(('command="' + c + '"') in line
+                                                                      for c in (command, legacy))
 out["authorized"] = {line.split()[-1]: line for line in lines if ours(line)}
 def blob(line):
     words = line.split()
@@ -222,7 +241,7 @@ out["authorized"] = {l.split()[-1]: l for l in new if ours(l)}
 print(json.dumps(out))
 '''
 
-# Runs on a PR mini under /usr/bin/python3 (3.9). Prints one JSON object.
+# Runs on a PR mini under REMOTE_PYTHON. Prints one JSON object.
 CLIENT_REMOTE = r'''
 import json, os, shutil, subprocess, sys
 args = json.loads(sys.argv[1])
@@ -292,14 +311,16 @@ class Failure(Exception):
 
 
 def remote(host: str, program: str, args: dict) -> dict:
-    """Run PROGRAM with ARGS (JSON) under /usr/bin/python3 on HOST over SSH; its JSON answer."""
+    """Run PROGRAM with ARGS (JSON) under REMOTE_PYTHON on HOST over SSH; its JSON answer."""
     # -I: no user site-packages, no PYTHON* variables, and no ~/json.py shadowing the standard library.
-    command = "/usr/bin/python3 -I - " + shlex.quote(json.dumps(args))
+    command = f"{REMOTE_PYTHON} -I - " + shlex.quote(json.dumps(args))
     try:
         proc = subprocess.run([SSH, *SSH_OPTIONS, host, command], input=program, capture_output=True, text=True,
                               timeout=REMOTE_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as error:
         raise Failure(f"{host}: ssh {type(error).__name__}") from error
+    if proc.returncode == 127:  # the login shell found no REMOTE_PYTHON
+        raise Failure(f"{host}: no {REMOTE_PYTHON}: {PYTHON_FIX}")
     if proc.returncode != 0:
         raise Failure(f"{host}: exit {proc.returncode}: {proc.stderr.strip()[-200:]}")
     try:
@@ -327,7 +348,7 @@ def forced_command(probe: dict, host: str, suffix: str = "") -> str:
     home = probe.get("home", "")
     if not isinstance(home, str) or not HOME_RE.fullmatch(home) or "/../" in home + "/" or "/./" in home + "/":
         raise Failure(f"{host}: unexpected home directory {home!r}")
-    command = f"/usr/bin/python3 -I {home}/{SERVE_RELATIVE}{suffix}"
+    command = f"{home}/{USER_PYTHON_RELATIVE} -I {home}/{SERVE_RELATIVE}{suffix}"
     if probe.get("command") != command:
         raise Failure(f"{host}: its serve command {probe.get('command')!r} is not {command!r}")
     return command
@@ -695,7 +716,7 @@ def mesh(hosts: list[str], overrides: dict[str, str], cidrs: str, user: str, app
     report["manifest_keys"] = [{"id": f"lan-mesh-{host}", "fingerprint": fingerprint(key), "comment": MESH_TAG + host,
                                 "role": f"compiled products over the LAN: {host} reads other PR minis' product caches "
                                         "(glaeda-seed-serve --role product, forced command)",
-                                "status": "active", "options": f'restrict,from="{cidrs}",command="/usr/bin/python3 -I ~/{SERVE_RELATIVE}{MESH_ROLE}"',
+                                "status": "active", "options": f'restrict,from="{cidrs}",command="{REMOTE_PYTHON} -I ~/{SERVE_RELATIVE}{MESH_ROLE}"',
                                 "public_key": f"{key} {MESH_TAG}{host}"} for host, key in keys.items()]
     report["ok"] = not any(str(h.get("key", "")).startswith("refused") for h in report["hosts"].values())
     report["next"] = ["add manifest_keys to ~/.config/glaeda/mini-fleet.json (every mesh host's authorized_keys "
@@ -727,41 +748,56 @@ HELPER_OWNER = "root:wheel"
 HELPER_UID = 0
 HELPER_LOCK = "/var/run/glaeda-lan-fetch-install.lock"
 HELPER_LOCK_MINUTES = 10  # a lock older than this, or held by a dead pid, is taken over
+# The helper's shebang: cmux CI execs the root copy directly as the runner user, so it starts the root-owned
+# Python 3.13 (glaeda-python ROOT_PYTHON), never the login user's writable ~/.local copy or Apple's python.
+HELPER_PYTHON = "/opt/glaeda-python/bin/python3.13"
 SCRIPT_DIR_OUT = Path(os.path.expanduser("~/.local/state/glaeda/seed-lan"))
 
-# Runs on a host under /usr/bin/python3 (3.9), as the login user: the helper's state, read-only.
+# Runs on a host under REMOTE_PYTHON, as the login user: the helper's state and ROOT_PYTHON's, read-only.
 HELPER_PROBE = r'''
 import hashlib, json, os, stat, sys
-path = json.loads(sys.argv[1])["path"]
+args = json.loads(sys.argv[1])
+path = args["path"]
 out = {"sha": "", "chain": []}
 try:
     out["sha"] = hashlib.sha256(open(path, "rb").read()).hexdigest()
 except OSError:
     pass
-p = path
-while True:
-    try:
-        info = os.lstat(p)
-        out["chain"].append([p, info.st_uid, stat.S_IMODE(info.st_mode), stat.S_ISLNK(info.st_mode)])
-    except OSError:
-        out["chain"].append([p, None, None, False])
-    if p == "/":
-        break
-    p = os.path.dirname(p)
+def chain(p):
+    found = []
+    while True:
+        try:
+            info = os.lstat(p)
+            found.append([p, info.st_uid, stat.S_IMODE(info.st_mode), stat.S_ISLNK(info.st_mode)])
+        except OSError:
+            found.append([p, None, None, False])
+        if p == "/":
+            return found
+        p = os.path.dirname(p)
+out["chain"] = chain(path)
+# The helper's shebang interpreter: its real file, the link and every directory above each, root-owned.
+python = args.get("python")
+if python:
+    real = os.path.realpath(python)
+    out["python"] = {"executable": os.access(real, os.X_OK) and os.path.isfile(real), "chain": chain(real),
+                     "link": chain(python) if real != python else []}
 print(json.dumps(out))
 '''
 
 
 def helper_root_script(data: bytes, path: str = None, owner: str = None, lock: str = None, uid: int = None,
-                       top: str = "/") -> str:
+                       top: str = "/", python: str = None) -> str:
     """A root script that installs DATA at PATH, run by hand as root (never through the fleet user).
 
     It fails closed unless every existing component from TOP down to PATH, the file included, is a
     non-symlink owned by UID with no group or other write. It creates only missing directories, installs
     through a temporary file whose sha256 must match, and takes a lock directory holding its pid: a
     live holder younger than HELPER_LOCK_MINUTES means BUSY (exit 75); a dead or older one is replaced.
+    It also refuses while PYTHON (the helper's shebang, HELPER_PYTHON) is not executable: the helper would not
+    start, and the copy already there keeps working until the mini has it.
     """
     path, owner, lock = path or HELPER_PATH, owner or HELPER_OWNER, lock or HELPER_LOCK
+    python = python or HELPER_PYTHON
     uid = HELPER_UID if uid is None else uid
     want = hashlib.sha256(data).hexdigest()
     parts, p = [path], os.path.dirname(path)
@@ -782,6 +818,8 @@ def helper_root_script(data: bytes, path: str = None, owner: str = None, lock: s
         f'  [ -n "$(find "$1" -maxdepth 0 -user {uid} ! -perm -0020 ! -perm -0002 2>/dev/null)" ] || '
         'fail "not owned by the install user, or group/other-writable: $1"',
         "}",
+        f'[ -x {q(python)} ] || fail "no {python} (the helper\'s interpreter): run sudo -n glaeda-python '
+        '--install-root, or glaeda-mini-setup --apply, first"',
         *[f'if [ -e {q(x)} ] || [ -L {q(x)} ]; then check {q(x)}; fi' for x in parts],
         f"lock={q(lock)}",
         'if ! mkdir "$lock" 2>/dev/null; then',
@@ -809,6 +847,17 @@ def helper_root_script(data: bytes, path: str = None, owner: str = None, lock: s
     ]) + "\n"
 
 
+def root_python_state(probe: dict) -> str:
+    """"ok" when the helper's shebang interpreter (HELPER_PYTHON) runs from a root-owned, go-w chain."""
+    python = probe.get("python") or {}
+    if not python.get("executable"):
+        return f"root_python_missing: {HELPER_PYTHON}; run sudo -n glaeda-python --install-root (glaeda-mini-setup --apply)"
+    for path, uid, mode, link in [*python.get("chain", []), *python.get("link", [])]:
+        if uid != 0 or mode is None or (mode & 0o022 and not link):
+            return f"root_python_untrusted: {path}"
+    return "ok"
+
+
 def helper_state(probe: dict, want: str) -> str:
     chain = probe.get("chain") or []
     if probe.get("sha") != want:
@@ -834,20 +883,26 @@ def helper_install(hosts: list[str], apply: bool, admin: str = "ADMIN") -> dict:
     report: dict = {"tool": "glaeda-seed-lan", "mode": "helper-install", "apply": apply, "path": HELPER_PATH,
                     "sha256": want, "hosts": {}}
     pending = []
+    no_python = []
     for host in hosts:
         try:
-            state = helper_state(remote(host, HELPER_PROBE, {"path": HELPER_PATH}), want)
+            probe = remote(host, HELPER_PROBE, {"path": HELPER_PATH, "python": HELPER_PYTHON})
+            state, python = helper_state(probe, want), root_python_state(probe)
         except Failure as error:
-            state = f"unreachable: {error}"
-        report["hosts"][host] = {"state": state}
+            state, python = f"unreachable: {error}", "unknown"
+        report["hosts"][host] = {"state": state, "root_python": python}
         if state != "current":
             pending.append(host)
-    report["ok"] = not pending
+        if python != "ok":
+            no_python.append(host)
+    report["ok"] = not pending and not no_python
+    python_next = [f"{', '.join(no_python)}: the helper runs {HELPER_PYTHON}, which is missing or not root-owned "
+                   "there; run glaeda-mini-setup --apply (sudo -n glaeda-python --install-root) first"] if no_python else []
     if not pending:
-        report["next"] = []
+        report["next"] = python_next
         return report
     if not apply:
-        report["next"] = ["rerun with --apply to write the root script and print the commands to run it"]
+        report["next"] = [*python_next, "rerun with --apply to write the root script and print the commands to run it"]
         return report
     script = helper_root_script(data)
     name = f"glaeda-lan-fetch-install-{want[:12]}.sh"
@@ -863,7 +918,7 @@ def helper_install(hosts: list[str], apply: bool, admin: str = "ADMIN") -> dict:
             f"ssh -t {admin}@{host} {shlex.quote(f'shasum -a 256 {name} && sudo /bin/bash {name}; rm -f {name}')}",
         ] for host in pending
     }
-    report["next"] = [
+    report["next"] = [*python_next,
         f"Run each host's commands as {admin}, an admin account other than cmux (or at the console: copy the "
         f"script there, check shasum -a 256 is {script_sha}, then sudo /bin/bash it). Never through the cmux "
         "account: its login shell would see the sudo password.",

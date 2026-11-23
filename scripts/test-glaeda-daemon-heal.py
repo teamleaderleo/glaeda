@@ -676,11 +676,13 @@ class SandboxHeal(Base):
 
 
 class Install(unittest.TestCase):
-    def test_launchdaemon_runs_the_root_snapshot_with_system_python_at_the_policy_interval(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+    def test_launchdaemon_runs_the_root_snapshot_with_root_python_at_the_policy_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(heal, "trusted_root_python", return_value=""):
             want = heal.desired_install(POLICY_PATH, Path(tmp))
             doc = plistlib.loads(want["plist"])
-            self.assertEqual(doc["ProgramArguments"][:3], ["/usr/bin/python3", "-I", os.fspath(Path(tmp) / "glaeda-daemon-heal")])
+            self.assertEqual(doc["ProgramArguments"][:3], [heal.ROOT_PYTHON, "-I", os.fspath(Path(tmp) / "glaeda-daemon-heal")])
+            self.assertEqual(heal.ROOT_PYTHON, "/opt/glaeda-python/bin/python3.13")
+            self.assertIsNone(want["rootPythonMissing"])
             self.assertEqual(doc["StartInterval"], POLICY["every_s"])
             self.assertNotIn("UserName", doc)
             self.assertIn(os.fspath(Path(tmp) / "macos-daemons.json"), doc["ProgramArguments"])
@@ -703,8 +705,38 @@ class Install(unittest.TestCase):
             (d / "macos-daemons.json").write_text("{}")
             self.assertEqual(heal.install_status(POLICY_PATH, d, plist)["stale"], [os.fspath(d / "macos-daemons.json")])
 
+    def test_a_host_without_root_python_keeps_the_interpreter_its_plist_names(self) -> None:
+        """Rollout: a mini glaeda-mini-setup has not given ROOT_PYTHON yet keeps what its installed plist runs (never a
+        newly written /usr/bin/python3), says so, and moves to ROOT_PYTHON once it is trusted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
+            d.mkdir()
+            missing = mock.patch.object(heal, "trusted_root_python", return_value="/opt/glaeda-python/bin/python3.13 is missing")
+            with missing:
+                want = heal.desired_install(POLICY_PATH, d, plist)
+                self.assertEqual(plistlib.loads(want["plist"])["ProgramArguments"][0], sys.executable, "no plist: this one")
+                self.assertIn("missing", want["rootPythonMissing"])
+                plist.write_bytes(plistlib.dumps({"Label": heal.LABEL, "ProgramArguments": ["/usr/bin/python3", "-I", "x"]}))
+                want = heal.desired_install(POLICY_PATH, d, plist)
+                self.assertEqual(plistlib.loads(want["plist"])["ProgramArguments"][0], "/usr/bin/python3")
+                self.assertEqual(heal.heal_python(plist), ("/usr/bin/python3", "/opt/glaeda-python/bin/python3.13 is missing"))
+                plist.write_bytes(b"not a plist")
+                self.assertEqual(heal.heal_python(plist)[0], sys.executable)
+            plist.write_bytes(plistlib.dumps({"Label": heal.LABEL, "ProgramArguments": ["/usr/bin/python3", "-I", "x"]}))
+            with mock.patch.object(heal, "trusted_root_python", return_value=""):
+                self.assertEqual(heal.heal_python(plist), (heal.ROOT_PYTHON, ""))
+                self.assertEqual(plistlib.loads(heal.desired_install(POLICY_PATH, d, plist)["plist"])["ProgramArguments"][0],
+                                 heal.ROOT_PYTHON)
+
+    def test_install_refuses_an_interpreter_another_account_can_write(self) -> None:
+        with mock.patch.object(heal, "heal_python", return_value=("/home/x/.local/bin/python3.13", "missing")), \
+                mock.patch.object(heal, "loaded", return_value=False), mock.patch.object(heal.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(heal.HealError, "refusing to make root run /home/x/.local/bin/python3.13.*--install-root"):
+                heal.install(POLICY_PATH, True)
+
     def test_runs_on_macos_system_python(self) -> None:
-        """The root daemon runs /usr/bin/python3 (3.9 on macOS): no syntax newer than that."""
+        """A copy installed before ROOT_PYTHON stages the next release under /usr/bin/python3 (3.9 on macOS): no
+        syntax newer than that."""
         import ast
         tree = ast.parse((ROOT / "scripts" / "glaeda-daemon-heal").read_text(), feature_version=(3, 9))
         self.assertFalse([n for n in ast.walk(tree) if type(n).__name__ == "Match"])
@@ -1501,6 +1533,15 @@ class Judge(unittest.TestCase):
         self.assertIn("boom", heal.judge(behind, T0, True)["why"])
         self.assertEqual(heal.judge(self.report(okAt=heal.iso(T0 - 4000)), T0, True)["state"], "stale")
 
+    def test_a_report_without_root_python_says_so_whatever_the_state(self) -> None:
+        self.assertNotIn("rootPythonMissing", heal.judge(self.report(), T0, True))
+        said = {**self.report(), "rootPython": {"path": heal.ROOT_PYTHON, "runs": "/usr/bin/python3",
+                                                "missing": "/opt/glaeda-python/bin/python3.13 is missing"}}
+        verdict = heal.judge(said, T0, True)
+        self.assertEqual((verdict["state"], verdict["rootPythonMissing"]),
+                         ("current", "/opt/glaeda-python/bin/python3.13 is missing"))
+        self.assertNotIn("rootPythonMissing", heal.judge(said, T0, False), "not installed: missing says it all")
+
 
 class Reload(unittest.TestCase):
     def test_a_plist_that_no_longer_matches_the_policy_is_reloaded_once_from_a_detached_helper(self) -> None:
@@ -1508,18 +1549,84 @@ class Reload(unittest.TestCase):
             d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
             (d / "state").mkdir(parents=True)
             (d / heal.POLICY_NAME).write_bytes(edited_policy(every_s=300))
-            plist.write_bytes(heal.desired_install(POLICY_PATH, d)["plist"])  # loaded at the old interval
+            with mock.patch.object(heal, "trusted_root_python", return_value=""):
+                plist.write_bytes(heal.desired_install(POLICY_PATH, d)["plist"])  # loaded at the old interval
+                spawn = mock.Mock()
+                state: dict = {}
+                self.assertTrue(heal.schedule_reload(d, plist, state, T0, 600, spawn))
+                argv, kw = spawn.call_args
+                self.assertEqual(argv[0][:2], [heal.ROOT_PYTHON, "-I"])
+                self.assertIn("--after-pid", argv[0])
+                self.assertTrue(kw["start_new_session"])
+                self.assertFalse(heal.schedule_reload(d, plist, state, T0 + 60, 600, spawn), "once per every_s")
+                plist.write_bytes(heal.desired_install(d / heal.POLICY_NAME, d)["plist"])
+                self.assertFalse(heal.schedule_reload(d, plist, {}, T0, 600, spawn))
+                self.assertEqual(spawn.call_count, 1)
+
+    def test_a_plist_on_the_old_python_moves_to_root_python_once_it_is_trusted_and_not_before(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
+            (d / "state").mkdir(parents=True)
+            (d / heal.POLICY_NAME).write_bytes(POLICY_PATH.read_bytes())
+            with mock.patch.object(heal, "trusted_root_python", return_value=""):
+                doc = plistlib.loads(heal.desired_install(d / heal.POLICY_NAME, d)["plist"])
+            doc["ProgramArguments"][0] = "/usr/bin/python3"  # what every copy before ROOT_PYTHON wrote
+            plist.write_bytes(plistlib.dumps(doc, sort_keys=True))
             spawn = mock.Mock()
-            state: dict = {}
-            self.assertTrue(heal.schedule_reload(d, plist, state, T0, 600, spawn))
-            argv, kw = spawn.call_args
-            self.assertEqual(argv[0][:2], ["/usr/bin/python3", "-I"])
-            self.assertIn("--after-pid", argv[0])
-            self.assertTrue(kw["start_new_session"])
-            self.assertFalse(heal.schedule_reload(d, plist, state, T0 + 60, 600, spawn), "once per every_s")
-            plist.write_bytes(heal.desired_install(d / heal.POLICY_NAME, d)["plist"])
-            self.assertFalse(heal.schedule_reload(d, plist, {}, T0, 600, spawn))
-            self.assertEqual(spawn.call_count, 1)
+            with mock.patch.object(heal, "trusted_root_python", return_value="missing"):
+                self.assertFalse(heal.schedule_reload(d, plist, {}, T0, 600, spawn), "no ROOT_PYTHON: the plist stays")
+            with mock.patch.object(heal, "trusted_root_python", return_value=""):
+                self.assertTrue(heal.schedule_reload(d, plist, {}, T0, 600, spawn))
+            self.assertEqual(spawn.call_args[0][0][0], heal.ROOT_PYTHON)
+
+
+class TrustedRootPython(unittest.TestCase):
+    """ROOT_PYTHON counts only when root alone can change it: the path, every link hop, its file and their parents."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name).resolve()
+        self.real_lstat = os.lstat
+        (self.base / "cpython" / "bin").mkdir(parents=True)
+        self.exe = self.base / "cpython" / "bin" / "python3.13"
+        self.exe.write_text("#!/bin/sh\n")
+        self.exe.chmod(0o755)
+        (self.base / "bin").mkdir()
+        self.link = self.base / "bin" / "python3.13"
+        self.link.symlink_to("../cpython/bin/python3.13")
+        for d in (self.base, self.base / "cpython", self.base / "cpython" / "bin", self.base / "bin"):
+            d.chmod(0o755)
+
+    def trusted(self, path: Path) -> str:
+        """As if every file this test made were root's: the modes alone decide (/ and /tmp are root's already)."""
+        def lstat(p, *a, **k):
+            st = self.real_lstat(p, *a, **k)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, heal.ROOT_UID) + tuple(st)[5:]) \
+                if str(p).startswith(os.fspath(self.base)) else st
+        with mock.patch.object(heal.os, "lstat", side_effect=lstat):
+            return heal.trusted_root_python(os.fspath(path))
+
+    def test_a_root_owned_chain_closed_to_others_is_trusted_through_its_link(self) -> None:
+        self.assertEqual(self.trusted(self.link), "")
+        self.assertEqual(self.trusted(self.exe), "")
+
+    def test_a_writable_directory_on_either_side_of_the_link_is_not(self) -> None:
+        (self.base / "bin").chmod(0o775)
+        self.assertIn("writable by another account", self.trusted(self.link))
+        (self.base / "bin").chmod(0o755)
+        (self.base / "cpython" / "bin").chmod(0o777)
+        self.assertIn(f"{self.base / 'cpython' / 'bin'} is writable", self.trusted(self.link))
+        (self.base / "cpython" / "bin").chmod(0o1777)  # sticky: only root may rename what root owns there
+        self.assertEqual(self.trusted(self.link), "")
+
+    def test_missing_not_executable_or_not_root_owned_is_not(self) -> None:
+        self.assertIn("missing", self.trusted(self.base / "nope"))
+        self.exe.chmod(0o644)
+        self.assertIn("not an executable file", self.trusted(self.link))
+        self.exe.chmod(0o755)
+        self.assertIn("not owned by root", heal.trusted_root_python(os.fspath(self.link)) if os.getuid() else "not owned by root")
+        self.assertIn("not an absolute path", heal.trusted_root_python("python3"))
 
 
 DISK_BYTES = (ROOT / "scripts" / "glaeda-disk").read_bytes()
@@ -1586,8 +1693,20 @@ class RunnerHygiene(unittest.TestCase):
         self.state: dict = {}
 
     def hygiene_pass(self, live: bool = True, now: float = T0) -> dict:
-        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
-                                 sys.executable, lambda uid: {501: "cmux"}[uid])
+        with mock.patch.object(heal, "trusted_root_python", return_value=""):
+            return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                     sys.executable, lambda uid: {501: "cmux"}[uid])
+
+    def test_each_account_job_moves_to_root_python_once_it_is_trusted(self) -> None:
+        self.hygiene_pass()
+        argv = self.run.argv[0]
+        self.assertEqual(argv[argv.index("--python") + 1], heal.ROOT_PYTHON)
+        self.state.clear()
+        with mock.patch.object(heal, "trusted_root_python", return_value="missing"):
+            heal.hygiene_pass(self.dir, self.state, T0, True, self.root, self.daemons, self.run, sys.executable,
+                              lambda uid: {501: "cmux"}[uid])
+        argv = self.run.argv[-1]
+        self.assertEqual(argv[argv.index("--python") + 1], "/usr/bin/python3", "the manifest's, until ROOT_PYTHON")
 
     def mtimes(self) -> list:
         return sorted((p, p.stat().st_mtime_ns) for p in self.root.rglob("*"))
@@ -1689,9 +1808,23 @@ class RunnerHygiene(unittest.TestCase):
             p.unlink()
         (self.root / "501").rmdir()
 
-    def census_pass(self, why: str = "", live: bool = True, now: float = T0) -> dict:
-        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
-                                 sys.executable, lambda uid: {501: "cmux"}[uid], lambda: why)
+    def census_pass(self, why: str = "", live: bool = True, now: float = T0, trusted: str = "") -> dict:
+        with mock.patch.object(heal, "trusted_root_python", return_value=trusted):
+            return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                     sys.executable, lambda uid: {501: "cmux"}[uid], lambda: why)
+
+    def test_without_root_python_the_census_keeps_the_interpreter_its_plist_names(self) -> None:
+        self.unenroll()
+        (self.daemons / f"{heal.HYGIENE_LABEL}.root-census.plist").write_bytes(plistlib.dumps(
+            {"Label": f"{heal.HYGIENE_LABEL}.root-census", "ProgramArguments": ["/usr/bin/python3", "-I", "x"]}))
+        self.census_pass(trusted="missing")
+        argv = self.run.argv[0]
+        self.assertEqual(argv[argv.index("--python") + 1], "/usr/bin/python3")
+        (self.daemons / f"{heal.HYGIENE_LABEL}.root-census.plist").unlink()
+        self.state.clear()
+        self.census_pass(trusted="missing", now=T0 + heal.HYGIENE_RETRY_S + 1)
+        argv = self.run.argv[-1]
+        self.assertEqual(argv[argv.index("--python") + 1], sys.executable, "no census plist: the pass's own interpreter")
 
     def test_no_enrolled_account_off_a_ci_mini_is_no_work(self) -> None:
         self.unenroll()
@@ -1711,7 +1844,7 @@ class RunnerHygiene(unittest.TestCase):
         self.assertEqual(census.read_bytes(), DISK_BYTES)
         self.assertEqual(self.run.argv[0], [sys.executable, "-I", os.fspath(self.dir / heal.HYGIENE_NAME),
                                             "--root-census", "--source", os.fspath(self.dir / heal.DISK_NAME),
-                                            "--python", "/usr/bin/python3", "--check"])
+                                            "--python", heal.ROOT_PYTHON, "--check"])
         self.assertEqual([a[-1] for a in self.run.argv], ["--check", "--apply", "--check"])
         calls = len(self.run.argv)
         again = self.census_pass(now=T0 + 120)

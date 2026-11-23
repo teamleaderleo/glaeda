@@ -11,6 +11,7 @@
 #   PIN_FORMULAS    the Homebrew formulas class receipts pin, space separated
 #   POOL_USER       the member's overrides.runner.poolUser (the account its PR pool runners run as), or empty;
 #                   when set, the secrets walk is repeated read-only as that user through sudo -n (cmuxterm-hq#18007)
+#                   under glaeda-python's root-owned ROOT_PYTHON, never Apple's python3
 # Emits "key<TAB>value" lines like the probe. Installs, downloads and writes nothing: rustup runs with
 # RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs; for a readable
 # secret it prints the path alone.
@@ -248,11 +249,16 @@ shopt -u nullglob dotglob
 
 # With a poolUser the PR jobs run as that account, not the login user, so what matters is what it can open
 # (cmuxterm-hq#18007). As that user (sudo -n: never a prompt), open each path above without reading it (EACCES
-# or EPERM is the answer we want), then walk the same locations under its own home. The done marker comes last:
-# without it (sudo refused, no such user, no developer directory for /usr/bin/python3) the answer is unknown.
-if [ -n "$POOL_USER" ] && [ "$shims" = run ]; then
+# or EPERM is the answer we want), then walk the same locations under its own home, run by glaeda-python's
+# ROOT_PYTHON (root-owned: running it as that user hands it nothing the login user could swap). The done marker comes
+# last: without it (sudo refused, no such user) the answer is unknown; pf_pool_python missing says no ROOT_PYTHON yet.
+ROOT_PYTHON=/opt/glaeda-python/bin/python3.13
+if [ -n "$POOL_USER" ] && [ ! -x "$ROOT_PYTHON" ]; then
   e pf_pool_user "$POOL_USER"
-  (cd / && printf '%s\0' "${login_secrets[@]}" | sudo -n -u "$POOL_USER" -H /usr/bin/python3 -I -c '
+  e pf_pool_python missing
+elif [ -n "$POOL_USER" ]; then
+  e pf_pool_user "$POOL_USER"
+  (cd / && printf '%s\0' "${login_secrets[@]}" | sudo -n -u "$POOL_USER" -H "$ROOT_PYTHON" -I -c '
 import errno, fnmatch, os, pwd, re, sys
 def bad(p):
     return "\n" in p or "\t" in p or "\r" in p

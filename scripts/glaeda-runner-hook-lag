@@ -174,7 +174,7 @@ def probe_main(names: list[str], hook: Path = HOOK) -> dict[str, Any] | None:
 
 
 def probe_member(fleet: Any, member: str, names: list[str]) -> tuple[list[dict[str, Any]] | None, str | None]:
-    remote = "/usr/bin/python3 -I - " + " ".join(fleet._quote(a) for a in (REMOTE_HOOKS, *names))
+    remote = f"{fleet.USER_PYTHON} -I - " + " ".join(fleet._quote(a) for a in (REMOTE_HOOKS, *names))
     code, out, err = fleet.run(["ssh", *fleet.SSH_OPTIONS, member, remote], PROBE_TIMEOUT_S, stdin=PROBE)
     if code != 0:
         return None, f"unreachable (exit {code}): {err.strip()[-200:]}"

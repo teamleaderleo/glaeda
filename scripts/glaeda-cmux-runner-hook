@@ -54,7 +54,7 @@ re-runs it elsewhere) when:
     (leaked_toolchain_env; the xcrun shim's own SDKROOT does not count), or, with --require-eligible, xcrun in the
     job's clean env resolves an SDK outside APP, a swiftc of another Swift than APP's toolchain, or an SDK of a newer
     major than APP's, cannot `xcrun --find` a tool cmux uses (CMUX_TOOLS), or the PATH's python3 or the
-    /usr/bin/python3 xcrun shim does not start (xcode_refusal, one probe batch: "toolchain: xcrun resolves ...
+    python3 xcrun shim does not start (xcode_refusal, one probe batch: "toolchain: xcrun resolves ...
     outside Xcode_26.6"). Only a definite mismatch refuses; a probe that times out or prints nothing is no answer. An admitted job's later steps get
     DEVELOPER_DIR=APP/Contents/Developer through $GITHUB_ENV when the runner's env does not already set it.
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
@@ -4230,8 +4230,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
 # A runner's pool Xcode is its job-started hook's --toolchain-xcode (glaeda-cmux-runner: the member's first verified
 # Xcode, the one its xcode-26.6 label names). cmux21 (macOS 27, 2026-10-21): Command Line Tools 27 in
 # /Library/Developer/CommandLineTools made xcrun resolve their MacOSX27 SDK and Swift 6.4 even with xcode-select and
-# DEVELOPER_DIR on Xcode_26.6, and the /usr/bin/python3 xcrun shim the gate ran under exported that SDKROOT into the
-# listener's environment, so every job built against an SDK its compiler rejects ("this SDK is not supported by the
+# DEVELOPER_DIR on Xcode_26.6, and Apple's python3 (the xcrun shim) the gate then ran under (glaeda-cmux-runner's
+# hook_python no longer picks Apple's python) exported that SDKROOT into the listener's environment, so every job built against an SDK its compiler rejects ("this SDK is not supported by the
 # compiler"). So the listener starts with SDKROOT and TOOLCHAINS removed and DEVELOPER_DIR on the pool Xcode
 # (listener_env), and a host whose xcrun still resolves outside that Xcode, or cannot find or start what cmux jobs
 # run (CMUX_TOOLS, both python3s), is refused (xcode_refusal): job-started
@@ -4246,11 +4246,13 @@ XCODE_PROBE_TTL_S = float(os.environ.get("GLAEDA_RUNNER_XCODE_PROBE_TTL_S") or 6
 XCODE_PROBE_CACHE = "xcode-probe.json"  # under the runner state dir
 SWIFT_VERSION = re.compile(r"\bSwift version (\d+(?:\.\d+)+)")
 # The tools cmux's macOS jobs run through xcrun or the developer dir: each must resolve (`xcrun --find`). And both
-# python3s must start: the job PATH's, and the xcrun shim, which cmux scripts reach as /usr/bin/python3 and which
-# fails outright (exit 72, "xcode-select: Failed to locate 'python3'") under an SDKROOT whose SDK is gone (cmux21,
-# 2026-10-21: app-compile, fast-tier and web-bundles failed as infra).
+# python3s must start: the job PATH's, and the xcrun shim, which cmux's own build scripts reach as SHIM_PYTHON and
+# which fails outright (exit 72, "xcode-select: Failed to locate 'python3'") under an SDKROOT whose SDK is gone (cmux21,
+# 2026-10-21: app-compile, fast-tier and web-bundles failed as infra). SHIM_PYTHON is only probed, as the workload's
+# interpreter: glaeda never runs its own code on Apple's python (the hook itself runs on glaeda-python's ROOT_PYTHON,
+# else Homebrew's or USER_PYTHON: glaeda-cmux-runner HOOK_PYTHONS).
 CMUX_TOOLS = ("swift", "swiftc", "clang", "git", "make", "ld", "xcodebuild", "python3")
-SHIM_PYTHON = os.environ.get("GLAEDA_RUNNER_SHIM_PYTHON") or "/usr/bin/python3"
+SHIM_PYTHON = os.environ.get("GLAEDA_RUNNER_SHIM_PYTHON") or "/usr/bin/python3"  # PY_PIN_EXEMPT: probes the xcrun shim cmux's scripts call
 # By absolute path: a PATH without xcrun would exit 127 for every probe and refuse a healthy host.
 XCRUN = os.environ.get("GLAEDA_RUNNER_XCRUN") or "/usr/bin/xcrun"
 BATCH_REAP_S = 2.0  # after the deadline's SIGKILL, how long the batch's pipe may take to close
@@ -4278,7 +4280,7 @@ def _under(path: str, parent: Path) -> bool:
 
 def leaked_toolchain_env(environ: Any, xcode_app: str | None) -> str | None:
     """Why this environment points xcrun outside the pool Xcode (an SDKROOT path outside it, any TOOLCHAINS), or None.
-    Under the /usr/bin/python3 shim SDKROOT is the shim's own (under_xcrun_shim): the caller leaves it out."""
+    Under Apple's python3 (the xcrun shim) SDKROOT is the shim's own (under_xcrun_shim): the caller leaves it out."""
     leaked = []
     sdkroot = environ.get("SDKROOT")  # a name (macosx) resolves through DEVELOPER_DIR; only a path is a leak
     if sdkroot and os.path.isabs(sdkroot) and not (xcode_app and _under(sdkroot, Path(xcode_app) / "Contents" /
@@ -4292,7 +4294,7 @@ def leaked_toolchain_env(environ: Any, xcode_app: str | None) -> str | None:
 
 
 def under_xcrun_shim(executable: str) -> bool:
-    """This interpreter is a developer directory's python, which /usr/bin/python3 (the xcrun shim) runs with SDKROOT
+    """This interpreter is a developer directory's python, which Apple's python3 (the xcrun shim) runs with SDKROOT
     set to what xcrun resolved for it: that SDKROOT is the shim's, not the environment the hook was given."""
     real = os.path.realpath(executable)
     return "/Contents/Developer/" in real or real.startswith("/Library/Developer/CommandLineTools/")
@@ -12903,7 +12905,8 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
             gate_log(f"the adopted listener's env is stale ({gate.stale_env}); restarting it once it is idle")
     os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
     os.environ.pop(GATE_JOB_DONE_AT_ENV, None)
-    # The gate's own env too (the /usr/bin/python3 shim exports SDKROOT): its eligibility probes see the job's env.
+    # The gate's own env too (a gate an older install still runs under Apple's xcrun shim python has SDKROOT
+    # exported): its eligibility probes see the job's env.
     clean = listener_env(os.environ, xcode)
     os.environ.clear()
     os.environ.update(clean)

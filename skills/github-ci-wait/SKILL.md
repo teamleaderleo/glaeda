@@ -213,7 +213,7 @@ With `job`, that job must have finished with `conclusion` (default success):
 ```json
 {"hooks": [{"name": "cloud-probe-promote", "repo": "manaflow-ai/cmux", "workflow": "backend.yml",
             "branch": "feat-cmux-next", "job": "promote-production", "conclusion": "success",
-            "command": ["/usr/bin/python3", "/abs/path/probe.py", "run", "--sha", "{head_sha}"]}]}
+            "command": ["/Users/you/.local/bin/python3.13", "/abs/path/probe.py", "run", "--sha", "{head_sha}"]}]}
 ```
 
 - Runs once per (hook, run, attempt), across restarts and crashes: the claim is on disk before

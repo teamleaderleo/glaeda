@@ -42,7 +42,7 @@ class RunnerHygieneTest(unittest.TestCase):
         self.daemons.mkdir()
         self.launchctl = Path("/usr/bin/true")
         self.account = rh.Account(self.entry.pw_name, max(self.entry.pw_uid, 500), self.home)
-        self.install = rh.Install(self.account, Path("/usr/bin/python3"), self.source,
+        self.install = rh.Install(self.account, rh.ROOT_PYTHON, self.source,
                                   self.root, self.root / str(self.account.uid),
                                   self.root / str(self.account.uid) / rh.DISK_NAME,
                                   self.root / str(self.account.uid) / rh.MANIFEST_NAME,
@@ -58,7 +58,7 @@ class RunnerHygieneTest(unittest.TestCase):
         self.assertEqual(plist["EnvironmentVariables"], {"HOME": str(self.home)})
         self.assertEqual(plist["StartInterval"], 900)
         self.assertEqual(plist["ProgramArguments"], [
-            "/usr/bin/python3", "-I", str(self.install.snapshot),
+            "/opt/glaeda-python/bin/python3.13", "-I", str(self.install.snapshot),
             "--runner-caches", "--pressure", "--idle", "--apply", "--top", "0",
         ])
         self.assertEqual(plist["StandardOutPath"], "/dev/null")
@@ -107,7 +107,7 @@ class RunnerHygieneTest(unittest.TestCase):
                                 pw_dir=os.fspath(link))
         with mock.patch.object(rh.pwd, "getpwnam", return_value=entry):
             with self.assertRaisesRegex(rh.HygieneError, "real directory"):
-                rh.build_install(entry.pw_name, self.source, Path("/usr/bin/python3"), self.root,
+                rh.build_install(entry.pw_name, self.source, rh.ROOT_PYTHON, self.root,
                                  self.daemons, self.launchctl)
 
     def test_manifest_records_source_digest(self) -> None:
@@ -193,10 +193,11 @@ class RunnerHygieneTest(unittest.TestCase):
         self.place()
         self.install.install_dir.chmod(0o755)
         self.install.snapshot.chmod(0o555)
+        self.install.plist.chmod(0o644)  # what --apply leaves, whatever this test's umask (huge-blue's is 0002)
         self.install.manifest.write_text(json.dumps({
             "version": 1, "uid": self.account.uid, "user": self.account.name, "home": str(self.home),
             "device": self.install.install_dir.stat().st_dev, "sha256": rh._sha256(self.source),
-            "snapshot": str(self.install.snapshot), "python": "/usr/bin/python3",
+            "snapshot": str(self.install.snapshot), "python": str(rh.ROOT_PYTHON),
             "plist_sha256": rh._sha256(self.install.plist)}))
         self.install.manifest.chmod(0o444)
         for path in (self.install.install_dir, self.install.snapshot, self.install.manifest, self.install.plist):
@@ -250,7 +251,7 @@ class RunnerHygieneTest(unittest.TestCase):
         plist = rh.census_plist_for(self.install)
         self.assertNotIn("UserName", plist)
         self.assertEqual(plist["Label"], rh.CENSUS_LABEL)
-        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", "-I", str(self.install.census_snapshot),
+        self.assertEqual(plist["ProgramArguments"], [str(rh.ROOT_PYTHON), "-I", str(self.install.census_snapshot),
                                                      "--root-census"])
         self.assertEqual(self.install.census_snapshot.parent, self.root / rh.CENSUS_DIR_NAME)
         self.assertEqual(self.install.census_plist, self.daemons / f"{rh.CENSUS_LABEL}.plist")
@@ -303,7 +304,7 @@ class RunnerHygieneTest(unittest.TestCase):
     def test_the_root_census_alone_installs_and_checks_with_no_account(self) -> None:
         # A CI mini no account was ever enrolled on (the lent CI minis, 2026-11-18): root daemon-heal runs
         # --root-census, which goes through the same census checks and writes the same plist an account's --apply does.
-        census = rh.Census(Path("/usr/bin/python3"), self.source, self.root, self.daemons, self.launchctl)
+        census = rh.Census(rh.ROOT_PYTHON, self.source, self.root, self.daemons, self.launchctl)
         self.assertEqual((census.census_dir, census.census_snapshot, census.census_plist),
                          (self.install.census_dir, self.install.census_snapshot, self.install.census_plist))
         self.assertEqual(rh.census_plist_bytes(census), rh.census_plist_bytes(self.install), "one plist, one writer's bytes")
@@ -336,6 +337,37 @@ class RunnerHygieneTest(unittest.TestCase):
             for argv in (["--root-census", "--user", self.account.name], ["--root-census", "--uninstall"], ["--check"]):
                 with self.assertRaises(SystemExit):
                     rh.main(argv)
+
+    def test_the_pinned_python_is_root_python_else_what_the_job_already_runs_never_apples(self) -> None:
+        ok = lambda path, label: path  # noqa: E731 (every candidate passes _safe_executable)
+        with mock.patch.object(rh, "_safe_executable", side_effect=ok):
+            self.assertEqual(rh.resolve_python(None, Path("/usr/bin/python3")), rh.ROOT_PYTHON)
+        def no_root_python(path, label):
+            if path == rh.ROOT_PYTHON:
+                raise rh.HygieneError(f"python is not executable: {path}")
+            return path
+        with mock.patch.object(rh, "_safe_executable", side_effect=no_root_python):
+            self.assertEqual(rh.resolve_python(None, Path("/usr/bin/python3")), Path("/usr/bin/python3"),
+                             "no ROOT_PYTHON yet: the job keeps its interpreter")
+            self.assertEqual(rh.resolve_python(None), Path(sys.executable), "nothing installed: this one, never PATH's")
+            self.assertEqual(rh.resolve_python(Path("/x/python3")), Path("/x/python3"))
+        self.install.census_plist.write_bytes(plistlib.dumps({"ProgramArguments": ["/usr/bin/python3", "-I", "x"]}))
+        self.assertEqual(rh._plist_python(self.install.census_plist), Path("/usr/bin/python3"))
+        self.install.install_dir.mkdir(parents=True)
+        self.install.manifest.write_text(json.dumps({"python": "/usr/bin/python3"}))
+        self.assertEqual(rh._saved_python(self.install.manifest), Path("/usr/bin/python3"))
+
+    def test_a_root_owned_link_chain_is_safe_and_a_link_another_account_owns_is_not(self) -> None:
+        # ROOT_PYTHON is a link into its copied prefix. Linux's /usr/bin/python3 is a root-owned link, like it.
+        system = Path("/usr/bin/python3")
+        if system.is_symlink() and system.lstat().st_uid == 0 and os.path.realpath(system).startswith("/usr/"):
+            self.assertEqual(rh._safe_executable(system, "python"), system)
+        target = Path(os.path.realpath(sys.executable))
+        if target.stat().st_uid == 0 and os.getuid() != 0:
+            link = self.base / "python3"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(rh.HygieneError, "link root does not own|unsafe parent"):
+                rh._safe_executable(link, "python")
 
     def test_check_is_read_only_on_the_command_line(self) -> None:
         with mock.patch.object(rh.platform, "system", return_value="Darwin"), \

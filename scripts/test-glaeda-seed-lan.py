@@ -305,14 +305,16 @@ class ArchiveServeTest(unittest.TestCase):
 
 
 # Stands in for /usr/bin/ssh from the operator Mac: runs the remote command locally with HOME set to that
-# host's sandbox, and python3 for /usr/bin/python3.
+# host's sandbox, and this python3 for the host's ~/.local/bin/python3.13 (exit 127 when FAKE_NO_PYTHON names it).
 FAKE_OPERATOR_SSH = """import os, subprocess, sys
 host, command = sys.argv[-2], sys.argv[-1]
 homes = os.environ["FAKE_HOMES"]
 if host not in os.listdir(homes):
     sys.stderr.write("ssh: Could not resolve hostname\\n"); sys.exit(255)
 env = {**os.environ, "HOME": os.path.join(homes, host)}
-command = command.replace("/usr/bin/python3 -I -", sys.executable + " -I -", 1)
+if host in os.environ.get("FAKE_NO_PYTHON", "").split(","):
+    sys.stderr.write("sh: ~/.local/bin/python3.13: No such file or directory\\n"); sys.exit(127)
+command = command.replace("~/.local/bin/python3.13 -I -", sys.executable + " -I -", 1)
 sys.exit(subprocess.run(["/bin/sh", "-c", command], env=env).returncode)
 """
 
@@ -388,7 +390,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(serve_path.stat().st_mode & 0o777, 0o755)
         lines = self.authorized()
         self.assertEqual(lines[0], self.foreign)
-        command = f"/usr/bin/python3 -I {self.seeder}/.local/libexec/glaeda-seed-serve"
+        command = f"{self.seeder}/.local/bin/python3.13 -I {self.seeder}/.local/libexec/glaeda-seed-serve"
         for host in ("cmux12s-mac-mini", "cmux13s-mac-mini"):
             conf = self.homes / host / ".config/glaeda/seed-lan"
             self.assertEqual(conf.stat().st_mode & 0o777, 0o700)
@@ -425,7 +427,7 @@ class InstallerTest(unittest.TestCase):
                 "--address", "172.20.21.158", "cmux12s-mac-mini", "--apply")
         code, report = self.cli(*argv)
         self.assertEqual(code, 0, report)
-        command = f"/usr/bin/python3 -I {archive}/.local/libexec/glaeda-seed-serve --role archive"
+        command = f"{archive}/.local/bin/python3.13 -I {archive}/.local/libexec/glaeda-seed-serve --role archive"
         lines = (archive / ".ssh/authorized_keys").read_text().splitlines()
         self.assertEqual(lines[0], self.foreign)
         self.assertEqual(len(lines), 2)
@@ -460,7 +462,7 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(code, 0, report)
         host_conf = json.loads((self.seeder / ".config/glaeda/lan-cache/config.json").read_text())
         self.assertEqual(host_conf, {"schema": 1, "source": "direct"})
-        command = f"/usr/bin/python3 -I {self.seeder}/.local/libexec/glaeda-seed-serve --role cache"
+        command = f"{self.seeder}/.local/bin/python3.13 -I {self.seeder}/.local/libexec/glaeda-seed-serve --role cache"
         lines = self.authorized()
         self.assertEqual(lines[0], self.foreign)
         for client in ("cmux12s-mac-mini", "cmux13s-mac-mini"):
@@ -667,7 +669,7 @@ class InstallerTest(unittest.TestCase):
 
         with unittest.mock.patch.object(lan.subprocess, "run", spy):
             self.install("cmux12s-mac-mini", apply=False)
-        self.assertTrue(calls and all(c[-1].startswith("/usr/bin/python3 -I - ") for c in calls))
+        self.assertTrue(calls and all(c[-1].startswith("~/.local/bin/python3.13 -I - ") for c in calls))
 
     def mesh(self, *extra: str) -> tuple[int, dict]:
         hosts = ["cmux12s-mac-mini", "cmux13s-mac-mini", "cmux11s-mac-mini"]
@@ -689,7 +691,7 @@ class InstallerTest(unittest.TestCase):
             self.assertEqual([p["name"] for p in conf["peers"]], [h for h in hosts if h != host])
             self.assertEqual(len((home / ".config/glaeda/lan-mesh/known_hosts").read_text().splitlines()), 3)
             lines = [l for l in (home / ".ssh/authorized_keys").read_text().splitlines() if "glaeda-lan-mesh@" in l]
-            command = f"/usr/bin/python3 -I {home}/.local/libexec/glaeda-seed-serve --role product"
+            command = f"{home}/.local/bin/python3.13 -I {home}/.local/libexec/glaeda-seed-serve --role product"
             self.assertEqual(sorted(lines), sorted(
                 f'restrict,from="172.20.20.0/22",command="{command}" {keys[p]} glaeda-lan-mesh@{p}'
                 for p in hosts if p != host))
@@ -741,7 +743,7 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue(calls)
         for argv in calls:
             self.assertEqual(argv[0], lan.SSH)
-            self.assertTrue(argv[-1].startswith("/usr/bin/python3 -I - "))
+            self.assertTrue(argv[-1].startswith("~/.local/bin/python3.13 -I - "))
             self.assertNotIn("sudo", " ".join(argv))
         script = Path(report["script"]["path"])
         self.assertEqual(script.parent, state)
@@ -752,11 +754,12 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue(run.startswith("ssh -t leoadmin@cmux12s-mac-mini "))
         self.assertIn(f"sudo /bin/bash {script.name}", run)
         self.assertNotIn("cmux@", " ".join(report["commands"]["cmux12s-mac-mini"]))
-        self.assertIn("other than cmux", report["next"][0])
+        self.assertTrue(any("other than cmux" in n for n in report["next"]), report["next"])
         self.assertEqual((code, report["ok"]), (1, False))  # not current until someone runs the commands
 
     def run_root_script(self, data: bytes, base: Path, **kwargs) -> subprocess.CompletedProcess:
         """Run the root script as ourselves: uid = ours, the chain checked from BASE down."""
+        kwargs.setdefault("python", sys.executable)  # the helper's interpreter must exist; ROOT_PYTHON may not here
         target = base / "Library/Application Support/glaeda/bin/glaeda-lan-fetch"
         script = lan.helper_root_script(data, path=os.fspath(target), owner=f"{os.getuid()}:{os.getgid()}",
                                         lock=os.fspath(base / "install.lock"), uid=os.getuid(), top=os.fspath(base),
@@ -849,10 +852,12 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual([l.split()[-1] for l in lines], ["glaeda-lan-mesh@cmux13s-mac-mini"])
 
     def test_forced_commands_come_from_constants_and_a_validated_home(self):
-        good = {"home": "/Users/cmux", "command": "/usr/bin/python3 -I /Users/cmux/.local/libexec/glaeda-seed-serve"}
+        good = {"home": "/Users/cmux",
+                "command": "/Users/cmux/.local/bin/python3.13 -I /Users/cmux/.local/libexec/glaeda-seed-serve"}
         self.assertEqual(lan.forced_command(good, "h"), good["command"])
         for bad in ({**good, "home": "/Users/cmux\" x"}, {**good, "home": "/Users/../etc"}, {**good, "home": "rel"},
-                    {**good, "command": good["command"] + " --role product"}):
+                    {**good, "command": good["command"] + " --role product"},
+                    {**good, "command": "/usr/bin/python3 -I /Users/cmux/.local/libexec/glaeda-seed-serve"}):
             with self.subTest(bad=bad), self.assertRaises(lan.Failure):
                 lan.forced_command(bad, "h")
 
@@ -871,6 +876,70 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(lan.helper_state({"sha": "b" * 64, "chain": good}, want), "stale")
         for bad in ([["/x", 501, 0o755, False]], [["/x", 0, 0o775, False]], [["/x", 0, 0o755, True]]):
             self.assertTrue(lan.helper_state({"sha": want, "chain": good[:1] + bad}, want).startswith("not root-owned"))
+
+    def test_a_key_line_with_the_old_apple_python_command_serves_until_apply_rewrites_it(self):
+        self.install("cmux12s-mac-mini", "cmux13s-mac-mini")
+        ak = self.seeder / ".ssh/authorized_keys"
+        new = f'command="{self.seeder}/.local/bin/python3.13 -I {self.seeder}/.local/libexec/glaeda-seed-serve"'
+        old = f'command="/usr/bin/python3 -I {self.seeder}/.local/libexec/glaeda-seed-serve"'
+        ak.write_text(ak.read_text().replace(new, old))  # as an earlier glaeda-seed-lan wrote it
+        code, plan = self.install("cmux12s-mac-mini", "cmux13s-mac-mini", apply=False)
+        self.assertEqual(code, 0, plan)
+        # Still recognised as ours (so it is replaced, never left beside a duplicate): pending, not refused.
+        self.assertTrue(all(h["authorized"] == "pending" for h in plan["hosts"].values()), plan)
+        self.assertEqual(ak.read_text().count(old), 2)  # the plan writes nothing: old lines keep serving
+        code, report = self.install("cmux12s-mac-mini", "cmux13s-mac-mini")
+        self.assertEqual(code, 0, report)
+        lines = self.authorized()
+        self.assertEqual(lines[0], self.foreign)
+        self.assertEqual(len(lines), 3)
+        self.assertFalse(any("/usr/bin/python3" in l for l in lines))
+        self.assertEqual(sum(new in l for l in lines), 2)
+        # Removal finds an old line too.
+        ak.write_text(ak.read_text().replace(new, old))
+        code, removed = self.cli("remove", "--seeder", "cmux15", "--apply")
+        self.assertEqual(self.authorized(), [self.foreign])
+
+    def test_a_host_without_the_users_python_names_the_fix(self):
+        os.environ["FAKE_NO_PYTHON"] = "cmux15"
+        code, report = self.install("cmux12s-mac-mini", apply=False)
+        self.assertEqual(code, 1)
+        self.assertIn("no ~/.local/bin/python3.13", report["error"])
+        self.assertIn("glaeda-python --install", report["error"])
+
+    def test_helper_install_reports_a_missing_root_python(self):
+        state = Path(self.tmp.name) / "operator-state"
+        with unittest.mock.patch.object(lan, "SCRIPT_DIR_OUT", state), \
+                unittest.mock.patch.object(lan, "HELPER_PYTHON", os.fspath(Path(self.tmp.name) / "no/python3.13")):
+            code, plan = self.cli("helper-install", "cmux12s-mac-mini")
+        self.assertEqual(code, 1)
+        self.assertTrue(plan["hosts"]["cmux12s-mac-mini"]["root_python"].startswith("root_python_missing"))
+        self.assertIn("--install-root", plan["hosts"]["cmux12s-mac-mini"]["root_python"])
+        self.assertTrue(any("glaeda-mini-setup --apply" in n for n in plan["next"]))
+
+    def test_root_python_state_needs_a_root_owned_chain(self):
+        good = [["/opt/glaeda-python/bin/python3.13", 0, 0o755, False], ["/opt", 0, 0o755, False], ["/", 0, 0o755, False]]
+        self.assertEqual(lan.root_python_state({"python": {"executable": True, "chain": good, "link": []}}), "ok")
+        self.assertTrue(lan.root_python_state({}).startswith("root_python_missing"))
+        self.assertTrue(lan.root_python_state({"python": {"executable": False, "chain": good}}).startswith(
+            "root_python_missing"))
+        for bad in ([["/opt", 501, 0o755, False]], [["/opt", 0, 0o775, False]]):
+            self.assertTrue(lan.root_python_state({"python": {"executable": True, "chain": good[:1] + bad}})
+                            .startswith("root_python_untrusted"))
+        # A root-owned symlink (0755 lrwxr-xr-x on macOS) in the link chain is fine; a user-owned one is not.
+        link = [["/opt/glaeda-python/bin/python3.13", 0, 0o755, True]]
+        self.assertEqual(lan.root_python_state({"python": {"executable": True, "chain": good, "link": link}}), "ok")
+        self.assertTrue(lan.root_python_state({"python": {"executable": True, "chain": good,
+                                                           "link": [[link[0][0], 501, 0o755, True]]}})
+                        .startswith("root_python_untrusted"))
+
+    def test_the_root_script_refuses_without_the_helpers_python(self):
+        script = lan.helper_root_script(b"helper bytes", python="/nonexistent/python3.13")
+        self.assertIn("[ -x /nonexistent/python3.13 ] || fail", script)
+        proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("FAILED no /nonexistent/python3.13", proc.stdout)
+        self.assertIn("--install-root", proc.stdout)
 
     def test_remove_drops_only_its_own_lines(self):
         self.install("cmux12s-mac-mini", "cmux13s-mac-mini")

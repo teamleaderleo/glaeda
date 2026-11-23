@@ -492,8 +492,10 @@ jobs:
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
 
-  # Python 3.9 compatibility is independent of the native script suite. In run 44640775409
-  # that suite passed, but left only 17 seconds for the updater before the shared timeout.
+  # The minis run every glaeda LaunchAgent, LaunchDaemon and ssh command under one pinned Python, uv's CPython 3.13
+  # (scripts/glaeda-python; never Apple's /usr/bin/python3). This job makes it the way glaeda-mini-setup does on a
+  # mini and runs the mini-side tests under it. Separate from the native script suite, which in run 44640775409
+  # passed but left only 17 seconds for the updater before the shared timeout.
   mini-python-tests:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
@@ -507,25 +509,50 @@ jobs:
           persist-credentials: false
           show-progress: false
 
-      # The PR minis run the LAN fetch broker under macOS's /usr/bin/python3, which is 3.9.
-      - name: Set up the minis' Python
+      - name: Install the minis' Python (glaeda-python --install)
         id: mini-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: "3.9"
+        run: |
+          sh -n scripts/glaeda-python
+          py=$(sh scripts/glaeda-python --install)
+          test "$py" = "$HOME/.local/bin/python3.13"
+          test "$(sh scripts/glaeda-python --path)" = "$py"
+          "$py" -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
+          echo "python-path=$py" >> "$GITHUB_OUTPUT"
+
+      - name: Test the root-owned copy (glaeda-python --install-root)
+        run: |
+          sudo -n env GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci SUDO_USER="$USER" sh scripts/glaeda-python --install-root
+          test "$(GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci sh scripts/glaeda-python --root-path)" = /opt/glaeda-python-ci/bin/python3.13
+          test "$(stat -c %u "$(readlink -f /opt/glaeda-python-ci/bin/python3.13)")" = 0
+          if GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci sh -c 'sudo -n chmod o+w /opt/glaeda-python-ci/bin && sh scripts/glaeda-python --root-path'; then
+            echo "a root copy another account can write must not count" >&2; exit 1
+          fi
 
       - name: Test the LAN fetch broker on the minis' Python
         run: '"${{ steps.mini-python.outputs.python-path }}" scripts/test-glaeda-lan-fetch.py'
 
-      # glaeda-update and glaeda-mini-health run from LaunchAgents under the same /usr/bin/python3.
-      - name: Test the updater and mini health on the minis' Python
+      - name: Test the updater, mini setup, mini health and daemon heal on the minis' Python
         env:
           PY: ${{ steps.mini-python.outputs.python-path }}
         run: |
-          "$PY" -c 'import ast, sys; [ast.parse(open(p).read(), p, feature_version=(3, 9)) for p in sys.argv[1:]]' \
-            scripts/glaeda-update scripts/glaeda-mini-health scripts/glaeda-mini-setup
           "$PY" scripts/test-glaeda-mini-health.py
           "$PY" scripts/test-glaeda-update.py
+          "$PY" scripts/test-glaeda-mini-setup.py
+          "$PY" scripts/test-glaeda-daemon-heal.py
+
+      - name: No glaeda runtime file runs Apple's /usr/bin/python3
+        run: |
+          # A line that only probes the job's own /usr/bin/python3 (the runner hook's SHIM_PYTHON) or is Linux-only
+          # carries PY_PIN_EXEMPT with its reason; every other runtime mention fails. Tests and docs may name it.
+          # config/fleet-ops.json is exported from cmuxterm-hq build-fleet/mini-ops (its console-unlock-guard changes
+          # there first); quarry_*_impl.py run on owned Linux, where /usr/bin/python3 is the distro's.
+          if git grep -n '/usr/bin/python3' -- scripts config skills .github \
+              ':!scripts/test-*' ':!scripts/quarry_*_impl.py' ':!.github/workflows/ci.yml' \
+              ':!config/fleet-ops.json' \
+              | grep -v 'PY_PIN_EXEMPT'; then
+            echo "error: a glaeda runtime file names Apple's /usr/bin/python3; use scripts/glaeda-python's interpreters" >&2
+            exit 1
+          fi
 
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.

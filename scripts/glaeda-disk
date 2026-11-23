@@ -1337,6 +1337,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "b956998b301fbfc71dc40700e0ac0ec60179d8cda36fd5f96bf30e06b9b19ce8",
     "32578ac689670fa75c50f963d754bd15724802588323a5463e7c83f65dbf62f3",
     "7d05f945b0fe963a1196caea7aa56ef2c200bfd8e5fbbab193f98c21e701cbeb",
+    "9087878ae9847d239633b0725d837ddd4a929559729e4d490a4d9829bf97be78",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5610,7 +5611,9 @@ def sudo_proc_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str
     if not sudo_reads():
         return None
     code = _PROC_LINKS_SRC + "\nimport json, sys\nl, d = proc_links()\nsys.stdout.write(json.dumps([l, len(d)]))\n"
-    python = sys.executable or "/usr/bin/python3"
+    python = sys.executable  # this interpreter, never a system python picked by name
+    if not python:
+        return None
     try:
         out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)), python, "-I", "-c", code],
                              capture_output=True, text=True, timeout=timeout + 15)

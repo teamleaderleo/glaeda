@@ -415,13 +415,13 @@ class Python(unittest.TestCase):
             self.assertIsNone(me.pick_python(None, Path("/home/op")))
         self.assertEqual(probed, [])
 
-    def test_missing_python_names_both_fixes(self) -> None:
+    def test_missing_python_names_the_pinned_install(self) -> None:
         err = io.StringIO()
         with mock.patch.object(me, "DARWIN_REQUIRED", False), \
              mock.patch.object(me, "pick_python", return_value=None), contextlib.redirect_stderr(err):
             self.assertEqual(me.main(["--cmux-root", "/c"]), 2)
-        self.assertIn("python@3.13", err.getvalue())
-        self.assertIn("~/.local/bin/python3", err.getvalue())
+        self.assertIn("glaeda-python --install", err.getvalue())
+        self.assertIn("~/.local/bin/python3.13", err.getvalue())
 
     def test_an_explicit_old_python_is_refused(self) -> None:
         with mock.patch.object(me.os, "access", return_value=True), \

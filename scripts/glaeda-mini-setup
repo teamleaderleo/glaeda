@@ -14,16 +14,19 @@
                                            (scripts/glaeda-cmux-runner, docs/CMUX_MINI_RUNNER.md)
 
 First, on a fresh Mac: install the Command Line Tools (xcode-select --install) and, ideally,
-Homebrew. Until the Command Line Tools exist, /usr/bin/python3 and /usr/bin/git are stubs that
-only open an install dialog, so this command cannot run with them. Run it with a Homebrew
-python3 or after the Command Line Tools are installed.
+Homebrew, then the pinned Python: `sh scripts/glaeda-python --install` (uv's CPython 3.13 at
+~/.local/bin/python3.13), and run this command with it. glaeda never runs Apple's python3 (Xcode's or the
+Command Line Tools' 3.9): every LaunchAgent this installs runs ~/.local/bin/python3.13, and every root
+LaunchDaemon and anything run as the runner user runs the root-owned copy /opt/glaeda-python/bin/python3.13.
 
 Planning performs no side effects. --apply is idempotent: a second run reports every
 action as unchanged. Everything it touches is under $HOME and owned by the current user.
 Nothing here uses sudo, changes system or security settings, installs Xcode, accepts a
 licence, registers a runner, or reads a token. Steps that need any of those are printed
-as operator steps instead. The one exception is the explicit --runner mode, which registers a
-GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
+as operator steps instead. The exceptions are the explicit --runner mode, which registers a
+GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md, and the root-owned Python copy:
+where `sudo -n` works on a build host, --apply runs `sudo -n glaeda-python --install-root` (it copies the
+uv 3.13 below to /opt/glaeda-python, root:wheel, writable by root only); elsewhere that is an operator step.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
@@ -61,6 +64,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
+    ~/.local/bin/glaeda-python                 from scripts/glaeda-python (makes and names the pinned Python below;
+                                               glaeda-mini-health runs `sudo -n glaeda-python --install-root`)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/lan-cache/config.json     on a macOS host with a GitHub Actions runner: glaeda-git-mirror's
                                                source {"schema": 1, "source": "direct"}, written once when absent
@@ -75,11 +80,14 @@ What --apply installs (templated for the current user):
     .metadata_never_index markers in the user-owned CI build roots (DerivedData and the
     glaeda native cache, plus any existing glaeda runner _work roots). These markers keep
     Spotlight out of build output without changing the system-wide index policy.
-    python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
+    ~/.local/bin/python3.13                    the one pinned Python (scripts/glaeda-python --install: uv, from the
+                                               uv on PATH, Homebrew's when this user owns it, or astral's installer,
+                                               then `uv python install 3.13`); every LaunchAgent above runs it
+    /opt/glaeda-python/bin/python3.13          on a macOS build host where sudo -n works: its root-owned copy, what
+                                               root LaunchDaemons and the runner user's protected toolchain run
 
-glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks for it the way
-enroll does and is not ready without it, so a missing interpreter shows up here, not 13 minutes
-into enrollment. When Homebrew belongs to another account, the fix is printed instead.
+glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid) and picks the same
+~/.local/bin/python3.13 first, so a missing interpreter shows up here, not 13 minutes into enrollment.
 
 --gh-only is narrower still: glaeda-gh (its daemon, the github-ci-wait skill), glaeda-update with its
 agent or timer, and glaeda-disk's pressure pass (the disk-pressure agent or timer, without the idle sweep), so a
@@ -217,7 +225,11 @@ OTA_SOURCES = ("teamleaderleo/glaeda", "manaflow-ai/glaeda")
 # Linux the timers need a systemd user manager
 HYGIENE_BLOCKING = frozenset({"python", "systemdUser"})
 RUN_TIMEOUT = 20
-ENROLL_PYTHON_FORMULA = "python@3.13"
+# The one Python (scripts/glaeda-python): uv's CPython 3.13 for this user, and its root-owned copy for root's jobs.
+PINNED_PYTHON = "python3.13"
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+GLAEDA_PYTHON_TOOL = SCRIPT_DIR / "glaeda-python"
+PYTHON_INSTALL_TIMEOUT = 600  # uv and a CPython download: well inside glaeda-update's wait for setup
 # git before 2.55 has a `git maintenance` bug that eats memory; hosts ran with maintenance.auto off
 # because of it, which let duplicate packs pile up (14 GiB in one cmux checkout on 2026-09-25)
 MIN_GIT = (2, 55)
@@ -293,7 +305,7 @@ class Context:
         # A fake HOME must never reach /Library/LaunchDaemons. This keeps tests and
         # rehearsals side-effect free even when they exercise --headless.
         self.headless = bool(headless) and self.platform == "macos" and not self.sandbox
-        self.python = python or pick_python()
+        self.python = python or pick_python(home, self.platform)
         self.reclaim_binary = reclaim_binary
         self.cmux_root = cmux_root
         self.glaeda_bin = glaeda_bin or home / ".local/share/glaeda/cmux-fleet/glaeda"
@@ -333,79 +345,33 @@ class Context:
         }
 
 
-def pick_python() -> str | None:
-    """The interpreter the glaeda-disk LaunchAgents run.
+def user_python(home: Path) -> Path:
+    """The pinned interpreter for this user's LaunchAgents: ~/.local/bin/python3.13 (scripts/glaeda-python)."""
+    return home / ".local/bin" / PINNED_PYTHON
 
-    /usr/bin/python3 is a stub that opens an install dialog until the Command Line Tools or
-    an Xcode exist, so it only counts once one does. The fleet's Xcode is a versioned app
-    such as Xcode_26.6.app, not only Xcode.app.
-    """
-    if HOST_PLATFORM == "linux":
+
+def pick_python(home: Path | None = None, platform_name: str = HOST_PLATFORM) -> str | None:
+    """The interpreter the glaeda LaunchAgents run: on macOS only the pinned uv CPython 3.13
+    (~/.local/bin/python3.13), never Apple's python3 and never whichever Homebrew python3 is newest.
+    None until glaeda-python --install made it; --apply runs that first (plan_pythons)."""
+    if platform_name == "linux":
         # The units run glaeda-disk through its `env python3` shebang with systemd's default PATH,
         # so only interpreters there count; a pyenv shim on the login PATH would not be found.
-        for candidate in ("/usr/local/bin/python3", "/usr/bin/python3"):
+        for candidate in ("/usr/local/bin/python3", "/usr/bin/python3"):  # PY_PIN_EXEMPT: Linux, the distro python3
             if os.access(candidate, os.X_OK):
                 return candidate
         return None
-    for candidate in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
-        if os.access(candidate, os.X_OK):
-            return candidate
-    if Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
-        Path("/Applications").glob("Xcode*.app")
-    ):
-        return "/usr/bin/python3"
-    return None
+    candidate = user_python(home or Path.home())
+    return os.fspath(candidate) if os.access(candidate, os.X_OK) else None
 
 
-APPLE_PYTHON_PROBES = 3  # attempts before a failing /usr/bin/python3 counts as broken
-APPLE_PYTHON_PROBE_TIMEOUT = 30.0
-APPLE_PYTHON_PROBE_PAUSE = 5.0
-
-
-@functools.lru_cache(maxsize=None)
-def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
-    """/usr/bin/python3 once it is real (Command Line Tools or an Xcode), else None.
-
-    macOS Local Network Privacy refuses LAN connections from a LaunchAgent whose program is not Apple's,
-    children included (2026-09-25: a Homebrew python3 agent and its /usr/bin/ssh got "No route to host").
-    The seed prefetch agent streams seeds from the trusted seeder over the LAN, so it runs Apple's python3.
-    It must also run: a broken xcode-select or an unaccepted Xcode licence makes /usr/bin/python3 exit
-    non-zero at once, and then the agent keeps the other interpreter (losing only the LAN step, not the
-    prefetch).
-
-    Only a probe that keeps exiting non-zero counts as broken. OTA runs setup from a Background agent
-    beside a compile, and on 2026-09-28 one failed probe there moved cmuxs-mac-mini-3's seed prefetch
-    and LAN broker to Homebrew python3, so every LAN fetch got "No route to host" until the next release.
-    So a slow probe (a timeout) is Apple's python3 under load, not a broken one, and a non-zero exit is
-    asked again before it counts.
-    """
-    if platform_name == "linux":
-        return None
-    if not (Path("/Library/Developer/CommandLineTools/usr/bin/python3").exists() or any(
-        Path("/Applications").glob("Xcode*.app")
-    )):
-        return None
-    for attempt in range(APPLE_PYTHON_PROBES):
-        if attempt:
-            time.sleep(APPLE_PYTHON_PROBE_PAUSE)
-        try:
-            probe = subprocess.run(["/usr/bin/python3", "-I", "-c", "pass"], stdin=subprocess.DEVNULL,
-                                   capture_output=True, timeout=APPLE_PYTHON_PROBE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            return "/usr/bin/python3"
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if probe.returncode == 0:
-            return "/usr/bin/python3"
-    return None
-
-
-# Local Network Privacy on macOS 27 also refuses Xcode's python3 (what /usr/bin/python3 runs once
-# xcode-select points at an Xcode, signed by Apple's developer team but not a platform binary) and every
-# child it starts: from 2026-10-09 every PR mini's seed prefetch got "No route to host" from cmux-lawrence
-# and fell back to R2. A /bin/sh parent that stays alive keeps the job's process an Apple platform binary,
-# and its children, the python3 and that python's /usr/bin/ssh, then reach the LAN (launchctl submit probe
-# on cmux14, macOS 27.0.1, 2026-10-19). No `exec`: the shell must stay the job's process. `launchctl kill`
+# Local Network Privacy on macOS 27 refused LAN connections from a LaunchAgent whose program is a python3 (Xcode's
+# too) and every child it starts: from 2026-10-09 every PR mini's seed prefetch got "No route to host" from
+# cmux-lawrence and fell back to R2. A /bin/sh parent that stays alive keeps the job's process an Apple platform
+# binary, and its children, the python3 and that python's /usr/bin/ssh, then reach the LAN (launchctl submit probe
+# on cmux14, macOS 27.0.1, 2026-10-19). Measured again on cmux15 (macOS 27.0.1, 2026-11-23): jobs rooted on Apple's
+# python3, on uv's python3.13 and on a /bin/sh parent all get EHOSTUNREACH for an in-process socket and all let a
+# /usr/bin/nc child connect, so the interpreter no longer matters and the pinned one runs under this parent. No `exec`: the shell must stay the job's process. `launchctl kill`
 # signals only the shell, so it forwards TERM/HUP/INT to the python3 and waits for it, then exits with its
 # status; launchd keeps tracking the job until the python3 is gone (and keeps its SIGKILL backstop).
 # A group signal (bootout) therefore reaches the python3 twice, so its TERM handlers must be idempotent.
@@ -439,16 +405,6 @@ def enroll_module() -> Any:
             loader.exec_module(module)
         _ENROLL = module
     return _ENROLL
-
-
-def enroll_python(ctx: Context) -> str | None:
-    """The Python 3.13+ glaeda-mini-enroll would pick for this HOME, or None."""
-    return enroll_module().pick_python(None, ctx.home)
-
-
-def unanswered_enroll_python(ctx: Context) -> str | None:
-    """A Python 3.13+ candidate that is there but did not answer enroll_python's probe in time, or None."""
-    return enroll_module().unanswered_python(ctx.home)
 
 
 def owned_brew() -> str | None:
@@ -885,7 +841,8 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
     brew = which("brew", ("/opt/homebrew/bin/brew",))
     checks["homebrew"] = check(brew is not None, brew or "missing")
     checks["python"] = check(ctx.python is not None, ctx.python or "missing",
-                             "" if ctx.python else "LaunchAgents need python3 (Homebrew or Command Line Tools)", True)
+                             "" if ctx.python else "LaunchAgents run ~/.local/bin/python3.13: glaeda-python --install "
+                             "(glaeda-mini-setup --apply runs it)", True)
     if ctx.headless and not ctx.skip_launchctl:
         code, _ = run([SUDO, "-n", "true"])
         checks["headlessSudo"] = check(
@@ -915,7 +872,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     """The LaunchAgents for this user: disk hygiene as hand-installed on Air Blue, plus the fleet-cas pruner."""
     disk = os.fspath(ctx.bin / "glaeda-disk")
     pressure = os.fspath(ctx.bin / "disk-pressure.sh")
-    python = ctx.python or "/usr/bin/python3"
+    python = ctx.python or os.fspath(user_python(ctx.home))
     agents = {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
@@ -1013,12 +970,11 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
-        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3
-        # under a /bin/sh parent, so it may reach the seed source on the LAN (apple_python, LAN_PARENT).
+        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. The pinned python3.13
+        # under a /bin/sh parent, so its ssh child may reach the seed source on the LAN (LAN_PARENT).
         LABEL_PREFIX + "seed-prefetch": {
             "Label": LABEL_PREFIX + "seed-prefetch",
-            "ProgramArguments": lan_program(apple_python(ctx.platform) or python,
-                                            os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"),
+            "ProgramArguments": lan_program(python, os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"),
             "StartInterval": 300,
             "ProcessType": "Background",
             "LowPriorityIO": True,
@@ -1092,11 +1048,11 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
-        # agent over a private Unix socket instead. Apple's python3 under a /bin/sh parent is what lets its ssh
-        # reach the peers (LAN_PARENT).
+        # agent over a private Unix socket instead. The pinned python3.13 under a /bin/sh parent is what lets its
+        # ssh reach the peers (LAN_PARENT).
         LABEL_PREFIX + "lan-fetch": {
             "Label": LABEL_PREFIX + "lan-fetch",
-            "ProgramArguments": lan_program(apple_python(ctx.platform) or python, "-I",
+            "ProgramArguments": lan_program(python, "-I",
                                             os.fspath(ctx.bin / "glaeda-lan-fetch"), "serve-local"),
             "RunAtLoad": True,
             "KeepAlive": True,
@@ -1539,7 +1495,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
         "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
         "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal")
+        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-python")
     for name in tools:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
@@ -1653,7 +1609,7 @@ def mark_owned(ctx: Context, actions: list[dict[str, Any]]) -> None:
 
 
 def plan_host_defaults(ctx: Context, actions: list[dict[str, Any]]) -> None:
-    """git defaults, alert sounds, Python 3.13 for enroll and git itself: never on a gh-only host."""
+    """git defaults, alert sounds and git itself: never on a gh-only host (plan_pythons makes the Python)."""
     # /usr/bin/git is an install-dialog stub until the Command Line Tools (or Xcode) exist.
     git_ok = which("git") is not None and (
         ctx.platform == "linux" or not DARWIN_REQUIRED or Path("/Library/Developer/CommandLineTools").exists() or bool(xcode_apps()))
@@ -1673,8 +1629,6 @@ def plan_host_defaults(ctx: Context, actions: list[dict[str, Any]]) -> None:
         actions.append({"kind": "git", "key": key, "value": value, "state": state, "previous": current,
                         "note": note, "owned": state == "unchanged" and key in owned_before})
     actions += plan_alert_sounds(ctx, prior)
-    if not ctx.hygiene_only:
-        actions.append(plan_enroll_python(ctx))
     actions.append(plan_git(ctx))
 
 
@@ -1707,27 +1661,80 @@ def plan_alert_sounds(ctx: Context, prior: dict[str, Any]) -> list[dict[str, Any
     return actions
 
 
-def plan_enroll_python(ctx: Context) -> dict[str, Any]:
-    act: dict[str, Any] = {"kind": "python", "key": "enroll-python", "formula": ENROLL_PYTHON_FORMULA}
-    found = enroll_python(ctx)
-    if found:
-        return {**act, "state": "unchanged", "value": found, "note": ""}
-    # A loaded host can miss the probe's deadline: a brew install then ran `brew update` for half an hour inside
-    # the update agent's setup while Python 3.13 sat there (2026-10-27). A Python that is there is never reinstalled.
-    slow = unanswered_enroll_python(ctx)
-    if slow:
-        return {**act, "state": "skipped", "value": slow,
-                "note": f"{slow} is there but did not answer its version check in time (a loaded host); "
-                        "not reinstalled, the next run checks again"}
-    brew = owned_brew()
-    if brew and not brew_allowed(ctx):
-        return {**act, "state": "blocked", "value": None,
-                "note": f"brew install {ENROLL_PYTHON_FORMULA} is not run with a sandbox HOME"}
-    if brew:
-        return {**act, "state": "create", "value": None, "brew": brew,
-                "note": f"brew install {ENROLL_PYTHON_FORMULA}; glaeda-mini-enroll needs Python 3.13+"}
-    return {**act, "state": "blocked", "value": None,
-            "note": "glaeda-mini-enroll needs Python 3.13+: " + enroll_module().PYTHON_FIX}
+def root_python_wanted(ctx: Context) -> bool:
+    """A macOS build host gets the root-owned copy: its root LaunchDaemons (glaeda-daemon-heal, the runner-hygiene
+    census) and the runner user's protected toolchain run it. Never from a sandbox HOME."""
+    return ctx.platform == "macos" and not ctx.hygiene_only and not ctx.sandbox
+
+
+def root_python_ok() -> bool:
+    """ROOT_PYTHON exists, runs, and it, its target and every directory above both are root-owned, writable by root
+    only (glaeda-python --root-path)."""
+    code, out = run(["/bin/sh", os.fspath(GLAEDA_PYTHON_TOOL), "--root-path"])
+    return code == 0 and out.strip() == ROOT_PYTHON
+
+
+def plan_pythons(ctx: Context) -> list[dict[str, Any]]:
+    """The one pinned Python: uv's CPython 3.13 for this user (every LaunchAgent and glaeda-mini-enroll run it) and,
+    on a macOS build host, its root-owned copy. Planning only reads; apply_pythons makes them."""
+    if ctx.platform == "linux":
+        return []
+    actions: list[dict[str, Any]] = []
+    want = os.fspath(user_python(ctx.home))
+    act: dict[str, Any] = {"kind": "python", "key": "python3.13", "path": want,
+                           "command": f"sh {GLAEDA_PYTHON_TOOL} --install"}
+    if ctx.python == want:
+        actions.append({**act, "state": "unchanged", "value": want, "note": ""})
+    elif ctx.python:
+        actions.append({**act, "state": "unchanged", "value": ctx.python, "note": f"--python {ctx.python} given"})
+    elif not brew_allowed(ctx):
+        actions.append({**act, "state": "blocked", "value": None,
+                        "note": "glaeda-python --install is not run with a sandbox HOME"})
+    else:
+        actions.append({**act, "state": "create", "value": None,
+                        "note": "uv python install 3.13; every LaunchAgent and glaeda-mini-enroll run it"})
+    if root_python_wanted(ctx):
+        root: dict[str, Any] = {"kind": "python", "key": "root-python", "path": ROOT_PYTHON,
+                                "command": f"sudo -n sh {GLAEDA_PYTHON_TOOL} --install-root"}
+        if root_python_ok():
+            actions.append({**root, "state": "unchanged", "value": ROOT_PYTHON, "note": ""})
+        else:
+            actions.append({**root, "state": "create", "value": None,
+                            "note": "a root-owned copy of the 3.13 above for root LaunchDaemons and the runner user"})
+    return actions
+
+
+def apply_pythons(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    """Make what plan_pythons planned, before anything that runs them is written. A root copy that sudo -n cannot
+    make is an operator step (operator_steps), not a failed run: the root jobs keep the interpreter they have."""
+    for act in actions:
+        if act.get("kind") != "python" or act.get("state") != "create":
+            continue
+        if act["key"] == "python3.13":
+            code, out = run(["/bin/sh", os.fspath(GLAEDA_PYTHON_TOOL), "--install"], timeout=PYTHON_INSTALL_TIMEOUT,
+                            env={**os.environ, "HOME": os.fspath(ctx.home)})
+            found = pick_python(ctx.home, ctx.platform)
+            act["applied"], act["value"] = found is not None, found
+            if found is None:
+                act["state"] = "failed"
+                act["note"] = f"glaeda-python --install exited {code}: {out.strip()[-300:]}"[:400]
+            else:
+                ctx.python = found
+        elif act["key"] == "root-python":
+            if ctx.python is None:
+                act["state"], act["note"] = "blocked", "needs ~/.local/bin/python3.13 first (its source)"
+                continue
+            code, _ = run([SUDO, "-n", "true"])
+            if code != 0:
+                act["state"], act["note"] = "skipped", "sudo -n is not available to this account: an operator step"
+                continue
+            code, out = run([SUDO, "-n", "/bin/sh", os.fspath(GLAEDA_PYTHON_TOOL), "--install-root"],
+                            timeout=PYTHON_INSTALL_TIMEOUT)
+            act["applied"] = code == 0 and root_python_ok()
+            act["value"] = ROOT_PYTHON if act["applied"] else None
+            if not act["applied"]:
+                act["state"] = "skipped"
+                act["note"] = f"sudo -n glaeda-python --install-root exited {code}: {out.strip()[-300:]}"[:400]
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -1769,7 +1776,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-python"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
@@ -1978,17 +1985,6 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["value"] = ".".join(map(str, version)) if version else None
             if not act["applied"]:
                 act["state"], act["note"] = "failed", f"brew install git exited {code}: {out.strip()[-300:]}"[:400]
-        if kind == "python" and state == "create":
-            # no `brew update` first: python@3.13 from the installed formulae is enough, and an auto-update holds
-            # the update agent's setup on the network
-            code, out = brew_install(act["brew"], act["formula"], no_auto_update=True)
-            found = enroll_python(ctx)
-            act["applied"] = found is not None
-            act["value"] = found
-            if found is None:
-                act["state"] = "failed"
-                act["note"] = (f"brew install {act['formula']} exited {code} and no Python 3.13+ was found: "
-                               + out.strip()[-300:])[:400]
         if kind == "git" and state == "create":
             code, out = run([which("git") or "git", "config", "--global", act["key"], act["value"]], env=ctx.git_env())
             act["applied"] = act["owned"] = code == 0
@@ -2134,9 +2130,13 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
     for a in actions:
         if a["kind"] == "gitpkg" and a["state"] in {"blocked", "failed"}:
             add(f"git {'.'.join(map(str, MIN_GIT))}+ (git maintenance memory bug)", a["note"], "Homebrew owner or operator")
-    if any(a["kind"] == "python" and a["state"] in {"blocked", "failed"} for a in actions):
-        add("glaeda-mini-enroll needs Python 3.13+ (os.waitid)", enroll_module().PYTHON_FIX,
-            "Homebrew owner or operator")
+    for a in actions:
+        if a["kind"] == "python" and a["key"] == "python3.13" and a["state"] in {"blocked", "failed"}:
+            add("glaeda runs one pinned Python: uv's CPython 3.13 (LaunchAgents, glaeda-mini-enroll)",
+                f"sh {GLAEDA_PYTHON_TOOL} --install", "operator")
+        if a["kind"] == "python" and a["key"] == "root-python" and a["state"] in {"blocked", "skipped", "failed"}:
+            add("root LaunchDaemons and the runner user run a root-owned copy of the pinned Python",
+                f"sudo sh {GLAEDA_PYTHON_TOOL} --install-root", "sudo (after the 3.13 above exists)")
     if c["workloadToolPath"]["level"] != "ok":
         add("cmux build tools must be on the fixed workload PATH", "cd <cmux> && ./scripts/setup.sh", "operator")
     if fleet_result is None:
@@ -2151,10 +2151,14 @@ def operator_steps(ctx: Context, pre: dict[str, Any], fleet_result: dict[str, An
         current = hashlib.sha256(root_copy.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else ""
     except OSError:
         current = ""
+    # The root copy's shebang is ROOT_PYTHON: helper-install refuses until that exists, so the step names it first.
+    root_python_first = any(a.get("kind") == "python" and a.get("key") == "root-python" and a.get("state") != "unchanged"
+                            for a in actions)
     if current != want or not root_chain(root_copy):
         add("cmux CI fetches compiled products from LAN peers through a root-owned glaeda-lan-fetch in a "
             "root-owned directory chain (cmux refuses anything a job could rewrite or rename)",
-            f"scripts/glaeda-seed-lan helper-install {platform.node().split('.')[0] or 'HOST'} --apply",
+            ("after the root-owned Python above: " if root_python_first else "")
+            + f"scripts/glaeda-seed-lan helper-install {platform.node().split('.')[0] or 'HOST'} --apply",
             "operator Mac, then root from a non-cmux admin account or the console, as it prints "
             "(docs/CMUX_MINI_RUNNER.md 2j); never sudo through the cmux account")
     add("Spotlight should skip build output", "System Settings > Spotlight > Search Privacy: add ~/Library/Developer/Xcode/DerivedData", "human (GUI)")
@@ -2381,6 +2385,10 @@ def main(argv: list[str] | None = None) -> int:
                   headless=args.headless, gh_only=args.gh_only,
                   profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None,
                   projects_tidy=projects_tidy)
+    # The pinned Python comes first: the preflight checks it and every agent planned below runs it.
+    python_actions = [] if args.uninstall else plan_pythons(ctx)
+    if args.apply:
+        apply_pythons(ctx, python_actions)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
@@ -2395,6 +2403,7 @@ def main(argv: list[str] | None = None) -> int:
         actions = plan_install(ctx)
         if args.apply:
             apply_install(ctx, actions)
+        actions = python_actions + actions
     fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
     # a failed git install is reported (receipt, operator step) but does not fail the run: glaeda-update
     # rolls a release back when setup fails, and a transient brew error is not the release's fault.

@@ -22,8 +22,12 @@ the VM volume and 3 GiB left on a 460 GiB disk, while its CPU streak kept breaki
 
 Only processes whose executable is exactly a policy path run as a system account (uid < 500) are touched, and a
 policy path must lie under a SIP-protected system directory. The installed copy and its policy are root-owned
-snapshots under INSTALL_DIR run by /usr/bin/python3 -I, so nothing the runner user (or a PR job) can write runs as
-root.
+snapshots under INSTALL_DIR run by ROOT_PYTHON -I (/opt/glaeda-python/bin/python3.13: the root-owned copy of the
+pinned uv Python that `glaeda-python --install-root` makes, every directory to it root-owned and closed to other
+users), so nothing the runner user (or a PR job) can write runs as root. A host that has no trusted ROOT_PYTHON yet
+keeps the interpreter its installed plist already names (never a newly written Apple python3) and its report says
+rootPython.missing, which judge passes on as rootPythonMissing; the first pass after glaeda-mini-setup --apply made
+ROOT_PYTHON rewrites the plist to it.
 
 The root copy keeps itself on the stable release (policy `release`), so a release that changes this script or the
 policy reaches every mini with no hand step. Every release.every_s an --apply pass reads ota-channels/control.json
@@ -81,7 +85,8 @@ reboot, behind these gates (fleet decision by claude-sr2 (coordinator), 2026-10-
     glaeda-mini-health turns into a sandboxd_wedged error that ci-dash keeps as an HQ fleet-alert issue.
 Every step (first slow probe, reboot, refusal, the first probe after a reboot) is a line in STATE/sandboxd-heal.jsonl,
 written and synced before the reboot runs.
-Stdlib only; runs on macOS /usr/bin/python3 (3.9).
+Stdlib only; runs on ROOT_PYTHON (3.13). The code stays parseable by Python 3.9: a copy installed before ROOT_PYTHON
+existed stages the next release and runs its plan pass with the interpreter it runs on.
 """
 
 from __future__ import annotations
@@ -118,7 +123,10 @@ POLICY_SCHEMA = "glaeda-macos-daemons/v1"
 LABEL = "com.teamleaderleo.glaeda.daemon-heal"
 INSTALL_DIR = Path("/Library/Application Support/glaeda/daemon-heal")
 PLIST = Path("/Library/LaunchDaemons") / f"{LABEL}.plist"
-SYSTEM_PYTHON = "/usr/bin/python3"  # SIP-protected; a Homebrew python is writable by the runner user
+# What the root LaunchDaemon runs: glaeda-python's ROOT_PYTHON, a root-owned copy of the pinned uv Python (a Homebrew
+# python, or the login user's ~/.local copy, is writable by a non-root account).
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+ROOT_PYTHON_FIX = "sudo glaeda-python --install-root (glaeda-mini-setup --apply runs it where sudo -n works)"
 SCRIPT_NAME = "glaeda-daemon-heal"
 POLICY_NAME = "macos-daemons.json"
 FLEET_OPS_NAME = "fleet-ops.json"
@@ -172,9 +180,9 @@ HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; t
 HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
 HYGIENE_TIMEOUT = 120
 HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
-# The python glaeda-runner-hygiene --root-census pins into the census plist: the one resolve_python() picks first, so
-# a later account enrollment writes the same plist bytes.
-CENSUS_PYTHON = "/usr/bin/python3"
+# The python glaeda-runner-hygiene pins into each account's plist and the census plist is ROOT_PYTHON, the one its
+# resolve_python() picks first, so a later account enrollment writes the same plist bytes. Without a trusted ROOT_PYTHON
+# each job keeps the interpreter it already names (hygiene_python).
 # sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs.
 SANDBOX_REBOOT = ["/sbin/shutdown", "-r", "now", "glaeda-daemon-heal: sandboxd is wedged (sandbox probe hangs)"]
 SANDBOX_JOURNAL = "sandboxd-heal.jsonl"  # in the state dir
@@ -760,18 +768,85 @@ def check_root_dir(path: Path) -> None:
             raise HealError(f"{current} is not a root-owned directory closed to other users")
 
 
+ROOT_UID = 0  # the owner a trusted interpreter's chain must have (tests patch it with their own uid)
+
+
+def trusted_root_python(path: str | None = None) -> str:
+    """"" when path (default ROOT_PYTHON) is an interpreter only root can change, else why not: the path, every link
+    it goes through, its resolved file and every directory above each of them are owned by root and not writable by
+    group or others (a sticky directory excepted, as glaeda-python --root-path checks), and the file is executable."""
+    path = path or ROOT_PYTHON
+    if not os.path.isabs(path):
+        return f"{path} is not an absolute path"
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except OSError as e:
+        return f"{path} is missing ({type(e).__name__})"
+    if not stat.S_ISREG(st.st_mode) or not os.access(real, os.X_OK):
+        return f"{path} is not an executable file"
+    hops, cur = [path], path
+    while os.path.islink(cur) and len(hops) < 40:  # every hop's directory, not only the last one's
+        cur = os.path.join(os.path.dirname(cur), os.readlink(cur))
+        hops.append(cur)
+    seen: set[str] = set()
+    for start in hops + [real]:
+        cur = os.path.normpath(start)
+        while cur not in seen:
+            seen.add(cur)
+            try:
+                st = os.lstat(cur)
+            except OSError as e:
+                return f"cannot stat {cur} ({type(e).__name__})"
+            if st.st_uid != ROOT_UID:
+                return f"{cur} is not owned by root"
+            if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022 \
+                    and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+                return f"{cur} is writable by another account"
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    return ""
+
+
+def plist_python(plist_path: Path) -> str | None:
+    """ProgramArguments[0] of an installed plist when it names an absolute path, else None."""
+    raw = read_bytes(plist_path)
+    if raw is None:
+        return None
+    try:
+        args = plistlib.loads(raw).get("ProgramArguments")
+    except Exception:  # noqa: BLE001 (a plist that does not parse names no interpreter)
+        return None
+    first = args[0] if isinstance(args, list) and args else None
+    return first if isinstance(first, str) and os.path.isabs(first) else None
+
+
+def heal_python(plist_path: Path = PLIST) -> tuple[str, str]:
+    """(the interpreter root runs this with, why ROOT_PYTHON is not it). ROOT_PYTHON when it is trusted; otherwise the
+    interpreter the installed plist already names (a host glaeda-mini-setup has not given ROOT_PYTHON yet), else
+    this process's own. Never a newly chosen Apple python3: the first pass after ROOT_PYTHON exists moves to it."""
+    why = trusted_root_python()
+    if not why:
+        return ROOT_PYTHON, ""
+    return plist_python(plist_path) or sys.executable, why
+
+
 # ---------------------------------------------------------------- install
 
 
-def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[str, Any]:
-    """The files the root LaunchDaemon needs, from this copy of the script and a validated policy."""
+def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_path: Path = PLIST) -> dict[str, Any]:
+    """The files the root LaunchDaemon needs, from this copy of the script and a validated policy. Its interpreter
+    is heal_python's: ROOT_PYTHON, or while that is missing the one the installed plist at plist_path names."""
     policy_bytes = policy_path.read_bytes()
     policy = validate_policy(json.loads(policy_bytes))
     script = install_dir / SCRIPT_NAME
     state_dir = install_dir / "state"
+    python, missing = heal_python(plist_path)
     plist = {
         "Label": LABEL,
-        "ProgramArguments": [SYSTEM_PYTHON, "-I", os.fspath(script), "--apply",
+        "ProgramArguments": [python, "-I", os.fspath(script), "--apply",
                              "--policy", os.fspath(install_dir / POLICY_NAME), "--state-dir", os.fspath(state_dir)],
         "StartInterval": policy["every_s"],
         "RunAtLoad": True,
@@ -786,12 +861,12 @@ def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[
     # root never runs an op body it did not verify against the signed release.
     files = {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
              install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])}
-    return {"files": files,
+    return {"files": files, "python": python, "rootPythonMissing": missing or None,
             "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
 
 
 def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_path: Path = PLIST) -> dict[str, Any]:
-    want = desired_install(policy_path, install_dir)
+    want = desired_install(policy_path, install_dir, plist_path)
     stale = [os.fspath(p) for p, (data, _m) in want["files"].items() if read_bytes(p) != data]
     if read_bytes(plist_path) != want["plist"]:
         stale.append(os.fspath(plist_path))
@@ -807,7 +882,8 @@ def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_pat
     # current/stale/missing from the root report: a self-updating copy follows stable, not this user's release
     verdict = judge(load_json(report_path), time.time(), installed)
     return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale, "verdict": verdict,
-            "loaded": loaded(), "reportFresh": fresh,
+            "loaded": loaded(), "reportFresh": fresh, "python": want["python"],
+            "rootPythonMissing": want["rootPythonMissing"],
             "reportAgeS": None if report_age is None else round(report_age),
             "sha256": sha256(Path(__file__).read_bytes()), "policySha256": sha256(policy_path.read_bytes()),
             "report": os.fspath(report_path)}
@@ -846,6 +922,9 @@ def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
         return {**status, "state": "unchanged" if status["current"] else "planned"}
     if os.geteuid() != 0:
         raise HealError("--install --apply needs root: the snapshot and the LaunchDaemon are root-owned")
+    untrusted = trusted_root_python(want["python"])
+    if untrusted:  # e.g. `sudo ~/.local/bin/python3.13 glaeda-daemon-heal --install` on a host with no ROOT_PYTHON
+        raise HealError(f"refusing to make root run {want['python']}: {untrusted}; {ROOT_PYTHON_FIX}")
     for d in (INSTALL_DIR, want["state_dir"]):
         d.mkdir(mode=0o755, parents=True, exist_ok=True)
         check_root_dir(d.parent)  # before chown/chmod: never follow a planted link with root's chown
@@ -1060,8 +1139,10 @@ def finish_pair(install_dir: Path, root: bool) -> bool:
 
 
 def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=bounded_run,
-                python: str = SYSTEM_PYTHON) -> None:
-    """The new pair must plan a pass with each other (its code reading its policy) before it replaces the snapshot."""
+                python: str | None = None) -> None:
+    """The new pair must plan a pass with each other (its code reading its policy) before it replaces the snapshot,
+    under the interpreter the LaunchDaemon will run it with (heal_python)."""
+    python = python or heal_python()[0]
     stage = stage_dir(install_dir, root)
     for name, data in files.items():
         atomic_write(stage / name, data, MODES[name], root)
@@ -1089,7 +1170,7 @@ def pair_hashes(install_dir: Path) -> dict[str, str | None]:
 
 
 def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_dir: Path = INSTALL_DIR,
-            root: bool = True, get=fetch, run=bounded_run, python: str = SYSTEM_PYTHON) -> dict[str, Any]:
+            root: bool = True, get=fetch, run=bounded_run, python: str | None = None) -> dict[str, Any]:
     """Bring the snapshot to the stable release's two files; returns the new state["release"]. Never raises: a
     channel or release that fails a check leaves the snapshot as it is and says why."""
     rel = dict(state.get("release") or {})
@@ -1149,7 +1230,17 @@ def parse_iso(text: Any) -> float | None:
 
 def judge(report: Any, now: float, installed: bool) -> dict[str, Any]:
     """current, stale or missing, and why, from the root report alone (any reader: mini-health, fleet-status).
-    reinstall: whether a root --install can fix it (not for a channel it cannot read or a release it refused)."""
+    reinstall: whether a root --install can fix it (not for a channel it cannot read or a release it refused).
+    rootPythonMissing: why the report says it does not run on ROOT_PYTHON yet (it keeps its old interpreter until
+    sudo glaeda-python --install-root makes one), whatever the state."""
+    verdict = _judge(report, now, installed)
+    said = report.get("rootPython") if installed and isinstance(report, dict) else None
+    if isinstance(said, dict) and said.get("missing"):
+        verdict["rootPythonMissing"] = str(said["missing"])[:200]
+    return verdict
+
+
+def _judge(report: Any, now: float, installed: bool) -> dict[str, Any]:
     if not installed:
         return {"state": "missing", "reinstall": True, "why": "the root daemon-heal LaunchDaemon is not installed"}
     at = parse_iso(report.get("at")) if isinstance(report, dict) else None
@@ -1183,12 +1274,12 @@ def schedule_reload(install_dir: Path, plist_path: Path, state: dict[str, Any], 
                     every_s: int, spawn=subprocess.Popen) -> bool:
     """A plist that no longer matches the installed policy (or this code) is reloaded by a detached --install, in
     its own session so launchd's bootout of this job does not end it; it waits for this pass to exit first."""
-    want = desired_install(install_dir / POLICY_NAME, install_dir)["plist"]
-    if read_bytes(plist_path) == want or now - float(state.get("reload_at") or 0) < every_s:
+    want = desired_install(install_dir / POLICY_NAME, install_dir, plist_path)
+    if read_bytes(plist_path) == want["plist"] or now - float(state.get("reload_at") or 0) < every_s:
         return False
     state["reload_at"] = now
     with open(install_dir / "state" / "reload.log", "ab") as log:
-        spawn([SYSTEM_PYTHON, "-I", os.fspath(install_dir / SCRIPT_NAME), "--install", "--apply", "--policy",
+        spawn([want["python"], "-I", os.fspath(install_dir / SCRIPT_NAME), "--install", "--apply", "--policy",
                os.fspath(install_dir / POLICY_NAME), "--after-pid", str(os.getpid())],
               stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
     return True
@@ -1654,7 +1745,7 @@ def _keep_current(argv: list[str], inputs, cache: dict[str, Any], key: str, entr
 
 
 def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: bool, hygiene_root: Path = HYGIENE_ROOT,
-                 daemons: Path = HYGIENE_DAEMONS, run=bounded_run, python: str = SYSTEM_PYTHON,
+                 daemons: Path = HYGIENE_DAEMONS, run=bounded_run, python: str | None = None,
                  account=account_name, ci_mini=ci_mini_why_not) -> dict[str, Any]:
     """Keep every runner account's glaeda-runner-hygiene job (a root-pinned glaeda-disk and its LaunchDaemon) on the
     release this copy runs. For each account that already has one (an operator enrolled it once; nothing is
@@ -1662,7 +1753,10 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
     release's --apply leaves; a stale one is reinstalled by that release's --apply. Only the two files refresh()
     took from the verified release and recorded in installed.json ever run as root. state["runner_hygiene"] remembers
     each account's last current inputs, so an unchanged one is not checked again until HYGIENE_RECHECK_S.
-    With no enrolled account on a CI mini, the host's root census alone is kept the same way (root_census_pass)."""
+    With no enrolled account on a CI mini, the host's root census alone is kept the same way (root_census_pass).
+    python runs the release's glaeda-runner-hygiene (heal_python); each job is pinned to ROOT_PYTHON once it is
+    trusted, and keeps the interpreter its manifest names until then (hygiene_python)."""
+    python = python or heal_python()[0]
     out: dict[str, Any] = {"accounts": {}}
     try:
         dirs = sorted((d for d in hygiene_root.iterdir() if d.name.isdigit() and (d / "manifest.json").is_file()),
@@ -1709,11 +1803,17 @@ def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: boo
                                                        daemons / f"{HYGIENE_LABEL}.{uid}.plist")]).encode())
 
         argv = [python, "-I", os.fspath(tool), "--user", user, "--source", os.fspath(disk),
-                "--python", manifest["python"]]
+                "--python", hygiene_python(manifest["python"], python)]
         _keep_current(argv, inputs, cache, uid, entry, now, live, run)
     for uid in [u for u in cache if u not in out["accounts"]]:
         cache.pop(uid)
     return out
+
+
+def hygiene_python(keep: str | None, fallback: str) -> str:
+    """The interpreter a runner-hygiene job is pinned to: ROOT_PYTHON when trusted, else the one it already names
+    (keep), else fallback (the interpreter this pass runs on)."""
+    return ROOT_PYTHON if not trusted_root_python() else keep or fallback
 
 
 def root_census_pass(tool: Path, disk: Path, verified: bool, hold: str, state: dict[str, Any], now: float, live: bool,
@@ -1736,7 +1836,8 @@ def root_census_pass(tool: Path, disk: Path, verified: bool, hold: str, state: d
         return sha256(json.dumps([sha256(read_bytes(p) or b"") for p in (
             tool, disk, census / DISK_NAME, daemons / f"{HYGIENE_LABEL}.root-census.plist")]).encode())
 
-    argv = [python, "-I", os.fspath(tool), "--root-census", "--source", os.fspath(disk), "--python", CENSUS_PYTHON]
+    pinned = hygiene_python(plist_python(daemons / f"{HYGIENE_LABEL}.root-census.plist"), python)
+    argv = [python, "-I", os.fspath(tool), "--root-census", "--source", os.fspath(disk), "--python", pinned]
     _keep_current(argv, inputs, cache, "host", entry, now, live, run)
     return entry
 
@@ -1801,6 +1902,8 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
         except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
             report["updater"] = {"error": str(e)[:300]}
     report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
+    runs, missing = heal_python()
+    report["rootPython"] = {"path": ROOT_PYTHON, "runs": runs, "missing": missing or None}
     report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
     if "release" in new_state:
         report["release"] = release_report(new_state["release"], policy)
@@ -1847,8 +1950,9 @@ def main(argv: list[str] | None = None) -> int:
             before = Path(__file__).read_bytes()
             if finish_pair(INSTALL_DIR, root=True) and Path(__file__).read_bytes() != before:
                 # a swap a crash cut short, finished: run the pass with the code that goes with the new policy
-                os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, "-I", os.fspath(INSTALL_DIR / SCRIPT_NAME),
-                                         *(sys.argv[1:] if argv is None else argv)])
+                python = heal_python()[0]
+                os.execv(python, [python, "-I", os.fspath(INSTALL_DIR / SCRIPT_NAME),
+                                  *(sys.argv[1:] if argv is None else argv)])
         if args.status:
             out = install_status(args.policy)
         elif args.install:

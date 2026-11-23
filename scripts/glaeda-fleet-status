@@ -1739,7 +1739,7 @@ class Builder:
             summary = f"root daemon-heal: {m['daemon_heal']['why'] or state}"
             if row.get("reinstall") is False:  # it cannot read its channel or refused a release: a reinstall is no fix
                 action = self.action(member, "read_daemon_heal_report", "agent",
-                                     "/usr/bin/python3 -c 'import json; print(json.load(open(\"/Library/Application "
+                                     "~/.local/bin/python3.13 -I -c 'import json; print(json.load(open(\"/Library/Application "
                                      "Support/glaeda/daemon-heal/state/report.json\")).get(\"release\"))'", safe=True,
                                      note="release.error says why; it retries every release.every_s")
             else:

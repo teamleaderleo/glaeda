@@ -883,9 +883,12 @@ sys.exit(m.main(sys.argv[1:]))
                               capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 3)
 
-    def test_the_helper_runs_apples_python_isolated(self):
+    def test_the_helper_runs_the_root_owned_python_313_isolated(self):
+        # CI execs the root-owned copy directly as the runner user: only root may write its interpreter.
         first = (ROOT / "scripts/glaeda-lan-fetch").read_text().splitlines()[0]
-        self.assertEqual(first, "#!/usr/bin/python3 -I")
+        self.assertEqual(first, "#!/opt/glaeda-python/bin/python3.13 -I")
+        lan = load("glaeda_seed_lan_for_lan_fetch", ROOT / "scripts/glaeda-seed-lan")
+        self.assertEqual(first, f"#!{lan.HELPER_PYTHON} -I")
 
 
 def put_state(state: Path, k: int, stamp: dict, files: dict[str, bytes], slot: str = "kept") -> str:

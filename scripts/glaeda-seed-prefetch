@@ -53,9 +53,11 @@ and prunes, or downloads a nearer seed the seeder did not have. So a miss or any
 behaviour.
 
 macOS Local Network Privacy blocks LAN connections from a LaunchAgent whose program is not Apple's
-(measured 2026-09-25: Homebrew python3 and its /usr/bin/ssh child got "No route to host"; /usr/bin/python3
-and its children connected). So glaeda-mini-setup runs this agent with /usr/bin/python3, the stream uses
-/usr/bin/ssh and /usr/bin/tar, and cmux's seed_derived_data.py still runs under Homebrew's python3
+(measured 2026-09-25: Homebrew python3 and its /usr/bin/ssh child got "No route to host"). On macOS 27 no
+python gets the LAN in-process, Apple's or uv's, but a /usr/bin child of either under a /bin/sh parent does
+(cmux15, 2026-11-23). So glaeda-mini-setup runs this agent as /bin/sh (LAN_PARENT) running the login user's
+Python 3.13 (glaeda-python USER_PYTHON, never Apple's python3), the stream uses /usr/bin/ssh and
+/usr/bin/tar, and cmux's seed_derived_data.py still runs under Homebrew's python3
 (cmux_python), which reaches only the internet.
 """
 
@@ -118,7 +120,7 @@ KEEP_SCRIPTS = 2  # extracted scripts/ci trees, by main commit
 MANIFEST = "cmux-seed-input-mtimes.json"
 ANCESTOR_LIMIT = 50
 # cmux's scripts run under Homebrew's python3, as its jobs do; without one, this agent's own interpreter
-# (reported in the record as cmux_python, since it may be Apple's 3.9).
+# (reported in the record as cmux_python).
 CMUX_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3")
 
 # Seeds over the LAN from the trusted seeder (glaeda-seed-serve). Written by glaeda-seed-lan install; the
@@ -345,7 +347,7 @@ def scripts_for(work: Path, mirror: Path, head: str) -> Path:
 def cmux_python() -> str:
     """The interpreter for cmux's seed_derived_data.py: Homebrew's, which cmux jobs use, else this one.
 
-    This agent runs under /usr/bin/python3 (3.9) for Local Network Privacy; cmux's scripts target its jobs' python3.
+    This agent runs under glaeda's own Python 3.13 (USER_PYTHON); cmux's scripts target its jobs' python3.
     """
     for candidate in CMUX_PYTHONS:
         if os.access(candidate, os.X_OK):
@@ -563,7 +565,7 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
             ssh_err.seek(0)
             detail = ssh_err.read().decode(errors="replace").strip()[-160:]
             if "No route to host" in detail:
-                detail += " (Local Network Privacy: the agent must run /usr/bin/python3 under a /bin/sh parent; rerun glaeda-mini-setup)"
+                detail += " (Local Network Privacy: the agent must run ~/.local/bin/python3.13 under a /bin/sh parent; rerun glaeda-mini-setup --apply)"
             run.unreachable = f"{address}: {'timed out' if run.timed_out else detail or 'no answer'}"
             return None
         words = header[len(SERVE_HEADER):].decode(errors="replace").split()

@@ -53,7 +53,7 @@ host, remote = args[0], shlex.split(" ".join(args[1:]))
 open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"host": host, "remote": remote}}) + "\\n")
 if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
-assert remote[0] == "/usr/bin/python3", remote
+assert remote[0] == "~/.local/bin/python3.13", remote  # USER_PYTHON, never Apple's /usr/bin/python3
 env = {{**os.environ, "HOME": os.path.join(os.environ["FAKE_HOMES"], host)}}
 sys.exit(subprocess.run([sys.executable, *remote[1:]], stdin=sys.stdin, env=env).returncode)
 """

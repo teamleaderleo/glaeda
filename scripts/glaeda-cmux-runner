@@ -265,23 +265,47 @@ def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
     return None
 
 
-# The hooks' interpreter, best first. /usr/bin/python3 is the xcrun shim: it runs Xcode's (or the Command Line Tools')
-# python with SDKROOT exported into its environment, which the gate once passed to every job (cmux21, 2026-10-21), and
-# it fails outright when that SDK is gone. A fleet member's job PATH has Homebrew's python3 anyway (the hook's
-# MIN_WORKLOAD_PYTHON), so the shim is the last resort.
-HOOK_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3")
-XCRUN_SHIM_PYTHON = "/usr/bin/python3"
+# glaeda-python's ROOT_PYTHON: the uv-installed Python 3.13 copied root:wheel and go-w, every parent root-owned
+# (glaeda-mini-setup --apply runs `sudo -n glaeda-python --install-root`). No account but root can replace it, so it is
+# what a runner user (a poolUser, a dedicated user) execs, and the hooks' interpreter wherever it is trusted.
+ROOT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+# The login user's uv-installed copy (glaeda-python --install), relative to the installing account's home.
+USER_PYTHON = ".local/bin/python3.13"
+# The hooks' interpreter after ROOT_PYTHON, best first: Homebrew's (a fleet member's job PATH has it anyway, the hook's
+# MIN_WORKLOAD_PYTHON), then this account's USER_PYTHON. Apple's python is never one: its python3 in /usr/bin is the xcrun shim
+# (Xcode's or the Command Line Tools' 3.9), which exported SDKROOT into the gate's environment and from there into
+# every job (cmux21, 2026-10-21), and fails outright when that SDK is gone.
+HOOK_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3")
+XCRUN_SHIM_PYTHON = "/usr/bin/python3"  # PY_PIN_EXEMPT: only to recognise and refuse the xcrun shim (apple_python)
+
+
+def apple_python(path: str) -> bool:
+    """path is Apple's python: the xcrun shim (XCRUN_SHIM_PYTHON) or a developer directory's python3 it runs."""
+    real = os.path.realpath(path)
+    return (real == os.path.realpath(XCRUN_SHIM_PYTHON) or "/Contents/Developer/" in real
+            or real.startswith("/Library/Developer/CommandLineTools/"))
+
+
+def root_python() -> str | None:
+    """ROOT_PYTHON when it runs and nothing but root can replace it (untrusted_exec with uid 0), else None."""
+    if os.access(ROOT_PYTHON, os.X_OK) and untrusted_exec(ROOT_PYTHON, 0) is None:
+        return ROOT_PYTHON
+    return None
 
 
 def hook_python() -> str | None:
-    """python3 on PATH unless it is the xcrun shim, else the first HOOK_PYTHONS that runs, the shim last."""
+    """ROOT_PYTHON when trusted, else python3 on PATH unless it is Apple's, else the first HOOK_PYTHONS (then this
+    account's USER_PYTHON) that runs; None when nothing does. Never Apple's python3 (the xcrun shim)."""
+    root = root_python()
+    if root:
+        return root
     found = shutil.which("python3")
-    if found and os.path.realpath(found) != XCRUN_SHIM_PYTHON:
+    if found and not apple_python(found):
         return found
-    for candidate in HOOK_PYTHONS:
-        if os.access(candidate, os.X_OK) and os.path.realpath(candidate) != XCRUN_SHIM_PYTHON:
+    for candidate in (*HOOK_PYTHONS, os.fspath(Path.home() / USER_PYTHON)):
+        if os.access(candidate, os.X_OK) and not apple_python(candidate):
             return candidate
-    return XCRUN_SHIM_PYTHON if os.access(XCRUN_SHIM_PYTHON, os.X_OK) else found
+    return None
 
 
 def write_atomic(path: Path, data: bytes, mode: int, make_parent: bool = True) -> None:
@@ -735,7 +759,7 @@ def ere_escape(text: str) -> str:
 
 
 def hook_wrappers(ctx: Context) -> dict[str, bytes]:
-    python = shlex.quote(ctx.python or "/usr/bin/python3")
+    python = shlex.quote(ctx.python or ROOT_PYTHON)
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
     gui_token = getattr(ctx, "gui_token", "gui")
     if not isinstance(gui_token, str):
@@ -975,8 +999,8 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
             "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
             "PATH": path,
-            # PROTECTED_TOOLCHAIN: /usr/bin/python3 and the other xcrun shims resolve to the root-owned Command Line
-            # Tools, never an Xcode another admin account can write
+            # PROTECTED_TOOLCHAIN: the xcrun shims in /usr/bin (git, make, clang) resolve to the root-owned Command
+            # Line Tools, never an Xcode another admin account can write
             **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {}),
             # POOL_USER: the node's enrollment and class receipt as the member user published them (the hook's
             # NODE_VIEW), since this account cannot read that user's home
@@ -1193,7 +1217,7 @@ def release_plan_labels(script: str, argv: list[str]) -> list[str] | None:
             skip = True
         elif arg not in ("--apply", "--allow-stale") and not arg.startswith("--output="):
             plan.append(arg)
-    python = sys.executable or "/usr/bin/python3"
+    python = sys.executable or ROOT_PYTHON
     code, out = run([python, script, *plan, "--output", "json"], timeout=180,
                     env={**os.environ, NO_RELEASE_CHECK: "1"})
     try:
@@ -3038,8 +3062,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
-    p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH unless it is the "
-                   "/usr/bin/python3 xcrun shim, else Homebrew's; HOOK_PYTHONS)")
+    p.add_argument("--python", help="interpreter the job hooks run (default: ROOT_PYTHON, "
+                   f"{ROOT_PYTHON}, when root-owned; else python3 on PATH unless it is Apple's, else Homebrew's or "
+                   "~/.local/bin/python3.13; HOOK_PYTHONS; never Apple's python3, the xcrun shim)")
     p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
                    "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
@@ -3313,7 +3338,7 @@ def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> 
     ctx.labels, ctx.labels_requested = list(entry["labels"]), True
     ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
     if entry.get("user") and not args.python:
-        ctx.python = PROTECTED_PYTHON  # PROTECTED_TOOLCHAIN: Apple's shim, never a Homebrew python
+        ctx.python = PROTECTED_PYTHON  # PROTECTED_TOOLCHAIN: the root-owned ROOT_PYTHON, never a Homebrew python
     if entry.get("user"):
         # DEDICATED_USER: its hook keeps the ledger files it writes (a nightly-style disk waiter, the disk-low turn)
         # under this account's own 0700 state, never in the member user's shared capacity directory, which it cannot
@@ -3448,13 +3473,15 @@ def pool_user_refusal(ctx: Context, manifest: Any, member: str, uninstall: bool,
 # PROTECTED_TOOLCHAIN (review of 7c91dc6b): a user entry's runner holds a session and a token the member user's PR
 # jobs must never reach, and those jobs can write whatever the member user owns: Homebrew (/opt/homebrew, given to that
 # user by fleet provisioning), an Xcode it installed, its home. So everything the runner, its hooks and its agents exec
-# comes from a protected toolchain: Apple's /usr/bin/python3 with DEVELOPER_DIR pinned to the root-owned Command Line
-# Tools, a PATH of only the system directories (plus declared entries that pass the check), and admit and watch
-# commands that pass it. The check (untrusted_exec): the path, its resolved target and every directory above either are
+# comes from a protected toolchain: glaeda-python's root-owned ROOT_PYTHON, DEVELOPER_DIR pinned to the root-owned
+# Command Line Tools (for the xcrun shims in /usr/bin: git, make, clang), a PATH of only the system directories (plus
+# declared entries that pass the check), and admit and watch commands that pass it. The check (untrusted_exec): the path, its resolved target and every directory above either are
 # owned by root or by this account and writable by neither group nor other. --dedicated on a user entry plans a
 # toolchain step that blocks the whole install, typed, when anything fails it.
 PROTECTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-PROTECTED_PYTHON = "/usr/bin/python3"
+PROTECTED_PYTHON = ROOT_PYTHON
+# The fix a mini without ROOT_PYTHON needs (glaeda-mini-setup --apply runs it hourly where sudo -n works).
+ROOT_PYTHON_FIX = "sudo -n glaeda-python --install-root (glaeda-mini-setup --apply runs it)"
 PROTECTED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
 TOOLCHAIN_MISSING = "protected-toolchain"
 
@@ -3491,12 +3518,9 @@ def untrusted_exec(path: str, uid: int, lstat: Callable[[str], os.stat_result] =
 
 
 def toolchain_paths(ctx: Context) -> list[str]:
-    """Everything a user entry's runner execs or searches: the installer's and the hooks' interpreter (and, for Apple's
-    shim, the Command Line Tools' python3 it runs), every PATH directory, and each absolute word of its admit and watch
-    commands that names a file."""
+    """Everything a user entry's runner execs or searches: the installer's and the hooks' interpreter, every PATH
+    directory, and each absolute word of its admit and watch commands that names a file."""
     paths = [sys.executable, ctx.python or PROTECTED_PYTHON]
-    if (ctx.python or PROTECTED_PYTHON) == PROTECTED_PYTHON:
-        paths.append(f"{PROTECTED_DEVELOPER_DIR}/usr/bin/python3")
     paths += runner_path(ctx.home, ":".join(declared_path(ctx)), protected=True).split(":")
     entry = dedicated_of(ctx) or {}
     for key in ("admit", "watch"):
@@ -3517,6 +3541,11 @@ def plan_toolchain(ctx: Context) -> dict[str, Any] | None:
         act["missing"] = TOOLCHAIN_MISSING
         act["note"] = ("a user entry execs only root- or self-owned, group/other-unwritable paths: "
                        + "; ".join(f"{r['path']}: {r['why']}" for r in refused))[:600]
+        if (ctx.python or PROTECTED_PYTHON) == ROOT_PYTHON and not os.path.exists(ROOT_PYTHON):
+            # a mini that has not run the new glaeda-mini-setup yet: name the fix first, before the path list
+            act["rootPython"] = "missing"
+            act["note"] = (f"root_python_missing: {ROOT_PYTHON} is not installed; run {ROOT_PYTHON_FIX}; "
+                           + act["note"])[:600]
     return act
 
 
@@ -3568,7 +3597,7 @@ def dedicated_word(ctx: Context, word: str) -> str:
     """A runner.dedicated command word or env value: "~/" is this user's home, "{runnerDir}" the runner's directory,
     and a whole word "{python}" the hook's own interpreter (the one job-started.sh execs the hook with)."""
     if word == "{python}":  # glaeda_fleet_labels.PYTHON_WORD
-        return ctx.python or "/usr/bin/python3"
+        return ctx.python or ROOT_PYTHON
     if word.startswith("~/"):
         word = os.fspath(ctx.home / word[2:])
     return word.replace("{runnerDir}", os.fspath(ctx.runner_dir))

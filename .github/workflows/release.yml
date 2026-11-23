@@ -115,9 +115,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          # the tools run under the host's python: macOS minis use /usr/bin/python3 (3.9)
-          smoke_python=python3
-          if [ "$RUNNER_OS" = macOS ] && [ -x /usr/bin/python3 ]; then smoke_python=/usr/bin/python3; fi
+          # the tools run under the hosts' one pinned Python: uv's CPython 3.13, made the way the hosts make it
+          smoke_python=$(sh scripts/glaeda-python --install)
           python3 scripts/glaeda_release.py smoke --source "$GITHUB_SHA" --target "$TARGET" \
             --python "$smoke_python" --output release-assets
       - name: Assemble release assets

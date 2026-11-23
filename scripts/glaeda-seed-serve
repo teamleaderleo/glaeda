@@ -1,8 +1,12 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """glaeda-seed-serve: stream a kept seed (trusted seeder) or a compiled product (any PR mini) over SSH.
 
     authorized_keys on the seeder (written by scripts/glaeda-seed-lan install):
-        restrict,from="<LAN>",command="/usr/bin/python3 -I ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
+        restrict,from="<LAN>",command="~/.local/bin/python3.13 -I ~/.local/libexec/glaeda-seed-serve" ssh-ed25519 ... glaeda-seed-lan@<mini>
+
+(~ written out as the home directory). The forced command names the login user's Python 3.13 (glaeda-python
+USER_PYTHON); the shebang is never used. A line still naming Apple's python3 (written before) keeps working
+until glaeda-seed-lan rewrites it, so this file stays parseable by Python 3.9 for now.
 
 This runs only as that forced command. The client's requested command arrives in SSH_ORIGINAL_COMMAND:
 
@@ -70,7 +74,7 @@ one request at a time per client address (a flock on client-<ip>), at most QUEUE
 all (queue-<n>.lock, taken without waiting: beyond it the answer is `busy` at once), of which at most
 SLOTS stream (flock, SLOT_WAIT to get one), each for at most SERVE_TIMEOUT seconds however slowly the
 client reads. Streams run at nice 10 with utility disk I/O, so the seeder's own seed job keeps the
-machine. The forced command runs python3 -I: no user site-packages, no PYTHON* variables. Each request appends one JSON line to RUN_DIR/serve.jsonl (bounded, rotated).
+machine. The forced command runs python3.13 -I: no user site-packages, no PYTHON* variables. Each request appends one JSON line to RUN_DIR/serve.jsonl (bounded, rotated).
 The options below are fixed by the authorized_keys command, never by the client.
 """
 
