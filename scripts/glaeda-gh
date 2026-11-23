@@ -341,6 +341,7 @@ import hashlib
 import importlib.util
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import http.client as http_client
+import io
 import ipaddress
 import json
 import math
@@ -1514,6 +1515,21 @@ def branch_target_step(kind: str, text: str, cwd: str | None = None) -> str:
     if not repo:
         return ""
     return f"glaeda-gh search prs --repo {repo} head:{branch} --state open --field target,state"
+
+
+def repo_targets(kind: str, targets: str | list[str], repo: str) -> str | list[str]:
+    """TARGETS with each bare N or #N named in REPO (`--repo` of status and wait), the rest as typed. Measured
+    2026-11-16..23: `status pr N --repo R` was refused as "unrecognized arguments", the form gh itself takes."""
+    if kind not in ("pr", "run", "comment"):
+        raise WatchError(f"--repo names the repository of a bare number, which {kind} does not take")
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo):
+        raise WatchError(f"--repo takes OWNER/REPO, not {repo!r}")
+
+    def one(text: str) -> str:
+        bare = BARE_NUMBER.fullmatch(drop_kind_prefix(text, kind))
+        return f"{repo}{'/' if kind == 'run' else '#'}{int(bare.group(1))}" if bare else text
+
+    return [one(t) for t in targets] if isinstance(targets, list) else one(targets)
 
 
 def parse_key(kind: str, text: str) -> str:
@@ -7411,7 +7427,8 @@ class Daemon:
             actor = self.outbox_actor(item)
             if item.get("appWriter") and not actor and not item.get("delivered"):
                 continue  # never replay an App-authored POST with the login
-            if not actor and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
+            broker = not actor and lane_vm_poster()  # the broker paces its own writes: this host's REST backoff is moot
+            if not actor and not broker and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
                 continue
             self.writing = True
             try:
@@ -7661,6 +7678,8 @@ class Daemon:
         if item.get("delivered"):
             self.post_delivered(path, item)
             return
+        if not actor and lane_vm_poster():
+            return self.post_through_broker(path, item)
         if item.get("uncertain"):
             # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
             # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
@@ -7726,6 +7745,39 @@ class Daemon:
                              error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
+
+    def post_through_broker(self, path: Path, item: dict) -> None:
+        """A lane VM's queued write, made with the lane-gh broker's own tool (broker_write), the route this host's
+        `gh` takes: the daemon here has no login, and its `gh auth token` post held every write queued for good
+        (lane_vm_poster). A limit's refusal made nothing, so the write waits out its retry_after, and so does every
+        write behind it (the pause is the login's). A write with no broker form fails with the command that makes it.
+        A lost answer fails rather than risk a second PR or comment: it names the repository to read first. An entry
+        a token-less attempt marked uncertain was never sent (its POST needed the token it could not get)."""
+        chosen = broker_post_args(item)
+        if chosen is None:
+            self.post_finish(path, item, error="the lane-gh broker has no tool for this write (a review, a gate, a "
+                                               f"status key or reviewers); {broker_post_next(item)}")
+            return
+        item.pop("uncertain", None)
+        outcome, value = broker_write(item, chosen, BROKER_OUTBOX_DEADLINE)
+        self.post_at = self.now
+        if outcome == "made":
+            url, number = broker_made_where(value)
+            self.post_delivered(path, item, {"html_url": url, "number": number}, note="made through the lane-gh broker")
+        elif outcome == "limited":
+            wait = min(float(value), float(PACE_HOLD_MAX))
+            self.post_hold = max(self.post_hold, self.now + wait)
+            item["notBefore"] = self.now + wait
+            item["holdUntil"] = self.now + wait
+            item["throttled"] = int(item.get("throttled") or 0) + 1
+            item["lastError"] = f"the broker's limit held it; it goes out in {wait:.0f}s"
+            write_json(path, item)
+            log({"event": "post-throttled", "id": item["id"], "wait": round(wait), "via": "lane-gh"})
+        elif outcome == "lost":
+            self.post_finish(path, item, error=f"{value}; it may have been made: read {item['repo']} before sending "
+                                               "it again")
+        else:
+            self.post_finish(path, item, error=f"the lane-gh broker did not make it: {value}")
 
     def post_after(self, item: dict, doc: dict) -> str | None:
         """A new PR's requested reviewers (not content creation, so no spacing); a failure is a note."""
@@ -12671,6 +12723,30 @@ def land_retarget_args(repo: str, number: str, base: str, broker: bool) -> list[
 
 
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
+# A head_moved stop names the live head it read (its next step is `--sha LIVE`), so it also says the pin it stopped was
+# replaced. A row then re-pinned at LIVE whose copy still shows that replaced head is reading something older than the
+# stop's own read, not a new push: a lane host, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
+# "the head is 383d1cd9dfe7 (the broker read it from GitHub)"; re-pinned at 383d1cd9dfe7 33 s later, pin_wait stopped
+# it "the head is 5bd7077339bc, not the --sha 383d1cd9dfe7" on the cache's copy (vouched fresh by an updatedAt probe,
+# not a head read), and the requester re-queued the same pin by hand, after which it was seen at once. Within this
+# bound such a copy never stops the row; pin_wait keeps reading (its nudge, direct read and LAND_PIN_READ_FAILS bound).
+# Past it the row stops head_moved as before, so a real force-push back to the replaced head still stops it.
+LAND_REPLACED_HEAD_WAIT = 300.0
+LAND_MOVED_NEXT = re.compile(r"--(?:sha|match-head-commit) ([0-9a-f]{40})\b")
+
+
+def land_replaced_head(e: dict, head: str, now: float) -> bool:
+    """True when HEAD is the pin E's last head_moved stop said GitHub had replaced, E is now pinned at the head that stop
+    read, and the re-pin is younger than LAND_REPLACED_HEAD_WAIT: a copy older than the stop's own read."""
+    moved = e.get("movedFrom")
+    if not isinstance(moved, dict):
+        return False
+    was, live = str(moved.get("was") or "").lower(), str(moved.get("head") or "").lower()
+    pin = str(e.get("pinSha") or "").lower()
+    since = e.get("pinSince")
+    return (bool(was and live and pin and head) and head.lower().startswith(was) and live.startswith(pin)
+            and isinstance(since, (int, float)) and not isinstance(since, bool)
+            and now - float(since) < LAND_REPLACED_HEAD_WAIT)
 
 
 def land_direct_read(key: str) -> str | None:
@@ -14662,8 +14738,29 @@ def land_step_class(out: str) -> str:
     found = LAND_STEP_CODE.findall(out or "")
     if found:
         return found[-1]
-    lines = [ln.strip() for ln in str(out or "").splitlines() if ln.strip()]
+    text = str(out or "")
+    # A step that printed a JSON document (the broker's indented envelope from a land that answered ok but did not
+    # merge) is read by its words, not its last line, which is `}`. manaflow-ai/cmux#47213 on a lane VM, 2026-11-23
+    # 08:14:33Z: `step_refused ... why=}` and `wait_refused code=}`, so its history named no reason at all.
+    with contextlib.suppress(ValueError):
+        text = "\n".join(land_json_words(json.loads(text))) or text
+    lines = [ln.strip() for ln in text.splitlines() if re.search(r"\w", ln)]
     return re.sub(r"[0-9a-f]{7,40}|\d+", "#", lines[-1] if lines else "no output")[:120]
+
+
+def land_json_words(doc: Any) -> list[str]:
+    """The refusal words in a step's JSON output DOC: each "error", "reason", "why" and "next" string, depth first, so
+    land_step_class reads the innermost (the broker's data under its envelope) last."""
+    words: list[str] = []
+    if isinstance(doc, dict):
+        words += [str(doc[k]) for k in ("error", "reason", "why", "next") if isinstance(doc.get(k), str) and doc[k].strip()]
+        for value in doc.values():
+            if isinstance(value, (dict, list)):
+                words += land_json_words(value)
+    elif isinstance(doc, list):
+        for value in doc:
+            words += land_json_words(value)
+    return words
 
 
 def land_step_named(out: str) -> dict | None:
@@ -16149,6 +16246,8 @@ class LandQueue:
             return False  # a copy still showing a pin it followed away from: a stale read, read again
         if self.base_merge_maybe(pin, head, data):
             return False  # maybe only a base merge on the pin: judge's worker reads whether it is (base_merge_check)
+        if land_replaced_head(e, head, self.now):
+            return False  # older than the last stop's own read: pin_wait keeps reading (LAND_REPLACED_HEAD_WAIT)
         since = float(e.get("pinSince") or e.get("created") or 0)
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
@@ -16349,6 +16448,12 @@ class LandQueue:
         since = self.forwarded_since(e)
         first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
         past = self.now - first > LAND_FORWARD_GIVE_UP
+        if state not in ("MERGED", "CLOSED") and read_at < since:
+            # No copy, or one older than the hand-off: ask the daemon to read it (its read scheduler paces and bounds
+            # the read), so the far host's merge ends this row merged instead of forward_no_outcome. 2026-11-23
+            # 07:25-07:55Z: 11 rows on two fleet hosts stopped "this host's cache holds no read of the
+            # PR" for PRs merged 9-17 h before (hq#19220, hq#18897, lw#8393 ...): nothing had asked for a read.
+            self.nudge(e["key"])
         if state == "MERGED":
             merge = data.get("mergeCommit")
             sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
@@ -17743,7 +17848,9 @@ class LandQueue:
         since = float(e.get("pinSince") or 0)
         reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
                  and not isinstance(t, bool)]
-        if head and reads and max(reads) >= since:
+        # A copy showing the head the last head_moved stop said was replaced is older than that stop's own read
+        # (LAND_REPLACED_HEAD_WAIT): no stop on it, the wait below keeps reading.
+        if head and reads and max(reads) >= since and not land_replaced_head(e, head, self.now):
             # GitHub, read since the request, says the head is not the pinned one: the pin refuses (as judge does)
             e.pop("pinWait", None)
             if self.old_pin_wait(e, head):
@@ -20492,6 +20599,9 @@ class LandQueue:
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or ""}
         repeat = land_stop_repeats(e.get("lastStop"), st)
+        live = LAND_MOVED_NEXT.search(nxt or "") if code == "head_moved" else None
+        if live and e.get("pinSha"):
+            e["movedFrom"] = {"was": str(e["pinSha"]).lower(), "head": live.group(1), "at": self.now}
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
                      "holdWindow", "forwardFirst"):
@@ -32816,9 +32926,62 @@ def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(item["body"])
     lacks = "the lane-gh broker has no tool for this write" if chosen is not None else "no lane-gh runs here"
-    why = no_login_refusal(item, path) or "this host has no login to post with"
+    why = no_login_refusal(item, path) or f"this host has no login to post with; {broker_post_next(item, path)}"
     print(f"glaeda-gh: not queued: {why} ({lacks}; its body is kept at {path})", file=sys.stderr)
     return 3
+
+
+BROKER_OUTBOX_DEADLINE = 120.0  # one queued write the daemon makes through the broker: a tick waits this long at most
+BROKER_RATE_LIMITED_EXIT = 75  # lane-gh's exit for a write GitHub's or the broker's limit refused (nothing was made)
+
+
+def lane_vm_poster() -> bool:
+    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream
+    and a runnable lane-gh. Such a host holds no login, so the daemon's own `gh auth token` post can never succeed:
+    fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh
+    signed in?" while the caller had been told the daemon posts it."""
+    return upstream_command() is None and lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
+
+
+def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+    """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
+    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
+    tool, call_args = chosen
+    argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
+    try:
+        done = run_bounded(argv, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "lost", f"the lane-gh broker gave no answer in {timeout:g}s"
+    except (OSError, subprocess.SubprocessError) as error:
+        return "refused", f"lane-gh did not run ({type(error).__name__}: {error})"
+    answer: Any = None
+    with contextlib.suppress(ValueError):
+        answer = json.loads(done.stdout)
+    if isinstance(answer, dict) and answer.get("ok"):
+        return "made", answer.get("data")
+    said = (answer.get("error") if isinstance(answer, dict) else None) or ""
+    if not said:
+        lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
+        said = lines[-1] if lines else "no answer"
+    if done.returncode == BROKER_RATE_LIMITED_EXIT:
+        wait = None
+        for source in (answer.get("data") if isinstance(answer, dict) else None, answer):
+            if isinstance(source, dict) and isinstance(source.get("retry_after"), (int, float)) \
+                    and not isinstance(source.get("retry_after"), bool):
+                wait = float(source["retry_after"])
+                break
+        if wait is None:
+            found = re.search(r"retry after (\d+)s", f"{said} {done.stderr or ''}")
+            wait = float(found.group(1)) if found else float(POST_BACKOFF)
+        return "limited", max(float(POST_SPACING), wait)
+    return "refused", str(said)[:300]
+
+
+def broker_made_where(data: Any) -> tuple[str | None, Any]:
+    """(url, number) from a broker write's data."""
+    if not isinstance(data, dict):
+        return None, None
+    return data.get("url") or data.get("html_url"), data.get("number")
 
 
 def broker_post(item: dict) -> int:
@@ -32829,31 +32992,17 @@ def broker_post(item: dict) -> int:
         return broker_post_unsent(item, None)
     if not os.access(LANE_GH_CMD, os.X_OK):
         return broker_post_unsent(item, chosen)
-    tool, call_args = chosen
-    argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
-    try:
-        done = run_bounded(argv, timeout=BROKER_POST_DEADLINE)
-    except subprocess.TimeoutExpired:
-        print(f"glaeda-gh: the lane-gh broker gave no answer in {BROKER_POST_DEADLINE:g}s; the write may still have "
-              f"been made, so read {item['repo']} before sending it again", file=sys.stderr)
+    outcome, value = broker_write(item, chosen, BROKER_POST_DEADLINE)
+    if outcome == "lost":
+        print(f"glaeda-gh: {value}; the write may still have been made, so read {item['repo']} before sending it "
+              "again", file=sys.stderr)
         return 1
-    except (OSError, subprocess.SubprocessError) as error:
-        print(f"glaeda-gh: lane-gh did not run ({type(error).__name__}: {error})", file=sys.stderr)
+    if outcome != "made":
+        said = f"rate limited, retry after {value:g}s" if outcome == "limited" else value
+        print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {said}", file=sys.stderr)
         return 1
-    answer: Any = None
-    with contextlib.suppress(ValueError):
-        answer = json.loads(done.stdout)
-    if not isinstance(answer, dict) or not answer.get("ok"):
-        said = (answer.get("error") if isinstance(answer, dict) else None) or ""
-        if not said:
-            lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
-            said = lines[-1] if lines else "no answer"
-        print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {str(said)[:300]}", file=sys.stderr)
-        return 1
-    data = answer.get("data")
-    where = None
-    if isinstance(data, dict):
-        where = data.get("url") or data.get("html_url") or data.get("number")
+    url, number = broker_made_where(value)
+    where = url or number
     print(f"{item['kind']} made through the lane-gh broker (this host holds no token)"
           + (f": {where}" if where else ""))
     return 0
@@ -32949,6 +33098,32 @@ def cmd_post_one_call(kind: str, args: argparse.Namespace) -> int:
     return cmd_gh(gh)
 
 
+def post_route_missing() -> str | None:
+    """Why the daemon here has no way to make a queued write, or None when it has one: the lane-gh broker on a lane VM
+    (lane_vm_poster), else this host's login (`gh auth token`, what post_one sends with). Asked at accept time, so a
+    write is refused at once instead of answering "queued" and never going out (the class "accepted then dropped":
+    fs-agent-lane-10 2026-11-23, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1" for good)."""
+    if lane_vm_poster():
+        return None
+    try:
+        gh_token()
+    except WatchError as error:
+        return (f"the daemon here has no write route: no GitHub login ({describe(error)}) and no lane-gh broker "
+                f"({LANE_GH_CMD} with the lane VM gh chain)")
+    return None
+
+
+def post_unrouted(item: dict, missing: str) -> int:
+    """Refuse a write this host cannot make: nothing queued, its body kept, the command that makes it named. Exit 3."""
+    path = unsent_dir() / f"{item['id']}.md"
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(item["body"], encoding="utf-8")
+    print(f"glaeda-gh: not queued: {missing}; sign gh in here (gh auth login) or post from a host that has a login "
+          f"(its body is kept at {path})", file=sys.stderr)
+    return 3
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
     try:
@@ -32960,6 +33135,11 @@ def cmd_post(args: argparse.Namespace) -> int:
         return 3
     if upstream_command() is not None:
         return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
+    if lane_vm_poster() and broker_post_args(item) is None:
+        return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
+    missing = post_route_missing()
+    if missing:
+        return post_unrouted(item, missing)
     with contextlib.suppress(Exception):
         gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
     write_json(outbox_dir() / f"{item['id']}.json", item)
@@ -33727,6 +33907,51 @@ def log_errors_emit(repo: str, logs: list[tuple[int, bytes, str]], limit: int, a
     return EXIT_OK
 
 
+# The shared intent layer (leo-workspace tools/intent.py, vendored as scripts/intent.py by scripts/intent-sync, and
+# installed beside ~/.local/bin in ~/.local/share/glaeda/intent/ by glaeda-mini-setup). Leo, 2026-11-23: "we need to
+# have really powerful aliasing for intent." It runs only on a refusal (main's parse_with_intent), so a form that parses
+# costs nothing; failing to load it costs the refusal nothing either.
+INTENT_DIRS = (Path(__file__).resolve().parent, Path.home() / ".local/share/glaeda/intent")
+INTENT_ON = False  # set where this file runs as the program (the end of the file); a test sets it to exercise the layer
+_intent_module: list = []
+
+
+def intent_layer():
+    """The shared intent module, loaded from INTENT_DIRS by path (this file runs under `python3 -I`, so a sibling is
+    no import), or None when none loads."""
+    if not _intent_module:
+        _intent_module.append(None)
+        for folder in INTENT_DIRS:
+            path = folder / "intent.py"
+            if not path.is_file():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location("intent", path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module  # registered before it runs, as a normal import does
+                spec.loader.exec_module(module)
+            except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+                sys.modules.pop("intent", None)
+                continue
+            _intent_module[0] = module
+            break
+    return _intent_module[0]
+
+
+def intent_trial() -> bool:
+    """Whether the intent layer is trying a form: then a refusal is its to read, and nothing is printed."""
+    module = _intent_module[0] if _intent_module else None
+    return bool(module is not None and getattr(module, "_state", {}).get("trial"))
+
+
+class Refused(Exception):
+    """A refusal parse_with_intent holds until the intent layer has read the call (Parser.defer)."""
+
+    def __init__(self, parser: "Parser", message: str):
+        super().__init__(message)
+        self.parser, self.message = parser, message
+
+
 class Parser(argparse.ArgumentParser):
     """`argparse`'s parser, with a bad argument exiting 64 instead of 2.
 
@@ -33738,8 +33963,16 @@ class Parser(argparse.ArgumentParser):
     writes to **stdout**, so a usage error became the first lines of a `--json` document."""
 
     argv: list[str] = []  # main() sets the raw arguments, for `next:` and --json
+    defer = False  # parse_with_intent: raise Refused rather than print, so the intent layer reads the call first
 
     def error(self, message: str) -> None:  # type: ignore[override]
+        if intent_trial():
+            argparse.ArgumentParser.error(self, message)  # the layer's own: ends its trial, prints nothing
+        if Parser.defer:
+            raise Refused(self, message)
+        self.refuse(message)
+
+    def refuse(self, message: str) -> None:
         hint, one_target = wait_extra_targets(message)
         elsewhere, without = flag_elsewhere(message)
         nxt = one_target or without or usage_next(Parser.argv, self.prog)
@@ -33762,6 +33995,8 @@ class Parser(argparse.ArgumentParser):
                 or not all(isinstance(c, str) for c in choices) or value in choices):
             return value
         meant, near = close_choice(value, choices)
+        if meant and intent_trial():
+            return meant  # the intent layer trying a form: said once, by the parse that runs
         if meant:
             name = action.option_strings[0] if action.option_strings else (action.metavar or action.dest)
             say_waiting(f"glaeda-gh: {name} `{value}` ran as `{meant}` (choices: {', '.join(choices)})")
@@ -33973,6 +34208,15 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         hand = post_elsewhere(words[1])
         if hand:
             return hand
+    # `checks OWNER/REPO` with no commit and no --consumer (measured 2026-11-16..23): no default is safe (which commit
+    # is the caller's to say), so the refusal is the form that runs in a checkout, and the read a PR's checks have.
+    if words[:1] == ["checks"] and prog in ("glaeda-gh", "glaeda-gh checks"):
+        repo = next((w for w in words[1:] if re.fullmatch(rf"{NAME}/{NAME}", w)), "OWNER/REPO")
+        shas = [w for w in words[1:] if SHA40.fullmatch(w)]
+        consumer = os.environ.get("ACPMUX_SESSION_NAME") or "NAME"
+        sha = " ".join(shas) or '"$(git rev-parse HEAD)"'
+        return (f"`glaeda-gh checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
+                f"name, so none is assumed; a pull request's checks: `glaeda-gh status pr {repo}#N`)")
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
         return f"glaeda-gh {words[0]} --help"
@@ -34183,6 +34427,9 @@ def parser() -> argparse.ArgumentParser:
                                                  "with or without the kind before it")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
+        s.add_argument("--repo", metavar="OWNER/REPO",
+                       help="the repository a bare N or #N names, instead of the origin of the directory you are in "
+                            "(`status pr 7 --repo o/r` is `status pr o/r#7`)")
         s.add_argument("--verbose", action="store_true",
                        help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
@@ -34937,6 +35184,16 @@ def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[s
         out.append(word)
         i += 1
     return out
+# The commands that write to GitHub or to this host's daemon: a misspelling of one is refused with its exact form,
+# never run (command_spelling_synonym), and intent_aliases.json's cli.glaeda-gh.exact holds the same list.
+WRITE_COMMANDS = ("land", "post", "restart", "serve")
+
+
+def writes(raw: list[str]) -> bool:
+    """RAW is a call that can change GitHub or this host: a write command, but not its `status` read."""
+    return bool(raw) and raw[0] in WRITE_COMMANDS and raw[1:2] != ["status"]
+
+
 def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """The first word as the one command it means: (argv, refusal lines).
 
@@ -34965,6 +35222,11 @@ def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                          *(f"next: {' '.join(['glaeda-gh', c] + raw[1:])}" for c in near)]
         return raw, []  # nothing near it: argparse refuses it with the commands, as it always has
     fixed = [meant] + raw[1:]
+    if meant in WRITE_COMMANDS:
+        # 2026-11-23: `lnad o/r#1` queued a land. A write is never run from a misspelling of it: the exact form is
+        # named and nothing runs (the intent layer's rule: never make a destructive command looser).
+        return raw, [f"glaeda-gh: `{word}` is no command, and `{meant}` writes to GitHub, so it is not guessed: "
+                     f"the exact form is needed", f"next: {typed_line(['glaeda-gh'] + fixed)}"]
     print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` (`{word}` is no command; `{meant}` is the "
           f"one it means)", file=sys.stderr)
     return fixed, []
@@ -35122,6 +35384,12 @@ def flag_near_miss_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 + ": it is not guessed",
                 *(f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [option + joined + value] + fixed[i + 1:])}"
                   for option in near)]
+        if meant and writes(raw):
+            # 2026-11-23: `land o/r#1 --jsn` queued a land, read as `--json`. A write never runs from a flag
+            # nobody typed (the intent layer's rule: never make a destructive command looser): name the form.
+            return raw, [f"glaeda-gh: `{name}` is no option of `{typed}`, and `{typed}` writes, so `{meant}` is "
+                         f"not guessed: the exact form is needed",
+                         f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [meant + joined + value] + fixed[i + 1:])}"]
         if meant:
             fixed[i] = meant + joined + value
             said.append(f"`{name}` is `{meant}`")
@@ -35231,6 +35499,59 @@ def bare_wait_count(word: str) -> bool:
     return True
 
 
+def probe_parse(argv: list[str]) -> bool:
+    """Whether ARGV parses, saying nothing and running nothing."""
+    Parser.defer = True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parser().parse_args(argv)
+        return True
+    except (Refused, SystemExit):
+        return False
+    finally:
+        Parser.defer = False
+
+
+def parse_with_intent(raw: list[str]) -> argparse.Namespace:
+    """RAW parsed; a refused RAW is first read by the shared intent layer (scripts/intent.py), which runs the one form
+    it meant and says so on stderr, prints the two or three it could mean, or, for a form that writes to GitHub
+    (merge, land, post, restart, ...: intent_aliases.json's unsafe words and its cli.glaeda-gh.exact list), prints the
+    exact form and runs nothing. Then this tool's own refusal, as before. INTENT_OFF=1 skips the layer."""
+    Parser.argv = raw
+    p = parser()
+    Parser.defer = True
+    try:
+        return p.parse_args(raw)
+    except Refused as refused:
+        held = refused
+    finally:
+        Parser.defer = False
+    layer = intent_layer() if INTENT_ON and not os.environ.get("INTENT_OFF") else None
+    if layer is not None:
+        try:
+            # The table's hand-written alias first (intent.alias: never onto a write, but `land-status` is
+            # `land status`, a read under land's word). argparse sees only `land` as a subcommand there, so
+            # fix() alone would refuse it as a write. Kept only when the aliased form parses.
+            hit = layer.alias(list(raw), "glaeda-gh")
+            if hit is not None and probe_parse(hit[0]):
+                said = shlex.join(["glaeda-gh"] + hit[0])
+                print(f"glaeda-gh: ran `{said}` for `{shlex.join(['glaeda-gh'] + raw)}` (the table's alias)",
+                      file=sys.stderr)
+                Parser.argv = hit[0]
+                return parser().parse_args(hit[0])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            meant = layer.fix(list(raw), p, "glaeda-gh")
+        except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            meant = raw
+        if meant != raw:
+            Parser.argv = meant
+            return parser().parse_args(meant)
+    held.parser.refuse(held.message)
+    raise SystemExit(64)  # refuse() exits; this only says so to the reader
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     for rewriter in (nesting_synonym, command_spelling_synonym):
@@ -35290,8 +35611,7 @@ def main(argv: list[str] | None = None) -> int:
     raw, inferred = infer_kind(raw)
     if inferred:
         print(inferred, file=sys.stderr)
-    Parser.argv = raw
-    args = parser().parse_args(raw)
+    args = parse_with_intent(raw)
     if getattr(args, "verbose", False):
         os.environ["AGENT_VERBOSE"] = "1"  # summary() and wait_request() read it, here and in the daemon's request
     try:
@@ -35394,6 +35714,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.pr is not None and (args.pr <= 0 or len(args.shas) != 1):
                 raise WatchError("--pr takes the PR number (1 or more) of the one head asked for")
             return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json, pr=args.pr)
+        if args.command in ("status", "wait") and args.repo is not None:
+            args.target = repo_targets(args.kind, args.target, args.repo)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json, fields=parse_fields(args.field))
         if args.rescue_grace < 0:
@@ -35512,4 +35834,5 @@ def exec_from_bytecode() -> None:
 
 if __name__ == "__main__":
     exec_from_bytecode()
+    INTENT_ON = True  # the program, not a test that imports it: a refused call is the intent layer's to read first
     raise SystemExit(main())
