@@ -28716,7 +28716,27 @@ class LandTest(Base):
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
+        self.assertIn("a direct read of it just now failed: lane-gh call get: quota", e["stop"]["reason"])
+        self.assertEqual(self.w.refreshed.count(self.KEY), 1)  # read once, at the give-up, not on every look
         self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_forwarded_land_the_cache_never_read_is_read_once_at_the_give_up_and_ends_merged(self):
+        # fs-agent-lane-2, 2026-11-23 07:51Z: five rows merged hours before stopped forward_no_outcome, a blocker
+        # notice each, because this host never read their PRs. One read at the give-up ends them by GitHub's answer.
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+
+        def merged(key: str) -> None:
+            self.w.refreshed.append(key)
+            self.pr(LA, state="MERGED")
+            self.w.cache[key]["data"]["mergeCommit"] = {"oid": "f" * 40}
+        self.q.refresh = merged
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.assertEqual((self.q.entries[self.KEY]["state"], self.w.refreshed), ("forwarded", []))
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual([c for c in self.w.sent() if "forward_no_outcome" in c[-1]], [])
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
