@@ -14779,6 +14779,19 @@ def gh_cache_newest() -> float:
     return newest
 
 
+def gh_cache_gens(repo: str | None) -> list[int]:
+    """The host's shared gh cache generations a read of REPO is answered under (leo-workspace tools/gh_shared_cache.py:
+    every entry keeps the generations of its scope and of `*` as it was stored, and is refused once either moved).
+    Each write through the shim bumps `host` and the repo it names, or `*` -- every key on the host -- when its flags
+    do not name one (`pr merge --squash --match-head-commit`, `run rerun --failed`). So this list moving means every
+    answer stored before it is now refused: no read of REPO can be served from that cache (unread_cache_stale)."""
+    gens = read_json(latch_state_dir() / "cache" / "generations.json")
+    if not isinstance(gens, dict):
+        return []
+    return [int(gens.get(k) or 0) if isinstance(gens.get(k), (int, float)) else 0
+            for k in ("host", str(repo or "").lower(), "*")]
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -16521,6 +16534,22 @@ class LandQueue:
         return [sha, c.get("fp"), c.get("fullAt"), c.get("dataAt"),
                 snap.get("fp"), snap.get("readAt"), snap.get("complete"), gh_cache_newest()]
 
+    def unread_probe_answerable(self, e: dict, gens: list[int]) -> bool:
+        """Whether a cache-only probe of E (the unread route) can be answered at all. The reads such a probe makes --
+        that PR with the review and comment fields, its head's check runs and status, its jobs with their steps -- are
+        ones the daemon's own cache and the git mirror never keep, so only the host's shared gh cache can answer, and
+        only E's own live judgment ever stored them there. GENS moving since that judgment started means every entry
+        it stored is refused (gh_cache_gens), so the probe must miss: one host, 7 days, unread_cache_miss 171 to
+        unread_cache_hit 3, and under --cache-only 325 of 325 gh calls refused with none ever answered, because the
+        judgment's own merge or update-branch step bumps `*` and wipes the reads its next probe would have read.
+        Generations only rise, so unmoved proves the entries are live; moved is taken as wiped even in the few cases
+        where the bump landed before they were stored -- the cost of that is a live judgment that was coming anyway."""
+        mark = e.get("cacheGen")
+        if not isinstance(mark, list) or mark == gens:
+            return True
+        self.count("unread_cache_stale")  # a probe not sent: the subprocess and the worker it would have held
+        return False
+
     def window_room(self, e: dict, sha: str = "") -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
@@ -16532,6 +16561,9 @@ class LandQueue:
         e.pop("paceNext", None)
         e.pop("cacheOnlyInputs", None)
         first = e.pop("unreadCacheFirst", None)
+        gens = gh_cache_gens(e.get("repo"))
+        if first is not None and not self.unread_probe_answerable(e, gens):
+            first = None  # a write wiped what E's last live judgment stored: that probe can only miss, so it is not sent
         if self.latch_free(e) and not self.broker_client():
             # (A broker client's latch-free owner has its REST reads answered by the broker's read App, its GraphQL by
             # the login: paced as before.) Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
@@ -16541,12 +16573,15 @@ class LandQueue:
             # GraphQL they never spend. The App's own refusals are what is measured for them (spent_until, the park).
             if first is not None:
                 e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if not over:
+            e["cacheGen"] = gens
             return True
         pool = over[0]
         slot = float(w.get("graphqlAt", float("-inf")))
@@ -16555,6 +16590,7 @@ class LandQueue:
             # GraphQL is spent to its reserve and REST has paced room: the caches first, then a live judgment over
             # REST, charged to REST alone (LAND_REST_ROUTE's comment).
             e["cacheOnlyJudge"] = "rest"
+            e["cacheGen"] = gens
             return True
         if over == ["graphql"]:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
@@ -33544,6 +33580,122 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
+# What agents type for a long flag, by the option of this tool it means. The `--until` precedent one level
+# down: every choice *argument* has taken a synonym or a typo of one of its choices since glaeda#2368 --
+# `wait --help` says it in so many words, "A synonym or a typo of one (checks-done, passed, merge) runs as
+# it, said on stderr" -- while a flag *name* one word off was argparse's bare "unrecognized arguments" and
+# nothing ran. Measured 2026-11-22 (bg-965d52bc2c83): `glaeda-gh wait pr teamleaderleo/... --until green
+# --deadline 20m` printed "unrecognized arguments: --deadline 20m" and exited 64, so the lane believed it
+# was watching its PR and was not -- a background wait that exits at once looks exactly like a wait that
+# waited, and the whole watch was lost for a lane round trip.
+#
+# A word here is used only where its option is one the command *typed* actually has, so `--ceiling` is
+# `wait --max` and no part of `status`. Nothing here is matched by prefix or by typo: these are the near
+# misses no edit distance reaches (`deadline` is seven edits from `timeout`), and a short one matched
+# loosely would pull an unrelated flag in. Spellings this tool already reads are no part of it: `--time_out`
+# and `--timeOut` are `flag_spelling_synonym`'s, and `--time` is argparse's own abbreviation.
+FLAG_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "--timeout": ("--deadline", "--time-limit", "--within", "--expires", "--expiry", "--stale-after",
+                  "--no-change-for", "--no-progress-for", "--idle-for", "--quiet-for", "--patience"),
+    "--max": ("--ceiling", "--hard-timeout", "--hard-limit", "--max-wait", "--max-total", "--at-most",
+              "--wall-clock", "--overall"),
+}
+
+
+def near_miss_option(name: str, options: dict[str, bool]) -> tuple[str, list[str]]:
+    """(the one option NAME means, []) or ("", the options it is as near to) or ("", []) for neither.
+
+    Two kinds of near miss, and each is read on its own evidence. A *synonym* must match a word of
+    `FLAG_SYNONYMS` exactly once normalised, because another word for the same thing is a deliberate
+    spelling, not an accident, and there is nothing in its letters to measure. A *typo* is measured against
+    the command's own option names only -- one edit, two in a name of six letters or more, the allowance
+    `close_choice` already uses for a choice's value -- so the table cannot widen the typo radius.
+
+    A name that is the start of one or more of this command's options is left alone whatever it is near:
+    argparse's `allow_abbrev` owns that word, taking `--contain` as `--contains` and refusing an ambiguous
+    one by name, and reading it here would take a decision off argparse and could differ from it."""
+    key = normalized_flag(name)
+    if not key:
+        return "", []
+    real = {normalized_flag(option): option for option in options}
+    if any(spelling.startswith(key) for spelling in real):
+        return "", []  # argparse's abbreviation, or its refusal of an ambiguous one: not this reader's word
+    synonyms: dict[str, list[str]] = {}
+    for option, words in FLAG_SYNONYMS.items():
+        if option not in options:
+            continue  # this command has no such option: the word means nothing here
+        for word in words:
+            synonyms.setdefault(normalized_flag(word), []).append(option)
+    named = sorted(set(synonyms.get(key, [])))
+    if named:
+        return (named[0], []) if len(named) == 1 else ("", named)
+    allowed = 1 if len(key) <= 5 else 2
+    best: dict[str, int] = {}
+    for spelling, option in real.items():
+        distance = typo_distance(key, spelling)
+        if distance <= allowed:
+            best[option] = distance
+    if not best:
+        return "", []
+    least = min(best.values())
+    near = sorted(option for option in best if best[option] == least)
+    return (near[0], []) if len(near) == 1 else ("", near)
+
+
+def flag_near_miss_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A long flag that near-misses one of this command's own options runs as it: (argv, refusal lines).
+
+    Runs after `flag_spelling_synonym`, so every flag this tool already recognises is in its canonical
+    spelling by now and only a flag argparse would have refused outright is read here. Three things are
+    deliberately *not* rewritten, because each is already answered better elsewhere: a flag that is a real
+    option of another command of this tool (`wait ... --notify` is `land`'s, and `flag_elsewhere` says so
+    and offers the call without it -- which command the caller meant is theirs to say); an abbreviation
+    (argparse's); and a flag near two options at once, refused here naming both and the call for each, as
+    `flag_spelling_synonym` refuses a spelling two options answer to. A flag that is near nothing at all
+    falls through to argparse, whose own line names it and the next step. Nothing past a bare `--` is a
+    flag of this tool's."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    options = flag_options(raw)
+    typed = typed_command(raw)
+    fixed: list[str] = list(raw)
+    said: list[str] = []
+    i = 0
+    while i < len(fixed):
+        word = fixed[i]
+        if word == "--":
+            break
+        if not word.startswith("--"):
+            i += 1
+            continue
+        name, joined, value = word.partition("=")
+        if name in options:
+            # Canonical already; a flag that takes its value in the next word consumes it, so a body or a
+            # regular expression spelled like a flag is never read as one.
+            i += 2 if options[name] and not joined else 1
+            continue
+        if [command for command in flag_commands(name) if command != typed]:
+            i += 1  # a real option of a sibling command: flag_elsewhere names where it lives
+            continue
+        meant, near = near_miss_option(name, options)
+        if near:
+            return raw, [
+                f"glaeda-gh: `{name}` is no option of `{typed}` and is as near to "
+                + " as to ".join(f"`{option}`" for option in near)
+                + ": it is not guessed",
+                *(f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [option + joined + value] + fixed[i + 1:])}"
+                  for option in near)]
+        if meant:
+            fixed[i] = meant + joined + value
+            said.append(f"`{name}` is `{meant}`")
+            i += 2 if options[meant] and not joined else 1
+            continue
+        i += 1  # no option of this command is anywhere near it: argparse refuses it, naming it and a next step
+    if said:
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
+
 # A wait flag given with no value. `--wait` reads as a switch ("wait for it"), and this tool's own
 # `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
 # --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
@@ -33687,7 +33839,7 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, bare_wait_synonym):
+    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, flag_near_miss_synonym, bare_wait_synonym):
         # The nesting and the command's own spelling ran at the top (a word a command owns is that command's,
         # and which options a command has depends on which command it is); the flags come after them.
         # `doubled_kind_synonym` first here: it only looks at a call that already leads with a real command,
