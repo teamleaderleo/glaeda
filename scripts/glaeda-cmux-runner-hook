@@ -2194,13 +2194,21 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 # while the waiter it would have queued behind keeps its turn for the next units. Leo, 2026-11-22: "you guys cannot
 # afford to wait on improvements right now". Only a waiting nightly job (fair_turn) or a non-capacity hold refuses it.
 FAST_TIER_CAPACITY_WAIT_S = 60.0
+# GENERATED_FILES_WAIT: cmux-next.yml's generated files job has a 70-minute timeout-minutes that also counts its wait
+# in "Set up runner". On 2026-11-22 03-05Z eight of them ran out the 70 minutes, and the wait was most of each
+# (wait/build minutes: 69.9/0, 69.9/0, 57.7/11.4, 59.5/7.0, 53.5/15.5, 41.6/27.6, 39.2/25.4, 29.1/29.9), and 29% of
+# all generated-files minutes in 26 logged jobs (1185 min) were that wait. So it too waits this long at most and is
+# then admitted busy like the fast tier (FAST_TIER_BUSY): a refusal would only send its re-run back to the same label.
+GENERATED_FILES_CAPACITY_WAIT_S = 240.0
+BOUNDED_WAIT_JOBS = {("cmux-next.yml", "fast-tier"): FAST_TIER_CAPACITY_WAIT_S,
+                     ("cmux-next.yml", "generated-files"): GENERATED_FILES_CAPACITY_WAIT_S}
 
 
 def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
-    """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
-    if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
+    """The home repository's BOUNDED_WAIT_JOBS bound, else None (FAST_TIER_WAIT, GENERATED_FILES_WAIT)."""
+    if repo is None or repo.lower() != home_repo.lower():
         return None
-    return FAST_TIER_CAPACITY_WAIT_S
+    return BOUNDED_WAIT_JOBS.get((workflow, job))
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -7981,6 +7989,68 @@ def plain_side_runner(args: argparse.Namespace) -> bool:
             and not args.sim_runner and not args.small_runner)
 
 
+# SIDE_SEED_FREE: after SIDE_FAST_FIT the side minis admitted the fast tier, and it ran out its limit cold: 2026-11-22
+# 07:15-09:15Z against 03-05Z, cuts at >=19.5 min 17 -> 45, greens 17 -> 3. Its cut logs (cmux18-2 and cmux18-5, one
+# mini, 07:02-07:25Z) read "the seed root is busy ... taking a shared root" and built from scratch to the 20 minutes.
+# cmux's owned_spm_scratch.py seed_lease holds <root>/.cmux-seed-root.lock exclusive for the job; the second root
+# (cmux-2, glaeda-disk CMUX_SECOND_SEED_ROOT) is taken when the first is held. So on a plain side runner the fast tier
+# is refused, before it takes anything, when no seed root is free: the first held, and the second absent, not a seed
+# root (no .cmux-seed-root) or held. The refusal is not for capacity, so FAST_TIER_BUSY does not admit it; it costs
+# under a minute where the cold build cost the whole limit, and the rescue places the re-run again. The probe is
+# glaeda-disk's seed_root_held: exclusive, non-blocking, released at once; an unreadable lock counts as held.
+# Off switch: SIDE_SEED_FREE_OFF_ENV=1 in the runner's environment, or a SIDE_SEED_FREE_OFF_FILE in the capacity
+# ledger (touch it on the mini, live), admits the fast tier as before (SIDE_FAST_FIT, FAST_TIER_BUSY). Each refusal
+# logs "refused: seed root:", which the cut read counts.
+SIDE_SEED_FREE_OFF_ENV = "GLAEDA_SIDE_SEED_FREE_OFF"
+SIDE_SEED_FREE_OFF_FILE = "side-seed-free.off"
+CMUX_SEED_ROOTS = (Path("/Users/runner/_work/cmux"), Path("/Users/runner/_work/cmux-2"))
+SEED_ROOTS_ENV = "GLAEDA_CMUX_SEED_ROOTS"  # tests: os.pathsep-joined roots instead of CMUX_SEED_ROOTS
+SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+SEED_ROOT_MARKER = ".cmux-seed-root"
+
+
+def seed_roots() -> tuple[Path, ...]:
+    raw = os.environ.get(SEED_ROOTS_ENV)
+    return tuple(Path(r) for r in raw.split(os.pathsep) if r) if raw else CMUX_SEED_ROOTS
+
+
+def seed_root_held(root: Path) -> bool:
+    """Whether a job holds this seed root's lock. No lock file: no job ever took it."""
+    try:
+        fd = os.open(root / SEED_ROOT_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def seed_root_refusal(roots: tuple[Path, ...] | None = None, capacity_dir: Path | None = None) -> str | None:
+    """Why the fast tier would build cold on this mini (SIDE_SEED_FREE), or None when a seed root is free: the first
+    unheld, or a later one that is a seed root (its marker) and unheld. None too when its off switch is set."""
+    if (os.environ.get(SIDE_SEED_FREE_OFF_ENV) or "").strip() == "1":
+        return None
+    if capacity_dir is not None and (capacity_dir / SIDE_SEED_FREE_OFF_FILE).exists():
+        return None
+    roots = seed_roots() if roots is None else roots
+    if not roots:
+        return None
+    first, *rest = roots
+    if not seed_root_held(first):
+        return None
+    if any(r.is_dir() and not r.is_symlink() and (r / SEED_ROOT_MARKER).is_file() and not seed_root_held(r)
+           for r in rest):
+        return None
+    return (f"seed root: every fast-tier seed root here is held by another job ({', '.join(map(str, roots))}), so "
+            "this one would build cold past its limit (SIDE_SEED_FREE)")
+
+
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
@@ -8159,8 +8229,10 @@ def exclusive_claim(capacity_dir: Path) -> str | None:
         for waiter in admission_waiters(capacity_dir):
             if waiter.get("class") == EXCLUSIVE_CLASS:
                 return f"a signing job waits for this mini to drain ({waiter.get('who') or 'pid ' + str(waiter['pid'])})"
+    # every token the exclusive class takes (CLASS_COST), not the gateway tokens alone: six ordinary gateway jobs on
+    # six gateway runners hold all of those at once (glaeda#1974 review F1), and they are no signing job
     if all((capacity_dir / f"{token}.token").exists() and not probe(capacity_dir / f"{token}.token")
-           for token in GATEWAY_TOKENS):
+           for token in CLASS_COST[EXCLUSIVE_CLASS][1]):
         return "a signing job holds this mini (every unit and token)"
     return None
 
@@ -15649,6 +15721,10 @@ def main(argv: list[str] | None = None) -> int:
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS
+                and (why := seed_root_refusal(capacity_dir=args.capacity_dir))):
+            return refused(why)  # SIDE_SEED_FREE: refused before it takes anything; never admitted busy
+        if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
             # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
             admit_class = job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0]
@@ -15682,8 +15758,9 @@ def main(argv: list[str] | None = None) -> int:
             fast_bound = fast_tier_capacity_wait(repo, args.home_repo, job_workflow(), os.environ.get("GITHUB_JOB", ""))
             cap = bounded_wait(cap, fast_bound)
             if fast_bound is not None:
-                print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
-                      "then runs busy beside the mini's other jobs (FAST_TIER_BUSY) instead of failing", flush=True)
+                print(f"{PREFIX}: {os.environ.get('GITHUB_JOB', '')}: it waits {fast_bound:g} s at most for capacity "
+                      "(FAST_TIER_WAIT, GENERATED_FILES_WAIT), then runs busy beside the mini's other jobs "
+                      "(FAST_TIER_BUSY) instead of failing", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
