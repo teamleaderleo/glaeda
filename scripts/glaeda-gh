@@ -12920,11 +12920,16 @@ def land_forward_pending(name: str, now: float) -> str:
             f"lost; {when}; do not reach {name} directly")
 
 
+def land_host_word(word: str) -> bool:
+    """Whether WORD names a host as ssh or reach takes it (HOST or USER@HOST), never an option such as "-o"."""
+    return bool(LAND_HOST_SHAPE.fullmatch(str(word or "").rsplit("@", 1)[-1])) and not str(word).startswith("-")
+
+
 def land_forward_name(command: list[str]) -> str:
     """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
     words."""
     i = land_command_host(command)
-    if i is not None and LAND_HOST_SHAPE.fullmatch(command[i]):
+    if i is not None and land_host_word(command[i]):
         return command[i]  # never an option word: a row once said "handed to -o's land queue"
     return " ".join(command)[:120]
 
@@ -15168,6 +15173,7 @@ class LandQueue:
         # keys whose PR state is being read live for a forwarded row past its give-up (forward_state_reads)
         self.forward_reading: set[str] = set()
         self.forward_state_thread: threading.Thread | None = None
+        self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -15287,6 +15293,7 @@ class LandQueue:
         """Every entry from disk. One whose step was claimed and never finished, or that was being judged, is judged
         again: the step is not run a second time on the claim alone."""
         d = self.entries_dir()
+        self.forward_name_now = None
         for p in sorted(d.glob("*.json")) if d.is_dir() else []:
             e = read_json(p)
             if not isinstance(e, dict) or not isinstance(e.get("key"), str) or e.get("state") not in LAND_STATES \
@@ -15327,10 +15334,11 @@ class LandQueue:
           quietly, an open one is landed again here. Once per row (forwardRepaired)."""
         changed = False
         to = e.get("forwardedTo")
-        if isinstance(to, str) and to and not LAND_HOST_SHAPE.fullmatch(to):
-            executor = land_executor(self.config())
-            name = land_forward_name(executor) if executor is not None else ""
-            good = name if LAND_HOST_SHAPE.fullmatch(name) else ""
+        if isinstance(to, str) and to.startswith("-"):  # an option word, never a host or a program's words
+            if self.forward_name_now is None:  # land.json read once a load, not once a row
+                executor = land_executor(self.config())
+                self.forward_name_now = land_forward_name(executor) if executor is not None else ""
+            good = self.forward_name_now if land_host_word(self.forward_name_now) else ""
             e["forwardedTo"] = good
             for h in e.get("history") or []:
                 if h.get("to") == to:
@@ -16124,6 +16132,8 @@ class LandQueue:
         due.sort(key=lambda k: float(self.entries[k].get("forwardStateAt") or 0))  # the longest unread first
         picked = due[:LAND_FORWARD_STATE_READS]
         self.forward_reading = set(picked)
+        # the row as picked: one landed by hand and forwarded again while its state was read is not settled on it
+        token = {k: (self.entries[k].get("gen"), self.entries[k].get("forwardFirst")) for k in picked}
 
         def read_all() -> None:
             try:
@@ -16131,9 +16141,13 @@ class LandQueue:
                     try:
                         got = self.forward_read_state(self.entries[key])
                         with self.lock:
-                            self.forward_settle(self.entries[key], *got, executor=executor)
+                            e = self.entries.get(key)
+                            if e is not None and (e.get("gen"), e.get("forwardFirst")) == token[key]:
+                                self.forward_settle(e, *got, executor=executor)
                     except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                         log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                        with self.lock, contextlib.suppress(KeyError):
+                            self.entries[key]["forwardStateAt"] = self.now  # to the back of the next pass's reads
                     finally:
                         self.forward_reading.discard(key)
             finally:
@@ -16201,8 +16215,10 @@ class LandQueue:
                     return False
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
                           f"closed); nothing is merged", "")
-            return False
-        if state == "OPEN" and self.stop_moved_pin(e, c, data):
+                return False
+            return past  # a copy older than the row: past the give-up, read live
+        # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
+        if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
         last = e.get("forwardResent") or {}
         if not e.get("forwardFirst"):
@@ -16282,6 +16298,9 @@ class LandQueue:
             self.forward_give_up(e, "OPEN", host, executor, "it was landed again here at "
                                  f"{str((e.get('forwardRelanded') or {}).get('head') or '?')[:12]} and that has no "
                                  "outcome either")
+            return
+        if land_read_quota(why):  # the login's spent quota says nothing of the PR: read again on a later pass
+            log({"event": "land-forward-state-quota", "key": e["key"], "why": land_trim(why, 160)})
             return
         fails = int(e.get("forwardStateFails") or 0) + 1
         e["forwardStateFails"] = fails

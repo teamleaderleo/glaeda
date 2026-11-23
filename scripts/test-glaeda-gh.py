@@ -28719,10 +28719,34 @@ class LandTest(Base):
     def test_a_forwarded_land_past_the_give_up_the_cache_shows_merged_reads_nothing_and_tells_nobody(self):
         self.forwarded_row()
         sent = len(self.w.sent())
-        self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
-        self.pr(LA, state="MERGED")
-        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - 100)
+        self.pr(LA, state="MERGED")  # read here only once the row is past its give-up
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 101)
         self.assertEqual((e["state"], self.state_reads(), len(self.w.sent())), ("merged", [], sent))
+
+    def test_a_forwarded_land_past_the_give_up_whose_cached_close_predates_it_is_read_live(self):
+        # a CLOSED copy older than the row may predate a reopen: past the give-up it is no reason to wait forever
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - 100)
+        self.pr(LA, state="CLOSED")
+        self.w.cache[self.KEY]["dataAt"] = 0
+        self.w.view_state = "MERGED"
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 101)
+        self.assertEqual((e["state"], len(self.state_reads())), ("merged", 1))
+
+    def test_a_spent_quota_is_no_failed_state_read(self):
+        # the login's spent quota says nothing of the PR: 1,299 reopened rows must not give up in three minutes
+        self.forwarded_row()
+        self.w.view_err = "gh-quota: refused: GitHub GraphQL rate limit is spent"
+        e = self.past_give_up()
+        for _ in range(gg.LAND_FORWARD_STATE_TRIES + 1):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("forwardStateFails")), ("forwarded", None))
+        self.w.view_err, self.w.view_state = None, "MERGED"
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
 
     def test_a_forwarded_land_past_the_give_up_whose_pr_closed_stops_closed_and_tells_nobody(self):
         self.forwarded_row()
@@ -28798,6 +28822,7 @@ class LandTest(Base):
         self.assertEqual(gg.land_forward_name(["ssh", "-o", "ConnectTimeout=5", "cmux-cp-1", "glaeda-gh"]), "cmux-cp-1")
         self.assertEqual(gg.land_forward_name(["ssh", "-oBatchMode=yes", "-p", "22", "h1", "x"]), "h1")
         self.assertNotEqual(gg.land_forward_name(["reach", "-o"]), "-o")
+        self.assertEqual(gg.land_forward_name(["ssh", "-p", "22", "leo@h1", "x"]), "leo@h1")
 
     def test_a_row_the_flag_parse_or_the_unread_give_up_wrote_is_repaired_at_load(self):
         # huge-blue 2026-11-23: 416 rows named "-o" as their far host, and 1,299 stopped forward_no_outcome unread
