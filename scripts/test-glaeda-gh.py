@@ -29042,9 +29042,11 @@ class LandTest(Base):
         e.pop("forwardQuiet")
         e.update(state="forwarded", mergeSha="", forwardFirst=None)
         e["handedOff"]["at"] = self.t
+        self.w.view_err = "HTTP 502"  # and the live read of its state fails too
         self.tick(gg.LAND_FORWARD_QUIET + 10)
         self.assertEqual(self.quiet_notices(), [])
         self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         [sent] = self.quiet_notices()
         self.assertIn("no read of the PR here says it ended", sent[-1])
 
@@ -29092,6 +29094,35 @@ class LandTest(Base):
         self.assertEqual(said[3], "host/lane")
         self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+
+    def test_a_row_after_a_forwarded_pr_merged_outside_the_queue_stops_waiting_within_a_pass_latch_or_not(self):
+        # glaeda#2540 sat waiting_after glaeda#2518 after a direct pinned merge of #2518: #2518's row here was
+        # "forwarded", which ends only from a copy of its PR (a one-off read at most every LAND_PEEK_EVERY that may never
+        # come) or at its give-up, 2 h on; and a row behind it held by the login's latch never looked at it again.
+        self.forwarded_row()
+        self.pr(LB, key="pr:o/r#2")
+        self.land("o/r#2", after=["o/r#1"], requester="host/two")
+        self.tick()
+        self.assertEqual(self.q.entries["pr:o/r#2"]["state"], "waiting_after")
+        self.latch("rest", self.t + 4 * 3600)
+        self.w.view_state = "MERGED"  # merged by hand: the daemon's copy of it still reads open
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        e1, e2 = self.q.entries[self.KEY], self.q.entries["pr:o/r#2"]
+        self.assertEqual((e1["state"], e1["mergeSha"], len(self.state_reads())), ("merged", "f" * 40, 1))
+        self.assertEqual(e2["state"], "queued")  # held by the latch, no longer behind #1
+        self.assertIn("after_merged", [h.get("event") for h in e2["history"]])
+
+    def test_a_forward_merged_outside_the_queue_with_no_copy_read_ends_merged_and_says_no_verdict_to_nobody(self):
+        # glaeda#2518 merged by hand while forwarded, and its requester was still told "handed to ... no verdict has
+        # come back": no copy here showed the merge. The notice now waits on a live read of the PR's state, and that
+        # read ends the row merged.
+        self.handed_off()
+        self.w.view_state = "MERGED"
+        for _ in range(int((gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT) // 60) + 4):
+            self.tick(60)  # the one-off read is asked and never lands
+        e = self.q.entries[self.KEY]
+        self.assertEqual(self.quiet_notices(), [])
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
 
     def test_a_forwarded_land_the_cache_shows_closed_stops_saying_so(self):
         self.forwarded_row()
