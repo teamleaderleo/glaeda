@@ -1191,7 +1191,7 @@ class HeadRunOrderTest(unittest.TestCase):
         self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
         asked: list = []
 
-        def graphql(query: str, variables: dict) -> tuple:
+        def graphql(query: str, variables: dict, _route: list | None = None) -> tuple:
             asked.append(variables["ids"])
             return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
                                        {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
