@@ -7419,7 +7419,8 @@ class FleetBudgetTest(Base):
         self.assertEqual(gg.fetch_host("far", False)["budget"], {})
         args = Path(gg.REACH_CMD + ".args").read_text().splitlines()
         self.assertEqual(args[:3], ["far", "sh", "-c"])
-        self.assertEqual(shlex.split("\n".join(args[3:])), [gg.FLEET_HOST_SCRIPT])
+        self.assertEqual(shlex.split("\n".join(args[3:])),
+                         [gg.remote_self_bounded(gg.FLEET_HOST_SCRIPT, gg.FLEET_HOST_TIMEOUT)])
         gg.REACH_CMD = self.script("reach", 'echo "reach: no route to far" >&2; exit 4\n')
         self.assertEqual(gg.fetch_host("far", False)["error"], "unreachable (exit 4: reach: no route to far)")
         gg.REACH_CMD = self.script("reach", "sleep 30\n")
@@ -7591,6 +7592,153 @@ class BoundedSubprocessTest(unittest.TestCase):
     def test_an_answer_within_the_deadline_is_returned(self) -> None:
         result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+
+
+class ChildReapingTest(unittest.TestCase):
+    """cosmic-gray 2026-11-22: 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days (alert sends
+    nobody waited for, many started by an image the daemon had execv'd away) and 55 `reach` probes of the budget
+    sweep alive 29 minutes past their 25 s bound, the bound held only by a caller that was gone. Every child serve
+    does not wait for is reaped each tick, the old image's by PID; a bounded child ends at its bound on its own."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("SELF_BOUND_SLACK", "SELF_BOUND_KILL"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+        gg.SELF_BOUND_SLACK = 0.3
+        gg.SELF_BOUND_KILL = 1
+        self.addCleanup(self.forget)
+
+    def forget(self) -> None:
+        with gg.DETACHED_LOCK:
+            gg.DETACHED.clear()
+            gg.INHERITED.clear()
+
+    def tool(self, body: str) -> str:
+        path = Path(self.tmp.name) / f"tool-{len(os.listdir(self.tmp.name))}"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def stat(self, pid: int) -> str:
+        done = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def zombie(self, pid: int) -> bool:
+        return self.stat(pid).startswith("Z")
+
+    def gone(self, pid: int, within: float) -> bool:
+        """PID no longer runs (absent, or a zombie of a parent that is not this test) within WITHIN seconds."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if not self.stat(pid) or self.zombie(pid):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_no_timeout_or_no_bound_leaves_the_argv_alone(self) -> None:
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: ""}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], None), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], math.inf), ["sh", "-c", "true"])
+        absent = os.fspath(Path(self.tmp.name) / "absent")
+        self.assertEqual(gg.self_bounded([absent], 5), [absent])  # Popen's OSError names it, not timeout's 127
+        fake = self.tool("exec \"$@\"\n")
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: fake}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), [fake, "-k", "1", "5.3", "sh", "-c", "true"])
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_the_bound_ends_the_whole_group_after_its_caller_is_gone(self) -> None:
+        """The caller never waits (it is gone: an execv, a SIGKILL); the child and the grandchild holding its pipes
+        still end at the bound."""
+        marker = Path(self.tmp.name) / "grandchild.pid"
+        tool = self.tool(f"sleep 60 &\necho $! > {marker}\nsleep 60\n")
+        proc = subprocess.Popen(gg.self_bounded([tool], 0.2), start_new_session=True, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        deadline = time.monotonic() + 5
+        while not (marker.exists() and marker.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(marker.read_text())
+        self.assertTrue(self.gone(grandchild, 8), "the grandchild outlived its bound")
+        self.assertIsNotNone(proc.wait(8))
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_run_bounded_answers_as_before_under_its_own_bound(self) -> None:
+        result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+        self.assertEqual(gg.run_bounded(["cat"], 10, input_text="in\n").stdout, "in\n")
+        with self.assertRaises(OSError):
+            gg.run_bounded([os.fspath(Path(self.tmp.name) / "absent")], 10)
+
+    def test_the_remote_script_bounds_itself_where_the_host_has_timeout(self) -> None:
+        done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo \"@@x 'q'\"", 5)], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.stdout, "@@x 'q'\n")
+        if any(os.access(p, os.X_OK) for p in gg.TIMEOUT_PATHS):
+            started = time.monotonic()
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("sleep 30", 0.3)], capture_output=True,
+                                  timeout=30)
+            self.assertEqual(done.returncode, 124)
+            self.assertLess(time.monotonic() - started, 10)
+        with mock.patch.object(gg, "TIMEOUT_PATHS", (os.fspath(Path(self.tmp.name) / "none"),)):
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo plain", 5)], capture_output=True,
+                                  text=True, timeout=30)
+        self.assertEqual(done.stdout, "plain\n")  # a host with no timeout runs it as it is
+
+    def until_zombie(self, pid: int) -> bool:
+        deadline = time.monotonic() + 5
+        while not self.zombie(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.zombie(pid)
+
+    def test_detached_children_are_reaped_and_never_left_defunct(self) -> None:
+        first = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertTrue(self.until_zombie(first.pid), "it ended, and nothing waited for it yet")
+        second = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertFalse(self.zombie(first.pid), "the next spawn reaps what ended")
+        self.assertTrue(self.until_zombie(second.pid))
+        self.assertEqual(gg.reap_children(), 0)  # what serve's tick does
+        self.assertFalse(self.zombie(second.pid))
+        self.assertEqual(gg.DETACHED, [])
+
+    def test_a_bounded_child_carries_its_deadline_for_the_reaper(self) -> None:
+        before = time.time()
+        env = gg.deadline_env({"PATH": "/usr/bin:/bin"}, 10)
+        self.assertEqual(env["CMUX_DEADLINE_OWNER"], "glaeda-gh")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertTrue(before + 10 <= int(env["CMUX_DEADLINE"]) <= time.time() + 10 + 0.3 + 1 + 1, env)
+        self.assertIsNone(gg.deadline_env(None, None))
+        self.assertEqual(gg.deadline_env({"A": "1"}, math.inf), {"A": "1"})
+        seen = gg.run_bounded(["sh", "-c", 'echo "$CMUX_DEADLINE_OWNER $CMUX_DEADLINE"'], 10).stdout.split()
+        self.assertEqual(seen[0], "glaeda-gh")
+        self.assertGreaterEqual(int(seen[1]), int(before) + 10)
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_a_bounded_detached_child_ends_at_its_bound(self) -> None:
+        proc = gg.spawn_detached(["sleep", "30"], bound=0.2, stdin=subprocess.DEVNULL)
+        self.assertIsNotNone(proc.wait(10))
+        self.assertEqual(gg.reap_children(), 0)
+
+    def test_the_previous_images_children_are_adopted_by_pid_and_reaped(self) -> None:
+        """An execv keeps the PID and its children; the new image holds no Popen for them."""
+        pids = [os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ) for _ in range(2)]
+        pids.append(os.posix_spawn("/bin/sh", ["sh", "-c", "sleep 1"], os.environ))
+        self.assertLessEqual(set(pids), gg.child_pids(os.getpid()))
+        with mock.patch.object(gg, "child_pids", return_value=set(pids)):
+            self.assertEqual(gg.adopt_inherited(), 3)
+        deadline = time.monotonic() + 5
+        while not all(self.zombie(p) for p in pids[:2]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(gg.reap_children(), 1)  # the sleeping one still runs
+        self.assertFalse(any(self.zombie(p) for p in pids[:2]))
+        deadline = time.monotonic() + 10
+        while gg.reap_children() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(gg.INHERITED, set())
+        with mock.patch.object(gg, "child_pids", return_value={999999}):
+            gg.adopt_inherited()
+        self.assertEqual(gg.reap_children(), 0)  # not ours: dropped, never retried
 
 
 class TickBudgetTest(Base):
@@ -26679,9 +26827,10 @@ class LandTest(Base):
         self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
         # handed off is no wake: the requester hears from huge-blue's queue when it merges or stops
         self.assertFalse(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
-        # nothing more here: no judgment, no step, no second hand-off
-        for _ in range(5):
-            self.tick(600)
+        # nothing more here inside LAND_FORWARD_RESEND: no judgment, no step, no second hand-off (past it, an open PR is
+        # handed off again: test_a_forwarded_land_still_open_past_the_bound_is_handed_off_again_once_per_bound)
+        for _ in range(int(gg.LAND_FORWARD_RESEND // 600)):
+            self.tick(599)
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
         # queued again at the same head: refused the same way, handed off never again (idempotent per PR and head)
         with mock.patch.object(gg, "policy_host", lambda: "host"):
@@ -27659,6 +27808,73 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--match-head-commit {LB}", e["stop"]["next"])
 
+    def forwarded_row(self, sha: str = "") -> dict:
+        """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
+        read nothing: the row is "forwarded" (finding hq#19725's rows)."""
+        self.broker = True
+        host = mock.patch.object(gg, "policy_host", lambda: "host")
+        host.start()
+        self.addCleanup(host.stop)
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", **({"sha": sha} if sha else {}))
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("forwardedTo"), len(self.handoffs())), ("forwarded", "huge-blue", 1))
+        return e
+
+    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_and_tells_its_requester(self):
+        # hq#19725: 9 rows MERGED on GitHub stayed "forwarded" on the lane VM for hours.
+        self.forwarded_row()
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")  # still open: nothing to say yet
+        self.pr(LA, state="MERGED")
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        [said] = [c for c in self.w.sent() if "merged" in c[-1]]
+        self.assertEqual(said[3], "host/lane")
+        self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
+        self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+
+    def test_a_forwarded_land_the_cache_shows_closed_stops_saying_so(self):
+        self.forwarded_row()
+        self.pr(LA, state="CLOSED")
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertIn("closed unmerged while handed to huge-blue", e["stop"]["reason"])
+        self.tick(gg.LAND_FORWARD_RESEND + 1)
+        self.assertEqual((len(self.handoffs()), self.q.entries[self.KEY]["state"]), (1, "stopped"))
+
+    def test_a_forwarded_land_still_open_past_the_bound_is_handed_off_again_once_per_bound(self):
+        # hq#19725: 61 rows went to an executor that later answered not_executor and were never sent again.
+        e = self.forwarded_row()
+        first = e["handedOff"]["at"]
+        self.tick(gg.LAND_FORWARD_RESEND / 2)
+        self.assertEqual(len(self.handoffs()), 1)  # inside the bound: the far host may still be judging it
+        e = self.tick(gg.LAND_FORWARD_RESEND / 2 + 1)
+        self.assertEqual(len(self.handoffs()), 2)
+        self.assertEqual(json.loads(self.handoffs()[-1][4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual((e["state"], e["forwardResent"]["n"]), ("forwarded", 1))
+        self.assertGreater(e["handedOff"]["at"], first)
+        [row] = [h for h in e["history"] if h.get("event") == "forward_resent"]
+        self.assertIn("handed off again", row["why"])
+        for _ in range(int(2 * gg.LAND_FORWARD_RESEND // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(len(self.handoffs()), 2)  # the second waits twice the bound, however often rows are looked at
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
+        self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
+
+    def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
+        self.forwarded_row(sha=LA)
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LC]  # a push on another commit, not a base merge on the pin
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(LB, e["stop"]["next"])
+        self.tick(gg.LAND_FORWARD_RESEND + 1)
+        self.assertEqual(len(self.handoffs()), 1)
+
     def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
         # On the broker host the hand-off is a plain queued land: land_judge's teammate rule stops it there, nothing
         # is merged, and the requester the lane named is told.
@@ -27950,6 +28166,42 @@ class LandTest(Base):
         self.tick(300)
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
+
+    def test_a_prs_own_ci_job_rate_limit_parks_only_its_entry_and_never_halves_the_pool(self):
+        """cmux-cp-1, 2026-11-22 17:42-21:00Z: 10 of 11 host-wide parks were land_judge's "base_red_excuse.py job
+        rate-limited at HEAD" (one PR's CI job printed only its repo installation's API refusal), worded as a quota
+        refusal with a reset. Each stopped every land 2-4 min and halved the pool, though no pool this host reads was
+        spent. That PR waits for the time it names; the next PR is judged on the same pass; the pool keeps its size."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        retry = self.t + 1500
+        at = time.strftime("%H:%M", time.gmtime(retry))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 1500}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: base_red_excuse.py job "
+            f"rate-limited at {LA} (exit 1): job-rate-limited: run 45060196034; job 130862862041; no attempt before "
+            f"{at}Z. Rerun run 45060196034 (job 130862862041) no sooner than {at}Z; the repo installation's API limit "
+            "refused only that hand-off job")))
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        refused_before = self.q.quota_refused
+        self.tick()
+        e = self.q.entries[self.KEY]
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"].get("own")), ("waiting", "quota", True))
+        self.assertEqual(e["wakeAt"], said + gg.land_jitter(self.KEY, said))
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        self.assertEqual(self.q.quota_refused, refused_before)  # adapt_pool does not halve on it
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged on the same pass
+
+    def test_the_job_quota_words_are_land_judges_own(self):
+        """LAND_JOB_QUOTA matches land_judge's fixed lead only, not a reset that merely mentions a job."""
+        self.assertTrue(gg.LAND_JOB_QUOTA.search("base_red_excuse.py job rate-limited at 908aa0087803ab6f006c9a77fb"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("quota: not judged, retry after 09:00Z (reset): GraphQL spent"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("base_red_excuse.py was rate-limited at 908aa0087803"))
 
     def test_a_ci_jobs_rate_limit_parks_only_its_entry_never_the_queue(self):
         """land_judge's "job rate-limited" quota answer names one CI job's rerun time on the installation's limit:
@@ -31870,6 +32122,24 @@ class LandForwardTest(Base):
         self.executor_serve(self.sent_batches[0])
         self.exec_tick(x)
         self.assertEqual(x.entries[self.KEY]["state"], "merged")
+
+    def test_a_forward_still_open_past_the_bound_is_sent_to_the_executor_again_and_a_merge_ends_it(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        self.assertEqual((len(self.sent_batches), self.q.entries[self.KEY]["state"]), (1, "forwarded"))
+        self.tick(gg.LAND_FORWARD_RESEND / 2)
+        self.assertEqual(len(self.sent_batches), 1)
+        e = self.tick(gg.LAND_FORWARD_RESEND / 2 + 1)
+        self.assertEqual(len(self.sent_batches), 2)
+        self.assertEqual(self.sent_batches[1]["requests"][0]["id"], self.sent_batches[0]["requests"][0]["id"])
+        self.assertEqual((e["state"], e["forwardResent"]["n"]), ("forwarded", 1))
+        self.pr(LA, state="MERGED")
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+        self.assertEqual(len(self.sent_batches), 2)
 
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
@@ -37488,6 +37758,137 @@ class GitHubSaidTest(unittest.TestCase):
             statement = line if any(s in line for s in sinks) else source[n - 2] + line  # the call may open above
             self.assertTrue(any(s in statement for s in sinks),
                             f"scripts/glaeda-gh:{n} formats GitHub's message itself: {statement.strip()}")
+
+
+class ATallySaysWhenItsBasisChangedTest(Base):
+    """A count of checks is a count over a set, and the set changes. One `wait pr` printed, 120 s apart,
+       checks FAILURE: 16 passed, 2 failed, 0 pending (of 18, 0 required)
+       checks PENDING: 16 passed, 0 failed, 1 pending (of 17, 0 required)
+    -- two lines of the same shape, both reading as facts about one set, while the set had lost the two checks the
+    first verdict was about. The second line must say that, and a vanished *failure* by name; a reorder must stay
+    silent, because a false positive here is worse than the silence it replaces."""
+
+    FAILED_PAIR = ("Verify / unit-tests", "Verify / ci-status")
+
+    def read_a(self):
+        """The 18 of the real first line: 16 passed and the 2 that failed."""
+        checks = [check_run(f"shard{i:02d}") for i in range(16)]
+        checks += [check_run(name, conclusion="FAILURE") for name in self.FAILED_PAIR]
+        return gg.parse_pr(pr_node(1, rollup="FAILURE", checks=checks))
+
+    def read_b(self):
+        """The 17 of the real second line: those 16, the 2 failures gone, and one check pending that was not there."""
+        checks = [check_run(f"shard{i:02d}") for i in range(16)]
+        checks += [check_run("Verify / rerun", status="IN_PROGRESS", conclusion=None)]
+        return gg.parse_pr(pr_node(1, rollup="PENDING", checks=checks))
+
+    def entry(self, *reads, now=None):
+        """READS stored one after another through the daemon's own write path, 120 s apart, as consecutive fetches
+        of one key -- the real cadence of the pair of lines this is about."""
+        now = NOW if now is None else now
+        for i, data in enumerate(reads):
+            self.daemon.now = now - (len(reads) - 1 - i) * 120.0
+            self.daemon.store("pr:o/r#1", gg.read_cache("pr:o/r#1"), data=data, dataAt=self.daemon.now)
+        return gg.read_cache("pr:o/r#1")
+
+    def test_the_eighteen_to_seventeen_pair_says_the_set_changed(self):
+        entry = self.entry(self.read_a(), self.read_b())
+        text = gg.summary("pr:o/r#1", entry)
+        checks_line = next(line for line in text.splitlines() if line.startswith("checks "))
+        self.assertIn("16 passed, 0 failed, 1 pending (of 17", checks_line)  # the tally is unchanged
+        self.assertIn("basis changed", checks_line)
+        self.assertIn("18 -> 17 checks", checks_line)
+        self.assertIn("not comparable with the earlier read", checks_line)
+        moved = [line for line in text.splitlines() if line.startswith("  basis moved ")]
+        self.assertEqual(len(moved), 1, text)
+        for name in self.FAILED_PAIR:
+            self.assertIn(name, moved[0])
+        self.assertIn("new: Verify / rerun", moved[0])
+
+    def test_a_failed_check_that_vanished_is_named_as_having_no_verdict(self):
+        text = gg.summary("pr:o/r#1", self.entry(self.read_a(), self.read_b()))
+        self.assertIn("2 failed check(s) left it with no verdict", text)
+        self.assertIn("a failed check that disappeared has no verdict -- not a pass, and not a red to chase either",
+                      text)
+        # and it stays a reading, never a verdict: the exit code is the one the 17 checks give on their own
+        entry = self.entry(self.read_a(), self.read_b())
+        self.assertIsNone(gg.check_verdict(entry["data"], "green"))
+        self.assertIsNone(gg.verdict("pr", entry["data"], "done"))
+
+    def test_a_check_that_appeared_is_said_too(self):
+        """17 -> 18: the other direction. A set that grew is not comparable either."""
+        text = gg.summary("pr:o/r#1", self.entry(self.read_b(), self.read_a()))
+        self.assertIn("17 -> 18 checks", text)
+        self.assertIn("new: ", text)
+        self.assertNotIn("left it with no verdict", text)  # nothing that had failed went anywhere
+
+    def test_a_reorder_of_the_same_members_stays_quiet(self):
+        """Order is not membership, and neither is a state that changed inside a member. Both must say nothing."""
+        a = self.read_a()
+        shuffled = {**a, "checks": list(reversed(a["checks"]))}
+        entry = self.entry(a, shuffled)
+        self.assertNotIn("basis", gg.summary("pr:o/r#1", entry))
+        self.assertIsNone(entry.get("churn"))
+        passing = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run(f"shard{i:02d}") for i in range(16)]
+                                      + [check_run(name) for name in self.FAILED_PAIR]))
+        self.assertNotIn("basis", gg.summary("pr:o/r#1", self.entry(a, passing)))
+
+    def test_a_first_read_and_a_cleared_cache_read_exactly_as_before(self):
+        """The memory is never a correctness dependency: cold, the output is the output of today's code."""
+        cold = gg.summary("pr:o/r#1", {"data": self.read_b(), "dataAt": time.time()})
+        warm = gg.summary("pr:o/r#1", self.entry(self.read_b()))
+        self.assertNotIn("basis", cold)
+        self.assertEqual([line for line in warm.splitlines() if line.startswith("checks ")],
+                         [line for line in cold.splitlines() if line.startswith("checks ")])
+
+    def test_a_partial_read_is_never_a_disappearance(self):
+        """A read that did not happen is unknown (docs/handbook/missing-read-counted-as-a-value.md): a held check
+        page or a rollup past its first page drops members it never read, which is not the set changing."""
+        a = self.read_a()
+        self.assertIsNone(gg.membership_change(a, {**self.read_b(), "checksTruncated": True}, time.time()))
+        self.assertIsNone(gg.membership_change(a, {**self.read_b(), "checksPageError": "HTTP 502"}, time.time()))
+        self.assertIsNone(gg.membership_change({**a, "checksTruncated": True}, self.read_b(), time.time()))
+
+    def test_a_new_head_commit_is_allowed_to_replace_the_basis(self):
+        """A push legitimately brings a new set, and the head is on the headline above the counts already."""
+        pushed = {**self.read_b(), "headRefOid": "b" * 40}
+        self.assertIsNone(gg.membership_change(self.read_a(), pushed, time.time()))
+
+    def test_the_memory_is_bounded_and_typed(self):
+        """glaeda's own rule: human and JSON output stay bounded. Names are capped with a count of the rest, a key
+        keeps CHURN_EVENTS changes, and each is dropped CHURN_KEEP after it happened."""
+        now = time.time()
+        wide = gg.parse_pr(pr_node(1, checks=[check_run(f"other{i:02d}", conclusion="FAILURE") for i in range(30)]))
+        change = gg.membership_change(wide, self.read_b(), now)
+        self.assertEqual(len(change["gone"]), gg.CHURN_NAMED)
+        self.assertEqual(change["goneMore"], 30 - gg.CHURN_NAMED)
+        self.assertEqual(change["goneTotal"], 30)
+        self.assertEqual(len(gg.churn_lines([change], now)), 1)
+        self.assertLess(len(gg.churn_lines([change], now)[0]), 400)
+        self.assertIn(f"+{30 - gg.CHURN_NAMED} more", gg.churn_lines([change], now)[0])
+        log = [dict(change, at=now - i) for i in range(10)]
+        self.assertEqual(len(gg.churn_events(log, now)), gg.CHURN_EVENTS)
+        self.assertEqual(gg.churn_events([dict(change, at=now - gg.CHURN_KEEP - 1)], now), [])
+        self.assertEqual(gg.churn_clause([dict(change, at=now - gg.CHURN_KEEP - 1)], now), "")
+        for field in ("at", "before", "after", "goneTotal", "newTotal", "lostFailedTotal"):
+            self.assertIsInstance(change[field], (int, float))
+        for field in ("gone", "new", "lostFailed"):
+            self.assertTrue(all(isinstance(n, str) for n in change[field]))
+
+    def test_a_change_survives_the_reads_that_did_not_print(self):
+        """The pair that cost the time was two *prints* 120 s apart; the read where the set moved was neither of
+        them. A change stays sayable for CHURN_KEEP, so a reader on that cadence cannot step over it."""
+        entry = self.entry(self.read_a(), self.read_b(), self.read_b())
+        self.assertIn("basis changed", gg.summary("pr:o/r#1", entry))
+        self.assertEqual(len(entry["churn"]), 1)
+
+    def test_json_carries_the_memory_typed(self):
+        entry = self.entry(self.read_a(), self.read_b())
+        doc = json.loads(gg.render("pr:o/r#1", entry, True))
+        self.assertEqual(doc["churn"][0]["before"], 18)
+        self.assertEqual(doc["churn"][0]["after"], 17)
+        self.assertEqual(doc["churn"][0]["lostFailedTotal"], 2)
+
 
 
 if __name__ == "__main__":
