@@ -1329,6 +1329,15 @@ SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cos
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
 checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
   detailsUrl databaseId startedAt completedAt } } } } }"""
+# Whether each suite ran anything in any attempt, asked of an App before SUITE_RUNS. Most suites whose newest attempt
+# ran nothing never ran anything (another App's suite that is requested and never run), and SUITE_RUNS's `app { slug }`
+# on a suite whose App another organization owns is that organization's IP allow list's FORBIDDEN: the suite was
+# node-benched (bench_nodes) and read on the login. The broker host, 2026-11-22 23:39Z-00:46Z: 165 login-fallback
+# lines, every one a last-real-attempt read, 89 "refused" and 55 more of those benched suites (then misnamed
+# "pool-resting"). This query asks no App node, so it stays on the App; a suite with no check run in any attempt is
+# answered here, empty, and only a suite that ran something is read with SUITE_RUNS (it needs the slug).
+SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
+... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
@@ -3648,24 +3657,30 @@ class AppPool:
         owner = next(iter(owners))
         return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
 
-    def passed_over(self, owner: str, scope: str) -> tuple[str, dict[str, str]]:
+    def passed_over(self, owner: str, scope: str, body: dict | None = None) -> tuple[str, dict[str, str]]:
         """Why no pool of the chain answers OWNER's SCOPE after pick() found none, without a mint or a request:
         (cause, {role: its own}). A role is "no-token" (this host holds none of it), "route-benched" (it refused
-        SCOPE lately, covers) or "pool-resting" (rate limited, under its floor, or a failed mint). The cause is
-        "no-token" when no role holds one, else "pool-resting" when any holder rests, else "route-benched"."""
+        SCOPE lately, covers), "node-benched" (it refused a node the GraphQL BODY asks, bench_nodes) or
+        "pool-resting" (rate limited, under its floor, or a failed mint). The cause is "no-token" when no role holds
+        one, else "pool-resting" when any holder rests, else "node-benched" when any holder benched a node, else
+        "route-benched". A node bench used to read as "pool-resting": the broker host, 2026-11-22 23:39Z-00:46Z, 55
+        last-real-attempt reads "pool-resting" on the login while every App of the chain had its points."""
         now = self.clock()
         each: dict[str, str] = {}
+        nodes = list(graphql_body_nodes(body).values()) if body is not None else []
         for pool in [self, *self.spares]:
             if not pool.covers(scope):
                 each[pool.role] = "route-benched"
             elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_cached():
                 each[pool.role] = "no-token"
+            elif nodes and pool.nodes_benched(nodes):
+                each[pool.role] = "node-benched"
             else:
                 each[pool.role] = "pool-resting"
         held = [c for c in each.values() if c != "no-token"]
         if not held:
             return "no-token", each
-        return ("pool-resting" if "pool-resting" in held else "route-benched"), each
+        return next(c for c in ("pool-resting", "node-benched", "route-benched") if c in held), each
 
     def ready_cached(self) -> bool:
         """ready_fn() (held_here: directory scans and token file reads) once per APP_POOL_TTL, for passed_over,
@@ -6963,7 +6978,7 @@ class Daemon:
         elif owner is None:
             cause = pool.owner_why(method, path, body)[1] or "other"
         else:
-            cause, pools = pool.passed_over(owner, scope)
+            cause, pools = pool.passed_over(owner, scope, body if path == "/graphql" else None)
         if cause == "write":
             return
         kind = (tuple(self.caller) + ("",))[0]
@@ -10679,11 +10694,11 @@ class Daemon:
         pool = self.app_pool
         benched = [s for s in suites if pool is not None and pool.chain_benched([f"id:{s}"])]
         held = frozenset(benched)
-        suites = [s for s in suites if s not in held] + benched
+        out: dict[str, list[dict] | str] = self.suites_never_ran([s for s in suites if s not in held], route)
+        suites = [s for s in suites if s not in held and s not in out] + benched
         starts = (list(range(0, len(suites) - len(benched), SUITE_RUNS_BATCH))
                   + list(range(len(suites) - len(benched), len(suites), SUITE_RUNS_BATCH)))
         ends = starts[1:] + [len(suites)]
-        out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start, end in zip(starts, ends):
@@ -10732,6 +10747,39 @@ class Daemon:
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
                                  for run in nodes]
         return out, None
+
+    def suites_never_ran(self, suites: list[str], route: "list[str] | None") -> dict[str, list]:
+        """{suite id: []} for each of SUITES an App says ran no check run in any attempt (SUITE_COUNTS), so
+        suite_runs reads only the rest with SUITE_RUNS. Asked only when an App answers it: on the login it would be
+        one more query, not one fewer. A suite it could not read (an error at its path, a null node, another id, no
+        count) is left out, and SUITE_RUNS reads it as before: never greener."""
+        found: dict[str, list] = {}
+        for start in range(0, len(suites), SUITE_RUNS_BATCH):
+            chunk = suites[start:start + SUITE_RUNS_BATCH]
+            if not route or not self.app_answers(SUITE_COUNTS, {"suites": chunk}, route):
+                break
+            reason, self.gql_reason = self.gql_reason, "last-real-attempt-count"
+            try:
+                doc, _ = self.graphql(SUITE_COUNTS, {"suites": chunk}, route)
+            finally:
+                self.gql_reason = reason
+            nodes = ((doc or {}).get("data") or {}).get("suiteRuns")
+            if not isinstance(nodes, list) or len(nodes) != len(chunk):
+                continue
+            hit: set[int] = set()
+            for e in (doc or {}).get("errors") or []:
+                path = e.get("path") if isinstance(e, dict) else None
+                if isinstance(path, list) and len(path) > 1 and path[0] == "suiteRuns" and type(path[1]) is int:
+                    hit.add(path[1])
+                else:
+                    hit.update(range(len(chunk)))
+            for n, (suite_id, node) in enumerate(zip(chunk, nodes)):
+                runs = node.get("checkRuns") if isinstance(node, dict) else None
+                total = runs.get("totalCount") if isinstance(runs, dict) else None
+                if n not in hit and isinstance(node, dict) and node.get("id") == suite_id and total == 0 \
+                        and type(total) is int:
+                    found[suite_id] = []
+        return found
 
     def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
                    extra: list[tuple[str, list[dict]]] = ()) -> dict | str:
@@ -14826,6 +14874,19 @@ def gh_cache_newest() -> float:
     return newest
 
 
+def gh_cache_gens(repo: str | None) -> list[int]:
+    """The host's shared gh cache generations a read of REPO is answered under (leo-workspace tools/gh_shared_cache.py:
+    every entry keeps the generations of its scope and of `*` as it was stored, and is refused once either moved).
+    Each write through the shim bumps `host` and the repo it names, or `*` -- every key on the host -- when its flags
+    do not name one (`pr merge --squash --match-head-commit`, `run rerun --failed`). So this list moving means every
+    answer stored before it is now refused: no read of REPO can be served from that cache (unread_cache_stale)."""
+    gens = read_json(latch_state_dir() / "cache" / "generations.json")
+    if not isinstance(gens, dict):
+        return []
+    return [int(gens.get(k) or 0) if isinstance(gens.get(k), (int, float)) else 0
+            for k in ("host", str(repo or "").lower(), "*")]
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -15699,7 +15760,8 @@ class LandQueue:
         full head that this queue's own update-branch did not make (pin_follow's case: no update was ever sent for
         E). A cache file read, no GitHub call, so a row gated behind busy workers, the load line or the pace cap stops
         as soon as the read lands instead of when a worker is free to judge it (judge and pin_wait stop it the same
-        way). A lane host, 2026-11-22: a pinned row waiting on its stack sat 3 h on a head that had moved."""
+        way). A lane host, 2026-11-22: a pinned row waiting on its stack sat 3 h on a head that had moved. A head that
+        may be an older commit of the pin (a stale copy) is read first on a worker (ancestry_wait), never here."""
         pin = str(e.get("pinSha") or "")
         head = str(data.get("headRefOid") or "").lower()
         if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head):
@@ -15714,6 +15776,8 @@ class LandQueue:
         at = c.get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
             return False  # a copy older than the pin may predate the push the pin names
+        if self.ancestry_wait(e, head, data):
+            return False  # maybe an older commit of the pin, a stale copy: a worker reads it (LAND_ANCESTRY_JQ)
         e.pop("pinWait", None)
         self.stop(e, "head_moved", land_moved_clause(head, pin),
                   f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
@@ -16568,6 +16632,22 @@ class LandQueue:
         return [sha, c.get("fp"), c.get("fullAt"), c.get("dataAt"),
                 snap.get("fp"), snap.get("readAt"), snap.get("complete"), gh_cache_newest()]
 
+    def unread_probe_answerable(self, e: dict, gens: list[int]) -> bool:
+        """Whether a cache-only probe of E (the unread route) can be answered at all. The reads such a probe makes --
+        that PR with the review and comment fields, its head's check runs and status, its jobs with their steps -- are
+        ones the daemon's own cache and the git mirror never keep, so only the host's shared gh cache can answer, and
+        only E's own live judgment ever stored them there. GENS moving since that judgment started means every entry
+        it stored is refused (gh_cache_gens), so the probe must miss: one host, 7 days, unread_cache_miss 171 to
+        unread_cache_hit 3, and under --cache-only 325 of 325 gh calls refused with none ever answered, because the
+        judgment's own merge or update-branch step bumps `*` and wipes the reads its next probe would have read.
+        Generations only rise, so unmoved proves the entries are live; moved is taken as wiped even in the few cases
+        where the bump landed before they were stored -- the cost of that is a live judgment that was coming anyway."""
+        mark = e.get("cacheGen")
+        if not isinstance(mark, list) or mark == gens:
+            return True
+        self.count("unread_cache_stale")  # a probe not sent: the subprocess and the worker it would have held
+        return False
+
     def window_room(self, e: dict, sha: str = "") -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
@@ -16579,6 +16659,9 @@ class LandQueue:
         e.pop("paceNext", None)
         e.pop("cacheOnlyInputs", None)
         first = e.pop("unreadCacheFirst", None)
+        gens = gh_cache_gens(e.get("repo"))
+        if first is not None and not self.unread_probe_answerable(e, gens):
+            first = None  # a write wiped what E's last live judgment stored: that probe can only miss, so it is not sent
         if self.latch_free(e) and not self.broker_client():
             # (A broker client's latch-free owner has its REST reads answered by the broker's read App, its GraphQL by
             # the login: paced as before.) Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
@@ -16588,12 +16671,15 @@ class LandQueue:
             # GraphQL they never spend. The App's own refusals are what is measured for them (spent_until, the park).
             if first is not None:
                 e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if not over:
+            e["cacheGen"] = gens
             return True
         pool = over[0]
         slot = float(w.get("graphqlAt", float("-inf")))
@@ -16602,6 +16688,7 @@ class LandQueue:
             # GraphQL is spent to its reserve and REST has paced room: the caches first, then a live judgment over
             # REST, charged to REST alone (LAND_REST_ROUTE's comment).
             e["cacheOnlyJudge"] = "rest"
+            e["cacheGen"] = gens
             return True
         if over == ["graphql"]:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
@@ -17001,6 +17088,8 @@ class LandQueue:
                 return True  # a copy still showing a pin it followed away from: a stale read, read again
             if self.base_merge_maybe(pin, head, c.get("data") or {}):
                 return False  # maybe only a base merge on the pin: judge's worker reads whether it is
+            if self.ancestry_wait(e, head, c.get("data") or {}):
+                return True  # maybe an older commit of the pin, a stale copy: a worker reads it (LAND_ANCESTRY_JQ)
             self.stop(e, "head_moved", land_moved_clause(head, pin),
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
@@ -17412,18 +17501,23 @@ class LandQueue:
         the old pin still shown (somebody may have pushed the branch back to it): the caller stops it as before.
         2026-11-22 22:08Z, glaeda#2540: pinned 023cd7fc, followed to f745a168 by repin_own_update at 21:30Z, judged
         there at 21:38Z, then stopped "the head is 023cd7fc0c87, not the --sha f745a168dca3 it was queued for" on a
-        copy that still showed the pin it had left; its owner re-pinned by hand."""
+        copy that still showed the pin it had left; its owner re-pinned by hand.
+
+        The same wait holds a HEAD that base_merge_check read to be an older commit of the pin (head_ancestry: an
+        ancestor of it, LAND_ANCESTRY_JQ's comment), which is a stale copy the same way (ancestor_head_seen)."""
         head = str(head or "").lower()
-        if not SHA40.fullmatch(head) or not any(
-                isinstance(h, dict) and h.get("event") in LAND_PIN_FOLLOW_EVENTS
-                and (was := str(h.get("was") or h.get("pin") or "").lower()) and head.startswith(was)
-                for h in e.get("history") or []):
+        pin = str(e.get("pinSha") or "")
+        followed = SHA40.fullmatch(head) is not None and any(
+            isinstance(h, dict) and h.get("event") in LAND_PIN_FOLLOW_EVENTS
+            and (was := str(h.get("was") or h.get("pin") or "").lower()) and head.startswith(was)
+            for h in e.get("history") or [])
+        if not followed and not (SHA40.fullmatch(head) and pin and self.head_ancestry(e, head, pin) is True):
             e.pop("oldPinWait", None)
             return False
         w = e.get("oldPinWait")
         if not isinstance(w, dict) or w.get("head") != head:
             w = e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
-            self.history(e, "old_pin_seen", head=head[:12], pin=str(e.get("pinSha") or "")[:12])
+            self.history(e, "old_pin_seen" if followed else "ancestor_head_seen", head=head[:12], pin=pin[:12])
             self.nudge(e["key"])
             self.save(e)
             return True
@@ -17435,12 +17529,122 @@ class LandQueue:
             self.save(e)
         return True
 
+    def head_ancestry(self, e: dict, head: str, pin: str, data: dict | None = None) -> bool | None:
+        """Whether HEAD is an older commit of PIN (one of its ancestors): the answer recorded on E for this head and
+        pin (headAncestry, which base_merge_check reads once), False when DATA's read of HEAD lists the pin among its
+        parents (a commit made on the pin is not one of its ancestors), else None: not known."""
+        head = str(head or "").lower()
+        rec = (e.get("headAncestry") or {}).get(f"{head}...{pin}")
+        if isinstance(rec, dict) and isinstance(rec.get("ancestor"), bool):
+            return rec["ancestor"]
+        data = data or {}
+        if str(data.get("headRefOid") or "").lower() == head:
+            parents = data.get("headParents")
+            if not isinstance(parents, list):
+                parents = [data["headParent"]] if data.get("headParent") else []
+            if land_parents_have(pin, parents):
+                return False
+        return None
+
+    def ancestry_wait(self, e: dict, head: str, data: dict) -> bool:
+        """Under the lock, at a would-be head_moved stop (stop_moved_pin, pin_wait, judge): True while HEAD, which is
+        not E's pin, is not known to be or not to be an older commit of it (head_ancestry), or is one (old_pin_wait
+        then holds it): the caller does not stop it. Its one read runs on a worker (ancestry_job), not here, and no
+        sooner than the wait a failed read set (base_merge_unread). False: the caller stops it head_moved as before
+        (it is no ancestor of the pin, its reads never answered, or this host has no gh-quota shim to read it with)."""
+        pin = str(e.get("pinSha") or "")
+        head = str(head or "").lower()
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head) \
+                or self.head_ancestry(e, head, pin, data) is not None or self.gh() is None:
+            return False  # known (an ancestor's wait is old_pin_wait's, which the caller asked first), or no shim
+        if (e.get("oldPinWait") or {}).get("head") == head:
+            return False  # a pin it followed away from, whose wait ran out: an older commit already, no read
+        if (e.get("baseMergeUnread") or {}).get("head") == head and e["state"] == "waiting" \
+                and float(e.get("wakeAt") or 0) > self.now:
+            return True  # its read failed: read again on that wait's wake
+        if e["key"] not in self.jobs:
+            self.submit(e["key"], self.ancestry_job, e["key"], head, pin, int(e.get("gen") or 0))
+        known = self.head_ancestry(e, head, pin, data)  # an inline job has answered already
+        return known is None or (known and self.old_pin_wait(e, head))
+
+    def ancestry_job(self, key: str, head: str, pin: str, gen: int = 0) -> None:
+        """On a worker, from ancestry_wait: read whether HEAD is an older commit of PIN (ancestry_read) and record the
+        answer on the entry (ancestry_answer). A `land cancel` or a newer `land` meanwhile wins (check)."""
+        was, self.local.gen = getattr(self.local, "gen", None), gen
+        try:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            older, why, said = self.ancestry_read(e, head, pin)
+            with self.lock:
+                self.check(e)
+                if str(e.get("pinSha") or "") == pin:
+                    self.ancestry_answer(e, head, pin, older, why, said)
+                    self.save(e)
+        except LandCancelled:
+            pass
+        finally:
+            self.local.gen = was
+
+    def ancestry_read(self, e: dict, head: str, pin: str) -> tuple[bool | None, str, str]:
+        """On a worker: one compare of HEAD...PIN through the gh-quota shim (LAND_ANCESTRY_JQ's comment). (True when
+        HEAD is an ancestor of PIN, else False; "", ""), or (None, why, the read's output) when the read failed."""
+        gh = self.gh()
+        path = f"repos/{e['repo']}/compare/{head}...{pin}"
+        got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE) if gh else None
+        try:
+            doc = json.loads(got.stdout or "") if got is not None and got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("s"), str):
+            return doc["s"] == "ahead" and doc.get("b") == 0, "", ""
+        rc = got.returncode if got is not None else "no gh-quota shim"
+        return (None, f"the read of {path} failed (exit {rc}), so it is not known to be an older commit of the pin",
+                f"{got.stdout or ''}\n{got.stderr or ''}" if got is not None else "")
+
+    def ancestry_answer(self, e: dict, head: str, pin: str, older: bool | None, why: str, said: str,
+                        kept: str = "") -> bool | None:
+        """Under the lock: record ancestry_read's answer on E (ancestry_record, with base_merge_check's own answer KEPT).
+        A read that failed waits and is read again (base_merge_unread: None), and past LAND_BASE_MERGE_UNREAD_MAX
+        failed reads of the head counts as no ancestor, so it stops as before. True: an older commit of the pin, whose
+        wait (old_pin_wait) has begun."""
+        if older is None:
+            if e["state"] == LAND_FORWARDED:  # a forwarded row keeps its state: read again on its next look
+                was = e.get("baseMergeUnread") if isinstance(e.get("baseMergeUnread"), dict) else {}
+                n = (int(was.get("n") or 0) if was.get("head") == head else 0) + 1
+                if n <= LAND_BASE_MERGE_UNREAD_MAX:
+                    e["baseMergeUnread"] = {"head": head, "n": n}
+                    self.history(e, "base_merge_unread", head=head[:12], n=n, why=land_trim(why, 200))
+                    return None
+            elif self.base_merge_unread(e, head, why, said):
+                if kept:
+                    self.ancestry_record(e, head, pin, None, kept)  # its base merge answer is not read again
+                return None
+            older = False
+        e.pop("baseMergeUnread", None)
+        self.ancestry_record(e, head, pin, older, kept)
+        return older and self.old_pin_wait(e, head)
+
+    def ancestry_record(self, e: dict, head: str, pin: str, ancestor: bool | None, why: str = "") -> None:
+        """Under the lock: record whether HEAD is an ancestor of PIN on E (headAncestry; None: not read yet), with
+        base_merge_check's own answer WHY when it read one, so neither is read again for this head and pin; answers
+        for other pins go."""
+        keep = {k: v for k, v in (e.get("headAncestry") or {}).items() if k.endswith(f"...{pin}")}
+        keep[f"{head}...{pin}"] = {**({"ancestor": ancestor} if ancestor is not None else {}), "at": self.now,
+                                   **({"why": why} if why else {})}
+        e["headAncestry"] = keep
+
+    def requeue(self, e: dict) -> None:
+        """Under the lock: E, whose worker judged nothing, is looked at again on the next pass (its head checks first)."""
+        e.update(state="queued", wait=None, wakeAt=None)
+        self.save(e)
+
     def base_merge_due(self, e: dict, head: str) -> bool:
         """Under the lock, from judge. True when HEAD, which no update of this queue's made, may be only a base merge on
         E's pin (land_base_merge_parent): the judgment goes ahead, and its worker reads first whether it is
         (base_merge_check), which repins or stops it. True as well when the cache's read of HEAD carried no parents (a
         probe, REST, an older query: head_parents): the worker reads them (parent ""). False: judge stops it
-        head_moved, as before."""
+        head_moved, as before (unless ancestry_wait holds it)."""
         pin = str(e.get("pinSha") or "")
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         if not self.base_merge_maybe(pin, head, data):
@@ -17475,9 +17679,17 @@ class LandQueue:
         base = str(data.get("baseRefName") or "")
         gh = self.gh()
         docs: list[dict] = []
+        with self.lock:
+            ancestor = self.head_ancestry(e, head, pin, data)
+            if (e.get("oldPinWait") or {}).get("head") == head:
+                ancestor = True  # a pin it followed away from (old_pin_wait's own case): an older commit, no read
+            kept = str(((e.get("headAncestry") or {}).get(f"{head}...{pin}") or {}).get("why") or "")
         why = "" if gh and base else "no gh-quota shim or base branch to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
-        if not why and not parent:
+        parents: Any = None
+        if kept:
+            why = kept  # read before, for this head and pin (ancestry_record): not read again
+        elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
             got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
             try:
@@ -17506,8 +17718,23 @@ class LandQueue:
             docs.append(doc)
         if not why:
             why = land_base_merge_why(pin, head, parent, base, docs[1], docs[0])
+        if isinstance(parents, list) and land_parents_have(pin, parents):
+            ancestor = False  # a commit made on the pin is not one of its ancestors: no compare
+        # Not only a base merge: before it stops head_moved, whether HEAD is an older commit of the pin, a stale copy
+        # of the PR (LAND_ANCESTRY_JQ's comment). One compare, recorded per head and pin.
+        older: Any = False
+        if why and not unread and ancestor is None and gh:
+            older = self.ancestry_read(e, head, pin)
         with self.lock:
             self.check(e)
+            if older is not False:
+                ancestor = self.ancestry_answer(e, head, pin, *older, kept=why)
+                if ancestor is None:
+                    return False  # the compare failed: E waits and the check runs again (base_merge_unread)
+            if ancestor and self.old_pin_wait(e, head):
+                # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
+                self.requeue(e)
+                return False
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
             e.pop("baseMergeUnread", None)
@@ -17624,10 +17851,15 @@ class LandQueue:
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and self.old_pin_wait(e, sha):
-            self.note_late(e, "waiting for a read newer than the pin it already followed away from")
+            self.note_late(e, "waiting for a read that shows the pin, not an older commit of it"
+                           if self.head_ancestry(e, sha, str(e.get("pinSha") or "")) is True
+                           else "waiting for a read newer than the pin it already followed away from")
             return False
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
                 and not self.base_merge_due(e, sha):
+            if self.ancestry_wait(e, sha, (self.cache_of(e["key"]) or {}).get("data") or {}):
+                self.note_late(e, "waiting for a read of whether its head is an older commit of the pin")
+                return False
             self.stop(e, "head_moved", land_moved_clause(sha, str(e.get("pinSha") or "")) + f" ({own})",
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
@@ -19829,6 +20061,24 @@ LAND_COMPARE_FILES_MAX = 300  # GitHub's compare lists at most this many files: 
 # (doubled each time: 30 s to 16 min, about half an hour in all). A failed read stopped the land at once before.
 LAND_BASE_MERGE_UNREAD_MAX = 6
 LAND_BASE_MERGE_UNREAD_WAIT = 30.0
+# A head_moved stop on a head that is an older commit of the pin (one of its ancestors) stops on a stale copy of the
+# PR, not on a moved head: a requester pins the head it just pushed, or that just got a base merge, and a branch goes
+# back to its own ancestor only by a force-push back, which is rare. The host that executes forwarded lands,
+# 2026-11-23 00:38-01:38Z: 26 head_moved stops in one hour; for 11 of them GitHub's compare of the pin with the head
+# the stop named said "behind", ahead 0, 1 to 233 commits back (cmux#50827 -81, #47369 -58, #48669 -2, #50734 -1,
+# #44463 -153, #50844 -138, #50889 -233; hq#16608 -120, hq#19217 -185; glaeda#2538 -8, glaeda#2561 -4), and each cost
+# its requester a re-land by hand. 7 of the 11 stopped in base_merge_check, the other 4 in stop_moved_pin, pin_wait or
+# judge. Before any of them stops a head the cache does not prove is no ancestor (head_ancestry), judge's worker reads
+# one compare of HEAD...PIN (base_merge_check; "ahead" with behind_by 0: HEAD is an ancestor of PIN), once per head and
+# pin; an ancestor waits as a pin already followed away from does (old_pin_wait, LAND_HEAD_TIMEOUT), then stops as
+# before; a read that fails is bounded like a base merge's (base_merge_unread), then stops as before.
+LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
+
+
+def land_parents_have(pin: str, parents: Any) -> bool:
+    """Whether PARENTS, a commit's parents as a read listed them, include the pinned PIN (a prefix pin matches)."""
+    return bool(pin) and isinstance(parents, list) and any(
+        SHA40.fullmatch(str(p or "").lower()) and not land_head_moved(pin, str(p).lower()) for p in parents)
 
 
 def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
@@ -21788,6 +22038,40 @@ def expected_missing(data: dict) -> list[str]:
     return [name for name in expected_contexts(pr_repo(data)) if name not in reported]
 
 
+# An expected context that nothing requires and nobody posts. EXPECTED_CONTEXTS exists because a green head is not
+# green until the status its merges wait on reports (leo-workspace#3538: ws-check went pending at push+26.5 min).
+# But that status has one publisher, a timer, and whenever that publisher falls behind it posts for no head at all --
+# a recurring state, not a transient one -- so "expected, not posted yet" held waits that could never end.
+# teamleaderleo/leo-workspace#8794 at 31a84d01, 2026-11-23: a `wait pr` spent 2401 s and ended `ended_by:
+# no-progress`, `progress_changes: 0`, on a PR that was MERGEABLE (CLEAN) with a SUCCESS rollup, 1 of 1 checks
+# passed, 0 required, and ws-check the only thing absent; its `next:` was the same wait again, with the same
+# `--timeout 2400 --max 9600`.
+# docs/handbook/done-wait-held-by-stragglers.md: a done wait ends once every check that decides has ended, and names
+# what it ended without. A context GitHub's base does not require decides nothing -- it cannot move mergeable, the
+# rollup or any required name -- so past EXPECTED_UNPOSTED_AFTER it no longer holds the wait. It is never read as a
+# pass: the verdict is EXIT_INCONCLUSIVE, the same value a straggler gets, because the absence of a verdict is its
+# own answer and must not be folded into pass or fail. A context the base requires (requiredNames, requiredMissing,
+# requiredUnread) holds the wait exactly as before, named at the same bound.
+EXPECTED_UNPOSTED_AFTER = 30 * 60  # past #3538's 26.5 min tail, and STRAGGLER_AFTER's bound for the same shape
+
+
+def expected_unposted(data: dict, now: float | None = None,
+                      bound: float = EXPECTED_UNPOSTED_AFTER) -> list[str]:
+    """The expected contexts of DATA's open head that nothing requires and that were still not posted BOUND seconds
+    after the head was pushed: the ones a wait ends without, in the order expected_contexts names them. Empty while
+    any of them may still arrive -- the head is younger than BOUND, or its push time cannot be placed (pushed_by),
+    when they hold the wait as they always did."""
+    now = time.time() if now is None else now
+    if data.get("state") != "OPEN":
+        return []
+    required = set(data.get("requiredNames") or []) | set(data.get("requiredMissing") or []) \
+        | set(data.get("requiredUnread") or [])
+    pushed = pushed_by(data)
+    if pushed is None or now - pushed < bound:
+        return []
+    return [name for name in expected_missing(data) if name not in required]
+
+
 def pushed_by(data: dict) -> float | None:
     """The latest the head can have been pushed: the PR's updatedAt (a push updates it) and the daemon's first
     sighting of the head, whichever is earlier; None when neither is known."""
@@ -22602,8 +22886,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         return EXIT_FAIL  # merge conflicts: the required checks will not run until the next push
     if bad:
         return EXIT_FAIL
-    if data.get("state") == "OPEN" and expected_missing(data):
-        return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if missing:
+        # a status every head of this repo gets has not been posted yet: unfinished, like a required one, until it is
+        # plainly not coming and nothing requires it (expected_unposted) -- then the wait ends without it, and says so
+        return None if set(missing) - set(expected_unposted(data, now)) else EXIT_INCONCLUSIVE
     return EXIT_OK
 
 
@@ -22992,7 +23279,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines[-1] += basis
             lines += churn_lines(entry.get("churn"), now)
         if data.get("state") == "OPEN" and expected_missing(data):
-            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
+            unposted = expected_unposted(data, now)
+            why = (f" (nothing requires them; not posted {int(EXPECTED_UNPOSTED_AFTER // 60)} min after the push, so a "
+                   "wait ends without them, and land-judge still counts them)" if unposted else "")
+            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}{why}")
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
@@ -23542,16 +23832,38 @@ def blocked_start_line(key: str, kind: str) -> str | None:
     return f"glaeda-gh: {key_name(key)} cannot be read right now: {blocked['text']}.{resumes}"
 
 
-def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
-    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line). When nothing
-    is being read for its kind (read_blocked) and the data is not fresh, the line names the bucket and the reset
-    as well: "no data yet" alone reads as "its CI has not started", which is the one thing it does not mean."""
+def pin_mismatch(pin: str | None, data: object) -> str | None:
+    """What a wait says when the caller pinned a full commit and that commit is not the head GitHub shows: both shas,
+    named, every time the state is said. None when there is no pin, the pin is not a full id, or it is the head.
+
+    A pin is an assertion about which commit the caller cares about. teamleaderleo/glaeda#2564 (3700 s, 2026-11-23)
+    was pinned to 41092a54, which was never the head in those 3700 s: every line it printed was about 4ce5d079 and
+    later ca129622, and it never said the head it reported was not the head it was asked about. A wait may legitimately
+    wait for a pinned push GitHub has not seen yet -- it may not do that silently, because the words it prints then
+    describe work the caller never asked about."""
+    if not isinstance(data, dict) or not pin or not re.fullmatch(r"[0-9a-f]{40}", str(pin)):
+        return None
+    head = str(data.get("headRefOid") or "")
+    if not head or head == str(pin):
+        return None
+    return (f"pinned --sha {str(pin)[:10]} is not the head GitHub shows ({head[:10]}), so this state is "
+            f"{head[:10]}'s, and this wait cannot end on {str(pin)[:10]} until that commit becomes the head")
+
+
+def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE,
+                   pin: str | None = None) -> str:
+    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line), and the pin it was
+    asked about whenever that is not the head this state is about (pin_mismatch). When nothing is being read for its
+    kind (read_blocked) and the data is not fresh, the line names the bucket and the reset as well: "no data yet" alone
+    reads as "its CI has not started", which is the one thing it does not mean."""
     lines = [line.strip() for line in summary(key, entry, until, grace, False).splitlines()]
     keep = lines[:2] if split_key(key)[0] == "pr" else lines[:1]
     state = "; ".join(line for line in keep if line and not line.startswith("http"))
     at = (entry or {}).get("dataAt")
     fresh = (entry or {}).get("data") and isinstance(at, (int, float)) and not isinstance(at, bool) \
         and time.time() - at < WAIT_PROGRESS_EVERY
+    mismatch = pin_mismatch(pin, (entry or {}).get("data"))
+    state = f"{state}; {mismatch}" if mismatch else state
     blocked = None if fresh else blocked_now(split_key(key)[0])
     return f"{state}; {blocked['text']}" if blocked is not None else state
 
@@ -23600,6 +23912,42 @@ def unseen_next(data: dict, key: str) -> str:
             else f"glaeda-gh status pr {key_name(key)} --verbose")
 
 
+def expected_unposted_next(key: str, data: dict) -> str:
+    """The step for a wait that ended without an expected context nothing requires: the land queue, pinned to the head
+    this wait read, which judges that head itself and holds the row until the context posts. Never another wait on a
+    state only that one publisher can change (docs/handbook/wait-that-cannot-end.md). Pinned because the step must act
+    on the head that was green and on no other; a head this tool cannot read as 40 hex is not pinned, and then the
+    step is to look."""
+    sha = str(data.get("headRefOid") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return f"glaeda-gh status pr {key_name(key)} --verbose"
+    return f"glaeda-gh land {key_name(key)} --match-head-commit {sha}"
+
+
+def timeout_next(req: dict, entry: dict | None, now: float | None = None) -> str:
+    """The `next:` of a wait that ended with nothing moving for its whole --timeout: a step that can change the state
+    it waited on. Never this same wait again -- that is the one step guaranteed not to help, and an agent takes it
+    (teamleaderleo/leo-workspace#8794, 2026-11-23: 2401 s, `progress_changes: 0`, `next:` itself with the same
+    `--timeout 2400 --max 9600`). A wait that was still moving at its --max keeps naming itself, on purpose: that
+    one can end. docs/handbook/wait-that-cannot-end.md."""
+    now = time.time() if now is None else now
+    kind = split_key(req["key"])[0]
+    key = req["key"]
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict) or kind != "pr":
+        return f"glaeda-gh status {kind} {key_name(key)}" + (" --jobs" if kind == "run" else "")
+    if expected_unposted(data, now):
+        return expected_unposted_next(key, data)
+    groups = classify(data, now, float(req.get("grace", RESCUE_GRACE)))
+    pending = groups["pending"]
+    if pending:
+        oldest = sorted(pending, key=lambda c: iso_epoch(c.get("startedAt")) or now)
+        return stuck_next(oldest[0], key)  # its own run: whether its job ever got a runner
+    if max(0, pending_on_every_page(data) - len(pending) - len(groups["held"])):
+        return unseen_next(data, key)  # the page past the rollup's first 100
+    return f"glaeda-gh status pr {key_name(key)} --verbose"
+
+
 def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RESCUE_GRACE,
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
@@ -23627,7 +23975,13 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     # it can see and the count it cannot are in the same breath. A read that did not happen is unknown
     # (docs/handbook/missing-read-counted-as-a-value.md): the wait names that part as unseen instead of absorbing it.
     unseen = max(0, pending_on_every_page(data) - len(pending) - len(groups["held"]))
-    if not pending and not unseen:
+    # The third absence, enumerated here with the other two instead of in a detector of its own: a context every head
+    # of this repo gets (expected_contexts) that was never posted holds the wait exactly as a pending check does, but
+    # it is in no group classify() returns, so this branch returned None and teamleaderleo/leo-workspace#8794 spent
+    # 2401 s with nothing said at all -- while a check merely *pending* beside finished siblings got a named warning
+    # and a run to look at. One kind of absence cannot get a name while the other gets silence.
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if not pending and not unseen and not missing:
         return None
 
     def since(c: dict) -> float | None:
@@ -23671,8 +24025,31 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    nxt = (stuck_next(decided[0], key) if decided
-           else stuck_next(oldest[0], key) if pending else unseen_next(data, key))
+    if missing:
+        unposted = expected_unposted(data, now)
+        pushed = pushed_by(data)
+        age = f" {span(now - pushed)} after the push" if pushed is not None else ""
+        verdictless = ("; nothing requires it, so this wait ends without it and says so" if unposted
+                       else "; it may still arrive, and until then it holds this wait as a required check would")
+        lines.append(f"  never posted: {', '.join(missing)}{age}; nothing has reported it on head "
+                     f"{str(data.get('headRefOid') or '')[:10]}, so it is in no pending check this wait can "
+                     f"name{verdictless}")
+    # A required check that has already failed outranks every absence below it (#2601): the decision is in, so the
+    # run to look at is the one that decided, not the oldest pending check nor a context nobody requires.
+    if decided:
+        nxt = stuck_next(decided[0], key)
+    elif pending:
+        nxt = stuck_next(oldest[0], key)
+    elif unseen:
+        nxt = unseen_next(data, key)
+    elif expected_unposted(data, now):
+        nxt = expected_unposted_next(key, data)
+    else:
+        # the bound after which this tool answers differently about the same state: a wait past it ends without the
+        # context instead of holding. Never this same wait (docs/handbook/wait-that-cannot-end.md)
+        pushed = pushed_by(data) or now
+        nxt = (f"glaeda-gh wait until {utc_clock(pushed + EXPECTED_UNPOSTED_AFTER)} && "
+               f"glaeda-gh status pr {key_name(key)} --verbose")
     lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
@@ -23685,7 +24062,8 @@ def progress_update(seen: dict, req: dict, entry: dict | None, now: float | None
     request, and its blocker drops a line it already printed the same way."""
     now = time.time() if now is None else now
     grace = float(req.get("grace", RESCUE_GRACE))
-    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace)
+    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace,
+                           str(req.get("sha") or "") if req.get("exact", True) else None)
     if state != seen.get("state"):
         seen.update(state=state, at=now, stuck=False)
         return state
@@ -23712,7 +24090,8 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            f"waited {waited} s for {name}, which is {data.get('state')}",
                            f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
-        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
+        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)),
+                               str(req.get("sha") or "") if req.get("exact", True) else None)
         deadline = utc_clock(wait_deadline(req))
         blocked = blocked_now(kind)
         now = time.time()
@@ -23725,9 +24104,10 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             return fail_fields("timeout", f"waited {waited} s for {name}, its ceiling (--max {wait_max(req):g}), while "
                                f"it was still changing ({last}); last seen: {state}",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        # nothing moved for the whole --timeout: the step is something that can move it, never this wait again
         return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
                            f"(deadline {deadline}; {last}); last seen: {state}",
-                           blocked_next(req, blocked) if blocked else wait_command(req))
+                           blocked_next(req, blocked) if blocked else timeout_next(req, entry, now))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
@@ -23737,6 +24117,17 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             blocked = blocked_now(kind)
             return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        unposted = expected_unposted(data, time.time())
+        if unposted:
+            pushed = pushed_by(data)
+            since = f" {span(time.time() - pushed)} after its push" if pushed is not None else ""
+            ended = len(classify(data, time.time(), float(req.get("grace", RESCUE_GRACE)))["passed"])
+            return fail_fields("expected-unposted",
+                               f"{name}: {', '.join(unposted)} is still not posted on head "
+                               f"{str(data.get('headRefOid') or '')[:10]}{since}, and nothing requires it: every "
+                               f"check that decides has ended ({ended} passed, 0 failed) and this wait ends without "
+                               f"it (not a pass; land-judge still counts it)",
+                               expected_unposted_next(key, data))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; land_judge counts them "
                            "running)")
@@ -24486,7 +24877,13 @@ def head_runs_unfinished(key: str, data: dict, now: float,
 
 
 def inconclusive_note(data: dict, now: float) -> str:
-    """What an inconclusive done wait says: how many checks are still queued with no runner, and any red already in."""
+    """What an inconclusive done wait says: the expected contexts nothing requires that were never posted, else how
+    many checks are still queued with no runner, and any red already in. Both are the same answer -- no verdict, not
+    a pass -- and each says which one it was, by name."""
+    unposted = expected_unposted(data, now)
+    if unposted:
+        return (f"not done: {', '.join(unposted)} was never posted on this head, nothing requires it, and the one "
+                f"publisher of it may post it later; every check that decides has ended (not a pass)")
     cut = straggler_cut(data, now)
     queued = len((cut or {}).get("stragglers") or [])
     failed = len(classify(data, now)["failed"])
@@ -24956,6 +25353,52 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                 entry[field] = prior[field]
         write_json(cache, entry)
     return entry
+
+
+# A `wait pr` on a PR this host's land queue already holds is a second watcher on a row the land daemon owns. The
+# daemon reads that PR, judges it on its own schedule and ends the row itself; the wait beside it reads nothing the
+# daemon does not already read, and it is not free. A parked row's PR gets one unwaited read per LAND_PEEK_EVERY
+# (600 s, keep_watching); a wait promotes the same key to waited, read every WAITED_FRESH (45 s, read_waited). So a
+# redundant watcher turns 6 reads an hour into 80 of the shared GraphQL pool -- the pool whose last 1000 points the
+# daemon keeps back precisely so lands stay readable. Measured on this host 2026-11-17..23: 414 of 842 `wait pr`
+# invocations (49%) overlapped an active land row for the same PR, 197 redundant watcher-hours. One of them polled
+# 1465 s and then ended "ended_by: blocked ... the shared GraphQL quota for this login is spent (911 of 5000 left,
+# under the 1000 this daemon keeps back for lands)" on a PR that had been `waiting ... wakes 02:47:21Z` the whole
+# time: the watcher and the thing it starved were the same system. The queue is local state, so this costs no read.
+def land_row_watched_here(key: str, sha: str | None = None) -> dict | None:
+    """The active row in this host's land queue for KEY, when one holds it, else None. Active means a state the land
+    daemon still works: a row already merged, stopped, cancelled or forwarded away (LAND_DONE) is nobody's watcher,
+    and a PR with no row here never was -- both wait exactly as they did before. With SHA, only a row whose head or
+    pin is that commit: a wait pinned to another commit asks a question this row's end does not answer, so it waits.
+    Reads land/entries only (land_entries): no GitHub call, nothing registered, no watcher started."""
+    want = (sha or "").lower()
+    for e in land_entries():
+        if e.get("key") != key or e.get("state") in LAND_DONE:
+            continue
+        if want and want not in {str(e.get(k) or "").lower() for k in ("head", "pinSha")}:
+            continue
+        return e
+    return None
+
+
+def land_row_wait_refusal(key: str, row: dict, timeout: float, as_json: bool) -> tuple[int, str, str]:
+    """What `wait pr` says instead of becoming the second watcher of ROW: (exit code, its --json object or "", its
+    stderr lines). The row's own words, as `land status` prints them (land_line), so the caller can match the two.
+    The `next:` is a wait that ends and changes the state it waits on: `land --wait` blocks on this row in the local
+    queue (exit 0 merged, 1 stopped, 2 still going) and, re-requesting the land, re-arms the row it blocks on --
+    it starts no GitHub watcher, so it is the wait this one was trying to be. Never "done": the caller still has no
+    verdict, and this says so."""
+    name = key_name(key)
+    reason = (f"{name} is already an active row in this host's land queue ({land_trim(land_line(row, time.time()), 240)}): "
+              f"the land daemon reads that PR, judges it on its own schedule and ends the row itself, and it tells "
+              f"the row's requester when it does. A second watcher here reads nothing the daemon does not already "
+              f"read and spends the shared GraphQL pool the land's own reserve keeps back for lands")
+    nxt = f"glaeda-gh land {name} --wait {max(1, int(timeout)):d}"
+    out = json.dumps({"ok": False, "code": "land_row_watching", "reason": reason, "next": nxt,
+                      "landRow": {"key": key, "state": row.get("state"), "head": row.get("head"),
+                                  "wakeAt": row.get("wakeAt"), "requester": row.get("requester")}}) + "\n" \
+        if as_json else ""
+    return 64, out, f"glaeda-gh: {reason}\nnext: {nxt}\n"
 
 
 def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int, str], str]:
@@ -33594,6 +34037,122 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
+# What agents type for a long flag, by the option of this tool it means. The `--until` precedent one level
+# down: every choice *argument* has taken a synonym or a typo of one of its choices since glaeda#2368 --
+# `wait --help` says it in so many words, "A synonym or a typo of one (checks-done, passed, merge) runs as
+# it, said on stderr" -- while a flag *name* one word off was argparse's bare "unrecognized arguments" and
+# nothing ran. Measured 2026-11-22 (bg-965d52bc2c83): `glaeda-gh wait pr teamleaderleo/... --until green
+# --deadline 20m` printed "unrecognized arguments: --deadline 20m" and exited 64, so the lane believed it
+# was watching its PR and was not -- a background wait that exits at once looks exactly like a wait that
+# waited, and the whole watch was lost for a lane round trip.
+#
+# A word here is used only where its option is one the command *typed* actually has, so `--ceiling` is
+# `wait --max` and no part of `status`. Nothing here is matched by prefix or by typo: these are the near
+# misses no edit distance reaches (`deadline` is seven edits from `timeout`), and a short one matched
+# loosely would pull an unrelated flag in. Spellings this tool already reads are no part of it: `--time_out`
+# and `--timeOut` are `flag_spelling_synonym`'s, and `--time` is argparse's own abbreviation.
+FLAG_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "--timeout": ("--deadline", "--time-limit", "--within", "--expires", "--expiry", "--stale-after",
+                  "--no-change-for", "--no-progress-for", "--idle-for", "--quiet-for", "--patience"),
+    "--max": ("--ceiling", "--hard-timeout", "--hard-limit", "--max-wait", "--max-total", "--at-most",
+              "--wall-clock", "--overall"),
+}
+
+
+def near_miss_option(name: str, options: dict[str, bool]) -> tuple[str, list[str]]:
+    """(the one option NAME means, []) or ("", the options it is as near to) or ("", []) for neither.
+
+    Two kinds of near miss, and each is read on its own evidence. A *synonym* must match a word of
+    `FLAG_SYNONYMS` exactly once normalised, because another word for the same thing is a deliberate
+    spelling, not an accident, and there is nothing in its letters to measure. A *typo* is measured against
+    the command's own option names only -- one edit, two in a name of six letters or more, the allowance
+    `close_choice` already uses for a choice's value -- so the table cannot widen the typo radius.
+
+    A name that is the start of one or more of this command's options is left alone whatever it is near:
+    argparse's `allow_abbrev` owns that word, taking `--contain` as `--contains` and refusing an ambiguous
+    one by name, and reading it here would take a decision off argparse and could differ from it."""
+    key = normalized_flag(name)
+    if not key:
+        return "", []
+    real = {normalized_flag(option): option for option in options}
+    if any(spelling.startswith(key) for spelling in real):
+        return "", []  # argparse's abbreviation, or its refusal of an ambiguous one: not this reader's word
+    synonyms: dict[str, list[str]] = {}
+    for option, words in FLAG_SYNONYMS.items():
+        if option not in options:
+            continue  # this command has no such option: the word means nothing here
+        for word in words:
+            synonyms.setdefault(normalized_flag(word), []).append(option)
+    named = sorted(set(synonyms.get(key, [])))
+    if named:
+        return (named[0], []) if len(named) == 1 else ("", named)
+    allowed = 1 if len(key) <= 5 else 2
+    best: dict[str, int] = {}
+    for spelling, option in real.items():
+        distance = typo_distance(key, spelling)
+        if distance <= allowed:
+            best[option] = distance
+    if not best:
+        return "", []
+    least = min(best.values())
+    near = sorted(option for option in best if best[option] == least)
+    return (near[0], []) if len(near) == 1 else ("", near)
+
+
+def flag_near_miss_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A long flag that near-misses one of this command's own options runs as it: (argv, refusal lines).
+
+    Runs after `flag_spelling_synonym`, so every flag this tool already recognises is in its canonical
+    spelling by now and only a flag argparse would have refused outright is read here. Three things are
+    deliberately *not* rewritten, because each is already answered better elsewhere: a flag that is a real
+    option of another command of this tool (`wait ... --notify` is `land`'s, and `flag_elsewhere` says so
+    and offers the call without it -- which command the caller meant is theirs to say); an abbreviation
+    (argparse's); and a flag near two options at once, refused here naming both and the call for each, as
+    `flag_spelling_synonym` refuses a spelling two options answer to. A flag that is near nothing at all
+    falls through to argparse, whose own line names it and the next step. Nothing past a bare `--` is a
+    flag of this tool's."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    options = flag_options(raw)
+    typed = typed_command(raw)
+    fixed: list[str] = list(raw)
+    said: list[str] = []
+    i = 0
+    while i < len(fixed):
+        word = fixed[i]
+        if word == "--":
+            break
+        if not word.startswith("--"):
+            i += 1
+            continue
+        name, joined, value = word.partition("=")
+        if name in options:
+            # Canonical already; a flag that takes its value in the next word consumes it, so a body or a
+            # regular expression spelled like a flag is never read as one.
+            i += 2 if options[name] and not joined else 1
+            continue
+        if [command for command in flag_commands(name) if command != typed]:
+            i += 1  # a real option of a sibling command: flag_elsewhere names where it lives
+            continue
+        meant, near = near_miss_option(name, options)
+        if near:
+            return raw, [
+                f"glaeda-gh: `{name}` is no option of `{typed}` and is as near to "
+                + " as to ".join(f"`{option}`" for option in near)
+                + ": it is not guessed",
+                *(f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [option + joined + value] + fixed[i + 1:])}"
+                  for option in near)]
+        if meant:
+            fixed[i] = meant + joined + value
+            said.append(f"`{name}` is `{meant}`")
+            i += 2 if options[meant] and not joined else 1
+            continue
+        i += 1  # no option of this command is anywhere near it: argparse refuses it, naming it and a next step
+    if said:
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
+
 # A wait flag given with no value. `--wait` reads as a switch ("wait for it"), and this tool's own
 # `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
 # --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
@@ -33737,7 +34296,7 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, bare_wait_synonym):
+    for rewriter in (doubled_kind_synonym, flag_spelling_synonym, flag_near_miss_synonym, bare_wait_synonym):
         # The nesting and the command's own spelling ran at the top (a word a command owns is that command's,
         # and which options a command has depends on which command it is); the flags come after them.
         # `doubled_kind_synonym` first here: it only looks at a call that already leads with a real command,
@@ -33879,6 +34438,20 @@ def main(argv: list[str] | None = None) -> int:
                                     args.max)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
+        if args.kind == "pr":
+            # Before any waiting line, any interest registered and any watcher: a new `wait pr` only. A wait already
+            # running (resume_wait, poll_wait) never comes back through here, so a row queued mid-wait never cuts one
+            # off -- the wait it is already in goes on to its own verdict.
+            pr_key = parse_key("pr", args.target)
+            row = land_row_watched_here(pr_key, args.sha)
+            if row is not None:
+                code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
+                say_waiting(lines.rstrip("\n"))
+                if out:
+                    with contextlib.suppress(OSError, ValueError):
+                        sys.stdout.write(out)
+                        sys.stdout.flush()
+                return code
         until, chosen = (wait_until_chosen("pr", parse_key("pr", args.target), None)
                          if args.kind == "pr" and args.until is None else (args.until or "green", None))
         if chosen:
