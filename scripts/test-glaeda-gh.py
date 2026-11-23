@@ -33203,7 +33203,7 @@ class LandForwardTest(Base):
         self.forwarded_to_executor()
         x = self.executor_queue()
         self.exec_tick(x)
-        with x.lock:
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
             x.stop(x.entries[self.KEY], "checks_red", "ci failed at LA", "fix ci")
         told = len(self.w.sent())
         e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
