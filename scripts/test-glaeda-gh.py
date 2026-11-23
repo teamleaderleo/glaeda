@@ -27434,6 +27434,71 @@ class LandTest(Base):
         self.assertEqual((took[-1]["code"], took[-1]["head"], took[-1]["override"]),
                          ("ci_never_ran", LB[:12], self.OVERRIDE["reason"]))
 
+    def stuck_then_override(self, legacy: bool = False) -> dict:
+        """An entry stopped checks_stuck at LA on a ws-check that never posts, then re-requested with an override.
+        LEGACY: the stop as an entry stopped before stuckVerdict was kept holds it (its history's stopped line)."""
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        self.assertIn("ws-check (pending", e["stop"]["reason"])
+        self.assertEqual(e["stuckVerdict"]["checks"], ["ws-check"])
+        self.assertEqual(self.merge_envs(), [])  # no override: never merged past the stuck check
+        if legacy:
+            e.pop("stuckVerdict")
+            self.q.save(e)
+        self.w.answers.clear()
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.w.answers.append(wait())
+        return self.tick()
+
+    def test_land_override_carries_a_checks_stuck_verdict_already_reached_at_the_same_head(self):
+        """lw#8104 (3289e083) and lw#8246 (2bceb3eb), cmux-cp-1 2026-11-23 ~03:30Z: stopped checks_stuck on a ws-check
+        that never posted, re-requested with an override, and left waiting on the same pending check up to another
+        4 h. The override covers the check the queue already judged stuck: one judgment, then the pinned merge."""
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                e = self.stuck_then_override(legacy)
+                self.assert_merged_at(LA)
+                [env] = self.merge_envs()
+                self.assertEqual((env.get("LAND_JUDGE_OVERRIDE"), env.get("LAND_JUDGE_OVERRIDE_RECEIPT")),
+                                 (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["override"]),
+                                 ("ws_check_missing", "checks_stuck", self.OVERRIDE["reason"]))
+                judged = [h for h in e["history"] if h["event"] == "judged"]
+                self.assertEqual(judged[-1].get("why"), "stuck_carry")
+
+    def test_land_override_never_skips_a_check_merely_running_or_one_that_started_since_the_verdict(self):
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800})  # noqa: E731
+        # 1. never judged stuck: an override waits on a running check as before
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+        # 2. judged stuck on ws-check, but a new check started since at that head: that is progress, not the stuck one
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA, checks=[("ws-check", "PENDING", None)])
+        self.land()
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual(e["stop"]["code"], "checks_stuck")
+        self.pr(LA, checks=[("ws-check", "PENDING", None), ("rerun", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+        # 3. a new head: the verdict was about the old one
+        self.pr(LB, checks=[("ws-check", "PENDING", None)])
+        e = self.run_hour(lambda: refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "timeout_s": 1800}),
+                          seconds=gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+
     def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
         never = "git commit --allow-empty -m x && git push"
         for override, answer, stopped in (

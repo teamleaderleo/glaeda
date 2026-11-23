@@ -13173,8 +13173,8 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
-                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", ""})
-LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke"})
+                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", ""})
+LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
 # (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
@@ -15150,6 +15150,8 @@ class LandQueue:
             e.pop("laneHost", None)
         if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
             e["override"] = land_request_override(req)
+            # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
+            e["overrideAt"] = self.now if e["override"] else None
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -16907,6 +16909,13 @@ class LandQueue:
                 return
         running = land_checks_running(data, head)
         kind = w.get("kind")
+        if running and kind not in ("head_change", "repin") and self.stuck_carry_due(e, head, data):
+            # an override given after this head's checks_stuck verdict: judged now, not after another wait on the same
+            # pending check (land_override_carries); take() merges it if the judgment is still only that wait
+            if self.judge(e, head, fp, why="stuck_carry"):
+                e["stuckCarryJudged"] = f"{e.get('requestId') or ''}|{head}"
+                self.history(e, "stuck_carry", head=head[:12])
+            return
         if e["state"] == "queued":
             if running:
                 self.wait_running(e, head, fp)
@@ -17353,6 +17362,14 @@ class LandQueue:
             if at >= since and pattern.search(str(cm.get("body") or "")):
                 return True
         return False
+
+    def stuck_carry_due(self, e: dict, head: str, data: dict) -> bool:
+        """Whether E at HEAD, its checks still running, is owed one judgment now because its override carries an
+        earlier checks_stuck verdict (land_override_carries). Once per request and head (stuckCarryJudged, marked when
+        the judgment starts): a judgment that does not merge it waits as before."""
+        if land_override_carry_verdict(e, head, data) is None:
+            return False
+        return e.get("stuckCarryJudged") != f"{e.get('requestId') or ''}|{head}"
 
     def wait_running(self, e: dict, head: str, fp: str) -> None:
         """Checks still run at the head: land_judge is not asked until they finish (the cache says when)."""
@@ -18413,6 +18430,9 @@ class LandQueue:
         if idle < LAND_WAIT_STUCK:
             return False
         left = land_unfinished(data, self.now) if fp else ""
+        # Kept past the stop, a requeue and a rearm (keyed by head): an override given after it answers it at once
+        # (land_override_carries)
+        e["stuckVerdict"] = {"head": head, "at": self.now, "checks": land_unfinished_names(data, head), "code": code}
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
                   f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
                   f"{land_reason(reason, 200)}", land_trim(nxt))
@@ -18486,6 +18506,18 @@ class LandQueue:
                           land_trim(answer.get("next")))
             return
         if kind == "stop" and act.get("stop") == "own_red" and self.rerun_unrelated(e, act, answer, head):
+            return
+        carried = land_override_carries(e, act, head, (self.cache_of(e["key"]) or {}).get("data") or {})
+        if carried is not None:
+            # land_override_carries' comment: a wait on a check this head was already judged stuck on, and an override
+            # given since: the pinned merge carrying it, at once
+            with self.lock:
+                self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
+                             carried="checks_stuck", stuckAt=round(float(carried.get("at") or 0), 3),
+                             **land_override_history(e))
+            log({"event": "land-override-carried", "key": e["key"], "head": head[:12],
+                 "code": str(answer.get("code") or kind), "override": (e.get("override") or {}).get("reason")})
+            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
@@ -19939,6 +19971,66 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
     if act.get("kind") == "command":
         return True
     return act.get("kind") == "stop" and str(act.get("stop") or "") not in set(LAND_STOP_CLASSES.values())
+
+
+# An override given after the queue already judged a check stuck covers that check at once. The queue stops an entry
+# checks_stuck once nothing at its head moved in LAND_WAIT_STUCK of waits; a re-request with --override-reason (the
+# rulebook's [never-without-ci]: "a stuck check or his say-so: merge pinned with LAND_JUDGE_OVERRIDE") started the
+# wait over, because an override answered only a stop or a command step, never a wait. 2026-11-23 ~03:30Z on
+# cmux-cp-1: lw#8104 (3289e083) and lw#8246 (2bceb3eb), stopped checks_stuck on a ws-check that never posted
+# (4.0 h and 4.2 h), were re-requested with an override and sat waiting on the same pending ws-check, up to another
+# 4 h. Now, at the same head, a request carrying an override given at or after that verdict, judged to a wait on the
+# checks (wait_pr, wait_run) whose unfinished checks are all ones the verdict named, is the pinned merge carrying the
+# override (override_merge, carried=checks_stuck, logged with its reason; land_judge logs it again). A check merely
+# running, never judged stuck at that head, still waits; a new head, a check that started since, a hold, a BLOCK or
+# any other stop is judged as before.
+def land_unfinished_names(data: dict, head: str) -> list[str]:
+    """The names (not workflows: land_wait_shape's comment) of the checks DATA shows unfinished at HEAD, sorted."""
+    if not head or str(data.get("headRefOid") or "").lower() != head:
+        return []
+    return sorted({str(c.get("name") or "") for c in data.get("checks") or []
+                   if str(c.get("status") or "").upper() not in ("COMPLETED", "") and c.get("name")})
+
+
+def land_stuck_verdict(e: dict, head: str) -> dict | None:
+    """E's checks_stuck verdict at HEAD ({"head", "at", "checks": names or None}), or None. An entry stopped before
+    stuckVerdict was kept has only its stop or its history's "stopped" line, whose reason names the head and the
+    checks still unfinished ("no check at <head12> moved ... still unfinished: NAME (status), ...")."""
+    v = e.get("stuckVerdict")
+    if isinstance(v, dict) and v.get("head") == head:
+        return v
+    said = f"no check at {head[:12]} moved"
+    lines = [e.get("stop") or {}, e.get("lastStop") or {}]
+    lines += [h for h in reversed(e.get("history") or []) if h.get("event") == "stopped"]
+    for h in lines:
+        if isinstance(h, dict) and h.get("code") == "checks_stuck" and said in str(h.get("reason") or ""):
+            return {"head": head, "at": float(h.get("at") or 0), "checks": None, "reason": str(h.get("reason") or "")}
+    return None
+
+
+def land_override_carry_verdict(e: dict, head: str, data: dict) -> dict | None:
+    """The checks_stuck verdict at HEAD E's override carries (the comment above), or None: E has an override given at
+    or after that verdict, and every check DATA shows unfinished at HEAD (at least one) is one it named."""
+    if not land_override_env(e) or not SHA40.fullmatch(head or ""):
+        return None
+    v = land_stuck_verdict(e, head)
+    if v is None or float(e.get("overrideAt") or 0) < float(v.get("at") or 0):
+        return None
+    pending = land_unfinished_names(data, head)
+    if not pending:
+        return None
+    named = v.get("checks")
+    if isinstance(named, list):
+        return v if set(pending) <= set(named) else None
+    said = str(v.get("reason") or "").split("still unfinished:", 1)[-1]
+    return v if all(f"{n} (" in said for n in pending) else None
+
+
+def land_override_carries(e: dict, act: dict, head: str, data: dict) -> dict | None:
+    """The verdict E's override carries when ACT, judged at HEAD, is a wait on the checks (the comment above)."""
+    if act.get("kind") not in LAND_WAIT_KINDS:
+        return None
+    return land_override_carry_verdict(e, head, data)
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
