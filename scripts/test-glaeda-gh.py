@@ -16132,6 +16132,159 @@ class PostTest(unittest.TestCase):
         self.addCleanup(env.stop)
         return root / "calls"
 
+    # -- creates on the App of their purpose (APP_CREATE_ROLE): issues on the issues App, PRs on the lander App while
+    # the login's create pause holds; never manaflow-ai/cmux's PRs; GLAEDA_APP_CREATES=0 turns it off.
+
+    APP_TOKEN = "ghs_" + "q" * 40
+
+    def app_writer(self, role: str | None) -> list:
+        """gh_app_token.py broker-actor, faked: ROLE's App answers with a token (None: no App here). Returns its argvs."""
+        asked: list = []
+        tool = Path(self.tmp.name) / "gh_app_token.py"
+        tool.write_text("")
+        state = Path(self.tmp.name) / "latch"
+        state.mkdir(exist_ok=True)
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "broker-actor" not in argv:
+                return real(argv, timeout, **kw)
+            asked.append(list(argv[argv.index("broker-actor"):]))
+            if role is None:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"role": role, "token": self.APP_TOKEN,
+                                                                    "note": "" if role == "issues" else "Authorship: lander"}), "")
+        for patch in (mock.patch.object(gg, "app_pool_tool", return_value=tool),
+                      mock.patch.object(gg, "run_bounded", side_effect=run),
+                      mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(state)})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return asked
+
+    def authed(self, transport: Scripted) -> tuple[Any, list]:
+        """TRANSPORT, recording each request's Authorization header."""
+        seen: list = []
+        def send(method, url, headers, body):
+            seen.append(headers.get("Authorization"))
+            return transport(method, url, headers, body)
+        return send, seen
+
+    def no_env_token(self) -> None:
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("GH_TOKEN", None)
+        os.environ.pop("GITHUB_TOKEN", None)
+        os.environ.pop(gg.APP_CREATES_ENV, None)
+
+    def test_a_new_issue_is_queued_and_made_on_the_issues_app(self) -> None:
+        self.no_env_token()
+        asked = self.app_writer("issues")
+        item = self.queue("issue", "o/r", "--title", "a bug", "--body", "what broke", "--label", "bug")
+        d, t = self.daemon((201, {}, {"number": 9, "html_url": "https://github.com/o/r/issues/9"}))
+        d.transport, seen = self.authed(t)
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("POST", "/repos/o/r/issues", {"title": "a bug", "body": "what broke",
+                                                                   "labels": ["bug"]})])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
+        self.assertEqual(asked, [["broker-actor", "issue", "o/r"]])
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/issues/9"))
+        self.assertEqual(d.rest_spent(), 0)
+
+    def test_post_issue_queues_only_where_the_daemon_makes_it(self) -> None:
+        self.no_env_token()
+        with mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(gg, "daemon_running", return_value=True):
+            self.assertTrue(gg.post_issue_queued())
+            with mock.patch.dict(os.environ, {gg.APP_CREATES_ENV: "0"}):
+                self.assertFalse(gg.post_issue_queued())  # the off switch: one `gh issue create` as before
+        with mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "daemon_running", return_value=True):
+            self.assertFalse(gg.post_issue_queued())  # a lane VM's gh reaches the broker, which makes it
+        with mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(gg, "daemon_running", return_value=False):
+            self.assertFalse(gg.post_issue_queued())  # no daemon: not left waiting on one
+
+    def test_an_issue_the_issues_app_refuses_is_made_on_the_login(self) -> None:
+        self.no_env_token()
+        self.app_writer("issues")
+        item = self.queue("issue", "o/r", "--title", "t", "--body", "b")
+        d, t = self.daemon((403, {}, {"message": "Resource not accessible by integration"}),
+                           (201, {}, {"number": 3, "html_url": "https://github.com/o/r/issues/3"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(gg.read_json(gg.outbox_dir() / (item["id"] + ".json")).get("appRefused"), "issues")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues", "/repos/o/r/issues"])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN, "Bearer " + TOKEN])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_an_apps_throttle_is_its_own_cooldown_never_the_logins_pause(self) -> None:
+        self.no_env_token()
+        self.app_writer("issues")
+        calls = self.pause_cmd(0, level=0)
+        item = self.queue("issue", "o/r", "--title", "t", "--body", "b")
+        d, t = self.daemon((403, {"retry-after": "600"}, {"message": "You have exceeded a secondary rate limit"}),
+                           (201, {}, {"number": 3, "html_url": "https://github.com/o/r/issues/3"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        d.content_pause_settle(10)
+        self.assertEqual(d.app_create_hold["issues"], NOW + 600)
+        self.assertLessEqual(d.post_hold, NOW)  # the login's hold is not set
+        self.assertEqual(d.pause_until, 0.0)  # nor is its pause
+        self.assertNotIn("--hold", calls.read_text() if calls.exists() else "")  # nor reported
+        self.step(d, NOW + gg.POST_SPACING)  # the App rests: the login, which is free, makes it
+        self.assertEqual(len(t.calls), 2)
+        self.assertNotIn(self.APP_TOKEN, seen[1])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_a_pr_goes_on_the_lander_app_while_the_logins_create_pause_holds(self) -> None:
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        comment = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "progress")
+        pr = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/x", "--base", "main", "--title", "t",
+                        "--body", "b")
+        d, t = self.daemon((201, {}, {"number": 8, "html_url": "https://github.com/teamleaderleo/glaeda/pull/8"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[:2] for c in t.calls], [("POST", "/repos/teamleaderleo/glaeda/pulls")])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
+        self.assertEqual(asked, [["broker-actor", "create", "teamleaderleo/glaeda"]])
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+        self.assertEqual(gg.post_state(comment["id"])["state"], "queued")  # the login's comment waits the pause out
+
+    def test_a_cmux_pr_never_leaves_the_login_in_a_pause(self) -> None:
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.queue("pr", "manaflow-ai/cmux", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "b")
+        d, t = self.daemon()
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual((t.calls, asked), ([], []))
+        self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
+
+    def test_app_creates_off_keeps_prs_and_issues_on_the_login(self) -> None:
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        with mock.patch.dict(os.environ, {gg.APP_CREATES_ENV: "0"}):
+            pr = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/x", "--base", "main", "--title", "t",
+                            "--body", "b")
+            self.assertIs(pr["appCreates"], False)
+            d, t = self.daemon()
+            d.clock_real = False
+            self.step(d, NOW)
+        self.assertEqual((t.calls, asked), ([], []))  # it waits the login's pause out, as before
+        self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
+
     def test_the_logins_create_pause_holds_queued_writes_in_order(self) -> None:
         first = self.queue("comment", "o/r#1", "--body", "one")
         second = self.queue("comment", "o/r#2", "--body", "two")
@@ -16728,7 +16881,7 @@ class PostTest(unittest.TestCase):
     def test_a_bad_entry_fails_alone(self) -> None:
         broken = self.queue("comment", "o/r#7", "--body", "x")
         doc = gg.read_json(gg.outbox_dir() / f"{broken['id']}.json")
-        doc["kind"] = "issue"
+        doc["kind"] = "gist"
         gg.write_json(gg.outbox_dir() / f"{broken['id']}.json", doc)
         good = self.queue("comment", "o/r#8", "--body", "y")
         d, t = self.daemon((201, {}, {"html_url": "u"}))

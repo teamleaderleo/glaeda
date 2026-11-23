@@ -3528,6 +3528,27 @@ def app_pool_tool() -> Path | None:
     return None
 
 
+# Creates on the App of their purpose (ci-217x-dictator's design, 2026-11-23; Leo: "use more of the apps then. go make
+# more"). A new issue goes on the issues App, and a new PR in a repo gh-app-roles.json's bot_authored_write_repos opts
+# in goes on the lander App while the login's create pause holds, so neither waits on one login's pause. Each kind has
+# exactly one App, the one whose purpose it is (machines/github-apps.md "Why per purpose": never N copies of one App,
+# never "the App with the most budget left"). manaflow-ai/cmux's CLA counts a PR's opener as a signer, so no create
+# there leaves the login. A refused or throttled App create goes on the login; the App's throttle is the App's own
+# cooldown (app_create_hold), never reported as the login's pause. GLAEDA_APP_CREATES=0 (in the daemon's environment,
+# or the caller's when it queues) turns this off: an issue is made in one `gh` call again and a PR waits out the
+# login's pause as before.
+APP_CREATES_ENV = "GLAEDA_APP_CREATES"
+APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
+APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
+APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
+
+
+def app_creates_on(env: Any = None) -> bool:
+    """Whether creates may go on the App of their purpose here (APP_CREATES_ENV, on unless it is "0")."""
+    return str((os.environ if env is None else env).get(APP_CREATES_ENV, "1")).strip() != "0"
+
+
 def app_pool_pushed_path(role: str, owner: str) -> Path:
     """The key home's pushed token filename for ROLE and OWNER."""
     owner = owner.lower()
@@ -5888,6 +5909,8 @@ class Daemon:
         # GitHub's secondary limit holds the outbox until then
         self.post_hold = saved_hold(held.get("holdUntil"), time.time())
         self.post_backoff = POST_BACKOFF  # the next hold without a Retry-After
+        self.app_create_hold: dict[str, float] = {}  # role -> until: that App's own create cooldown (app_create_refused)
+        self.app_actors: dict[tuple[str, str], tuple[float, dict | None]] = {}  # (op, repo) -> (asked, actor)
         self.pause_until = 0.0  # the login's create pause (content_pause_until), as last read
         self.pause_next = float("-inf")  # when it may next be asked
         self.pause_ask: threading.Thread | None = None  # the ask in flight (content_pause_until)
@@ -7364,43 +7387,95 @@ class Daemon:
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
 
+    def login_create_paused(self) -> bool:
+        """Whether the login's creates are held: its create pause (content_pause_until, or not known), or this
+        daemon's own hold after the login's create was throttled (post_hold)."""
+        return self.now < self.post_hold or self.now < self.content_pause_until() or self.content_pause_unknown()
+
+    def app_create_due(self, item: dict) -> bool:
+        """Whether ITEM is a create that may go on the App of its purpose now (APP_CREATE_ROLE), the login aside:
+        on (app_creates_on, and the item was not queued with it off), never in APP_CREATE_NEVER, not refused by
+        that App already, and that App not in its own cooldown (app_create_hold)."""
+        op = APP_CREATE_OP.get(str(item.get("kind")))
+        if not op or not app_creates_on() or item.get("appCreates") is False:
+            return False
+        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+            return False
+        return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
+
     def outbox_actor(self, item: dict) -> dict | None:
         """Pick the installed writer on the same host as the login. No token goes in the outbox."""
-        op = {"pr": "create", "comment": "comment"}.get(item.get("kind"))
+        op = {"pr": "create", "comment": "comment", "issue": "issue"}.get(item.get("kind"))
         if (not op or self.upstream() is not None or item.get("status") or item.get("delivered") or item.get("reviewers") or
                 os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
             return None
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        role = "lander" if op == "create" else "review"
+        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+            return None
+        role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
         if saved is None and (item.get("uncertain") or item.get("attempts")):
             return None  # the first send was already attempted by the login
         if saved not in (None, role):
             return None
+        if saved is None and op in APP_CREATE_ROLE and item.get("appRefused"):
+            return None  # that App refused it: the login makes it
         state = latch_state_dir()
         def held(identity):
             doc = read_json(state / ("rest-exhausted" + identity + ".json")) or {}
             until = doc.get("until") if isinstance(doc, dict) else None
             return doc if isinstance(until, (int, float)) and until > self.clock() and not doc.get("share") and \
                 doc.get("counter") in (None, "core") else {}
-        if not saved and held("").get("source") not in ("x-ratelimit-reset", "said"):
+        # A new issue goes on the issues App whenever creates on Apps are on; a new PR when the login's REST quota is
+        # spent, or (on) while the login's create pause holds. Anything else keeps the login.
+        by_purpose = self.app_create_due(item) and (op == "issue" or self.login_create_paused())
+        if not saved and not by_purpose and held("").get("source") not in ("x-ratelimit-reset", "said"):
             return None
-        if held("@app-" + role):
+        if held("@app-" + role) or self.app_create_hold.get(role, 0.0) > self.clock():
             return None
         tool = app_pool_tool()
         if not tool:
             return None
+        key = (op, str(item["repo"]).lower())
+        cached = self.app_actors.get(key)
+        if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
+            return cached[1]
+        actor = None
         try:
             result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
-            actor = json.loads(result.stdout) if not result.returncode else None
-            if isinstance(actor, dict) and actor.get("role") == role and isinstance(actor.get("note"), str) and \
-                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(actor.get("token", ""))):
-                return actor
+            found = json.loads(result.stdout) if not result.returncode else None
+            if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
+                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
+                actor = found
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
-        return None
+        self.app_actors[key] = (self.clock(), actor)
+        return actor
+
+    def app_create_refused(self, path: Path, item: dict, role: str, status: int, h: dict, text: str) -> None:
+        """An App create GitHub refused before making anything (its rate limit, its credential, a permission or an
+        install it lacks): the item goes on the login on its next turn. A throttle rests that App alone
+        (app_create_hold, its own cooldown): the login's pause is neither set nor reported for it."""
+        throttled = status == 429 or (status == 403 and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0"
+                                                         or THROTTLED.search(text)))
+        if throttled:
+            try:
+                wait = (retry_after_seconds(h["retry-after"]) or 0.0) if h.get("retry-after") else (
+                    float(h.get("x-ratelimit-reset", 0)) - self.now if h.get("x-ratelimit-remaining") == "0" else 0.0)
+            except ValueError:
+                wait = 0.0
+            wait = POST_BACKOFF if math.isnan(wait) or wait <= 0 else min(wait, PACE_HOLD_MAX)
+            self.app_create_hold[role] = max(self.app_create_hold.get(role, 0.0), self.clock() + wait)
+        else:
+            item["appRefused"] = role
+        item.pop("appWriter", None)  # nothing was made: the login may make it
+        self.app_actors.clear()
+        write_json(path, item)
+        log({"event": "post-app-refused", "id": item["id"], "role": role, "status": status,
+             "throttled": bool(throttled), **({"wait": round(self.app_create_hold[role] - self.clock())}
+                                              if throttled else {})})
 
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
@@ -7410,8 +7485,9 @@ class Daemon:
         self.adopt_pace_hold()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
-        if self.now < max(self.post_hold, self.post_at + POST_SPACING):
+        if self.now < self.post_at + POST_SPACING:
             return
+        paused = None  # the login's create pause, asked once and only when a write is due (login_create_paused)
         for path, item in self.retire_superseded(outbox_queue()):
             if not isinstance(item, dict) or item.get("id") != path.stem:
                 with contextlib.suppress(OSError):
@@ -7422,9 +7498,15 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
-            if self.now < self.content_pause_until() or self.content_pause_unknown():
-                return  # shared content/secondary cooldown also holds an App-authored write
-            actor = self.outbox_actor(item)
+            paused = self.login_create_paused() if paused is None else paused
+            if paused:
+                # The login's create pause holds the login's writes and the review App's comments. A create goes on the
+                # App of its purpose meanwhile (app_create_due), so it never waits on the login's pause.
+                actor = self.outbox_actor(item) if self.app_create_due(item) else None
+                if not actor:
+                    continue  # the login's write waits out its pause; a create behind it may still go on its App
+            else:
+                actor = self.outbox_actor(item)
             if item.get("appWriter") and not actor and not item.get("delivered"):
                 continue  # never replay an App-authored POST with the login
             broker = not actor and lane_vm_poster()  # the broker paces its own writes: this host's REST backoff is moot
@@ -7725,6 +7807,9 @@ class Daemon:
             if item["kind"] == "comment":
                 self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
+        elif actor and item["kind"] in APP_CREATE_OP and (status in (401, 403, 404, 429) or (
+                status == 422 and THROTTLED.search(text))):
+            self.app_create_refused(path, item, actor["role"], status, h, text)
         elif actor and status in (403, 429) and h.get("x-ratelimit-remaining") == "0" and not h.get("retry-after") and not THROTTLED.search(text):
             reset = str(h.get("x-ratelimit-reset", ""))
             item["notBefore"] = max(self.now + POST_SPACING, min(self.now + PACE_HOLD_MAX, int(reset)) if reset.isdigit() else 0)
@@ -7899,6 +7984,9 @@ class Daemon:
             api = f"/repos/{repo}/pulls?state=open&head={urllib.parse.quote(head)}&base={urllib.parse.quote(item['base'])}"
         elif item["kind"] == "comment":
             api = f"/repos/{repo}/issues/{item['number']}/comments?per_page=100&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        elif item["kind"] == "issue":
+            api = (f"/repos/{repo}/issues?state=all&sort=created&direction=asc&per_page=100"
+                   f"&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         else:
             api = f"/repos/{repo}/pulls/{item['number']}/reviews?per_page=100"
         try:
@@ -7911,6 +7999,9 @@ class Daemon:
         if status != 200 or not isinstance(doc, list):
             return None, False
         for found in reversed(doc):
+            if item["kind"] == "issue" and isinstance(found, dict) and (
+                    found.get("pull_request") or found.get("title") != item["title"]):
+                continue
             if isinstance(found, dict) and (item["kind"] == "pr" or (found.get("body") or "") == item["body"]):
                 if found.get("html_url"):
                     return found, True
@@ -9228,6 +9319,9 @@ class Daemon:
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None,
                              "pause": self.content_pause_status()}}
+        app_holds = {r: round(t, 3) for r, t in self.app_create_hold.items() if t > self.now}
+        if app_holds:  # an App resting from creates: its own cooldown, never the login's holdUntil or pause
+            status["outbox"]["appHolds"] = app_holds
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
         if self.read_pool is not None:  # never a token: how many keys it read, and why the last repo got none
@@ -32609,6 +32703,9 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     if item["kind"] == "pr":
         return "POST", f"/repos/{repo}/pulls", {"title": item["title"], "head": item["head"], "base": item["base"],
                                                 "body": item["body"], "draft": False}
+    if item["kind"] == "issue":
+        return "POST", f"/repos/{repo}/issues", {"title": item["title"], "body": item["body"],
+                                                 **({"labels": item["labels"]} if item.get("labels") else {})}
     raise WatchError(f"unknown write kind {item['kind']!r}")
 
 
@@ -32635,6 +32732,15 @@ def post_item(args: argparse.Namespace) -> dict:
         if not args.head or not args.base or not args.title:
             raise WatchError("post pr needs --head, --base and --title")
         item.update(repo=args.target, head=args.head, base=args.base, title=args.title, reviewers=args.reviewer or [])
+    elif args.kind == "issue":
+        # queued only where the daemon makes it (post_issue_queued): on the issues App, the login if that refuses
+        if not re.fullmatch(rf"{NAME}/{NAME}", args.target or ""):
+            raise WatchError(f"post issue takes OWNER/REPO (with --title T and --body-file F), not {args.target!r}")
+        if not args.title:
+            raise WatchError("post issue needs --title (and --body-file F, or --body)")
+        if args.head or args.base or args.reviewer:
+            raise WatchError("--head, --base and --reviewer are for post pr")
+        item.update(repo=args.target, title=args.title, labels=post_one_call_labels(args))
     else:
         # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
         # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
@@ -32670,8 +32776,18 @@ def post_item(args: argparse.Namespace) -> dict:
         item.update(repo=f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", number=int(number))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
+    if not app_creates_on():
+        item["appCreates"] = False  # queued with GLAEDA_APP_CREATES=0: the daemon keeps it on the login
     item["id"] = f"{time.time_ns() // 1_000_000:013d}-{os.getpid()}-{os.urandom(3).hex()}"
     return item
+
+
+def post_issue_queued() -> bool:
+    """Whether `post issue` queues (and the daemon makes it on the issues App, APP_CREATE_ROLE) rather than run one
+    `gh issue create`: creates on Apps on (app_creates_on), this host's own login behind the daemon (no upstream, not
+    a lane VM, whose `gh` reaches the broker that makes it), and the daemon running, so the issue is not left waiting
+    on a daemon that is down."""
+    return app_creates_on() and upstream_command() is None and not lane_vm_poster() and daemon_running(DOWN_GRACE)
 
 
 def post_state(post_id: str) -> dict | None:
@@ -35630,6 +35746,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
+            elif one == "issue" and post_issue_queued():
+                args.kind = "issue"  # queued like a PR: the daemon makes it on the issues App (APP_CREATE_ROLE)
             elif one:
                 return cmd_post_one_call(one, args)
             return cmd_post(args)
