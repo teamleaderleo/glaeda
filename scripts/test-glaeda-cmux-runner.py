@@ -7928,6 +7928,46 @@ def fake_clt(base: Path, sdk: str = "27.0") -> Path:
     return path
 
 
+class LedgerSelfHealTest(unittest.TestCase):
+    """The runner may repair only a foreign regular ledger file in its own directory."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="ledger-self-heal-"))
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+        self.capacity = self.root / "capacity"
+        self.capacity.mkdir()
+        self.target = self.capacity / "host.lock"
+        self.target.write_bytes(b"old ledger\n")
+        self.target.chmod(0o640)
+        self.fleet = hook.FLEET_DIR
+        hook.FLEET_DIR = os.fspath(self.root)
+        self.addCleanup(setattr, hook, "FLEET_DIR", self.fleet)
+
+    def test_swap_keeps_mode_group_and_old_inode_aside(self) -> None:
+        real_lstat = os.lstat
+        original = real_lstat(self.target)
+        foreign = mock.Mock(st_mode=stat.S_IFREG | 0o640, st_uid=4242, st_gid=original.st_gid)
+        with mock.patch.object(hook, "_ledger_path", return_value=(self.target, self.capacity)), \
+                mock.patch.object(hook, "_ledger_other_tool", return_value=None), \
+                mock.patch.object(hook.os, "lstat", side_effect=[foreign, real_lstat(self.target)]):
+            self.assertTrue(hook.heal_ledger_file(self.target, PermissionError(errno.EACCES, "denied")))
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o640)
+        self.assertEqual(self.target.read_bytes(), b"old ledger\n")
+        aside = list(self.capacity.glob("host.lock.uid4242-owned.*"))
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_bytes(), b"old ledger\n")
+        self.assertFalse(hook.heal_ledger_file(self.target, PermissionError(errno.EACCES, "denied")),
+                         "a second runner sees the runner-owned replacement")
+
+    def test_symlinks_and_other_account_tools_are_never_healed(self) -> None:
+        link = self.capacity / "link.lock"
+        link.symlink_to(self.target)
+        self.assertFalse(hook.heal_ledger_file(link, PermissionError(errno.EACCES, "denied")))
+        with mock.patch.object(hook, "_ledger_other_tool", return_value="another account's fleet tool is running"):
+            self.assertFalse(hook.heal_ledger_file(self.target, PermissionError(errno.EACCES, "denied")))
+        self.assertEqual(link.readlink(), self.target)
+
+
 class MirrorBorrowTest(unittest.TestCase):
     """A cmux runner checkout borrows the mini's git mirror at job-completed and drops its local copies; at
     job-started a borrower whose mirror is gone or was rebuilt loses its .git, so checkout clones it whole."""
