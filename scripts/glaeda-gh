@@ -12820,11 +12820,11 @@ def land_command_host(command: list[str]) -> int | None:
         if word == "--":
             return i + 1 if i + 1 < len(command) else None
         if word.startswith("-") and len(word) > 1:
-            # -o VALUE, or -oVALUE / a cluster of flags with no value
-            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
-                i += 2
-            else:
-                i += 1
+            # -o VALUE, -oVALUE, a cluster of flags with no value, or one ending in a value flag (-4o VALUE): as
+            # getopt reads it, the first value flag takes the rest of its word, else the next word
+            flag = None if word.startswith("--") else next(
+                (j for j, ch in enumerate(word[1:], 1) if ch in SSH_VALUE_FLAGS), None)
+            i += 2 if flag == len(word) - 1 else 1
             continue
         return i
     return None
@@ -14334,7 +14334,9 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # for good. A team scheduler's pinned land on a platform PR, 2026-11-23: handed to the executor, no outcome for 260
 # min, until its lane re-queued it by hand. Past this long since the row was first forwarded (the third re-send's
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
-# what to do, and its requester is told as any stop tells it.
+# what to do, and its requester is told as any stop tells it. Before it stops, the PR's state is read once
+# (forward_give_up_job): on 2026-11-23 a lane VM got 10 forward_no_outcome blockers for PRs that had merged the day
+# before, its cache holding no read of them. MERGED ends the row merged with no notice, CLOSED stops it closed.
 LAND_FORWARD_GIVE_UP = 7200.0
 
 
@@ -16064,6 +16066,17 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
+    def forward_host(self, e: dict) -> str:
+        """The host E was handed to, as said in messages: its forwardedTo, else its hand-off's or re-send's host, when
+        that is a host name. A row forwarded before land_command_host skipped ssh's options holds "-o" there, and the
+        give-up notice for it named "-o's land queue" (a peer host, 2026-11-23): a word that is no host name is
+        never said as one."""
+        for word in (e.get("forwardedTo"), (e.get("handedOff") or {}).get("host"),
+                     (e.get("forwardResent") or {}).get("to")):
+            if isinstance(word, str) and not word.startswith("-") and LAND_HOST_SHAPE.fullmatch(word):
+                return word
+        return "the host it was handed to"
+
     def forward_follow(self, e: dict, executor: bool) -> None:
         """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
         does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
@@ -16073,7 +16086,7 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "").upper()
-        host = str(e.get("forwardedTo") or "the host it was handed to")
+        host = self.forward_host(e)
         at = c.get("dataAt")
         read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
         if state == "MERGED":
@@ -16095,6 +16108,11 @@ class LandQueue:
             e["forwardFirst"] = first
             self.save(e)
         if self.now - first > LAND_FORWARD_GIVE_UP:
+            if not e.get("forwardGiveUpRead") and self.gh() is not None:
+                # the cache's copy is missing or may be hours old: one read of its state first (LAND_FORWARD_GIVE_UP)
+                if e["key"] not in self.jobs:
+                    self.submit(e["key"], self.forward_give_up_job, e["key"], executor, int(e.get("gen") or 0))
+                return
             self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
             return
         if state != "OPEN":
@@ -16127,11 +16145,51 @@ class LandQueue:
         log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
         self.hand_off_now(e, head, why, "forward_resent")
 
-    def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool) -> None:
+    def forward_give_up_job(self, key: str, executor: bool, gen: int = 0) -> None:
+        """On a worker, from forward_follow at LAND_FORWARD_GIVE_UP: one read of the PR's state (read_state) before
+        the row is given up. MERGED ends it merged, quietly (the merge is long past and nothing waits on it), CLOSED
+        stops it closed, and only one still open, or unreadable, stops forward_no_outcome. A `land cancel` or a newer
+        `land` meanwhile wins (check)."""
+        was, self.local.gen = getattr(self.local, "gen", None), gen
+        try:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            state, merge_sha, why = self.read_state(e)
+            with self.lock:
+                self.check(e)
+                if e["state"] != LAND_FORWARDED:
+                    return
+                e["forwardGiveUpRead"] = {"at": self.now, "state": state or "unreadable"}
+                self.history(e, "state_read", state=state or "unreadable", before="forward_no_outcome",
+                             **({"why": land_trim(why, 200)} if why else {}))
+                host = self.forward_host(e)
+                if state == "MERGED":
+                    self.merged(e, merge_sha or e.get("mergeSha") or "",
+                                f"forwarded to {host}: a state read at the give-up shows it", wake=False)
+                    return
+                if state == "CLOSED":
+                    self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (a state read shows "
+                              f"it closed); nothing is merged", "")
+                    return
+                first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
+                self.forward_give_up(e, state, host, first, int((e.get("forwardResent") or {}).get("n") or 0),
+                                     executor, unread=why if not state else "")
+        except LandCancelled:
+            pass
+        finally:
+            self.local.gen = was
+
+    def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool,
+                        unread: str = "") -> None:
         """Under the lock. A forwarded E with no outcome LAND_FORWARD_GIVE_UP after it was first forwarded stops
-        forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on."""
+        forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on.
+        UNREAD: why the one state read at the give-up (forward_give_up_job) failed."""
         if state:
             cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
+        elif unread:
+            cause = (f"this host's cache holds no read of the PR and its state could not be read "
+                     f"({land_trim(unread, 120)}), so it cannot tell whether it ended")
         else:
             cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
         if resends:
@@ -20003,13 +20061,14 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str) -> None:
+    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True) -> None:
+        """E ends merged at MERGE_SHA, its requester told (WAKE False: a quiet log line, notify's)."""
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
         self.history(e, "merged", sha=merge_sha, how=how)
         self.save(e)
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
-                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""))
+                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake)
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -20098,7 +20157,7 @@ class LandQueue:
         repeat = land_stop_repeats(e.get("lastStop"), st)
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
-                     "holdWindow", "forwardFirst"):
+                     "holdWindow", "forwardFirst", "forwardGiveUpRead"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)

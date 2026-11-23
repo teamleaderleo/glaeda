@@ -28708,15 +28708,58 @@ class LandTest(Base):
         self.assertEqual(said[3], "host/lane")
 
     def test_a_forwarded_land_the_cache_never_read_stops_at_the_give_up_instead_of_staying_forwarded(self):
-        # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on
+        # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on; its
+        # one state read at the give-up fails too
         self.forwarded_row()
         self.w.cache.pop(self.KEY, None)
+        self.w.view_err = "HTTP 502"
         self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
+        self.assertIn("HTTP 502", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)  # read once, never again per look
+
+    def test_a_forwarded_land_that_merged_unseen_ends_merged_quietly_at_the_give_up(self):
+        # 2026-11-23: a lane VM got 10 forward_no_outcome blockers for PRs merged the day before, its cache holding
+        # no read of them. The one state read at the give-up shows it merged: it ends merged, no notice sent.
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_state = "MERGED"
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
+        self.assertEqual(self.w.gh_calls("pr", "view"), [])  # inside the bound: no read
+        before = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), before)
+        self.assertFalse(any("forward_no_outcome" in c[-1] for c in self.w.sent()))
+        self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)
+
+    def test_a_forwarded_land_that_closed_unseen_stops_closed_at_the_give_up(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_state = "CLOSED"
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertIn("closed unmerged while handed to huge-blue", e["stop"]["reason"])
+
+    def test_a_forwarded_row_naming_an_ssh_option_as_its_host_never_says_it(self):
+        # a row forwarded before the executor name skipped ssh's options held forwardedTo "-o": its give-up notice
+        # named "-o's land queue"
+        self.forwarded_row()
+        self.q.entries[self.KEY]["forwardedTo"] = "-o"
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_err = "HTTP 502"
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
+        self.assertEqual(e["stop"]["code"], "forward_no_outcome")
+        self.assertNotIn("-o", e["stop"]["reason"])
+        self.assertIn("handed to huge-blue's land queue", e["stop"]["reason"])
+        self.assertEqual(self.q.forward_host({"forwardedTo": "-o"}), "the host it was handed to")
+        self.assertFalse(self.q.forward_host({"forwardedTo": "-o", "forwardResent": {"to": "-p"}}).startswith("-"))
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
@@ -33410,6 +33453,11 @@ class LandForwardTest(Base):
         self.assertEqual(gg.land_forward_name(["ssh", "-T", "-oBatchMode=yes", "h2", "x"]), "h2")
         self.assertEqual(gg.land_forward_name(list(self.EXEC)), "big-exec")
         self.assertEqual(gg.land_forward_name(["/opt/bin/serve-land", "--x"]), "/opt/bin/serve-land --x")
+        # a cluster ending in a value flag takes the next word as its value, as ssh's getopt does
+        self.assertEqual(gg.land_forward_name(["ssh", "-4o", "BatchMode=yes", "h3", "x"]), "h3")
+        self.assertEqual(gg.land_forward_name(["ssh", "-Tp22", "h4", "x"]), "h4")
+        for argv in (ssh, ["ssh", "-4o", "BatchMode=yes", "h3"], ["ssh", "-i", "k", "-o", "A=b", "-l", "u", "h5"]):
+            self.assertFalse(gg.land_forward_name(argv).startswith("-"), argv)
         with mock.patch.object(gg, "policy_host", return_value="me"):
             self.assertEqual(gg.land_redirected(ssh, "other-exec"),
                              ["ssh", "-o", "BatchMode=yes", "other-exec", ".local/bin/glaeda-gh", "land", "serve"])
