@@ -13901,6 +13901,7 @@ LAND_HANDOFF_DEADLINE = 60.0
 # requester as a merge here does, CLOSED stops it, a moved pin stops it head_moved, and one still OPEN this long past
 # its last hand-off is handed off again, once per LAND_FORWARD_RESEND (the far host applies a repeated request once).
 LAND_FORWARD_RESEND = 1800.0
+LAND_FORWARD_RESEND_DOUBLINGS = 4  # the wait before a row's next re-send doubles this many times, then holds
 LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files, not one per daemon tick
 
 
@@ -15579,9 +15580,11 @@ class LandQueue:
         if state != "OPEN" or self.stop_moved_pin(e, c, data):
             return
         since = self.forwarded_since(e)
-        if self.now - since <= LAND_FORWARD_RESEND:
-            return
         last = e.get("forwardResent") or {}
+        # each re-send waits twice as long as the one before (30, 60, 120 min, to 8 h): a far host still waiting on
+        # the PR's own checks is not asked again every bound, by every row it holds
+        if self.now - since <= LAND_FORWARD_RESEND * 2 ** min(int(last.get("n") or 0), LAND_FORWARD_RESEND_DOUBLINGS):
+            return
         n = int(last.get("n") or 0) + 1
         why = (f"still open {self.now - since:.0f} s after it was handed to {host}, with no outcome there: "
                f"handed off again (LAND_FORWARD_RESEND)")

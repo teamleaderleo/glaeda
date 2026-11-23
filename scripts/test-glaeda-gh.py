@@ -27858,9 +27858,9 @@ class LandTest(Base):
         self.assertGreater(e["handedOff"]["at"], first)
         [row] = [h for h in e["history"] if h.get("event") == "forward_resent"]
         self.assertIn("handed off again", row["why"])
-        for _ in range(int(gg.LAND_FORWARD_RESEND // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+        for _ in range(int(2 * gg.LAND_FORWARD_RESEND // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
             self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
-        self.assertEqual(len(self.handoffs()), 2)  # once per bound, however often the rows are looked at
+        self.assertEqual(len(self.handoffs()), 2)  # the second waits twice the bound, however often rows are looked at
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
