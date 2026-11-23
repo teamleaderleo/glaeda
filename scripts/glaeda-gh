@@ -22752,8 +22752,22 @@ def refresh_log_tail(n: int = REFRESH_LOG_SHOWN) -> list[str]:
     return lines[-n:] if n > 0 else []
 
 
+# Where log() writes. stdout is the daemon's log (serve sets this); every other process -- a CLI call, the gh
+# shim -- owns its stdout as its answer. Measured 2026-11-23 with no gh login: `budget --json` printed a
+# "login-fallback" event line in front of its document, so stdout was no longer one JSON document, and the same
+# line would land in the output of any `gh` the shim served. The module default stays stdout for the suite's
+# in-process daemon; the program's entry point turns it off and serve() back on.
+LOG_STDOUT = True
+
+
 def log(event: dict) -> None:
-    print(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event}), flush=True)
+    line = json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event})
+    if LOG_STDOUT:
+        print(line, flush=True)
+        return
+    if sys.stderr is not None:  # closed fd 2: print(file=None) would write to stdout, the thing kept clean here
+        with contextlib.suppress(OSError, ValueError):
+            print(line, file=sys.stderr, flush=True)
 
 
 def clear_failing() -> None:
@@ -23030,6 +23044,8 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 def serve(foreground_ok: bool = False) -> int:
+    global LOG_STDOUT
+    LOG_STDOUT = True  # the daemon's stdout is its log
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
@@ -36103,6 +36119,7 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         return raw, []
     values = bare_wait_defaults(raw)
     hungry = value_hungry_flags(raw)
+    full = len(positional_words(raw)) >= positional_capacity(parser_nodes(raw)[-1])
     fixed: list[str] = []
     said: list[str] = []
     i = 0
@@ -36113,7 +36130,13 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             break
         value = values.get(word)
         nxt = raw[i + 1] if i + 1 < len(raw) else None
-        has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
+        # A number argparse will refuse (-5, nan, inf) or a word the command has no positional slot left for
+        # (`wait file X --timeout soon`) is the caller's value for this flag, typed wrong: `seconds` refuses it
+        # by name ("is not a number of seconds"). Read as a bare flag it became `--timeout 3600 soon` and
+        # argparse's "unrecognized arguments: soon", which names no flag and no reason.
+        has_value = nxt is not None and (bare_wait_count(nxt) and not nxt.startswith("-")
+                                         or bare_wait_number_typed(nxt)
+                                         or (full and not nxt.startswith("-")))
         if value is None or has_value or (fixed and fixed[-1] in hungry):
             fixed.append(word)
             i += 1
@@ -36125,6 +36148,15 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     if said:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
+
+
+def bare_wait_number_typed(word: str) -> bool:
+    """Whether WORD was typed as a number, however `seconds` judges it: -5, nan, inf, 1e9."""
+    try:
+        float(word)
+    except ValueError:
+        return False
+    return True
 
 
 def bare_wait_count(word: str) -> bool:
@@ -36476,4 +36508,5 @@ def exec_from_bytecode() -> None:
 if __name__ == "__main__":
     exec_from_bytecode()
     INTENT_ON = True  # the program, not a test that imports it: a refused call is the intent layer's to read first
+    LOG_STDOUT = False  # stdout is this call's answer; serve() takes it back for the daemon's log
     raise SystemExit(main())

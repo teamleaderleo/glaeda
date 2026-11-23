@@ -5642,8 +5642,11 @@ class ClientTest(Base):
         code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.3)
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         lines = text.strip().splitlines()
-        self.assertEqual(lines[-1], "next: glaeda-gh wait pr o/r#1 --timeout 0.3")
-        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1 \(deadline \d\d:\d\d:\d\dZ\); last seen: ")
+        # Never this same wait again (timeout_next, leo-workspace#8794): the pending check has no run to open, so
+        # the step is the PR's own verbose status.
+        self.assertEqual(lines[-1], "next: glaeda-gh status pr o/r#1 --verbose")
+        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1: no change for 0.3 s \(deadline "
+                                    r"\d\d:\d\d:\d\dZ; no change since the wait began\); last seen: ")
         self.assertIn("checks PENDING", lines[-2])
 
     def test_a_wait_says_how_it_stands_while_it_blocks(self) -> None:
@@ -5653,7 +5656,8 @@ class ClientTest(Base):
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         progress = [line for line in text.splitlines() if line.startswith("glaeda-gh: still waiting on pr:o/r#1: ")]
         self.assertTrue(progress, text)
-        self.assertRegex(progress[0], r"\d+s of 0.5s, deadline \d\d:\d\d:\d\dZ; o/r#1 OPEN .*; checks PENDING")
+        self.assertRegex(progress[0], r"no change for \d+s of 0.5s, deadline \d\d:\d\d:\d\dZ \(moves while it "
+                                      r"progresses; ceiling \d\d:\d\d:\d\dZ\); o/r#1 OPEN .*; checks PENDING")
 
     def test_a_daemon_ruled_wait_keeps_the_state_its_blocker_prints(self) -> None:
         running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
@@ -36726,7 +36730,10 @@ class QueuedNeverDoneTest(unittest.TestCase):
         whole, _ = self.head(13438, ["size"], ["tests"], 60)
         gg.write_json(gg.cache_dir() / gg.file_name(key),
                       {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": whole, "error": None})
-        self.assertEqual(gg.wait_step(req, self.now, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
+        # The whole read is a change, and --timeout is "no change for S": this step moves the deadline on and
+        # keeps waiting; once the read has stood still for the whole --timeout, it times out.
+        self.assertIsNone(gg.wait_step(req, self.now, lambda repo, paths: {}))
+        self.assertEqual(gg.wait_step(req, self.now + 61, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
 
     def test_hq13397_runs_queued_with_no_check_runs_hold_the_wait(self) -> None:
         """claude-sr2-coord-old: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success twice
