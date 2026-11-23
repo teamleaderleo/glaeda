@@ -665,6 +665,7 @@ HOOK_STEP = "Set up runner"
 # a refusal fails at job start, after up to 240 s waiting for the gui token (cmux owned_pool_rescue's window)
 REFUSAL_SECONDS = 360
 RESCUE_GRACE = 360  # how long a refused attempt stays pending while a rescue re-run may follow
+UNSEEN_SHA_GRACE = 300  # how long a --sha in no checkout here, which GitHub does not show as the head, may still be a push GitHub has not seen
 GLAEDA_RUNNER = re.compile(r"(?:^|-)glaeda(?:-|$)")
 COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 s cycle are missed
 COMMENT_BODY_MAX = 4000
@@ -25980,9 +25981,26 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
                                  f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
                                  "GitHub has not seen yet")
+            if exact and not final:
+                # A full id may be a push GitHub has not seen -- but only one that exists. One that is in no
+                # checkout here either is a typo, another repo's commit (land-pin-sha-from-wrong-repo) or a
+                # fabrication: nothing will ever make it the head, so it is refused at UNSEEN_SHA_GRACE instead
+                # of waiting out the whole timeout to print the same two shas in a note.
+                if req.get("unseenSince") is None:
+                    req["unseenSince"] = now
+                    req["shaHere"] = git_rev_parse(sha) is not None
+                unseen = now - float(req["unseenSince"])
+                if not req.get("shaHere") and unseen >= UNSEEN_SHA_GRACE:
+                    raise WatchError(f"--sha {sha[:12]} is a commit in no checkout here, and GitHub has shown head "
+                                     f"{head[:12]} for {int(unseen)}s: nothing will make it the head, so this wait "
+                                     f"can only time out. Wait for {head[:12]}, or pass the id of a commit you "
+                                     "really pushed (git rev-parse HEAD, in the checkout you pushed from)")
         elif head and not exact:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True
+        elif head:
+            req.pop("unseenSince", None)  # the head caught up: a later push counts as pending again
+            req.pop("shaHere", None)
     settle = float(req.get("settle", SETTLE_GRACE))
     if usable and kind == "pr" and until == "done" and data.get("state") == "OPEN":
         try:

@@ -1049,6 +1049,56 @@ class PinnedHeadStatedTest(Base):
         self.assertIn(self.HEAD[:10], first or "")
 
 
+class UnseenPinnedShaTest(Base):
+    """big-red/efficiency-standing-lane, 2026-11-23: a wait on teamleaderleo/leo-workspace#9346 was armed with a full
+    id padded out of a short one -- a commit that exists in no checkout and that GitHub never showed -- and it was
+    accepted, to wait out all 3600 s and then print a note naming the head it had seen the whole time. A full id may
+    be a push GitHub has not seen (resolve_sha), but one that is in no checkout here either is a typo or another
+    repo's commit (land --match-head-commit from the wrong worktree), and such a wait can only time out."""
+
+    PIN = "a" * 40
+    HEAD = "b" * 40
+    KEY = "pr:o/r#9346"
+
+    def request(self) -> dict:
+        req = gg.wait_request("pr", "o/r#9346", "green", 3600.0, False, False, self.PIN, True, gg.RESCUE_GRACE,
+                              settle=0)
+        req["began"] = NOW - 5
+        return req
+
+    def cache(self, head: str) -> None:
+        node = pr_node(9346, rollup="PENDING", checks=[check_run("ws-check", "IN_PROGRESS", None)])
+        node.update(url="https://github.com/o/r/pull/9346", headRefOid=head)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "fetchedAt": NOW, "dataAt": NOW, "data": gg.parse_pr(node), "error": None})
+
+    def test_a_pin_in_no_checkout_that_is_never_the_head_is_refused_at_the_grace(self) -> None:
+        req = self.cache(self.HEAD) or self.request()
+        with mock.patch.object(gg, "git_rev_parse", return_value=None):
+            self.assertIsNone(gg.wait_step(req, NOW), "inside the grace it is still an unseen push")
+            with self.assertRaises(gg.WatchError) as caught:
+                gg.wait_step(req, NOW + gg.UNSEEN_SHA_GRACE + 1)
+        said = str(caught.exception)
+        self.assertIn(self.HEAD[:12], said, "it names the head GitHub does show")
+        self.assertIn(self.PIN[:12], said)
+
+    def test_a_pin_this_checkout_holds_keeps_waiting_for_the_push(self) -> None:
+        req = self.cache(self.HEAD) or self.request()
+        with mock.patch.object(gg, "git_rev_parse", return_value=self.PIN):
+            self.assertIsNone(gg.wait_step(req, NOW))
+            self.assertIsNone(gg.wait_step(req, NOW + gg.UNSEEN_SHA_GRACE * 10),
+                              "a commit that exists here may still be pushed")
+
+    def test_the_clock_starts_over_once_the_head_catches_up(self) -> None:
+        req = self.cache(self.HEAD) or self.request()
+        with mock.patch.object(gg, "git_rev_parse", return_value=None):
+            self.assertIsNone(gg.wait_step(req, NOW))
+            self.assertEqual(req["unseenSince"], NOW)
+            self.cache(self.PIN)
+            gg.wait_step(req, NOW + 1)
+            self.assertIsNone(req.get("unseenSince"), "the pin became the head: nothing left to refuse")
+
+
 class StatusStateTest(unittest.TestCase):
     """cmuxterm-hq#8968 review (2026-11-10): a head's data folded a status `error` into `failure`, the same answer a
     real red gives, so a reader could not tell a poster that gave no verdict (compile-status with the results service
