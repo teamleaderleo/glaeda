@@ -973,6 +973,15 @@ waited 60 s or more (2026-11-16 to 11-19), 3 passed, and 141 timeouts had spent 
 their caps waiting. cmux's owned-pool rescue re-runs a refusal; it never re-runs a PR job
 GitHub timed out.
 
+An ordinary home-repo isolated job whose need fills the mini (its units, with the idle
+reserve it must leave, are every unit there) waits at most `ISOLATED_CAPACITY_WAIT_S`
+(600 s) for the mini to empty, then is refused so cmux's owned-pool rescue places it again
+(ISOLATED_WAIT). A mini running PR work never empties: on 2026-11-22 generated-files waited
+4160 s on a 7-unit mini ("N of 7 units free ... needs 7") until its run was cancelled, and 9
+of 11 such jobs in 15:40-18:40Z were cancelled waiting. A smaller isolated job keeps its
+unbounded wait. `GLAEDA_RUNNER_ISOLATED_WAIT_S` on a runner sets the bound; `off` or `0`
+lifts it.
+
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
 in the job's own event payload (`GITHUB_EVENT_PATH`, no API call). They go ahead of DEV
