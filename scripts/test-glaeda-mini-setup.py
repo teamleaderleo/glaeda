@@ -292,6 +292,13 @@ class MiniSetupTest(unittest.TestCase):
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
                              "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch", "worktree-reclaim") else None)
+        # the declared-cache evictor ships as a dry run: its plist never carries the deletion flag
+        registry = plistlib.loads(
+            (self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-registry-evict.plist").read_bytes())
+        self.assertEqual(registry["ProgramArguments"][1:],
+                         [os.fspath(bin_dir / "glaeda-disk-registry"), "evict", "--json", "--apply"])
+        self.assertNotIn("GLAEDA_DISK_REGISTRY", registry.get("EnvironmentVariables", {}))
+        self.assertEqual((bin_dir / "glaeda-disk-registry").read_bytes(), (ROOT / "scripts/glaeda-disk-registry").read_bytes())
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
         repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
         self.assertEqual(repair["ProgramArguments"], ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])

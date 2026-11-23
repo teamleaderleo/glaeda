@@ -37,6 +37,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
+    ~/.local/bin/glaeda-disk-registry          from scripts/glaeda-disk-registry (LRU eviction to config/disk-registry.toml's
+                                               budgets; a dry run without GLAEDA_DISK_REGISTRY=1)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
                                                /Users/Shared/cmux-build-fleet/git/cmux.git; a no-op without a runner)
@@ -1012,6 +1014,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
+        # The declared caches (config/disk-registry.toml, scripts/glaeda-disk-registry): every hour, holds each
+        # regenerating cache to its budget, least recently used unit first, at most 8 units a pass. Without
+        # GLAEDA_DISK_REGISTRY=1 in its environment, which this plist does not set, it logs its plan and deletes
+        # nothing (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2; the per-host rollout sets the flag).
+        LABEL_PREFIX + "disk-registry-evict": {
+            "Label": LABEL_PREFIX + "disk-registry-evict",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-disk-registry"), "evict", "--json", "--apply"],
+            "StartInterval": 3600,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk-registry.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk-registry.err"),
+        },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
         # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3
         # under a /bin/sh parent, so it may reach the seed source on the LAN (apple_python, LAN_PARENT).
@@ -1146,7 +1162,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
 # "It's just, like, random garbage that was accumulated").
 RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
     "idle-warm", "idle-fuzz", "mini-health", "git-mirror", "seed-prefetch", "lan-fetch", "fleet-cas-prune",
-    "wallpaper"))
+    "wallpaper", "disk-registry-evict"))
 
 
 def has_glaeda_runner(ctx: Context) -> bool:
@@ -1539,7 +1555,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
         "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
         "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal")
+        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry")
     for name in tools:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
@@ -1769,7 +1785,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
