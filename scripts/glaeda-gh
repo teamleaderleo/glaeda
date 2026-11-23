@@ -7407,7 +7407,8 @@ class Daemon:
             actor = self.outbox_actor(item)
             if item.get("appWriter") and not actor and not item.get("delivered"):
                 continue  # never replay an App-authored POST with the login
-            if not actor and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
+            broker = not actor and lane_vm_poster()  # the broker paces its own writes: this host's REST backoff is moot
+            if not actor and not broker and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
                 continue
             self.writing = True
             try:
@@ -7657,6 +7658,8 @@ class Daemon:
         if item.get("delivered"):
             self.post_delivered(path, item)
             return
+        if not actor and lane_vm_poster():
+            return self.post_through_broker(path, item)
         if item.get("uncertain"):
             # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
             # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
@@ -7722,6 +7725,39 @@ class Daemon:
                              error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
+
+    def post_through_broker(self, path: Path, item: dict) -> None:
+        """A lane VM's queued write, made with the lane-gh broker's own tool (broker_write), the route this host's
+        `gh` takes: the daemon here has no login, and its `gh auth token` post held every write queued for good
+        (lane_vm_poster). A limit's refusal made nothing, so the write waits out its retry_after, and so does every
+        write behind it (the pause is the login's). A write with no broker form fails with the command that makes it.
+        A lost answer fails rather than risk a second PR or comment: it names the repository to read first. An entry
+        a token-less attempt marked uncertain was never sent (its POST needed the token it could not get)."""
+        chosen = broker_post_args(item)
+        if chosen is None:
+            self.post_finish(path, item, error="the lane-gh broker has no tool for this write (a review, a gate, a "
+                                               f"status key or reviewers); {broker_post_next(item)}")
+            return
+        item.pop("uncertain", None)
+        outcome, value = broker_write(item, chosen, BROKER_OUTBOX_DEADLINE)
+        self.post_at = self.now
+        if outcome == "made":
+            url, number = broker_made_where(value)
+            self.post_delivered(path, item, {"html_url": url, "number": number}, note="made through the lane-gh broker")
+        elif outcome == "limited":
+            wait = min(float(value), float(PACE_HOLD_MAX))
+            self.post_hold = max(self.post_hold, self.now + wait)
+            item["notBefore"] = self.now + wait
+            item["holdUntil"] = self.now + wait
+            item["throttled"] = int(item.get("throttled") or 0) + 1
+            item["lastError"] = f"the broker's limit held it; it goes out in {wait:.0f}s"
+            write_json(path, item)
+            log({"event": "post-throttled", "id": item["id"], "wait": round(wait), "via": "lane-gh"})
+        elif outcome == "lost":
+            self.post_finish(path, item, error=f"{value}; it may have been made: read {item['repo']} before sending "
+                                               "it again")
+        else:
+            self.post_finish(path, item, error=f"the lane-gh broker did not make it: {value}")
 
     def post_after(self, item: dict, doc: dict) -> str | None:
         """A new PR's requested reviewers (not content creation, so no spacing); a failure is a note."""
@@ -32340,6 +32376,59 @@ def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
     return 3
 
 
+BROKER_OUTBOX_DEADLINE = 120.0  # one queued write the daemon makes through the broker: a tick waits this long at most
+BROKER_RATE_LIMITED_EXIT = 75  # lane-gh's exit for a write GitHub's or the broker's limit refused (nothing was made)
+
+
+def lane_vm_poster() -> bool:
+    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream
+    and a runnable lane-gh. Such a host holds no login, so the daemon's own `gh auth token` post can never succeed:
+    fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh
+    signed in?" while the caller had been told the daemon posts it."""
+    return upstream_command() is None and lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
+
+
+def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+    """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
+    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
+    tool, call_args = chosen
+    argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
+    try:
+        done = run_bounded(argv, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "lost", f"the lane-gh broker gave no answer in {timeout:g}s"
+    except (OSError, subprocess.SubprocessError) as error:
+        return "refused", f"lane-gh did not run ({type(error).__name__}: {error})"
+    answer: Any = None
+    with contextlib.suppress(ValueError):
+        answer = json.loads(done.stdout)
+    if isinstance(answer, dict) and answer.get("ok"):
+        return "made", answer.get("data")
+    said = (answer.get("error") if isinstance(answer, dict) else None) or ""
+    if not said:
+        lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
+        said = lines[-1] if lines else "no answer"
+    if done.returncode == BROKER_RATE_LIMITED_EXIT:
+        wait = None
+        for source in (answer.get("data") if isinstance(answer, dict) else None, answer):
+            if isinstance(source, dict) and isinstance(source.get("retry_after"), (int, float)) \
+                    and not isinstance(source.get("retry_after"), bool):
+                wait = float(source["retry_after"])
+                break
+        if wait is None:
+            found = re.search(r"retry after (\d+)s", f"{said} {done.stderr or ''}")
+            wait = float(found.group(1)) if found else float(POST_BACKOFF)
+        return "limited", max(float(POST_SPACING), wait)
+    return "refused", str(said)[:300]
+
+
+def broker_made_where(data: Any) -> tuple[str | None, Any]:
+    """(url, number) from a broker write's data."""
+    if not isinstance(data, dict):
+        return None, None
+    return data.get("url") or data.get("html_url"), data.get("number")
+
+
 def broker_post(item: dict) -> int:
     """Make a queued write through the lane-gh broker and say what it did. Exit 0 written, 1 the broker said no or
     gave no answer, 3 not sent at all (its body and the command that sends it are named)."""
@@ -32348,31 +32437,17 @@ def broker_post(item: dict) -> int:
         return broker_post_unsent(item, None)
     if not os.access(LANE_GH_CMD, os.X_OK):
         return broker_post_unsent(item, chosen)
-    tool, call_args = chosen
-    argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
-    try:
-        done = run_bounded(argv, timeout=BROKER_POST_DEADLINE)
-    except subprocess.TimeoutExpired:
-        print(f"glaeda-gh: the lane-gh broker gave no answer in {BROKER_POST_DEADLINE:g}s; the write may still have "
-              f"been made, so read {item['repo']} before sending it again", file=sys.stderr)
+    outcome, value = broker_write(item, chosen, BROKER_POST_DEADLINE)
+    if outcome == "lost":
+        print(f"glaeda-gh: {value}; the write may still have been made, so read {item['repo']} before sending it "
+              "again", file=sys.stderr)
         return 1
-    except (OSError, subprocess.SubprocessError) as error:
-        print(f"glaeda-gh: lane-gh did not run ({type(error).__name__}: {error})", file=sys.stderr)
+    if outcome != "made":
+        said = f"rate limited, retry after {value:g}s" if outcome == "limited" else value
+        print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {said}", file=sys.stderr)
         return 1
-    answer: Any = None
-    with contextlib.suppress(ValueError):
-        answer = json.loads(done.stdout)
-    if not isinstance(answer, dict) or not answer.get("ok"):
-        said = (answer.get("error") if isinstance(answer, dict) else None) or ""
-        if not said:
-            lines = [x.strip() for x in (done.stderr or "").splitlines() if x.strip()]
-            said = lines[-1] if lines else "no answer"
-        print(f"glaeda-gh: the lane-gh broker did not make this {item['kind']}: {str(said)[:300]}", file=sys.stderr)
-        return 1
-    data = answer.get("data")
-    where = None
-    if isinstance(data, dict):
-        where = data.get("url") or data.get("html_url") or data.get("number")
+    url, number = broker_made_where(value)
+    where = url or number
     print(f"{item['kind']} made through the lane-gh broker (this host holds no token)"
           + (f": {where}" if where else ""))
     return 0
@@ -32479,6 +32554,8 @@ def cmd_post(args: argparse.Namespace) -> int:
         return 3
     if upstream_command() is not None:
         return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
+    if lane_vm_poster() and broker_post_args(item) is None:
+        return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
     with contextlib.suppress(Exception):
         gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
     write_json(outbox_dir() / f"{item['id']}.json", item)

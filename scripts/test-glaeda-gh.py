@@ -15754,6 +15754,89 @@ class PostTest(unittest.TestCase):
         self.assertNotIn("body", state)
         self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
 
+    def lane_vm(self, *answers):
+        """The daemon on a lane VM: no login (token raises as `gh auth token` does there), lane-gh runs the write.
+        ANSWERS are (exit, stdout) pairs, one per lane-gh call; the calls made are returned."""
+        ran: list[list[str]] = []
+        replies = list(answers)
+
+        def run(argv, timeout=None, **_kw):
+            ran.append(list(argv))
+            code, out = replies.pop(0)
+            return subprocess.CompletedProcess(argv, code, json.dumps(out), "")
+
+        def no_token():
+            raise gg.WatchError("gh auth token exited 1; is gh signed in?")
+        d = gg.Daemon(transport=Scripted(), token=no_token, controller=None)
+        for patch in (mock.patch.object(gg, "lane_vm_poster", return_value=True),
+                      mock.patch.object(gg, "run_bounded", side_effect=run)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return d, ran
+
+    def test_a_lane_vm_queued_pr_is_made_through_the_broker_and_keeps_its_number(self) -> None:
+        """fs-agent-lane-10 2026-11-23 07:38Z: `post pr` queued, then sat "last attempt: gh auth token exited 1; is
+        gh signed in?" for good, because the daemon posts with this host's login and a lane VM has none."""
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"number": 9, "url": "https://github.com/o/r/pull/9"}}))
+        self.step(d, NOW)
+        self.assertEqual(ran[0][1:4], ["call", "pr_create", "o/r"])
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "base": "main", "head": "lane/x", "title": "t",
+                                                 "body": "why"})
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"], state["number"]),
+                         ("posted", "https://github.com/o/r/pull/9", 9))
+        self.assertEqual(d.transport.calls, [])  # never the login's REST
+
+    def test_a_lane_vm_queued_comment_is_made_through_the_broker(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body-file", "-")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"url": "https://github.com/o/r/pull/7#issuecomment-1"}}))
+        self.step(d, NOW)
+        self.assertEqual(ran[0][1:4], ["call", "comment", "o/r"])
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_a_lane_vm_write_the_broker_rate_limits_waits_its_retry_after_and_then_goes(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, ran = self.lane_vm((75, {"ok": False, "status": 403, "retry_after": 90, "error": "secondary"}),
+                              (0, {"ok": True, "data": {"url": "u"}}))
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.step(d, NOW + 60)
+        self.assertEqual(len(ran), 1)  # held: nothing sent inside the pause
+        self.step(d, NOW + 91)
+        self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (2, "posted"))
+
+    def test_a_lane_vm_write_left_uncertain_by_a_token_less_attempt_is_sent(self) -> None:
+        """The queue's earlier attempts on a lane VM marked it uncertain and then failed for want of a token, before
+        any POST: the broker now sends it rather than looking it up forever."""
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why")
+        path = gg.outbox_dir() / f"{item['id']}.json"
+        gg.write_json(path, {**item, "uncertain": True, "attempts": 2,
+                             "lastError": "could not look for an earlier attempt"})
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"number": 9, "url": "u/9"}}))
+        self.step(d, NOW)
+        self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (1, "posted"))
+
+    def test_a_lane_vm_lost_broker_answer_fails_naming_the_read_never_twice(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "run_bounded", side_effect=subprocess.TimeoutExpired("lane-gh", 1)):
+            self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("read o/r before sending it again", state["error"])
+
+    def test_a_lane_vm_review_is_refused_at_accept_naming_what_posts_it(self) -> None:
+        args = gg.parser().parse_args(["post", "review", "o/r#7", "--body", "r"])
+        err = io.StringIO()
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "upstream_command", return_value=None), contextlib.redirect_stderr(err):
+            self.assertEqual(gg.cmd_post(args), 3)
+        self.assertIn("glaeda-gh post review o/r#7", err.getvalue())
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
     def test_lost_app_response_looks_up_with_original_app_without_another_post(self):
         item = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/recover", "--base", "main",
                           "--title", "recovery", "--body", "body")
