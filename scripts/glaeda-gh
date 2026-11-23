@@ -430,6 +430,15 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 # laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
+# A lane VM's name as its lane-gh broker knows it: the bootstrap's client mark (leo-workspace tools/lane-vm-bootstrap
+# CLIENT_MARK), written from the broker's ping answer and re-stamped from it at least daily. fs-agent-lane-12,
+# 2026-11-23: a Freestyle slot cloned from fs-agent-lane-11 kept lane-11's update.json ("host": "fs-agent-lane-11"),
+# so every land row named its requester fs-agent-lane-11/SESSION, hand_off passed it on as this VM's own, and the
+# broker refused all of them ("requester must be a session on this VM (fs-agent-lane-12/SESSION ...) a VM names
+# only its own sessions"): 5 of 5 rows stopped handoff_refused after 6 tries each, none ever reached the broker
+# host's queue. The broker's name is the one every broker check holds this VM to, so on a lane VM it wins.
+LANE_VM_NAME_FILE = Path.home() / ".cache/lane-gh/client"
+LANE_VM_NAME_SHAPE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
 # Falling back from the controller to REST is spend, not just a failure: on one developer workstation on
 # 2026-11-21 it ran a few times every ten minutes for hours, and only refresh-errors.log knew, which nobody
@@ -626,6 +635,12 @@ REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may tak
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
 # (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
 # 325 waited PRs sat 3 h unread; the stale valve restarted the daemon every 30 min to no effect)
+# The asked heads with no answer too, past the first of the tick, and on GraphQL as on REST (the head batches go first
+# there): the land queue registers the head of every open entry for land-judge (watch_head), so ~700 heads were asked and
+# unanswered at once, and they ranked ahead of every waited PR with no bound. The land host, 2026-11-22 10:2xZ: 48 head
+# reads and 3 PR reads stored in 600 s, 331 waited PRs, waited PR data 7,195 s old; at 06:57Z and 08:51Z "no pr read
+# stored in the last 600s; ticks spent 600 s, most in read head (518 s)". One asked head a tick still goes first, so a
+# merge gate's new SHA is never starved; the rest share the tick with the waited PRs.
 REST_PLAIN_BUDGET = 30  # seconds of a tick's REST phase the plain watches may take: past it they are deferred (first next
 # tick, in order) and only what a wait blocks on, a finished run to confirm or an asked head with no answer is still read
 # (huge-blue 2026-11-20: 1170 watches over REST, ticks of 90 s back to back, `checks` for a new SHA "unread" for 10+ min)
@@ -650,6 +665,7 @@ HOOK_STEP = "Set up runner"
 # a refusal fails at job start, after up to 240 s waiting for the gui token (cmux owned_pool_rescue's window)
 REFUSAL_SECONDS = 360
 RESCUE_GRACE = 360  # how long a refused attempt stays pending while a rescue re-run may follow
+UNSEEN_SHA_GRACE = 300  # how long a --sha in no checkout here, which GitHub does not show as the head, may still be a push GitHub has not seen
 GLAEDA_RUNNER = re.compile(r"(?:^|-)glaeda(?:-|$)")
 COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 s cycle are missed
 COMMENT_BODY_MAX = 4000
@@ -5515,7 +5531,14 @@ def _bounded(value: Any, default: float, low: float, high: float) -> float:
 
 
 def policy_host() -> str:
-    """This host's name in the fleet policy: update.json's host, else the short hostname."""
+    """This host's name in the fleet policy: on a lane VM the broker's name for it (LANE_VM_NAME_FILE), else
+    update.json's host, else the short hostname."""
+    try:
+        vm = LANE_VM_NAME_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        vm = ""
+    if LANE_VM_NAME_SHAPE.fullmatch(vm):
+        return vm
     doc = read_json(UPDATE_CONFIG)
     host = doc.get("host") if isinstance(doc, dict) else None
     return host if isinstance(host, str) and host else socket.gethostname().split(".")[0].lower()
@@ -8979,8 +9002,11 @@ class Daemon:
                 if len(self.gql_log) > before:
                     self.plain_at[kind] = self.now
             if blocked[kind]:
+                # the blocked heads go first, within the heads' share while a waited PR or run is due (REST_HEAD_BUDGET)
+                until = (time.monotonic() + REST_HEAD_BUDGET
+                         if kind == "head" and (blocked["pr"] or blocked["run"]) else None)
                 with self.phase(f"read {kind}"):
-                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind])
+                    spilled += self.batched(kind, blocked[kind], self.graphql_fetch[kind], until=until)
                 self.post_between()
         self.gql_paced = None
         sent = len(self.gql_log)
@@ -9023,12 +9049,18 @@ class Daemon:
             over_rest = confirms + [plain] + [e for e in over_rest if e is not plain and not self.wait_confirms(e)]
         plain_until = time.monotonic() + REST_PLAIN_BUDGET
         head_until = time.monotonic() + REST_HEAD_BUDGET
+        # the last waited PR or run in the order: a head past the heads' share ahead of it is deferred (REST_HEAD_BUDGET)
+        last_waited = max((i for i, x in enumerate(over_rest) if x["key"].startswith(("pr:", "run:")) and self.waited(x)),
+                          default=-1)
+        asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
-                if e["key"].startswith("head:") and time.monotonic() >= head_until and not self.head_unanswered(e) \
-                        and any(x["key"].startswith(("pr:", "run:")) and self.waited(x) for x in over_rest[i + 1:]):
-                    self.defer([e])  # the heads' share is spent and a waited PR or run is still unread: it reads now
-                    continue
+                if e["key"].startswith("head:") and time.monotonic() >= head_until and i < last_waited \
+                        and (asked_read or not self.head_unanswered(e)):
+                    self.defer([e], "the heads' share of the tick, waited PRs still to read")
+                    continue  # the heads' share is spent and a waited PR or run is still unread: it reads now
+                if e["key"].startswith("head:") and self.head_unanswered(e):
+                    asked_read = True
                 if time.monotonic() >= plain_until and not (self.waited(e) or self.wait_confirms(e)
                                                             or self.head_unanswered(e)):
                     self.defer([e])  # the plain watches' share of this tick is spent: first next tick, in order
@@ -9941,7 +9973,8 @@ class Daemon:
         return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
                 "head": self.fetch_head_rest}
 
-    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> list[dict]:
+    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None],
+                until: float | None = None) -> list[dict]:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
         halves the batch (once per tick, never below GQL_BATCH_MIN) and is retried at once as two
         halves, so one heavy entry cannot keep the rest stale: it ends up alone, is remembered as
@@ -9950,7 +9983,8 @@ class Daemon:
         the extra queries a tick spends on splitting; what is left waits for the next cycle. Returns the
         entries left unread because GraphQL stopped (its quota, or a throttle) partway, the one that hit it
         included, for the caller to read over REST, and the entries GraphQL failed with a 5xx or no answer that could
-        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN)."""
+        not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN).
+        UNTIL (a time.monotonic() deadline): past it, once a query was sent, what is left is deferred (first next tick)."""
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
 
@@ -9991,8 +10025,12 @@ class Daemon:
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
         to_rest: list[dict] = list(backing_off)
+        asked = False  # a query was sent: UNTIL may cut the rest
         while queue:
             chunk = queue.pop(0)
+            if until is not None and asked and time.monotonic() >= until:
+                self.defer(chunk + [e for c in queue for e in c], f"the {kind}s' share of the tick, waited reads due")
+                return to_rest
             on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
             if (self.mode("graphql") == "stop" and not on_app) or self.gql_down():
                 return to_rest + chunk + [e for c in queue for e in c]
@@ -10013,6 +10051,7 @@ class Daemon:
                 continue
             self.gql_limited = False
             self.gql_reason = kind
+            asked = True
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             self.limited = []
             try:
@@ -13861,7 +13900,15 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
 # stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
-                             r"|rate limit is spent|secondary rate limit|content-creation cooldown", re.I)
+                             r"|rate limit is spent|secondary rate limit|content-creation cooldown"
+                             r"|content writes are paced", re.I)
+# The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
+# next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
+# paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
+# never counts toward a stop. teamleaderleo/leo-workspace#8104, 2026-11-23 08:06Z: six paced merges in a row stopped
+# a land_judge-approved PR merge_refused; update-branch rows stopped update_branch_conflict / update_branch_refused.
+LAND_PACE = re.compile(r"content writes are paced (?:until reset \((\d+)\s*s\b|for (\d+)\s*s more)", re.I)
+LAND_PACE_ANY = re.compile(r"content writes are paced", re.I)
 # The time a refusal names, in gh_latch.reset_from's order: land_judge's "no attempt before", then "retry after" /
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
@@ -14541,6 +14588,20 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # no route could read LAND_FORWARD_STATE_TRIES times, stops forward_no_outcome, and its notice is an inbox fyi
 # (cmuxterm-hq docs/handbook/notice-flood.md: a program's message is an fyi, not a blocker).
 LAND_FORWARD_STATE_FRESH = 900.0
+# A peer that takes hand-offs and answers none. A lane VM, 2026-11-23: the broker host named its executor as the far
+# host of every hand-off, the executor's `land serve` took each one ("ok"), and none came back: 32 rows "forwarded"
+# there, each re-sent every 30 min to the same silent queue, while rows judged here again merged in minutes. Every
+# re-send went back to that peer, and every fresh "unreadable" answer handed one more row to it. Now a peer is silent
+# when at least LAND_PEER_SILENT_ROWS rows sit forwarded to it past LAND_PEER_SILENT and no outcome of a forwarded row
+# (merged, closed: forwardOutcome) has come from it within LAND_PEER_SILENT, and it stays silent for
+# LAND_PEER_SILENT_HOLD after rows were taken back from it, unless an outcome from it comes in after that
+# (silent_peers). While the broker's peer is silent a lane VM hands no judgment to it: the row stays here and keeps
+# retrying (unjudgeable_here, early_hand_off, infra_read_stop), and a forwarded row it handed for a judgment is taken
+# back to be judged here (forward_reclaim). An ownership hand-off still goes (no merge of another lane's PR is possible
+# here), and an overflow skips a silent peer for the next one (overflow_send).
+LAND_PEER_SILENT = 1800.0
+LAND_PEER_SILENT_ROWS = 3
+LAND_PEER_SILENT_HOLD = 7200.0
 LAND_FORWARD_STATE_READS = 20
 LAND_FORWARD_STATE_TRIES = 3
 LAND_FORWARD_FYI_CLASS = "fyi"
@@ -15135,10 +15196,27 @@ def land_read_quota(error: str) -> bool:
     return DIRECT_QUOTA in text or bool(LAND_UNREAD_QUOTA.search(text) or LAND_STEP_QUOTA.search(text))
 
 
+def land_step_failed(e: dict, head: str) -> str:
+    """The step failure an identical-refusal stop of E at HEAD also names, or "": the step each judgment took (an
+    override's merge) and how often it was refused at HEAD (e["stepFail"]). teamleaderleo/leo-workspace#9202,
+    2026-11-23 11:35:44Z: three passes judged red_not_excused, each took override_merge and its merge was refused,
+    and the stop said only "3 identical refusals in a row: land-judge: refused: ... not excused", naming the verdict
+    the override had already answered, not the merge that failed."""
+    fail = e.get("stepFail") or {}
+    if str(fail.get("head") or "") != head or not int(fail.get("count") or 0):
+        return ""
+    why = f"; last: {fail['why']}" if fail.get("why") else ""
+    return f" (its {fail.get('kind') or 'step'} was refused {int(fail['count'])} times in a row at {head[:12]}{why})"
+
+
 def land_quota_said(text: str, now: float) -> float | None:
     """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
     NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
     more than LAND_QUOTA_MAX_S ahead."""
+    m = LAND_PACE.search(text or "")
+    if m:  # the pacer names seconds: the reset is that long from NOW (same bound as a clock time)
+        sec = float(m.group(1) or m.group(2))
+        return now + sec if sec <= LAND_QUOTA_MAX_S else None
     for pattern in LAND_QUOTA_SAID:
         m = pattern.search(text or "")
         if not m:
@@ -15400,6 +15478,9 @@ class LandQueue:
         self.forward_awaited: set[str] = set()  # keys a waiting_after row here waits on (forwards_follow)
         self.forward_state_thread: threading.Thread | None = None
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
+        self.peer_quiet: dict[str, str] = {}  # silent peers, each to why (silent_peers, LAND_PEER_SILENT)
+        self.peer_quiet_at = float("-inf")  # silent_peers reads the rows again after this
+        self.broker_peer = ""  # the far host the broker's last taken hand-off named
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -15533,6 +15614,11 @@ class LandQueue:
                              **({"claimed": claimed.get("kind")} if isinstance(claimed, dict) else {}))
                 if isinstance(claimed, dict):
                     e["interrupted"] = claimed
+                    # The step never answered: the judgment after it repeats the one that took it, not a new refusal
+                    # of the PR's (judge_and_take). leo-workspace#9177, 2026-11-23: a paced override merge at 11:33:53Z,
+                    # the override_merge again at 11:36:23Z, a restart mid-merge at 11:41:08Z, and the judgment after
+                    # it at 11:43:32Z was the third "identical refusal": stopped red_not_excused, nothing refused.
+                    e["stepUnfinished"] = True
                 e["action"] = None
                 e["state"] = "queued"
                 e["wakeAt"] = None
@@ -16048,7 +16134,10 @@ class LandQueue:
         if self.overflow_thread is not None and self.overflow_thread.is_alive():
             return
         with self.lock:
-            keys = self.overflow_due(live)
+            # a peer that takes rows and answers none is skipped for the next (LAND_PEER_SILENT's comment)
+            quiet = self.silent_peers()  # logs land-peer-silent once when a peer turns silent
+            peers = [p for p in peers if land_forward_name(p) not in quiet]
+            keys = self.overflow_due(live) if peers else []
             if not keys:
                 return
             self.overflow_after = self.now + LAND_OVERFLOW_EVERY
@@ -16538,6 +16627,88 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
+    def silent_peers(self) -> dict[str, str]:
+        """Under the lock. The far hosts that take forwarded rows and answer none (LAND_PEER_SILENT's comment), each to
+        why, from this queue's own rows (no read, no call), at most once per LAND_FORWARD_LOOK_EVERY. Also notes the
+        host the broker's newest taken hand-off named (broker_peer)."""
+        if self.now < self.peer_quiet_at:
+            return self.peer_quiet
+        self.peer_quiet_at = self.now + LAND_FORWARD_LOOK_EVERY
+        outcome: dict[str, float] = {}
+        reclaimed: dict[str, float] = {}
+        pending: dict[str, int] = {}
+        broker = (0.0, "")
+        for e in self.entries.values():
+            o = e.get("forwardOutcome") or {}
+            if o.get("host"):
+                outcome[str(o["host"])] = max(outcome.get(str(o["host"]), 0.0), float(o.get("at") or 0))
+            r = e.get("forwardReclaimed") or {}
+            if r.get("from"):
+                reclaimed[str(r["from"])] = max(reclaimed.get(str(r["from"]), 0.0), float(r.get("at") or 0))
+            done = e.get("handedOff") or {}
+            if done.get("host") and float(done.get("at") or 0) > broker[0]:
+                broker = (float(done.get("at") or 0), str(done["host"]))
+            host = str(e.get("forwardedTo") or "")
+            if e.get("state") == LAND_FORWARDED and host:
+                first = float(e.get("forwardFirst") or 0) or self.forwarded_at(e)
+                if first and self.now - first > LAND_PEER_SILENT:
+                    pending[host] = pending.get(host, 0) + 1
+        self.broker_peer = broker[1]
+        quiet: dict[str, str] = {}
+        for host in set(pending) | set(reclaimed):
+            last = outcome.get(host, 0.0)
+            ago = f"{(self.now - last) / 60:.0f} min ago" if last else "never, on record here"
+            if pending.get(host, 0) >= LAND_PEER_SILENT_ROWS and self.now - last > LAND_PEER_SILENT:
+                quiet[host] = (f"{pending[host]} rows handed to it over {LAND_PEER_SILENT / 60:.0f} min ago, and its "
+                               f"last outcome came {ago}")
+            elif reclaimed.get(host, 0.0) > last and self.now - reclaimed[host] < LAND_PEER_SILENT_HOLD:
+                quiet[host] = (f"rows were taken back from it {(self.now - reclaimed[host]) / 60:.0f} min ago and no "
+                               f"outcome has come from it since")
+        for host in sorted(set(quiet) - set(self.peer_quiet)):
+            log({"event": "land-peer-silent", "peer": host, "why": quiet[host]})
+        for host in sorted(set(self.peer_quiet) - set(quiet)):
+            log({"event": "land-peer-answering", "peer": host})
+        self.peer_quiet = quiet
+        return quiet
+
+    def broker_peer_silent(self) -> str:
+        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or ""."""
+        if not self.broker_client():
+            return ""
+        quiet = self.silent_peers()
+        return quiet.get(self.broker_peer, "") if self.broker_peer else ""
+
+    def note_forward_outcome(self, e: dict, host: str) -> None:
+        """Under the lock: a forwarded E ended with an outcome from HOST (merged or closed), which says HOST answers."""
+        if host and e.get("forwardedTo"):
+            e["forwardOutcome"] = {"host": host, "at": self.now}
+
+    @staticmethod
+    def handed_for_judgment(e: dict) -> bool:
+        """Whether E's last hand-off was for a judgment this VM could not make (this host may judge it again), not
+        for the broker's ownership refusal of a write step (which this host can never take)."""
+        done = e.get("handedOff") or {}
+        if done.get("kind"):
+            return done.get("kind") == "judgment"
+        why = next((str(h.get("why") or "") for h in reversed(e.get("history") or [])
+                    if h.get("event") == "handed_off"), "ownership")
+        return why != "ownership"  # hand_off's reason for an owner refusal (no reason of its own)
+
+    def forward_reclaim(self, e: dict, host: str, why: str) -> None:
+        """Under the lock. A row this lane VM handed to HOST for a judgment, HOST silent (WHY): taken back to be judged
+        here again at once, its pin kept. The far queue may still take it; a merge there ends it here as any
+        merge does (retire_from_cache)."""
+        for field in ("handedOff", "forwardResent", "forwardFirst", "forwardQuiet", "handoffDue"):
+            e.pop(field, None)
+        e["forwardedTo"] = None
+        e["forwardReclaimed"] = {"from": host, "at": self.now}
+        self.history(e, "forward_reclaimed", was=host, why=land_trim(f"{host} is silent: {why}", 200))
+        log({"event": "land-forward-reclaimed", "key": e["key"], "from": host})
+        # as wait() writes it, with no job's generation to check: this runs on the tick, not in a job
+        e.update(state="waiting", action=None, wakeAt=self.now,
+                 wait={"kind": "retry", "why": f"taken back from {host}, which answers no hand-off: judged here"})
+        self.save(e)
+
     def forward_follow(self, e: dict, executor: bool) -> bool:
         """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
         does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
@@ -16564,6 +16735,7 @@ class LandQueue:
         if state == "MERGED":
             merge = data.get("mergeCommit")
             sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+            self.note_forward_outcome(e, host)
             if past:  # the far host that merged it told its requester long ago (LAND_FORWARD_STATE_FRESH's comment)
                 self.forward_settle(e, "MERGED", sha, "", "", executor=executor, how="the cache shows it")
                 return False
@@ -16571,17 +16743,24 @@ class LandQueue:
             return False
         if state == "CLOSED":
             if read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen (retire_from_cache)
+                self.note_forward_outcome(e, host)
                 if past:
                     self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
                     return False
+                # quiet: whoever closed it knows (2026-11-23 09:32Z: a closed PR woke its requester as a [blocker])
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
-                          f"closed); nothing is merged", "")
+                          f"closed); nothing is merged", "", tell="quiet")
                 return False
             return past or self.forward_state_wanted(e)  # a copy older than the row: read live
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
         if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
         last = e.get("forwardResent") or {}
+        if not executor and e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e):
+            quiet = self.silent_peers().get(str(e.get("forwardedTo") or ""))
+            if quiet:  # re-sending to a peer that answers none only waits longer (LAND_PEER_SILENT's comment)
+                self.forward_reclaim(e, host, quiet)
+                return False
         if not e.get("forwardFirst"):
             e["forwardFirst"] = first
             self.save(e)
@@ -16653,18 +16832,20 @@ class LandQueue:
                 return
             if state == "CLOSED":
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); "
-                          "nothing is merged", "")
+                          "nothing is merged", "", tell="quiet")  # whoever closed it knows
                 return
             self.save(e)
             return
         if state == "MERGED":
             sha = merge_sha or e.get("mergeSha") or ""
+            self.note_forward_outcome(e, host)
             e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
             self.history(e, "merged", sha=sha, how=f"forwarded to {host}: {how} merged", quiet="forward_give_up")
             self.save(e)
             log({"event": "land-forward-settled", "key": e["key"], "state": "merged", "how": how})
             return
         if state == "CLOSED":
+            self.note_forward_outcome(e, host)
             self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); nothing is "
                       f"merged", "", tell="quiet")
             log({"event": "land-forward-settled", "key": e["key"], "state": "closed", "how": how})
@@ -16730,13 +16911,17 @@ class LandQueue:
             e["forwardQuietTold"] = {"at": self.now, "since": first, "to": host, "by": "forward_give_up"}
         cause = f"the PR is still {state.lower()}; {why}" if state else why
         resends = int((e.get("forwardResent") or {}).get("n") or 0)
+        # a full head to pin at: `glaeda-gh land --match-head-commit` takes a 40-hex id, never "HEAD"
+        pin = str((e.get("forwardRelanded") or {}).get("head") or e.get("pinSha")
+                  or (e.get("handedOff") or {}).get("head") or e.get("head") or "").lower()
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
                   f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="quiet" if told else "fyi")
+                  f"{key_name(e['key'])} --match-head-commit {pin if SHA40.fullmatch(pin) else '<its 40-hex head>'}",
+                  tell="quiet" if told else "fyi")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -16825,7 +17010,8 @@ class LandQueue:
         only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
-        own = not host or bool(LAND_JOB_QUOTA.search(text or ""))  # its PR's own CI job's limit, not this host's
+        # its PR's own CI job's limit, or the pacer on content writes: not this host's reads
+        own = not host or bool(LAND_JOB_QUOTA.search(text or "") or LAND_PACE_ANY.search(text or ""))
         if not own:
             self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
@@ -17750,7 +17936,8 @@ class LandQueue:
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
         infra = e.pop("infraHandoff", None)
-        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED:
+        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED \
+                and not self.broker_peer_silent():
             # a stop that only said GitHub could not be read here (infra_read_stop): the broker host reads it instead,
             # unless the cache shows the unpinned head moved since (then it is judged here, at the new head)
             head = str(infra.get("head") or "")
@@ -18006,9 +18193,15 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
-                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
-                # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
+            elif self.refresh_held():
+                pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
+            elif self.busy() >= self.workers():
+                # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
+                # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
+                # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
+                self.gated(e, ready=True)
+            else:
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
                                 **self.refresh_starting(e["key"])}
@@ -18199,7 +18392,8 @@ class LandQueue:
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
         if self.busy() >= self.workers():
-            return True  # read on a free worker, a later tick; judged after it
+            self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
+            return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
@@ -18403,7 +18597,7 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def follow_own_update(self, e: dict, head: str) -> str | None:
+    def follow_own_update(self, e: dict, head: str, read: list | None = None) -> str | None:
         """Move E's pin to HEAD when HEAD is the base merge this queue's own update_branch made at the pinned head;
         None when it moved (or nothing was pinned elsewhere), else why HEAD still stops the land (head_moved).
         hq#14568 (glaeda#2377) followed it only when the cache showed the new head right after an update that returned
@@ -18424,6 +18618,8 @@ class LandQueue:
         parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
         if parents is None and str(data.get("headRefOid") or "").lower() == head and data.get("headParent"):
             parents = [data["headParent"]]  # pr_head_parent's first parent (pin_follow's read) says it as well
+        if parents is None and isinstance(read, list):
+            parents = read  # a read of HEAD's commit the caller made (repin_parents): the cache does not show HEAD
         unread = [h for h in e.get("history") or [] if h.get("event") == "pin_parent_unread" and h.get("head") == head[:12]]
         if not isinstance(parents, list) and unread:  # glaeda#2364: pin_follow waited for its parent and none came
             return "no read of this head said its first parent within the wait, so it is not known to be this update"
@@ -18436,6 +18632,27 @@ class LandQueue:
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
         return None
+
+    def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
+        """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
+        (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
+        the pin (follow_own_update): an update was sent at the pin, the head named is another, and the cache does not
+        show it (a cached read carries its own parents). None: no such case, or the read did not answer."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        gh = self.gh()
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha) or not sent \
+                or land_head_moved(pin, sent) or gh is None:
+            return None
+        if str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower() == sha:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{sha}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def old_pin_wait(self, e: dict, head: str) -> bool:
         """Under the lock. True while HEAD, which is not E's pin, is a pin E's own queue already followed away from
@@ -18605,8 +18822,12 @@ class LandQueue:
         if land_base_merge_parent(pin, head, data):
             return True
         head = str(head or "").lower()
-        return bool(pin) and SHA40.fullmatch(head) is not None and str(data.get("headRefOid") or "").lower() == head \
-            and not isinstance(data.get("headParents"), list) and self.gh() is not None
+        if not bool(pin) or SHA40.fullmatch(head) is None or str(data.get("headRefOid") or "").lower() != head \
+                or self.gh() is None:
+            return False
+        parents = data.get("headParents")
+        # a merge whose first parent is not the pin may sit on top of other base merges (land_base_merge_chain)
+        return not isinstance(parents, list) or len(parents) == 2
 
     def base_merge_check(self, e: dict, check: dict) -> bool:
         """On a worker, before the judgment: whether CHECK's head is only a base merge on its pin, from two compare
@@ -18631,21 +18852,27 @@ class LandQueue:
         why = "" if gh and base else "no gh-quota shim or base branch to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
         parents: Any = None
+        chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
         if kept:
             why = kept  # read before, for this head and pin (ancestry_record): not read again
         elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
-            got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
-            try:
-                parents = json.loads(got.stdout or "") if got.returncode == 0 else None
-            except ValueError:
-                parents = None
-            if not isinstance(parents, list):
-                why, unread = f"the read of {path} failed (exit {got.returncode}), so its parents are not known", True
-                said = f"{got.stdout or ''}\n{got.stderr or ''}"
+            if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+                parents = data["headParents"]  # the cache read them: no call
             else:
+                got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
+                try:
+                    parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+                except ValueError:
+                    parents = None
+                if not isinstance(parents, list):
+                    why = f"the read of {path} failed (exit {got.returncode}), so its parents are not known"
+                    unread, said = True, f"{got.stdout or ''}\n{got.stderr or ''}"
+            if isinstance(parents, list):
                 parent = land_base_merge_parent(pin, head, {"headRefOid": head, "headParents": parents})
-                if not parent:
+                if not parent and len(parents) == 2:
+                    parent, why, unread, said, chain = self.base_merge_chain(e, head, pin, base)
+                elif not parent:
                     why = (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) are not the pinned head "
                            "and then one more commit: a push, not a base merge on it")
         for path in ([f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{head}",
@@ -18690,9 +18917,43 @@ class LandQueue:
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
             e["updatedHead"], e["updatedHeadAt"] = head, self.now
             e.pop("pinWait", None)
-            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
+            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12],
+                         **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def base_merge_chain(self, e: dict, head: str, pin: str, base: str) -> tuple[str, str, bool, str, int]:
+        """On a worker, from base_merge_check: whether HEAD is a run of base merges on PIN (land_base_merge_chain), from
+        one compare PIN...HEAD (its commits and their parents) and one compare of each merge's second parent with BASE
+        (an ancestor of it). (the top merge's second parent, "", False, "", merges) when it is; else ("", why, unread,
+        said, 0): unread when a read did not answer (base_merge_unread's case), not when an answer says no."""
+        gh = self.gh()
+        if not gh or not base:
+            return "", "no gh-quota shim or base branch to read it with", False, "", 0
+        path = f"repos/{e['repo']}/compare/{pin}...{head}"
+        got = self.call([gh, "api", path, "--jq", LAND_CHAIN_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            return ("", f"the read of {path} failed (exit {got.returncode}), so its commits are not known", True,
+                    f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+        seconds, why = land_base_merge_chain(pin, head, doc)
+        for s in dict.fromkeys(seconds) if not why else ():
+            path = f"repos/{e['repo']}/compare/{s}...{urllib.parse.quote(base, safe='')}"
+            got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+            try:
+                ans = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                ans = None
+            if not isinstance(ans, dict) or not isinstance(ans.get("s"), str):
+                return ("", f"the read of {path} failed (exit {got.returncode}), so it is not shown to be on {base}",
+                        True, f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+            if not (ans["s"] == "identical" or (ans["s"] == "ahead" and ans.get("b") == 0)):
+                why = f"its merged commit {s[:12]} is not on {base}: not a merge of {base}"
+                break
+        return ("", why, False, "", 0) if why else (seconds[0], "", False, "", len(seconds))
 
     def base_merge_unread(self, e: dict, head: str, why: str, said: str) -> bool:
         """Under the lock, from base_merge_check: its read of HEAD did not answer (WHY; SAID is the read's output).
@@ -19075,7 +19336,9 @@ class LandQueue:
             why = str(judging.get("why") or "")  # what made this judgment run (LAND_JUDGE_WHY)
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
-            counts = counts and not e.pop("stepQuotaParked", False)
+            # Nor is one after a step a restart cut off (load: stepUnfinished).
+            parked, unfinished = e.pop("stepQuotaParked", False), e.pop("stepUnfinished", False)
+            counts = counts and not parked and not unfinished
             check = e.pop("baseMergeCheck", None)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
@@ -19183,7 +19446,8 @@ class LandQueue:
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
                           f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
-                          f"refusals in a row: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
+                          f"refusals in a row{land_step_failed(e, head)}: {land_reason(answer.get('reason'))}",
+                          land_trim(answer.get("next")))
                 return
             self.save(e)
         self.take(e, act, answer)
@@ -19215,13 +19479,15 @@ class LandQueue:
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
             return ""
+        if self.broker_peer_silent():
+            return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
         """E is due a judgment: on a broker client that could not read GitHub in most of its last live judgments
         (LAND_EARLY_HANDOFF's comment), hand it at its full head to the broker host's land queue now, on a job of its
         own, with no judgment here and no wait for a worker or a pace slot; True when that job was started."""
-        if not self.broker_client() or e.get("state") == LAND_FORWARDED:
+        if not self.broker_client() or e.get("state") == LAND_FORWARDED or self.broker_peer_silent():
             return False
         recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
         if sum(recent) < LAND_EARLY_HANDOFF_BAD:
@@ -19265,7 +19531,7 @@ class LandQueue:
             or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
         why = land_trim(f"{code}: {land_reason(reason, 160)}", 200)
         hand = self.broker_client() and e.get("state") != LAND_FORWARDED and bool(SHA40.fullmatch(head)) \
-            and not land_head_moved(pin, head)
+            and not land_head_moved(pin, head) and not self.broker_peer_silent()
         r = e.get("infraRetry") or {}
         n = int(r.get("n") or 0) + 1 if r.get("head") == head else 1
         if not hand and n > LAND_INFRA_RETRY_CAP:
@@ -19598,6 +19864,7 @@ class LandQueue:
         if kind == "review":
             self.do_review(e, head, answer)
             return
+        parents = self.repin_parents(e, act, head) if kind == "repin" else None
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
@@ -19625,6 +19892,17 @@ class LandQueue:
                 sha = str(act.get("sha") or "").lower()
                 cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
+                    # The head land_judge read is this queue's own update_branch's base merge on the pin: the pin
+                    # follows it now (follow_own_update; a push by anyone else is not followed). Without this, a row
+                    # with no cached PR read is judged at its full pin again and again (fresh_head: land_full_pin),
+                    # the repin wait's sha is never read (tick's no-data branch), and the same "pin" refusal reaches
+                    # the stop. manaflow-ai/cmux-platform#1771, 2026-11-23: update_branch at the pin 2f3e4212176e
+                    # (11:58:07Z, exit 0) made a11cfabd1bde; 13 judgments at 2f3e4212176e followed, and at 12:03:51Z it
+                    # stopped "pin: 3 identical refusals in a row: ... PR read head 'a11cfabd...' does not match
+                    # pinned head 2f3e4212...". glaeda#2649 stopped the same way that morning.
+                    # Only on a read of that head's parents (repin_parents): with none, nothing is followed here.
+                    if parents is not None and self.follow_own_update(e, sha, parents) is None:
+                        e["streak"] = None  # the refusal named the head the queue made itself: nothing to count
                     self.wait(e, {"kind": "repin", "sha": sha}, None)
                 elif SHA40.fullmatch(sha) and sha == head == cached:
                     # land_judge's judge_again(), its fallback for a refusal with no step of its own: judge this same
@@ -20050,6 +20328,12 @@ class LandQueue:
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
+        with self.lock:
+            # Tried from here on: only a merge that began ends the once-per-head retry (the refusal path's check). A
+            # restart between the refusal and this line once stopped cmux#51491 as a conflict with no merge tried
+            # (2026-11-23 09:34Z), where git merged its base cleanly.
+            e.setdefault("unionMerge", {"head": head, "at": self.now})["tried"] = True
+            self.save(e)
         try:
             sha, branch, base_sha, why = self.union_plan(e, head)
         except OSError as error:
@@ -20246,7 +20530,8 @@ class LandQueue:
             # A conflict refusal that names a step this queue runs (an update-branch that could still merge the base
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
-            if kind == "update_branch" and (e.get("unionMerge") or {}).get("head") != head:
+            tried = e.get("unionMerge") or {}
+            if kind == "update_branch" and (tried.get("head") != head or not tried.get("tried")):
                 # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
                 # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
                 e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
@@ -20306,7 +20591,8 @@ class LandQueue:
             return None
         last = e.get("stepFail") or {}
         n = int(last.get("count") or 0) + 1 if last.get("sig") == sig else 1
-        e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
+        e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now,
+                         "why": land_trim(land_tail(out), 200)}  # what a judgment's streak stop names (land_step_failed)
         self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
         if n >= LAND_STEP_STOP:
             # A stop with an empty `next:` ends nobody's hold: the row sits until a person happens to read it. The
@@ -20386,7 +20672,9 @@ class LandQueue:
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
-                                  "request": str(doc.get("request") or "")}
+                                  "request": str(doc.get("request") or ""),
+                                  "kind": "judgment" if due.get("kind") == "judgment" else "ownership"}
+                self.peer_quiet_at = float("-inf")  # the broker's peer may be another now: silent_peers reads again
                 e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=host)
                 self.history(e, "handed_off", to=host, head=head[:12], why=reason)
                 self.save(e)
@@ -20418,8 +20706,15 @@ class LandQueue:
     def handoff_head_moved(self, e: dict, head: str, out: str, repinned: bool) -> str | None:
         """Under the lock, after the broker refused E's hand-off at HEAD with OUT: the PR's live head to hand it off at
         instead when OUT names one (LAND_HANDOFF_HEAD) and E may land it, else "" (counted as any refusal); None when E
-        was stopped because its pin is not that head. A second refusal of this kind in one hand-off (REPINNED: the
-        head moved again between two reads) is counted, never chased."""
+        was stopped because its pin is not that head, or re-queued to be judged on a fresh read first. A second
+        refusal of this kind in one hand-off (REPINNED: the head moved again between two reads) is counted, never chased.
+
+        A pinned E whose pin is not the broker's head is judged once more before it stops: that head may be only the
+        lander's base merge on the pin, which judge's base_merge_check follows (repin_base_merge) and every other head
+        stops head_moved there, as here. manaflow-ai/cmuxterm-hq#15729, 2026-11-23 08:29Z: pinned c87ae6aa, the
+        lander's "Merge branch 'main' into ..." 51a62dd9 (first parent c87ae6aa) at 08:00Z, and the hand-off stopped
+        it head_moved with no parent read. Once per head (handoffPinMoved): a judgment that reads nothing newer hands
+        off at the old head again, and the second refusal naming the same head stops it."""
         m = LAND_HANDOFF_HEAD.search(out)
         if not m or m.group(2) != head or m.group(1) == head or repinned:
             return ""
@@ -20427,6 +20722,11 @@ class LandQueue:
         self.nudge(e["key"])  # this host's copy of the head is stale: the daemon reads it again
         pin = str(e.get("pinSha") or "")
         if land_head_moved(pin, live):
+            if e.get("handoffPinMoved") != live:
+                e["handoffPinMoved"] = live
+                self.history(e, "handoff_pin_moved", pin=pin[:12], head=live[:12])
+                self.requeue(e)  # judge reads it again: a base merge on the pin is followed, anything else stops
+                return None
             name = key_name(e["key"])
             self.stop(e, "head_moved", land_moved_clause(live, pin, " (the broker read it from GitHub)")
                       + "; nothing was handed off",
@@ -21245,6 +21545,37 @@ def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
     if not SHA40.fullmatch(first) or land_head_moved(pin, first) or not SHA40.fullmatch(second):
         return ""
     return second
+
+
+# A run of base merges on a pinned head: the lander bot merged the base twice (95d7a2428 -> 429b4ab2fc -> 694409d218,
+# hq#17489, six head_moved stops in a day) before the queue read the PR, so HEAD's first parent was a base merge and not
+# the pin. The pin follows HEAD when walking its first parents reaches the pin, every commit passed is a merge (two
+# parents) and every second parent is an ancestor of the base branch (base_merge_chain reads that). A non-merge commit
+# anywhere on the walk, or a merge of a commit not on the base, stops it head_moved as before. The diff rule
+# (land_base_merge_why) then holds the whole run to the pin's own diff.
+LAND_CHAIN_JQ = "{s: .status, n: .total_commits, c: [.commits[]? | {s: .sha, p: [.parents[]?.sha]}]}"
+LAND_CHAIN_MAX = 20  # merges one pin follows in one step
+
+
+def land_base_merge_chain(pin: str, head: str, doc: dict) -> tuple[list[str], str]:
+    """(the second parents of the merges from HEAD down to PIN along first parents, top first, "") when DOC, GitHub's
+    compare PIN...HEAD as LAND_CHAIN_JQ shapes it, shows every commit on that walk a two-parent merge and the walk
+    reaches PIN; else ([], why not). Whether those second parents are on the base is for the caller's reads."""
+    head = str(head or "").lower()
+    commits = (doc or {}).get("c")
+    if not isinstance(commits, list) or (doc or {}).get("s") != "ahead" or (doc or {}).get("n") != len(commits):
+        return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
+    parents = {str((c or {}).get("s") or "").lower(): [str(p or "").lower() for p in (c or {}).get("p") or []]
+               for c in commits if isinstance(c, dict)}
+    seconds, cur = [], head
+    while land_head_moved(pin, cur):
+        ps = parents.get(cur)
+        if ps is None or len(ps) != 2 or not all(SHA40.fullmatch(p) for p in ps) or len(seconds) >= LAND_CHAIN_MAX:
+            return [], (f"{cur[:12]} between the pin and the head is not a merge of the base (parents "
+                        f"{', '.join(p[:12] for p in ps or []) or 'unlisted'}): a push, not base merges on the pin")
+        seconds.append(ps[1])
+        cur = ps[0]
+    return seconds, ""
 
 
 def land_diff_lines(patch: str) -> tuple[str, ...]:
@@ -25890,9 +26221,26 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
                                  f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
                                  "GitHub has not seen yet")
+            if exact and not final:
+                # A full id may be a push GitHub has not seen -- but only one that exists. One that is in no
+                # checkout here either is a typo, another repo's commit (land-pin-sha-from-wrong-repo) or a
+                # fabrication: nothing will ever make it the head, so it is refused at UNSEEN_SHA_GRACE instead
+                # of waiting out the whole timeout to print the same two shas in a note.
+                if req.get("unseenSince") is None:
+                    req["unseenSince"] = now
+                    req["shaHere"] = git_rev_parse(sha) is not None
+                unseen = now - float(req["unseenSince"])
+                if not req.get("shaHere") and unseen >= UNSEEN_SHA_GRACE:
+                    raise WatchError(f"--sha {sha[:12]} is a commit in no checkout here, and GitHub has shown head "
+                                     f"{head[:12]} for {int(unseen)}s: nothing will make it the head, so this wait "
+                                     f"can only time out. Wait for {head[:12]}, or pass the id of a commit you "
+                                     "really pushed (git rev-parse HEAD, in the checkout you pushed from)")
         elif head and not exact:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True
+        elif head:
+            req.pop("unseenSince", None)  # the head caught up: a later push counts as pending again
+            req.pop("shaHere", None)
     settle = float(req.get("settle", SETTLE_GRACE))
     if usable and kind == "pr" and until == "done" and data.get("state") == "OPEN":
         try:
@@ -33393,6 +33741,7 @@ JOB_LOG_TMP_KEEP = 3600.0  # a writer's temporary file this old was left by a cr
 JOB_LOG_DONE = b"Cleaning up orphan processes"
 LOG_CONTROLLER_TIMEOUT = 8  # the controller's job-log read (it may read GitHub itself first)
 LOG_REST_TIMEOUT = 18  # one `gh api .../logs` read (a redirect to blob storage, which gh follows)
+LOG_ERRORS_BUDGET = 120  # `log errors`'s whole wall clock, run id or job (log_read_seconds)
 
 
 def job_log_path(repo: str, job: int) -> Path:
@@ -33468,15 +33817,34 @@ def kept_evict(root: Path, suffix: str, max_bytes: int, now: float | None = None
     return {"removed": removed, "bytes": total}
 
 
-def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, bytes]:
+def log_read_seconds(deadline: float | None, cap: float) -> float:
+    """How long one log read may take: CAP, or what is left of DEADLINE when that is less. 0.0 when the budget is
+    spent, which every caller reads as "do not make this call".
+
+    `log errors` had no whole-command bound, only a timeout per step, and a run id makes many steps: one doomed
+    job-log read for the number itself (8 s controller + 18 s REST, because a run id and a job id are the same
+    bare integer) and then one per failed job the run has, up to `--reads`. Measured 2026-11-23 on
+    manaflow-ai/cmux/44919951254: `timeout 180 glaeda-gh log errors` was killed with nothing printed (rc 124).
+    This command is the designated "why did this run fail" front door, so its never answering is why a red
+    triage falls back to `gh run view --log-failed | grep -i error` -- which on a Rust job returns passing
+    lines, acpmux's own test names holding the word "error"."""
+    if deadline is None:
+        return cap
+    return max(0.0, min(cap, deadline - time.monotonic()))
+
+
+def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
     """(HTTP status, body) of the controller's GET /v1/github/job-log: 200 is a finished job's log; 0 when it did not
     answer. 404 (unknown job, or an older controller), 409 (still running), 410 (GitHub expired it) and 429 (its log
     reads are spent) carry no log."""
     headers = {"Authorization": f"Bearer {ctl.token}"} if ctl.token else {}
     url = f"{ctl.base}/v1/github/job-log?repo={urllib.parse.quote(repo, safe='/')}&id={int(job)}"
+    left = log_read_seconds(deadline, LOG_CONTROLLER_TIMEOUT)
+    if not left:  # the caller's budget is spent: a read that cannot finish is not started
+        return 0, b""
     try:
-        with hard_deadline(LOG_CONTROLLER_TIMEOUT + 1), \
-                OPENER.open(urllib.request.Request(url, headers=headers), timeout=LOG_CONTROLLER_TIMEOUT) as response:
+        with hard_deadline(left + 1), \
+                OPENER.open(urllib.request.Request(url, headers=headers), timeout=left) as response:
             return response.status, response.read(JOB_LOG_RAW_MAX + 1)
     except urllib.error.HTTPError as error:
         return error.code, b""
@@ -33484,7 +33852,7 @@ def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, byt
         return 0, b""
 
 
-def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
+def rest_job_log(repo: str, job: int, deadline: float | None = None) -> tuple[bool, bytes, str]:
     """One `gh api repos/REPO/actions/jobs/JOB/logs` through the PATH gh (so the quota guard and a lane's broker see
     it; gh follows the redirect to blob storage, which no quota counts): (ok, log bytes, why not)."""
     gh = find_gh()
@@ -33492,9 +33860,12 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         return False, b"", "gh not found"
     route = f"repos/{repo}/actions/jobs/{int(job)}/logs"
     for flags in (["--allow-escape-sequences"], []):  # newer gh strips a log's colour codes without it; older lacks it
+        left = log_read_seconds(deadline, LOG_REST_TIMEOUT)
+        if not left:
+            return False, b"", "the command's time budget was spent"
         try:
             done = subprocess.run([gh, "api", *flags, route], stdin=subprocess.DEVNULL, capture_output=True,
-                                  timeout=LOG_REST_TIMEOUT, check=False)
+                                  timeout=left, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             return False, b"", f"gh api: {type(error).__name__}"
         if done.returncode == 0:
@@ -33509,10 +33880,12 @@ def job_log_finished(text: bytes) -> bool:
     return JOB_LOG_DONE in text[-4096:]
 
 
-def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log
-                 ) -> tuple[bytes | None, str, str]:
+def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log,
+                 deadline: float | None = None) -> tuple[bytes | None, str, str]:
     """(log, source, why not) for JOB: kept here, else from the build controller, else one REST read. rest=None
-    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota."""
+    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota.
+    DEADLINE is the caller's whole budget (monotonic): each read takes the smaller of its own timeout and what is
+    left of it, so a command that makes several reads cannot outlive the bound it published."""
     repo = repo.lower()
     text = job_log_get(repo, job)
     if text is not None:
@@ -33520,7 +33893,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     ctl = Controller.from_env() if controller == "env" else controller
     status = 0
     if ctl is not None:
-        status, body = controller_job_log(ctl, repo, job)
+        status, body = controller_job_log(ctl, repo, job, deadline)
         if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
             with contextlib.suppress(OSError):
                 job_log_put(repo, job, body)  # the controller serves only a finished job's log
@@ -33532,7 +33905,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     if rest is None:
         return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
             status, "not kept by the controller")
-    ok, body, why = rest(repo, job)
+    ok, body, why = rest(repo, job, deadline)
     if not ok:
         return None, "", why
     if job_log_finished(body):
@@ -34010,14 +34383,21 @@ def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool | str
 
 
 def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
-                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS) -> int:
+                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS,
+                   budget: float = LOG_ERRORS_BUDGET) -> int:
     """One job's error-level lines by step, not its whole log. A run id here reads the newest READS failed jobs of
     that run, because the two kinds of id are indistinguishable (run_jobs_typed_as_a_job). Exit 0 with a log read
-    (a log with no error line prints a count of 0), 1 with none."""
+    (a log with no error line prints a count of 0), 1 with none.
+
+    BUDGET is the whole command's wall clock (`--timeout`): every read inside it takes the smaller of its own
+    timeout and what is left (log_read_seconds), and a job the budget cannot reach is named unread with its own
+    command, like one past `--reads`. Without it the per-step timeouts added up unannounced and the command could
+    answer nothing at all."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
-    text, source, why = job_log_read(repo, job, controller, rest)
+    deadline = time.monotonic() + budget if budget > 0 else None
+    text, source, why = job_log_read(repo, job, controller, rest, deadline)
     if text is not None:
         return log_errors_emit(repo, [(job, text, source)], limit, as_json, None)
     try:
@@ -34041,11 +34421,22 @@ def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, 
                 f"{'its' if not over else f'the newest {len(take)} of its'} {len(failed)} failed job(s)")
     read, unread = [], []
     for r in take:
-        one, src, reason = job_log_read(repo, int(r["id"]), controller, rest)
+        jid = int(r["id"])
+        if not log_read_seconds(deadline, 1):
+            # The budget is spent. A kept copy costs nothing, so it is still served; anything that would need a
+            # read is named unread, with its own command, rather than making a call that cannot finish.
+            kept = job_log_get(repo, jid)
+            if kept is None:
+                unread.append({"job": jid, "why": f"unread: the command's {budget:g} s budget was spent "
+                                                  f"(`glaeda-gh log errors {repo} {jid}` reads this one)"})
+                continue
+            read.append((jid, kept, "cache"))
+            continue
+        one, src, reason = job_log_read(repo, jid, controller, rest, deadline)
         if one is None:
-            unread.append({"job": int(r["id"]), "why": reason})
+            unread.append({"job": jid, "why": reason})
         else:
-            read.append((int(r["id"]), one, src))
+            read.append((jid, one, src))
     if over:
         # Bounded like `run_id_hint`'s own offer: a next step has to be readable to be a next step (95
         # commands, 3001 characters measured on a 100-failed-job run).
@@ -34711,6 +35102,9 @@ def parser() -> argparse.ArgumentParser:
     le.add_argument("--reads", type=reads_cap, default=LOG_ERRORS_RUN_READS, metavar="N",
                     help="given a run id, how many of its failed jobs to read, newest first (default "
                          "%(default)s; the rest are named with their own commands)")
+    le.add_argument("--timeout", "--budget", dest="budget", type=seconds, default=LOG_ERRORS_BUDGET, metavar="S",
+                    help="the whole command's wall clock (default %(default)s); a failed job it cannot reach in "
+                         "time is named with its own command, never waited for silently")
     le.add_argument("--json", action="store_true")
     for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
                                   "on the controller, never REST)"),
@@ -35814,7 +36208,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             if args.kind == "errors":
-                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads)
+                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads,
+                                      budget=args.budget)
             if args.kind == "search":
                 return cmd_log_search(args.repo, args.pattern, args.since, args.job, args.workflow, args.seg,
                                       args.conclusion, args.reads, args.limit, args.json)
