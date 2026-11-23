@@ -28695,12 +28695,13 @@ class LandTest(Base):
         # A pinned land handed to the executor sat 260 min with no outcome: nothing ended it. Still open, re-sent
         # twice, no answer: it stops forward_no_outcome, the requester told, the far host named.
         self.forwarded_row()
-        for _ in range(int(1.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+        for _ in range(int(2.6 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
             if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
                 break
         e = self.q.entries[self.KEY]
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertEqual(e["forwardResent"]["n"], 2)
+        self.assertTrue(e.get("giveUpReforwarded"))  # handed to the current land host once before it gave up
         self.assertIn("handed off again 2 times", e["stop"]["reason"])
         self.assertIn("huge-blue", e["stop"]["reason"])
         self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
@@ -28711,12 +28712,86 @@ class LandTest(Base):
         # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on
         self.forwarded_row()
         self.w.cache.pop(self.KEY, None)
+        self.w.view_state = "BOGUS"  # GitHub's state cannot be read either
         self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_forwarded_land_past_the_give_up_reads_github_and_ends_merged_or_closed_without_a_warning(self):
+        # cosmic-gray, 2026-11-23 07:45Z: ~24 forward_no_outcome warns, for PRs that were merged or closed
+        for state, want in (("MERGED", "merged"), ("CLOSED", "stopped")):
+            self.forwarded_row()
+            self.w.cache.pop(self.KEY, None)
+            self.w.view_state = state
+            self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+            e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+            self.assertEqual(e["state"], want)
+            if state == "CLOSED":
+                self.assertEqual(e["stop"]["code"], "closed")
+            self.assertEqual([c for c in self.w.sent() if "forward_no_outcome" in c[-1]], [])
+            self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)  # read once
+            self.tearDown()
+            self.setUp()
+
+    def test_a_forwarded_open_land_past_the_give_up_is_handed_to_the_current_land_host_once(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_state = "OPEN"
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        before = len(self.handoffs())
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertEqual(len(self.handoffs()), before + 1)
+        self.assertTrue(any(h.get("event") == "forward_reforwarded" for h in e["history"]))
+        self.assertEqual([c for c in self.w.sent() if "forward_no_outcome" in c[-1]], [])
+
+    def test_a_forwarded_land_the_land_host_still_works_is_not_warned_about(self):
+        # leo-workspace#8104: the row was live on cmux-cp-1 when the forwarding host warned
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.q.forward_target_row = lambda e: "judging"
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertTrue(any(h.get("event") == "forward_target_live" for h in e["history"]))
+        self.assertEqual([c for c in self.w.sent() if "forward_no_outcome" in c[-1]], [])
+
+    def test_forward_target_row_reads_the_land_hosts_row_state(self):
+        e = self.forwarded_row()
+        row = json.dumps({"entries": [{"key": e["key"], "state": "stopped", "updated": 1},
+                                      {"key": e["key"], "state": "judging", "updated": 2}]})
+        with mock.patch.object(gg, "land_executor", lambda: ["reach", "cp", "glaeda-gh", "land", "serve"]), \
+                mock.patch.object(self.q, "call", lambda argv, *a: subprocess.CompletedProcess(argv, 0, row, "")) as _:
+            self.assertEqual(self.q.forward_target_row(e), "judging")
+        with mock.patch.object(gg, "land_executor", lambda: None):
+            self.assertEqual(self.q.forward_target_row(e), "")
+
+    def test_the_forward_no_outcome_stops_of_one_pass_go_out_as_one_notice_per_requester(self):
+        e = self.forwarded_row()
+        other = dict(e, key="pr:o/r#2")
+        self.q.forward_give_up_notify([(e, "x"), (other, "y")])
+        said = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(len(said), 1)
+        self.assertIn("2 lands", said[0][-1])
+
+    def test_the_executor_host_is_never_an_ssh_option_or_its_value(self):
+        # cmux#49386: "handed to -o's land queue"; a cluster ending in a value flag takes the next word as its value
+        for command, host in ((["ssh", "-o", "BatchMode=yes", "h", "x"], "h"), (["ssh", "-oBatchMode=yes", "h"], "h"),
+                              (["ssh", "-qo", "A=b", "h"], "h"), (["ssh", "-4o", "A=b", "h"], "h"),
+                              (["reach", "-o", "A=b", "-o", "C=d", "h"], "h"), (["ssh", "-Nf", "-p", "22", "h"], "h")):
+            self.assertEqual(gg.land_forward_name(command), host, command)
+
+    def test_a_forwarded_open_row_recorded_with_an_option_as_its_host_is_forwarded_again_at_once(self):
+        e = self.forwarded_row()
+        e["forwardedTo"] = "-o"
+        self.q.save(e)
+        before = len(self.handoffs())
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(len(self.handoffs()), before + 1)
+        self.assertTrue(any(h.get("event") == "forward_reforwarded" for h in e["history"]))
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
