@@ -25584,9 +25584,58 @@ class LandTest(Base):
         self.assertIn("a push, not a base merge", e["stop"]["reason"])
         self.assertEqual((self.compares(), self.w.explains()), ([], []))
 
+    LF = "f" * 40
+
+    def base_chain(self, head_parents: list | None = None, mid_parents: list | None = None, on_base: dict | None = None,
+                   n: int | None = None) -> None:
+        """The cache shows LB, whose first parent LC is itself a merge on the pin LA (two base merges in a row)."""
+        top = self.LF
+        self.base_merged(parents=head_parents or [LC, top], mb=top)
+        mid = mid_parents or [LA, self.LD]
+        commits = [{"s": LB, "p": head_parents or [LC, top]}, {"s": LC, "p": mid}]
+        self.w.api[f"repos/o/r/compare/{LA}...{LB}"] = json.dumps({"s": "ahead", "n": n or len(commits), "c": commits})
+        for sha in (top, self.LD):
+            ans = (on_base or {}).get(sha, {"s": "ahead", "b": 0})
+            self.w.api[f"repos/o/r/compare/{sha}...main"] = None if ans is None else json.dumps(ans)
+        self.w.api[f"repos/o/r/compare/{top}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
+
+    def test_the_pin_follows_a_run_of_base_merges(self):
+        # hq#17489: 95d7a2428 -> 429b4ab2fc -> 694409d218, the head two base merges past the pin
+        self.pinned_and_waiting()
+        self.base_chain()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual([(h["was"], h["head"], h["merges"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12], 2)])
+        self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])
+        self.assert_merged_at(LB)
+
+    def test_a_run_with_a_commit_pushed_in_it_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_chain(mid_parents=[LA])  # LC is one commit on the pin, not a merge
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_run_with_a_merge_of_a_commit_not_on_the_base_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_chain(on_base={self.LD: {"s": "diverged", "b": 3}})
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("not a merge of main", e["stop"]["reason"])
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_run_whose_commits_were_not_all_listed_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_chain(n=300)
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+
     def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
         self.pinned_and_waiting()
         self.base_merged(parents=[LC, self.LD])
+        self.w.api[f"repos/o/r/compare/{LA}...{LB}"] = json.dumps({"s": "diverged", "n": 5, "c": []})  # no run of merges
         e = self.tick(30)
         self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertEqual(self.compares(), [])
