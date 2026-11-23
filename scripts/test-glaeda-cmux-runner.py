@@ -19252,7 +19252,8 @@ class DedicatedRunnerTest(unittest.TestCase):
         self.assertIn(".local/bin", tool["note"])
         for want in (cr.ROOT_PYTHON, "/usr/bin", "/sbin", "/usr/bin/true", sys.executable):
             self.assertIn(want, checked)
-        self.assertFalse([p for p in checked if p.endswith("/python3") and cr.apple_python(p)], checked)
+        # sys.executable is the test run's own interpreter (the distro /usr/bin/python3 on a Linux CI runner), not one chosen
+        self.assertFalse([p for p in checked if p != sys.executable and p.endswith("/python3") and cr.apple_python(p)], checked)
         self.assertFalse([a for a in doc["actions"][1:] if a.get("applied")], "nothing applied past a blocked toolchain")
 
     def test_a_user_entry_on_a_mini_without_root_python_blocks_naming_the_fix(self) -> None:
