@@ -30572,6 +30572,120 @@ class LandTest(Base):
         self.assertTrue(gg.LAND_STEP_QUOTA.search("shared content-creation cooldown: every lane's creates wait"))
         self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # land_judge's reason: unchanged
 
+    def test_a_gh_quota_pace_is_not_a_merge_refusal_and_waits_for_its_seconds(self):
+        # leo-workspace#8104, 2026-11-23 08:06Z: "gh-quota: refused: content writes are paced until reset (#s; ...)"
+        # six times stopped a land_judge-approved PR merge_refused. A pace parks its row for the seconds it names.
+        self.pr(LA)
+        self.land()
+        real, refused = self.w.run, []
+
+        def paced_merge(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh-quota: refused: content writes are paced until "
+                                                   "reset (45s; next: queue it instead of spending the pause)")
+            return real(argv, timeout, env)
+        self.q.run = paced_merge
+        for n in range(1, gg.LAND_STEP_STOP + 3):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(0 if n == 1 else max(60, e["wakeAt"] - self.t + 1))
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertGreaterEqual(e["wakeAt"], self.t + 40, n)
+            self.assertNotIn("stepFail", e)
+        self.assertEqual(len(refused), gg.LAND_STEP_STOP + 2)
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertEqual(gg.land_quota_said("content writes are paced for 33s more (the login's x)", 1000.0), 1033.0)
+        self.assertEqual(gg.land_quota_said("content writes are paced until reset (300s; y)", 1000.0), 1300.0)
+        # a real refusal (branch rule, review) is not a pace
+        self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
+                                                    "have been met, add the --auto flag"))
+
+    def refuse_merges(self, text: str) -> list:
+        """Every `gh pr merge` the queue sends is refused with TEXT (exit 1); the list of those sent."""
+        real, refused = self.q.run, []
+
+        def run(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", text)
+            if argv[1:3] == ["pr", "view"] and "state,mergeCommit,headRefOid" in argv:  # the read after it: still open
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "mergeCommit": None,
+                                                                        "headRefOid": LA}), "")
+            return real(argv, timeout, env)
+        self.q.run = run
+        return refused
+
+    RED = "land-judge: refused: base_red_excuse.py exit 1: not excused: 'ws-check' has no result"
+
+    def test_a_paced_override_merge_waits_for_its_reset_and_never_stops_on_the_verdict(self):
+        # leo-workspace#9202, 2026-11-23: judged red_not_excused, took override_merge, and the merge was refused
+        # "gh-quota: refused: content writes are paced until reset (#s; ...)" at 11:15, 11:30 and 11:33Z; at 11:35:44Z
+        # the row stopped red_not_excused "3 identical refusals in a row". A pace is the login's: the row waits for
+        # the reset it names, one merge per reset, and its judgments never count toward the stop.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        refused = self.refuse_merges("HTTP 429: gh-quota: refused: content writes are paced until reset (45s; next: "
+                                     "queue it instead of spending the pause)")
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 3):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if n == 1 else e["wakeAt"] - self.t + 1)
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertEqual(e["wait"]["until"], self.t + 45, n)  # the reset it named
+            self.assertGreaterEqual(e["wakeAt"], self.t + 45, n)  # never before it
+            self.assertEqual(len(refused), n)  # one merge per reset
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+
+    def test_a_merge_a_restart_cut_off_is_not_a_refusal_toward_the_stop(self):
+        # leo-workspace#9177, 2026-11-23: a paced override merge (11:33:53Z), the override_merge again (11:36:23Z), a
+        # restart mid-merge (11:41:08Z "restart claimed=merge"), and the judgment after it (11:43:32Z) stopped the row
+        # red_not_excused "3 identical refusals in a row". The judgment after a cut-off step repeats the one that took it.
+        paced = "gh-quota: refused: content writes are paced until reset (45s; next: queue it instead)"
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.refuse_merges(paced)
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 2):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if not e.get("wakeAt") else e["wakeAt"] - self.t + 1)
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            # At the reset the daemon judges again (the pace's own exemption spent), claims the merge, and restarts.
+            e.pop("stepQuotaParked", None)
+            e.update(state="acting", action={"kind": "merge", "claimedAt": self.t, "head": LA}, wait=None,
+                     wakeAt=None)
+            self.q.save(e)
+            self.q = self.queue()
+            self.refuse_merges(paced)
+            e = self.q.entries[self.KEY]
+            self.assertEqual((e["state"], e["history"][-1]["event"], e["history"][-1].get("claimed")),
+                             ("queued", "restart", "merge"), n)
+        e = self.tick()
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertEqual((e["streak"] or {}).get("count"), 1)
+
+    def test_a_refused_override_merge_still_stops_at_the_third_verdict_and_names_the_merge(self):
+        # Not a pace: the identical-refusal stop is unchanged, and it names the merge that kept failing, not only the
+        # verdict the override answered.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        why = "To have the pull request merged after all the requirements have been met, add the --auto flag."
+        refused = self.refuse_merges(why)
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 1):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if n == 1 else e["wakeAt"] - self.t + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "red_not_excused"))
+        self.assertEqual(len(refused), gg.LAND_STREAK_STOP - 1)
+        self.assertTrue(e["stop"]["reason"].startswith(
+            f"{gg.LAND_STREAK_STOP} identical refusals in a row (its merge was refused {gg.LAND_STREAK_STOP - 1} "
+            f"times in a row at {LA[:12]}; last: {why}"), e["stop"]["reason"])
+        self.assertIn("not excused", e["stop"]["reason"])
+
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
         self.land()
