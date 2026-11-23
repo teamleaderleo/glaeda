@@ -1350,6 +1350,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "e086936669eca0a96cc84a68635f8bbb04fc00fe7719a4eab175b8872bc76481",
     "08961a67d6469c324c8483af59fc8506a0f971ba2d3f120623af7c9beddc928e",
     "83892d97432ccb27614d9b1eafde53333532deaa7e42e1febe984bd08ac24377",
+    "0ac8d18181eb9c21066f730bc52650d2913ea9b6562c616a58b7070e86877a42",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2740,6 +2741,16 @@ def running_job_hours() -> float:
                 oldest = max(oldest, secs / 3600)
         _RUNNING_JOB_HOURS = oldest
     return _RUNNING_JOB_HOURS
+
+
+# On a devbox (a person's Mac, where agents' try builds and live checks build), a per-checkout Xcode build used this
+# recently is about to be run or rebuilt on: pressure's short idle window does not reach it (2026-11-23 14:01:48Z: a
+# pressure pass deleted DerivedData/cmux-try48231, 14.5 GB, 0.1 h after a live check's build finished, while caches
+# and mirrors still held space). A fleet mini's build caches keep no window (BUILD_CACHES_UNWINDOWED; Leo,
+# 2026-11-18: "these build caches, if they're not being used, they're not useful"). Process, open-file and socket
+# evidence still hold an older build a run still uses.
+FRESH_BUILD_HOURS = 3.0
+FRESH_BUILD_FAMILY_IDS = frozenset({"xcode-derived-data"})
 
 
 def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int | None]:
@@ -5914,7 +5925,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, platform="macos"),
+               build_output=True, platform="macos",
+               min_idle_hours=FRESH_BUILD_HOURS if role == "devbox" else 0.0),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
@@ -15351,6 +15363,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             return (0, math.inf, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
             return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
+        if ACTIVITY_MODE == "pressure" and i.family in FRESH_BUILD_FAMILY_IDS:
+            # a person's or agent's build costs its owner a cold rebuild: after the caches and mirrors that are due
+            return (-0.25, i.idle_hours, i.bytes, 0)
         return (0, value(i, families[i.family]), 0, 0)
     for i in sorted(items, key=order, reverse=True):
         if i.verdict != "reclaimable":

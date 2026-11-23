@@ -8229,8 +8229,10 @@ def exclusive_claim(capacity_dir: Path) -> str | None:
         for waiter in admission_waiters(capacity_dir):
             if waiter.get("class") == EXCLUSIVE_CLASS:
                 return f"a signing job waits for this mini to drain ({waiter.get('who') or 'pid ' + str(waiter['pid'])})"
+    # every token the exclusive class takes (CLASS_COST), not the gateway tokens alone: six ordinary gateway jobs on
+    # six gateway runners hold all of those at once (glaeda#1974 review F1), and they are no signing job
     if all((capacity_dir / f"{token}.token").exists() and not probe(capacity_dir / f"{token}.token")
-           for token in GATEWAY_TOKENS):
+           for token in CLASS_COST[EXCLUSIVE_CLASS][1]):
         return "a signing job holds this mini (every unit and token)"
     return None
 
