@@ -37284,6 +37284,37 @@ class GitHubSaidTest(unittest.TestCase):
         self.assertEqual(gg.gh_said(None, default="no message"), "no message")
         self.assertEqual(gg.gh_said({"type": "RATE_LIMITED"}), "RATE_LIMITED")
 
+    def test_an_exception_carrying_githubs_words_drops_the_id_where_it_is_raised(self) -> None:
+        """describe() hands a WatchError's text on as written, so a refused `gh api` child's stderr tail, a
+        broker's forwarded refusal and a land executor's reason all reach a person through one constructor.
+
+        Detector: test_every_github_message_is_read_through_the_chokepoint (widened here to count
+        `.get("message", ...)`, the shape that let the REST refusal body back out)."""
+        self.assertEqual(gg.describe(gg.WatchError(f"gh api /repos/o/r: gh: {SAID_RAW} (HTTP 403)")),
+                         f"gh api /repos/o/r: gh: {SAID_SAFE} (HTTP 403)")
+        self.assertNotIn(SAID_ID, str(gg.WatchError(f"upstream: lane-gh: {SAID_RAW}")))
+        self.assertIn(SAID_LOGIN, str(gg.WatchError(f"upstream: lane-gh: {SAID_RAW}")))
+        # the other direction: a message with no identifier in it is raised byte for byte, words and all
+        for clean in ("rest: HTTP 404", "land executor: not_executor: this host is not the executor",
+                      "search was not answered: {\"type\": \"NOT_FOUND\"}", "more than 100 check runs"):
+            with self.subTest(clean=clean):
+                self.assertEqual(str(gg.WatchError(clean)), clean)
+
+    def test_a_stored_cache_error_and_the_refresh_log_drop_the_id_at_their_sink(self) -> None:
+        """`error` is the one cache field GitHub's sentence reaches and every surface that prints an entry prints
+        it; the refresh log is read back by `budget` and `status`. Both sanitize where they are written, so an
+        upstream host that stored an id cannot propagate it here either."""
+        self.assertEqual(gg.gh_sanitize(f"HTTP 403 {SAID_RAW}"), f"HTTP 403 {SAID_SAFE}")
+        self.assertEqual(gg.gh_sanitize("HTTP 404 Not Found"), "HTTP 404 Not Found")  # unchanged, not swallowed
+
+    def test_a_write_refusals_own_top_level_message_drops_the_id_too(self) -> None:
+        """write_failure sanitized each per-error message but formatted the body's own one itself; a 403 on a
+        write is exactly where a spent quota speaks."""
+        line = gg.write_failure({"kind": "comment", "repo": "o/r", "number": 1}, 403, {"message": SAID_RAW})
+        self.assertNotIn(SAID_ID, line)
+        self.assertIn(SAID_LOGIN, line)
+        self.assertIn("403", line)  # the failing operation and its status are still named
+
     def test_every_github_message_is_read_through_the_chokepoint(self) -> None:
         """One function, not N regex strips: a site that reads "message" out of GitHub's answer and formats it
         itself is how the id came back, so every such site names gh_said on its own line. gh_said's own body is
@@ -37295,7 +37326,10 @@ class GitHubSaidTest(unittest.TestCase):
                 inside = True
             elif inside and line.startswith(("def ", "class ")):
                 inside = False
-            if inside or not re.search(r'\["message"\]|\(\s*"message"\s*\)', line):
+            # #2582's own detector matched only ["message"] and ("message"), so `.get("message", "")` -- the REST
+            # refusal body in Reader.get, the one that printed "HTTP 403 ... for user ID NNNN" -- slipped past it and
+            # the id came back. Every way of reading the field counts now, default argument or not.
+            if inside or not re.search(r'\["message"\]|\(\s*["\']message["\']\s*(?:,[^)]*)?\)', line):
                 continue
             if re.fullmatch(r'\s*if e\.get\("message"\):.*', line):  # a test for one, then the fields instead
                 continue
