@@ -69,6 +69,8 @@ gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
+# Nor may a lane VM's own broker name (its lane-gh client mark) rename the host every test reads update.json for.
+gg.LANE_VM_NAME_FILE = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-lane-vm-name-{os.getpid()}"
 # Nor may a host's own pacer hear about the tests' secondary 403s.
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
 # Nor may a test's secondary 403 write the host's own login latch marks (latch_write_secondary), or a host's marks or
@@ -8950,6 +8952,7 @@ sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
 gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
+gg.LANE_VM_NAME_FILE = Path(sys.argv[3]) / "no-lane-vm-name"
 gg.head_runs_get = lambda repo, paths, budget=0: {p: {"total_count": 0, "workflow_runs": []} for p in paths}
 gg.APP_POOL_DIR = Path(sys.argv[3]) / "no-app-pool"
 """
@@ -18933,6 +18936,25 @@ class DaemonPolicyTest(Base):
         gg.DAEMON_CONFIG.unlink()
         with mock.patch.object(gg.socket, "gethostname", return_value="Lane-A.local"):
             self.assertEqual(gg.daemon_policy()["restShare"], 0.25)
+
+    def test_a_lane_vm_is_named_as_its_broker_names_it_over_a_cloned_update_json(self) -> None:
+        """fs-agent-lane-12, 2026-11-23: a slot cloned from fs-agent-lane-11 kept its update.json, so land requesters
+        read fs-agent-lane-11/SESSION and the broker refused every hand-off as another VM's session."""
+        mark = Path(self.tmp.name) / "lane-gh-client"
+        self.addCleanup(setattr, gg, "LANE_VM_NAME_FILE", gg.LANE_VM_NAME_FILE)
+        gg.LANE_VM_NAME_FILE = mark
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "fs-agent-lane-11", "ring": "stable"}))
+        self.assertEqual(gg.policy_host(), "fs-agent-lane-11")  # no mark: not a lane VM, update.json names it
+        mark.write_text("fs-agent-lane-12\n")
+        self.assertEqual(gg.policy_host(), "fs-agent-lane-12")
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "land-stops-b"}, clear=False):
+            self.assertEqual(gg.land_requester(None), "fs-agent-lane-12/land-stops-b")
+        gg.FLEET_POLICY.write_text(json.dumps({"default": {"restShare": 0.0},
+                                               "hosts": {"fs-agent-lane-12": {"restShare": 0.25}}}))
+        self.assertEqual(gg.daemon_policy()["restShare"], 0.25)
+        for junk in ("", "-o", "two words", "a/b", "x" * 80):  # not a host name: update.json still names it
+            mark.write_text(junk)
+            self.assertEqual(gg.policy_host(), "fs-agent-lane-11", junk)
 
     def test_the_shipped_fleet_policy_keeps_every_daemon_within_the_account_share(self) -> None:
         doc = json.loads((ROOT / "config" / "gh-daemon.json").read_text())
