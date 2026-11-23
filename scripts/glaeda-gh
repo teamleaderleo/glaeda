@@ -32543,6 +32543,32 @@ def cmd_post_one_call(kind: str, args: argparse.Namespace) -> int:
     return cmd_gh(gh)
 
 
+def post_route_missing() -> str | None:
+    """Why the daemon here has no way to make a queued write, or None when it has one: the lane-gh broker on a lane VM
+    (lane_vm_poster), else this host's login (`gh auth token`, what post_one sends with). Asked at accept time, so a
+    write is refused at once instead of answering "queued" and never going out (the class "accepted then dropped":
+    fs-agent-lane-10 2026-11-23, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1" for good)."""
+    if lane_vm_poster():
+        return None
+    try:
+        gh_token()
+    except WatchError as error:
+        return (f"the daemon here has no write route: no GitHub login ({describe(error)}) and no lane-gh broker "
+                f"({LANE_GH_CMD} with the lane VM gh chain)")
+    return None
+
+
+def post_unrouted(item: dict, missing: str) -> int:
+    """Refuse a write this host cannot make: nothing queued, its body kept, the command that makes it named. Exit 3."""
+    path = unsent_dir() / f"{item['id']}.md"
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(item["body"], encoding="utf-8")
+    print(f"glaeda-gh: not queued: {missing}; sign gh in here (gh auth login) or post from a host that has a login "
+          f"(its body is kept at {path})", file=sys.stderr)
+    return 3
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
     try:
@@ -32556,6 +32582,9 @@ def cmd_post(args: argparse.Namespace) -> int:
         return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
     if lane_vm_poster() and broker_post_args(item) is None:
         return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
+    missing = post_route_missing()
+    if missing:
+        return post_unrouted(item, missing)
     with contextlib.suppress(Exception):
         gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
     write_json(outbox_dir() / f"{item['id']}.json", item)

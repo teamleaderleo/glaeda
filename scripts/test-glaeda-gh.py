@@ -97,6 +97,10 @@ gg.CONTENT_PAUSE_NAMES = ()
 os.environ.pop(gg.CONTENT_PAUSE_ENV, None)
 # Nor is a test run on a lane VM a lane VM's daemon (lane_vm_poster): only a test that names a chain has one.
 os.environ.setdefault("GLAEDA_GH_LANE_CHAIN", os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-chain-{os.getpid()}"))
+# Nor may this host's own login (or its lack of one: a lane VM's gh has no token) decide whether a test's post is
+# accepted: every test host has a write route unless the test says otherwise. PostRouteTest asks the real one.
+POST_ROUTE_MISSING = gg.post_route_missing
+gg.post_route_missing = lambda: None
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
 
 
@@ -15838,6 +15842,44 @@ class PostTest(unittest.TestCase):
             self.assertEqual(gg.cmd_post(args), 3)
         self.assertIn("glaeda-gh post review o/r#7", err.getvalue())
         self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
+    def test_a_post_with_no_write_route_is_refused_at_accept_never_queued(self) -> None:
+        # The class "accepted then dropped": a lane VM's daemon without the broker poster answered "queued" and
+        # never posted (`last attempt: gh auth token exited 1`). With no login and no broker, refuse at once.
+        args = gg.parser().parse_args(["post", "pr", "o/r", "--head", "lane/x", "--base", "main",
+                                       "--title", "t", "--body", "b"])
+        err = io.StringIO()
+        with mock.patch.object(gg, "post_route_missing", POST_ROUTE_MISSING), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(gg, "gh_token", side_effect=gg.WatchError("gh auth token exited 1; is gh signed in?")), \
+                mock.patch.object(gg, "daemon_running", side_effect=AssertionError("queued")), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_post(args), 3)
+        said = err.getvalue()
+        self.assertIn("not queued: the daemon here has no write route", said)
+        self.assertIn("gh auth token exited 1", said)
+        self.assertIn("lane-gh broker", said)
+        self.assertNotIn("queued as", said + out.getvalue())
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")) if gg.outbox_dir().is_dir() else [], [])
+
+    def test_a_write_route_is_a_login_or_the_lane_vm_broker(self) -> None:
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("a lane VM asks no login")):
+            self.assertIsNone(POST_ROUTE_MISSING())  # the broker is the route: the post works there
+        with mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(gg, "gh_token", return_value=TOKEN):
+            self.assertIsNone(POST_ROUTE_MISSING())
+
+    def test_a_lane_vm_post_is_queued_through_the_broker_route(self) -> None:
+        args = gg.parser().parse_args(["post", "comment", "o/r#7", "--body", "b"])
+        with mock.patch.object(gg, "post_route_missing", POST_ROUTE_MISSING), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_post(args), 0)
+        self.assertIn("queued as", out.getvalue())
+        self.assertEqual(len(list(gg.outbox_dir().glob("*.json"))), 1)
 
     def test_lost_app_response_looks_up_with_original_app_without_another_post(self):
         item = self.queue("pr", "teamleaderleo/glaeda", "--head", "lane/recover", "--base", "main",
