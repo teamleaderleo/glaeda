@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import hashlib
 import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -25,8 +26,18 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-gg = importlib.machinery.SourceFileLoader("glaeda_gh_intent", os.fspath(SCRIPTS / "glaeda-gh")).load_module()
-gd = importlib.machinery.SourceFileLoader("glaeda_disk_intent", os.fspath(SCRIPTS / "glaeda-disk")).load_module()
+
+
+def load_script(name: str, path: Path):
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+gg = load_script("glaeda_gh_intent", SCRIPTS / "glaeda-gh")
+gd = load_script("glaeda_disk_intent", SCRIPTS / "glaeda-disk")
 
 def line(*argv: str) -> str:
     """ARGV as the layer prints it: shell-quoted, so it runs when pasted (`'o/r#1'`: `#` starts a comment)."""

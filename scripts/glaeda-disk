@@ -18459,9 +18459,11 @@ def install_intent(prog: str) -> None:
             import importlib.util
             spec = importlib.util.spec_from_file_location("intent", path)
             module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module  # registered before it runs, as a normal import does
             spec.loader.exec_module(module)
             module.install(prog)
         except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            sys.modules.pop("intent", None)
             continue
         return
 
