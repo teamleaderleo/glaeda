@@ -13918,7 +13918,12 @@ def land_redact(text: Any) -> str:
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
-    text = " ".join(str(text or "").split())
+    """TEXT on one line, cut to LIMIT, with GitHub's account id out of it (land_redact).
+
+    Every land string a person reads is cut here -- a judge's refusal reason, an escalation notice, a peer's
+    "why" -- and a judge quotes gh's own refusal in its reason ("quota: gh: API rate limit already exceeded for
+    user ID NNNN"), so this is where that id stops. The substitution is idempotent, so clean text is unchanged."""
+    text = land_redact(" ".join(str(text or "").split()))
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
