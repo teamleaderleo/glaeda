@@ -23809,6 +23809,69 @@ class LandTest(Base):
             self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
                                "readAt": self.t, "rollup": {"nodes": self.NODES}}
 
+    def test_a_job_that_ended_during_the_pass_frees_its_worker_in_the_same_pass(self):
+        """A finished job held its worker until the next reap (the start of the next pass, or a refill), so a pass that
+        ran for seconds read "every worker busy" for rows a worker had already freed for, and its land-pool line said
+        busy 24 of 24 while those workers were judging nothing (2026-11-22/23 23:50-00:25Z: busy 24 every line,
+        judgments 35 % of the worker time). The row that reaches judge() takes the worker that freed."""
+        self.five_snapped()
+        pool = self.pooled(2)
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 2)
+        pool.handed[0][1].finished = True  # its judgment ends while the pass is still going: no reap since
+        waiting = [k for k in self.q.entries if k not in self.q.jobs]
+        with self.q.lock:
+            self.q.pass_one(waiting[0], None, None)
+        self.assertEqual(len(pool.handed), 3, "the freed worker judges the next row in this pass")
+        self.assertEqual(len(self.q.jobs), 2)
+        self.assertNotIn(pool.handed[0][0], self.q.jobs)
+
+    def test_rows_waiting_on_a_snapshot_leave_a_freed_worker_for_a_ready_judgment(self):
+        """Refill hands a worker that frees between passes to the rows the pass left for one (next_up), at most
+        LAND_REFILL_TRIES per free worker. Rows whose snapshot the daemon has not read yet were listed in the pass's
+        order with the ready ones, so N of them ahead spent every try on starting (or failing to start) a snapshot
+        wait, and the worker stayed free until the next pass while a ready judgment waited behind them. A row ready to
+        judge now goes first; the others keep their order behind it."""
+        pool = self.pooled(1)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"  # no snapshot: a judgment would first wait for the daemon's read
+        self.pr(LA, key="pr:o/r#9")
+        self.w.cache["pr:o/r#9"]["fp"] = "F"
+        self.snaps["pr:o/r#9"] = {"schema": gg.ROLLUP_SCHEMA, "key": "pr:o/r#9", "head": LA, "fp": "F",
+                                  "complete": True, "readAt": self.t, "rollup": {"nodes": self.NODES}}
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        for n in (1, 2, 3, 4, 5):
+            self.land(f"o/r#{n}")
+        self.t += 60
+        self.land("o/r#9")  # queued last: behind every snapshot wait in the pass's order
+        self.tick()
+        self.assertIn("pr:o/r#9", self.q.next_up)
+        self.assertEqual(self.q.next_up[0], "pr:o/r#9", "a row ready to judge is first for a worker that frees")
+        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+        self.q.refill(self.t + 1)
+        self.assertEqual(pool.keys(), ["pr:o/r#9"])
+
+    def test_refill_frees_the_worker_of_a_finished_job_with_no_row_listed(self):
+        """A refill with no row left for a worker still reaps: the land-pool line and the refresh reads count the
+        workers that are judging, not the jobs that ended since the last pass."""
+        pool = self.pooled(1)
+        self.five_snapped()
+        self.land("o/r#1")
+        self.tick()
+        self.assertEqual(len(self.q.jobs), 1)
+        pool.handed[0][1].finished = True
+        self.q.next_up = []
+        self.q.refill(self.t + 1)
+        self.assertEqual(self.q.jobs, {})
+
     def test_a_land_judged_hours_ago_goes_before_lands_queued_since(self):
         # huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (judged hours before)
         # sat behind every PR queued since and was not judged between two restarts.
