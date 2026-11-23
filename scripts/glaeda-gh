@@ -23031,7 +23031,9 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
     pending and how long each has been (the age is the load-bearing part -- "pending" alone reads the same at 20 s and
-    at 14 min), that their siblings have finished when they have, and a next step for a check that is not moving.
+    at 14 min), that their siblings have finished when they have, that a required check has already failed and so
+    decided it when one has, and a next step for whichever check the reader should look at: the one that decided it if
+    any did, else the one that is not moving.
 
     None while there is nothing to say: the state has not been still that long, the target is not a PR (a run's status
     is its own state), or nothing is pending. Never the blind read of glaeda#2316, which is the opposite case: there
@@ -23074,19 +23076,31 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
              and not groups["held"] else "")
     # The rollup can already be red while a `--until done` wait goes on (it ends on the checks, not on the rollup):
     # cmux#48834 said PENDING against a rollup FAILURE for 25 minutes and never said the two were not the same test.
+    # A required check that has already failed decided this wait, whatever its siblings are still doing.
+    # teamleaderleo/glaeda#2564 (3700 s) said "not moving: Verify / scripts pending 11m" on every progress line while
+    # `ci-status / Require every Verify job` had already failed: the words named the slowest check instead of the
+    # deciding one, so a reader kept waiting on a verdict that was already in. `required` is on every check this wait
+    # has already read, so naming it costs no extra read, and this changes no exit code and no verdict mapping.
+    decided = [c for c in groups["failed"] if c.get("required")]
+    gate = (f" {label(decided[0])} is required and has already failed"
+            + (f" (and {len(decided) - 1} more required check(s) with it)" if len(decided) > 1 else "")
+            + ": the decision is already in, and nothing still pending can change it."
+            if decided else "")
     rollup = str(data.get("checkState") or "").upper()
     disagrees = (f" GitHub's rollup already says {rollup}; this wait ends on the checks it counts, not on the rollup, "
                  "so a red there does not end it." if rollup in COUNT_BAD else "")
     stands = (f"{len(pending)} of {len(data['checks'])} checks are still pending" if pending
               else f"every one of the {len(data['checks'])} checks it can read has finished")
     lines = [f"glaeda-gh: WARNING: {key_name(key)} has not changed for {span(unchanged)}: "
-             f"{stands}{siblings}.{alone}{disagrees}"]
+             f"{stands}{siblings}.{gate}{alone}{disagrees}"]
     if pending:
         lines.append(f"  not moving: {named}{more}")
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    lines.append(f"next: {stuck_next(oldest[0], key) if pending else unseen_next(data, key)}")
+    nxt = (stuck_next(decided[0], key) if decided
+           else stuck_next(oldest[0], key) if pending else unseen_next(data, key))
+    lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
 

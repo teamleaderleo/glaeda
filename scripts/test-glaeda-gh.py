@@ -35870,6 +35870,110 @@ class WaitStateNotMovingTest(Base):
                          f"and the state it moved to, once: {done.stderr!r}")
         self.assertEqual(len(lines), 2, f"nothing else: {done.stderr!r}")
 
+class GateAlreadyDecidedTest(Base):
+    """teamleaderleo/glaeda#2564, 2026-11-23: 3700 s of a wait whose every progress line said
+
+        glaeda-gh: WARNING: teamleaderleo/glaeda#2564 has not changed for 11m: ...
+          not moving: Verify / scripts pending 11m (since 00:35:24Z)
+        next: gh run view 45089631085 -R teamleaderleo/glaeda
+
+    while `ci-status / Require every Verify job` -- a required check -- had already failed. The verdict was in, and
+    the words named the slowest thing in the data instead of the deciding thing, so a reader kept waiting on a
+    decision that had already been made. `required` is on every check the wait has already read, so this costs no
+    extra read; it changes no exit code and no verdict mapping (both pinned below)."""
+
+    BEGAN = 1764000000.0
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.BEGAN = float(int(time.time()))
+
+    def pending(self, name: str = "scripts", workflow: str | None = "Verify", run: int = 45089631085) -> dict:
+        suite = {"workflowRun": {"databaseId": run, "workflow": {"name": workflow, "databaseId": 9}}}
+        return {**check_run(name, "IN_PROGRESS", None), "databaseId": 77,
+                "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.BEGAN - 660)),
+                "checkSuite": suite}
+
+    def gate(self, required: bool = True, conclusion: str = "FAILURE") -> dict:
+        """`ci-status / Require every Verify job`, the check whose failure is the whole verdict."""
+        return {**check_run("Require every Verify job", "COMPLETED", conclusion), "databaseId": 88,
+                "isRequired": required,
+                "checkSuite": {"workflowRun": {"databaseId": 45089999999,
+                                               "workflow": {"name": "ci-status", "databaseId": 11}}}}
+
+    def entry(self, checks: list[dict]) -> dict:
+        data = gg.parse_pr(pr_node(2564, rollup="FAILURE", checks=checks))
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#2564"),
+                      {"key": "pr:o/r#2564", "fetchedAt": self.BEGAN, "dataAt": self.BEGAN,
+                       "data": data, "error": None})
+        return gg.read_cache("pr:o/r#2564")
+
+    def note(self, checks: list[dict]) -> str:
+        said = gg.stuck_note("pr:o/r#2564", self.entry(checks), 660, now=self.BEGAN)
+        self.assertIsNotNone(said, "a pending check and a still state: the diagnosis exists")
+        return said
+
+    def test_2564_a_failed_required_gate_is_named_as_having_decided_it(self) -> None:
+        note = self.note([check_run("fast-checks"), self.pending(), self.gate()])
+        self.assertIn("ci-status / Require every Verify job is required and has already failed", note)
+        self.assertIn("the decision is already in, and nothing still pending can change it", note)
+
+    def test_the_next_step_is_the_check_that_decided_not_the_slowest_one(self) -> None:
+        """The measured run's `next:` was the pending check's run. The reader needs the one that failed."""
+        note = self.note([check_run("fast-checks"), self.pending(), self.gate()])
+        last = note.splitlines()[-1]
+        self.assertEqual(last, "next: gh run view 45089999999 -R o/r")
+        self.assertNotIn("45089631085", last, "the slowest pending sibling is not the step any more")
+        self.assertNotIn("glaeda-gh wait", last,
+                         "docs/handbook/wait-that-cannot-end.md: a next: never names this same wait again")
+
+    def test_a_failure_nothing_requires_claims_no_decision(self) -> None:
+        """A red that gates nothing has not decided anything: `--until done` ends on the checks it counts."""
+        note = self.note([check_run("fast-checks"), self.pending(), self.gate(required=False)])
+        self.assertNotIn("the decision is already in", note)
+        self.assertNotIn("has already failed", note)
+        self.assertEqual(note.splitlines()[-1], "next: gh run view 45089631085 -R o/r",
+                         "with nothing decided, the step is still the check that is not moving")
+
+    def test_a_required_check_that_passed_or_is_pending_decides_nothing(self) -> None:
+        for name, checks in (("passed", [self.pending(), self.gate(conclusion="SUCCESS")]),
+                             ("pending", [self.pending(), {**self.gate(), "status": "IN_PROGRESS",
+                                                            "conclusion": None}])):
+            with self.subTest(gate=name):
+                note = self.note([check_run("fast-checks")] + checks)
+                self.assertNotIn("the decision is already in", note)
+
+    def test_more_than_one_failed_required_check_is_counted_not_listed(self) -> None:
+        second = {**self.gate(), "name": "Require every Proof job", "databaseId": 89}
+        note = self.note([check_run("fast-checks"), self.pending(), self.gate(), second])
+        self.assertIn("is required and has already failed (and 1 more required check(s) with it)", note)
+
+    def test_it_changes_what_the_wait_says_and_never_what_it_returns(self) -> None:
+        """A naming fix: the same data takes the same verdict and the same exit code it took before."""
+        checks = [check_run("fast-checks"), self.pending(), self.gate()]
+        data = gg.parse_pr(pr_node(2564, rollup="FAILURE", checks=checks))
+        sha = str(data.get("headRefOid") or "")
+        self.assertIsNone(gg.verdict("pr", data, "done", sha, now=self.BEGAN),
+                          "a check is still pending: `--until done` has no verdict yet, as before")
+        self.assertEqual(gg.verdict("pr", gg.parse_pr(pr_node(2564, rollup="FAILURE",
+                                                             checks=[check_run("fast-checks"), self.gate()])),
+                                    "done", sha, now=self.BEGAN), gg.EXIT_FAIL,
+                         "and once nothing is pending, the failed gate is a plain red: exit 1, unchanged")
+
+    def test_the_line_rides_with_the_state_it_diagnoses_and_is_said_once(self) -> None:
+        entry = self.entry([check_run("fast-checks"), self.pending(), self.gate()])
+        req = gg.wait_request("pr", "o/r#2564", "done", 1800.0, False, False, None, True, gg.RESCUE_GRACE)
+        req["began"] = self.BEGAN
+        seen, said = {}, []
+        for i in range(1, 14):
+            line = gg.progress_update(seen, req, entry, self.BEGAN + i * gg.WAIT_PROGRESS_EVERY)
+            if line is not None:
+                said.append(line)
+        self.assertEqual(len(said), 2, f"one state, one diagnosis, then quiet: {said}")
+        self.assertIn("the decision is already in", said[1])
+        self.assertNotIn("the decision is already in", said[0], "the first line is the state, exactly as before")
+
+
 class PrintedTargetNotationTest(unittest.TestCase):
     """The notation this tool prints for a target is accepted back as one.
 
