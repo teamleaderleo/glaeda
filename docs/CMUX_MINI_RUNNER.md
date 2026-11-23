@@ -1821,7 +1821,8 @@ in at the producer's root. So one root job per root per mini:
   `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
-  display worker and leaves its PNG archive in fleet storage); job-started refuses any other job at once. Its gate is never held
+  display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which
+  submits the cmux Dev device-app build `try.sh` reuses); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
   Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
@@ -2006,6 +2007,46 @@ A symlinked entry is removed, never followed.
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
+
+## 2h0. Gateway and small runners are LaunchDaemons (ROLE_DAEMON)
+
+Leo, 2026-11-23, after cmuxs-mac-mini-5 lost its login session at 15:40Z and all 17 of its runners went down:
+"prevent these in the future across all". A `gui/<uid>` LaunchAgent ends with the login session. On every host,
+gui ones included, `glaeda-cmux-runner` therefore installs a gateway runner (`gatewayRunners`,
+`glaeda-gateway-xcode-*`) and a small runner (`smallRunners`, `glaeda-small-xcode-*`) as the `--headless` system
+LaunchDaemon: `UserName` is the runner user, and the program is the root-owned supervisor. A logout leaves them
+running. Their jobs need no Aqua session. Gateway jobs are thin cmux-ci clients. Small jobs are size,
+web-validation, comment, guard-status, synthetic probes and `codesign --verify`, and none of them launches an app or a
+simulator. Every other role stays a LaunchAgent: pool, root, side, fast, sim, std, gui, session, nightly, trusted and
+dedicated runners. Their jobs need the console's Aqua session for `launchctl asuser`, simctl (a system daemon finds
+no CoreSimulatorService), XCUITest and captures. A poolUser runner is also left out, because it has no sudo.
+`GLAEDA_RUNNER_ROLE_DAEMON=0` stops new promotions, but a runner whose receipt already says headless stays headless.
+
+A fleet mini's sudo asks for a password, and an apply has no tty. So the root part is one script,
+`scripts/glaeda-runner-daemon-root`, which an origin runs through `fleet-sudo`:
+
+1. `glaeda-cmux-runner-fleet --apply --hosts HOST` keeps each such runner as the LaunchAgent it is. It stages the
+   daemon plist at `~/.local/state/glaeda/cmux-runner/instance-K/daemon.plist` and fails on a `root-step` action
+   whose note ends with the command to run.
+2. `{ echo 'set -- cmux K ...'; cat scripts/glaeda-runner-daemon-root; } | fleet-sudo HOST -f -` runs from an
+   origin's glaeda checkout on main. It accepts a staged plist only when it is exactly that runner's daemon: the
+   label, `UserName`, the supervisor with this runner's directory and logs, and a fixed key list with no
+   `StandardOutPath` and nothing that runs as root. It then installs the plist and the supervisor as root and loads
+   the daemon. It also writes `/etc/sudoers.d/glaeda-runner-daemons` (checked with `visudo -c`), which holds that
+   label's exact `launchctl bootstrap/bootout/enable/print/kickstart system/<label>` commands and the plist's
+   `rm -f`. A loaded daemon whose plist changed is reloaded only while its runner has no job.
+3. The supervisor waits while the LaunchAgent's listener runs. The next apply boots that agent out only while the
+   runner is idle, which it checks with its listeners frozen, and removes the agent plist. A busy runner drains
+   instead, and the apply after the job moves it. When the daemon is not loaded yet, a relabel waits for the move.
+4. Read back with `launchctl print system/com.teamleaderleo.glaeda.cmux-runner.K`. mini-health reads the daemon
+   there and kickstarts it with `sudo -n`, which the drop-in allows.
+
+After the root step, the installer can relabel and restart the runner without a password. A change to a daemon's
+plist or to the supervisor needs the root step again; the apply keeps the running service and names the step. A
+daemon plist names no log path, because launchd would open it as root in a directory the user can write. The
+supervisor opens `~/Library/Logs/glaeda-cmux-runner-K.log` and `.err` itself, as the user. An uninstall follows the
+receipt and removes the daemon with the drop-in's commands. A rollback to LaunchAgents is a
+`GLAEDA_RUNNER_ROLE_DAEMON=0` apply after the daemon is booted out and its plist removed.
 
 ## 2h1. The gui and session runners run in the console session
 
@@ -2537,7 +2578,8 @@ It acts only where all of the following hold. Otherwise it reports and changes n
 - `/Library/Application Support/cmux-fleet-ops` already exists, because a root install made it.
 - The host is not reserved. The pass reads `~/.local/share/glaeda/fleet-reservations.json`
   (`glaeda-fleet-reservations/v1`) from the home of the user who owns `/Users/Shared/cmux-build-fleet`. A list that
-  is missing, unreadable, or past its own `expires` counts as reserved. So does an active entry naming this host
+  is missing or unreadable counts as reserved; one past its own `expires` is released, and holds only by an entry
+  still live by its own `from`/`until`. So does an active entry naming this host
   (its machine name or the host in `~/.config/glaeda/update.json`, plus the list's aliases), and so does an active
   `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
   bytes installed are the pinned ones.
