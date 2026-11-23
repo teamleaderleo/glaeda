@@ -34,6 +34,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
     glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
+                                                        OWNER/REPO#N instead: a comment on that PR
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
     glaeda-gh budget [--json] [--local]                 who spent the login's quota this hour, per host
@@ -802,6 +803,16 @@ STALE_VALVE_COOLDOWN = 1800
 # valve answering "one_key" every tick, and a person running `glaeda-gh restart` each time. Above 3963 s, which the
 # 11-18 incident's rule was made for, and below the hours a person waited.
 STALE_ONE_KEY_MAX = 2 * 3600
+# And one key is a few keys: past this many waited keys over STALE_DATA_AFTER, one fresh waited key is no reason to hold
+# the valve. cmux-cp-1, 2026-11-22 19:15-20:19Z: 181 of 318 waited PRs past the bound, "backlog: 263 pr reads stored",
+# the valve answering "one_key" every tick for 64 minutes (21 repeats held) while a person ran `glaeda-gh restart`.
+STALE_ONE_KEY_COUNT = 3
+# When each waited key's wait began (Daemon.waited_since), kept in this file so a restart does not start the stale clock
+# over. A land's waited watch carries no waitBegan, so every restart set its blocked time to zero: cmux-cp-1,
+# 2026-11-22 20:19Z, `glaeda-gh restart` "cleared" a FIRE at 1,823 s, and nine minutes later 223 of 346 waited PRs still
+# had data over 600 s old (p50 1,234 s). The restart had reset the alarm, not read anything. A file older than
+# WAIT_INTEREST at start is a daemon down longer than any wait's interest: its waits lapsed, and it is not read.
+WAITED_SINCE_FILE = "waited-since.json"
 # Read progress (daemon.json "progress", Daemon.stall_cause): the reads this daemon stored per kind over this window,
 # where its ticks spent their time (each top-level phase, the waits for a GraphQL slot, GitHub's answers) and the
 # request in flight. huge-blue, 2026-11-18: pr data for waits 3088 s, then 748 s 18 min after a restart, old behind a
@@ -1778,6 +1789,19 @@ def outbox_dir() -> Path:
 
 def posted_dir() -> Path:
     return BASE / "posted"  # finished writes: the URL, or why it failed (kept POST_KEEP)
+
+
+def waited_since_load() -> dict[str, float]:
+    """The waited keys' wait starts a daemon before this one kept (WAITED_SINCE_FILE), unless it is older than
+    WAIT_INTEREST; never in the future."""
+    doc = read_json(BASE / WAITED_SINCE_FILE)
+    if not isinstance(doc, dict) or not isinstance(doc.get("since"), dict):
+        return {}
+    at, now = doc.get("at"), time.time()
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= now - at < WAIT_INTEREST:
+        return {}
+    return {str(k): min(float(v), now) for k, v in doc["since"].items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
 def file_name(key: str) -> str:
@@ -5656,6 +5680,8 @@ class Daemon:
         self.refresh_notes: dict[tuple[str, str], dict] = {}  # (source, error) -> rate-limit state (refresh_note)
         self.newest_data: dict[str, float | None] = {}  # oldest_data's: per kind, the freshest live watch's data age
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
+        self.waited_since = waited_since_load()  # key -> when a wait took it, kept across a restart (WAITED_SINCE_FILE)
+        self.waited_since_saved = dict(self.waited_since)
         self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
         self.explained_at: dict[str, float] = {}  # kind -> the last tick stale_explained(kind) explained its old data
         self.stale_streak = 0  # ticks in a row the stale alarm found starvation nothing explains (the valve)
@@ -6271,7 +6297,8 @@ class Daemon:
             return level, text, {**data, "valve": data["cause"]}
         age = data.get("age")
         stuck = isinstance(age, (int, float)) and age > STALE_ONE_KEY_MAX  # STALE_ONE_KEY_MAX's comment
-        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER and not stuck:
+        many = (getattr(self, "stale_count", None) or {}).get(data.get("kind"), 0) > STALE_ONE_KEY_COUNT
+        if reading and isinstance(fresh, (int, float)) and fresh < STALE_DATA_AFTER and not stuck and not many:
             # The daemon reads its other waited keys (one of them is FRESH s old): this one key is stale, and a restart
             # would only drop every land judgment in flight. huge-blue, 2026-11-18: six valve restarts in six hours,
             # each for one PR (pr:manaflow-ai/cmux#46087 at 3963 s), each starting the 596-land queue over. Its read
@@ -8898,6 +8925,10 @@ class Daemon:
         self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
+        if self.waited_since != self.waited_since_saved:
+            with contextlib.suppress(OSError):
+                write_json(BASE / WAITED_SINCE_FILE, {"at": self.clock(), "since": self.waited_since})
+            self.waited_since_saved = dict(self.waited_since)
         self.note_explained()  # before check_alarms: the stale alarm and the valve read it (catching_up)
         self.flush_refresh_notes()
         # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
@@ -9039,6 +9070,13 @@ class Daemon:
         finally:
             self.in_land = False
 
+    def land_read_room(self) -> int:
+        """How many due lands may hold a waited watch on their PR (LAND_WATCH_SHARE): a share of the PR reads this
+        daemon stored over the last READ_PROGRESS_WINDOW, so a slower GitHub narrows the window instead of leaving
+        every waited PR older than STALE_DATA_AFTER; at least LAND_WATCH_FLOOR."""
+        reads = sum(1 for t in self.read_done.get("pr", []) if self.now - t < READ_PROGRESS_WINDOW)
+        return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
+
     def land_tick(self) -> None:
         """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
         an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
@@ -9049,7 +9087,7 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
-                                        feed_quiet=self.land_feed_quiet)
+                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room)
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -9778,6 +9816,7 @@ class Daemon:
         self.blocked = {kind: 0 for kind in CYCLES}
         self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
+        self.stale_count = {kind: 0 for kind in CYCLES}  # waited keys blocked past STALE_DATA_AFTER (STALE_ONE_KEY_COUNT)
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
         # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
         # at zero, which capped its blocked time at zero and silenced the alarm (review of glaeda#1970, F1).
@@ -9807,6 +9846,8 @@ class Daemon:
             self.blocked[kind] += self.waited(e)
             if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
                 self.fresh_waited[kind] = age_s
+            if self.waited(e) and blocked > STALE_DATA_AFTER:
+                self.stale_count[kind] += 1
             if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
                 self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
@@ -12369,6 +12410,16 @@ def land_update_branch_args(repo: str, number: str, head: str, needs: list[str],
     return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
 
 
+def land_retarget_args(repo: str, number: str, base: str, broker: bool) -> list[str]:
+    """The gh argv of a base change to BASE: the broker's `pr edit` form (BROKER, a lane VM), else GitHub's REST PATCH.
+    Not `gh pr edit` on a host: gh 2.45 (huge-blue's) reads the PR's classic project cards first, and GitHub refuses
+    that read ("GraphQL: Projects (classic) is being deprecated"), so every retarget failed. manaflow-ai/cmux-quillet-
+    look#3, 2026-11-22: three retargets in a row failed that way and the land stopped stacked_base."""
+    if broker:
+        return ["pr", "edit", number, "-R", repo, "--base", base]
+    return ["api", "-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", f"base={base}", "--jq", ".base.ref"]
+
+
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
 
 
@@ -13424,9 +13475,11 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # update-branch calls at one head -- 48 of the host's 57 conflict refusals that day were the 2nd through 6th of a
 # streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
-# names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases or force-pushes:
-# that is a write on someone's branch, so it stays the requester's call, as the draft case stays theirs. The one push
-# is LAND_UNION's: the base merge update-branch would have made, when git merges the base into the head cleanly.
+# names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases a conflict away or
+# force-pushes over one: that is a write on someone's branch, so it stays the requester's call, as the draft case
+# stays theirs. The pushes are LAND_UNION's (the base merge update-branch would have made, when git merges the base
+# into the head cleanly) and LAND_STACKED_REBASE's (a stacked PR's own commits moved off a base that squash-merged,
+# which changes no line of the PR's own diff).
 # A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
 # update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
 # append-only file (goals/*.md, docs/handbook/*.md, REPAIR.md in cmuxterm-hq) stops on update_branch_conflict
@@ -13452,6 +13505,22 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# A stacked PR whose base PR merged is retargeted by this queue onto that PR's own base (land_judge's stacked_base
+# step, `retarget`). When the base PR squash-merged, its commits are not on the new base, so the PR, still holding
+# them under its own, conflicts with the squash of those very commits the moment it is retargeted. manaflow-ai/
+# cmux-quillet-look#3, 2026-11-22 18:05Z: its base quillet-sans-tracking-5 was #2's head; #2 squash-merged into main;
+# after a hand retarget #3 read CONFLICTING, and a person ran `git rebase --onto origin/main <#2's head>` (same tree)
+# and force-pushed it. Now the queue does that itself, before it retargets (stacked_rebase): in its own bare mirror
+# (LAND_UNION_URL's) it reads the base PR's last head (refs/pull/M/head) and, when that head is not on the new base
+# but is under the PR's head, replays each of the PR's own commits after it onto the new base (git merge-tree with the
+# commit's parent as the merge base: a cherry-pick, keeping each commit's author, date and message; one already on the
+# base drops out, as in a rebase). The result is pushed to the PR's branch with --force-with-lease pinned to the head
+# land_judge judged, a pin on that head follows it (only this queue made it, from that head), and then the base is
+# changed. A replay that conflicts, a merge commit among the PR's own commits, or nothing left of them stops the land
+# (retarget_conflict, stacked_empty) naming the hand step; nothing is pushed then. A base PR that merged with a merge
+# commit (its head on the new base) or a PR already moved off it needs no rebase: only the base changes. A lane VM
+# (broker_client) only retargets, as before: its broker pushes no rewritten branch.
+LAND_STACKED_REBASE_MAX = 200  # the PR's own commits replayed at most; more stops as a conflict would, naming the step
 LAND_STEP_CONFLICT = re.compile(r"\bmerge conflict between base and head\b"
                                 r"|\b(?:pull request|PR) has merge conflicts\b"
                                 r"|\bmerge conflicts? must be resolved\b", re.I)
@@ -13531,6 +13600,20 @@ LAND_COMMAND_WAIT_RUN = re.compile(r"\s*glaeda-gh wait run ([\w.-]+/[\w.-]+)/(\d
 LAND_COMMAND_WAIT_PR = re.compile(r"\s*glaeda-gh wait pr ([\w.-]+/[\w.-]+)#(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
 LAND_COMMAND_TIMEOUT = re.compile(r"--timeout[ =](\d+)")
 LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
+# The other half of that same answer: a "command" step that is a rerun, which this queue runs too.
+# land_judge's deferred_daemon_wait answers a head whose `cmux-next path routing` routed the daemon tier with the
+# same-tree cmux-tui deferred with one of two next steps, both carried as a "command" under code `checks_running`:
+# a `glaeda-gh wait run ...` when the same-tree run is going (pending: the status may yet post, taken as that wait
+# above), or a `gh run rerun ID [--failed] -R OWNER/REPO` when nothing will dispatch or post
+# `cmux-next daemon tests (same-tree)` at this head. The second is not a wait: that run's own routing settled it, so
+# no wait can end it, and the land stopped `checks_running` -- a wait-shaped stop a person cleared by running the
+# printed rerun and queueing the land again (manaflow-ai/cmux#51287 at 73624632940a, stopped 2026-11-23 01:55Z and
+# cleared by `gh run rerun 45095171002` by hand; #49867 at e83f397504a4, stopped 18:16Z and queued again 50 min
+# later). A refusal that names a next step is a step: a command that is exactly that rerun, on this PR's own
+# repository, is taken as the rerun step (take's rerun_failed), which the queue already bounds -- LAND_RERUN_CAP per
+# (head, run), the stale_replay guard, and a 2 h budget -- and then judges again. It decides nothing itself: the
+# rerun posts a real verdict or the cap stops the entry. A check that will never post has not passed.
+LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]+/[\w.-]+)\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -13551,6 +13634,14 @@ LAND_PEEK_EVERY = 600.0
 # ago behind busy workers, and every one was waited: about 8,100 PR reads an hour the read loop cannot make, so even
 # the PRs a worker was about to judge went unread.
 LAND_WATCH_AHEAD = 2
+# And never more of them than the read loop can keep fresh: at most LAND_WATCH_SHARE of the PR reads this daemon stored
+# over the last READ_PROGRESS_WINDOW (one STALE_DATA_AFTER), and at least LAND_WATCH_FLOOR (a fresh daemon, or a lane VM
+# whose reads its upstream makes). The adaptive pool (adapt_pool) grows the workers, not the reads: cmux-cp-1,
+# 2026-11-22 19:15-20:19Z, 74 to 157 workers held 150-300 due lands waited, 318 waited PRs against 263-298 PR reads
+# stored per 600 s (each read 2+ s while GitHub answered 502 after 10.5 s), p50 waited data 1,034 s, and the stale alarm
+# FIRE'd twice in an hour. The rest are read like a parked entry, and the one a worker takes next is inside the window.
+LAND_WATCH_SHARE = 1 / 3
+LAND_WATCH_FLOOR = 16
 # A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
 # deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
 LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
@@ -14389,7 +14480,25 @@ def land_action(answer: dict, head: str) -> dict:
         act = land_fallback(answer, head)
     if act.get("kind") != "command":
         return act
-    return land_command_fetch(act, answer) or land_command_wait(act, answer, head)
+    return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
+        or land_command_wait(act, answer, head)
+
+
+def land_command_rerun(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is the rerun land_judge names for a check its routing settled (LAND_COMMAND_RERUN's
+    comment) as that rerun step, else None. Only a `checks_running` refusal's own command, and only a run in this
+    PR's repository: any other rerun text stays a command, which stops as before."""
+    if str(answer.get("code") or "") != "checks_running":
+        return None
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_RERUN.fullmatch(text)
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    if not named or not repo or named.group(3).lower() != repo.lower():
+        return None
+    return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "rerun_failed", "repo": repo,
+            "runs": [int(named.group(1))], "all": not named.group(2), "from": "command"}
 
 
 def land_command_fetch(act: dict, answer: dict) -> dict | None:
@@ -14665,7 +14774,10 @@ class LandQueue:
                  peek: Callable[[str], None] | None = None,
                  head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading,
-                 feed_quiet: Callable[[str, str, float], bool] | None = None) -> None:
+                 feed_quiet: Callable[[str, str, float], bool] | None = None,
+                 read_room: Callable[[], int | None] | None = None) -> None:
+        # how many due lands may hold a waited PR watch, by the daemon's own read rate (LAND_WATCH_SHARE); None: no cap
+        self.read_room = read_room or (lambda: None)
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
@@ -14747,6 +14859,7 @@ class LandQueue:
         # takes the next of them (refill), not the next pass (LAND_REFILL_EVERY)
         self.next_up: list[str] = []
         self.pass_wanted: list[str] = []
+        self.pass_ready: set[str] = set()  # of pass_wanted, the rows ready to judge on a worker (gated ready=True)
         self.pass_ended: float | None = None  # the pass's latch end (land_latch_spread): no refill inside its spread
         self.pool_logged = float("-inf")
         self.green_wait: dict | None = None  # the wait clock as the last land-pool line read it (land_green_waits)
@@ -15031,15 +15144,24 @@ class LandQueue:
         # Only the first LAND_WATCH_AHEAD per worker of the due entries, in the order workers take them, are read at
         # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
         due_keys = [k for k in order if self.due(self.entries[k])]
-        self.lean = set(due_keys[max(1, self.workers() * LAND_WATCH_AHEAD):])
+        window = max(1, self.workers() * LAND_WATCH_AHEAD)
+        room = self.read_room()
+        if room is not None:
+            window = max(1, min(window, int(room)))  # what the read loop keeps fresh (LAND_WATCH_SHARE)
+        self.lean = set(due_keys[window:])
         self.pass_wanted = []
+        self.pass_ready = set()
         self.pass_ended = ended
         for key in order:
             if self.queue_quota_parked():
                 break  # a worker parked the host while this pass was submitting judgments
             self.pass_one(key, latch, ended)
         # what refill hands the workers that free before the next pass, in this pass's order
-        self.next_up = [] if latch is not None else self.pass_wanted
+        # a row ready to judge first, then the rest in the pass's order: a row whose snapshot the daemon has not read
+        # yet can only start a snapshot wait on a refill, which needs no worker (refill)
+        self.next_up = [] if latch is not None else \
+            [k for k in self.pass_wanted if k in self.pass_ready] + \
+            [k for k in self.pass_wanted if k not in self.pass_ready]
         self.adapt_pool()
         self.log_pool()
 
@@ -15087,11 +15209,11 @@ class LandQueue:
         so every gate (latch, park, fresh head, snapshot, login share, pace) still holds; at most LAND_REFILL_TRIES
         rows per free worker are considered, so a refill costs a few rows' work, never a pass's sort."""
         self.now = time.time() if now is None else now
+        self.reap()  # a job that ended frees its worker now, row or no row to hand it (busy counts judging workers)
         if not self.next_up or self.pass_latch is not None or self.refused is not None:
             return 0
         if self.pass_ended is not None:
             return 0  # the reset spread after a latch: the pass's own stagger decides who goes
-        self.reap()
         free = self.workers() - len(self.jobs)
         if free <= 0:
             return 0
@@ -15926,6 +16048,15 @@ class LandQueue:
                 log({"event": "land-slot-held", "key": key, "job": job, "state": state, "heldS": round(self.now - at),
                      "workers": self.workers(), "busy": len(self.jobs)})
 
+    def busy(self) -> int:
+        """The workers holding a job, reaped first when they all look busy: a job ends on its worker thread, and until
+        a reap it kept its worker, so a pass (seconds under a long queue) read "every worker busy" for workers that
+        were judging nothing. 2026-11-22/23 23:50-00:25Z: every land-pool line read busy 24 of 24 while judgments
+        took 35 % of the worker time; 8 of the 16 jobs it listed were rows already back to "waiting"."""
+        if len(self.jobs) >= self.workers():
+            self.reap()
+        return len(self.jobs)
+
     def slot_held(self) -> dict | None:
         """The job holding its worker longest (the land-pool line's "slotHeld"), or None while no job runs."""
         live = [(at, key, job) for key, (at, job) in self.job_started.items() if key in self.jobs]
@@ -16155,13 +16286,16 @@ class LandQueue:
             on_login += 0 if seen and seen[1] else 1
         return on_login < cap
 
-    def gated(self, e: dict, why: str = "every worker busy") -> None:
-        """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
+    def gated(self, e: dict, why: str = "every worker busy", ready: bool = False) -> None:
+        """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line.
+        READY: past every gate but the worker count, its snapshot ready or needing none (first for refill)."""
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
         if why == "every worker busy":
-            self.pass_wanted.append(e["key"])  # ready for a worker: the next one that frees (refill)
+            self.pass_wanted.append(e["key"])  # waiting for a worker: one that frees takes it (refill)
+            if ready:
+                self.pass_ready.add(e["key"])
         self.note_late(e, why)
 
     def note_late(self, e: dict, why: str) -> None:
@@ -16847,7 +16981,7 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif len(self.jobs) < self.workers() and not self.refresh_held():  # no free worker: a later pass
+            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
                 # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
                 # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
                 w["readAt"] = w["directAt"] = self.now
@@ -16982,7 +17116,7 @@ class LandQueue:
         if self.refresh_held():
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
-        if len(self.jobs) >= self.workers():
+        if self.busy() >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
@@ -17405,10 +17539,12 @@ class LandQueue:
             self.note_late(e, "the login's reset stagger")
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
-        free = len(self.jobs) < workers
+        free = self.busy() < workers
         room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD)
         if not free and not room and not e.get("snapshotWait"):
-            self.gated(e)
+            # whether its snapshot is ready (read only, nothing nudged): a ready row goes first for a worker that
+            # frees before the next pass, ahead of rows that could only start a snapshot wait (refill)
+            self.gated(e, ready=self.snapshot(e["key"], sha)[1] != "wait")
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
         pin = self.fresh_head(e, sha, free)
         if pin is None:
@@ -17425,15 +17561,16 @@ class LandQueue:
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
-            if not free or self.snapshot(e["key"], sha)[1] == "wait":
+            waits = self.snapshot(e["key"], sha)[1] == "wait"
+            if not free or waits:
                 self.gated(e, "every worker busy" if not free else
-                          "snapshot waits ahead fill the room (snapshotWaiting)")
+                          "snapshot waits ahead fill the room (snapshotWaiting)", ready=not waits)
                 return False
         elif self.snapshot_wait(e, sha, free):
             self.note_late(e, "waiting for the daemon's snapshot of its head")
             return False  # judged on the daemon's next read of this head (one read, shared), not on land_judge's own
         if not free:
-            self.gated(e)  # a judgment it could start: ready, waiting for a worker
+            self.gated(e, ready=True)  # a judgment it could start: ready, waiting for a worker
             return False
         if self.jobs and (held := self.headroom_why()):
             self.gated(e, held)  # LAND_HEADROOM, read once a pass; the first judgment always runs
@@ -18112,7 +18249,7 @@ class LandQueue:
                 with self.lock:
                     self.stop(e, "policy", f"retarget to an unsafe base name {base!r}", land_trim(answer.get("next")))
                 return
-            self.push_step(e, "retarget", head, ["pr", "edit", number, "-R", repo, "--base", base], base=base)
+            self.retarget(e, head, base, answer)
             return
         if kind == "fetch":
             self.do_fetch(e, act, answer, head)
@@ -18134,7 +18271,8 @@ class LandQueue:
                 if capped:
                     self.stop(e, "rerun_failed_cap",
                               f"run {', '.join(map(str, capped))} was rerun {LAND_RERUN_CAP} times at {head[:12]} and "
-                              f"is still cancelled: {land_reason(answer.get('reason'))}",
+                              f"{'still posts no verdict' if act.get('all') else 'is still cancelled'}: "
+                              f"{land_reason(answer.get('reason'))}",
                               f"gh run view {capped[0]} -R {repo}")
                     return
                 for r in runs:  # counted before the send: a restart mid-send counts it
@@ -18152,7 +18290,10 @@ class LandQueue:
             if stale:
                 self.update_branch(e, head)
                 return
-            results =[self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+            # A whole rerun ("all": land_command_rerun), never --failed, when the step's point is that the run's own
+            # path routing must route again: its jobs did not fail, they were never run.
+            flags = [] if act.get("all") else ["--failed"]
+            results =[self.call([gh, "run", "rerun", str(r), *flags, "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
             no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
             with self.lock:
@@ -18367,6 +18508,166 @@ class LandQueue:
         elif named == "union_merge":
             self.union_merge(e, head)
 
+    def retarget(self, e: dict, head: str, base: str, answer: dict) -> None:
+        """land_judge's stacked_base step: move the PR onto BASE, its merged base PR's own base, first rebasing its own
+        commits off that PR's last head when it squash-merged (LAND_STACKED_REBASE_MAX's comment)."""
+        repo, number = e["repo"], str(e["number"])
+        if not self.broker_client() and SHA40.fullmatch(head or ""):
+            try:
+                state, said = self.stacked_rebase(e, head, base)
+            except OSError as error:
+                state, said = "failed", describe(error)
+            if state in ("conflict", "empty"):
+                name = key_name(e["key"])
+                with self.lock:
+                    self.history(e, "stacked_rebase_stopped", head=head[:12], why=land_trim(said, 200))
+                    self.stop(e, "retarget_conflict" if state == "conflict" else "stacked_empty",
+                              f"its base PR squash-merged, and moving its own commits onto {base} {said}; nothing was "
+                              "pushed", f"rebase it by hand (gh pr checkout {number} -R {repo}; git rebase --onto "
+                              f"origin/{base} <the base PR's last head>; git push --force-with-lease), then "
+                              f"gh api -X PATCH repos/{repo}/pulls/{number} -f base={base}, and re-land it pinned: "
+                              f"glaeda-gh land {name} --match-head-commit <the new 40-hex head>"
+                              if state == "conflict" else f"gh pr close {number} -R {repo}")
+                return
+            if state == "failed":
+                # decided nothing (a fetch, a read, a push refused): a refused step, backed off, stopped at the
+                # LAND_STEP_STOP-th; the base is not changed, so the next judgment names this step again
+                with self.lock:
+                    self.history(e, "stacked_rebase_failed", head=head[:12], why=land_trim(said, 200))
+                    self.step_refused(e, "retarget", head,
+                                      subprocess.CompletedProcess([], 1, "", f"the stacked rebase failed: {said}"))
+                return
+            if state == "rebased":
+                head = said  # the PR's branch is now the rebased head; the base change follows from it
+        self.push_step(e, "retarget", head, land_retarget_args(repo, number, base, self.broker_client()), base=base)
+
+    def stacked_rebase(self, e: dict, head: str, base: str) -> tuple[str, str]:
+        """(state, what): "none" (no rebase needed: why), "rebased" (pushed: the new head), "conflict" or "empty"
+        (nothing pushed: why), "failed" (decided nothing: why). LAND_STACKED_REBASE_MAX's comment."""
+        repo = e["repo"]
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        branch, old = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(old) and BRANCH_SAFE.fullmatch(base)) \
+                or ".." in branch + old + base:
+            return "failed", f"the PR's branch {branch!r}, base {old!r} or new base {base!r} is not a plain branch name"
+        if old == base:
+            return "none", f"its base already is {base}"
+        if repo.split("/", 1)[0].lower() not in LAND_MERGE_OWNERS:
+            return "none", f"{repo} is not of an owner this queue pushes to (LAND_MERGE_OWNERS): only the base changes"
+        gh = self.gh()
+        if gh is None:
+            return "failed", "no gh-quota shim to read the base PR through"
+        owner = repo.split("/", 1)[0]
+        got = self.call([gh, "api", f"repos/{repo}/pulls?head={owner}:{urllib.parse.quote(old, safe='')}"
+                         "&state=closed&per_page=100", "--jq",
+                         "[.[] | select(.merged_at != null) | {number, merged_at, sha: .head.sha}]"], LAND_GH_DEADLINE)
+        try:
+            prs = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            prs = None
+        if not isinstance(prs, list):
+            return "failed", f"the base {old}'s merged PRs could not be read: {land_trim(land_tail(got.stderr or ''), 160)}"
+        prs = [p for p in prs if isinstance(p, dict) and isinstance(p.get("number"), int)
+               and SHA40.fullmatch(str(p.get("sha") or ""))]
+        if not prs:
+            return "none", f"no merged PR has {old} as its head (closed unmerged: only the base changes)"
+        last = max(prs, key=lambda p: str(p.get("merged_at") or ""))
+        pull, old_head = int(last["number"]), str(last["sha"])
+        gitdir = os.fspath(land_dir() / "union" / (repo.replace("/", "__") + ".git"))
+        url = LAND_UNION_URL.format(repo=repo)
+        if not os.path.isdir(gitdir):
+            os.makedirs(os.path.dirname(gitdir), exist_ok=True)
+            got = self.union_git(gitdir, "init", "--quiet", "--bare")
+            if got.returncode != 0:
+                return "failed", f"git init of {gitdir} failed: {land_trim(got.stderr, 160)}"
+        got = self.union_git(gitdir, "config", "--get", "remote.origin.url")
+        if (got.stdout or "").strip() != url:
+            self.union_git(gitdir, "config", "remote.origin.url", url)
+        got = self.union_git(gitdir, "fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin",
+                             f"+refs/heads/{base}:refs/remotes/origin/{base}",
+                             f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+                             f"+refs/pull/{pull}/head:refs/remotes/origin/pull/{pull}", timeout=LAND_FETCH_DEADLINE)
+        if got.returncode != 0:
+            return "failed", f"the fetch of {base}, {branch} and #{pull}'s head failed: " \
+                             f"{land_trim(land_tail(got.stderr or ''), 160)}"
+        got = self.union_git(gitdir, "rev-parse", f"refs/remotes/origin/{branch}^{{commit}}",
+                             f"refs/remotes/origin/{base}^{{commit}}", f"refs/remotes/origin/pull/{pull}^{{commit}}")
+        shas = (got.stdout or "").split()
+        if got.returncode != 0 or len(shas) != 3:
+            return "failed", f"{branch}, {base} or #{pull}'s head is not on github.com/{repo}"
+        if shas[0] != head:
+            return "failed", f"github.com/{repo}'s {branch} is at {shas[0][:12]}, not the judged head {head[:12]}"
+        onto = shas[1]
+        if shas[2] != old_head:
+            return "failed", f"#{pull}'s head reads {shas[2][:12]}, not the {old_head[:12]} it merged at"
+        if self.union_git(gitdir, "merge-base", "--is-ancestor", old_head, onto).returncode == 0:
+            return "none", f"#{pull}'s head {old_head[:12]} is on {base} (not squashed): only the base changes"
+        if self.union_git(gitdir, "merge-base", "--is-ancestor", old_head, head).returncode != 0:
+            return "none", f"the head {head[:12]} is not on #{pull}'s head {old_head[:12]}: only the base changes"
+        got = self.union_git(gitdir, "rev-list", "--reverse", "--topo-order", "--parents", f"{old_head}..{head}")
+        rows = [line.split() for line in (got.stdout or "").splitlines() if line.strip()]
+        if got.returncode != 0 or not rows:
+            return "failed", f"the PR's own commits after {old_head[:12]} could not be listed"
+        if len(rows) > LAND_STACKED_REBASE_MAX:
+            return "conflict", f"would replay {len(rows)} commits (more than {LAND_STACKED_REBASE_MAX})"
+        merges = [r[0] for r in rows if len(r) != 2]
+        if merges:
+            return "conflict", f"meets the merge commit {merges[0][:12]} among them, which no replay here makes"
+        tip, kept, dropped = onto, 0, 0
+        for sha, parent in rows:
+            got = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages",
+                                 f"--merge-base={parent}", tip, sha)
+            tree = (got.stdout or "").split("\0", 1)[0].split("\n", 1)[0].strip()
+            if got.returncode == 1:
+                paths = [p for p in (got.stdout or "").splitlines()[1:] if p.strip()]
+                return "conflict", (f"conflicts at {sha[:12]}" +
+                                    (f" in {land_trim(', '.join(paths), 160)}" if paths else ""))
+            if got.returncode != 0 or not SHA40.fullmatch(tree):
+                return "failed", f"git merge-tree at {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+            now = self.union_git(gitdir, "rev-parse", f"{tip}^{{tree}}")
+            if (now.stdout or "").strip() == tree:
+                dropped += 1  # already on the base: a rebase drops it too
+                continue
+            meta = self.union_git(gitdir, "log", "-1", "--format=%an%x00%ae%x00%ad%x00%B", "--date=raw", sha)
+            parts = (meta.stdout or "").split("\0", 3)
+            if meta.returncode != 0 or len(parts) != 4:
+                return "failed", f"the author of {sha[:12]} could not be read"
+            commit = self.union_git(gitdir, "-c", "user.name=glaeda-land", "-c",
+                                    "user.email=glaeda-land@users.noreply.github.com", "commit-tree", tree, "-p", tip,
+                                    "-m", parts[3].strip() or f"(replayed {sha[:12]})",
+                                    extra={"GIT_AUTHOR_NAME": parts[0], "GIT_AUTHOR_EMAIL": parts[1],
+                                           "GIT_AUTHOR_DATE": parts[2]})
+            made = (commit.stdout or "").strip()
+            if commit.returncode != 0 or not SHA40.fullmatch(made):
+                return "failed", f"git commit-tree for {sha[:12]} failed: {land_trim(commit.stderr, 160)}"
+            tip, kept = made, kept + 1
+        if not kept:
+            return "empty", f"finds every one of its {len(rows)} commits already on {base}"
+        name = key_name(e["key"])
+        with self.lock:
+            self.claim(e, "retarget", before=head, base=base, form="stacked_rebase", rebased=tip)
+        got = self.union_git(gitdir, "push", "--quiet", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{head}",
+                             "origin", f"{tip}:refs/heads/{branch}", timeout=LAND_GH_DEADLINE)
+        with self.lock:
+            self.finish(e, got)
+            if got.returncode != 0:
+                return "failed", (f"the push of the rebased head {tip[:12]} (lease at {head[:12]}) failed: "
+                                  f"{land_trim(land_tail(got.stderr or ''), 160)}")
+            did = (f"rebased its {kept} own commit{'s' if kept != 1 else ''} after #{pull}'s head {old_head[:12]} "
+                   f"(squash-merged) onto {base} {onto[:12]}" + (f", {dropped} already there dropped" if dropped else "")
+                   + f": {head[:12]} -> {tip[:12]}, pushed with --force-with-lease at {head[:12]}")
+            e["stackedRebase"] = did
+            self.history(e, "stacked_rebased", head=head[:12], rebased=tip[:12], base=base, onto=onto[:12],
+                         after=old_head[:12], pull=pull, commits=kept, dropped=dropped)
+            pin = str(e.get("pinSha") or "")
+            if pin and not land_head_moved(pin, head):
+                # this queue made the new head from the judged, pinned one: the pin follows it, as after update-branch
+                e["pinSha"], e["pinSince"], e["pinSeen"] = tip, self.now, True
+                self.history(e, "pin_followed", was=pin[:12], head=tip[:12], parent=onto[:12], step="stacked_rebase")
+            self.save(e)
+        self.notify(e, e.get("requester") or "", f"glaeda land {name}: {did}", wake=False)
+        return "rebased", tip
+
     def conflict_stop(self, e: dict, kind: str, head: str, said: str, union_why: str = "") -> None:
         """Under the lock: stop E on a merge conflict at HEAD (LAND_STEP_CONFLICT's comment), naming the one step."""
         name = key_name(e["key"])
@@ -18378,10 +18679,11 @@ class LandQueue:
                   f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>")
 
     def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
-                  e: dict | None = None) -> subprocess.CompletedProcess:
+                  e: dict | None = None, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
         pre = [f"--attr-source={attrs}"] if attrs else []  # core.attributesFile off: only that tree's attributes
-        return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e)
+        return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e,
+                         extra)
 
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
         """(merge commit, the PR's branch, base sha, "") when git's merge of the base into HEAD, honoring the base's
@@ -19062,7 +19364,8 @@ class LandQueue:
         self.history(e, "merged", sha=merge_sha, how=how)
         self.save(e)
         self.notify(e, e.get("requester") or "",
-                    f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else ""))
+                    f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
+                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""))
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -31120,13 +31423,14 @@ def broker_post(item: dict) -> int:
     return 0
 
 
-def post_issue_names_an_existing_issue(target: str) -> str:
-    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+def post_target_number(target: str) -> str:
+    """The issue or pull request number a `post` target names, or "" where it names a repository.
 
-    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    Nothing is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
     that issue: the caller had the number from a wait or land line, not from this parser's help. Until
     2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
-    cost the refusal plus the same call typed again under another kind.
+    cost the refusal plus the same call typed again under another kind. `post pr OWNER/REPO#N` reads the same
+    way and was refused ("post pr takes OWNER/REPO") until 2026-11-23, measured on a comment for cmux#51063.
     """
     text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
     found = KEY_RES["comment"].fullmatch(text)
@@ -32399,8 +32703,9 @@ def parser() -> argparse.ArgumentParser:
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
-            s.add_argument("--timeout", type=seconds, default=3600,
-                           help="seconds with no change in what it waits on (default 3600): every change it sees "
+            s.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=3600,
+                           help="seconds with no change in what it waits on (default 3600; --wait is the same): "
+                                "every change it sees "
                                 "(a check or job started or finished, a comment, a file growing, CPU used) moves "
                                 "the deadline; exit 2 once nothing changed for this long, or at --max. `wait "
                                 "until` alone counts it from the start")
@@ -32432,8 +32737,9 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--max-age", type=float, default=HEAD_PENDING_TTL * 2, metavar="S",
                    help=f"checks still running are served from the cache if read this recently (default {HEAD_PENDING_TTL * 2}s); "
                         "finished heads are good for 12 minutes")
-    c.add_argument("--wait", type=float, default=30, metavar="S",
-                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
+    c.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=30, metavar="S",
+                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is); "
+                        "--timeout is the same")
     c.add_argument("--pr", type=int, metavar="N",
                    help="the PR whose head this is: a head with no entry is served from that PR's cached rollup "
                         "when it is of this head and all green (route pr-rollup)")
@@ -32451,8 +32757,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--reviewer", action="append", metavar="LOGIN", help="pr: request a review (repeatable)")
     po.add_argument("--event", choices=("comment", "approve", "request-changes"), default="comment",
                     help="review: the verdict (default comment)")
-    po.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session)")
+    po.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session); "
+                         "--timeout is the same")
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
@@ -32547,8 +32854,9 @@ def parser() -> argparse.ArgumentParser:
                     help="replay: one finished run, as the controller's feed (/v1/github/events) or GitHub serves it")
     oe.add_argument("--jobs-file", type=Path, metavar="PATH",
                     help="replay: its attempt's jobs ({\"jobs\": [...]}, run-jobs' or GitHub's), instead of reading them")
-    oe.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="replay: wait up to S seconds for the command to end, to print its exit code")
+    oe.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="replay: wait up to S seconds for the command to end, to print its exit code; "
+                         "--timeout is the same")
     oe.add_argument("--json", action="store_true")
     ld = sub.add_parser("land", help="land a PR: the daemon takes each step land_judge names until it merges or stops "
                                      "(land status, land cancel)")
@@ -32888,7 +33196,10 @@ def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) ->
     if parent != "post":
         return True
     if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
-        return False
+        # Since 2026-11-23 `post pr OWNER/REPO#N` is a comment on that pull request, which takes a body and
+        # not --head/--base/--title. Without a body it is still a call `post` could only refuse.
+        return bool(post_target_number(target)) and bool(
+            {normalized_flag("--body"), normalized_flag("--body-file")} & typed)
     needs = NESTING_WRITE_INPUT.get((parent, word))
     return not needs or bool({normalized_flag(f) for f in needs} & typed)
 
@@ -33432,7 +33743,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
             if one == "issue":
-                numbered = post_issue_names_an_existing_issue(args.target)
+                numbered = post_target_number(args.target)
                 if numbered and args.title:
                     raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
                                      f"to comment on it, or pass OWNER/REPO to file a new issue")
@@ -33440,6 +33751,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
                           f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
                     args.kind, one = "comment", "comment"
+            if args.kind == "pr":
+                numbered = post_target_number(args.target)
+                opening = [f for f, v in (("--head", args.head), ("--base", args.base), ("--title", args.title)) if v]
+                if numbered and opening:
+                    raise WatchError(f"post pr {args.target} names pull request {numbered}, which exists: drop "
+                                     f"{', '.join(opening)} to comment on it, or pass OWNER/REPO to open a new one")
+                if numbered:
+                    print(f"glaeda-gh: post pr {args.target} names pull request {numbered}, which exists: this is "
+                          f"a comment on it (a new pull request takes OWNER/REPO with --head, --base and --title)",
+                          file=sys.stderr)
+                    args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:
