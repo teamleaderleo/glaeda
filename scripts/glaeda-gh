@@ -1151,15 +1151,12 @@ CONTENT_PAUSE_RETRY = 60  # seconds after a failed or timed-out ask before the n
 CONTENT_PAUSE_SLOW_DEADLINE = 15
 CONTENT_PAUSE_REPORT_DEADLINE = 15
 # While no answer is newer than CONTENT_PAUSE_RETRY and the ask is failing or still running, the pause is unknown:
-# creates wait rather than go out into a pause other writers may have reported. For CONTENT_PAUSE_BLIND_MAX at most
-# past the last answer (or the first ask, with none): a keeper broken for good then stops no create, and the outbox
-# posts as a host with no keeper does, logged once per outage and shown by `post status`.
+# creates wait rather than go out into a pause other writers may have reported. CONTENT_PAUSE_BLIND_MAX is the
+# threshold for an outage log, never permission to post without the shared authority's answer.
 CONTENT_PAUSE_BLIND_MAX = 600
 # A keeper that answers the ask with a usage error (argparse's "usage: ..." or "invalid choice", exit 2) has no
-# `content-pause`: an older gh-quota than this outbox. That is an answer, not a failed ask: the outbox posts as a host
-# with no keeper does (logged once), and asks again every CONTENT_PAUSE_ABSENT_REPROBE, so the pause applies again as
-# soon as the keeper gains the command. Counted as failures, it held every create for CONTENT_PAUSE_BLIND_MAX after
-# each daemon start, on every host whose gh-quota lagged (cosmic-gray, 2026-11-18).
+# `content-pause`: an older gh-quota than this outbox. Creates stay queued until the keeper is upgraded and answers;
+# ask again every CONTENT_PAUSE_ABSENT_REPROBE without delaying read traffic.
 CONTENT_PAUSE_ABSENT_REPROBE = 600
 CONTENT_PAUSE_USAGE = re.compile(r"(?im)^\s*usage:|invalid choice")
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
@@ -3177,8 +3174,7 @@ _CONTENT_PAUSE_UNREAD: set[str] = set()  # CONTENT_PAUSE_ENV values already logg
 
 def content_pause_cmd() -> list[str] | None:
     """The command that reads and extends the login's create pause (CONTENT_PAUSE_ENV), or None: none on this host.
-    A setting shlex cannot read (an unclosed quote) is no command, logged once: raising here stopped every outbox
-    pass."""
+    A setting shlex cannot read (an unclosed quote) is logged once; the outbox holds creates without stopping reads."""
     named = os.environ.get(CONTENT_PAUSE_ENV)
     if named is not None:
         try:
@@ -3187,7 +3183,7 @@ def content_pause_cmd() -> list[str] | None:
             if named not in _CONTENT_PAUSE_UNREAD:
                 _CONTENT_PAUSE_UNREAD.add(named)
                 log({"event": "content-pause-cmd",
-                     "error": f"{CONTENT_PAUSE_ENV} unreadable ({error}): no pause asked"})
+                     "error": f"{CONTENT_PAUSE_ENV} unreadable ({error}): repair the command; creates stay queued"})
             return None
     with contextlib.suppress(OSError):
         cli = PACE_CLI.resolve().parent / "gh_quota.py"
@@ -7469,6 +7465,8 @@ class Daemon:
         whether that answer is too old to post on. The pacer's own hold (adopt_pace_hold) applies either way."""
         cmd = content_pause_cmd()
         if cmd is None:
+            if os.environ.get(CONTENT_PAUSE_ENV, "").strip():
+                self.pause_absent = True  # malformed explicit configuration is no permission to post
             return 0.0
         clock = self.clock()
         wait = 0.0
@@ -7526,10 +7524,9 @@ class Daemon:
             asked, why = value
             if not self.pause_absent:
                 log({"event": "content-pause-absent", "error": why,
-                     "next": f"posting as with no keeper; asked again every {CONTENT_PAUSE_ABSENT_REPROBE}s"})
+                     "next": f"upgrade the keeper; creates stay queued; asked again every {CONTENT_PAUSE_ABSENT_REPROBE}s"})
             self.pause_absent = True
             self.pause_next = asked + CONTENT_PAUSE_ABSENT_REPROBE
-            self.pause_answered_at = clock  # an answer: a later failure holds from here, for CONTENT_PAUSE_BLIND_MAX
             self.pause_failures = self.pause_timeouts = 0
             self.pause_error, self.pause_blind_logged = None, False
             return
@@ -7556,11 +7553,12 @@ class Daemon:
         self.errors.append(f"content pause: {value}")
 
     def content_pause_unknown(self) -> bool:
-        """Whether creates wait because the pause is not known: no answer within CONTENT_PAUSE_RETRY, and the ask is
-        still running or failing. For CONTENT_PAUSE_BLIND_MAX past the last answer (or the first ask) at most: past
-        it a keeper that never answers stops nothing, and the outbox posts as a host with no keeper (logged once)."""
-        if self.pause_ask is None and self.pause_failures == 0 or self.pause_absent:
-            return False  # a recent answer, or a keeper without content-pause: no keeper, as on a host with none
+        """An unavailable configured keeper never authorizes a create. Outages are logged once past the bound;
+        read traffic and bounded recovery asks continue while writes stay queued."""
+        if self.pause_absent:
+            return True
+        if self.pause_ask is None and self.pause_failures == 0:
+            return False
         clock = self.clock()
         known = self.pause_answered_at if self.pause_answered_at is not None else self.pause_first_ask
         if known is None or clock - known < CONTENT_PAUSE_RETRY and self.pause_answered_at is not None:
@@ -7571,7 +7569,7 @@ class Daemon:
             self.pause_blind_logged = True
             log({"event": "post-pause-unknown", "failures": self.pause_failures, "error": self.pause_error,
                  "since": round(clock - known)})
-        return False
+        return True
 
     def content_pause_status(self) -> dict | None:
         """daemon.json outbox.pause: the ask's state for `post status`, or None when no ask was made."""
@@ -32279,7 +32277,7 @@ def pause_line(pause: Any) -> list[str]:
                      f"{pause.get('lastError')}); last answer "
                      + (f"{span(ago)} ago" if isinstance(ago, (int, float)) else "never"))
     if pause.get("absent"):
-        parts.append("the pause keeper has no content-pause (an older gh-quota): creates go out as with no keeper")
+        parts.append("the pause keeper has no content-pause (an older gh-quota): upgrade it; creates stay queued")
     if pause.get("holding"):
         parts.append("creates wait until the pause is known")
     return parts
