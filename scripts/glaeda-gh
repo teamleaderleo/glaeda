@@ -13531,6 +13531,20 @@ LAND_COMMAND_WAIT_RUN = re.compile(r"\s*glaeda-gh wait run ([\w.-]+/[\w.-]+)/(\d
 LAND_COMMAND_WAIT_PR = re.compile(r"\s*glaeda-gh wait pr ([\w.-]+/[\w.-]+)#(\d+)((?:\s+--[a-z-]+(?:[ =]\S+)?)*)\s*")
 LAND_COMMAND_TIMEOUT = re.compile(r"--timeout[ =](\d+)")
 LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
+# The other half of that same answer: a "command" step that is a rerun, which this queue runs too.
+# land_judge's deferred_daemon_wait answers a head whose `cmux-next path routing` routed the daemon tier with the
+# same-tree cmux-tui deferred with one of two next steps, both carried as a "command" under code `checks_running`:
+# a `glaeda-gh wait run ...` when the same-tree run is going (pending: the status may yet post, taken as that wait
+# above), or a `gh run rerun ID [--failed] -R OWNER/REPO` when nothing will dispatch or post
+# `cmux-next daemon tests (same-tree)` at this head. The second is not a wait: that run's own routing settled it, so
+# no wait can end it, and the land stopped `checks_running` -- a wait-shaped stop a person cleared by running the
+# printed rerun and queueing the land again (manaflow-ai/cmux#51287 at 73624632940a, stopped 2026-11-23 01:55Z and
+# cleared by `gh run rerun 45095171002` by hand; #49867 at e83f397504a4, stopped 18:16Z and queued again 50 min
+# later). A refusal that names a next step is a step: a command that is exactly that rerun, on this PR's own
+# repository, is taken as the rerun step (take's rerun_failed), which the queue already bounds -- LAND_RERUN_CAP per
+# (head, run), the stale_replay guard, and a 2 h budget -- and then judges again. It decides nothing itself: the
+# rerun posts a real verdict or the cap stops the entry. A check that will never post has not passed.
+LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]+/[\w.-]+)\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -14389,7 +14403,25 @@ def land_action(answer: dict, head: str) -> dict:
         act = land_fallback(answer, head)
     if act.get("kind") != "command":
         return act
-    return land_command_fetch(act, answer) or land_command_wait(act, answer, head)
+    return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
+        or land_command_wait(act, answer, head)
+
+
+def land_command_rerun(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is the rerun land_judge names for a check its routing settled (LAND_COMMAND_RERUN's
+    comment) as that rerun step, else None. Only a `checks_running` refusal's own command, and only a run in this
+    PR's repository: any other rerun text stays a command, which stops as before."""
+    if str(answer.get("code") or "") != "checks_running":
+        return None
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_RERUN.fullmatch(text)
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    if not named or not repo or named.group(3).lower() != repo.lower():
+        return None
+    return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "rerun_failed", "repo": repo,
+            "runs": [int(named.group(1))], "all": not named.group(2), "from": "command"}
 
 
 def land_command_fetch(act: dict, answer: dict) -> dict | None:
@@ -18134,7 +18166,8 @@ class LandQueue:
                 if capped:
                     self.stop(e, "rerun_failed_cap",
                               f"run {', '.join(map(str, capped))} was rerun {LAND_RERUN_CAP} times at {head[:12]} and "
-                              f"is still cancelled: {land_reason(answer.get('reason'))}",
+                              f"{'still posts no verdict' if act.get('all') else 'is still cancelled'}: "
+                              f"{land_reason(answer.get('reason'))}",
                               f"gh run view {capped[0]} -R {repo}")
                     return
                 for r in runs:  # counted before the send: a restart mid-send counts it
@@ -18152,7 +18185,10 @@ class LandQueue:
             if stale:
                 self.update_branch(e, head)
                 return
-            results =[self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
+            # A whole rerun ("all": land_command_rerun), never --failed, when the step's point is that the run's own
+            # path routing must route again: its jobs did not fail, they were never run.
+            flags = [] if act.get("all") else ["--failed"]
+            results =[self.call([gh, "run", "rerun", str(r), *flags, "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
             no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
             with self.lock:
