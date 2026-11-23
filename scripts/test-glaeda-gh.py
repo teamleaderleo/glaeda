@@ -36833,6 +36833,61 @@ class ABareWaitFlagTest(unittest.TestCase):
         self.assertEqual((code, seen.get("wait")), (0, 3600.0))
 
 
+class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
+    """`--wait S` and `--timeout S` are one flag wherever this tool waits for something to end.
+
+    Measured 2026-11-23, waiting for a queued PR's number: `glaeda-gh post status ID --wait --timeout 600`
+    printed "read as `glaeda-gh post status ID --wait 3600 --timeout 600`" -- the bare-wait reader had
+    already given the first spelling its default -- and then exited 2 with "unrecognized arguments:
+    --timeout 600", with nothing waited for; the wait was retyped in a second call. `land` has declared
+    both spellings on one destination since 2026-11-22, and `post`, `checks`, `on-event` and `wait` each
+    declared one of the two, so which spelling worked depended on the command."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        enter = contextlib.redirect_stderr(self.err)
+        enter.__enter__()
+        self.addCleanup(enter.__exit__, None, None, None)
+
+    def test_every_command_that_waits_answers_to_both_spellings(self) -> None:
+        """The structural claim, so a command added later cannot take only one of them: the set of commands
+        owning `--wait` is the set owning `--timeout`."""
+        self.assertEqual(gg.flag_commands("--wait"), gg.flag_commands("--timeout"))
+        self.assertIn("post", gg.flag_commands("--timeout"))  # the fixture: the command that was refused
+
+    def test_a_timeout_on_a_command_that_spelled_it_wait_is_that_wait(self) -> None:
+        """And a duration with a unit, which `seconds` reads: `type=float` refused `20m` as not a number."""
+        for typed, dest, want in (
+                (["post", "status", "17953-44-03", "--timeout", "600"], "wait", 600.0),
+                (["post", "status", "17953-44-03", "--timeout", "20m"], "wait", 1200.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--timeout", "45"], "wait", 45.0),
+                (["on-event", "replay", "--timeout", "90s"], "wait", 90.0),
+                (["wait", "pr", "o/r#1", "--wait", "5m"], "timeout", 300.0)):
+            self.assertEqual(getattr(gg.parser().parse_args(typed), dest), want, typed)
+
+    def test_main_waits_the_number_for_the_call_that_was_refused(self) -> None:
+        """End to end, the exact argv measured 2026-11-23: one wait of 600 seconds, in this call."""
+        seen: dict[str, object] = {}
+
+        def fake_post_status(key: str, wait: float, *a: object, **kw: object) -> int:
+            seen["wait"] = wait
+            return 0
+
+        with mock.patch.object(gg, "cmd_post_status", fake_post_status):
+            code = gg.main(["post", "status", "1795398633920-445750-03874f", "--wait", "--timeout", "600"])
+        self.assertEqual((code, seen.get("wait")), (0, 600.0))
+
+    def test_a_deadline_the_loop_cannot_honour_is_still_refused(self) -> None:
+        """What `seconds` buys on the commands that read `type=float`: `inf` is a wait nobody is waiting for
+        and `nan` never reaches its deadline."""
+        for typed in (["post", "status", "ID", "--wait", "inf"], ["post", "status", "ID", "--timeout", "nan"],
+                      ["checks", "o/r", "a" * 40, "--consumer", "x", "--wait", "-5"],
+                      ["on-event", "replay", "--timeout", "nan"]):
+            with self.assertRaises(SystemExit) as exit_:
+                gg.parser().parse_args(typed)
+            self.assertNotEqual(exit_.exception.code, 0, typed)
+
+
 class AFlagsCaseConventionTest(unittest.TestCase):
     """snake_case, camelCase and kebab-case of one of the command's own options are that option, and a
     spelling two real options would both answer to is refused rather than picked."""
