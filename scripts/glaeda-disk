@@ -1100,7 +1100,8 @@ PRESSURE_NEWEST_SEED = False
 PRESSURE_SIM_RUNTIMES = False
 BUILD_CACHE_FAMILY_NAMES = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
                             "ci-ios-derived-data", "cmux-ci-admission", "cmux-ci-runner-admission",
-                            "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-next-ci-generated",
+                            "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-fast-tier-seed-root-2",
+                            "cmux-next-ci-generated",
                             "runner-checkout-build", "xcode-derived-data")
 
 
@@ -1346,6 +1347,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "f7e6ab44787e5a3cff88b4a053705a853a92b13a557242f71ef9579734bcbd09",
     "1ce4c03ed98484700e221db0067a56f18c74b2627503afe198871db040984e53",
     "445c9e4bb1dbdbd0c37184d01e27771e95ca758ed4ae5ef1a28d7db47f5568fa",
+    "e086936669eca0a96cc84a68635f8bbb04fc00fe7719a4eab175b8872bc76481",
+    "08961a67d6469c324c8483af59fc8506a0f971ba2d3f120623af7c9beddc928e",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1435,10 +1438,11 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
                            platform="macos"))
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
-    packages = CMUX_SEED_ROOT / "cmux/Packages"
-    if (packages.is_dir() and not CMUX_SEED_ROOT.is_symlink()  # a fast-tier job used the seed root here
-            and (CMUX_SEED_ROOT / SEED_ROOT_MARKER).is_file()):
-        fams.append(seed_root_family(packages))
+    for seed_root, fid in ((CMUX_SEED_ROOT, SEED_ROOT_FAMILY), (CMUX_SECOND_SEED_ROOT, SECOND_SEED_ROOT_FAMILY)):
+        packages = seed_root / "cmux/Packages"
+        if (packages.is_dir() and not seed_root.is_symlink()  # a fast-tier job used the seed root here
+                and (seed_root / SEED_ROOT_MARKER).is_file()):
+            fams.append(seed_root_family(packages, fid))
     return fams
 
 
@@ -1712,6 +1716,12 @@ def remove_spm_scratch(path: Path) -> bool:
 # the builds go, only under that lock; the mirrored source beside them is small.
 CMUX_SEED_ROOT = Path("/Users/runner/_work/cmux")
 SEED_ROOT_FAMILY = "cmux-fast-tier-seed-root"
+# The second seed root (cmux owned_spm_scratch.SECOND_SEED_WORKSPACE): a job that finds the first held takes it, on a
+# mini with the disk to keep both; the seed workflow builds its own seed at that path. 7 of 15 cold 60-min fast-tier
+# timeouts in 6 h (2026-11-23) had the one root held. Its own id, so apply's family-by-id map keeps each root's lock.
+CMUX_SECOND_SEED_ROOT = Path("/Users/runner/_work/cmux-2")
+SECOND_SEED_ROOT_FAMILY = "cmux-fast-tier-seed-root-2"
+SEED_ROOT_FAMILIES = (SEED_ROOT_FAMILY, SECOND_SEED_ROOT_FAMILY)
 SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
 # owned_spm_scratch.SEED_MARKER: provisioning marks the seed root. The nightly-next builder's runner also works in
 # /Users/runner/_work/cmux/cmux; without the marker those builds are its runner checkout's, not this family's.
@@ -1719,9 +1729,9 @@ SEED_ROOT_MARKER = ".cmux-seed-root"
 SEED_ROOT_REBUILD_MINUTES = 30.0  # above every per-slot build family: they go first under pressure
 
 
-def seed_root_family(packages: Path) -> Family:
+def seed_root_family(packages: Path, fid: str = SEED_ROOT_FAMILY) -> Family:
     """The seed workspace's package builds: PACKAGES is <seed root>/cmux/Packages."""
-    return Family(SEED_ROOT_FAMILY, packages, True, "the next fast-tier job on this mini restores the base seed",
+    return Family(fid, packages, True, "the next fast-tier job on this mini restores the base seed",
                   depth=3, match=".build", build_output=True,  # <platform>/<package>/.build
                   owner="cmux owned_spm_scratch.py (seed_lease)", rebuild_minutes=SEED_ROOT_REBUILD_MINUTES,
                   platform="macos")
@@ -2068,7 +2078,7 @@ def family_item_window(fam: Family, path: Path, idle_hours: float, archived: fro
         return max(window, CMUX_TUI_SETTLE_HOURS)
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
-    if fam.id == SEED_ROOT_FAMILY:  # rewritten by nearly every fast-tier job, so its window rarely passes: below the
+    if fam.id in SEED_ROOT_FAMILIES:  # rewritten by nearly every fast-tier job, so its window rarely passes: below the
         if seed_root_emergency(fam):  # emergency floor it goes once no job holds it (the floor hold: below)
             return 0.0
     if fam.id == SPM_SCRATCH:
@@ -2104,7 +2114,7 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones), and the fast tier's seed root builds (its
     lock keeps the ones a job holds)."""
-    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION, SEED_ROOT_FAMILY) or fam.app_clones
+    if (fam.id in (RUNNER_BUILD_FAMILY, RUNNER_ROOT_ADMISSION, *SEED_ROOT_FAMILIES) or fam.app_clones
             or media_tour_warm_slot(fam, path)):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
@@ -2120,7 +2130,7 @@ def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
     slot has no age window, so the floor hold is the only thing that lets it go."""
     if media_tour_warm_slot(fam, Path(item.path)):
         return True
-    if fam.id == SEED_ROOT_FAMILY and seed_root_emergency(fam):  # goes below the emergency floor too, like spm scratch
+    if fam.id in SEED_ROOT_FAMILIES and seed_root_emergency(fam):  # goes below the emergency floor too, like spm scratch
         return False
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
@@ -8349,7 +8359,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_aside_parents(fam.root))
-        if fam.id == SEED_ROOT_FAMILY:  # its builds go aside beside the lock (seed_root_aside)
+        if fam.id in SEED_ROOT_FAMILIES:  # its builds go aside beside the lock (seed_root_aside)
             dirs.add(seed_root_lock(fam).parent)
         if fam.id == TART_IMAGES:  # an image sits at any depth: every namespace directory above one
             dirs.update(tart_walk(fam.root)[1])
@@ -11080,7 +11090,7 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
-    if fam.id == SEED_ROOT_FAMILY:  # a package build; the seed root's lock is its in-use signal
+    if fam.id in SEED_ROOT_FAMILIES:  # a package build; the seed root's lock is its in-use signal
         return False
     if fam.id == CANONICAL_ADMISSION:  # a DerivedData; the root's token is its in-use signal
         return False
@@ -12251,7 +12261,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(why)
         if fam.id in BUILD_STATE_FAMILY_IDS and not blind and (why := build_state_held(fam, path, cmds)):
             reasons.append(why)
-        if fam.id == SEED_ROOT_FAMILY and seed_root_held(fam, path):
+        if fam.id in SEED_ROOT_FAMILIES and seed_root_held(fam, path):
             reasons.append("a fast-tier job holds the seed root's lock (owned_spm_scratch.py seed_lease)")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
@@ -12580,18 +12590,20 @@ def queued_disk_want(capacity_dir: Path | None = None, now: float | None = None)
 # (~/.local/share/glaeda/fleet-reservations.json, schema glaeda-fleet-reservations/v1:
 # {"expires", "reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}; the
 # writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
-# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
-# missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
-# host-local file says, except a missing list on a host that runs no controller worker (controller_worker_host): there
+# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. An expired list is
+# released: only an entry in it still live by its own from/until holds its host; with none, the host is not reserved
+# (2026-11-23: a list 24 h past its expires held a mini at 90% used as "kept as reserved", so keepup neither deduped
+# nor evicted). Fails closed: a missing, unreadable or malformed list, or one with no expires, reads as reserved,
+# whatever the host-local file says, except a missing list on a host that runs no controller worker (controller_worker_host): there
 # a missing list means no reservations, and cleanup proceeds (2026-11-17: passes on such hosts logged "fleet
 # reservations unreadable (FileNotFoundError); kept as reserved" and deleted nothing). A list that is there but
-# unreadable, malformed or expired, or one missing where a controller worker runs or may run, still fails closed.
+# unreadable or malformed, or one missing where a controller worker runs or may run, still fails closed.
 FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
 FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
 UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
 HOST_RESERVATION_LOCAL = FLEET_ROOT / "reservation.json"
 # When the lease host_reservation last found began (its "from", or the host-local marker's "since"), None when it
-# found none or failed closed (an unreadable, malformed or expired list, an unreadable marker).
+# found none or failed closed (an unreadable or malformed list, an unreadable marker).
 RESERVATION_SINCE: float | None = None
 
 
@@ -12677,8 +12689,10 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
         entries, aliases = doc["reservations"], doc.get("aliases", {})
         if not isinstance(entries, list) or not isinstance(aliases, dict):
             raise ValueError("malformed")
-        if reservation_time(doc["expires"]) <= now:  # KeyError without one: the writer stopped refreshing it
-            return f"fleet reservations expired at {doc['expires']}; kept as reserved"
+        # KeyError without one: malformed, fails closed. An expired list is released, not reserved: its writer
+        # stopped refreshing it, so it proves no new hold, but an entry in it still live by its own from/until keeps
+        # its host (a live reservation's behaviour is unchanged); with none, the list holds nothing
+        stale = reservation_time(doc["expires"]) <= now
         alias = {str(h).lower(): {a.lower() for a in _str_list(v, "aliases")} for h, v in aliases.items()}
         hit, since = "", None
         for e in entries:  # every entry is checked, so one malformed entry anywhere fails closed
@@ -12691,6 +12705,8 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
                 raise ValueError("from must be before until")
             if not hit and names & hosts and start <= now <= end:
                 hit, since = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})", start
+                if stale:
+                    hit += f" (list expired at {doc['expires']})"
         if hit:
             RESERVATION_SINCE = since
             return hit
@@ -15370,7 +15386,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
-                or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))
+                or (i.family in SEED_ROOT_FAMILIES and seed_root_held(fam, p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
                 or (tmp_canonical_root(fam, p) and canonical_root_held(p, whole_root=True))):
             outcome = "changed:in-use"
@@ -15434,7 +15450,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     released += max(0, original_bytes - destination.stat().st_size)
                 elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
-                elif i.family == SEED_ROOT_FAMILY:
+                elif i.family in SEED_ROOT_FAMILIES:
                     gone = remove_seed_root_build(fam, p)  # only under its lock: a job may take the root now
                 elif i.family == CANONICAL_ADMISSION:
                     gone = remove_canonical_admission(p)  # only under its root's token: a job may take it now
