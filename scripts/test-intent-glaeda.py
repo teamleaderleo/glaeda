@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import copy
 import hashlib
 import importlib.machinery
 import io
@@ -28,25 +27,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 gg = importlib.machinery.SourceFileLoader("glaeda_gh_intent", os.fspath(SCRIPTS / "glaeda-gh")).load_module()
 gd = importlib.machinery.SourceFileLoader("glaeda_disk_intent", os.fspath(SCRIPTS / "glaeda-disk")).load_module()
-
-# The glaeda-gh entries this PR asks leo-workspace tools/intent_aliases.json to carry (the vendored table is a
-# byte-identical copy, so it gets them by scripts/intent-sync once they land there). Until then the tests that need
-# them lay them over the vendored table; once synced, PROPOSED is already in it and the overlay changes nothing.
-PROPOSED = {
-    "glaeda-gh": {
-        "aliases": [{"under": [], "from": ["land-status"], "to": ["land", "status"]}],
-        "default": {"log": "job"},
-        "exact": ["on-event", "serve"],  # `on-event replay` runs the on-event commands; replay is a choice, not a subcommand
-        # glaeda-gh's reads the shared `reads` list does not name: a read-only meaning among them may run as the best one
-        "safe": ["checks", "budget", "audit", "runners", "job", "errors", "flaky"],
-    },
-    "glaeda-disk": {
-        "aliases": [{"from": ["status"], "to": ["report"]}],  # for the PreToolUse rewrite, which reads no parser
-        "safe": ["report"],
-        "exact": ["keepup"],  # keepup --apply deletes
-    },
-}
-
 
 def line(*argv: str) -> str:
     """ARGV as the layer prints it: shell-quoted, so it runs when pasted (`'o/r#1'`: `#` starts a comment)."""
@@ -74,16 +54,6 @@ class Base(unittest.TestCase):
         os.environ.pop("INTENT_OFF", None)
         os.environ.pop("INTENT_TABLE", None)
 
-    def with_proposed(self) -> None:
-        cli = self.table.setdefault("cli", {})
-        for name, entries in PROPOSED.items():
-            mine = cli.setdefault(name, {})
-            for key, value in entries.items():
-                if isinstance(value, list):
-                    mine[key] = list(mine.get(key) or []) + [v for v in value if v not in (mine.get(key) or [])]
-                else:
-                    mine[key] = {**(mine.get(key) or {}), **value}
-
     def parse(self, argv: list[str]) -> tuple[argparse.Namespace | None, str, int | None]:
         err = io.StringIO()
         with contextlib.redirect_stderr(err), mock.patch.object(gg, "say_waiting",
@@ -108,13 +78,14 @@ class MeasuredMisses(Base):
         self.assertEqual((code, args.kind, args.repo, args.job), (None, "job", "o/r", 123))
         self.assertIn(f"ran `{line('log', 'job', 'o/r', '123')}`", err)
 
-    def test_log_with_no_kind_is_listed_then_runs_as_log_job_with_the_default(self) -> None:
+    def test_log_with_no_kind_and_no_default_runs_the_best_read_and_names_the_others(self) -> None:
+        """a805a3c4: several read-only meanings (log's kinds are glaeda-gh `safe`): the best runs, the others named."""
+        self.table["cli"]["glaeda-gh"].pop("default")
         args, err, code = self.parse(["log", "o/r", "123"])
-        # a805a3c4: a missing verb is supplied only when it reads, and of log's kinds only `search` is in the shared
-        # reads list, so with no glaeda-gh entry the one read that fits runs (a search, harmless, said on stderr)
-        self.assertEqual((code, args.kind), (None, "search"))
-        self.assertIn(f"ran `{line('log', 'search', 'o/r', '123')}`", err)
-        self.with_proposed()
+        self.assertEqual((code, args.kind), (None, "job"))
+        self.assertIn("read-only forms; also", err)
+
+    def test_log_with_no_kind_runs_as_log_job_by_the_table_default(self) -> None:
         args, err, code = self.parse(["log", "o/r", "123"])
         self.assertEqual((code, args.kind, args.job), (None, "job", 123))
         self.assertIn(f"ran `{line('log', 'job', 'o/r', '123')}`", err)
@@ -131,15 +102,19 @@ class MeasuredMisses(Base):
         self.assertEqual((code, args.repo), (None, "o/r"))
         self.assertIn("ran `glaeda-gh status pr 2467 --repo o/r`", err)
 
-    def test_land_status_glued_is_refused_with_the_form_that_runs(self) -> None:
-        """`land` is an unsafe word, and `status` is a word of land's positional, not a subcommand the layer can
-        see as a read: so the repair is named, never run (an intent.py change upstream would let it run)."""
-        self.with_proposed()
-        with mock.patch.object(gg, "cmd_land_status", side_effect=AssertionError("must not run")):
-            args, err, code = self.parse(["land-status", "o/r#1"])
-        self.assertEqual((args, code), (None, 64))
-        self.assertIn("the exact form is needed", err)
-        self.assertIn("  " + line("land", "status", "o/r#1"), err)
+    def test_land_status_glued_runs_as_land_status_and_says_so(self) -> None:
+        """The table's alias `land-status` -> `land status` (60a81f74: a read under a write's word applies), run
+        through intent.alias: the land status read runs, the land write never does."""
+        args, err, code = self.parse(["land-status", "o/r#1"])
+        self.assertEqual((code, args.command, args.words), (None, "land", ["status", "o/r#1"]))
+        self.assertIn(f"ran `{line('land', 'status', 'o/r#1')}` for `{line('land-status', 'o/r#1')}`", err)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), mock.patch.object(gg, "INTENT_ON", True), \
+                mock.patch.object(gg, "cmd_land_status", return_value=0) as read, \
+                mock.patch.object(gg, "cmd_land", side_effect=AssertionError("must not land")), \
+                mock.patch.object(gg, "cmd_land_cancel", side_effect=AssertionError("must not cancel")):
+            self.assertEqual(gg.main(["land-status", "o/r#1"]), 0)
+        read.assert_called_once()
 
     def test_land_dash_dash_status_keeps_its_refusal(self) -> None:
         args, err, code = self.parse(["land", "--status", "o/r#1"])
@@ -188,7 +163,6 @@ class Writes(Base):
 
     def test_no_write_is_ever_a_read_only_best_guess(self) -> None:
         """a805a3c4 runs the best of several read-only meanings: no glaeda-gh write is ever read-only to it."""
-        self.with_proposed()
         intent, parser = layer(), gg.parser()
         for argv in (["land", "o/r#1"], ["land", "cancel", "o/r#1"], ["post", "comment", "o/r#1", "--body", "hi"],
                      ["post", "close", "o/r#1"], ["restart"], ["serve"], ["on-event", "replay"]):
@@ -214,7 +188,6 @@ class Writes(Base):
 
     def test_the_proposed_exact_entries_hold_the_writes_the_unsafe_words_miss(self) -> None:
         intent = layer()
-        self.with_proposed()
         for path in (["on-event", "replay", "--run-file", "/tmp/x"], ["serve", "--foreground-ok"]):
             with self.subTest(path=path):
                 self.assertIsNotNone(intent._unsafe(gg.parser(), path, self.table, "glaeda-gh"))  # noqa: SLF001
@@ -301,10 +274,13 @@ class Drift(unittest.TestCase):
                               text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_the_glaeda_cli_entries_are_not_hand_edited_into_the_copy(self) -> None:
-        table = json.loads((SCRIPTS / "intent_aliases.json").read_text())
-        self.assertEqual(table.get("schema"), "intent-aliases.v1")
-        self.assertIsInstance(copy.deepcopy(table.get("cli")), dict)
+    def test_the_synced_table_carries_the_glaeda_entries(self) -> None:
+        """They live upstream (leo-workspace tools/intent_aliases.json) and arrive by scripts/intent-sync only."""
+        cli = json.loads((SCRIPTS / "intent_aliases.json").read_text())["cli"]
+        self.assertIn({"from": ["land-status"], "to": ["land", "status"]}, cli["glaeda-gh"]["aliases"])
+        self.assertEqual(cli["glaeda-gh"]["default"], {"log": "job"})
+        self.assertTrue({"on-event", "serve"} <= set(cli["glaeda-gh"]["exact"]))
+        self.assertIn("keepup", cli["glaeda-disk"]["exact"])
 
 
 if __name__ == "__main__":

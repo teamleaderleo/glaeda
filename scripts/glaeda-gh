@@ -341,6 +341,7 @@ import hashlib
 import importlib.util
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import http.client as http_client
+import io
 import ipaddress
 import json
 import math
@@ -34786,6 +34787,19 @@ def bare_wait_count(word: str) -> bool:
     return True
 
 
+def probe_parse(argv: list[str]) -> bool:
+    """Whether ARGV parses, saying nothing and running nothing."""
+    Parser.defer = True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parser().parse_args(argv)
+        return True
+    except (Refused, SystemExit):
+        return False
+    finally:
+        Parser.defer = False
+
+
 def parse_with_intent(raw: list[str]) -> argparse.Namespace:
     """RAW parsed; a refused RAW is first read by the shared intent layer (scripts/intent.py), which runs the one form
     it meant and says so on stderr, prints the two or three it could mean, or, for a form that writes to GitHub
@@ -34802,6 +34816,19 @@ def parse_with_intent(raw: list[str]) -> argparse.Namespace:
         Parser.defer = False
     layer = intent_layer() if INTENT_ON and not os.environ.get("INTENT_OFF") else None
     if layer is not None:
+        try:
+            # The table's hand-written alias first (intent.alias: never onto a write, but `land-status` is
+            # `land status`, a read under land's word). argparse sees only `land` as a subcommand there, so
+            # fix() alone would refuse it as a write. Kept only when the aliased form parses.
+            hit = layer.alias(list(raw), "glaeda-gh")
+            if hit is not None and probe_parse(hit[0]):
+                said = shlex.join(["glaeda-gh"] + hit[0])
+                print(f"glaeda-gh: ran `{said}` for `{shlex.join(['glaeda-gh'] + raw)}` (the table's alias)",
+                      file=sys.stderr)
+                Parser.argv = hit[0]
+                return parser().parse_args(hit[0])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             meant = layer.fix(list(raw), p, "glaeda-gh")
         except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal

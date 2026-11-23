@@ -118,6 +118,53 @@
     "forget"
    ]
   },
+  "glaeda-disk": {
+   "aliases": [
+    {
+     "from": [
+      "status"
+     ],
+     "to": [
+      "report"
+     ]
+    }
+   ],
+   "exact": [
+    "keepup"
+   ],
+   "safe": [
+    "report"
+   ]
+  },
+  "glaeda-gh": {
+   "aliases": [
+    {
+     "from": [
+      "land-status"
+     ],
+     "to": [
+      "land",
+      "status"
+     ]
+    }
+   ],
+   "default": {
+    "log": "job"
+   },
+   "exact": [
+    "on-event",
+    "serve"
+   ],
+   "safe": [
+    "checks",
+    "budget",
+    "audit",
+    "runners",
+    "job",
+    "errors",
+    "flaky"
+   ]
+  },
   "leo-asks": {
    "exact": [
     "done",

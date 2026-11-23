@@ -631,6 +631,14 @@ def _fill(parser, spec: dict) -> None:
             _fill(subs.add_parser(name, allow_abbrev=inner.get("abbrev", True)), inner)
 
 
+def _write_words(typed: list, path: list, tbl: dict) -> bool:
+    """Whether an alias from TYPED to the subcommand words PATH touches a write: an unsafe word typed, or one in
+    PATH, unless PATH ends in a reading verb under it (`land status` reads; _unsafe says the same of a parser)."""
+    if len(path) > 1 and path[-1] in (tbl.get("reads") or ()):
+        return False  # what runs is a read, whatever word was typed for it (`land-status`)
+    return any(unsafe_word(t, tbl) for t in list(typed) + list(path))
+
+
 def alias(argv: list, prog: str, tbl: dict | None = None):
     """(ARGV with the table's first matching alias of PROG applied, the rule), or None. For a CLI with no spec: the
     words agents typed and the words that then worked (tools/intent_table.py). Never with an unsafe word on a side."""
@@ -638,8 +646,8 @@ def alias(argv: list, prog: str, tbl: dict | None = None):
     for rule in (tbl.get("cli") or {}).get(prog, {}).get("aliases") or []:
         under, frm, to = rule.get("under") or [], rule.get("from") or [], rule.get("to") or []
         at = len(under)
-        if frm and to and argv[:at] == under and argv[at:at + len(frm)] == frm and not any(
-                unsafe_word(t, tbl) for t in frm + to) and not _exact_path(prog, under + to, tbl):
+        if frm and to and argv[:at] == under and argv[at:at + len(frm)] == frm and not _write_words(
+                frm, under + to, tbl) and not _exact_path(prog, under + to, tbl):
             return argv[:at] + list(to) + argv[at + len(frm):], rule
     return None
 
@@ -785,8 +793,8 @@ def words(argv: list, prog: str, subcommands: list | None = None, flags: dict | 
     out = list(argv)
     for rule in (tbl.get("cli") or {}).get(prog, {}).get("aliases") or []:
         frm, to = rule.get("from") or [], rule.get("to") or []
-        if frm and not rule.get("under") and out[:len(frm)] == frm and (len(frm) > 1 or len(to) > 1) and not any(
-                unsafe_word(t, tbl) for t in to):
+        if frm and not rule.get("under") and out[:len(frm)] == frm and (len(frm) > 1 or len(to) > 1) and not (
+                _write_words(frm, to, tbl)):
             print(f"{prog}: ran `{_show(prog, to + out[len(frm):])}` for `{_show(prog, out)}`",
                   file=sys.stderr if err is None else err)
             _log(prog, out, {"outcome": "ran", "candidates": [{"argv": to + out[len(frm):], "notes": ["table"]}],
