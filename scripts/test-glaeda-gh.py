@@ -19805,6 +19805,26 @@ class BrokerSweepTest(BrokerBase):
             later = time.time() + gg.GH_SWEEP_WINDOW + 1
             self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/jobs/4"], "GET", later))
 
+    def test_the_refusal_names_when_its_window_clears_before_the_override(self) -> None:
+        """The detector for glaeda#2601: a caller that wants to obey by waiting must be told the moment it may read
+        again. The guard already holds each read's time, pruned to the window, so the oldest of them plus the window
+        is exactly when one more target becomes legal -- and the refusal said only "30 in the last 10 minutes".
+        Without a time the only *immediate* path the message named was the override, which no agent may take."""
+        at = 1_700_000_000.0  # a fixed clock: the clear time this asserts is a wall-clock string
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 2):
+            self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/runs/1/jobs"], "GET", at))
+            self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/runs/2/jobs"], "GET", at + 5))
+            err = gg.gh_sweep_refusal(["api", "repos/o/r/actions/runs/3/jobs"], "GET", at + 10)
+        self.assertIsNotNone(err)
+        clears = gg.utc_clock(at + gg.GH_SWEEP_WINDOW)  # the oldest read, at `at`, ages out one window after it
+        self.assertIn(clears, err)
+        self.assertIn(f"glaeda-gh wait until {clears}", err)
+        # The override is documented last: an agent reading top-to-bottom reaches a compliant step first.
+        self.assertLess(err.index("glaeda-gh wait until"), err.index("GLAEDA_GH_SWEEP_OK"))
+        self.assertLess(err.index("glaeda-gh runners o"), err.index("GLAEDA_GH_SWEEP_OK"))
+        # Still the refusal land's quota classifier reads (LAND_UNREAD_QUOTA), so a sweep-refused judgment still parks.
+        self.assertRegex(err, gg.LAND_UNREAD_QUOTA)
+
     def test_what_is_a_sweep_target(self) -> None:
         for path, want in (("repos/O/R/actions/runs/5/jobs?per_page=100", "o/r run 5"),
                            ("/repos/o/r/actions/runs/5/attempts/2/jobs", "o/r run 5"),

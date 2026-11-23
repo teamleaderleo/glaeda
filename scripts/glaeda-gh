@@ -29147,7 +29147,8 @@ def gh_cache_final_get(key: str, now: float) -> dict | None:
 # that ran every few minutes. `glaeda-gh runners OWNER` answers the same question from GitHub's
 # runner list, which carries `busy` and the labels for each runner: a page per 100 runners, shared
 # by every session on the host for the answer cache's TTL. A caller still sweeping per-job reads
-# past GH_SWEEP_MAX distinct runs or jobs in GH_SWEEP_WINDOW is refused with a message naming it.
+# past GH_SWEEP_MAX distinct runs or jobs in GH_SWEEP_WINDOW is refused with a message naming it, and naming
+# the time the rolling window clears, so waiting it out is a step the refusal itself hands over.
 # Polling one run's jobs is one target however often it is read, so it is never counted as a sweep.
 GH_SWEEP_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/"
                          r"(?:runs/(\d+)(?:/attempts/\d+)?/jobs|jobs/(\d+))/?(?:\?.*)?$")
@@ -29190,11 +29191,19 @@ def gh_sweep_refusal(words: list[str], method: str, now: float) -> str | None:
         mine = callers.setdefault(caller, {})
         if target not in mine and len(mine) >= GH_SWEEP_MAX:
             owner = target.split("/")[0]
+            # The window is rolling, so this same read is legal again without any override once the oldest read in it
+            # ages out -- and `mine` is pruned to the window, so min() is that read and needs no new state. Said
+            # because a refusal that names only the escape hatch as an immediate step is read as naming it as the
+            # step, and no agent here may take it: the wait is the compliant path and the message has to carry it.
+            # Same shape as every other quota refusal here (blocked_start_line): the time, then the wait that ends.
+            clears = utc_clock(min(mine.values()) + GH_SWEEP_WINDOW)
             return (f"glaeda-gh: refused: this caller read the jobs of {len(mine)} different runs or jobs in the last "
                     f"{int(GH_SWEEP_WINDOW // 60)} minutes, which is a runner-occupancy sweep and spends a REST request "
-                    f"each from the quota every session shares. `glaeda-gh runners {owner}` answers which runners are "
-                    f"busy, and with which labels, from one read the whole host shares. A read that really needs "
-                    f"every job can set GLAEDA_GH_SWEEP_OK=1.")
+                    f"each from the quota every session shares. The oldest of those reads ages out at {clears}, when "
+                    f"one more target becomes legal: `glaeda-gh wait until {clears}` is the wait that ends. "
+                    f"`glaeda-gh runners {owner}` answers which runners are "
+                    f"busy, and with which labels, from one read the whole host shares, with no wait at all. A read "
+                    f"that really needs every job can set GLAEDA_GH_SWEEP_OK=1.")
         mine[target] = now
         write_json(path, callers)
     return None
