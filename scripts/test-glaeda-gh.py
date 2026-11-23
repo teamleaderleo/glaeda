@@ -29293,6 +29293,44 @@ class LandTest(Base):
         self.q.window["graphqlAt"] = self.t
         self.assertTrue(self.q.window_room(e, "d" * 40))  # a new slot and a new head: judged from the caches
 
+    def test_an_unread_probe_waits_for_a_shared_cache_no_write_has_wiped(self):
+        """After an unreadable answer the next judgment reads this host's caches first (unreadCacheFirst). Only the
+        entry's own live judgment stores the reads such a probe needs -- that PR at that head, its check runs, its
+        jobs -- and the shared cache refuses every entry whose generations a write has bumped since (leo-workspace
+        tools/gh_shared_cache.py). The lander is its host's biggest writer (each merge and update-branch bumps one),
+        so the probe reads a cache its own last step wiped: one host, 7 days, unread_cache_miss 171 to
+        unread_cache_hit 3, and under --cache-only 325 of 325 gh calls refused, never one answered. A probe sent
+        after a bump cannot answer, so it is not sent: the live judgment it would precede runs, exactly as it does
+        after the miss."""
+        head = "c" * 40
+        self.pr(head)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        gens = gg.latch_state_dir() / "cache" / "generations.json"
+        gens.parent.mkdir(parents=True, exist_ok=True)
+        gens.write_text(json.dumps({"host": 4, "*": 2, "o/r": 3}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e.get("cacheOnlyJudge"), "unread")  # nothing says the caches are wiped: probe, as before
+        # The judgment's own merge step (gh pr merge --squash) is a write this cache cannot name: it bumps `*`,
+        # which refuses every entry on the host, including the ones that judgment just stored.
+        gens.write_text(json.dumps({"host": 5, "*": 3, "o/r": 3}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))  # the judgment still runs: only the probe before it is dropped
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+        self.assertEqual(gg.land_counts()[gg.land_day(self.t)].get("unread_cache_stale"), 1)
+        # Nothing wrote since that judgment: its stored reads can answer, so the probe is worth its subprocess again.
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e.get("cacheOnlyJudge"), "unread")
+        # A repo-scoped write (the update-branch step) refuses that repo's entries alone: same answer, by its scope.
+        gens.write_text(json.dumps({"host": 6, "*": 3, "o/r": 4}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+
     def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
         """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
         The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the
@@ -37360,6 +37398,118 @@ class ABareWaitFlagTest(unittest.TestCase):
         with mock.patch.object(gg, "cmd_post_status", fake_post_status):
             code = gg.main(["post", "status", "1795389726663-2573281-b1d8b9", "--wait"])
         self.assertEqual((code, seen.get("wait")), (0, 3600.0))
+
+
+class AFlagNameThatNearMissesTest(unittest.TestCase):
+    """A long flag one word off an option of the command runs as that option, as a choice's *value* has
+    since glaeda#2368. Measured 2026-11-22 (bg-965d52bc2c83), verbatim:
+
+        $ glaeda-gh wait pr teamleaderleo/... --until green --deadline 20m
+        usage: glaeda-gh [-h]
+                         {serve,status,wait,checks,post,log,read,budget,audit,search,runners,on-event,land,restart} ...
+        glaeda-gh: error: unrecognized arguments: --deadline 20m
+        next: glaeda-gh wait --help
+
+    The wait never happened, and a *background* wait that exits 64 at once reads as a wait that waited: the
+    lane believed it was watching its PR for the rest of a round trip. `--timeout` and `20m` were both
+    right; only the flag's name was not."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_the_deadline_that_lost_a_watch_is_the_timeout(self) -> None:
+        typed = ["wait", "pr", "teamleaderleo/leo-workspace#230", "--until", "green", "--deadline", "20m"]
+        fixed, refusal = gg.flag_near_miss_synonym(list(typed))
+        self.assertEqual(refusal, [])
+        self.assertEqual(fixed, ["wait", "pr", "teamleaderleo/leo-workspace#230", "--until", "green",
+                                 "--timeout", "20m"])
+        said = self.err.getvalue()
+        self.assertIn("`--deadline` is `--timeout`", said)
+        self.assertIn("--timeout 20m", said, "the whole call is said, so the next one is typed canonically")
+        self.assertNotIn("unrecognized arguments", said)
+
+    def test_the_value_of_a_resolved_flag_is_never_read_as_a_flag_of_its_own(self) -> None:
+        """`--timeout` takes its value in the next word, so that word is data in every spelling of the
+        flag: a body or a pattern that happens to be spelled like one of these names stays a value."""
+        self.assertEqual(gg.flag_near_miss_synonym(
+            ["post", "comment", "o/r#1", "--body", "--deadline", "--timeout", "60"])[0],
+            ["post", "comment", "o/r#1", "--body", "--deadline", "--timeout", "60"])
+
+    def test_a_synonym_only_counts_where_the_command_has_that_option(self) -> None:
+        """`status` has no `--timeout` at all, so `--deadline` means nothing there and argparse's own
+        refusal -- which names the word and a next step -- stands."""
+        typed = ["status", "pr", "o/r#1", "--deadline", "20m"]
+        self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (typed, []))
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_a_typo_of_an_option_of_this_command_runs_as_it(self) -> None:
+        for typed, want in ((["wait", "pr", "o/r#1", "--timout", "5"],
+                             ["wait", "pr", "o/r#1", "--timeout", "5"]),
+                            (["wait", "pr", "o/r#1", "--jsno"], ["wait", "pr", "o/r#1", "--json"]),
+                            (["wait", "pr", "o/r#1", "--ceiling", "1h"],
+                             ["wait", "pr", "o/r#1", "--max", "1h"])):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (want, []), typed)
+
+    def test_a_flag_as_near_to_two_options_is_refused_naming_both(self) -> None:
+        """The refusal `flag_spelling_synonym` already gives a spelling two options answer to: the word it
+        refused, both options, and a runnable `next:` line for each. Nothing is guessed."""
+        fixed, refusal = gg.flag_near_miss_synonym(["wait", "pr", "o/r#1", "--xone"])
+        self.assertEqual(fixed, ["wait", "pr", "o/r#1", "--xone"])
+        self.assertEqual(refusal[0], "glaeda-gh: `--xone` is no option of `wait` and is as near to "
+                                     "`--done` as to `--gone`: it is not guessed")
+        self.assertEqual(refusal[1:], ["next: glaeda-gh wait pr o/r#1 --done",
+                                       "next: glaeda-gh wait pr o/r#1 --gone"])
+
+    def test_a_flag_that_is_no_option_of_anything_is_still_refused(self) -> None:
+        """Not a parser that accepts anything: a word near nothing falls through to argparse, whose line
+        echoes it and names a next step. Checked through `main`, which is where that line is printed."""
+        said = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=said)), \
+                self.assertRaises(SystemExit) as caught:
+            gg.main(["wait", "pr", "o/r#1", "--totallyunknown", "5"])
+        self.assertEqual(caught.exception.code, 64)
+        said = said.getvalue()
+        self.assertIn("unrecognized arguments: --totallyunknown 5", said)
+        self.assertIn("next: glaeda-gh wait --help", said)
+
+    def test_a_flag_that_lives_on_another_command_keeps_the_line_that_names_it(self) -> None:
+        """`wait ... --notify` is `land`'s flag, and which command the caller meant is theirs to say:
+        `flag_elsewhere` names where it lives and offers the call without it. Never rewritten into some
+        near flag of `wait` instead."""
+        typed = ["wait", "run", "o/r/1", "--timeout", "1500", "--notify"]
+        self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (typed, []))
+        said = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=said)), \
+                self.assertRaises(SystemExit) as caught:
+            gg.main(list(typed))
+        self.assertEqual(caught.exception.code, 64)
+        said = said.getvalue()
+        self.assertIn("`--notify` is no option of `wait`: it is `land`'s", said)
+        self.assertIn("next: glaeda-gh wait run o/r/1 --timeout 1500", said)
+
+    def test_an_abbreviation_is_left_to_argparse(self) -> None:
+        """`allow_abbrev` is on, so the start of an option is argparse's word: it resolves a unique one and
+        refuses an ambiguous one by name. Reading it here could differ from argparse and would take that
+        decision off it."""
+        for typed in (["wait", "file", "/x", "--contain", "y"], ["wait", "pr", "o/r#1", "--time", "60"],
+                      ["wait", "pr", "o/r#1", "--j"], ["land", "o/r#1", "--match-head", "a" * 40]):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_every_call_that_works_today_is_left_exactly_as_typed(self) -> None:
+        """No currently-accepted flag changes meaning: a canonical call is untouched and says nothing."""
+        for typed in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1", "--timeout", "60"],
+                      ["wait", "pr", "o/r#1", "--max", "1h", "--sha", "a" * 40], ["land", "o/r#1"],
+                      ["post", "comment", "o/r#1", "--body", "hi"], ["log", "job", "o/r", "1"],
+                      ["search", "prs", "repo:o/r"], ["on-event", "status"], ["checks", "o/r", "a" * 40],
+                      ["gh", "pr", "view", "1", "--deadline"], ["coord-alert", "x"], ["wait-resume", "x"],
+                      ["--help"], ["-h"], [], ["o/r#1"], ["nonsense", "x"],
+                      ["post", "comment", "o/r#1", "--body", "hi", "--", "--deadline"]):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "")
 
 
 class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
