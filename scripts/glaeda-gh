@@ -14645,6 +14645,19 @@ def gh_cache_newest() -> float:
     return newest
 
 
+def gh_cache_gens(repo: str | None) -> list[int]:
+    """The host's shared gh cache generations a read of REPO is answered under (leo-workspace tools/gh_shared_cache.py:
+    every entry keeps the generations of its scope and of `*` as it was stored, and is refused once either moved).
+    Each write through the shim bumps `host` and the repo it names, or `*` -- every key on the host -- when its flags
+    do not name one (`pr merge --squash --match-head-commit`, `run rerun --failed`). So this list moving means every
+    answer stored before it is now refused: no read of REPO can be served from that cache (unread_cache_stale)."""
+    gens = read_json(latch_state_dir() / "cache" / "generations.json")
+    if not isinstance(gens, dict):
+        return []
+    return [int(gens.get(k) or 0) if isinstance(gens.get(k), (int, float)) else 0
+            for k in ("host", str(repo or "").lower(), "*")]
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -16362,6 +16375,22 @@ class LandQueue:
         return [sha, c.get("fp"), c.get("fullAt"), c.get("dataAt"),
                 snap.get("fp"), snap.get("readAt"), snap.get("complete"), gh_cache_newest()]
 
+    def unread_probe_answerable(self, e: dict, gens: list[int]) -> bool:
+        """Whether a cache-only probe of E (the unread route) can be answered at all. The reads such a probe makes --
+        that PR with the review and comment fields, its head's check runs and status, its jobs with their steps -- are
+        ones the daemon's own cache and the git mirror never keep, so only the host's shared gh cache can answer, and
+        only E's own live judgment ever stored them there. GENS moving since that judgment started means every entry
+        it stored is refused (gh_cache_gens), so the probe must miss: one host, 7 days, unread_cache_miss 171 to
+        unread_cache_hit 3, and under --cache-only 325 of 325 gh calls refused with none ever answered, because the
+        judgment's own merge or update-branch step bumps `*` and wipes the reads its next probe would have read.
+        Generations only rise, so unmoved proves the entries are live; moved is taken as wiped even in the few cases
+        where the bump landed before they were stored -- the cost of that is a live judgment that was coming anyway."""
+        mark = e.get("cacheGen")
+        if not isinstance(mark, list) or mark == gens:
+            return True
+        self.count("unread_cache_stale")  # a probe not sent: the subprocess and the worker it would have held
+        return False
+
     def window_room(self, e: dict, sha: str = "") -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
@@ -16373,6 +16402,9 @@ class LandQueue:
         e.pop("paceNext", None)
         e.pop("cacheOnlyInputs", None)
         first = e.pop("unreadCacheFirst", None)
+        gens = gh_cache_gens(e.get("repo"))
+        if first is not None and not self.unread_probe_answerable(e, gens):
+            first = None  # a write wiped what E's last live judgment stored: that probe can only miss, so it is not sent
         if self.latch_free(e) and not self.broker_client():
             # (A broker client's latch-free owner has its REST reads answered by the broker's read App, its GraphQL by
             # the login: paced as before.) Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
@@ -16382,12 +16414,15 @@ class LandQueue:
             # GraphQL they never spend. The App's own refusals are what is measured for them (spent_until, the park).
             if first is not None:
                 e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
+            e["cacheGen"] = gens
             return True
         if not over:
+            e["cacheGen"] = gens
             return True
         pool = over[0]
         slot = float(w.get("graphqlAt", float("-inf")))
@@ -16396,6 +16431,7 @@ class LandQueue:
             # GraphQL is spent to its reserve and REST has paced room: the caches first, then a live judgment over
             # REST, charged to REST alone (LAND_REST_ROUTE's comment).
             e["cacheOnlyJudge"] = "rest"
+            e["cacheGen"] = gens
             return True
         if over == ["graphql"]:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).

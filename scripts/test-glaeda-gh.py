@@ -29042,6 +29042,44 @@ class LandTest(Base):
         self.q.window["graphqlAt"] = self.t
         self.assertTrue(self.q.window_room(e, "d" * 40))  # a new slot and a new head: judged from the caches
 
+    def test_an_unread_probe_waits_for_a_shared_cache_no_write_has_wiped(self):
+        """After an unreadable answer the next judgment reads this host's caches first (unreadCacheFirst). Only the
+        entry's own live judgment stores the reads such a probe needs -- that PR at that head, its check runs, its
+        jobs -- and the shared cache refuses every entry whose generations a write has bumped since (leo-workspace
+        tools/gh_shared_cache.py). The lander is its host's biggest writer (each merge and update-branch bumps one),
+        so the probe reads a cache its own last step wiped: one host, 7 days, unread_cache_miss 171 to
+        unread_cache_hit 3, and under --cache-only 325 of 325 gh calls refused, never one answered. A probe sent
+        after a bump cannot answer, so it is not sent: the live judgment it would precede runs, exactly as it does
+        after the miss."""
+        head = "c" * 40
+        self.pr(head)
+        self.land()
+        self.q.now = self.t
+        self.q.ingest()
+        e = self.q.entries[self.KEY]
+        gens = gg.latch_state_dir() / "cache" / "generations.json"
+        gens.parent.mkdir(parents=True, exist_ok=True)
+        gens.write_text(json.dumps({"host": 4, "*": 2, "o/r": 3}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e.get("cacheOnlyJudge"), "unread")  # nothing says the caches are wiped: probe, as before
+        # The judgment's own merge step (gh pr merge --squash) is a write this cache cannot name: it bumps `*`,
+        # which refuses every entry on the host, including the ones that judgment just stored.
+        gens.write_text(json.dumps({"host": 5, "*": 3, "o/r": 3}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))  # the judgment still runs: only the probe before it is dropped
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+        self.assertEqual(gg.land_counts()[gg.land_day(self.t)].get("unread_cache_stale"), 1)
+        # Nothing wrote since that judgment: its stored reads can answer, so the probe is worth its subprocess again.
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertEqual(e.get("cacheOnlyJudge"), "unread")
+        # A repo-scoped write (the update-branch step) refuses that repo's entries alone: same answer, by its scope.
+        gens.write_text(json.dumps({"host": 6, "*": 3, "o/r": 4}))
+        e["unreadCacheFirst"] = head
+        self.assertTrue(self.q.window_room(e, head))
+        self.assertIsNone(e.get("cacheOnlyJudge"))
+
     def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
         """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
         The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the
