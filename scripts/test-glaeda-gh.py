@@ -28694,10 +28694,12 @@ class LandTest(Base):
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
 
     def past_give_up(self) -> dict:
-        """Tick the forwarded row past LAND_FORWARD_GIVE_UP since it was first forwarded, until it leaves "forwarded"
+        """Tick the forwarded row until the give-up has resolved it once (it left "forwarded", or it was handed again),
         or the bound has passed twice over."""
+        requeued = self.q.entries[self.KEY].get("forwardRequeued")
         for _ in range(int(2.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
-            if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if e["state"] != "forwarded" or e.get("forwardRequeued") != requeued:
                 break
         return self.q.entries[self.KEY]
 
@@ -28714,7 +28716,7 @@ class LandTest(Base):
         sent = len(self.w.sent())
         e = self.past_give_up()
         self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
-        self.assertNotIn("stop", e)
+        self.assertIsNone(e.get("stop"))
         self.assertEqual(len(self.w.sent()), sent)  # silent: no blocker, no merged notice
         self.assertTrue(any(h.get("event") == "forward_resolve" for h in e["history"]), e["history"])
         self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)  # one state read, at the give-up only
@@ -33179,6 +33181,58 @@ class LandForwardTest(Base):
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual(e["state"], "merged")
         self.assertEqual(len(self.sent_batches), 2)
+
+    def give_up(self) -> dict:
+        for _ in range(int(2.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if e["state"] != "forwarded" or e.get("forwardRequeued"):
+                return e
+        return self.q.entries[self.KEY]
+
+    def test_a_forward_the_executor_merged_but_this_cache_never_read_ends_merged_here_with_no_message(self):
+        # 2026-11-23 07:45-07:56Z: ~30 [blocker] forward_no_outcome stops from cosmic-gray, huge-blue and cmux-cp-1 for
+        # PRs their executor had merged days before. At the give-up this host asks the executor's queue first.
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+        self.w.cache.pop(self.KEY, None)  # this host's cache holds no read of the PR
+        self.w.view_err = "gh-quota: refused: latched"  # and GitHub is not read: the executor's answer is enough
+        sent = len(self.w.sent())
+        e = self.give_up()
+        self.assertEqual(e["state"], "merged")
+        self.assertEqual(len(self.w.sent()), sent)
+        [r] = [h for h in e["history"] if h.get("event") == "forward_resolve"]
+        self.assertIn("merged", r["receiver"])
+
+    def test_a_forward_the_executor_lost_with_the_pr_open_is_sent_again_pinned_under_a_new_id(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        first = self.sent_batches[0]["requests"][0]["id"]
+        for f in (self.exec_base / "land" / "requests").glob("*.json"):  # the executor lost it (made by this test)
+            f.unlink()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_state, self.w.view_head = "OPEN", LA
+        sent = len(self.sent_batches)
+        e = self.give_up()
+        self.assertEqual((e["forwardRequeued"], e["pinSha"]), (1, LA))
+        self.tick()
+        r = self.sent_batches[-1]["requests"][0]
+        self.assertGreater(len(self.sent_batches), sent)
+        self.assertEqual(r["sha"], LA)
+        self.assertNotEqual(r["id"], first)
+        self.assertTrue(r["id"].startswith("requeue-"), r["id"])
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
 
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
