@@ -3355,7 +3355,7 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
         return None
     found: list[tuple[str, str]] = []
     for e in errors:
-        if not isinstance(e, dict) or protection_forbidden(e):
+        if not isinstance(e, dict) or protection_forbidden(e) or foreign_app_forbidden(owner, e):
             continue
         text = gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""), limit=None)
         if not app_graphql_refused(text):
@@ -3366,6 +3366,61 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
             return None
         found.append((node, ".".join(str(p) for p in e["path"])))
     return found or None
+
+
+# One field of an answer is not the answer. The broker host, 2026-11-22 18Z to 2026-11-23 02Z: 1,300
+# app-pool-node-refused lines, every one at suiteRuns.N.app, every one the `cursor` organization's IP allow list: an
+# App token may not read the Cursor App's own node from this address, while the suite itself (its conclusion, its
+# workflow run, its check runs) came back whole beside that error. Each one benched the suite node in every pool, so
+# that read and every read of that suite for the next hour went on the login (867 `refused` and 898 `pool-resting`
+# login-fallback lines in those 9 hours; Leo: "we have ten App pools for exactly this"). Such an error is now part of
+# the answer: the App's 200 is kept, no node or scope is benched, and the field reads as unread (unread_foreign_apps),
+# never as GitHub's documented null app.
+APP_FIELD = "app"
+
+
+def foreign_app_forbidden(owner: str, error: Any) -> bool:
+    """Whether one GraphQL error of a 200 App answer is another organization's IP allow list refusing an `app` field
+    only (a check suite's App node): the rest of the answer stands."""
+    if not isinstance(error, dict) or str(error.get("type") or "") != "FORBIDDEN":
+        return False
+    path = error.get("path")
+    if not (isinstance(path, list) and len(path) > 1 and path[-1] == APP_FIELD):
+        return False
+    org = APP_POOL_IP_ALLOW_LIST.search(str(error.get("message") or ""))
+    return bool(org) and org.group(1).lower() != str(owner or "").lower()
+
+
+def unread_foreign_apps(owner: str, doc: Any) -> list[str]:
+    """Take DOC's foreign_app_forbidden errors out of it, in place, and return their paths ("suiteRuns.3.app"). Each
+    path's `app` key is removed from its object, which is marked appUnread: a reader sees an App it could not read,
+    not a null one (run_identity's appNull) and not an unread suite (suite_runs reads a suite by its errors)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("errors"), list):
+        return []
+    kept, paths = [], []
+    for e in doc["errors"]:
+        if not foreign_app_forbidden(owner, e):
+            kept.append(e)
+            continue
+        paths.append(".".join(str(p) for p in e["path"]))
+        node: Any = doc.get("data")
+        for step in e["path"][:-1]:
+            if isinstance(node, dict) and isinstance(step, str):
+                node = node.get(step)
+            elif isinstance(node, list) and type(step) is int and 0 <= step < len(node):
+                node = node[step]
+            else:
+                node = None
+                break
+        if isinstance(node, dict) and node.get(APP_FIELD) is None:
+            node.pop(APP_FIELD, None)
+            node["appUnread"] = True
+    if paths:
+        if kept:
+            doc["errors"] = kept
+        else:
+            doc.pop("errors", None)
+    return paths
 
 
 def entry_nodes(key: str) -> list[str]:
@@ -6973,6 +7028,12 @@ class Daemon:
                 doc = json.loads(raw) if raw else None
             except ValueError:
                 doc = None
+            # another organization's IP allow list on a check suite's `app` field only: the rest of the answer is
+            # the App's, and those fields read as unread (unread_foreign_apps), never the login's to read again
+            unread_apps = unread_foreign_apps(owner, doc) if status == 200 and graphql_body else []
+            if unread_apps:
+                log({"event": "app-pool-app-unread", "role": pool.role, "owner": owner, "route": route,
+                     "scope": scope, "paths": unread_apps[:5], "count": len(unread_apps)})
             if isinstance(doc, dict):
                 errors = doc.get("errors")
                 error_text = " ".join(gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""),
@@ -10663,7 +10724,10 @@ class Daemon:
                 if (runs.get("pageInfo") or {}).get("hasNextPage"):
                     out[suite_id] = "graphql: last real attempt: more than 100 check runs in one suite"
                     continue
-                context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
+                # an App another organization's IP allow list kept from the App token (unread_foreign_apps) is unread,
+                # not GitHub's null app: the context has no `app` (run_identity names no app and no appNull)
+                context = {"conclusion": suite.get("conclusion"),
+                           **({} if suite.get("appUnread") else {"app": suite.get("app")}),
                            "workflowRun": suite.get("workflowRun")}
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
                                  for run in nodes]
@@ -12983,6 +13047,14 @@ LAND_NOTIFY_DEADLINE = 30.0
 # a later acpmux; huge-blue logged 1,893 against 976 land-pool lines.
 LAND_NOTIFY_TRIES = 3
 LAND_NOTIFY_RETRY_S = 5.0
+# What acpmux answered decides the resend. The broker host cmux-cp-1, 2026-11-22 18Z-2026-11-23 02Z: of 307
+# land-notify-failed, ~190 were "no_session: no session matches HOST/SESSION" (a lane that has ended: no resend
+# finds it, so it is told once and logged land-notify-no-session), and 78 were the mesh hub's "429
+# mesh.rate_limited" or "503 mesh.unavailable", resent 5 s apart into the same limit. A busy hub is now resent
+# LAND_NOTIFY_BUSY_RETRY_S, then twice that, apart.
+LAND_NOTIFY_GONE = re.compile(r"\bno_session:")
+LAND_NOTIFY_BUSY = re.compile(r"\b(?:429|503)\b|mesh\.rate_limited|mesh\.unavailable")
+LAND_NOTIFY_BUSY_RETRY_S = 30.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
@@ -19451,8 +19523,14 @@ class LandQueue:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if LAND_NOTIFY_GONE.search(whys[-1]):
+                    # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
+                    log({"event": "land-notify-no-session", "key": e["key"], "to": to, "why": whys[-1],
+                         "tries": tried})
+                    return
                 if tried < LAND_NOTIFY_TRIES:
-                    time.sleep(LAND_NOTIFY_RETRY_S)
+                    busy = LAND_NOTIFY_BUSY.search(whys[-1])
+                    time.sleep(LAND_NOTIFY_BUSY_RETRY_S * tried if busy else LAND_NOTIFY_RETRY_S)
             why = whys[-1]
             log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why, "tries": len(whys)})
             with contextlib.suppress(Exception):
