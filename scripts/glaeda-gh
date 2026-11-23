@@ -1388,7 +1388,17 @@ TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,2048}|github_pat_[A-Za-z0-9
 
 
 class WatchError(RuntimeError):
-    pass
+    """Our own message, which describe() hands on as written -- so GitHub's personal identifiers come out of it
+    where it is raised, not at each print.
+
+    Every GitHub or `gh` sentence that reaches a person through an exception reaches it here, because describe()
+    reduces anything that is not ours to a type name: the stderr tail of a refused `gh api` child, a broker's or
+    an upstream's forwarded refusal, a land executor's reason, a search that was not answered. gh_sanitize names
+    the login whose bucket a quota refusal spent and is idempotent, so a message with no identifier in it is
+    raised byte for byte and the words stay GitHub's own."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*(gh_sanitize(a) if isinstance(a, str) else a for a in args))
 
 
 # ---------------------------------------------------------------- keys and files
@@ -3911,7 +3921,7 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         status = answer.get("status")
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
-            return 502, {}, json.dumps({"message": f"direct: {why}"[:UPSTREAM_ERROR_MAX]}).encode()
+            return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
         return status, {}, json.dumps(answer.get("data")).encode()
     return send
 
@@ -5359,7 +5369,7 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
         part = f"{where}: {code}" if where and code else where or code
         if part:  # an error dict with none of the three says nothing; empty parens say less than no parens
             parts.append(part)
-    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip().rstrip(":")  # a body with no message: no bare colon
+    line = f"HTTP {status}: {gh_said(doc.get('message'), limit=None)}".rstrip().rstrip(":")  # a body with no message: no bare colon
     if parts:
         line += f" ({'; '.join(parts)})"
     if repo:
@@ -7388,7 +7398,7 @@ class Daemon:
             found, _ = self.post_find(item, actor)
             self.post_finish(path, item, url=found.get("html_url") if found else None,
                              note="a pull request for this head is already open",
-                             error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
+                             error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
 
@@ -7403,7 +7413,8 @@ class Daemon:
             return f"reviewers not requested: {describe(error) if isinstance(error, WatchError) else 'out of time'}"
         if 200 <= status < 300:
             return None
-        return f"reviewers not requested: HTTP {status} {(answer or {}).get('message', '') if isinstance(answer, dict) else ''}".strip()
+        said = gh_said(answer.get("message"), limit=None) if isinstance(answer, dict) else ""
+        return f"reviewers not requested: HTTP {status} {said}".strip()
 
     def post_delivered(self, path: Path, item: dict, doc: dict | None = None, note: str | None = None) -> None:
         """Checkpoint delivery before follow-up effects: a failed/interrupted regrade never replays content."""
@@ -9696,6 +9707,10 @@ class Daemon:
             self.beat = self.now
 
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
+        # `error` is the one field of a cache entry GitHub's own sentence reaches (a REST refusal, an upstream's
+        # forwarded one), and every surface that prints an entry prints it; the id goes here, once, for all of them.
+        if isinstance(fields.get("error"), str):
+            fields = {**fields, "error": gh_sanitize(fields["error"])}
         cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         cache = cache_dir() / file_name(key)
         with bounded_lock(cache_dir() / ".write.lock") as held:
@@ -10610,7 +10625,7 @@ class Daemon:
             return "same", None, etag
         if status == 200 and isinstance(doc, (dict, list)):  # .../rules/branches/B answers a list
             return "fresh", doc, h.get("etag")
-        message = (doc or {}).get("message", "") if isinstance(doc, dict) else ""
+        message = gh_said(doc.get("message"), limit=None) if isinstance(doc, dict) else ""
         return "error", f"HTTP {status} {message}".strip()[:200], None
 
     def fetch_run(self, e: dict) -> None:
@@ -13903,7 +13918,12 @@ def land_redact(text: Any) -> str:
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
-    text = " ".join(str(text or "").split())
+    """TEXT on one line, cut to LIMIT, with GitHub's account id out of it (land_redact).
+
+    Every land string a person reads is cut here -- a judge's refusal reason, an escalation notice, a peer's
+    "why" -- and a judge quotes gh's own refusal in its reason ("quota: gh: API rate limit already exceeded for
+    user ID NNNN"), so this is where that id stops. The substitution is idempotent, so clean text is unchanged."""
+    text = land_redact(" ".join(str(text or "").split()))
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
@@ -20302,6 +20322,7 @@ def utc_stamp(at: float) -> str:
 def refresh_log_write(line: str) -> None:
     """One refresh-failure line on stderr and in BASE/REFRESH_LOG, cut to its newest half past REFRESH_LOG_MAX.
     Never raises: writing down a failure must not become one."""
+    line = gh_sanitize(line)  # the reasons here are GitHub's own words (refresh_note)
     with contextlib.suppress(Exception):
         print(line, file=sys.stderr, flush=True)
     path = BASE / REFRESH_LOG
@@ -28922,7 +28943,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
     if done.returncode != 0:
-        return None, f"{where} not read ({(done.stderr or '').strip()[:120]})"
+        return None, f"{where} not read ({gh_said((done.stderr or '').strip(), limit=120)})"
     try:
         doc = json.loads(gzip.decompress(base64.b64decode(done.stdout.strip(), validate=True)))
     except (ValueError, OSError, EOFError, zlib.error) as error:
@@ -30876,7 +30897,7 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         err = done.stderr.decode(errors="replace").strip()
         if not (flags and "unknown flag" in err):
             break
-    return False, b"", (err or f"gh api exited {done.returncode}")[-300:]
+    return False, b"", (gh_said(err, limit=None) or f"gh api exited {done.returncode}")[-300:]
 
 
 def job_log_finished(text: bytes) -> bool:
