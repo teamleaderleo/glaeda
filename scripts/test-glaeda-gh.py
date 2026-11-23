@@ -27483,6 +27483,115 @@ class LandTest(Base):
         [env] = self.merge_envs()
         self.assertFalse(set(want) & set(env))
 
+    NOMINATED = {"path": "repo-autoland", "evidence": {"ship-receipt": {"head": LA, "why": ""}}}
+
+    def judge_envs(self) -> list[dict]:
+        return [env for c, env in zip(self.w.calls, self.w.envs) if c[1:3] == [self.w.mh, "explain"]]
+
+    def test_a_nominated_land_judges_and_merges_with_its_nomination_and_a_plain_one_without(self):
+        # ci-v2 step 12: the nomination rode only a mark on the host that filed the land, so a queue on another host
+        # judged the merge as a plain glaeda-land. Now every judgment and merge try carries it (LAND_NOMINATED_ENV).
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", self.NOMINATED))
+        self.assertEqual([h.get("nominated") for h in e["history"] if h["event"] == "queued"], ["repo-autoland"])
+        envs = self.judge_envs() + self.merge_envs()
+        self.assertGreaterEqual(len(envs), 2)
+        for env in envs:
+            self.assertEqual(json.loads(env[gg.LAND_NOMINATED_ENV]), self.NOMINATED)
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.w.config["env"] = {gg.LAND_NOMINATED_ENV: json.dumps(self.NOMINATED)}  # never inherited from land.json
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", None))
+        for env in self.judge_envs() + self.merge_envs():
+            self.assertNotIn(gg.LAND_NOMINATED_ENV, env)
+
+    def test_a_malformed_nomination_is_kept_unreadable_so_the_judge_refuses_it(self):
+        # never dropped: a request that says it was nominated is judged as a nomination it cannot read (refused)
+        for raw in ("repo-autoland", {"path": "Not A Path", "evidence": {}}, {"path": "next-autoland", "evidence": []},
+                    {"path": "next-autoland", "evidence": {"x": "y" * gg.LAND_NOMINATED_MAX}}):
+            with self.subTest(raw=str(raw)[:40]):
+                got = gg.land_nominated(raw)
+                self.assertEqual(set(got), {"unreadable"})
+                env = gg.land_nominated_env({"nominated": got})
+                self.assertIn("unreadable", json.loads(env[gg.LAND_NOMINATED_ENV]))
+        self.assertIsNone(gg.land_nominated(None))
+        self.assertEqual(gg.land_nominated_env({}), {})
+        # a served (forwarded) request with a malformed one keeps it as unreadable on the entry
+        self.pr(LA)
+        rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "requester": "host/lane", "nominated": 7})
+        self.assertTrue(rid, why)
+        self.w.answers.append(refusal("fast_gates", LA, {"kind": "stop", "stop": "fast_gates", "why": "unreadable"}))
+        e = self.tick()
+        self.assertEqual(set(e.get("nominated") or {}), {"unreadable"})
+        [env] = self.judge_envs()
+        self.assertIn("unreadable", json.loads(env[gg.LAND_NOMINATED_ENV]))
+        self.assertEqual(self.merge_envs(), [])
+
+    def test_the_nomination_travels_to_an_executor_an_overflow_peer_and_a_lane_vms_hand_off(self):
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+        # the outbox a forwarding host resends to its executor carries it
+        batch, _, _ = self.q.forward_batch()
+        self.assertEqual([r.get("nominated") for r in batch], [self.NOMINATED])
+        # the executor's end: `land serve` applies the forwarded request with its nomination
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA)
+        handed = gg.LandQueue.handoff_request(self.KEY, {"key": self.KEY, "requestId": "", "gen": 1,
+                                                          "nominated": dict(self.NOMINATED)})
+        rid, why = gg.land_serve_one(handed)
+        self.assertTrue(rid, why)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", self.NOMINATED))
+        self.assertTrue(all(json.loads(env[gg.LAND_NOMINATED_ENV]) == self.NOMINATED
+                            for env in self.judge_envs() + self.merge_envs()))
+        # a plain handoff request names none
+        self.assertNotIn("nominated", gg.LandQueue.handoff_request(self.KEY, {"key": self.KEY, "gen": 1}))
+        # a lane VM's hand-off to the broker host sends it (a broker that does not know it refuses the hand-off)
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+            self.w.gh_rc["merge"] = 1
+            self.w.gh_err["merge"] = self.NOT_OWNER
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane",
+                                               "nominated": self.NOMINATED})
+
+    def test_land_cli_queues_the_nomination_and_refuses_one_it_cannot_keep(self):
+        ev = json.dumps(self.NOMINATED["evidence"])
+        self.assertEqual(gg.land_nominated_given("repo-autoland", ev), self.NOMINATED)
+        self.assertEqual(gg.land_nominated_given("next-autoland", None), {"path": "next-autoland", "evidence": {}})
+        self.assertIsNone(gg.land_nominated_given(None, None))
+        for path, evidence in ((None, ev), ("repo-autoland", "{not json"), ("repo-autoland", "[]"), ("X Y", ev)):
+            with self.subTest(path=path, evidence=evidence[:10]):
+                with self.assertRaises(gg.WatchError):
+                    gg.land_nominated_given(path, evidence)
+        self.pr(LA)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane"}), \
+                mock.patch.object(gg, "policy_host", return_value="host"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--nominated-path", "repo-autoland",
+                                      "--nominated-evidence", ev, "--json"]), 0)
+        self.w.answers.append(ok_answer(LA))
+        self.assertEqual(self.tick().get("nominated"), self.NOMINATED)
+
     def test_land_override_goes_to_the_brokers_land_as_its_override(self):
         self.broker = True
         self.pr(LA)
