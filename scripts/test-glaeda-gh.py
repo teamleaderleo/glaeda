@@ -35383,7 +35383,7 @@ class WaitBlockedByQuotaTest(Base):
         # and it still never names itself: a wait that read nothing for its whole --timeout cannot be its own next
         # step (leo-workspace#8794 burned 2401 s that way), so it names the read that would explain the silence
         nxt = gg.wait_outcome(self.request(), gg.EXIT_TIMEOUT, None, 1800)["next"]
-        self.assertEqual(nxt, "glaeda-gh status pr o/r#7208 --verbose")
+        self.assertEqual(nxt, "glaeda-gh status pr o/r#7208")
         self.assertNotIn("glaeda-gh wait", nxt)
 
     def test_no_records_at_all_claims_nothing(self) -> None:
