@@ -28825,9 +28825,11 @@ class LandTest(Base):
         self.assertEqual(self.quiet_notices(), [])
         self.assertEqual(self.q.entries[self.KEY]["forwardQuiet"]["ended"], "MERGED")
         # a fresh forward whose PR is never read again: told once the read's wait is out, saying no read ended it
+        # (the cache's MERGED also ended the row merged: forward_follow; the fresh forward is a forwarded row again)
         self.w.cache.pop(self.KEY, None)
         e = self.q.entries[self.KEY]
         e.pop("forwardQuiet")
+        e.update(state="forwarded", mergeSha="", forwardFirst=None)
         e["handedOff"]["at"] = self.t
         self.tick(gg.LAND_FORWARD_QUIET + 10)
         self.assertEqual(self.quiet_notices(), [])

@@ -16164,8 +16164,9 @@ class LandQueue:
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
     def forwarded_at(self, e: dict) -> float:
-        """When E was forwarded: its hand-off's time, its forward's stamp, or its last forwarding history event."""
-        for at in ((e.get("handedOff") or {}).get("at"), e.get("forwardedAt")):
+        """When E was forwarded: its first forward (forwardFirst, which a re-send this host makes by itself keeps:
+        forward_follow), its hand-off's time, its forward's stamp, or its last forwarding history event."""
+        for at in (e.get("forwardFirst"), (e.get("handedOff") or {}).get("at"), e.get("forwardedAt")):
             if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
                 return float(at)
         for h in reversed(e.get("history") or []):
@@ -16178,6 +16179,8 @@ class LandQueue:
         since = self.forwarded_at(e)
         if not since or self.now - since < LAND_FORWARD_QUIET:
             return
+        if self.now - (float(e.get("forwardFirst") or 0) or self.forwarded_since(e)) > LAND_FORWARD_GIVE_UP:
+            return  # past the give-up its PR is read and settled, telling nobody when it ended (forward_settle)
         quiet = e.get("forwardQuiet") or {}
         if float(quiet.get("since") or 0) == since:
             return  # this forward was told (or seen ended) once
