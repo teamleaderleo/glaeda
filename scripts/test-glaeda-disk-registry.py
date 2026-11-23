@@ -186,6 +186,12 @@ class EvictTest(unittest.TestCase):
         self.assertTrue(any("a symlink, kept" in k for k in result["kept"]))
         self.assertTrue(self.root.is_dir(), "the cache root itself is never removed")
 
+    def test_one_pass_deletes_at_most_max_units(self):
+        _code, result = self.run_cli("evict", "--apply", "--json", "--max-units", "1", flag="1")
+        self.assertEqual(result["deferred"], 2)
+        left = [name for name in ("feat", "link", "main") if os.path.lexists(self.root / name)]
+        self.assertEqual(len(left), 2, "one unit goes per pass at --max-units 1; the rest wait")
+
     def test_a_unit_used_since_the_plan_is_kept(self):
         cache = reg.parse({"schema": reg.SCHEMA, "cache": [{"name": "dd", "path": f"{self.root}/{{stream}}",
                                                             "owner": "t", "regenerates": True, "budget_gib": 0}]},

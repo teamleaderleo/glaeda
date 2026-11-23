@@ -9,10 +9,12 @@ config/disk-registry.toml declares each cache that may outlive a job: its path, 
 size budget. This tool reads it and:
 
   status [--json]          each cache's size against its budget (read only)
-  evict [--json] [--apply] the LRU plan: for each regenerating cache, least recently used units first until under
+  evict [--json] [--apply] [--max-units N]
+                           the LRU plan: for each regenerating cache, least recently used units first until under
                            budget, plus units idle past idle_shrink_days down to min_gib. Without --apply, or without
                            GLAEDA_DISK_REGISTRY=1 in the environment, it prints the plan and deletes nothing.
                            A cache with regenerates = false is never evicted; over budget it is an alarm line.
+                           One pass deletes at most --max-units units (default 8); the rest wait for the next pass.
   slot NAME --stream S     the per-stream slot path of a {stream} cache (derived-data), created with --create
 
 Off by default: a host opts into deletion with GLAEDA_DISK_REGISTRY=1. A unit used within in_use_hours is never
@@ -55,6 +57,7 @@ GIB = 1024 ** 3
 STREAM = "{stream}"
 STREAM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 CACHE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+MAX_UNITS_PER_PASS = 8  # one pass deletes at most this many units; the next pass, an hour on, takes the rest
 DEFAULTS = {"evict": "lru", "idle_shrink_days": 3.0, "in_use_hours": 6.0}
 # [checker] (design section 3, read by glaeda-disk): undeclared growth past this many GiB on a volume is an alarm
 CHECKER_DEFAULTS = {"undeclared_alarm_gib": 5.0}
@@ -399,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("evict", help="the LRU plan; deletes only with --apply and GLAEDA_DISK_REGISTRY=1")
     e.add_argument("--json", action="store_true")
     e.add_argument("--apply", action="store_true")
+    e.add_argument("--max-units", type=int, default=MAX_UNITS_PER_PASS,
+                   help=f"delete at most this many units per pass (default {MAX_UNITS_PER_PASS}); the rest wait")
     sl = sub.add_parser("slot", help="the per-stream slot path of a {stream} cache")
     sl.add_argument("name")
     sl.add_argument("--stream", required=True)
@@ -435,9 +440,15 @@ def main(argv: list[str] | None = None) -> int:
         plans = [plan(c) for c in registry.caches]
         kept: list[str] = []
         freed = 0
+        deferred = 0
+        budget_units = max(0, args.max_units)
         if apply:
             for p in plans:
                 for unit, _why in p.evict:
+                    if budget_units <= 0:
+                        deferred += 1
+                        continue
+                    budget_units -= 1
                     why = remove_unit(unit, p.cache)
                     if why:
                         kept.append(why)
@@ -447,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                                          f"dry run ({FLAG_ENV}=1 not set; off by default)")
         if args.json:
             print(json.dumps({"schema": SCHEMA, "host": registry.host, "mode": mode, "freed_gib": round(freed / GIB, 2),
-                              "kept": kept, "caches": [plan_json(p) for p in plans]}))
+                              "deferred": deferred, "kept": kept, "caches": [plan_json(p) for p in plans]}))
         else:
             print(f"glaeda-disk-registry evict: {mode}")
             for p in plans:
@@ -460,7 +471,8 @@ def main(argv: list[str] | None = None) -> int:
             for why in kept:
                 print(f"  kept: {why}")
             if apply:
-                print(f"  freed {freed / GIB:.1f} GiB")
+                print(f"  freed {freed / GIB:.1f} GiB" + (f"; {deferred} unit(s) past --max-units wait for the next pass"
+                                                         if deferred else ""))
     return 1 if any(p.alarm for p in plans) else 0
 
 
