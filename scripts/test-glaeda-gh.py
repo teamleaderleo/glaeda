@@ -806,6 +806,164 @@ class UnfinishedStatusTest(Base):
         self.assertEqual(gg.read_cache(key)["data"]["headSeenAt"], NOW)
 
 
+class ExpectedUnpostedTest(Base):
+    """teamleaderleo/leo-workspace#8794 at 31a84d01 (2026-11-23): one `wait pr` spent 2401 s and ended `ended_by:
+    no-progress`, `progress_changes: 0`, on a PR that was MERGEABLE (CLEAN) with a SUCCESS rollup, 1 of 1 checks
+    passed, 0 required, and ws-check -- expected, required by nothing, published by one timer -- the only thing
+    absent. Its `next:` was the same wait with the same `--timeout 2400 --max 9600`.
+    docs/handbook/done-wait-held-by-stragglers.md: a done wait ends once every check that decides has ended, and
+    names what it ended without."""
+
+    SHA = "31a84d018232f37cf187b49c6499bde10f2c2e5d"
+    REPO = "teamleaderleo/leo-workspace"
+    KEY = f"pr:{REPO}#8794"
+    LAND = f"glaeda-gh land {REPO}#8794 --match-head-commit {SHA}"
+
+    def head(self, pushed: float, *nodes: dict, required: list[str] | None = None, rollup: str = "SUCCESS") -> dict:
+        """#8794's state as the cache held it: CLEAN, one passed check, nothing required, ws-check not posted."""
+        node = pr_node(8794, rollup=rollup, checks=list(nodes) or [check_run("GitGuardian Security Checks")])
+        node.update(url=f"https://github.com/{self.REPO}/pull/8794", headRefOid=self.SHA, mergeable="MERGEABLE",
+                    mergeStateStatus="CLEAN", updatedAt=iso(pushed))
+        data = gg.parse_pr(node)
+        data["requiredNames"] = list(required or [])
+        return data
+
+    def request(self, timeout: float = 2400.0) -> dict:
+        req = gg.wait_request("pr", f"{self.REPO}#8794", "done", timeout, False, False, self.SHA, True,
+                              gg.RESCUE_GRACE, ceiling=9600.0)
+        req["began"] = NOW - 2401
+        return req
+
+    def test_8794_an_unposted_expected_context_nothing_requires_does_not_hold_a_done_wait(self) -> None:
+        data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1)
+        self.assertEqual(gg.expected_missing(data), ["ws-check"])
+        self.assertEqual(gg.expected_unposted(data, NOW), ["ws-check"])
+        for until in ("green", "done", "required"):
+            # its own value: never folded into the pass that EXIT_OK is or the failure that EXIT_FAIL is
+            self.assertEqual(gg.verdict("pr", data, until, self.SHA, now=NOW), gg.EXIT_INCONCLUSIVE, until)
+        self.assertNotIn(gg.EXIT_INCONCLUSIVE, (gg.EXIT_OK, gg.EXIT_FAIL, gg.EXIT_TIMEOUT))
+        out = gg.wait_outcome(self.request(), gg.EXIT_INCONCLUSIVE, {"data": data}, 2401)
+        self.assertEqual(out["code"], "expected-unposted")
+        self.assertIn("ws-check", out["reason"])
+        self.assertIn("nothing requires it", out["reason"])
+        self.assertIn("not a pass", out["reason"])
+        self.assertIn("land-judge still counts it", out["reason"])
+        # the step is the land queue pinned to the head this wait read: it judges that head and holds the row
+        self.assertEqual(out["next"], self.LAND)
+        self.assertNotEqual(out["next"], gg.wait_command(self.request()))
+        self.assertIn("ws-check", gg.inconclusive_note(data, NOW))
+        self.assertIn("expected, not posted yet: ws-check", gg.summary(self.KEY, {"data": data}))
+        self.assertIn("a wait ends without them", gg.summary(self.KEY, {"data": data}))
+
+    def test_it_still_holds_the_wait_while_the_publisher_may_still_post_it(self) -> None:
+        # leo-workspace#3538: the head was pushed at 14:02 and ws-check went pending at 14:28:31 (26.5 min)
+        data = self.head(NOW - 1590)
+        self.assertEqual(gg.expected_unposted(data, NOW), [])
+        self.assertIsNone(gg.verdict("pr", data, "done", self.SHA, now=NOW))
+        self.assertNotIn("a wait ends without them", gg.summary(self.KEY, {"data": data}))
+        # nor when the push cannot be placed at all
+        blind = {**self.head(NOW - 9999), "updatedAt": None, "headSeenAt": None}
+        self.assertEqual(gg.expected_unposted(blind, NOW), [])
+
+    def test_a_required_context_in_the_same_state_never_ends_the_wait(self) -> None:
+        old = NOW - gg.EXPECTED_UNPOSTED_AFTER - 1
+        for required in (["ws-check"],):
+            data = self.head(old, required=required)
+            self.assertEqual(gg.expected_unposted(data, NOW), [])
+            self.assertIsNone(gg.verdict("pr", data, "done", self.SHA, now=NOW))
+        held = self.head(old)
+        held["requiredMissing"] = ["ws-check"]
+        self.assertEqual(gg.expected_unposted(held, NOW), [])
+        unread = self.head(old)
+        unread["requiredUnread"] = ["ws-check"]
+        self.assertEqual(gg.expected_unposted(unread, NOW), [])
+
+    def test_a_check_that_is_genuinely_still_running_keeps_the_wait(self) -> None:
+        data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1, check_run("GitGuardian Security Checks"),
+                         check_run("build", "IN_PROGRESS", None), rollup="PENDING")
+        self.assertIsNone(gg.verdict("pr", data, "done", self.SHA, now=NOW), "a running check still decides")
+        red = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1, check_run("build", "COMPLETED", "FAILURE"),
+                        rollup="FAILURE")
+        self.assertEqual(gg.verdict("pr", red, "done", self.SHA, now=NOW), gg.EXIT_FAIL, "a red is still a red")
+
+    def test_the_wait_ends_on_its_first_read_instead_of_spending_its_timeout(self) -> None:
+        """The measured bug: 2401 s and no answer. On the same state the wait now answers at its first read."""
+        data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1)
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "fetchedAt": NOW, "dataAt": NOW, "data": data, "error": None})
+        req = self.request()
+        req["began"] = NOW - 1  # one second in, far inside its 2400 s no-progress budget and its 9600 s ceiling
+        done = gg.wait_step(req, NOW)
+        self.assertIsNotNone(done, "a wait with nothing left to learn must not sit out its timeout")
+        code, text = done
+        self.assertEqual(code, gg.EXIT_INCONCLUSIVE)
+        self.assertIn("result: inconclusive", text)
+        self.assertIn("ws-check", text)
+        self.assertIn("not a pass", text)
+        self.assertIn(f"next: {self.LAND}", text)
+        self.assertNotIn("result: timeout", text)
+        self.assertNotIn(f"next: {gg.wait_command(req)}", text)
+
+
+class TimeoutNextStepTest(Base):
+    """docs/handbook/wait-that-cannot-end.md over every `next:` this wait path can print: a wait that ended with
+    nothing moving never names itself. #8794 printed `next: glaeda-gh wait pr ... --timeout 2400 --max 9600` after
+    2401 s with `progress_changes: 0`; an agent that takes it waits another 2400 s on the same unchanged state."""
+
+    SHA = "3" * 40
+
+    def request(self, timeout: float = 2400.0) -> dict:
+        req = gg.wait_request("pr", "o/r#8794", "done", timeout, False, False, self.SHA, True, gg.RESCUE_GRACE,
+                              ceiling=9600.0)
+        req["began"] = NOW - 2401
+        req["moved"] = {"at": NOW - 2401, "changes": 0}  # nothing moved for the whole wait
+        return req
+
+    def head(self, *nodes: dict, repo: str = "o/r", rollup: str = "PENDING", counts: dict | None = None,
+             pushed: float = 0.0) -> dict:
+        node = pr_node(8794, rollup=rollup, checks=list(nodes))
+        node.update(url=f"https://github.com/{repo}/pull/8794", headRefOid=self.SHA, mergeStateStatus="CLEAN",
+                    updatedAt=iso(pushed or NOW - 3600))
+        data = gg.parse_pr(node)
+        if counts:
+            data.update(checksTruncated=True, checkCounts=counts)
+        return data
+
+    def states(self) -> list[tuple[str, dict | None]]:
+        """Every shape this wait can time out on with nothing moving."""
+        return [
+            ("nothing read at all", None),
+            ("a check still pending", {"data": self.head(check_run("build", "IN_PROGRESS", None))}),
+            ("every check passed", {"data": self.head(check_run("build"), rollup="SUCCESS")}),
+            ("an expected context never posted",
+             {"data": self.head(check_run("GitGuardian Security Checks"), repo="teamleaderleo/leo-workspace",
+                                rollup="SUCCESS")}),
+            ("unfinished past the first 100",
+             {"data": self.head(*[check_run(f"c{i}") for i in range(100)], rollup="PENDING",
+                                counts={"runs": {"SUCCESS": 100, "QUEUED": 3}, "statuses": {}})}),
+        ]
+
+    def test_a_no_progress_timeout_never_names_the_wait_that_just_ended(self) -> None:
+        req = self.request()
+        again = gg.wait_command(req)
+        self.assertEqual(gg.wait_ended_by(req, NOW), "no-progress")
+        for why, entry in self.states():
+            with self.subTest(state=why):
+                nxt = gg.wait_outcome(req, gg.EXIT_TIMEOUT, entry, 2401)["next"]
+                self.assertNotEqual(nxt, again, why)
+                self.assertNotIn("glaeda-gh wait pr", nxt, f"{why}: it named a wait on the state that did not move")
+                self.assertTrue(nxt.startswith(("glaeda-gh", "gh ")), nxt)
+
+    def test_a_wait_still_moving_at_its_ceiling_may_name_itself(self) -> None:
+        """The one allowed self-naming, kept honest: a wait whose target kept changing can end next time."""
+        req = self.request()
+        req["moved"] = {"at": NOW - 10, "changes": 7}
+        self.assertEqual(gg.wait_ended_by(req, NOW), "ceiling")
+        out = gg.wait_outcome(req, gg.EXIT_TIMEOUT, {"data": self.head(check_run("build", "IN_PROGRESS", None))}, 9601)
+        self.assertEqual(out["next"], gg.wait_command(req))
+        self.assertIn("still changing", out["reason"])
+
+
 class StatusStateTest(unittest.TestCase):
     """cmuxterm-hq#8968 review (2026-11-10): a head's data folded a status `error` into `failure`, the same answer a
     real red gives, so a reader could not tell a poster that gave no verdict (compile-status with the results service

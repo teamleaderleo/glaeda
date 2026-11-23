@@ -21150,6 +21150,40 @@ def expected_missing(data: dict) -> list[str]:
     return [name for name in expected_contexts(pr_repo(data)) if name not in reported]
 
 
+# An expected context that nothing requires and nobody posts. EXPECTED_CONTEXTS exists because a green head is not
+# green until the status its merges wait on reports (leo-workspace#3538: ws-check went pending at push+26.5 min).
+# But that status has one publisher, a timer, and whenever that publisher falls behind it posts for no head at all --
+# a recurring state, not a transient one -- so "expected, not posted yet" held waits that could never end.
+# teamleaderleo/leo-workspace#8794 at 31a84d01, 2026-11-23: a `wait pr` spent 2401 s and ended `ended_by:
+# no-progress`, `progress_changes: 0`, on a PR that was MERGEABLE (CLEAN) with a SUCCESS rollup, 1 of 1 checks
+# passed, 0 required, and ws-check the only thing absent; its `next:` was the same wait again, with the same
+# `--timeout 2400 --max 9600`.
+# docs/handbook/done-wait-held-by-stragglers.md: a done wait ends once every check that decides has ended, and names
+# what it ended without. A context GitHub's base does not require decides nothing -- it cannot move mergeable, the
+# rollup or any required name -- so past EXPECTED_UNPOSTED_AFTER it no longer holds the wait. It is never read as a
+# pass: the verdict is EXIT_INCONCLUSIVE, the same value a straggler gets, because the absence of a verdict is its
+# own answer and must not be folded into pass or fail. A context the base requires (requiredNames, requiredMissing,
+# requiredUnread) holds the wait exactly as before, named at the same bound.
+EXPECTED_UNPOSTED_AFTER = 30 * 60  # past #3538's 26.5 min tail, and STRAGGLER_AFTER's bound for the same shape
+
+
+def expected_unposted(data: dict, now: float | None = None,
+                      bound: float = EXPECTED_UNPOSTED_AFTER) -> list[str]:
+    """The expected contexts of DATA's open head that nothing requires and that were still not posted BOUND seconds
+    after the head was pushed: the ones a wait ends without, in the order expected_contexts names them. Empty while
+    any of them may still arrive -- the head is younger than BOUND, or its push time cannot be placed (pushed_by),
+    when they hold the wait as they always did."""
+    now = time.time() if now is None else now
+    if data.get("state") != "OPEN":
+        return []
+    required = set(data.get("requiredNames") or []) | set(data.get("requiredMissing") or []) \
+        | set(data.get("requiredUnread") or [])
+    pushed = pushed_by(data)
+    if pushed is None or now - pushed < bound:
+        return []
+    return [name for name in expected_missing(data) if name not in required]
+
+
 def pushed_by(data: dict) -> float | None:
     """The latest the head can have been pushed: the PR's updatedAt (a push updates it) and the daemon's first
     sighting of the head, whichever is earlier; None when neither is known."""
@@ -21966,8 +22000,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         return EXIT_FAIL  # merge conflicts: the required checks will not run until the next push
     if bad:
         return EXIT_FAIL
-    if data.get("state") == "OPEN" and expected_missing(data):
-        return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if missing:
+        # a status every head of this repo gets has not been posted yet: unfinished, like a required one, until it is
+        # plainly not coming and nothing requires it (expected_unposted) -- then the wait ends without it, and says so
+        return None if set(missing) - set(expected_unposted(data, now)) else EXIT_INCONCLUSIVE
     return EXIT_OK
 
 
@@ -22206,7 +22243,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append("checks: none reported yet for this head commit"
                          + (f" (not started; settles in {int(left)}s)" if left is not None else "") + partial)
         if data.get("state") == "OPEN" and expected_missing(data):
-            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
+            unposted = expected_unposted(data, now)
+            why = (f" (nothing requires them; not posted {int(EXPECTED_UNPOSTED_AFTER // 60)} min after the push, so a "
+                   "wait ends without them, and land-judge still counts them)" if unposted else "")
+            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}{why}")
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
@@ -22711,6 +22751,42 @@ def unseen_next(data: dict, key: str) -> str:
             else f"glaeda-gh status pr {key_name(key)} --verbose")
 
 
+def expected_unposted_next(key: str, data: dict) -> str:
+    """The step for a wait that ended without an expected context nothing requires: the land queue, pinned to the head
+    this wait read, which judges that head itself and holds the row until the context posts. Never another wait on a
+    state only that one publisher can change (docs/handbook/wait-that-cannot-end.md). Pinned because the step must act
+    on the head that was green and on no other; a head this tool cannot read as 40 hex is not pinned, and then the
+    step is to look."""
+    sha = str(data.get("headRefOid") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return f"glaeda-gh status pr {key_name(key)} --verbose"
+    return f"glaeda-gh land {key_name(key)} --match-head-commit {sha}"
+
+
+def timeout_next(req: dict, entry: dict | None, now: float | None = None) -> str:
+    """The `next:` of a wait that ended with nothing moving for its whole --timeout: a step that can change the state
+    it waited on. Never this same wait again -- that is the one step guaranteed not to help, and an agent takes it
+    (teamleaderleo/leo-workspace#8794, 2026-11-23: 2401 s, `progress_changes: 0`, `next:` itself with the same
+    `--timeout 2400 --max 9600`). A wait that was still moving at its --max keeps naming itself, on purpose: that
+    one can end. docs/handbook/wait-that-cannot-end.md."""
+    now = time.time() if now is None else now
+    kind = split_key(req["key"])[0]
+    key = req["key"]
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict) or kind != "pr":
+        return f"glaeda-gh status {kind} {key_name(key)}" + (" --jobs" if kind == "run" else "")
+    if expected_unposted(data, now):
+        return expected_unposted_next(key, data)
+    groups = classify(data, now, float(req.get("grace", RESCUE_GRACE)))
+    pending = groups["pending"]
+    if pending:
+        oldest = sorted(pending, key=lambda c: iso_epoch(c.get("startedAt")) or now)
+        return stuck_next(oldest[0], key)  # its own run: whether its job ever got a runner
+    if max(0, pending_on_every_page(data) - len(pending) - len(groups["held"])):
+        return unseen_next(data, key)  # the page past the rollup's first 100
+    return f"glaeda-gh status pr {key_name(key)} --verbose"
+
+
 def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RESCUE_GRACE,
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
@@ -22822,9 +22898,10 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             return fail_fields("timeout", f"waited {waited} s for {name}, its ceiling (--max {wait_max(req):g}), while "
                                f"it was still changing ({last}); last seen: {state}",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        # nothing moved for the whole --timeout: the step is something that can move it, never this wait again
         return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
                            f"(deadline {deadline}; {last}); last seen: {state}",
-                           blocked_next(req, blocked) if blocked else wait_command(req))
+                           blocked_next(req, blocked) if blocked else timeout_next(req, entry, now))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
@@ -22834,6 +22911,17 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             blocked = blocked_now(kind)
             return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        unposted = expected_unposted(data, time.time())
+        if unposted:
+            pushed = pushed_by(data)
+            since = f" {span(time.time() - pushed)} after its push" if pushed is not None else ""
+            ended = len(classify(data, time.time(), float(req.get("grace", RESCUE_GRACE)))["passed"])
+            return fail_fields("expected-unposted",
+                               f"{name}: {', '.join(unposted)} is still not posted on head "
+                               f"{str(data.get('headRefOid') or '')[:10]}{since}, and nothing requires it: every "
+                               f"check that decides has ended ({ended} passed, 0 failed) and this wait ends without "
+                               f"it (not a pass; land-judge still counts it)",
+                               expected_unposted_next(key, data))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; land_judge counts them "
                            "running)")
@@ -23582,7 +23670,13 @@ def head_runs_unfinished(key: str, data: dict, now: float,
 
 
 def inconclusive_note(data: dict, now: float) -> str:
-    """What an inconclusive done wait says: how many checks are still queued with no runner, and any red already in."""
+    """What an inconclusive done wait says: the expected contexts nothing requires that were never posted, else how
+    many checks are still queued with no runner, and any red already in. Both are the same answer -- no verdict, not
+    a pass -- and each says which one it was, by name."""
+    unposted = expected_unposted(data, now)
+    if unposted:
+        return (f"not done: {', '.join(unposted)} was never posted on this head, nothing requires it, and the one "
+                f"publisher of it may post it later; every check that decides has ended (not a pass)")
     cut = straggler_cut(data, now)
     queued = len((cut or {}).get("stragglers") or [])
     failed = len(classify(data, now)["failed"])
