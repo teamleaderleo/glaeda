@@ -34777,10 +34777,11 @@ def target_flag_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             got = ""
         i += 1
         if not got:
+            stands_for = "OWNER/REPO" if key == "repo" else "N"
+            next_line = typed_line(["glaeda-gh"] + rest + [name, stands_for] + raw[i:])
             return raw, [f"glaeda-gh: `{name}` names no target: it takes "
                          + ("OWNER/REPO" if key == "repo" else f"N or OWNER/REPO#N ({key})"),
-                         f"next: {typed_line(['glaeda-gh'] + rest + [name, 'OWNER/REPO' if key == 'repo' else 'N']
-                                             + raw[i:])}"]
+                         f"next: {next_line}"]
         if key in named and named[key].lower() != got.lower():
             return raw, [f"glaeda-gh: `{name}` is given twice, as {named[key]!r} and {got!r}, and they do not "
                          f"name the same thing: it is not guessed",
