@@ -7989,6 +7989,59 @@ def plain_side_runner(args: argparse.Namespace) -> bool:
             and not args.sim_runner and not args.small_runner)
 
 
+# SIDE_SEED_FREE: after SIDE_FAST_FIT the side minis admitted the fast tier, and it ran out its limit cold: 2026-11-22
+# 07:15-09:15Z against 03-05Z, cuts at >=19.5 min 17 -> 45, greens 17 -> 3. Its cut logs (cmux18-2 and cmux18-5, one
+# mini, 07:02-07:25Z) read "the seed root is busy ... taking a shared root" and built from scratch to the 20 minutes.
+# cmux's owned_spm_scratch.py seed_lease holds <root>/.cmux-seed-root.lock exclusive for the job; the second root
+# (cmux-2, glaeda-disk CMUX_SECOND_SEED_ROOT) is taken when the first is held. So on a plain side runner the fast tier
+# is refused, before it takes anything, when no seed root is free: the first held, and the second absent, not a seed
+# root (no .cmux-seed-root) or held. The refusal is not for capacity, so FAST_TIER_BUSY does not admit it; it costs
+# under a minute where the cold build cost the whole limit, and the rescue places the re-run again. The probe is
+# glaeda-disk's seed_root_held: exclusive, non-blocking, released at once; an unreadable lock counts as held.
+CMUX_SEED_ROOTS = (Path("/Users/runner/_work/cmux"), Path("/Users/runner/_work/cmux-2"))
+SEED_ROOTS_ENV = "GLAEDA_CMUX_SEED_ROOTS"  # tests: os.pathsep-joined roots instead of CMUX_SEED_ROOTS
+SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+SEED_ROOT_MARKER = ".cmux-seed-root"
+
+
+def seed_roots() -> tuple[Path, ...]:
+    raw = os.environ.get(SEED_ROOTS_ENV)
+    return tuple(Path(r) for r in raw.split(os.pathsep) if r) if raw else CMUX_SEED_ROOTS
+
+
+def seed_root_held(root: Path) -> bool:
+    """Whether a job holds this seed root's lock. No lock file: no job ever took it."""
+    try:
+        fd = os.open(root / SEED_ROOT_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def seed_root_refusal(roots: tuple[Path, ...] | None = None) -> str | None:
+    """Why the fast tier would build cold on this mini (SIDE_SEED_FREE), or None when a seed root is free: the first
+    unheld, or a later one that is a seed root (its marker) and unheld."""
+    roots = seed_roots() if roots is None else roots
+    if not roots:
+        return None
+    first, *rest = roots
+    if not seed_root_held(first):
+        return None
+    if any(r.is_dir() and not r.is_symlink() and (r / SEED_ROOT_MARKER).is_file() and not seed_root_held(r)
+           for r in rest):
+        return None
+    return (f"seed root: every fast-tier seed root here is held by another job ({', '.join(map(str, roots))}), so "
+            "this one would build cold past its limit (SIDE_SEED_FREE)")
+
+
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
@@ -15656,6 +15709,10 @@ def main(argv: list[str] | None = None) -> int:
         if (admit_class is None and args.fast_runner and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
+        if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS
+                and (why := seed_root_refusal())):
+            return refused(why)  # SIDE_SEED_FREE: refused before it takes anything; never admitted busy
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
             # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
