@@ -35,7 +35,13 @@ if [ "$#" -lt 2 ]; then
     echo "usage: glaeda-runner-daemon-root USER K [K ...] (as root; the instance numbers the apply's ROOT STEP named)" >&2
     exit 2
 fi
-exec </dev/null 3<<'PY' /usr/bin/python3 -I /dev/fd/3 "$@"
+# glaeda-python's ROOT_PYTHON: a root-owned copy nothing but root can replace (never Apple's python3).
+ROOT_PYTHON=/opt/glaeda-python/bin/python3.13
+if [ ! -x "$ROOT_PYTHON" ]; then
+    echo "glaeda-runner-daemon-root: no $ROOT_PYTHON; install it first: sudo -n glaeda-python --install-root" >&2
+    exit 2
+fi
+exec </dev/null 3<<'PY' "$ROOT_PYTHON" -I /dev/fd/3 "$@"
 import os
 import plistlib
 import pwd
