@@ -24750,6 +24750,52 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["wait"]["kind"], e["wait"]["before"]), ("head_change", LA))
 
+    def test_a_repin_to_a_head_the_cache_never_shows_wakes_and_takes_a_worker_under_a_full_pool(self):
+        # cmux-cp-1, 2026-11-23: glaeda#2615 sat in repin 03:58-04:42Z with CI green and its copy 48 min old; 307 rows
+        # waited on repin, none with a wake. A wait with no wake is never due: due rows sort ahead of it and refill
+        # hands workers only to due rows, so under a full pool it never got one. The wait now asks for its own read
+        # and has a deadline; past it the row is due in its turn and is judged at the head land_judge named.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "repin", LB))
+        self.assertIsNotNone(e["wakeAt"])
+        self.assertLessEqual(e["wakeAt"], self.t + gg.LAND_HEAD_TIMEOUT)
+        self.assertIn(self.KEY, self.w.nudged)  # its read is asked for at once, not left to the next refresh
+        pool = self.pooled(1)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()  # the one worker stays busy; the cache keeps showing LA throughout
+        self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        e = self.q.entries[self.KEY]
+        self.assertTrue(self.q.due(e), "past its deadline a repin row is due, whether or not the cache moved")
+        self.pr(LA, key="pr:o/r#2")
+        self.land("o/r#2")  # a row queued after the repin's deadline: due too, behind it
+        self.tick()
+        del self.q.jobs["pr:o/r#99"]  # the worker frees
+        self.w.answers.append(ok_answer(LB))
+        self.tick(gg.LAND_SNAPSHOT_WAIT + 1)
+        self.assertEqual(pool.keys()[:1], [self.KEY], "the repin row takes the free worker first, in its due turn")
+
+    def test_a_waiting_row_saved_with_no_wake_is_due_after_a_restart(self):
+        # The rows the repin wait left with no wake before it had one: a restart gives each the wake it would have had
+        # from its last judgment, so the 307 on cmux-cp-1 are judged in their turn and do not wait for a re-queue.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": LB}))
+        e = self.tick()
+        e["wakeAt"] = None  # as the old code saved it, judged 3 h ago
+        e["explain"]["at"] = time.time() - 3 * 3600
+        self.q.save(e)
+        self.q = self.queue()  # the re-exec: a fresh queue off the same disk
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["wakeAt"], e["explain"]["at"] + gg.LAND_HEAD_TIMEOUT)
+        self.assertTrue(self.q.due(e))
+        self.assertEqual(e["history"][-1]["event"], "wake_set")
+
     def test_base_red_unrelated_waits_on_the_base_run_then_merges(self):
         self.pr(LA)
         self.land()
