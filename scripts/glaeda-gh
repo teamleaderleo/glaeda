@@ -16533,7 +16533,8 @@ class LandQueue:
         closed outside the queue then ends it, and the row behind it stops waiting (after_wait), instead of both
         waiting until the give-up (2 h) on a copy that read open after the hand-off and that nothing reads again."""
         return e["key"] in self.forward_awaited and \
-            self.now - float(e.get("forwardStateAt") or 0) >= LAND_PEEK_EVERY
+            self.now - float(e.get("forwardStateAt") or 0) >= LAND_PEEK_EVERY and \
+            not self.queue_quota_parked()  # a park holds every read of the login it spent
 
     def forward_settle(self, e: dict, state: str, merge_sha: str, head: str, why: str, executor: bool = False,
                        how: str = "read live") -> None:
