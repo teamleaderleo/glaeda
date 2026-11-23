@@ -86,6 +86,8 @@ os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 # The missing-Rust check reads this host's real ~/.cargo/bin: off in this process (and what it starts with its env);
 # RustToolchainMissing tests turn it on against a fake bin dir. The hooks run_hook starts get a fake HOME and PATH.
 os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
+# The missing-cmux-ci check reads this host's real ~/.local/bin/cmux-ci: off here; its test turns it on with a fake home.
+os.environ["GLAEDA_RUNNER_CLIENT_GATE"] = "0"
 # The off-the-tailnet hold reads this host's real Tailscale: off in this process; GateOffTheTailnet turns it on with
 # tailnet_look patched.
 os.environ["GLAEDA_RUNNER_GATE_TAILNET"] = "off"
@@ -12185,6 +12187,44 @@ class GateTest(unittest.TestCase):
         script.write_text("exec /usr/bin/python3 /hook job-started --fleet-class m4pro-48 --instance 1\n")
         (bin_dir / "rustup").unlink()
         self.assertIsNone(gate.claimed(), "no --require-eligible: never held for the toolchain")
+
+    def test_a_runner_account_without_the_cmux_ci_client_is_held_at_once(self) -> None:
+        """2026-11-23: an AWS Mac's PR runners ran as their own account, the cmux-ci client was installed only for the
+        login user, and its gateway runners took cmux's fleet compile jobs and failed each with "...cmux-ci is not
+        installed". The gate holds a --require-eligible runner whose own home has no client on the poll that sees it
+        (CLIENT_GATE), and lets go on the poll after it is installed."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m4pro-48 "
+                          "--gateway-runner --instance 1\n")
+        home = self.tmp / "pool-home"
+        home.mkdir()
+        for patch in (mock.patch.object(hook, "CLIENT_GATE", True),
+                      mock.patch.object(hook.Path, "home", return_value=home)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        gate.eligible_at = time.monotonic()  # a look just ran and said eligible: the next is 300 s away
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None) as look:
+            why = gate.claimed()
+            self.assertEqual(why, f"ineligible: {hook.client_missing(home)}")
+            self.assertIn(f"{home / '.local/bin/cmux-ci'} is not installed", why)
+            look.assert_not_called()
+            (home / ".local/bin").mkdir(parents=True)
+            (home / ".local/bin/cmux-ci").symlink_to(home / "gone")
+            self.assertIn("a link to a file that is gone", gate.claimed() or "")
+            (home / ".local/bin/cmux-ci").unlink()
+            make_executable(home / ".local/bin/cmux-ci", "#!/bin/sh\nexit 0\n")
+            self.assertIsNone(gate.claimed(), "listening again on the next poll")
+            (home / ".local/bin/cmux-ci").unlink()
+            script.write_text("exec /usr/bin/python3 /hook job-started --fleet-class m4pro-48 --instance 1\n")
+            self.assertIsNone(gate.claimed(), "no --require-eligible: never held for the client")
+        with mock.patch.object(hook, "CLIENT_GATE", False):
+            self.assertIsNone(hook.client_missing(home), "GLAEDA_RUNNER_CLIENT_GATE=0 turns it off")
 
     def test_a_missing_toolchain_never_outlives_its_return(self) -> None:
         """The threaded look's toolchain_refusal also refuses a missing toolchain, but the per-poll check owns that

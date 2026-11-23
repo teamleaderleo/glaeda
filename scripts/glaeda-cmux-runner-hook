@@ -4120,6 +4120,29 @@ def toolchain_missing(env: dict[str, str] | None = None, home: Path | None = Non
     return f"node not eligible ({TOOLCHAIN_MISSING}: {'; '.join(gone)})" if gone else None
 
 
+# CLIENT_GATE (cmuxterm-hq build-fleet/mini-ops/client.py): a fleet runner's jobs call $HOME/.local/bin/cmux-ci (cmux's
+# build-fleet compile, the Swift canary, the gateway clients), and $HOME is the account the runner runs as, which on a
+# poolUser member is not the login user. 2026-11-23: one AWS Mac's PR runners ran as cmux-pr-runner, the client was
+# installed only for ec2-user, and its gateway runners took cmux's "cmux-next app compile (build fleet)" jobs and
+# failed each in seconds with "/Users/cmux-pr-runner/.local/bin/cmux-ci is not installed". A missing file is no slow
+# probe, so the gate holds a --require-eligible runner on the poll that sees it, like a missing Rust toolchain, and
+# GitHub hands the job to a runner that has it. `fleet client apply HOST` installs it for every runner account.
+CLIENT_MISSING = "cmux-ci client missing"
+CLIENT_GATE = os.environ.get("GLAEDA_RUNNER_CLIENT_GATE", "1") != "0"
+CLIENT_REL = ".local/bin/cmux-ci"
+
+
+def client_missing(home: Path | None = None) -> str | None:
+    """Why this account's jobs cannot run cmux-ci ($HOME/.local/bin/cmux-ci not an executable file), or None."""
+    if not CLIENT_GATE:
+        return None
+    exe = (home or Path.home()) / CLIENT_REL
+    if os.path.isfile(exe) and os.access(exe, os.X_OK):
+        return None
+    what = "a link to a file that is gone" if os.path.islink(exe) and not os.path.exists(exe) else "not installed"
+    return f"node not eligible ({CLIENT_MISSING}: {exe} is {what}; fleet client apply installs it)"
+
+
 def fleet_toolchain_missing(home: Path | None = None) -> str | None:
     """toolchain_missing on the workload PATH, for a mini with a glaeda runner that runs its jobs with
     --require-eligible (a fleet build node), else None."""
@@ -12036,10 +12059,15 @@ class Gate:
             self.eligible_why = self.missing_why = None
             return None
         missing = toolchain_missing()  # run.sh's PATH, so the jobs'; every poll: a few stats, a definite answer
-        if missing != self.missing_why:
+        client = None if missing else client_missing()  # CLIENT_GATE: one stat
+        if (missing or client) != self.missing_why:
+            back = ("the cmux-ci client is back" if self.missing_why and CLIENT_MISSING in self.missing_why
+                    else "the Rust toolchain is back")
             gate_log(f"{missing}; held off at once so another runner takes the job (glaeda-mini-health: "
-                     "toolchain_missing)" if missing else "the Rust toolchain is back")
-            self.missing_why = missing
+                     "toolchain_missing)" if missing else
+                     f"{client}; held off at once so another runner takes the job" if client else back)
+            self.missing_why = missing or client
+        missing = missing or client
         if missing:
             return f"ineligible: {missing}"
         running =self.eligible_look is not None and self.eligible_look.is_alive()
