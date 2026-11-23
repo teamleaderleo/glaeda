@@ -54,6 +54,15 @@ class CiSuiteVerdict(unittest.TestCase):
                          'echo "workspace bootstrap tests passed"')
         self.assertIn("failed=0", out.stdout, out.stdout + out.stderr)
 
+    def test_a_verdict_on_stderr_counts(self) -> None:
+        """unittest writes `Ran N tests` and `OK` to stderr, not stdout. The helper merges the suite's streams
+        (`2>&1`) before it reads them; drop that and every unittest suite the workflow runs -- most of the 77 --
+        would read as verdictless at once. This pins the merge, not only the patterns."""
+        out = run_suites('echo ..; { echo "Ran 3 tests in 0.1s"; echo OK; } >&2',
+                         'echo "Ran 7 tests in 1.1s" >&2; echo FAILED >&2; exit 0')
+        self.assertIn("failed=0", out.stdout, out.stdout + out.stderr)
+        self.assertIn("2>&1", helper(), "the suite's streams are merged before the verdict is read")
+
     def test_a_nonzero_exit_is_still_a_failure_and_keeps_its_code(self) -> None:
         out = run_suites('echo boom; exit 3')
         self.assertIn("failed=1", out.stdout, out.stdout)
