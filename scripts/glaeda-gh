@@ -18117,6 +18117,21 @@ class LandQueue:
                    if self.now - float(((self.entries.get(k) or {}).get("snapshotWait") or {}).get("since") or 0)
                    < LAND_SNAPSHOT_WAIT)
 
+    def room_starved(self, e: dict, sha: str) -> bool:
+        """True when E, due at least LAND_SNAPSHOT_WAIT with a worker free, found no room ahead of the workers to
+        start its own snapshot wait: it is judged live now, as a wait that ran out would have been by then. The room
+        bounds how many reads the waits nudge; it must not hold a row longer than a wait would. cmux-cp-1, 2026-11-23
+        08:42-10:07Z: 6-10 of 24 workers busy at load 0.12-0.78/core, 42-45 waits renewed by newer rows each pass,
+        and 78 rows due late, the oldest 85 min, every one "snapshot waits ahead fill the room (snapshotWaiting)":
+        a row with no wait of its own never got a place, so it never got the wait that ends in a live judgment."""
+        if self.now - self.due_since(e) < LAND_SNAPSHOT_WAIT:
+            return False
+        if (e.get("roomStarved") or {}).get("sha") != sha:
+            e["roomStarved"] = {"sha": sha, "at": self.now}
+            self.history(e, "snapshot_room_live", head=sha[:12], waited=round(self.now - self.due_since(e)),
+                         waits=len(self.snapshot_waiting))
+        return True
+
     def snapshot_wait(self, e: dict, sha: str, free: bool = True) -> bool:
         """True while E waits for the daemon to read SHA's rollup snapshot (at most LAND_SNAPSHOT_WAIT, nudged). A wait
         that ran out with no worker FREE stays (True): it is judged live when one frees, never waits a second time."""
@@ -18546,6 +18561,8 @@ class LandQueue:
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
             waits = self.snapshot(e["key"], sha)[1] == "wait"
+            if free and waits and self.room_starved(e, sha):
+                waits = False  # judged live on the free worker, as a wait that ran out is (snapshot_wait)
             if not free or waits:
                 self.gated(e, "every worker busy" if not free else
                           "snapshot waits ahead fill the room (snapshotWaiting)", ready=not waits)

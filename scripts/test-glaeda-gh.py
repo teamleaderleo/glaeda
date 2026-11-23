@@ -24586,6 +24586,29 @@ class LandTest(Base):
         self.assertEqual(self.q.snapshot_places(False), 4)  # every worker busy: each wait keeps its place, as before
         self.assertEqual(len(pool.handed), 0)
 
+    def test_a_due_row_the_snapshot_room_keeps_out_is_judged_live_on_a_free_worker_after_a_waits_length(self):
+        """cmux-cp-1, 2026-11-23 08:42-10:07Z: 6-10 of 24 workers busy, 42-45 snapshot waits renewed by other rows
+        each pass, and 78 rows due late (the oldest 85 min), each "snapshot waits ahead fill the room": a row with no
+        wait of its own never got a place, so it never reached the live judgment a run-out wait ends in."""
+        pool = self.pooled(2)
+        full = self.q.workers() * (1 + gg.LAND_SNAPSHOT_AHEAD)
+        self.pr(LA, key="pr:o/r#1")
+        self.w.cache["pr:o/r#1"]["fp"] = "F"  # no snapshot: a judgment would wait for the daemon's read first
+        self.land("o/r#1")
+        # the other rows' waits fill the room ahead of the workers, each renewed as the one before it ran out
+        with mock.patch.object(self.q, "snapshot_places", lambda free: full):
+            self.tick()
+            e = self.q.entries["pr:o/r#1"]
+            self.assertFalse(e.get("snapshotWait"))
+            self.assertEqual(len(pool.handed), 0, "inside a wait's length the room still holds it")
+            self.assertNotIn("pr:o/r#1", self.w.nudged)
+            for _ in range(3):
+                self.tick(gg.LAND_SNAPSHOT_WAIT / 2 + 1)
+        self.assertEqual(pool.keys(), ["pr:o/r#1"], "judged live on the free worker, past a wait's length")
+        events = [h.get("event") for h in self.q.entries["pr:o/r#1"]["history"]]
+        self.assertEqual(events.count("snapshot_room_live"), 1)
+        self.assertEqual(events.count("snapshot_wait"), 0)
+
     def test_no_wait_for_a_partial_snapshot_an_upstream_host_or_a_rest_read(self):
         for setup in ("partial", "upstream", "rest"):
             with self.subTest(setup):
