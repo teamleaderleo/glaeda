@@ -9,6 +9,7 @@ reaches an argv, a file, or the output.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import copy
 import datetime
@@ -34,6 +35,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.parse
@@ -2631,6 +2633,30 @@ class HookTest(unittest.TestCase):
                                                           None, deadline, log, self.dir, table))
             ev.assert_not_called()
 
+    def test_a_solo_run_peak_that_does_not_fit_refuses_and_leaves_its_need_for_the_listeners(self) -> None:
+        """The positive JOB_OWN_NEED_ALONE case (#2577 review): a job whose peak was learned from runs alone, at 54.7 GiB,
+        is refused at 18 GiB free and its 64.7 GiB need is left for the account's listeners (OWN_NEED_HOLD); admitted
+        with room, or refused never (a crowded peak), it leaves none."""
+        state = self.dir / "state"
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            solo = self.peak_log([(100.0, 45.3, True)] * 3)
+            self.assertEqual(hook.learned_job_peaks(hook.job_log_tail(solo), alone_only=True)[self.PEAK_KEY],
+                             (54.7, "p90 of 3 runs here alone"))
+            with mock.patch.object(hook, "free_gib", return_value=70.0):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, solo, state))
+            self.assertIsNone(hook.own_need_held(state, 10.0), "admitted: no record")
+            crowded = self.peak_log([(100.0, 45.3, False)] * 20)
+            with mock.patch.object(hook, "free_gib", return_value=18.0):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded, state))
+                self.assertIsNone(hook.own_need_held(state, 18.0), "a crowded peak never refuses, so no record")
+                why = hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, solo, state) or ""
+            self.assertIn("own need of 64.7 GiB", why)
+            self.assertIn("(JOB_DISK_OWN_NEED)", why)
+            held = hook.own_need_held(state, 18.0)
+            self.assertEqual((held or {}).get("need_gib"), 64.7)
+            self.assertEqual((held or {}).get("key"), self.PEAK_KEY)
+
     def test_a_job_whose_own_learned_peak_does_not_fit_is_refused_for_the_rescue(self) -> None:
         """JOB_DISK_OWN_NEED: build-app's learned peak is 30 GiB, so under 10 + 30 = 40 GiB free it is refused (cmux22's
         ENOSPC daemon tests started at 33 GiB free); at 40 it starts; with no history, a guess, it never refuses."""
@@ -2649,6 +2675,8 @@ class HookTest(unittest.TestCase):
             # JOB_OWN_NEED_ALONE: a peak learned only beside other jobs counts their writes too: no refusal
             crowded = self.peak_log([(100.0, 45.0, False)] * 20)
             self.assertIn("p90 of 20 runs here", hook.learned_job_peaks(hook.job_log_tail(crowded))[self.PEAK_KEY][1])
+            self.assertEqual(hook.learned_job_peaks(hook.job_log_tail(crowded), alone_only=True), {})
+            self.assertIn(self.PEAK_KEY, hook.learned_job_peaks(hook.job_log_tail(log), alone_only=True))
             with mock.patch.object(hook, "free_gib", return_value=17.2):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded))
             with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
@@ -4264,6 +4292,36 @@ class HookTest(unittest.TestCase):
         self.assertEqual(other.returncode, 1, other.stdout)
         self.assertNotIn("admitted busy", other.stdout)
         self.finish("s3")
+
+    def test_a_fast_tier_job_behind_an_older_units_waiter_runs_busy_not_refused(self) -> None:
+        """FAST_TIER_BUSY (hq#17742): the fast tier behind an older job waiting here for units (fair_turn's "has
+        waited longer here for units", run 45042885544 on ultra2, 16:22Z) is admitted busy past FAST_TIER_WAIT, not
+        refused; the waiter keeps its turn for the units. Only a waiting nightly job still refuses it."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"],
+                                      "who": "ultra2-glaeda fill-main-test (run 45042885544)"}) + "\n")
+        try:
+            busy = self.job("fast-tier", "s0", 14, None, env=self.FAST_TIER)
+            self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+            self.assertIn("(ultra2-glaeda fill-main-test (run 45042885544) has waited longer here for units);"
+                          " admitted busy", busy.stdout)
+            self.assertIn("holding 0/14 units for fast-tier (isolated", busy.stdout)
+            self.assertTrue(hook.probe(capacity / "unit-0"), "the waiter's units stay free for its turn")
+        finally:
+            self.finish("s0")
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"], "tier": hook.TIER_NIGHTLY,
+                                      "who": "cmux14-glaeda-2 build (run 1)"}) + "\n")
+        try:
+            nightly = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
+            self.assertEqual(nightly.returncode, 1, nightly.stdout)
+            self.assertIn("is a nightly job and goes first here for units", nightly.stdout)
+            self.assertNotIn("admitted busy", nightly.stdout)
+        finally:
+            marker.unlink()
+            self.finish("s1")
 
     def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
         """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
@@ -11983,6 +12041,26 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.bounded_wait(None, bound), bound)
         self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
 
+    def test_generated_files_waits_a_bounded_time_for_capacity(self) -> None:
+        """GENERATED_FILES_WAIT: on 2026-11-22 03-05Z eight cmux-next generated files jobs ran out their 70-minute
+        timeout, mostly waiting in "Set up runner" (69.9 and 57.7 of 70 minutes, for two), and 29% of 1185 logged
+        generated-files minutes were that wait. After GENERATED_FILES_CAPACITY_WAIT_S it is admitted busy like the
+        fast tier (FAST_TIER_BUSY), since a refusal's re-run goes back to the same label."""
+        bound = hook.GENERATED_FILES_CAPACITY_WAIT_S
+        self.assertEqual(bound, 240.0)
+        self.assertLess(bound + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S, 10 * 60,
+                        "admitted busy within minutes, not most of the 70-minute timeout")
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "generated-files"),
+                         bound)
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "fast-tier"),
+                         hook.FAST_TIER_CAPACITY_WAIT_S, "the fast tier keeps its own bound")
+        for repo, workflow, job in (("someone/else", "cmux-next.yml", "generated-files"),
+                                    (None, "cmux-next.yml", "generated-files"),
+                                    ("manaflow-ai/cmux", "ci.yml", "generated-files")):
+            with self.subTest(repo=repo, workflow=workflow, job=job):
+                self.assertIsNone(hook.fast_tier_capacity_wait(repo, home, workflow, job))
+
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
@@ -12656,33 +12734,23 @@ class GateTest(unittest.TestCase):
             self.assertNotIn("OWN_NEED_HOLD", gate.low_disk() or "", "the off switch")
             (self.tmp / "capacity" / hook.RUNNER_JOBS_HOLD_OFF_FILE).unlink()
             self.assertIn("OWN_NEED_HOLD", gate.low_disk() or "", "switch gone: held again")
+            notes.clear()
+            free["gib"] = 2.0
+            self.assertIn("DISK_FULL_NO_LISTEN", gate.low_disk() or "", "a full disk takes over")
+            self.assertEqual([n for n in notes if n.startswith("OWN_NEED_HOLD end")], ["OWN_NEED_HOLD end free_gib=2.0 "
+                             "held_s=0"], "the hold's end is logged, not left stale")
+            free["gib"] = 18.0
+            self.assertIn("OWN_NEED_HOLD", gate.low_disk() or "", "the record still stands: held again")
             free["gib"] = 70.0
             self.assertIsNone(gate.low_disk(), "room for the refused job: listening, the record gone")
             self.assertFalse((self.state / hook.OWN_NEED_FILE).exists())
-            self.assertEqual(len([n for n in notes if n.startswith("OWN_NEED_HOLD end")]), 2)
+            self.assertEqual(len([n for n in notes if n.startswith("OWN_NEED_HOLD end")]), 2, notes)
             free["gib"] = 18.0
             hook.own_need_record(self.state, 64.7, "k", now=time.time() - hook.OWN_NEED_HOLD_S - 1)
             self.assertIsNone(gate.low_disk(), "past the bound: listening")
             (self.state / hook.OWN_NEED_FILE).write_text("{not json")
             self.assertIsNone(gate.low_disk(), "an unreadable record holds nothing")
             self.assertFalse((self.state / hook.OWN_NEED_FILE).exists())
-
-    def test_job_disk_own_refusal_leaves_its_need_for_the_listeners(self) -> None:
-        """The refusal itself writes the record the listener gate reads (OWN_NEED_HOLD); admitted, it writes none."""
-        # JOB_OWN_NEED_ALONE: a peak learned beside other jobs neither refuses nor leaves a record for the listeners
-        with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here")}), \
-                mock.patch.object(hook, "job_log_tail", return_value=""), \
-                mock.patch.object(hook, "free_gib", return_value=18.0):
-            self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
-        self.assertIsNone(hook.own_need_held(self.state, 18.0))
-        with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here alone")}), \
-                mock.patch.object(hook, "job_log_tail", return_value=""):
-            with mock.patch.object(hook, "free_gib", return_value=70.0):
-                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
-            self.assertIsNone(hook.own_need_held(self.state, 10.0))
-            with mock.patch.object(hook, "free_gib", return_value=18.0):
-                self.assertIn("JOB_DISK_OWN_NEED", hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
-            self.assertEqual(hook.own_need_held(self.state, 18.0)["need_gib"], 64.7)
 
     def test_the_runner_jobs_hold_logs_its_start_and_end_and_has_an_off_switch(self) -> None:
         """RUNNER_JOBS_HOLD: one countable line when a hold starts (free, need, reserve, jobs in flight) and one when it
@@ -12722,6 +12790,18 @@ class GateTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {hook.RUNNER_JOBS_HOLD_OFF_ENV: "1"}):
                 self.assertIsNone(gate.low_disk(), "the environment off switch")
             self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "switch gone: held again")
+            # A disk that fills while held: DISK_FULL_NO_LISTEN takes over, and the hold ends, logged, not left stale.
+            notes.clear()
+            free["gib"] = 2.0
+            self.assertIn("DISK_FULL_NO_LISTEN", gate.low_disk() or "")
+            ends = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD end")]
+            self.assertEqual(len(ends), 1, notes)
+            self.assertIn("free_gib=2.0", ends[0])
+            self.assertIsNone(gate.disk_held)
+            self.assertIsNone(gate.disk_hold_started)
+            free["gib"] = 25.0
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "a new hold after the full disk")
+            self.assertEqual(len([n for n in notes if n.startswith("RUNNER_JOBS_HOLD start")]), 1, notes)
 
     def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
         """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with
@@ -20033,6 +20113,276 @@ class PoolUserRunnerTest(unittest.TestCase):
         self.assertIn("glaeda-side-std-xcode-26.6", default["labels"] + default["sidePools"])
 
 
+FAKE_SUDO = FAKE_LOG_HEADER + r'''
+argv = sys.argv[1:]
+log("sudo", argv)
+rule = os.path.exists(os.path.join(state, "sudoers"))  # the root step's drop-in (RUNNER_SUDOERS) is in place
+if argv[:2] == ["-n", "-l"]:
+    sys.exit(0 if rule and "bootstrap" in argv else 1)  # never a plist write: that is the root step's
+if argv[:1] == ["-n"]:
+    argv = argv[1:]
+if not rule:
+    print("sudo: a terminal is required to read the password"); sys.exit(1)
+os.execv(argv[0], argv)
+'''
+
+
+def daemon_root_module():
+    """The Python half of scripts/glaeda-runner-daemon-root (the heredoc), loaded without running its main."""
+    text = (ROOT / "scripts" / "glaeda-runner-daemon-root").read_text()
+    body = text.split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY\n", 1)[0]
+    body = body.replace("\nsys.exit(main(sys.argv[1:]))", "\n")
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    with tmp:
+        tmp.write(body)
+    try:
+        return load("glaeda_runner_daemon_root", Path(tmp.name)), body
+    finally:
+        os.unlink(tmp.name)
+
+
+def role_manifest() -> dict:
+    """mini-std with two pool runners, a gateway runner (2) and a small runner (3)."""
+    manifest = copy.deepcopy(MANIFEST)
+    manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 2, "capacityUnits": 10, "compileSlots": 2,
+                                                          "canonicalRoots": 2, "gatewayRunners": 1,
+                                                          "smallRunners": 1}}}
+    return manifest
+
+
+class RoleDaemonTest(unittest.TestCase):
+    """ROLE_DAEMON. Leo, 2026-11-23, after cmuxs-mac-mini-5 lost its login session and all 17 of its runners went
+    down: "prevent these in the future across all". A gateway or small runner is a system LaunchDaemon on every host,
+    gui ones included; every other role stays a gui/<uid> LaunchAgent. A host whose sudo asks for a password gets one
+    root step (scripts/glaeda-runner-daemon-root through fleet-sudo); the apply moves the runner off its LaunchAgent
+    only when it is idle."""
+
+    setUp_runner, tearDown, build_release = RunnerTest.setUp, RunnerTest.tearDown, RunnerTest.build_release
+    invoke, log, by_kind = RunnerTest.invoke, RunnerTest.log, RunnerTest.by_kind
+
+    def setUp(self) -> None:
+        self.setUp_runner()
+        base = self.home.parent
+        self.daemons = base / "LaunchDaemons"
+        self.daemons.mkdir()
+        self.sudo = make_executable(self.bin / "sudo", FAKE_SUDO)
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_name="cmux", pw_uid=os.getuid())  # not a sandbox HOME
+        more = [mock.patch.object(cr, "SYSTEM_DAEMON_DIR", self.daemons),
+                mock.patch.object(cr, "SYSTEM_HELPER", base / "glaeda-headless-supervise"),
+                mock.patch.object(cr, "SUDO", os.fspath(self.sudo)),
+                mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw),
+                mock.patch.object(cr, "xcode_present", return_value=True),
+                mock.patch.dict(os.environ, {cr.ROLE_DAEMON_OFF_ENV: ""})]
+        for p in more:
+            p.start()
+        self.patches += more
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(role_manifest()))
+        self.manifest = os.fspath(path)
+
+    def run_instance(self, k: int, *extra: str, expect: int = 0) -> dict:
+        return self.invoke(*extra, "--manifest", self.manifest, "--member", "mini-std", "--instance", str(k),
+                           expect=expect)
+
+    def label(self, k: int) -> str:
+        return f"{cr.LABEL}.{k}"
+
+    def test_only_gateway_and_small_runners_are_role_daemons(self) -> None:
+        for gateway, small, extra, want in ((True, False, {}, True), (False, True, {}, True), (False, False, {}, False),
+                                            (True, False, {"sandbox": True}, False),
+                                            (True, False, {"skip_launchctl": True}, False),
+                                            (True, False, {"pool_user": "cmuxpool"}, False),
+                                            (False, True, {"dedicated": {"name": "x"}}, False)):
+            ctx = types.SimpleNamespace(**{"gateway_runner": gateway, "small_runner": small, "sandbox": False,
+                                           "skip_launchctl": False, "pool_user": None, "dedicated": None, **extra})
+            with self.subTest(gateway=gateway, small=small, extra=extra):
+                self.assertEqual(cr.role_daemon(ctx), want)
+        ctx = types.SimpleNamespace(gateway_runner=True, small_runner=False, sandbox=False, skip_launchctl=False,
+                                    pool_user=None, dedicated=None)
+        with mock.patch.dict(os.environ, {cr.ROLE_DAEMON_OFF_ENV: "0"}):
+            self.assertFalse(cr.role_daemon(ctx), "the kill switch")
+
+    def test_a_pool_runner_stays_a_launchagent_with_no_root_step(self) -> None:
+        plan = self.run_instance(0)
+        kinds = self.by_kind(plan)
+        self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents")
+        self.assertNotIn("root-step", kinds)
+        self.assertNotIn("agent-move", kinds)
+        self.assertFalse(plan.get("headless"))
+
+    def test_a_gateway_runner_on_a_password_host_stays_an_agent_and_names_the_fleet_sudo_root_step(self) -> None:
+        for k in (2, 3):  # the gateway and the small runner
+            with self.subTest(k=k):
+                plan = self.run_instance(k)
+                kinds = self.by_kind(plan)
+                self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents",
+                                 "never left with neither: it runs as the LaunchAgent until the root step")
+                step = kinds["root-step"]
+                self.assertEqual(step["state"], "needed")
+                self.assertEqual(plan["actions"][-1]["kind"], "root-step", "last: nothing waits for it")
+                tail = (f"{{ echo 'set -- cmux {k}'; cat scripts/glaeda-runner-daemon-root; }} "
+                        "| fleet-sudo mini-std -f -")
+                self.assertTrue(step["note"].startswith("ROOT STEP NEEDED"), step["note"])
+                self.assertTrue(step["note"].endswith(tail), step["note"])
+                self.assertIn(tail, step["note"][-200:], "glaeda-cmux-runner-fleet shows a note's last 200 characters")
+        self.assertEqual(list(self.daemons.iterdir()), [], "a plan writes nothing")
+
+    def test_apply_stages_a_daemon_plist_the_root_step_accepts_and_fails_on_the_root_step(self) -> None:
+        receipt = self.run_instance(2, "--apply", expect=1)
+        kinds = self.by_kind(receipt)
+        self.assertEqual(kinds["root-step"]["state"], "failed")
+        self.assertTrue(kinds["root-step"]["staged"])
+        self.assertIn("root-step:", " ".join(receipt["blocking"]))
+        self.assertTrue(kinds["agent"]["applied"], "the LaunchAgent is installed and runs the runner meanwhile")
+        staged = self.home / ".local/state/glaeda/cmux-runner/instance-2" / cr.DAEMON_STAGE
+        doc = plistlib.loads(staged.read_bytes())
+        self.assertEqual(doc["Label"], self.label(2))
+        self.assertEqual(doc["UserName"], "cmux")
+        self.assertNotIn("StandardOutPath", doc)
+        self.assertNotIn("StandardErrorPath", doc)
+        runner = os.fspath(self.home / "actions-runner-glaeda-2")
+        logs = os.fspath(self.home / "Library/Logs/glaeda-cmux-runner-2")
+        self.assertEqual(doc["ProgramArguments"], [os.fspath(cr.SYSTEM_HELPER), runner, logs + ".log", logs + ".err"])
+        root, _ = daemon_root_module()
+        root.HELPER = os.fspath(cr.SYSTEM_HELPER)
+        data = root.checked(plistlib.loads(root.read_stage(os.fspath(staged), os.getuid())), "cmux",
+                            os.fspath(self.home), "2")
+        self.assertEqual(data, staged.read_bytes(), "the root step installs exactly what the apply staged")
+        self.assertEqual(list(self.daemons.iterdir()), [])
+
+    def test_after_the_root_step_the_apply_moves_an_idle_runner_off_its_launchagent(self) -> None:
+        (self.state / "loaded.json").write_text("[]")
+        self.run_instance(2, "--apply", expect=1)
+        agent = self.home / "Library/LaunchAgents" / f"{self.label(2)}.plist"
+        self.assertTrue(agent.exists())
+        # the root step: the plist, the supervisor, the sudoers rule, and the daemon loaded
+        staged = self.home / ".local/state/glaeda/cmux-runner/instance-2" / cr.DAEMON_STAGE
+        (self.daemons / f"{self.label(2)}.plist").write_bytes(staged.read_bytes())
+        (self.daemons / f"{self.label(2)}.plist").chmod(0o644)
+        (self.state / "sudoers").write_text("")
+        with mock.patch.object(cr, "helper_stale", return_value=False), \
+                mock.patch.object(cr, "ensure_headless_helper", lambda ctx: None):
+            receipt = self.run_instance(2, "--apply")
+        kinds = self.by_kind(receipt)
+        self.assertTrue(receipt["headless"])
+        self.assertEqual(kinds["agent"]["path"], os.fspath(self.daemons / f"{self.label(2)}.plist"))
+        self.assertEqual(kinds["agent"]["state"], "unchanged")
+        self.assertNotIn("root-step", kinds)
+        self.assertEqual(kinds["agent-move"]["state"], "moved", kinds["agent-move"])
+        self.assertFalse(agent.exists(), "the LaunchAgent plist is removed once it is booted out")
+        bootouts = [e["argv"] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] == "bootout"]
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{self.label(2)}"], bootouts)
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_the_move_goes_before_a_relabel_when_the_daemon_is_loaded_and_defers_it_otherwise(self) -> None:
+        ctx = types.SimpleNamespace(skip_launchctl=False, label="L", uid=501, pool_user=None, dedicated=None,
+                                    plist_path=self.home / "agent.plist")
+        ctx.plist_path.write_text("")
+
+        def plan(daemon_loaded: bool, agent_loaded: bool) -> list[dict]:
+            actions = [{"kind": "agent", "loaded": daemon_loaded}, {"kind": "register", "state": "relabel"},
+                       {"kind": "verify"}]
+            with mock.patch.object(cr, "run", return_value=(0 if agent_loaded else 113, "")):
+                cr.plan_agent_move(ctx, actions)
+            return actions
+        first = plan(True, True)
+        self.assertEqual([a["kind"] for a in first], ["agent", "agent-move", "register", "verify"])
+        self.assertEqual(first[2]["state"], "relabel", "the relabel then registers under the daemon")
+        later = plan(False, True)
+        self.assertEqual([a["kind"] for a in later], ["agent", "agent-move", "register", "verify"])
+        self.assertEqual((later[2]["state"], later[2]["deferred"]), ("unchanged", "relabel"))
+        ctx.plist_path.unlink()
+        self.assertEqual([a["kind"] for a in plan(True, False)], ["agent", "register", "verify"], "nothing to move")
+
+    def test_a_busy_runner_is_not_moved_and_drains(self) -> None:
+        agent = self.home / "agent.plist"
+        agent.write_text("")
+        ctx = mock.Mock(label="L")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=True), \
+                mock.patch.object(cr, "stop_if_idle", return_value=False), \
+                mock.patch.object(cr, "start_drain", return_value=True) as drain:
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "failed")
+        self.assertTrue(act["draining"])
+        drain.assert_called_once()
+        self.assertTrue(agent.exists(), "a job is never cancelled; the plist stays for a re-run")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=False):
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "failed")
+        self.assertIn("not loaded", act["note"])
+        self.assertTrue(agent.exists(), "no daemon: the LaunchAgent keeps the runner")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=True), \
+                mock.patch.object(cr, "stop_if_idle", return_value=True), \
+                mock.patch.object(cr, "end_drain", return_value=None):
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "moved")
+        self.assertFalse(agent.exists())
+
+    def test_the_root_script_installs_the_installers_supervisor_and_parses_on_python_3_9(self) -> None:
+        root, body = daemon_root_module()
+        self.assertEqual(root.HELPER_BYTES, cr.HEADLESS_HELPER)
+        self.assertEqual(root.HELPER, "/usr/local/sbin/glaeda-headless-supervise")
+        self.assertEqual(root.SUDOERS, cr.RUNNER_SUDOERS)
+        ast.parse(body, feature_version=(3, 9))
+        script = (ROOT / cr.DAEMON_ROOT_SCRIPT).read_text()
+        self.assertIn("/usr/bin/python3 -I", script)
+        self.assertTrue(os.access(ROOT / cr.DAEMON_ROOT_SCRIPT, os.X_OK))
+
+    def test_the_root_script_refuses_any_plist_but_this_runners_daemon(self) -> None:
+        root, _ = daemon_root_module()
+        home = "/Users/cmux"
+        runner, logs = f"{home}/actions-runner-glaeda-14", f"{home}/Library/Logs/glaeda-cmux-runner-14"
+        good = {"Label": f"{cr.LABEL}.14", "UserName": "cmux", "WorkingDirectory": runner, "RunAtLoad": True,
+                "KeepAlive": True, "ProgramArguments": [root.HELPER, runner, logs + ".log", logs + ".err"],
+                "EnvironmentVariables": {"PATH": "/usr/bin"}, "ThrottleInterval": 10, "ProcessType": "Interactive",
+                "SessionCreate": True}
+        self.assertEqual(plistlib.loads(root.checked(good, "cmux", home, "14")), good)
+        for change in ({"UserName": "root"}, {"Label": f"{cr.LABEL}.15"}, {"GroupName": "wheel"},
+                       {"StandardOutPath": "/tmp/x"}, {"ProgramArguments": ["/bin/sh", "-c", "id"]},
+                       {"ProgramArguments": [root.HELPER, "/tmp/evil", logs + ".log", logs + ".err"]},
+                       {"WorkingDirectory": "/"}, {"EnvironmentVariables": {"A B": "x"}},
+                       {"EnvironmentVariables": {"PATH": 1}}, {"RunAtLoad": 1}, {"SessionCreate": False},
+                       {"ThrottleInterval": 0}, {"ProcessType": "x"}, {"Program": "/bin/sh"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                root.checked({**good, **change}, "cmux", home, "14")
+        with self.assertRaises(ValueError):
+            root.checked({k: v for k, v in good.items() if k != "UserName"}, "cmux", home, "14")
+        rules = root.sudoers_rules({("cmux", f"{cr.LABEL}.14")}).decode()
+        for command in (f"/bin/launchctl bootstrap system /Library/LaunchDaemons/{cr.LABEL}.14.plist",
+                        f"/bin/launchctl bootout system/{cr.LABEL}.14", f"/bin/launchctl kickstart system/{cr.LABEL}.14",
+                        f"/bin/rm -f /Library/LaunchDaemons/{cr.LABEL}.14.plist"):
+            self.assertIn(command, rules)
+        self.assertEqual(rules.count("NOPASSWD"), 1)
+        self.assertNotIn("ALL=(root) NOPASSWD: ALL", rules)
+        self.assertTrue(root.RULE_RE.match(f"# glaeda-runner-daemon-root: cmux {cr.LABEL}.14"))
+
+    def test_the_root_script_reads_only_a_regular_file_of_that_user(self) -> None:
+        root, _ = daemon_root_module()
+        target = self.home / "x.plist"
+        target.write_bytes(b"x")
+        link = self.home / "link.plist"
+        link.symlink_to(target)
+        with self.assertRaises(OSError):
+            root.read_stage(os.fspath(link), os.getuid())
+        with self.assertRaises(ValueError):
+            root.read_stage(os.fspath(target), os.getuid() + 1)
+        big = self.home / "big.plist"
+        big.write_bytes(b"x" * (root.STAGE_MAX + 1))
+        with self.assertRaises(ValueError):
+            root.read_stage(os.fspath(big), os.getuid())
+        self.assertEqual(root.read_stage(os.fspath(target), os.getuid()), b"x")
+
+    def test_a_headless_plist_names_no_log_path_and_its_supervisor_opens_the_logs(self) -> None:
+        self.assertIn(b'exec >>"$2" 2>>"$3"', cr.HEADLESS_HELPER)
+        receipt = self.run_instance(2, "--apply", expect=1)
+        self.assertNotIn("StandardOutPath", plistlib.loads(Path(self.by_kind(receipt)["root-step"]["path"]).read_bytes()))
+        agent = plistlib.loads(Path(self.by_kind(receipt)["agent"]["path"]).read_bytes())
+        self.assertIn("StandardOutPath", agent, "a LaunchAgent still logs through launchd")
+
+
 class PoolNodeViewTest(unittest.TestCase):
     """NODE_VIEW and SHARED_FLEET (POOL_USER, cmuxterm-hq#18007) in the hook."""
 
@@ -22402,6 +22752,49 @@ class StepBackfillTest(unittest.TestCase):
             with self.subTest(need=bad):
                 marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "need": bad}))
                 self.assertEqual([w["need"] for w in hook.admission_waiters(self.capacity)], [None])
+
+class DerivedDataSlotTest(unittest.TestCase):
+    """DERIVED_DATA_SLOT: job-started exports this stream's DerivedData slot only with GLAEDA_DISK_REGISTRY=1."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name) / "dd"
+        self.github_env = Path(tmp.name) / "github_env"
+        self.github_env.write_text("")
+        runner_temp = Path(tmp.name) / "runner_temp"
+        runner_temp.mkdir()
+        patch = mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(self.github_env),
+                                             "RUNNER_TEMP": os.fspath(runner_temp)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_off_by_default(self) -> None:
+        for flag in (None, "0", "true"):
+            env = {"GITHUB_REF_NAME": "main"} | ({"GLAEDA_DISK_REGISTRY": flag} if flag else {})
+            self.assertEqual(hook.derived_data_slot_start(env, self.base), [])
+        self.assertFalse(self.base.exists())
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_a_pr_uses_its_base_branch_slot_and_a_push_its_own(self) -> None:
+        notes = hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_BASE_REF": "feat/cmux-next",
+                                              "GITHUB_REF_NAME": "123/merge"}, self.base)
+        self.assertIn("derived data slot", notes[0])
+        self.assertTrue((self.base / "feat-cmux-next").is_dir())
+        self.assertIn(f"CMUX_DERIVED_DATA_SLOT={self.base / 'feat-cmux-next'}", self.github_env.read_text())
+        hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_REF_NAME": "main"}, self.base)
+        self.assertTrue((self.base / "main").is_dir())
+
+    def test_an_odd_ref_gets_no_slot(self) -> None:
+        for ref in ("", "..", "-x", "a..b"):
+            notes = hook.derived_data_slot_start({"GLAEDA_DISK_REGISTRY": "1", "GITHUB_REF_NAME": ref}, self.base)
+            self.assertIn("skipped", notes[0])
+        self.assertEqual(self.github_env.read_text(), "")
+
+    def test_slot_dir_matches_the_registry(self) -> None:
+        text = (ROOT / "config" / "disk-registry.toml").read_text()
+        self.assertIn(f'path = "{hook.DERIVED_DATA_SLOT_DIR}/{{stream}}"', text)
+
 
 class JobScratchTest(unittest.TestCase):
     """JOB_SCRATCH: a per-job sparse APFS image (hdiutil mocked), opt-in, best effort, scoped to this runner."""

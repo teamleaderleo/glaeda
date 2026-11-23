@@ -768,6 +768,9 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # fleet-rd-host-macos.yml's check (advisory, cmux#43689) submits scripts/ci/cmux-tui-rust-check.sh rd-host
 # (cmux-ci run --class isolated --os macos) for a pull request that changes cmux-rd-host, and only greps the
 # client's log; it waits at most 80 min (20 min queue, 1 h run). Without it every run was refused here.
+# cmux-next-ios-try-ahead.yml's build-ahead (advisory) submits the cmux Dev device-app step try.sh asks for
+# (cmux-ci run --class simulator, lowest priority, the try.sh key) for each same-repository iPhone pull request head,
+# so a later try.sh N only downloads; it waits at most 300 min. Its first run, 45124160918 on cmux#51721, was refused here.
 # GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
 # while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
 # cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
@@ -788,7 +791,7 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                          ("fleet-rd-host-macos.yml", "check")})
+                          ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
@@ -2191,13 +2194,21 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 # while the waiter it would have queued behind keeps its turn for the next units. Leo, 2026-11-22: "you guys cannot
 # afford to wait on improvements right now". Only a waiting nightly job (fair_turn) or a non-capacity hold refuses it.
 FAST_TIER_CAPACITY_WAIT_S = 60.0
+# GENERATED_FILES_WAIT: cmux-next.yml's generated files job has a 70-minute timeout-minutes that also counts its wait
+# in "Set up runner". On 2026-11-22 03-05Z eight of them ran out the 70 minutes, and the wait was most of each
+# (wait/build minutes: 69.9/0, 69.9/0, 57.7/11.4, 59.5/7.0, 53.5/15.5, 41.6/27.6, 39.2/25.4, 29.1/29.9), and 29% of
+# all generated-files minutes in 26 logged jobs (1185 min) were that wait. So it too waits this long at most and is
+# then admitted busy like the fast tier (FAST_TIER_BUSY): a refusal would only send its re-run back to the same label.
+GENERATED_FILES_CAPACITY_WAIT_S = 240.0
+BOUNDED_WAIT_JOBS = {("cmux-next.yml", "fast-tier"): FAST_TIER_CAPACITY_WAIT_S,
+                     ("cmux-next.yml", "generated-files"): GENERATED_FILES_CAPACITY_WAIT_S}
 
 
 def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
-    """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
-    if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
+    """The home repository's BOUNDED_WAIT_JOBS bound, else None (FAST_TIER_WAIT, GENERATED_FILES_WAIT)."""
+    if repo is None or repo.lower() != home_repo.lower():
         return None
-    return FAST_TIER_CAPACITY_WAIT_S
+    return BOUNDED_WAIT_JOBS.get((workflow, job))
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -10179,9 +10190,11 @@ JOB_PEAK_RECENT = 20
 JOB_PEAK_MAX_GIB = RUNNER_JOB_DISK_MAX_GIB
 
 
-def learned_job_peaks(records: list[dict[str, Any]]) -> dict[str, tuple[float, str]]:
+def learned_job_peaks(records: list[dict[str, Any]], alone_only: bool = False) -> dict[str, tuple[float, str]]:
     """{job key: (its learned peak in GiB, where it came from)} from job-log records (job_log_tail), for each job with
-    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest."""
+    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest. alone_only keeps only
+    the peaks learned from runs with no other runner job beside them (JOB_OWN_NEED_ALONE), never the fallback over
+    every run, whose free-disk drop counts the neighbours' writes too."""
     runs: dict[str, list[tuple[float, bool]]] = {}
     for record in records:
         if record.get("event") != "completed" or not (key := _job_key(record)):
@@ -10195,7 +10208,7 @@ def learned_job_peaks(records: list[dict[str, Any]]) -> dict[str, tuple[float, s
         rows = rows[-JOB_PEAK_RECENT:]
         alone = [growth for growth, solo in rows if solo]
         values, kind = (alone, "alone") if len(alone) >= JOB_PEAK_MIN_SAMPLES else ([g for g, _ in rows], "any")
-        if len(values) < JOB_PEAK_MIN_SAMPLES:
+        if len(values) < JOB_PEAK_MIN_SAMPLES or (alone_only and kind != "alone"):
             continue
         peak = min(JOB_PEAK_MAX_GIB, math.ceil(round(_p90(values) * 10, 6)) / 10)
         peaks[key] = (peak, f"p90 of {len(values)} runs here{' alone' if kind == 'alone' else ''}")
@@ -10285,17 +10298,16 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
         free = free_or_none(path)
         if free is None:
             return None
-        peaks = learned_job_peaks(job_log_tail(log))
+        peaks = learned_job_peaks(job_log_tail(log), alone_only=True)
         if key is None or key not in peaks:
-            return None  # no history here: the flat default is a guess, not this job's need
+            # no history here (the flat default is a guess), or a peak learned only beside other jobs: not its need
+            return None
         own, source = peaks[key]
-        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks' "alone") is its own need. The
+        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks alone_only) is its own need. The
         # fallback p90 over every run measures free_start - free_min, which counts the jobs writing beside it: a fast
         # tier learned 54.7 GiB ("p90 of 20 runs here", 2026-11-22 22:02Z, refused at 17.2 GiB free on cmux23 against a
         # fleet-measured 5.3 GiB p95 per job), a need no carrier of its label had, so the rescue's re-runs never
         # found a runner. Such a peak stays the in-flight warning (job_disk_peak_hold) and never refuses.
-        if not source.endswith(" alone"):
-            return None
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
@@ -11682,6 +11694,26 @@ class Gate:
             return None
         return reservation_refusal(self.reservation, time.time(), nightly_slot=scope.nightly) if self.reservation else None
 
+    def runner_jobs_hold_edge(self, path: str, hold: bool, crowded: tuple[str, float] | None) -> None:
+        """RUNNER_JOBS_HOLD's countable log: one "RUNNER_JOBS_HOLD start" line when a hold begins and one
+        "RUNNER_JOBS_HOLD end ... held_s=S" when it clears, whichever way low_disk() leaves it (the jobs fit again,
+        the off switch, or a full disk's DISK_FULL_NO_LISTEN taking over). Clears disk_held when not holding."""
+        if not hold:
+            self.disk_held = None
+        if hold == (self.disk_hold_started is not None):
+            return
+        now = time.monotonic()
+        free = free_or_none(path)
+        numbers = (f"free_gib={free if free is None else round(free, 1)} "
+                   f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
+                   f"jobs_in_flight={self.disk_jobs_in_flight}")
+        if hold:
+            gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
+            self.disk_hold_started = now
+        else:
+            gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
+            self.disk_hold_started = None
+
     def low_disk(self) -> str | None:
         """Warn and request bounded cleanup below this runner's disk target. The housekeeping floor is advisory:
         stopping the listener at 30 GiB (and resuming at 32) left usable minis idle and froze listeners at their
@@ -11691,7 +11723,10 @@ class Gate:
         No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
         job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
         (DISK_FULL_NO_LISTEN), and one short of the jobs in flight's measured disk plus its own (RUNNER_JOBS_HOLD,
-        hq#19208) hold it. An idle pool runner short of one job's measured peak
+        hq#19208) hold it. RUNNER_JOBS_HOLD's off switch is GLAEDA_RUNNER_JOBS_HOLD_OFF=1 in the runner's environment or
+        a runner-jobs-hold.off file in the capacity ledger (runner_jobs_hold_off), which return it to reclaim-and-listen
+        (RUNNER_JOBS_DISK); each hold logs one "RUNNER_JOBS_HOLD start free_gib= need_gib= reserve_gib=
+        jobs_in_flight=" line and one "RUNNER_JOBS_HOLD end ... held_s=" line (runner_jobs_hold_edge). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
         to hold the listener (DISK_SHORT_HOLD) so the job went to a runner with room (cmux run 43119216549,
@@ -11742,6 +11777,8 @@ class Gate:
             full_gib = min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
+                self.runner_jobs_hold_edge(path, False, None)  # a hold in force ends here, logged, not left stale
+                self.own_need_edge(path, None)
                 self.evict_in_background(path, max(floor, peak, aim))
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
@@ -11755,25 +11792,15 @@ class Gate:
             # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
             if (held := self.own_need_hold(path, scope)) is not None:
                 self.disk_short = None
+                self.runner_jobs_hold_edge(path, False, None)  # one hold at a time: OWN_NEED_HOLD's need covers it
                 self.evict_in_background(path, max(floor, held, aim))
                 # the same words every poll while the record stands: the gate logs the hold once
                 return (f"disk: a job refused here (JOB_DISK_OWN_NEED) needs {held:g} GiB free; reclaiming, taking no "
                         f"job until it fits, at most {OWN_NEED_HOLD_S / 60:g} min from the refusal ({OWN_NEED})")
             crowded = self.runner_jobs_short(path)
-            self.disk_held = None
             hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
             now = time.monotonic()
-            if hold != (self.disk_hold_started is not None):
-                free = free_or_none(path)
-                numbers = (f"free_gib={free if free is None else round(free, 1)} "
-                           f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
-                           f"jobs_in_flight={self.disk_jobs_in_flight}")
-                if hold:
-                    gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
-                    self.disk_hold_started = now
-                else:
-                    gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
-                    self.disk_hold_started = None
+            self.runner_jobs_hold_edge(path, hold, crowded)
             if hold and crowded:
                 self.disk_short, self.disk_held = None, crowded[0]
                 self.evict_in_background(path, max(floor, crowded[1], aim))
@@ -11786,6 +11813,9 @@ class Gate:
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
             elif crowded:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
+        else:
+            self.runner_jobs_hold_edge(path, False, None)
+            self.own_need_edge(path, None)
         self.disk_short = short
         if short:
             self.evict_in_background(path, max(short[1], aim))
@@ -11814,18 +11844,26 @@ class Gate:
         record = None
         if not scope.small and runner_jobs_hold_off(self.capacity_dir) is None:
             record = own_need_held(self.state_dir, free_or_none(path))
+        self.own_need_edge(path, record)
+        return None if record is None else record["need_gib"]
+
+    def own_need_edge(self, path: str, record: dict[str, Any] | None) -> None:
+        """OWN_NEED_HOLD's countable log: one "OWN_NEED_HOLD start" line when a hold begins and one "OWN_NEED_HOLD end
+        ... held_s=S" when it clears, whichever way low_disk() leaves it (room, the bound, the off switch, or a full
+        disk's DISK_FULL_NO_LISTEN taking over), so a start line always gets its end."""
         started = getattr(self, "own_need_started", None)
+        if (record is not None) == (started is not None):
+            return
         now = time.monotonic()
-        if record is not None and started is None:
-            free = free_or_none(path)
+        free = free_or_none(path)
+        if record is not None:
             gate_log(f"{OWN_NEED} start free_gib={free if free is None else round(free, 1)} "
                      f"need_gib={record['need_gib']:g} key={record['key']}")
             self.own_need_started = now
-        elif record is None and started is not None:
-            free = free_or_none(path)
-            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} held_s={round(now - started)}")
+        else:
+            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} "
+                     f"held_s={round(now - (started or now))}")
             self.own_need_started = None
-        return None if record is None else record["need_gib"]
 
     def suite_first(self, busy: bool = False) -> str | None:
         """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
@@ -14610,6 +14648,44 @@ def job_scratch_end(env: Mapping[str, str] | None = None, base: Path | None = No
     return [note] if note else []
 
 
+# DERIVED_DATA_SLOT (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2): Xcode DerivedData must not live on
+# the per-job scratch (a cold DerivedData costs minutes per build), so it lives in a registered cache, one slot per
+# stream: config/disk-registry.toml's derived-data, DERIVED_DATA_SLOT_DIR/<stream>, held to its budget LRU by
+# scripts/glaeda-disk-registry. job-started tells the job its slot as CMUX_DERIVED_DATA_SLOT (for xcodebuild
+# -derivedDataPath); the stream is the PR's base branch, else the pushed branch, '/' as '-'. Opt-in with the
+# registry's own flag, GLAEDA_DISK_REGISTRY=1; unset or anything else exports nothing.
+DISK_REGISTRY_ENV = "GLAEDA_DISK_REGISTRY"
+DERIVED_DATA_SLOT_DIR = Path(FLEET_DIR) / "dd"
+DERIVED_DATA_SLOT_EXPORT = "CMUX_DERIVED_DATA_SLOT"
+DERIVED_DATA_STREAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def derived_data_stream(env: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if env is None else env
+    ref = env.get("GITHUB_BASE_REF") or env.get("GITHUB_REF_NAME") or ""
+    stream = ref.replace("/", "-")
+    return stream if DERIVED_DATA_STREAM.fullmatch(stream) and ".." not in stream else None
+
+
+def derived_data_slot_start(env: Mapping[str, str] | None = None, base: Path | None = None) -> list[str]:
+    """job-started: create this job's stream slot and export CMUX_DERIVED_DATA_SLOT. Off (no flag): nothing."""
+    env = os.environ if env is None else env
+    if env.get(DISK_REGISTRY_ENV, "") != "1":
+        return []
+    stream = derived_data_stream(env)
+    if stream is None:
+        return ["derived data slot: skipped: no plain GITHUB_BASE_REF or GITHUB_REF_NAME"]
+    slot = (DERIVED_DATA_SLOT_DIR if base is None else base) / stream
+    try:
+        slot.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if slot.is_symlink() or not slot.is_dir():
+            return [f"derived data slot: skipped: {slot} is not a plain directory"]
+    except OSError as error:
+        return [f"derived data slot: none for this job: {error.strerror or error}"]
+    return [f"derived data slot: {slot}; "
+            f"{export_job_env(DERIVED_DATA_SLOT_EXPORT, os.fspath(slot), 'glaeda-derived-data-slot')}"]
+
+
 def cleanup_job_leftovers(work: str | None = None) -> list[str]:
     """job-completed: end processes left running from this runner's _work. Each pid is signalled only while
     its command is unchanged, so a reused pid is never hit."""
@@ -15614,8 +15690,9 @@ def main(argv: list[str] | None = None) -> int:
             fast_bound = fast_tier_capacity_wait(repo, args.home_repo, job_workflow(), os.environ.get("GITHUB_JOB", ""))
             cap = bounded_wait(cap, fast_bound)
             if fast_bound is not None:
-                print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
-                      "then runs busy beside the mini's other jobs (FAST_TIER_BUSY) instead of failing", flush=True)
+                print(f"{PREFIX}: {os.environ.get('GITHUB_JOB', '')}: it waits {fast_bound:g} s at most for capacity "
+                      "(FAST_TIER_WAIT, GENERATED_FILES_WAIT), then runs busy beside the mini's other jobs "
+                      "(FAST_TIER_BUSY) instead of failing", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
@@ -15781,6 +15858,9 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # JOB_SCRATCH: best effort, never fails an admitted job
             for scratch in job_scratch_start():
                 print(f"{PREFIX}: {scratch}", flush=True)
+        with contextlib.suppress(Exception):  # DERIVED_DATA_SLOT: best effort, never fails an admitted job
+            for slot_note in derived_data_slot_start():
+                print(f"{PREFIX}: {slot_note}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
