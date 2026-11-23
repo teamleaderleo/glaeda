@@ -7157,6 +7157,9 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(gd.cua_source_clone(fam, build))
         self.assertEqual(gd.item_window(fam, src, gd.DEFAULT_AGE_HOURS, frozenset()), 12.0)
         self.assertEqual(gd.item_window(fam, build, gd.DEFAULT_AGE_HOURS, frozenset()), 1.0)
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):
+            self.assertEqual(gd.item_window(fam, src, gd.DEFAULT_AGE_HOURS, frozenset()), 12.0)
+            self.assertEqual(gd.item_window(fam, build, gd.DEFAULT_AGE_HOURS, frozenset()), 1.0)
 
     def test_registry_images_go_at_any_age_under_pressure_only(self) -> None:
         fam = gd.Family(gd.TART_IMAGES, Path("/x/OCIs"), True, "pull again", min_idle_hours=gd.TART_IDLE_HOURS)
@@ -8795,6 +8798,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse((self.root / "finished").exists())
         self.assertTrue((self.root / "live").exists(), "a running build's cache stays")
         self.assertEqual(json.loads(summary.read_text())["outlived_build_caches"]["count"], 0)
+        self.assertEqual(json.loads(summary.read_text())["outlived_build_caches"]["bytes"], 0)
 
     def test_build_caches_keep_their_windows_off_a_fleet_mini_or_when_turned_off(self) -> None:
         make(self.root / "finished", age_hours=0.05)

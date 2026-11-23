@@ -77,7 +77,8 @@ safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
 by its own timeout, so the runner takes its next job at once) and always exits 0. One such pass runs at a time per
-host: a trigger at or above glaeda-disk's target is skipped, and one that arrives while a pass runs is coalesced
+host: admission triggers at or above glaeda-disk's target are skipped, but job completion always triggers cleanup
+of finished build caches. A trigger that arrives while a pass runs is coalesced
 into that pass's single follow-up (both logged in glaeda-disk's run log as "runner hook" skips). A
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
@@ -14830,7 +14831,7 @@ def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
         return f"glaeda-disk skipped: {type(error).__name__}", False
 
 
-# job-completed's passes: one at a time per host, triggers coalesced, none started above the target. Every job on
+# Disk passes: one at a time per host, triggers coalesced; completion triggers run even above the target. Every job on
 # every runner started its own detached pass, and a pass takes 11-28 min under pressure, so on cmux14 2889 of 2986
 # passes (2026-10-24..26) skipped as eviction_busy, each still starting glaeda-disk and measuring (median 10.6 s).
 DISK_PASS_LOCK = "hook-pass.lock"  # held by the one bounding process running passes (DISK_BOUND), never by a hook
@@ -15084,11 +15085,13 @@ def disk_pass_running(lock: Path) -> bool:
     return False
 
 
-def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DISK_TIMEOUT_S) -> str:
+def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DISK_TIMEOUT_S,
+                           *, job_completed: bool = False) -> str:
     """job-completed's pass: glaeda-disk --pressure in a detached process (DISK_BOUND), each pass bounded by
     BACKGROUND_DISK_TIMEOUT_S, so the runner takes its next job at once ("Complete runner" took 121-124 s on main's
-    macOS jobs while job-completed waited on it). One pass at a time per host: a trigger above glaeda-disk's target is
-    skipped (a stat and a log read); otherwise it writes the pending trigger, and while a pass runs it is coalesced
+    macOS jobs while job-completed waited on it). One pass at a time per host: an admission trigger above glaeda-disk's
+    target is skipped (a stat and a log read). Completion always writes a trigger to remove finished build caches,
+    regardless of free space. While a pass runs the trigger is coalesced
     into it (the running pass does one more for every batch of triggers), so no trigger is lost and none queues.
     The child leaves the runner's session and execs with RUNNER_TRACKING_ID dropped, so the runner's orphan cleanup
     does not kill it, and closes every inherited fd, so it holds no lock of this job's. Best effort: returns a note,
@@ -15103,7 +15106,7 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
         timeout = min(timeout, BACKGROUND_DISK_TIMEOUT_MAX_S)
         state, log = disk_state_dir(), disk_run_log()
         free, targets = free_gib(str(Path.home())), disk_targets(log, config=disk_config_sha256(argv[1]))
-        if targets is not None and disk_short(targets) == "":
+        if not job_completed and targets is not None and disk_short(targets) == "":
             disk_skip_line(HOOK_SKIP_ABOVE_TARGET, free, targets)
             return f"glaeda-disk skipped: every filesystem at or above its target ({free:.1f} GiB free on home)"
         state.mkdir(parents=True, exist_ok=True)
@@ -15924,7 +15927,7 @@ def main(argv: list[str] | None = None) -> int:
         # both phases trigger the one queued pass: job-started ran its own pass before every job, which spent 10-20 s
         # measuring and then skipped as busy behind the queue's (cmux14, 2026-10-26: 23 of 28 busy skips in an hour
         # came within 150 s of a job start); under the floor, evict() above still frees space before admitting
-        note = disk_pressure_detached(args.disk)
+        note = disk_pressure_detached(args.disk, job_completed=args.phase == "job-completed")
         print(f"{PREFIX}: {note}", flush=True)
     if args.phase == "job-completed" and args.promotion_lease is None:  # last: between this job and the next
         note = install_staged_hook(Path(__file__).resolve().parent)
