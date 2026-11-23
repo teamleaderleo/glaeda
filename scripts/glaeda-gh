@@ -14331,6 +14331,13 @@ LAND_HANDOFF_DEADLINE = 60.0
 LAND_FORWARD_RESEND = 1800.0
 LAND_FORWARD_RESEND_DOUBLINGS = 4  # the wait before a row's next re-send doubles this many times, then holds
 LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files, not one per daemon tick
+# The re-send above only repeats the hand-off: a forwarded row that nothing ever answers, or that this host cannot
+# read or re-send (no cached read of its PR, a peer's overflow, a row with no hand-off record), stayed "forwarded"
+# for good. A team scheduler's pinned land on a platform PR, 2026-11-23: handed to the executor, no outcome for 260
+# min, until its lane re-queued it by hand. Past this long since the row was first forwarded (the third re-send's
+# place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
+# what to do, and its requester is told as any stop tells it.
+LAND_FORWARD_GIVE_UP = 7200.0
 
 
 def land_session_lane(name: str) -> str:
@@ -15408,7 +15415,8 @@ class LandQueue:
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
-                     stepTransient=None, lastStop=None)  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     forwardFirst=None)  # and its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e))
         else:
@@ -16080,10 +16088,19 @@ class LandQueue:
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
                           f"closed); nothing is merged", "")
             return
-        if state != "OPEN" or self.stop_moved_pin(e, c, data):
+        if state == "OPEN" and self.stop_moved_pin(e, c, data):
             return
         since = self.forwarded_since(e)
         last = e.get("forwardResent") or {}
+        first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
+        if not e.get("forwardFirst"):
+            e["forwardFirst"] = first
+            self.save(e)
+        if self.now - first > LAND_FORWARD_GIVE_UP:
+            self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
+            return
+        if state != "OPEN":
+            return
         # each re-send waits twice as long as the one before (30, 60, 120 min, to 8 h): a far host still waiting on
         # the PR's own checks is not asked again every bound, by every row it holds
         if self.now - since <= LAND_FORWARD_RESEND * 2 ** min(int(last.get("n") or 0), LAND_FORWARD_RESEND_DOUBLINGS):
@@ -16111,6 +16128,23 @@ class LandQueue:
         e["forwardResent"] = {"at": self.now, "n": n, "to": host}
         log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
         self.hand_off_now(e, head, why, "forward_resent")
+
+    def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool) -> None:
+        """Under the lock. A forwarded E with no outcome LAND_FORWARD_GIVE_UP after it was first forwarded stops
+        forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on."""
+        if state:
+            cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
+        else:
+            cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
+        if resends:
+            cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
+        elif not executor and not ((e.get("handedOff") or {}).get("key") and self.broker_client()):
+            cause += "; this host cannot hand it off again (no hand-off record of its own)"
+        self.stop(e, "forward_no_outcome",
+                  f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
+                  f"still merge it; nothing here does",
+                  f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
+                  f"{key_name(e['key'])} (--sha HEAD to pin it)")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -20066,7 +20100,7 @@ class LandQueue:
         repeat = land_stop_repeats(e.get("lastStop"), st)
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
-                     "holdWindow"):
+                     "holdWindow", "forwardFirst"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
@@ -34743,10 +34777,11 @@ def target_flag_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             got = ""
         i += 1
         if not got:
+            stands_for = "OWNER/REPO" if key == "repo" else "N"
+            next_line = typed_line(["glaeda-gh"] + rest + [name, stands_for] + raw[i:])
             return raw, [f"glaeda-gh: `{name}` names no target: it takes "
                          + ("OWNER/REPO" if key == "repo" else f"N or OWNER/REPO#N ({key})"),
-                         f"next: {typed_line(['glaeda-gh'] + rest + [name, 'OWNER/REPO' if key == 'repo' else 'N']
-                                             + raw[i:])}"]
+                         f"next: {next_line}"]
         if key in named and named[key].lower() != got.lower():
             return raw, [f"glaeda-gh: `{name}` is given twice, as {named[key]!r} and {got!r}, and they do not "
                          f"name the same thing: it is not guessed",
