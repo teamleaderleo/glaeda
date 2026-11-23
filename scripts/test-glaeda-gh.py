@@ -69,6 +69,8 @@ gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
+# Nor may a lane VM's own broker name (its lane-gh client mark) rename the host every test reads update.json for.
+gg.LANE_VM_NAME_FILE = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-lane-vm-name-{os.getpid()}"
 # Nor may a host's own pacer hear about the tests' secondary 403s.
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
 # Nor may a test's secondary 403 write the host's own login latch marks (latch_write_secondary), or a host's marks or
@@ -9033,6 +9035,7 @@ sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
 gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
+gg.LANE_VM_NAME_FILE = Path(sys.argv[3]) / "no-lane-vm-name"
 gg.head_runs_get = lambda repo, paths, budget=0: {p: {"total_count": 0, "workflow_runs": []} for p in paths}
 gg.APP_POOL_DIR = Path(sys.argv[3]) / "no-app-pool"
 """
@@ -19137,6 +19140,25 @@ class DaemonPolicyTest(Base):
         gg.DAEMON_CONFIG.unlink()
         with mock.patch.object(gg.socket, "gethostname", return_value="Lane-A.local"):
             self.assertEqual(gg.daemon_policy()["restShare"], 0.25)
+
+    def test_a_lane_vm_is_named_as_its_broker_names_it_over_a_cloned_update_json(self) -> None:
+        """fs-agent-lane-12, 2026-11-23: a slot cloned from fs-agent-lane-11 kept its update.json, so land requesters
+        read fs-agent-lane-11/SESSION and the broker refused every hand-off as another VM's session."""
+        mark = Path(self.tmp.name) / "lane-gh-client"
+        self.addCleanup(setattr, gg, "LANE_VM_NAME_FILE", gg.LANE_VM_NAME_FILE)
+        gg.LANE_VM_NAME_FILE = mark
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "fs-agent-lane-11", "ring": "stable"}))
+        self.assertEqual(gg.policy_host(), "fs-agent-lane-11")  # no mark: not a lane VM, update.json names it
+        mark.write_text("fs-agent-lane-12\n")
+        self.assertEqual(gg.policy_host(), "fs-agent-lane-12")
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "land-stops-b"}, clear=False):
+            self.assertEqual(gg.land_requester(None), "fs-agent-lane-12/land-stops-b")
+        gg.FLEET_POLICY.write_text(json.dumps({"default": {"restShare": 0.0},
+                                               "hosts": {"fs-agent-lane-12": {"restShare": 0.25}}}))
+        self.assertEqual(gg.daemon_policy()["restShare"], 0.25)
+        for junk in ("", "-o", "two words", "a/b", "x" * 80):  # not a host name: update.json still names it
+            mark.write_text(junk)
+            self.assertEqual(gg.policy_host(), "fs-agent-lane-11", junk)
 
     def test_the_shipped_fleet_policy_keeps_every_daemon_within_the_account_share(self) -> None:
         doc = json.loads((ROOT / "config" / "gh-daemon.json").read_text())
@@ -30502,6 +30524,120 @@ class LandTest(Base):
         self.assertTrue(gg.LAND_STEP_QUOTA.search("shared content-creation cooldown: every lane's creates wait"))
         self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # land_judge's reason: unchanged
 
+    def test_a_gh_quota_pace_is_not_a_merge_refusal_and_waits_for_its_seconds(self):
+        # leo-workspace#8104, 2026-11-23 08:06Z: "gh-quota: refused: content writes are paced until reset (#s; ...)"
+        # six times stopped a land_judge-approved PR merge_refused. A pace parks its row for the seconds it names.
+        self.pr(LA)
+        self.land()
+        real, refused = self.w.run, []
+
+        def paced_merge(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh-quota: refused: content writes are paced until "
+                                                   "reset (45s; next: queue it instead of spending the pause)")
+            return real(argv, timeout, env)
+        self.q.run = paced_merge
+        for n in range(1, gg.LAND_STEP_STOP + 3):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(0 if n == 1 else max(60, e["wakeAt"] - self.t + 1))
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertGreaterEqual(e["wakeAt"], self.t + 40, n)
+            self.assertNotIn("stepFail", e)
+        self.assertEqual(len(refused), gg.LAND_STEP_STOP + 2)
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertEqual(gg.land_quota_said("content writes are paced for 33s more (the login's x)", 1000.0), 1033.0)
+        self.assertEqual(gg.land_quota_said("content writes are paced until reset (300s; y)", 1000.0), 1300.0)
+        # a real refusal (branch rule, review) is not a pace
+        self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
+                                                    "have been met, add the --auto flag"))
+
+    def refuse_merges(self, text: str) -> list:
+        """Every `gh pr merge` the queue sends is refused with TEXT (exit 1); the list of those sent."""
+        real, refused = self.q.run, []
+
+        def run(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", text)
+            if argv[1:3] == ["pr", "view"] and "state,mergeCommit,headRefOid" in argv:  # the read after it: still open
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "mergeCommit": None,
+                                                                        "headRefOid": LA}), "")
+            return real(argv, timeout, env)
+        self.q.run = run
+        return refused
+
+    RED = "land-judge: refused: base_red_excuse.py exit 1: not excused: 'ws-check' has no result"
+
+    def test_a_paced_override_merge_waits_for_its_reset_and_never_stops_on_the_verdict(self):
+        # leo-workspace#9202, 2026-11-23: judged red_not_excused, took override_merge, and the merge was refused
+        # "gh-quota: refused: content writes are paced until reset (#s; ...)" at 11:15, 11:30 and 11:33Z; at 11:35:44Z
+        # the row stopped red_not_excused "3 identical refusals in a row". A pace is the login's: the row waits for
+        # the reset it names, one merge per reset, and its judgments never count toward the stop.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        refused = self.refuse_merges("HTTP 429: gh-quota: refused: content writes are paced until reset (45s; next: "
+                                     "queue it instead of spending the pause)")
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 3):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if n == 1 else e["wakeAt"] - self.t + 1)
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertEqual(e["wait"]["until"], self.t + 45, n)  # the reset it named
+            self.assertGreaterEqual(e["wakeAt"], self.t + 45, n)  # never before it
+            self.assertEqual(len(refused), n)  # one merge per reset
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+
+    def test_a_merge_a_restart_cut_off_is_not_a_refusal_toward_the_stop(self):
+        # leo-workspace#9177, 2026-11-23: a paced override merge (11:33:53Z), the override_merge again (11:36:23Z), a
+        # restart mid-merge (11:41:08Z "restart claimed=merge"), and the judgment after it (11:43:32Z) stopped the row
+        # red_not_excused "3 identical refusals in a row". The judgment after a cut-off step repeats the one that took it.
+        paced = "gh-quota: refused: content writes are paced until reset (45s; next: queue it instead)"
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        self.refuse_merges(paced)
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 2):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if not e.get("wakeAt") else e["wakeAt"] - self.t + 1)
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            # At the reset the daemon judges again (the pace's own exemption spent), claims the merge, and restarts.
+            e.pop("stepQuotaParked", None)
+            e.update(state="acting", action={"kind": "merge", "claimedAt": self.t, "head": LA}, wait=None,
+                     wakeAt=None)
+            self.q.save(e)
+            self.q = self.queue()
+            self.refuse_merges(paced)
+            e = self.q.entries[self.KEY]
+            self.assertEqual((e["state"], e["history"][-1]["event"], e["history"][-1].get("claimed")),
+                             ("queued", "restart", "merge"), n)
+        e = self.tick()
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertEqual((e["streak"] or {}).get("count"), 1)
+
+    def test_a_refused_override_merge_still_stops_at_the_third_verdict_and_names_the_merge(self):
+        # Not a pace: the identical-refusal stop is unchanged, and it names the merge that kept failing, not only the
+        # verdict the override answered.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        why = "To have the pull request merged after all the requirements have been met, add the --auto flag."
+        refused = self.refuse_merges(why)
+        e: dict = {}
+        for n in range(1, gg.LAND_STREAK_STOP + 1):
+            self.w.answers.append(refusal("red_not_excused", LA, {"kind": "stop", "stop": "red_not_excused"},
+                                          reason=self.RED))
+            e = self.tick(2.0 if n == 1 else e["wakeAt"] - self.t + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "red_not_excused"))
+        self.assertEqual(len(refused), gg.LAND_STREAK_STOP - 1)
+        self.assertTrue(e["stop"]["reason"].startswith(
+            f"{gg.LAND_STREAK_STOP} identical refusals in a row (its merge was refused {gg.LAND_STREAK_STOP - 1} "
+            f"times in a row at {LA[:12]}; last: {why}"), e["stop"]["reason"])
+        self.assertIn("not excused", e["stop"]["reason"])
+
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
         self.land()
@@ -31457,6 +31593,30 @@ class LandTest(Base):
         self.assertEqual(self.w.nudged.count(self.KEY), 1)
         self.assertEqual(self.w.refreshed, [self.KEY])
         self.assert_merged_at(LB)
+
+    def test_a_pinned_lands_direct_read_takes_the_next_worker_that_frees(self):
+        """cmuxterm-hq#20976, 2026-11-23 11:33Z: re-pinned at 27f77d6a on a copy 40 min old showing ac80e473, the row
+        sat in pin_wait with every worker busy at each pass (24 of 24, 300-400 rows gated). Its direct read waited for
+        a pass that found a free worker, but the workers that freed between passes went to the rows the pass listed
+        for them (refill), and a pin wait was never listed. It is now, so the next worker that frees reads its PR."""
+        self.nudge_reads = False
+        pool = self.pooled(1)
+        self.pr(LA)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        self.land_pinned(LB)
+        e = self.tick(1)  # pin_wait: the nudge goes out, and nothing answers it
+        self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
+        e = self.tick(gg.NUDGE_MIN + 1)  # the direct read is due, every worker busy
+        self.assertEqual((pool.keys(), e["state"]), ([], "queued"))
+        self.assertIn(self.KEY, self.q.next_up, "a pin wait's direct read waits for a worker like a judgment")
+        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+        self.q.refill(self.t + 1)
+        self.assertEqual(pool.keys(), [self.KEY])
+        self.assertIsNotNone((self.q.entries[self.KEY].get("pinWait") or {}).get("directAt"))
 
     def test_a_pinned_land_whose_reads_all_fail_stops_naming_the_pin_and_the_error(self):
         """huge-blue, 2026-11-21 20:15Z: hq#17124, hq#14715, cmux#48244 and hq#17344 waited in pin_wait with no bound

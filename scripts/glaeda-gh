@@ -430,6 +430,15 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 # laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
+# A lane VM's name as its lane-gh broker knows it: the bootstrap's client mark (leo-workspace tools/lane-vm-bootstrap
+# CLIENT_MARK), written from the broker's ping answer and re-stamped from it at least daily. fs-agent-lane-12,
+# 2026-11-23: a Freestyle slot cloned from fs-agent-lane-11 kept lane-11's update.json ("host": "fs-agent-lane-11"),
+# so every land row named its requester fs-agent-lane-11/SESSION, hand_off passed it on as this VM's own, and the
+# broker refused all of them ("requester must be a session on this VM (fs-agent-lane-12/SESSION ...) a VM names
+# only its own sessions"): 5 of 5 rows stopped handoff_refused after 6 tries each, none ever reached the broker
+# host's queue. The broker's name is the one every broker check holds this VM to, so on a lane VM it wins.
+LANE_VM_NAME_FILE = Path.home() / ".cache/lane-gh/client"
+LANE_VM_NAME_SHAPE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
 # Falling back from the controller to REST is spend, not just a failure: on one developer workstation on
 # 2026-11-21 it ran a few times every ten minutes for hours, and only refresh-errors.log knew, which nobody
@@ -5500,7 +5509,14 @@ def _bounded(value: Any, default: float, low: float, high: float) -> float:
 
 
 def policy_host() -> str:
-    """This host's name in the fleet policy: update.json's host, else the short hostname."""
+    """This host's name in the fleet policy: on a lane VM the broker's name for it (LANE_VM_NAME_FILE), else
+    update.json's host, else the short hostname."""
+    try:
+        vm = LANE_VM_NAME_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        vm = ""
+    if LANE_VM_NAME_SHAPE.fullmatch(vm):
+        return vm
     doc = read_json(UPDATE_CONFIG)
     host = doc.get("host") if isinstance(doc, dict) else None
     return host if isinstance(host, str) and host else socket.gethostname().split(".")[0].lower()
@@ -13789,7 +13805,15 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
 # stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
-                             r"|rate limit is spent|secondary rate limit|content-creation cooldown", re.I)
+                             r"|rate limit is spent|secondary rate limit|content-creation cooldown"
+                             r"|content writes are paced", re.I)
+# The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
+# next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
+# paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
+# never counts toward a stop. teamleaderleo/leo-workspace#8104, 2026-11-23 08:06Z: six paced merges in a row stopped
+# a land_judge-approved PR merge_refused; update-branch rows stopped update_branch_conflict / update_branch_refused.
+LAND_PACE = re.compile(r"content writes are paced (?:until reset \((\d+)\s*s\b|for (\d+)\s*s more)", re.I)
+LAND_PACE_ANY = re.compile(r"content writes are paced", re.I)
 # The time a refusal names, in gh_latch.reset_from's order: land_judge's "no attempt before", then "retry after" /
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
@@ -15077,10 +15101,27 @@ def land_read_quota(error: str) -> bool:
     return DIRECT_QUOTA in text or bool(LAND_UNREAD_QUOTA.search(text) or LAND_STEP_QUOTA.search(text))
 
 
+def land_step_failed(e: dict, head: str) -> str:
+    """The step failure an identical-refusal stop of E at HEAD also names, or "": the step each judgment took (an
+    override's merge) and how often it was refused at HEAD (e["stepFail"]). teamleaderleo/leo-workspace#9202,
+    2026-11-23 11:35:44Z: three passes judged red_not_excused, each took override_merge and its merge was refused,
+    and the stop said only "3 identical refusals in a row: land-judge: refused: ... not excused", naming the verdict
+    the override had already answered, not the merge that failed."""
+    fail = e.get("stepFail") or {}
+    if str(fail.get("head") or "") != head or not int(fail.get("count") or 0):
+        return ""
+    why = f"; last: {fail['why']}" if fail.get("why") else ""
+    return f" (its {fail.get('kind') or 'step'} was refused {int(fail['count'])} times in a row at {head[:12]}{why})"
+
+
 def land_quota_said(text: str, now: float) -> float | None:
     """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
     NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
     more than LAND_QUOTA_MAX_S ahead."""
+    m = LAND_PACE.search(text or "")
+    if m:  # the pacer names seconds: the reset is that long from NOW (same bound as a clock time)
+        sec = float(m.group(1) or m.group(2))
+        return now + sec if sec <= LAND_QUOTA_MAX_S else None
     for pattern in LAND_QUOTA_SAID:
         m = pattern.search(text or "")
         if not m:
@@ -15478,6 +15519,11 @@ class LandQueue:
                              **({"claimed": claimed.get("kind")} if isinstance(claimed, dict) else {}))
                 if isinstance(claimed, dict):
                     e["interrupted"] = claimed
+                    # The step never answered: the judgment after it repeats the one that took it, not a new refusal
+                    # of the PR's (judge_and_take). leo-workspace#9177, 2026-11-23: a paced override merge at 11:33:53Z,
+                    # the override_merge again at 11:36:23Z, a restart mid-merge at 11:41:08Z, and the judgment after
+                    # it at 11:43:32Z was the third "identical refusal": stopped red_not_excused, nothing refused.
+                    e["stepUnfinished"] = True
                 e["action"] = None
                 e["state"] = "queued"
                 e["wakeAt"] = None
@@ -16869,7 +16915,8 @@ class LandQueue:
         only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
-        own = not host or bool(LAND_JOB_QUOTA.search(text or ""))  # its PR's own CI job's limit, not this host's
+        # its PR's own CI job's limit, or the pacer on content writes: not this host's reads
+        own = not host or bool(LAND_JOB_QUOTA.search(text or "") or LAND_PACE_ANY.search(text or ""))
         if not own:
             self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
@@ -18051,9 +18098,15 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
-                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
-                # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
+            elif self.refresh_held():
+                pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
+            elif self.busy() >= self.workers():
+                # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
+                # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
+                # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
+                self.gated(e, ready=True)
+            else:
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
                                 **self.refresh_starting(e["key"])}
@@ -18244,7 +18297,8 @@ class LandQueue:
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
         if self.busy() >= self.workers():
-            return True  # read on a free worker, a later tick; judged after it
+            self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
+            return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
@@ -19120,7 +19174,9 @@ class LandQueue:
             why = str(judging.get("why") or "")  # what made this judgment run (LAND_JUDGE_WHY)
             # The step after the last judgment was refused for quota (step_refused, do_merge): this judgment repeats
             # it and is not a new refusal of the PR's.
-            counts = counts and not e.pop("stepQuotaParked", False)
+            # Nor is one after a step a restart cut off (load: stepUnfinished).
+            parked, unfinished = e.pop("stepQuotaParked", False), e.pop("stepUnfinished", False)
+            counts = counts and not parked and not unfinished
             check = e.pop("baseMergeCheck", None)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
@@ -19228,7 +19284,8 @@ class LandQueue:
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
                           f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
-                          f"refusals in a row: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
+                          f"refusals in a row{land_step_failed(e, head)}: {land_reason(answer.get('reason'))}",
+                          land_trim(answer.get("next")))
                 return
             self.save(e)
         self.take(e, act, answer)
@@ -20360,7 +20417,8 @@ class LandQueue:
             return None
         last = e.get("stepFail") or {}
         n = int(last.get("count") or 0) + 1 if last.get("sig") == sig else 1
-        e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
+        e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now,
+                         "why": land_trim(land_tail(out), 200)}  # what a judgment's streak stop names (land_step_failed)
         self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
         if n >= LAND_STEP_STOP:
             # A stop with an empty `next:` ends nobody's hold: the row sits until a person happens to read it. The
