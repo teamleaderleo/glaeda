@@ -35498,6 +35498,11 @@ class AppPoolTest(Base):
               "allow list enabled, and your IP address is not permitted to access this resource.")
 
     def cursor_suite_answer(self, extra: list | None = None) -> None:
+        # suite_runs counts first (SUITE_COUNTS, #2599): both suites ran something, so both are read with SUITE_RUNS
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 json.dumps({"data": {"suiteRuns": [
+                                     {"id": "CS_kwDORDHQWM8AAAAcaN5WbA", "checkRuns": {"totalCount": 1}},
+                                     {"id": "CS_ours", "checkRuns": {"totalCount": 1}}]}}).encode()))
         suites = [{"id": "CS_kwDORDHQWM8AAAAcaN5WbA", "conclusion": "SUCCESS", "app": None, "workflowRun": None,
                    "checkRuns": {"pageInfo": {"hasNextPage": False}, "nodes": [
                        {"id": "CR_1", "name": "Cursor Bugbot", "status": "COMPLETED", "conclusion": "SUCCESS",
@@ -35523,8 +35528,8 @@ class AppPoolTest(Base):
         with contextlib.redirect_stdout(out):
             runs, _ = self.daemon.suite_runs(["CS_kwDORDHQWM8AAAAcaN5WbA", "CS_ours"], paced=False,
                                              route=["manaflow-ai/cmux"])
-        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (1, 0, 0),
-                         "one App read; no spare, no login")
+        self.assertEqual((len(self.app_calls), len(spare_calls), len(self.gh.calls)), (2, 0, 0),
+                         "the App's count and its read; no spare, no login")
         self.assertEqual(self.login_reads, 0, "the login's token is not even read")
         logged = out.getvalue()
         for event in ("login-fallback", "app-pool-node-refused", "app-pool-refused"):
@@ -35546,7 +35551,7 @@ class AppPoolTest(Base):
         self.cursor_suite_answer()
         with contextlib.redirect_stdout(io.StringIO()):
             self.daemon.suite_runs(["CS_kwDORDHQWM8AAAAcaN5WbA"], paced=False, route=["manaflow-ai/cmux"])
-        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (2, 0))
+        self.assertEqual((len(self.app_calls), len(self.gh.calls)), (4, 0))
 
     def test_an_unread_app_beside_another_refusal_or_on_the_owners_own_list_is_refused_as_before(self) -> None:
         other = {"type": "FORBIDDEN", "path": ["suiteRuns", 1], "message": "Resource not accessible by integration"}
@@ -35613,18 +35618,23 @@ class AppPoolTest(Base):
         self.assertNotIn("login-fallback", out.getvalue())
         self.assertEqual(self.pool.unreadable, {}, "nothing benched")
 
-    def test_another_orgs_suite_that_ran_something_still_goes_on_the_login_and_is_named_node_benched(self) -> None:
+    def test_another_orgs_suite_that_ran_something_stays_on_the_app_with_its_app_unread(self) -> None:
+        # #2599 left this suite on the login (node-benched); its FORBIDDEN `app` is part of the App's answer now
+        # (foreign_app_forbidden), so it is read on the App every time, never benched.
         kinds, full = self.suite_app({"S1": 1, "S2": 0}, foreign={"S1"})
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             first, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
             again, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
         self.assertEqual((first["S2"], again["S2"]), ([], []))
-        self.assertEqual(set(self.pool.unreadable), {"node:id:S1"})
-        self.assertEqual(kinds, ["count", "runs", "count"], "the benched suite is not counted again on the App")
-        causes = [json.loads(l)["cause"] for l in out.getvalue().splitlines() if '"login-fallback"' in l]
-        self.assertEqual(causes, ["refused", "node-benched"], "a node bench is not a resting pool")
-        self.assertEqual(len(self.gh.calls), 2)
+        for got in (first, again):
+            self.assertEqual([r["name"] for r in got["S1"]], ["job0"])
+            self.assertNotIn("app", got["S1"][0]["checkSuite"], "unread, not GitHub's null app")
+        self.assertEqual(self.pool.unreadable, {}, "nothing benched")
+        self.assertEqual(kinds, ["count", "runs", "count", "runs"])
+        self.assertEqual(full, [["S1"], ["S1"]])
+        self.assertNotIn('"login-fallback"', out.getvalue())
+        self.assertEqual(self.gh.calls, [], "nothing on the login")
 
     def test_a_count_the_app_could_not_read_is_read_with_suite_runs_never_greener(self) -> None:
         answers = iter([({"data": {"suiteRuns": [None, {"id": "S2", "checkRuns": None}, {"id": "SX", "checkRuns":
