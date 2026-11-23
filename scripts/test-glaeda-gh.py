@@ -26098,16 +26098,18 @@ class LandTest(Base):
         # same checks for an answer that cannot differ. Counted apart from the backoff's judgments (explain_unmoved_
         # fp_moved) so "judgments that moved nothing" is not read as one waste: hq#15832 Fix 120 measured 171 of them
         # and nearly held every retry for 600 s on the strength of the total, which would have delayed every recovery.
+        # The direction that is still judged: mergeability the last judgment did not have arriving is new data, so
+        # only the direction that loses it is skipped (mergeability_lost, test below).
         wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
                                                       "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
-        self.pr(LA)
+        self.pr(LA, mergeable="UNKNOWN")
         self.land()
         self.w.answers.append(wait())
         e = self.tick()
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
         first = len(self.w.explains())
         # inside the keep, a flip is answered from the verdict: no judgment at all
-        self.pr(LA, mergeable="UNKNOWN")
+        self.pr(LA, mergeable="MERGEABLE")
         self.tick(gg.LAND_VERDICT_KEEP / 2)
         self.assertEqual(len(self.w.explains()), first, "the kept verdict answered the flip")
         # past the keep, the same flip judges again (left flipped: flipping back would restore the fingerprint)
@@ -26120,6 +26122,75 @@ class LandTest(Base):
         day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
         split = gg.land_unmoved_split(day)
         self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]), (0, 1, {"fp_moved": 1}))
+
+    def test_a_mergeability_the_cache_lost_is_not_judged_and_the_wake_still_judges_it(self):
+        # The step the measurement above did not take: the queue classifies these judgments as a change the verdict
+        # does not depend on and then takes them anyway (one fleet lander's queue, 2026-11-22..23: 71 of 1204
+        # judgments, every one a live read off the GraphQL and REST buckets every lane's CI wait reads from). The
+        # classification is reachable before the read -- seenChecks and the head are the cache's, taken in judge()
+        # from the copy it already holds -- so the one direction that provably carries nothing (GitHub no longer
+        # saying whether the PR merges) is not judged at all.
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
+                                                      "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
+        day = lambda: (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(wait())
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["seenMergeable"]), ("waiting", "pr", "MERGEABLE"))
+        first = len(self.w.judgments())
+        # past the keep, mergeability going uncomputed is not a judgment: no read, and the skip is counted
+        self.pr(LA, mergeable="UNKNOWN")
+        e = self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.judgments()), first, "no read spent on an answer GitHub stopped giving")
+        self.assertEqual((day().get("explain_skipped"), day().get("explain_skipped_fp_moved")), (1, 1))
+        self.assertIsNone(day().get("explain_unmoved_fp_moved"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "skipped"][-1]["was"], "MERGEABLE")
+        # it stays uncomputed: still no read, and the skip is counted once, not once a tick
+        e = self.tick(60.0)
+        self.assertEqual((len(self.w.judgments()), day().get("explain_skipped")), (first, 1))
+        # it comes back as the value already judged: the fingerprint it restores is the one judged, so nothing to do
+        self.pr(LA, mergeable="MERGEABLE")
+        e = self.tick(60.0)
+        self.assertEqual((len(self.w.judgments()), day().get("explain_skipped")), (first, 1))
+        # and it is lost again: a second skip, counted on its own (the flip back cleared the dedup)
+        self.pr(LA, mergeable="UNKNOWN")
+        e = self.tick(60.0)
+        self.assertEqual((len(self.w.judgments()), day().get("explain_skipped")), (first, 2))
+        # The guarantee: the wake its own verdict set is untouched, so the row is judged there, as it would have been.
+        self.assertGreater(e["wakeAt"], self.t)
+        self.w.answers.append(wait())
+        e = self.tick(4 * gg.LAND_VERDICT_KEEP)
+        judged = [h for h in e["history"] if h["event"] == "judged"]
+        self.assertEqual(len(self.w.judgments()), first + 1, "the wake judges it")
+        self.assertEqual((judged[-1].get("why"), judged[-1].get("code")), ("woke", "checks_running"))
+        self.assertEqual((e["state"], e["wait"]["kind"], self.w.sent()), ("waiting", "pr", []))
+
+    def test_mergeability_arriving_or_a_row_with_no_wake_is_judged_as_before(self):
+        # The skip's own bounds: it answers False unless the last judgment had a computed mergeability, was a wait on
+        # the PR that read something, and the row has a wake ahead of it to be judged at.
+        q, now = self.q, self.t + 1.0
+        q.now = now
+        base = {"key": self.KEY, "seenHead": LA, "seenChecks": "fp1", "seenMergeable": "MERGEABLE", "wakeAt": now + 60,
+                "explain": {"head": LA, "checks": "fp1", "code": "checks_running",
+                            "action": {"kind": "wait_pr"}}}
+        cache = {"data": land_pr(LA, mergeable="UNKNOWN")}
+        with mock.patch.object(gg, "land_check_fingerprint", lambda c: "fp1"):
+            self.assertTrue(q.mergeability_lost(dict(base), cache, LA, "fp2"))
+            for why, e in (("mergeability arrived", {**base, "seenMergeable": "UNKNOWN"}),
+                           ("no wake ahead", {**base, "wakeAt": now - 1}),
+                           ("no wake at all", {**base, "wakeAt": None}),
+                           ("the last answer judged nothing",
+                            {**base, "explain": {**base["explain"], "code": "unreadable"}}),
+                           ("the last step was not a wait",
+                            {**base, "explain": {**base["explain"], "action": {"kind": "merge"}}}),
+                           ("another head", {**base, "seenHead": LB}),
+                           ("the checks moved", {**base, "seenChecks": "fp0"})):
+                with self.subTest(why=why):
+                    self.assertFalse(q.mergeability_lost(dict(e), cache, LA, "fp2"), why)
+            # a computed value arriving, or one that conflicts, is never the skip either
+            for m in ("MERGEABLE", "CONFLICTING"):
+                self.assertFalse(q.mergeability_lost(dict(base), {"data": land_pr(LA, mergeable=m)}, LA, "fp2"), m)
 
     def test_land_status_never_prints_the_unmoved_total_without_its_split(self):
         # A count whose name reads as waste has to say which half is skippable, in the line that prints it.

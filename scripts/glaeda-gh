@@ -13028,6 +13028,9 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # not a wait making progress; a check finishing, starting, or appearing where the reads had held none (the count
 # rising) still is.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
+# mergeable as GitHub gives it while it has not computed the answer: strictly less than a computed MERGEABLE or
+# CONFLICTING, so a judgment is never spent on reaching it (mergeability_lost).
+LAND_MERGEABLE_UNCOMPUTED = frozenset({"", "UNKNOWN"})
 # What made a judgment run (judge's WHY, kept on the entry and counted with explain_unmoved_<why>): a bound of the
 # queue's own ran out (LAND_JUDGE_DUE) or some evidence changed. An "unmoved" judgment -- same head, same check
 # fingerprint -- is the queue working as designed when a bound ran out, and redundant only when it was a change the
@@ -16616,9 +16619,15 @@ class LandQueue:
             reran = land_rerun_ran(w, data.get("checks") or [])
             if w.get("ran") != before:
                 self.save(e)
+        if fp == e.get("seen"):
+            # Back at the fingerprint the last judgment was made on: a mergeability this queue skipped and that came
+            # back is not a change, and the next loss of it is its own skip to count (mergeability_lost).
+            e.pop("skipFp", None)
         if woke or fp != e.get("seen") or reran:
             if not woke and not reran and (self.verdict_holds(e, c, head, fp) or self.feed_holds(e, head)):
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
+            if not woke and not reran and self.mergeability_lost(e, c, head, fp):
+                return  # GitHub stopped saying whether it merges: less than the last judgment had, judged at the wake
             if woke and not reran and (e.get("feedVerdict") or {}).get("code") in LAND_TIMER_HELD \
                     and self.feed_holds(e, head):
                 return  # the wait's timer, with no check event since the verdict: the same answer (LAND_TIMER_HELD)
@@ -16862,6 +16871,62 @@ class LandQueue:
             self.save(e)
         return True
 
+    def mergeability_lost(self, e: dict, c: dict | None, head: str, fp: str) -> bool:
+        """True when the only thing the cache shows differently since E's last judgment is that GitHub has stopped
+        saying whether the PR merges (mergeable MERGEABLE or CONFLICTING -> UNKNOWN, or absent), at the same head,
+        the same state and the same checks: a wake this queue does not spend a judgment on.
+
+        land_fingerprint holds mergeable's value and land_check_fingerprint only its CONFLICTING-ness, so a
+        fingerprint that moved while the check fingerprint held can only be mergeable moving between its
+        non-CONFLICTING values. GitHub recomputes mergeable on every push to the base and answers UNKNOWN while it
+        does, so a row waiting out its checks is woken to judge the same head on the same checks for an answer that
+        cannot differ (`land status`: explain_unmoved_fp_moved, 71 of 1204 judgments over 2026-11-22..23 on one fleet
+        lander's queue, the whole redundant share of its unmoved judgments bar 21). Each of those judgments is a live
+        read of the PR, off the same GraphQL and REST buckets every lane's CI wait reads from, which ran to zero
+        repeatedly on 2026-11-21: a judgment the queue can tell will not move its verdict is quota taken out of
+        another lane's ability to see its own CI.
+
+        Why no real state change can be missed:
+        - UNKNOWN is GitHub saying it has not computed the answer. It is strictly less than the computed value the
+          last judgment was made on, so no verdict can depend on reaching it: there is no answer land_judge could
+          give at mergeable=UNKNOWN that it could not give at the value already judged.
+        - The row's wake must already be live and in the future, and this leaves wakeAt, the backoff and every
+          deadline untouched. A skipped judgment is therefore deferred at most to the wake its own verdict set, where
+          it runs as why="woke" exactly as it would have.
+        - E["seen"] is left at the fingerprint the last judgment was made on, so mergeability coming back is judged
+          at once (the value moves away from UNKNOWN and this answers False), and a flip back to the value already
+          judged restores that fingerprint and needs no judgment at all.
+        - A row with no live wake, whose last answer judged nothing (LAND_NOT_JUDGED), whose last step was not a wait
+          on the PR, or whose checks have run since (wait_running drops seenChecks) is judged as before.
+
+        Counted once per fingerprint (explain_skipped, explain_skipped_fp_moved in `land status`), so the reads this
+        did not spend are readable next to the explain_unmoved_fp_moved it replaces."""
+        prior = e.get("explain") or {}
+        if not head or prior.get("head") != head or e.get("seenHead") != head:
+            return False
+        if (prior.get("action") or {}).get("kind") not in LAND_WAIT_KINDS:
+            return False
+        if str(prior.get("code") or "") in LAND_NOT_JUDGED:
+            return False  # the last judgment read nothing: what it was made on says nothing about this one
+        checks = land_check_fingerprint(c)
+        if not checks or e.get("seenChecks") != checks or prior.get("checks") != checks:
+            return False
+        was = str(e.get("seenMergeable") or "")
+        now = str(((c or {}).get("data") or {}).get("mergeable") or "")
+        if was in LAND_MERGEABLE_UNCOMPUTED or now not in LAND_MERGEABLE_UNCOMPUTED:
+            return False  # judged on an uncomputed value already, or it moved to a computed one: judge it
+        wake = e.get("wakeAt")
+        if not isinstance(wake, (int, float)) or isinstance(wake, bool) or wake <= self.now:
+            return False  # no wake ahead to be judged at: judge it now, as before
+        if e.get("skipFp") != fp:
+            e["skipFp"] = fp
+            self.count("explain_skipped")
+            self.count("explain_skipped_fp_moved")
+            self.history(e, "skipped", head=head[:12], was=was, code=prior.get("code"),
+                         wake=round(wake - self.now))
+            self.save(e)
+        return True
+
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
         LAND_REFRESH_AFTER (see there); on a host with its own login, a direct read of a due entry's PR whose copy is
@@ -16995,6 +17060,7 @@ class LandQueue:
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
                  wakeAt=self.now + LAND_WAIT_DEFAULT)
         e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
+        e.pop("seenMergeable", None)  # that fingerprint's mergeability goes with it (mergeability_lost)
         self.unhold(e)  # not due now: its wake is ahead (hold, LAND_DUE_LATE)
         e.pop("dueLate", None)
         self.history(e, "checks_running", head=head[:12])
@@ -17382,7 +17448,8 @@ class LandQueue:
                  if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if since:
             held += max(0.0, self.now - min(since))
-        e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
+        e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c),
+                 seenMergeable=str((c.get("data") or {}).get("mergeable") or ""), keptFp=None, skipFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
                           "why": why if why in LAND_JUDGE_WHY else "fp_moved",
                           # the wait this judgment ended (its kind, and the verdict that set it): "woke" alone does
