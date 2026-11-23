@@ -1195,7 +1195,7 @@ def file_sha256(path: Path) -> str | None:
 
 # leo-workspace tools/fast-patch puts a commit already on main live ahead of the ring (glaeda-gh re-execs onto it in
 # seconds) and names what it installed here: {"commit": SHA, "tools": {NAME: SHA256}}. Without this, the next full run
-# saw that install as drift and put the ring's older bytes back (gcp-agent-lane-10, 2026-11-23: fast-patch put
+# saw that install as drift and put the ring's older bytes back (a lane VM, 2026-11-23: fast-patch put
 # 4bcb452c live at 03:22:02Z, this updater reinstalled a02f5478 at 03:23:22Z). A tool whose installed bytes are the
 # ones named there is not drift until the installed release includes that commit (its ancestry.txt); then the
 # release is as new or newer and is put back as before.
