@@ -11765,6 +11765,49 @@ class FileAndPidWaitTest(unittest.TestCase):
         self.assertTrue(said)
         self.assertEqual(gg.parser().parse_args(fixed).command, "status")
 
+    def test_a_transposed_command_pair_runs_in_the_order_this_tool_takes(self) -> None:
+        """`status land` (typed so 2026-11-22, refused with "invalid choice: 'land'", read nothing) runs
+        `land status`, said on stderr, with everything after the pair carried untouched."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(gg.transposed_pair_synonym(["status", "land"]), (["land", "status"], []))
+            self.assertEqual(gg.transposed_pair_synonym(["status", "land", "o/r#1", "--json"]),
+                             (["land", "status", "o/r#1", "--json"], []))
+        said = err.getvalue()
+        self.assertEqual(said.count("read as `glaeda-gh land status`"), 1)
+        self.assertIn("`status land` is no call of this tool", said)
+        # Through main: the spelling of either word is read first, so a near spelling transposes too.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(gg, "cmd_land_status", return_value=0) as land:
+            self.assertEqual(gg.main(["status", "land"]), 0)
+            self.assertEqual(gg.main(["statsu", "land"]), 0)
+        self.assertEqual(land.call_count, 2)
+        self.assertEqual(err.getvalue().count("read as `glaeda-gh land status`"), 2)
+
+    def test_a_pair_that_is_already_a_call_or_only_one_command_is_left_alone(self) -> None:
+        """Only a pair of real commands whose typed order matches nothing is transposed: a call that runs is
+        never rewritten, and neither is a pair the tool does not have in either order."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for same in (["land", "status"], ["land", "status", "o/r#1"], ["land", "cancel", "o/r#1"],
+                         ["post", "status", "o/r#1"], ["log", "search", "o/r"], ["status", "pr", "o/r#1"],
+                         ["wait", "until", "green"], ["search", "prs", "x"], ["land", "o/r#1"],
+                         ["status", "o/r#1"], ["budget", "land"], ["gh", "pr", "view", "1"],
+                         ["status", "--json"], ["status"], []):
+                self.assertEqual(gg.transposed_pair_synonym(list(same)), (same, []), " ".join(same))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_the_words_land_dispatches_are_the_words_declared_here(self) -> None:
+        """COMMAND_OWN_WORDS is `land`'s own branches in `main`: argparse holds no choices for them, so a
+        verb added to one and not the other is red here rather than silently unreadable above."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text(encoding="utf-8")
+        body = source.split('if args.command == "land":', 1)[1].split('if args.command == "on-event":', 1)[0]
+        branched = set(re.findall(r'words\[0\] == "([a-z-]+)"', body)) | set(
+            re.findall(r'words == \["([a-z-]+)"\]', body))
+        self.assertEqual(branched, set(gg.COMMAND_OWN_WORDS["land"]))
+        self.assertEqual(gg.command_own_words("land"), list(gg.COMMAND_OWN_WORDS["land"]))
+        self.assertEqual(set(gg.command_own_words("status")), {"pr", "run", "comment"})
+
     def test_a_command_a_nesting_word_and_a_stranger_are_all_left_alone(self) -> None:
         """A real command is never rewritten; a word nesting_synonym owns stays its; a word near nothing keeps
         argparse's own refusal, with the commands in it."""

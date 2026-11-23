@@ -33469,6 +33469,55 @@ def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     return fixed, []
 
 
+# The words a command dispatches from its own free positional, where argparse holds no choices to read:
+# `land` takes `words` (nargs="+") and `main` branches on `words[0]`. Every other command's first slot is a
+# nested parser or a positional with choices, which `first_slot_words` reads off the parser itself.
+# test_the_words_land_dispatches_are_the_words_declared_here pins this against `main`'s own branches, so a
+# verb added there and not here is red rather than silently missing from the reading below.
+COMMAND_OWN_WORDS = {"land": ("cancel", "serve", "status")}
+
+
+def command_own_words(name: str) -> list[str]:
+    """Every word the command NAME takes in its first slot: a nested parser's names, its first positional's
+    choices (`first_slot_words`), or the verbs it dispatches itself (`COMMAND_OWN_WORDS`)."""
+    words = first_slot_words(child_parser(parser(), name))
+    return words or list(COMMAND_OWN_WORDS.get(name, ()))
+
+
+def transposed_pair_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """Two command words typed in the other order, run in the order that is a call: (argv, refusal lines).
+
+    Measured 2026-11-22: `glaeda-gh status land` -- the same two words as `glaeda-gh land status` -- exited
+    64 with "invalid choice: 'land' (choose from pr, run, comment)" and read nothing. A transposition is the
+    typo this tool should be most forgiving of: the caller named both halves of a real command and only
+    ordered them as the other CLI they last used does. `wait --until` already takes "a synonym or a typo
+    (checks-done, passed, merge) ... said on stderr"; this is that tolerance for a NOUN VERB pair.
+
+    Narrow on purpose, all four conditions: both words are real top-level commands; the first one has a
+    first slot of its own; the word typed into that slot is none of the words it takes, so the order typed
+    is no call of this tool and reaches nothing but an argparse usage error; and the first word *is* one of
+    the second's own words, so the other order is one real call and not a guess between two. Everything
+    after the pair is carried untouched, and the reading is said on stderr so the next call is typed the way
+    this tool spells it."""
+    if len(raw) < 2 or raw[0].startswith("-") or raw[1].startswith("-"):
+        return raw, []
+    if raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, _ = nesting_table()
+    first, second = raw[0], raw[1]
+    if first not in tops or second not in tops:
+        return raw, []
+    typed = command_own_words(first)
+    if not typed or second in typed:
+        return raw, []  # the order typed is a call of its own: never rewritten
+    if first not in command_own_words(second):
+        return raw, []
+    fixed = [second, first] + raw[2:]
+    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` (`{first} {second}` is no call of this "
+          f"tool; `{second} {first}` is the same two words in the order it takes)", file=sys.stderr)
+    return fixed, []
+
+
 def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A long flag typed in another of its own case conventions, as this tool spells it: (argv, refusal lines).
 
@@ -33616,13 +33665,15 @@ def bare_wait_count(word: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    for rewriter in (nesting_synonym, command_spelling_synonym):
+    for rewriter in (nesting_synonym, command_spelling_synonym, transposed_pair_synonym):
         # The command word first, before anything else reads it. Every rewriter below gates on an exact
         # command word (`search`, `log`, `land`), so a near spelling of it skipped them all and the call was
         # refused on its shape instead: 2026-11-22 `glaeda-gh logs job manaflow-ai/cmux/137389338821` had
         # `logs` corrected to `log` and then died on "one of the arguments JOB_ID|RUN_ID --job is required",
         # because the one-word target rewrite had already run and seen `logs`. The nesting before the
-        # spelling, as it is below: a word a command owns is that command's.
+        # spelling, as it is below: a word a command owns is that command's. The transposition last of the
+        # three: it reads two command words, and the spelling before it is what makes a near spelling of
+        # either one a command word at all (`statsu land` -> `status land` -> `land status`).
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
