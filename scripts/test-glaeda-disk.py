@@ -47,6 +47,7 @@ loader.exec_module(gd)
 # Never the host's own sudo, nor a stale-scratch family that depends on it: a runner with passwordless sudo turned
 # every census test's unreadable fixture into a measured row. StaleTmpScratchTest and CensusSudoTest set both.
 gd._SUDO_READS = False
+gd._RUNNER_ACCOUNTS_ENABLED = False  # RUNNER_ACCOUNTS: no test reaches sudo
 gd._STALE_TMP_ENABLED = False
 
 
@@ -14750,6 +14751,40 @@ class TartLimaReferencesTest(unittest.TestCase):
         policy.write_text(json.dumps({"fleet_claims_expire": False}))
         self.assertEqual(gd.disk_policy(policy)["fleet_claims_expire"], False, "one host can turn it off")
 
+    def test_a_launchd_jobs_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """RFD 0028 rule 1, no protected VMs: the Linux VM supervisor's slot record (until = stopped + 30 min) is
+        a claim like a person's on a fleet mini; the base stays by name and a running slot by its ha.pid."""
+        now = time.time()
+
+        def slot(name: str, until: float | None) -> Path:
+            path = self.lima_vm(name, 26 * 24)
+            doc: dict[str, object] = {"owner": self.LVM_LABEL, "why": "Linux worker VM slot", "state": "stopped"}
+            if until is not None:
+                doc["until"] = until
+            (path / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+            self.age(path, 26 * 24)
+            return path
+
+        slot("cmux21-lvm-1", now + 600)  # stopped 20 min ago: inside its bound
+        slot("cmux21-lvm-2", now - 60)  # stopped 31 min ago
+        slot("cmux21-lvm-3", None)  # an old supervisor's claim, no until
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-1"].verdict, "kept", items["cmux21-lvm-1"].reasons)
+            self.assertIn(f"claimed by {self.LVM_LABEL} until", items["cmux21-lvm-1"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "reclaimable", items["cmux21-lvm-2"].reasons)
+            self.assertIn("its until has passed", items["cmux21-lvm-2"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
+            self.assertIn("it names no until", items["cmux21-lvm-3"].reasons[-1])
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept", items["cmux-linux-bake"].reasons)
+            self.assertIn("the Linux worker VMs' base", "; ".join(items["cmux-linux-bake"].reasons))
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "kept", "off a fleet mini an installed job's claim holds")
+
     def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
         base = self.tart_vm("ubase", 30 * 24, self.ECID)
         clone = self.tart_vm("vm0", 26 * 24, self.ECID)  # stopped since 2026-10-19 (cmux23), cloned from ubase
@@ -16537,6 +16572,184 @@ class PressureHeldBytesTest(unittest.TestCase):
             path = self.root / f"{key}.json"
             path.write_text(json.dumps({key: False}))
             self.assertIs(gd.disk_policy(path)[key], False)
+
+
+class RunnerAccountsTest(unittest.TestCase):
+    """RUNNER_ACCOUNTS: a pool or dedicated runner account's home is counted and reclaimed by a pass run as it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.users = self.root / "Users"
+        self.users.mkdir()
+        saved = {k: getattr(gd, k) for k in ("DARWIN", "_RUNNER_ACCOUNTS_ENABLED", "RUNNER_ACCOUNT_MODE",
+                                             "USERS_ROOT", "RUNNER_HYGIENE_DAEMONS", "RUNNER_ACCOUNTS_STATE",
+                                             "HOME")}
+        self.addCleanup(lambda: [setattr(gd, k, v) for k, v in saved.items()])
+        gd.DARWIN, gd._RUNNER_ACCOUNTS_ENABLED, gd.RUNNER_ACCOUNT_MODE = True, True, False
+        gd.USERS_ROOT = self.users
+        gd.RUNNER_HYGIENE_DAEMONS = self.root / "LaunchDaemons"
+        gd.RUNNER_HYGIENE_DAEMONS.mkdir()
+        gd.RUNNER_ACCOUNTS_STATE = self.root / "state" / "runner-accounts.json"
+        gd.HOME = self.users / "fleet"
+        gd.HOME.mkdir()
+
+    def entry(self, name: str, uid: int, home: Path | None = None, gid: int = 20) -> pwd.struct_passwd:
+        home = self.users / name if home is None else home
+        home.mkdir(parents=True, exist_ok=True)
+        return pwd.struct_passwd((name, "*", uid, gid, "", os.fspath(home), "/bin/zsh"))
+
+    def test_candidates_are_other_non_admin_login_accounts_without_their_own_hygiene_job(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        own = self.entry("fleet", 501)
+        admin = self.entry("ops", 503)
+        hygiene = self.entry("person", 504)
+        (gd.RUNNER_HYGIENE_DAEMONS / f"{gd.RUNNER_HYGIENE_LABEL}.504.plist").write_text("")
+        daemon = self.entry("_svc", 300)
+        shared = self.entry("shared", 505, self.users / "Shared")
+        elsewhere = self.entry("away", 506, self.root / "var" / "away")
+        with mock.patch.object(gd, "_account_is_admin", side_effect=lambda e: e.pw_name == "ops"):
+            got = gd.runner_account_candidates([pool, own, admin, hygiene, daemon, shared, elsewhere], own_uid=501)
+        self.assertEqual([e.pw_name for e in got], ["cmux-pr-runner"])
+
+    def test_no_candidates_off_macos_by_policy_or_inside_a_runner_account_pass(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        with mock.patch.object(gd, "_account_is_admin", return_value=False):
+            self.assertEqual(len(gd.runner_account_candidates([pool], own_uid=501)), 1)
+            gd.RUNNER_ACCOUNT_MODE = True
+            self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+            gd.RUNNER_ACCOUNT_MODE, gd.DARWIN = False, False
+            self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+            gd.DARWIN = True
+            with mock.patch.dict(gd.POLICY, {"runner_accounts": False}):
+                self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+
+    def test_argv_keeps_the_mode_and_drops_this_runs_own_outputs(self) -> None:
+        got = gd.runner_account_argv(["--dead", "--apply", "--json", "--receipt", "/tmp/r.json",
+                                      "--root-override=/x", "--runner-caches", "--top", "0"])
+        self.assertEqual(got, ["--runner-account", "--dead", "--apply", "--top", "0"])
+
+    def test_sudo_refused_is_named_not_reached(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 1, b"", b"sudo: a password is required\n"))
+        row = gd.run_runner_account(pool, ["--pressure", "--apply"], run=run)
+        self.assertEqual(row["state"], "not reached")
+        self.assertIn("password", row["why"])
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:6], [gd.SUDO, "-n", "-u", "cmux-pr-runner", "-H", "/bin/sh"])
+
+    def test_pass_runs_as_the_account_and_its_summary_is_counted(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        line = gd.RUNNER_ACCOUNT_LINE + json.dumps({"state": "ran", "reclaimed_bytes": 40 * gd.GIB,
+                                                     "home_bytes": 150 * gd.GIB, "runners": 2})
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if argv[5] == "/bin/sh":
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return subprocess.CompletedProcess(argv, 0, f"progress\n{line}\n".encode(), b"")
+        with mock.patch.object(gd, "runner_account_candidates", return_value=[pool]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rows = gd.delegate_runner_accounts(["--dead", "--apply"], run=run)
+        self.assertEqual(rows[0]["state"], "ran")
+        self.assertEqual(rows[0]["reclaimed_bytes"], 40 * gd.GIB)
+        self.assertIn("runner account cmux-pr-runner: ran: reclaimed", out.getvalue())
+        install, pass_ = calls
+        self.assertEqual(install[1]["input"], Path(gd.__file__).read_bytes())
+        self.assertEqual(pass_[0][:5], [gd.SUDO, "-n", "-u", "cmux-pr-runner", "-H"])
+        self.assertIn("--runner-account", pass_[0])
+        self.assertEqual(pass_[0][-2:], ["--dead", "--apply"])
+        self.assertEqual(pass_[1]["timeout"], gd.RUNNER_ACCOUNT_TIMEOUT_S)
+        state = json.loads(gd.RUNNER_ACCOUNTS_STATE.read_text())
+        self.assertEqual(state[pool.pw_dir]["bytes"], 150 * gd.GIB)
+
+    def test_a_pass_past_its_bound_is_a_timeout_row(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+
+        def run(argv, **kw):
+            if argv[5] == "/bin/sh":
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        row = gd.run_runner_account(pool, ["--apply"], run=run)
+        self.assertEqual(row["state"], "timeout")
+
+    def test_a_home_without_enrolled_runners_deletes_nothing(self) -> None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]), \
+                mock.patch.object(gd, "_logged_main") as logged, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.runner_account_main(["--runner-account", "--dead", "--apply"]), 0)
+        logged.assert_not_called()
+        self.assertIn('"not a runner account"', out.getvalue())
+
+    def test_a_runner_account_pass_runs_the_full_pass_and_reports_its_home(self) -> None:
+        def logged(args):
+            gd.RUN.clear()
+            gd.RUN["released"] = 5 * gd.GIB
+            self.assertEqual(args, ["--dead", "--apply"])
+            self.assertTrue(gd.RUNNER_ACCOUNT_MODE)
+            return 0
+        with mock.patch.object(gd, "enrolled_runners", return_value=[gd.HOME / "actions-runner"]), \
+                mock.patch.object(gd, "_logged_main", side_effect=logged), \
+                mock.patch.object(gd, "du_bytes", return_value=90 * gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.runner_account_main(["--runner-account", "--dead", "--apply"]), 0)
+        summary = json.loads(out.getvalue().splitlines()[-1][len(gd.RUNNER_ACCOUNT_LINE):])
+        self.assertEqual((summary["state"], summary["reclaimed_bytes"], summary["home_bytes"]),
+                         ("ran", 5 * gd.GIB, 90 * gd.GIB))
+
+    def test_a_hook_pass_never_delegates(self) -> None:
+        with mock.patch.object(gd, "_main_impl", side_effect=lambda a: gd.RUN.update(apply=True) or 0), \
+                mock.patch.object(gd, "delegate_runner_accounts", return_value=[]) as delegate, \
+                mock.patch.object(gd, "write_run_line"), mock.patch.object(gd, "release_hook_pass"), \
+                mock.patch.object(gd, "release_full_disk_reserve", return_value=0), \
+                mock.patch.object(gd, "refill_full_disk_reserve"), \
+                mock.patch.object(gd, "launch_background_census"):
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}):
+                gd._logged_main(["--pressure", "--apply"])
+            delegate.assert_not_called()
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: ""}):
+                gd._logged_main(["--pressure", "--apply", "--need", "20"])
+                delegate.assert_not_called()
+                gd._logged_main(["--pressure", "--apply"])
+            delegate.assert_called_once_with(["--pressure", "--apply"])
+
+    def test_accounting_counts_a_runner_account_home_its_pass_sized(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        dev = Path(pool.pw_dir).stat().st_dev
+        fs = gd.Fs(dev, str(self.root), 2 * gd.GIB, 200 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = gd.ACCOUNTING
+        gd.ACCOUNTING = self.root / "accounting.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "ACCOUNTING", saved), gd._ACCOUNTING_MEM.clear(),
+                                  gd._ACCOUNTING_COVERAGE_MEM.clear()))
+
+        def account(now):
+            with mock.patch.object(gd, "fixed_measurement_roots", return_value=[]), \
+                    mock.patch.object(gd, "accounting_coverage", return_value=[]), \
+                    mock.patch.object(gd, "census_for", return_value=None), \
+                    mock.patch.object(gd, "root_census_for", return_value=None), \
+                    mock.patch.object(gd, "apfs_sibling_volumes", return_value=None), \
+                    mock.patch.object(gd, "sim_runtime_row", return_value=None), \
+                    mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                    mock.patch.object(gd.time, "time", return_value=now):
+                gd._ACCOUNTING_MEM.clear()
+                gd._ACCOUNTING_COVERAGE_MEM.clear()
+                return gd.filesystem_accounting([fs], [])[0]
+        now = time.time()
+        before = account(now)
+        gd.save_runner_account_sizes([{"account": "cmux-pr-runner", "home": pool.pw_dir,
+                                       "home_bytes": 150 * gd.GIB}], now=now)
+        after = account(now)
+        self.assertEqual(after["measured"] - before["measured"], 150 * gd.GIB)
+        self.assertEqual(before["accounting_gap"] - after["accounting_gap"], 150 * gd.GIB)
+        scope = [row for row in after["coverage"] if row["scope"] == gd.RUNNER_ACCOUNT_SCOPE]
+        self.assertEqual(scope[0]["children"][0]["account"], "cmux-pr-runner")
+        stale = account(now + gd.RUNNER_ACCOUNT_SIZE_MAX_AGE_S + 1)
+        self.assertEqual(stale["measured"], before["measured"])
 
 
 if __name__ == "__main__":
