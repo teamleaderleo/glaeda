@@ -14350,9 +14350,7 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # for good. A team scheduler's pinned land on a platform PR, 2026-11-23: handed to the executor, no outcome for 260
 # min, until its lane re-queued it by hand. Past this long since the row was first forwarded (the third re-send's
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
-# what to do, and its requester is told as any stop tells it. Before it stops, the PR's state is read once
-# (forward_give_up_job): on 2026-11-23 a lane VM got 10 forward_no_outcome blockers for PRs that had merged the day
-# before, its cache holding no read of them. MERGED ends the row merged with no notice, CLOSED stops it closed.
+# what to do, and its requester is told as any stop tells it.
 LAND_FORWARD_GIVE_UP = 7200.0
 # The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
 # holds no read of a PR nobody here watches. huge-blue, 2026-11-23 07:45-07:56Z: 1,299 rows stopped forward_no_outcome
@@ -16299,7 +16297,7 @@ class LandQueue:
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "").upper()
-        host = self.forward_host(e)
+        host = str(e.get("forwardedTo") or "the host it was handed to")
         at = c.get("dataAt")
         read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
         since = self.forwarded_since(e)
@@ -20331,14 +20329,13 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str, wake: bool = True) -> None:
-        """E ends merged at MERGE_SHA, its requester told (WAKE False: a quiet log line, notify's)."""
+    def merged(self, e: dict, merge_sha: str, how: str) -> None:
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
         self.history(e, "merged", sha=merge_sha, how=how)
         self.save(e)
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
-                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake)
+                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""))
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -20429,7 +20426,7 @@ class LandQueue:
         repeat = land_stop_repeats(e.get("lastStop"), st)
         e.update(state="stopped", wait=None, wakeAt=None, action=None, stop=st)
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld", "unreadCacheFirst", "unreadRun", "paceSince",
-                     "holdWindow", "forwardFirst", "forwardGiveUpRead"):
+                     "holdWindow", "forwardFirst"):
             e.pop(held, None)  # a stopped entry is held by nothing, and a rearm or requeue starts its reads afresh
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
