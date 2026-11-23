@@ -51,6 +51,20 @@ class LoaderTest(unittest.TestCase):
         self.assertEqual(reg.parse(d, "mini-a").caches[0].budget_gib, 5)
         self.assertEqual(reg.parse(d, "mini-b").caches[0].budget_gib, 1)
 
+    def test_checker_threshold_defaults_reads_and_overrides_per_host(self):
+        self.assertEqual(reg.load(ROOT / "config" / "disk-registry.toml").undeclared_alarm_gib, 5)
+        self.assertEqual(reg.parse(doc(), "h").undeclared_alarm_gib, reg.CHECKER_DEFAULTS["undeclared_alarm_gib"])
+        d = doc()
+        d["checker"] = {"undeclared_alarm_gib": 8}
+        d["hosts"] = {"mini-a": {"checker": {"undeclared_alarm_gib": 2}}}
+        self.assertEqual(reg.parse(d, "mini-a").undeclared_alarm_gib, 2)
+        self.assertEqual(reg.parse(d, "mini-b").undeclared_alarm_gib, 8)
+        for bad in ({"nope": 1}, {"undeclared_alarm_gib": "x"}, "x"):
+            d = doc()
+            d["checker"] = bad
+            with self.assertRaises(reg.RegistryError):
+                reg.parse(d, "h")
+
     def test_refuses_what_it_cannot_read_exactly(self):
         bad = [
             {"schema": "other/v1", "cache": doc()["cache"]},

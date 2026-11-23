@@ -22,6 +22,12 @@ evict = "lru"            # by last use, oldest first, until under budget
 idle_shrink_days = 3     # untouched this long: shrink to min_gib even under budget
 in_use_hours = 6         # a unit used this recently is never evicted (a running job may hold it)
 
+[checker]
+# glaeda-disk's checker (design section 3): df used - [base] - these caches - live cmux-job-* volumes is undeclared
+# growth; past this on a volume it is an alarm (summary.json finding undeclared_growth) naming the top paths. The fix is
+# a cache entry here or a scratch redirect, never a new deletion rule.
+undeclared_alarm_gib = 5
+
 [base]
 # macOS, the Xcode install, Homebrew and the runner itself: measured, never evicted.
 expected_gib = 120

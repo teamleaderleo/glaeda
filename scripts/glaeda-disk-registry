@@ -56,6 +56,8 @@ STREAM = "{stream}"
 STREAM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 CACHE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 DEFAULTS = {"evict": "lru", "idle_shrink_days": 3.0, "in_use_hours": 6.0}
+# [checker] (design section 3, read by glaeda-disk): undeclared growth past this many GiB on a volume is an alarm
+CHECKER_DEFAULTS = {"undeclared_alarm_gib": 5.0}
 
 
 class RegistryError(ValueError):
@@ -85,6 +87,7 @@ class Registry:
     base_gib: float | None
     source: str
     host: str
+    undeclared_alarm_gib: float = CHECKER_DEFAULTS["undeclared_alarm_gib"]
 
 
 @dataclass
@@ -180,7 +183,17 @@ def parse(doc: dict[str, Any], host: str, source: str = "<doc>") -> Registry:
             in_use_hours=_number(entry.get("in_use_hours", defaults["in_use_hours"]), f"{name}.in_use_hours")))
     if not caches:
         raise RegistryError("no [[cache]] entries")
-    return Registry(caches=caches, base_gib=base_gib, source=source, host=host)
+    checker = dict(CHECKER_DEFAULTS)
+    raw_checker = doc.get("checker") or {}
+    if not isinstance(raw_checker, dict):
+        raise RegistryError("checker: not a table")
+    host_checker = ((doc.get("hosts") or {}).get(host) or {}).get("checker") or {}
+    for key, value in {**raw_checker, **host_checker}.items():
+        if key not in CHECKER_DEFAULTS:
+            raise RegistryError(f"checker.{key}: unknown key")
+        checker[key] = _number(value, f"checker.{key}")
+    return Registry(caches=caches, base_gib=base_gib, source=source, host=host,
+                    undeclared_alarm_gib=checker["undeclared_alarm_gib"])
 
 
 def registry_file(explicit: str | None = None) -> Path:

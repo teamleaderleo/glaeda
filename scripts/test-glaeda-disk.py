@@ -16718,5 +16718,78 @@ class RunnerAccountsTest(unittest.TestCase):
         self.assertEqual(stale["measured"], before["measured"])
 
 
+
+class UndeclaredGrowthTest(unittest.TestCase):
+    """The checker (declared-disk-persistence design section 3): used - base - registered caches - job volumes."""
+
+    G = gd.GIB
+
+    def check(self, rows, *, used, volumes=None, gap=0, base=0, caches=(), sizes=None, alarm=5):
+        return gd.undeclared_growth(used * self.G, [(Path(p), n * self.G, "keep") for p, n in rows], volumes,
+                                    gap * self.G, "apfs invisible", base * self.G, [(c, Path(r)) for c, r in caches],
+                                    lambda root: None if sizes is None else sizes.get(str(root)), alarm * self.G)
+
+    def test_used_less_base_caches_and_job_volumes_is_undeclared(self):
+        got = self.check([("/Users/Shared/dd", 50), ("/opt/junk", 20), ("/private/var/folders", 7)], used=200,
+                         volumes=[{"name": "cmux-job-1", "bytes": 3 * self.G}, {"name": "Preboot", "bytes": self.G}],
+                         base=120, caches=[("derived-data", "/Users/Shared/dd")])
+        self.assertEqual(got["declared"], 50 * self.G)
+        self.assertEqual(got["job_volumes"], 3 * self.G)
+        self.assertEqual(got["job_volume_count"], 1)
+        self.assertEqual(got["undeclared"], 27 * self.G)
+        self.assertTrue(got["alarm"])
+        self.assertEqual([t["path"] for t in got["top"]], ["/opt/junk", "/private/var/folders"])
+
+    def test_never_below_zero_and_quiet_under_the_threshold(self):
+        got = self.check([("/opt/a", 1)], used=100, base=120)
+        self.assertEqual(got["undeclared"], 0)
+        self.assertFalse(got["alarm"])
+        self.assertFalse(self.check([], used=124, base=120)["alarm"])
+
+    def test_a_cache_inside_a_wider_row_is_sized_and_taken_out_of_that_row(self):
+        got = self.check([("/Users/Shared", 90)], used=90, caches=[("derived-data", "/Users/Shared/dd")],
+                         sizes={"/Users/Shared/dd": 60 * self.G})
+        self.assertEqual(got["caches"], {"derived-data": 60 * self.G})
+        self.assertEqual(got["top"], [{"path": "/Users/Shared", "bytes": 30 * self.G, "owner": gd.census_owner("/Users/Shared")}])
+
+    def test_an_unsizable_cache_is_named_not_silently_zero(self):
+        got = self.check([("/Users/Shared", 10)], used=10, caches=[("derived-data", "/Users/Shared/dd")])
+        self.assertEqual(got["unsized_caches"], ["derived-data"])
+
+    def test_unattributed_gap_is_a_top_row_and_other_homes_are_redacted(self):
+        got = self.check([("/Users/someone-else/big", 8)], used=20, gap=12)
+        self.assertEqual(got["top"][0]["path"], "(no directory: apfs invisible)")
+        self.assertEqual(got["top"][1]["path"], "private-user-data")
+
+    def test_findings_only_past_the_alarm_and_name_the_fix(self):
+        quiet = {"mount": "/", "undeclared": self.check([], used=1)}
+        loud = {"mount": "/", "undeclared": self.check([("/opt/junk", 20)], used=20)}
+        self.assertEqual(gd.undeclared_findings([quiet, {"mount": "/x", "undeclared": {"error": "nope"}}]), [])
+        [finding] = gd.undeclared_findings([quiet, loud])
+        self.assertEqual((finding["id"], finding["severity"], finding["path"]), ("undeclared_growth", "warn", "/opt/junk"))
+        self.assertIn("20.0 GiB undeclared growth on /", finding["evidence"])
+        self.assertIn("disk-registry.toml", finding["evidence"])
+
+    def test_reads_the_shipped_registry_beside_itself(self):
+        with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "1", "GLAEDA_DISK_REGISTRY_FILE":
+                                          os.fspath(ROOT / "config" / "disk-registry.toml")}), \
+                mock.patch.dict(gd._DISK_REGISTRY_MEM, clear=True):
+            got = gd.undeclared_for_volume(300 * self.G, [(Path("/opt/junk"), 10 * self.G, "keep")], None, 0, "x")
+        self.assertEqual(got["base"], 120 * self.G)
+        self.assertEqual(got["alarm_bytes"], 5 * self.G)
+        self.assertEqual(got["undeclared"], 180 * self.G)
+        with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "0"}):
+            self.assertIsNone(gd.undeclared_for_volume(1, [], None, 0, "x"))
+
+    def test_a_broken_registry_shows_as_an_error_not_zero_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "r.toml"
+            bad.write_text('schema = "glaeda-disk-registry/v1"\n[checker]\nnope = 1\n')
+            with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "1", "GLAEDA_DISK_REGISTRY_FILE": os.fspath(bad)}), \
+                    mock.patch.dict(gd._DISK_REGISTRY_MEM, clear=True):
+                got = gd.undeclared_for_volume(1, [], None, 0, "x")
+        self.assertIn("registry not loaded", got["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
