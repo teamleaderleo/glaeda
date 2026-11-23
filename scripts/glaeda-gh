@@ -14609,8 +14609,29 @@ def land_step_class(out: str) -> str:
     found = LAND_STEP_CODE.findall(out or "")
     if found:
         return found[-1]
-    lines = [ln.strip() for ln in str(out or "").splitlines() if ln.strip()]
+    text = str(out or "")
+    # A step that printed a JSON document (the broker's indented envelope from a land that answered ok but did not
+    # merge) is read by its words, not its last line, which is `}`. manaflow-ai/cmux#47213 on a lane VM, 2026-11-23
+    # 08:14:33Z: `step_refused ... why=}` and `wait_refused code=}`, so its history named no reason at all.
+    with contextlib.suppress(ValueError):
+        text = "\n".join(land_json_words(json.loads(text))) or text
+    lines = [ln.strip() for ln in text.splitlines() if re.search(r"\w", ln)]
     return re.sub(r"[0-9a-f]{7,40}|\d+", "#", lines[-1] if lines else "no output")[:120]
+
+
+def land_json_words(doc: Any) -> list[str]:
+    """The refusal words in a step's JSON output DOC: each "error", "reason", "why" and "next" string, depth first, so
+    land_step_class reads the innermost (the broker's data under its envelope) last."""
+    words: list[str] = []
+    if isinstance(doc, dict):
+        words += [str(doc[k]) for k in ("error", "reason", "why", "next") if isinstance(doc.get(k), str) and doc[k].strip()]
+        for value in doc.values():
+            if isinstance(value, (dict, list)):
+                words += land_json_words(value)
+    elif isinstance(doc, list):
+        for value in doc:
+            words += land_json_words(value)
+    return words
 
 
 def land_step_named(out: str) -> dict | None:

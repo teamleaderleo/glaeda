@@ -27823,6 +27823,16 @@ class LandTest(Base):
         # each refusal is counted as itself: the last one (read Apps busy) is a first, not an eighth
         self.assertEqual((e["stepFail"]["class"], e["stepFail"]["count"]), (gg.land_step_class(said[1]), 1))
 
+    def test_land_step_class_reads_a_json_documents_words_not_its_closing_brace(self):
+        # manaflow-ai/cmux#47213, 2026-11-23 08:14:33Z: a broker land answered ok without merging, its indented envelope
+        # was the step's output, and history said `why=}`.
+        out = json.dumps({"ok": True, "status": 200, "data": {"ok": True, "merged": False,
+                          "reason": "checks still running at abc1234: 3 queued; next: glaeda-gh wait pr o/r#1"}}, indent=1)
+        self.assertEqual(gg.land_step_class(out), "checks still running at #: # queued; next: glaeda-gh wait pr o/r##")
+        self.assertEqual(gg.land_step_class("refused: busy\n}\n"), "refused: busy")
+        self.assertEqual(gg.land_step_class("{}"), "no output")
+        self.assertEqual(gg.land_step_class(""), "no output")
+
     def test_a_draft_pr_stops_at_the_first_refusal_and_names_gh_pr_ready(self):
         """A draft is permanent until someone marks it ready, so one refusal is the whole answer. 2026-11-21,
         leo-workspace#7087 (opened as a draft by the PreCompact checkpoint hook): six identical "Pull Request is
