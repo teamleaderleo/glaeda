@@ -7458,11 +7458,12 @@ class Daemon:
             self.now = tick_now
 
     def content_pause_until(self) -> float:
-        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. The ask runs on its
+        """When the login's create pause ends (0: none). Only active holds are cached; each create asks afresh.
+        The ask runs on its
         own thread: the daemon waits CONTENT_PAUSE_DEADLINE for it on its main thread (the reads and waits lose that
         to a hung keeper), and a slower answer, up to CONTENT_PAUSE_SLOW_DEADLINE, is taken on a later pass. A failed
         or timed-out ask keeps the last answer and is not repeated for CONTENT_PAUSE_RETRY; content_pause_unknown says
-        whether that answer is too old to post on. The pacer's own hold (adopt_pace_hold) applies either way."""
+        whether the authority is unavailable. The pacer's own hold (adopt_pace_hold) applies either way."""
         cmd = content_pause_cmd()
         if cmd is None:
             if os.environ.get(CONTENT_PAUSE_ENV, "").strip():
@@ -7542,7 +7543,8 @@ class Daemon:
             if until > max(self.now, self.pause_until):
                 log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})
             self.pause_until = until
-            self.pause_next = asked + CONTENT_PAUSE_TTL
+            # A hold may be cached until it expires; a clear answer authorizes only this pass's write.
+            self.pause_next = min(asked + CONTENT_PAUSE_TTL, until) if until > clock else clock
             self.pause_answered_at = clock
             self.pause_failures = self.pause_timeouts = 0
             self.pause_error, self.pause_blind_logged = None, False
@@ -7561,9 +7563,7 @@ class Daemon:
             return False
         clock = self.clock()
         known = self.pause_answered_at if self.pause_answered_at is not None else self.pause_first_ask
-        if known is None or clock - known < CONTENT_PAUSE_RETRY and self.pause_answered_at is not None:
-            return False  # a recent answer stands
-        if clock - known < CONTENT_PAUSE_BLIND_MAX:
+        if known is None or clock - known < CONTENT_PAUSE_BLIND_MAX:
             return True
         if not self.pause_blind_logged:
             self.pause_blind_logged = True

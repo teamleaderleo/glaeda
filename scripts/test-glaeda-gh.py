@@ -15952,6 +15952,39 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/issues/2/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
 
+    def test_each_create_rechecks_a_clear_answer_and_holds_on_new_pause_or_failure(self) -> None:
+        for answer in (json.dumps({"blocked_until": NOW + 100}), "not json"):
+            with self.subTest(answer=answer):
+                first = self.queue("comment", "o/r#1", "--body", "one")
+                second = self.queue("comment", "o/r#2", "--body", "two")
+                calls = self.pause_cmd(0, level=0)
+                calls.unlink(missing_ok=True)
+                ok = (201, {}, {"html_url": "u"})
+                d, t = self.daemon(ok, ok)
+                d.clock_real = False
+                self.step(d, NOW)
+                self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+                (calls.parent / "pause.json").write_text(answer)
+                self.step(d, NOW + gg.POST_SPACING)
+                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(gg.post_state(second["id"])["state"], "queued")
+                self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+                # Restore authority and drain this subcase's queue after its bounded retry/hold.
+                (calls.parent / "pause.json").write_text('{"blocked_until": 0}')
+                self.step(d, NOW + 200)
+                self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+
+    def test_an_expired_short_hold_requires_a_new_answer(self) -> None:
+        item = self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 1)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        (calls.parent / "pause.json").write_text('{"blocked_until": 0}')
+        self.step(d, NOW + 2)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+
     def test_a_failed_pause_read_keeps_the_last_answer(self) -> None:
         self.queue("comment", "o/r#1", "--body", "one")
         calls = self.pause_cmd(NOW + 100)
