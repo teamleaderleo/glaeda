@@ -23377,22 +23377,79 @@ class LogScanTest(Base):
         self.assertEqual(sorted(j for j in self.ctl_reads if 2 <= j <= 8), [4, 5, 6, 7, 8])
         self.assertEqual(self.rest_calls, 0)
 
-    def test_errors_of_a_run_cut_out_of_a_truncated_history_says_the_look_was_cut_short(self) -> None:
-        """A read that was cut short is unknown, not a value -- the same rule this command exists to serve. The
-        history scan drops the oldest records past LOG_SCAN_KEEP and reports that it did; that flag was discarded,
-        so a run that did finish inside the window, but fell outside the slice kept, was announced as "no run N
-        finished in the last 72 h" -- a confident claim about something never read."""
+    def _cut_history(self) -> None:
+        """A kept-job history the scan truncates, with run 9's only job cut out of the slice it keeps."""
         for n in range(8):  # more than 2 * LOG_SCAN_KEEP, so the oldest are dropped and the scan says so
             self.rec(20 + n, run=5, minutes_ago=5 + n)
         self.rec(2, run=9, minutes_ago=60)  # the oldest: cut out of the kept slice
+
+    def test_errors_of_a_run_cut_out_of_a_truncated_history_reads_the_run_instead_of_dead_ending(self) -> None:
+        """The cut-short flag stopped the command and told the reader to run `glaeda-gh status run o/r/9` -- the
+        one call this seam exists to spare them, followed by the whole command again (3 calls, 72 s measured on
+        manaflow-ai/cmuxterm-hq/45131616635, where `status run` answered in 1 s). One read of the run here is the
+        same question, asked once, and it carries the failed job the command then reads."""
+        self._cut_history()
+        self.ctl_logs[777] = (200, self.FAIL_LOG)
+        asked: list = []
+
+        def read_run(repo: str, number: int) -> tuple[list[dict] | None, str | None]:
+            asked.append((repo, number))
+            return [{"id": 777, "status": "completed", "conclusion": "failure"}], None
+
+        said = io.StringIO()
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3), mock.patch.object(gg, "run_read_once", read_run), \
+                self.diagnostics_in(said):
+            code, text = self.run_cmd(gg.cmd_log_errors, "o/r", 9, as_json=True, rest=self.no_rest)
+        doc = json.loads(text)
+        self.assertEqual(code, 0, said.getvalue())
+        self.assertEqual(asked, [("o/r", 9)], "the run was not read, or was read more than once")
+        self.assertEqual([j["job"] for j in doc["jobs"]], [777])
+        self.assertNotIn("went unchecked", said.getvalue())
+        self.assertNotIn("status run o/r/9", said.getvalue())  # nothing left for the reader to go and ask
+
+    def test_errors_of_a_run_the_read_could_not_reach_still_says_the_look_was_cut_short(self) -> None:
+        """A read that could not be made is still unknown, not a value -- the one case the flag is for. It says
+        why it could not be made, and still offers the call that can end the refusal."""
+        self._cut_history()
         err = io.StringIO()
-        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3), mock.patch("sys.stderr", err):
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3), \
+                mock.patch.object(gg, "run_read_once", lambda repo, n: (None, "the rest bucket is spent")), \
+                mock.patch("sys.stderr", err):
             code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, rest=self.no_rest)
         said = err.getvalue()
         self.assertEqual((code, out), (1, ""))
         self.assertNotIn("no run 9", said)  # it was never looked at: do not claim it is not one
         self.assertIn("went unchecked", said)
+        self.assertIn("the rest bucket is spent", said)  # the read's own words, not a shrug
         self.assertIn("glaeda-gh status run o/r/9", said)  # a next step that can end the refusal
+
+    def test_errors_of_a_number_github_has_no_run_for_offers_no_further_call(self) -> None:
+        """When the read answers "no such run", the number is of neither kind, and naming `status run` would send
+        the reader to the read whose answer the sentence already carries."""
+        self._cut_history()
+        err = io.StringIO()
+        with mock.patch.object(gg, "LOG_SCAN_KEEP", 3), \
+                mock.patch.object(gg, "run_read_once", lambda repo, n: (None, None)), \
+                mock.patch("sys.stderr", err):
+            code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, rest=self.no_rest)
+        said = err.getvalue()
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("neither kind", said)
+        self.assertNotIn("went unchecked", said)
+        self.assertNotIn("status run o/r/9", said)
+
+    def test_a_history_that_was_not_cut_short_answers_no_run_with_no_github_read(self) -> None:
+        """The whole-window case is unchanged: a scan that covered its window and found no such run is an answer,
+        and a bogus job id must not cost a GitHub read to refuse."""
+        self.rec(2, run=5, minutes_ago=30)
+        reads: list = []
+        err = io.StringIO()
+        with mock.patch.object(gg, "run_read_once", lambda repo, n: reads.append(n) or (None, None)), \
+                mock.patch("sys.stderr", err):
+            code, out = self.run_cmd(gg.cmd_log_errors, "o/r", 9, rest=self.no_rest)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(reads, [], "read GitHub for a question the history had already answered")
+        self.assertIn("no run 9", err.getvalue())
 
     def test_errors_of_a_run_that_could_not_be_looked_up_does_not_claim_it_is_no_run(self) -> None:
         """The unchecked-vs-absent distinction is the point of the change, and nothing pinned it: deleting the
@@ -23553,6 +23610,81 @@ class LogScanTest(Base):
         self.assertIn("glaeda-gh status run o/r/9", said)
         self.assertNotIn("no run 9", said)
         self.assertNotIn("went unchecked", said)
+
+
+class RunReadOnceTest(unittest.TestCase):
+    """`run_read_once`: the one read that settles a run id when the controller's kept job history cannot. It is
+    what `status run --jobs` reads -- this host's cache entry first, then one direct read -- and it answers in
+    three states, so no caller has to guess which of them it got."""
+
+    def read(self, entry: dict | None, direct: str | None = None, second: dict | None = None):
+        """run_read_once over a cache that holds ENTRY (then SECOND after a direct read), with DIRECT as what the
+        direct read reports. Returns (answer, direct reads made)."""
+        reads: list = []
+        seen = [entry, second if second is not None else entry]
+
+        def read_cache(key: str) -> dict | None:
+            return seen[min(len(reads), 1)]
+
+        def direct_read(req: dict) -> str | None:
+            reads.append(req)
+            return direct
+
+        with mock.patch.object(gg, "read_cache", read_cache), mock.patch.object(gg, "direct_read", direct_read), \
+                mock.patch.object(gg, "register", lambda *a, **k: None), \
+                mock.patch.object(gg, "blocked_now", lambda kind, now=None: None):
+            return gg.run_read_once("o/r", 9), reads
+
+    def test_a_cached_job_list_is_answered_with_no_read_at_all(self) -> None:
+        """A run some watcher already read costs nothing: the point of the fix is fewer calls, not one more."""
+        entry = {"data": {"id": 9}, "jobs": [{"id": 5, "status": "completed", "conclusion": "failure"}]}
+        (jobs, why), reads = self.read(entry)
+        self.assertEqual((why, reads), (None, []))
+        self.assertEqual([j["id"] for j in jobs or []], [5])
+
+    def test_the_jobs_come_back_newest_first_and_only_the_finished_ones(self) -> None:
+        """The history scan's order and its contract: a job still running has no conclusion to read a log by."""
+        entry = {"data": {"id": 9}, "jobs": [
+            {"id": 5, "status": "completed", "conclusion": "failure"},
+            {"id": 9, "status": "completed", "conclusion": "success"},
+            {"id": 7, "status": "in_progress", "conclusion": None}]}
+        (jobs, why), _ = self.read(entry)
+        self.assertIsNone(why)
+        self.assertEqual([j["id"] for j in jobs or []], [9, 5])
+
+    def test_a_run_with_no_cache_entry_is_read_once(self) -> None:
+        entry = {"data": {"id": 9}, "jobs": [{"id": 5, "status": "completed", "conclusion": "failure"}]}
+        (jobs, why), reads = self.read(None, second=entry)
+        self.assertEqual(why, None)
+        self.assertEqual([j["id"] for j in jobs or []], [5])
+        self.assertEqual(len(reads), 1, "one read, or the fix costs more calls than it saves")
+        self.assertEqual((reads[0]["kind"], reads[0]["jobs"]), ("run", True))
+
+    def test_a_number_github_has_no_run_for_is_an_answer_not_a_failure(self) -> None:
+        """Not found is a value: the caller may say so, instead of offering a read that would say the same."""
+        (jobs, why), _ = self.read(None, second={"missing": True})
+        self.assertEqual((jobs, why), (None, None))
+
+    def test_a_read_that_could_not_be_made_says_why_in_its_own_words(self) -> None:
+        (jobs, why), _ = self.read(None, direct="the rest bucket is spent")
+        self.assertEqual((jobs, why), (None, "the rest bucket is spent"))
+
+    def test_a_spent_bucket_is_refused_before_the_read_is_attempted(self) -> None:
+        """The same refusal a starved `status` read takes: an exhausted route is not asked again."""
+        reads: list = []
+        blocked = {"exhausted": True, "routed": "rest", "bucket": "rest", "text": "the rest pool is spent until 10Z"}
+        with mock.patch.object(gg, "read_cache", lambda key: None), \
+                mock.patch.object(gg, "direct_read", lambda req: reads.append(req)), \
+                mock.patch.object(gg, "register", lambda *a, **k: None), \
+                mock.patch.object(gg, "blocked_now", lambda kind, now=None: blocked):
+            jobs, why = gg.run_read_once("o/r", 9)
+        self.assertEqual((jobs, why, reads), (None, blocked["text"], []))
+
+    def test_a_repository_word_that_is_no_repository_is_refused_not_raised(self) -> None:
+        """A WatchError out of here would escape as a traceback in the middle of a log refusal."""
+        jobs, why = gg.run_read_once("not-a-repo", 9)
+        self.assertIsNone(jobs)
+        self.assertIn("run", str(why))
 
 
 # ---------------------------------------------------------------- land: the queue that takes land_judge's next steps
@@ -28872,8 +29004,10 @@ class LandTest(Base):
         # huge-blue 2026-11-23: cmux#18775 told three times, once per hand-off. A new hand-off of the same PR (a
         # re-send, a re-land) is no new word: one per PR, kept on the row across passes and restarts
         e = self.q.entries[self.KEY]
-        e["handedOff"]["at"] = self.t
+        e["handedOff"]["at"] = e["forwardFirst"] = self.t  # a new forward, nowhere near its give-up
+        e.pop("forwardQuiet")
         self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.pr(LA)
         self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
         self.assertEqual(len(self.quiet_notices()), 1, "told once per PR")
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
@@ -28906,10 +29040,12 @@ class LandTest(Base):
         self.assertEqual(self.q.entries[self.KEY]["forwardQuiet"]["ended"], "MERGED")
         # a fresh forward whose PR is never read again: once the read's wait is out nobody is told on a state nobody
         # read (huge-blue 2026-11-23: most of the ~20 [blocker]s in 10 min said only "no read of the PR here says it
-        # ended"); forward_follow's give-up reads it live
+        # ended"); forward_follow's give-up reads it live (the cache's MERGED also ended the row merged:
+        # forward_follow; the fresh forward is a forwarded row again)
         self.w.cache.pop(self.KEY, None)
         e = self.q.entries[self.KEY]
         e.pop("forwardQuiet")
+        e.update(state="forwarded", mergeSha="", forwardFirst=None)
         e["handedOff"]["at"] = self.t
         self.tick(gg.LAND_FORWARD_QUIET + 10)
         self.assertEqual(self.quiet_notices(), [])

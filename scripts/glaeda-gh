@@ -15510,6 +15510,7 @@ class LandQueue:
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
+                e.pop("forwardQuietTold", None)  # a land by hand is a new ask: it may be told once again
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e), **land_nominated_history(e))
         else:
@@ -16157,8 +16158,8 @@ class LandQueue:
 
     def forwards_unjudged(self) -> None:
         """Every forwarded row LAND_FORWARD_QUIET past its forward with no ending on record: its PR is read once, and
-        unless a copy read since the forward shows it merged or closed, its requester is told once per forward
-        (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
+        only a read that shows it still open tells its requester, once per PR (forwardQuietTold), as an fyi; a read
+        that never lands tells nobody (forward_quiet). A cache file read per row, and one one-off read per row past the bound."""
         self.forward_reads = 0
         for key in [k for k, e in self.entries.items() if e.get("state") == LAND_FORWARDED and k not in self.jobs]:
             try:
@@ -16168,8 +16169,9 @@ class LandQueue:
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
     def forwarded_at(self, e: dict) -> float:
-        """When E was forwarded: its hand-off's time, its forward's stamp, or its last forwarding history event."""
-        for at in ((e.get("handedOff") or {}).get("at"), e.get("forwardedAt")):
+        """When E was forwarded: its first forward (forwardFirst, which a re-send this host makes by itself keeps:
+        forward_follow), its hand-off's time, its forward's stamp, or its last forwarding history event."""
+        for at in (e.get("forwardFirst"), (e.get("handedOff") or {}).get("at"), e.get("forwardedAt")):
             if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
                 return float(at)
         for h in reversed(e.get("history") or []):
@@ -16182,6 +16184,8 @@ class LandQueue:
         since = self.forwarded_at(e)
         if not since or self.now - since < LAND_FORWARD_QUIET:
             return
+        if self.now - (float(e.get("forwardFirst") or 0) or self.forwarded_since(e)) > LAND_FORWARD_GIVE_UP:
+            return  # past the give-up its PR is read and settled, telling nobody when it ended (forward_settle)
         quiet = e.get("forwardQuiet") or {}
         if float(quiet.get("since") or 0) == since:
             return  # this forward was told (or seen ended, or its read given up on) once
@@ -16481,7 +16485,7 @@ class LandQueue:
         naming why and the way on; its requester is told as an inbox fyi, never a blocker."""
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         e["forwardGaveUp"] = self.now  # read before it stopped: repair_forwarded never reopens it
-        told = bool(e.get("forwardQuietTold"))  # one fyi a PR (LAND_FORWARD_QUIET's comment): told once, no second
+        told = bool(e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"))  # one fyi a PR (LAND_FORWARD_QUIET's comment): told once, no second
         if not told:
             e["forwardQuietTold"] = {"at": self.now, "since": first, "to": host, "by": "forward_give_up"}
         cause = f"the PR is still {state.lower()}; {why}" if state else why
@@ -33522,33 +33526,91 @@ def cmd_log_flaky(repo: str, test: str | None = None, since: str = "72h", job: s
     return EXIT_OK if flaky else EXIT_FAIL
 
 
-def run_jobs_typed_as_a_job(repo: str, number: int, controller: Any,
-                            what: str = "log errors") -> tuple[list[dict] | None, bool]:
-    """REPO's finished jobs of run NUMBER, newest first, or None when no run of REPO by that number finished inside
-    the window the controller keeps logs for -- and whether the history read was cut short, which decides whether
-    that None means "no such run" or "not looked at".
+def run_read_once(repo: str, number: int) -> tuple[list[dict] | None, str | None]:
+    """REPO's run NUMBER's finished jobs as the cache holds them (id, status, conclusion), newest first -- what
+    `status run --jobs` reads: this host's cache entry when a watcher already has one, else one direct read. Three
+    answers, so the caller never has to guess which it got: a list (that run exists), (None, None) when GitHub says
+    there is no such run, and (None, why) when the read could not be made at all (a spent bucket, no login, a
+    failure), which is unknown and not a value.
+
+    One read, charged like a session's own `status run` and refused the same way a starved `status` read is."""
+    try:
+        key = parse_key("run", f"{repo}/{int(number)}")
+    except WatchError as error:
+        return None, str(error)
+    entry = read_cache(key)
+    if entry is None or ("jobs" not in entry and not entry.get("missing")):
+        blocked = blocked_now("run")
+        if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
+            return None, blocked["text"]
+        register(key, True, once=True)
+        why = direct_read({"key": key, "kind": "run", "jobs": True, "began": time.time()})
+        if why:
+            return None, why
+        entry = read_cache(key)
+    if entry is None:
+        return None, "the read stored no answer"
+    if entry.get("missing"):
+        return None, None  # GitHub answered: no run by that number in this repository
+    jobs = entry.get("jobs")
+    if jobs is None:
+        return None, "the run was read without its jobs"
+    finished = [j for j in jobs if isinstance(j, dict) and j.get("status") == "completed"]
+    # Newest first like the history scan's own order; a job id rises with the job, so it stands in for a time the
+    # cache entry does not carry.
+    return sorted(finished, key=lambda j: int(j.get("id") or 0), reverse=True), None
+
+
+def run_jobs_typed_as_a_job(repo: str, number: int, controller: Any, what: str = "log errors",
+                            read_run: Callable | None = None) -> tuple[list[dict] | None, bool | str, bool]:
+    """REPO's finished jobs of run NUMBER, newest first, or None when there is no run of REPO by that number --
+    then whether the reading was cut short, which decides whether that None means "no such run" or "not looked
+    at" (a string there is why the run could not be read either), and whether GitHub itself answered that there is
+    no such run (so no `status run` can say otherwise).
 
     A run id and a job id are both bare integers, so neither the caller nor argparse can tell one from the other:
     `log errors manaflow-ai/cmuxterm-hq 44950653493` (a run id, copied from the run's own page) answered "no log
     for job 44950653493", which reads as a job whose log has expired. The reader's next step was `status run` to
     get the job id, then the same command again -- two calls for a number they already had. The controller's own
-    timing history says which jobs a run has, so the reading is settled here, for no GitHub read."""
+    timing history says which jobs a run has, so the reading is settled here, for no GitHub read.
+
+    It is settled here even when that history cannot settle it. The history scan drops its oldest records past
+    LOG_SCAN_KEEP (60000) and says so, and a run outside the slice kept then read the same as no run at all: this
+    function returned "not looked at", and the hint told the reader to run `glaeda-gh status run REPO/N` -- the
+    one call this function was written to spare them, followed by the whole command again. Measured 2026-11-23 on
+    manaflow-ai/cmuxterm-hq/45131616635: 3 calls and 72 s (65 s of them spent reaching that dead end) where
+    `status run` answered in 1 s and named the failed job, which `log errors` then read in 6 s. So a cut-short
+    scan asks GitHub the same question `status run` asks, once (READ_RUN), and the answer is a value either way.
+    A read that could not be made is still "not looked at": that is the one case the flag is for."""
     _, _, recs, cut = log_scan_setup(repo, "72h", controller, what)
     of_run = [r for r in recs if r.get("run") and int(r["run"]) == number]
-    if not of_run:
-        return None, cut
-    return sorted(of_run, key=lambda r: r.get("at") or "", reverse=True), cut
+    if of_run:
+        return sorted(of_run, key=lambda r: r.get("at") or "", reverse=True), cut, False
+    if not cut:
+        # The scan covered the whole window and the run is not in it: an answer, for no GitHub read.
+        return None, False, False
+    jobs, why = (read_run or run_read_once)(repo, number)
+    if why is not None:
+        return None, why, False
+    return jobs, False, jobs is None
 
 
-def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool = False) -> str:
+def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool | str = False,
+                gone: bool = False) -> str:
     """What to say about NUMBER when it is no job of REPO: which failed jobs its run has, that it is no run either,
     or that the look for one was cut short. Named so both `log job` and `log errors` refuse the same way."""
+    if jobs is None and gone:
+        # GitHub answered this one (run_read_once), so there is no call left to offer: naming `status run` here
+        # would send the reader to the very read whose answer this sentence carries.
+        return f"; and GitHub has no run {number} of {repo} either: the number is of neither kind in this repository"
     if jobs is None and cut:
         # The history scan dropped records to stay bounded, so this number may well be a run of REPO that simply
-        # fell outside the slice kept. A read that was cut short is unknown, not a value.
+        # fell outside the slice kept. A read that was cut short is unknown, not a value. The GitHub read that
+        # settles it is made for the reader (run_read_once); CUT carries its own words when it could not be made.
+        tried = f", and reading the run itself did not answer either ({cut})" if isinstance(cut, str) else ""
         return (f"; whether {number} is a run of {repo} went unchecked: the controller's job history came back cut "
                 f"short of the whole window, so a run outside the newest {LOG_SCAN_KEEP} jobs kept reads the same "
-                f"as no run at all (`glaeda-gh status run {repo}/{number}` says what it is)")
+                f"as no run at all{tried} (`glaeda-gh status run {repo}/{number}` says what it is)")
     if jobs is None:
         return (f"; no run {number} of {repo} finished in the last 72 h either (a run of another repository, or one "
                 f"too old to have logs: `glaeda-gh status run {repo}/{number}` says which)")
@@ -33573,14 +33635,15 @@ def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, 
     if text is not None:
         return log_errors_emit(repo, [(job, text, source)], limit, as_json, None)
     try:
-        jobs, cut = run_jobs_typed_as_a_job(repo, job, controller, "log errors")
+        jobs, cut, gone = run_jobs_typed_as_a_job(repo, job, controller, "log errors")
     except (WatchError, OSError) as error:
         print(f"glaeda-gh: no log for {repo} job {job}: {why}; whether {job} is a run id went unchecked: {error}",
               file=sys.stderr)
         return EXIT_FAIL
     failed = [r for r in (jobs or []) if (r.get("conclusion") or "") in LOG_FAILED]
     if not failed:
-        print(f"glaeda-gh: no log for {repo} job {job}: {why}{run_id_hint(repo, job, jobs, cut)}", file=sys.stderr)
+        print(f"glaeda-gh: no log for {repo} job {job}: {why}{run_id_hint(repo, job, jobs, cut, gone)}",
+              file=sys.stderr)
         return EXIT_FAIL
     # Bounded, newest first: unlike the sibling scans this path can fall through to REST on the person's own
     # quota, so a run of a wide matrix (60 failed jobs measured) must not read every one of them unasked. The
