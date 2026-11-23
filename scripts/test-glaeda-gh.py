@@ -863,9 +863,10 @@ class ExpectedUnpostedTest(Base):
         self.assertEqual(gg.EXIT_INCONCLUSIVE, 7)
         data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1)
         self.assertEqual(gg.verdict("pr", data, "done", self.SHA, now=NOW), gg.EXIT_INCONCLUSIVE)
-        # the same state the stragglers case takes, rendered the same way: PENDING, never FAILURE
-        self.assertNotIn("FAILURE", gg.summary(self.KEY, {"data": data}))
-        self.assertIn("PENDING", gg.summary(self.KEY, {"data": data}))
+        # the same word the stragglers case already renders (status_view, origin/main): INCONCLUSIVE, never FAILURE
+        said = gg.summary(self.KEY, {"data": data})
+        self.assertNotIn("FAILURE", said)
+        self.assertIn("checks INCONCLUSIVE", said)
         out = gg.wait_outcome(self.request(), gg.EXIT_INCONCLUSIVE, {"data": data}, 2401)
         self.assertFalse(out["ok"])
         self.assertNotIn(out["code"], ("fail", "timeout", "ok"))
