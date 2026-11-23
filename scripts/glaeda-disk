@@ -787,6 +787,12 @@ def referenced_main_checkout(path: Path, *, nested: bool = False) -> str:
 # ~/.cargo/bin/rustup on 2026-10-26 (21:26-00:48Z); job-started then refused every job ("cannot name a toolchain
 # for 'rustc 1.98.1'"). Whatever removed it, glaeda-disk must never be able to.
 TOOLCHAIN_HOME_PATHS = (".cargo/bin", ".rustup")  # under HOME; CARGO_HOME/bin and RUSTUP_HOME too
+# The shared RUSTUP_HOME every hq fleet job gets (<work root>/cache/rustup: cmuxterm-hq build-fleet cmd/worker
+# rust_cache.go, rustup_shim.go; CMUX_RUSTUP_HOME on the AWS workers). glaeda-disk runs without the job's RUSTUP_HOME,
+# so before 2026-11-23 fleet-artifacts took this home as one idle item (cmuxs-mac-mini-3, cmux10s and ~14 more iOS
+# simulator minis, 0.5-2.8 GiB a pass) and the next job failed "missing manifest in toolchain
+# '1.95.0-aarch64-apple-darwin'". Held at, inside and above, like ~/.rustup; the worker repairs its toolchains.
+FLEET_RUSTUP_HOMES = ("/Users/Shared/cmux-build-fleet/cache/rustup", "/Volumes/ephemeral0/cmux-ci/fleet-worker/cache/rustup")
 # Every tool job-started probes (glaeda-cmux-runner-hook TOOLCHAIN_PROBES, toolchain_refusal, xcode_refusal).
 TOOLCHAIN_TOOLS = ("rustup", "rustc", "cargo", "zig", "python3", "gh", "git", "xcodebuild", "xcrun", "swift", "swiftc",
                    "clang", "make", "ld")
@@ -808,7 +814,8 @@ def toolchain_keep(fresh: bool = False) -> tuple[str, ...]:
     env = os.environ
     key = (os.fspath(HOME), env.get("CARGO_HOME", ""), env.get("RUSTUP_HOME", ""))
     if fresh or key not in _TOOLCHAIN_KEEP:
-        paths = [HOME / rel for rel in TOOLCHAIN_HOME_PATHS] + [Path(r) for r in TOOLCHAIN_ROOTS]
+        paths = ([HOME / rel for rel in TOOLCHAIN_HOME_PATHS] + [Path(r) for r in TOOLCHAIN_ROOTS]
+                 + [Path(r) for r in FLEET_RUSTUP_HOMES])
         if env.get("CARGO_HOME"):
             paths.append(Path(env["CARGO_HOME"]) / "bin")
         if env.get("RUSTUP_HOME"):
@@ -857,11 +864,25 @@ def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
                for p in {os.path.abspath(path), os.path.realpath(path)} for k in keep)
 
 
+def rustup_home_at(path: Path) -> bool:
+    """PATH is a rustup home itself (toolchains/ beside settings.toml or update-hashes/), not one remove() set aside.
+    Its toolchains can still go one at a time (rustup_verdict keeps the pinned ones); the home never goes whole."""
+    if path.name.startswith(DELETING_PREFIX):
+        return False
+    try:
+        return (not path.is_symlink() and (path / "toolchains").is_dir()
+                and ((path / "settings.toml").is_file() or (path / "update-hashes").is_dir()))
+    except OSError:
+        return False
+
+
 def toolchain_held(path: Path, fresh: bool = False) -> bool:
-    """PATH is at, inside or above a toolchain_keep() path or a role_keep() path. No family flag lifts it (not
-    allow_stale_protected). A root above a role keep is held whole, so a family that would take that root as one
-    item splits it first (nightly_next_split: the cmux-nightly-next root's other runners' trees still go by age)."""
-    return _at_inside_or_above(path, toolchain_keep(fresh)) or _at_inside_or_above(path, role_keep())
+    """PATH is at, inside or above a toolchain_keep() path or a role_keep() path, or is a rustup home (rustup_home_at).
+    No family flag lifts it (not allow_stale_protected). A root above a role keep is held whole, so a family that would
+    take that root as one item splits it first (nightly_next_split: the cmux-nightly-next root's other runners' trees
+    still go by age)."""
+    return (_at_inside_or_above(path, toolchain_keep(fresh)) or _at_inside_or_above(path, role_keep())
+            or rustup_home_at(path))
 
 
 # A dedicated runner's warm state, kept by role and not by age (Leo, 2026-10-26: warm compile caches an incremental
