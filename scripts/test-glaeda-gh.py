@@ -28771,6 +28771,55 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
 
+    def test_a_merge_step_conflict_only_in_union_files_is_merged_here_and_the_pinned_land_goes_on(self):
+        """cmuxterm-hq, 2026-11-23: findings PRs #20862 and #20882 that only appended a line to
+        docs/findings/CLAIMED.md (merge=union) stopped merge_conflict three times each: land_judge said merge, the
+        base moved, and GitHub's merge refused the conflict it ignores .gitattributes to see. The merge step's
+        refusal takes the same base merge as update-branch's, once per head, and the land goes on."""
+        head, base = self.union_origin()
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request has merge conflicts (mergePullRequest)"
+        self.w.answers.append(ok_answer(head))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("show", f"{merged}:goals/x.md"),
+                         "- 10:00Z goal set\n- 11:00Z the lane's line\n- 11:05Z another PR's line, landed first")
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("step_refused", "union_merged")],
+                         ["step_refused", "union_merged"])
+        self.w.gh_rc["merge"] = 0
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"], e["mergeSha"]), ("merged", None, merged, "f" * 40))
+        self.assertEqual([c[-1] for c in self.w.gh_calls("pr", "merge")], [head, merged])  # refused, then merged
+
+    def test_a_true_merge_step_conflict_stops_once_naming_the_merge(self):
+        """A merge-step conflict git cannot settle (no merge=union on the path) still stops, as merge_conflict, with
+        the reason saying why it was not merged here, and nothing is pushed."""
+        head, _ = self.union_origin(attrs="")
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "GraphQL: Pull Request has merge conflicts (mergePullRequest)"
+        self.w.answers.append(ok_answer(head))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "merge_conflict"))
+        self.assertIn("not merged here", e["stop"]["reason"])
+        self.assertIn("goals/x.md", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
+
     def stacked_origin(self, squash: bool = True, conflict: bool = False) -> dict[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it), as manaflow-ai/cmux-quillet-look stood on 2026-11-22:
         #2 (stack/a onto main) merged, squashed unless SQUASH is False (a merge commit); #1 (stack/b) still onto

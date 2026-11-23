@@ -13962,6 +13962,11 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # scratch merge: nothing checked out, nothing to clean up). Only a PR whose branch lives on the base repository
 # (forks never: union_plan reads the branch from github.com/<base repo> and requires it at the judged head) of an
 # owner in LAND_MERGE_OWNERS is pushed to; a plain merge commit, fast-forward only, never a force-push.
+# The pinned merge's own conflict refusal ("Pull Request has merge conflicts (mergePullRequest)") takes the same base
+# merge, once per head: a land judged mergeable whose base moved before the merge went straight to merge_conflict, so
+# cmuxterm-hq findings and reading PRs that only appended a line to docs/findings/CLAIMED.md stopped again and again
+# (2026-11-23, hq#20862 and hq#20882 three times each; cmuxterm-hq
+# docs/findings/2026-11-23-land-merge-conflict-skips-union.md). Its stop names the merge step, as before.
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
@@ -20119,6 +20124,7 @@ class LandQueue:
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
+        kind = str((e.get("unionMerge") or {}).get("kind") or "update_branch")  # the step GitHub refused
         with self.lock:
             # Tried from here on: only a merge that began ends the once-per-head retry (the refusal path's check). A
             # restart between the refusal and this line once stopped cmux#51491 as a conflict with no merge tried
@@ -20134,7 +20140,7 @@ class LandQueue:
                 if (e.get("unionMerge") or {}).get("retry") or why.startswith("git ") or "timed out" in why:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
-                self.conflict_stop(e, "update_branch", head, said, why)
+                self.conflict_stop(e, kind, head, said, why)
             return
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
@@ -20161,7 +20167,7 @@ class LandQueue:
                 e.pop("updateSent", None)
                 why = f"the push of the base merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
                 self.history(e, "union_merge_skipped", head=head[:12], why=why)
-                self.conflict_stop(e, "update_branch", head, said, why)
+                self.conflict_stop(e, kind, head, said, why)
                 return
             e.pop("stepFail", None)
             e.pop("stepTransient", None)
@@ -20322,10 +20328,13 @@ class LandQueue:
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
             tried = e.get("unionMerge") or {}
-            if kind == "update_branch" and (tried.get("head") != head or not tried.get("tried")):
-                # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
-                # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
-                e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
+            if kind in ("update_branch", "merge") and (tried.get("head") != head or not tried.get("tried")):
+                # GitHub's update-branch and merge ignore .gitattributes and the 422 is often stale: a base merge git
+                # makes cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
+                # The merge step too: a pinned land refused at the merge for a conflict only in merge=union files
+                # (cmuxterm-hq docs/findings/2026-11-23-land-merge-conflict-skips-union.md) was stopped unmerged.
+                e["unionMerge"] = {"head": head, "at": self.now, "kind": kind,
+                                   "out": land_trim(land_tail(out), 200)}
                 self.save(e)
                 return "union_merge"
             self.conflict_stop(e, kind, head, land_trim(land_tail(out), 200))
@@ -20667,6 +20676,8 @@ class LandQueue:
             self.hand_off(e, sha)
         elif named == "update_branch":
             self.update_branch(e, sha)
+        elif named == "union_merge":
+            self.union_merge(e, sha)
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
         """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
