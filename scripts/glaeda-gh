@@ -12920,11 +12920,16 @@ def land_forward_pending(name: str, now: float) -> str:
             f"lost; {when}; do not reach {name} directly")
 
 
+def land_host_word(word: str) -> bool:
+    """Whether WORD names a host as ssh or reach takes it (HOST or USER@HOST), never an option such as "-o"."""
+    return bool(LAND_HOST_SHAPE.fullmatch(str(word or "").rsplit("@", 1)[-1])) and not str(word).startswith("-")
+
+
 def land_forward_name(command: list[str]) -> str:
     """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
     words."""
     i = land_command_host(command)
-    if i is not None and LAND_HOST_SHAPE.fullmatch(command[i]):
+    if i is not None and land_host_word(command[i]):
         return command[i]  # never an option word: a row once said "handed to -o's land queue"
     return " ".join(command)[:120]
 
@@ -15168,6 +15173,7 @@ class LandQueue:
         # keys whose PR state is being read live for a forwarded row past its give-up (forward_state_reads)
         self.forward_reading: set[str] = set()
         self.forward_state_thread: threading.Thread | None = None
+        self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -15287,6 +15293,7 @@ class LandQueue:
         """Every entry from disk. One whose step was claimed and never finished, or that was being judged, is judged
         again: the step is not run a second time on the claim alone."""
         d = self.entries_dir()
+        self.forward_name_now = None
         for p in sorted(d.glob("*.json")) if d.is_dir() else []:
             e = read_json(p)
             if not isinstance(e, dict) or not isinstance(e.get("key"), str) or e.get("state") not in LAND_STATES \
@@ -15327,10 +15334,11 @@ class LandQueue:
           quietly, an open one is landed again here. Once per row (forwardRepaired)."""
         changed = False
         to = e.get("forwardedTo")
-        if isinstance(to, str) and to and not LAND_HOST_SHAPE.fullmatch(to):
-            executor = land_executor(self.config())
-            name = land_forward_name(executor) if executor is not None else ""
-            good = name if LAND_HOST_SHAPE.fullmatch(name) else ""
+        if isinstance(to, str) and to.startswith("-"):  # an option word, never a host or a program's words
+            if self.forward_name_now is None:  # land.json read once a load, not once a row
+                executor = land_executor(self.config())
+                self.forward_name_now = land_forward_name(executor) if executor is not None else ""
+            good = self.forward_name_now if land_host_word(self.forward_name_now) else ""
             e["forwardedTo"] = good
             for h in e.get("history") or []:
                 if h.get("to") == to:
@@ -15457,6 +15465,8 @@ class LandQueue:
             e["override"] = land_request_override(req)
             # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
             e["overrideAt"] = self.now if e["override"] else None
+        if fresh or "nominated" in req:  # the same: a plain re-request of an open nominated entry keeps its gates
+            e["nominated"] = land_nominated(req.get("nominated"))
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -15468,9 +15478,10 @@ class LandQueue:
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
-                         **land_override_history(e))
+                         **land_override_history(e), **land_nominated_history(e))
         else:
-            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e))
+            self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e),
+                         **land_nominated_history(e))
         self.entries[key] = e
         self.save(e)
         self.changed_entries.add(key)
@@ -15731,7 +15742,7 @@ class LandQueue:
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy", "lane", "laneHost", "override") if k in req}
+                                                      "queuedBy", "lane", "laneHost", "override", "nominated") if k in req}
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
@@ -15739,7 +15750,7 @@ class LandQueue:
     @staticmethod
     def handoff_request(key: str, e: dict) -> dict:
         """E as one `land serve` request that hands it to another host's queue (an executor's, or a peer's overflow):
-        its request id, requester, lane, --after and override kept, so a resend is applied once."""
+        its request id, requester, lane, --after, override and nomination kept, so a resend is applied once."""
         rid = str(e.get("requestId") or "")
         return ({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
                  f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
@@ -15750,6 +15761,7 @@ class LandQueue:
                 # PARENT/CHILD would read as a session on the executor's host
                 | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
                 | ({"override": e["override"]} if e.get("override") else {})
+                | ({"nominated": e["nominated"]} if e.get("nominated") is not None else {})
                 # a pinned row's pin goes with it (forward_reland): the far queue lands that head or none
                 | ({"sha": str(e["pinSha"]).lower()} if LAND_PIN_SHA.fullmatch(str(e.get("pinSha") or "")) else {}))
 
@@ -16124,6 +16136,8 @@ class LandQueue:
         due.sort(key=lambda k: float(self.entries[k].get("forwardStateAt") or 0))  # the longest unread first
         picked = due[:LAND_FORWARD_STATE_READS]
         self.forward_reading = set(picked)
+        # the row as picked: one landed by hand and forwarded again while its state was read is not settled on it
+        token = {k: (self.entries[k].get("gen"), self.entries[k].get("forwardFirst")) for k in picked}
 
         def read_all() -> None:
             try:
@@ -16131,9 +16145,13 @@ class LandQueue:
                     try:
                         got = self.forward_read_state(self.entries[key])
                         with self.lock:
-                            self.forward_settle(self.entries[key], *got, executor=executor)
+                            e = self.entries.get(key)
+                            if e is not None and (e.get("gen"), e.get("forwardFirst")) == token[key]:
+                                self.forward_settle(e, *got, executor=executor)
                     except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                         log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                        with self.lock, contextlib.suppress(KeyError):
+                            self.entries[key]["forwardStateAt"] = self.now  # to the back of the next pass's reads
                     finally:
                         self.forward_reading.discard(key)
             finally:
@@ -16201,8 +16219,10 @@ class LandQueue:
                     return False
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
                           f"closed); nothing is merged", "")
-            return False
-        if state == "OPEN" and self.stop_moved_pin(e, c, data):
+                return False
+            return past  # a copy older than the row: past the give-up, read live
+        # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
+        if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
         last = e.get("forwardResent") or {}
         if not e.get("forwardFirst"):
@@ -16283,6 +16303,9 @@ class LandQueue:
                                  f"{str((e.get('forwardRelanded') or {}).get('head') or '?')[:12]} and that has no "
                                  "outcome either")
             return
+        if land_read_quota(why):  # the login's spent quota says nothing of the PR: read again on a later pass
+            log({"event": "land-forward-state-quota", "key": e["key"], "why": land_trim(why, 160)})
+            return
         fails = int(e.get("forwardStateFails") or 0) + 1
         e["forwardStateFails"] = fails
         self.history(e, "forward_state_unread", why=land_trim(why, 160), n=fails)
@@ -16304,6 +16327,8 @@ class LandQueue:
             req.update(lane=e.get("lane"), laneHost=e.get("laneHost") or "")
         if e.get("override"):
             req["override"] = e["override"]
+        if e.get("nominated") is not None:  # a nominated land stays nominated, its gates kept (land_nominated)
+            req["nominated"] = e["nominated"]
         e.pop("handedOff", None)  # a lane VM hands it off afresh if its owner check refuses again (owner_refused)
         self.apply(req, e["key"], e["repo"], int(e["number"]))
         e = self.entries[e["key"]]
@@ -18441,12 +18466,14 @@ class LandQueue:
         env["PATH"] = ":".join(parts)
         extra_env = self.config().get("env")
         if isinstance(extra_env, dict):
-            env.update({str(k): str(v) for k, v in extra_env.items() if k not in LAND_ENV_TAGS})
+            env.update({str(k): str(v) for k, v in extra_env.items()
+                        if k not in LAND_ENV_TAGS and k != LAND_NOMINATED_ENV})
         env.update(LAND_ENV_TAGS)
         if e is not None:
             lane = land_lane(e) or (LAND_QUEUE_LANE if self.broker_client() else "")
             if lane:
                 env[LAND_LANE_ENV] = lane
+            env.update(land_nominated_env(e))  # every step's gh (the merge's land_judge) judges under the nominating path
         return env
 
     @staticmethod
@@ -18527,6 +18554,7 @@ class LandQueue:
                 extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
         with self.lock:
             self.count("snapshot" if extra else "live")
+        extra.update(land_nominated_env(e))  # judged under the nominating path, as the merge is (LAND_NOMINATED_ENV)
         for n, run_argv in enumerate(tries):
             bound = LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE
             with self.lock:
@@ -19908,6 +19936,10 @@ class LandQueue:
         requester = str(e.get("requester") or "")
         if requester.startswith(f"{policy_host()}/"):
             args["requester"] = requester  # the broker takes only a session on this VM; else it tells the VM's lane
+        if e.get("nominated") is not None:
+            # The broker host's queue must judge it under the nominating path. A broker that does not know the argument
+            # refuses it (cmuxterm-hq parts/49-calls-land-handoff.py: unknown argument): refused, never a plain land.
+            args["nominated"] = e["nominated"]
         lane_gh = self.path("laneGh", Path(LANE_GH_CMD)).as_posix()
         with self.lock:
             self.claim(e, "hand_off", head=head)
@@ -20477,6 +20509,76 @@ def land_override_env(e: dict) -> dict[str, str]:
     return {"LAND_JUDGE_OVERRIDE": str(o["reason"]), "LAND_JUDGE_OVERRIDE_RECEIPT": str(o["receipt"])}
 
 
+# ci-v2 migration step 12 (leo-workspace tools/land_nominations.py, land_judge rules autoland_ship and fast_gates): a land
+# next-autoland or repo-autoland nominated is filed with its nominating path and the gate evidence its pass computed
+# (`land --nominated-path P --nominated-evidence JSON`), kept on the entry as "nominated" ({"path", "evidence"}). Every
+# judgment and merge try of it runs with LAND_NOMINATED_ENV (that, as JSON), which land_judge reads as the nomination
+# (leo-workspace gh_shim_train.nomination_checked) and judges the merge under that path. Before, that rode only a
+# host-local mark, so a land executed elsewhere was judged as a plain glaeda-land merge. It travels as "override" does:
+# to the executor (land.json "executor"), to an overflow peer ("overflow") and in a lane VM's land_handoff. A request
+# whose "nominated" is not that shape keeps {"unreadable": WHY}, which land_judge refuses: never a plain land.
+LAND_NOMINATED_ENV = "LAND_JUDGE_NOMINATED"
+LAND_NOMINATED_MAX = 4000  # the evidence as JSON, at most: two gate results of a 40-hex head and a one-line why each
+LAND_NOMINATED_PATH = re.compile(r"[a-z][a-z0-9-]{0,39}")
+
+
+def land_nominated(raw: Any) -> dict | None:
+    """A request's "nominated" as the entry keeps it: None for none, {"path", "evidence"} rebuilt from a checked one,
+    else {"unreadable": WHY} (kept, so land_judge refuses the land rather than judging it as nobody's nomination)."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict) and set(raw) == {"unreadable"}:
+        return {"unreadable": str(raw["unreadable"])[:200] or "unreadable"}
+    if not isinstance(raw, dict):
+        return {"unreadable": f"nominated is a {type(raw).__name__}, not an object"}
+    path, evidence = raw.get("path"), raw.get("evidence", {})
+    if not isinstance(path, str) or not LAND_NOMINATED_PATH.fullmatch(path):
+        return {"unreadable": f"not a nominating path: {str(path)[:60]!r}"}
+    if not isinstance(evidence, dict):
+        return {"unreadable": f"the evidence is a {type(evidence).__name__}, not an object"}
+    try:
+        text = json.dumps(evidence, sort_keys=True)
+    except (TypeError, ValueError) as error:
+        return {"unreadable": f"the evidence is not JSON: {type(error).__name__}"}
+    if len(text) > LAND_NOMINATED_MAX:
+        return {"unreadable": f"the evidence is {len(text)} characters, past {LAND_NOMINATED_MAX}"}
+    return {"path": path, "evidence": json.loads(text)}
+
+
+def land_nominated_given(path: str | None, evidence: str | None) -> dict | None:
+    """`land --nominated-path P [--nominated-evidence JSON]` as the entry keeps it, or None with neither; refused
+    (WatchError) when what was given cannot be kept whole, so the nominator files nothing it would not be judged by."""
+    if path is None and evidence is None:
+        return None
+    if path is None:
+        raise WatchError("--nominated-evidence goes with --nominated-path (the path that nominated the head)")
+    try:
+        doc = json.loads(evidence) if evidence is not None else {}
+    except ValueError as error:
+        raise WatchError(f"--nominated-evidence is not JSON: {error}") from None
+    got = land_nominated({"path": path, "evidence": doc})
+    if got is None or "unreadable" in got:
+        raise WatchError(f"--nominated-path/--nominated-evidence: {(got or {}).get('unreadable')}")
+    return got
+
+
+def land_nominated_env(e: dict) -> dict[str, str]:
+    """The environment a judgment or merge try of E adds: its nomination as JSON (LAND_NOMINATED_ENV), or nothing."""
+    n = e.get("nominated")
+    if n is None:
+        return {}
+    if not isinstance(n, dict):
+        n = {"unreadable": f"the entry's nomination is a {type(n).__name__}"}
+    return {LAND_NOMINATED_ENV: json.dumps(n, sort_keys=True)}
+
+
+def land_nominated_history(e: dict) -> dict:
+    n = e.get("nominated")
+    if not isinstance(n, dict):
+        return {}
+    return {"nominated": str(n.get("path") or "unreadable")}
+
+
 # An entry queued with an override (`land --override-reason R --override-receipt T`) carried it only on the merge
 # step, and land_judge explain, which runs without it, decides whether there is a merge step at all. So a refusal that
 # names no step the queue runs stopped it, the override unused: cmux#47821 lost its override once the queue's own
@@ -20585,7 +20687,7 @@ def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
                  queued_by: str = "", lane: tuple[str, str] | None = None, sha: str = "",
-                 override: dict | None = None) -> str:
+                 override: dict | None = None, nominated: dict | None = None) -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
     request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
     steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
@@ -20600,7 +20702,8 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
                 "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {})
-               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {}))
+               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {})
+               | ({"nominated": nominated} if nominated is not None else {}))
     return rid
 
 
@@ -21211,7 +21314,7 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
                        as_json: bool, sha: str = "", override: dict | None = None,
-                       ceiling: float | None = None) -> int:
+                       ceiling: float | None = None, nominated: dict | None = None) -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -21223,13 +21326,14 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
         | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
-        | ({"override": override} if override else {})
+        | ({"override": override} if override else {}) \
+        | ({"nominated": nominated} if nominated is not None else {})
     why = land_forward_pending(name, time.time()) if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
                                             queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]), sha=sha,
-                                            override=override))
+                                            override=override, nominated=nominated))
     if not why:
         try:
             # the executor waits up to --max while the land keeps moving (an older one: --timeout in all)
@@ -21510,7 +21614,8 @@ def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool)
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
-             pin: str | None = None, override: dict | None = None, ceiling: float | None = None) -> int:
+             pin: str | None = None, override: dict | None = None, ceiling: float | None = None,
+             nominated: dict | None = None) -> int:
     """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
@@ -21546,7 +21651,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor = land_executor()
     if executor is not None:
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
-                                  ceiling)
+                                  ceiling, nominated)
     followed = land_pin_already_followed(read_json(LandQueue.entries_dir() / file_name(key)), sha, requester) \
         if sha else ""
     if followed:
@@ -21573,7 +21678,8 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         return EXIT_FAIL
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override)
+                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override,
+                       nominated=nominated)
     no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
                f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
                "lease") if not lane and land_broker_client() else ""
@@ -21668,7 +21774,8 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
                        rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req),
-                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req))
+                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req),
+                       nominated=land_nominated(req.get("nominated")))
     return rid, ""
 
 
@@ -34024,6 +34131,12 @@ def parser() -> argparse.ArgumentParser:
                          "LAND_JUDGE_OVERRIDE (and LAND_JUDGE_OVERRIDE_RECEIPT) is taken")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
                     help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+    ld.add_argument("--nominated-path", dest="nominated_path", metavar="PATH",
+                    help="the merge path that nominated this head (next-autoland, repo-autoland): every judgment and "
+                         f"merge try runs with {LAND_NOMINATED_ENV}, wherever the queue runs it (executor, overflow, "
+                         "a lane VM's hand-off), and land_judge judges it under that path")
+    ld.add_argument("--nominated-evidence", dest="nominated_evidence", metavar="JSON",
+                    help="with --nominated-path: the gate evidence the nominating pass computed (a JSON object)")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
                     help="wait for it to merge or stop until its queue entry has not changed for S seconds (exit 0 "
                          "merged, 1 stopped, 2 still going); --timeout is the same")
@@ -34985,8 +35098,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
             override = land_override(*land_override_given(args.override_reason, args.override_receipt))
+            nominated = land_nominated_given(args.nominated_path, args.nominated_evidence)
             return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,
-                            args.max_wait)
+                            args.max_wait, nominated)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:
