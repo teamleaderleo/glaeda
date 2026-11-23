@@ -1191,7 +1191,7 @@ class HeadRunOrderTest(unittest.TestCase):
         self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
         asked: list = []
 
-        def graphql(query: str, variables: dict) -> tuple:
+        def graphql(query: str, variables: dict, _route: list | None = None) -> tuple:
             asked.append(variables["ids"])
             return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
                                        {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
@@ -1206,7 +1206,7 @@ class HeadRunOrderTest(unittest.TestCase):
         gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
         self.assertEqual(asked, [["CR_10", "CR_11"]])
         down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
-                                     graphql=lambda q, v: (None, "graphql: down"))
+                                     graphql=lambda q, v, _route=None: (None, "graphql: down"))
         again = gg.head_data("a" * 40, runs, {}, {}, order)
         again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
                          for k, rs in again["runs"].items()}
@@ -3783,7 +3783,10 @@ class BalanceTest(Base):
     def test_richness_is_what_is_left_over_the_time_to_reset(self) -> None:
         self.budgets(rest=(1600, 120), graphql=(1600, 3000))  # same count, both above their floors: 2 minutes to go is rich
         self.assertGreater(self.daemon.richness("rest"), 10 * self.daemon.richness("graphql"))
-        self.assertEqual(self.daemon.route("pr"), "rest")
+        # A PR is cost-weighted and capped at the reads per second the daemon's own time affords (read_seconds: a
+        # REST PR read is ~4 s, a GraphQL one ~0.5 s), so a rich REST bucket alone does not move PRs: GraphQL
+        # still reads them faster than REST could.
+        self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "rest")
         self.assertEqual(self.daemon.route("comment"), "graphql")  # comment watches never move
         self.budgets(rest=(1600, 3000), graphql=(1600, 120))
@@ -3806,7 +3809,7 @@ class BalanceTest(Base):
 
     def test_the_cheaper_path_flips_as_buckets_drain(self) -> None:
         """Both buckets drain about evenly: reads follow whichever has more to spend per second."""
-        self.budgets(rest=(4500, 1800), graphql=(1000, 1800))
+        self.budgets(rest=(4500, 1800), graphql=(600, 1800))  # GraphQL nearly at its reserve: PRs move to REST
         self.assertEqual(self.daemon.route("pr"), "rest")
         self.budgets(rest=(900, 1800), graphql=(1000, 600))  # REST drained; GraphQL's reset is near
         self.assertEqual(self.daemon.route("pr"), "graphql")
@@ -4590,6 +4593,7 @@ class BalanceTest(Base):
         gg.register("pr:o/r#4")
         self.daemon.tick(NOW + gg.CYCLE)
         data = gg.read_cache("pr:o/r#4")["data"]
+        print("DEBUG", [c[:2] for c in self.gh.calls], self.daemon.errors if hasattr(self.daemon,"errors") else None, data["checks"], self.daemon.paths, file=sys.stderr)
         self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
         self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
 
@@ -5642,8 +5646,11 @@ class ClientTest(Base):
         code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.3)
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         lines = text.strip().splitlines()
-        self.assertEqual(lines[-1], "next: glaeda-gh wait pr o/r#1 --timeout 0.3")
-        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1 \(deadline \d\d:\d\d:\d\dZ\); last seen: ")
+        # Never this same wait again (timeout_next, leo-workspace#8794): the pending check has no run to open, so
+        # the step is the PR's own verbose status.
+        self.assertEqual(lines[-1], "next: glaeda-gh status pr o/r#1 --verbose")
+        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1: no change for 0.3 s \(deadline "
+                                    r"\d\d:\d\d:\d\dZ; no change since the wait began\); last seen: ")
         self.assertIn("checks PENDING", lines[-2])
 
     def test_a_wait_says_how_it_stands_while_it_blocks(self) -> None:
@@ -5653,7 +5660,8 @@ class ClientTest(Base):
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         progress = [line for line in text.splitlines() if line.startswith("glaeda-gh: still waiting on pr:o/r#1: ")]
         self.assertTrue(progress, text)
-        self.assertRegex(progress[0], r"\d+s of 0.5s, deadline \d\d:\d\d:\d\dZ; o/r#1 OPEN .*; checks PENDING")
+        self.assertRegex(progress[0], r"no change for \d+s of 0.5s, deadline \d\d:\d\d:\d\dZ \(moves while it "
+                                      r"progresses; ceiling \d\d:\d\d:\d\dZ\); o/r#1 OPEN .*; checks PENDING")
 
     def test_a_daemon_ruled_wait_keeps_the_state_its_blocker_prints(self) -> None:
         running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
@@ -36726,7 +36734,10 @@ class QueuedNeverDoneTest(unittest.TestCase):
         whole, _ = self.head(13438, ["size"], ["tests"], 60)
         gg.write_json(gg.cache_dir() / gg.file_name(key),
                       {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": whole, "error": None})
-        self.assertEqual(gg.wait_step(req, self.now, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
+        # The whole read is a change, and --timeout is "no change for S": this step moves the deadline on and
+        # keeps waiting; once the read has stood still for the whole --timeout, it times out.
+        self.assertIsNone(gg.wait_step(req, self.now, lambda repo, paths: {}))
+        self.assertEqual(gg.wait_step(req, self.now + 61, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
 
     def test_hq13397_runs_queued_with_no_check_runs_hold_the_wait(self) -> None:
         """claude-sr2-coord-old: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success twice
