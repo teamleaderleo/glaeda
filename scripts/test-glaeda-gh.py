@@ -23809,6 +23809,69 @@ class LandTest(Base):
             self.snaps[key] = {"schema": gg.ROLLUP_SCHEMA, "key": key, "head": LA, "fp": "F", "complete": True,
                                "readAt": self.t, "rollup": {"nodes": self.NODES}}
 
+    def test_a_job_that_ended_during_the_pass_frees_its_worker_in_the_same_pass(self):
+        """A finished job held its worker until the next reap (the start of the next pass, or a refill), so a pass that
+        ran for seconds read "every worker busy" for rows a worker had already freed for, and its land-pool line said
+        busy 24 of 24 while those workers were judging nothing (2026-11-22/23 23:50-00:25Z: busy 24 every line,
+        judgments 35 % of the worker time). The row that reaches judge() takes the worker that freed."""
+        self.five_snapped()
+        pool = self.pooled(2)
+        for n in range(1, 6):
+            self.land(f"o/r#{n}")
+        self.tick()
+        self.assertEqual(len(pool.handed), 2)
+        pool.handed[0][1].finished = True  # its judgment ends while the pass is still going: no reap since
+        waiting = [k for k in self.q.entries if k not in self.q.jobs]
+        with self.q.lock:
+            self.q.pass_one(waiting[0], None, None)
+        self.assertEqual(len(pool.handed), 3, "the freed worker judges the next row in this pass")
+        self.assertEqual(len(self.q.jobs), 2)
+        self.assertNotIn(pool.handed[0][0], self.q.jobs)
+
+    def test_rows_waiting_on_a_snapshot_leave_a_freed_worker_for_a_ready_judgment(self):
+        """Refill hands a worker that frees between passes to the rows the pass left for one (next_up), at most
+        LAND_REFILL_TRIES per free worker. Rows whose snapshot the daemon has not read yet were listed in the pass's
+        order with the ready ones, so N of them ahead spent every try on starting (or failing to start) a snapshot
+        wait, and the worker stayed free until the next pass while a ready judgment waited behind them. A row ready to
+        judge now goes first; the others keep their order behind it."""
+        pool = self.pooled(1)
+        for n in range(1, 6):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["fp"] = "F"  # no snapshot: a judgment would first wait for the daemon's read
+        self.pr(LA, key="pr:o/r#9")
+        self.w.cache["pr:o/r#9"]["fp"] = "F"
+        self.snaps["pr:o/r#9"] = {"schema": gg.ROLLUP_SCHEMA, "key": "pr:o/r#9", "head": LA, "fp": "F",
+                                  "complete": True, "readAt": self.t, "rollup": {"nodes": self.NODES}}
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        for n in (1, 2, 3, 4, 5):
+            self.land(f"o/r#{n}")
+        self.t += 60
+        self.land("o/r#9")  # queued last: behind every snapshot wait in the pass's order
+        self.tick()
+        self.assertIn("pr:o/r#9", self.q.next_up)
+        self.assertEqual(self.q.next_up[0], "pr:o/r#9", "a row ready to judge is first for a worker that frees")
+        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+        self.q.refill(self.t + 1)
+        self.assertEqual(pool.keys(), ["pr:o/r#9"])
+
+    def test_refill_frees_the_worker_of_a_finished_job_with_no_row_listed(self):
+        """A refill with no row left for a worker still reaps: the land-pool line and the refresh reads count the
+        workers that are judging, not the jobs that ended since the last pass."""
+        pool = self.pooled(1)
+        self.five_snapped()
+        self.land("o/r#1")
+        self.tick()
+        self.assertEqual(len(self.q.jobs), 1)
+        pool.handed[0][1].finished = True
+        self.q.next_up = []
+        self.q.refill(self.t + 1)
+        self.assertEqual(self.q.jobs, {})
+
     def test_a_land_judged_hours_ago_goes_before_lands_queued_since(self):
         # huge-blue, 2026-11-18 after glaeda#2161: "never judged" sorted first, so cmux#45661 (judged hours before)
         # sat behind every PR queued since and was not judged between two restarts.
@@ -37297,6 +37360,118 @@ class ABareWaitFlagTest(unittest.TestCase):
         with mock.patch.object(gg, "cmd_post_status", fake_post_status):
             code = gg.main(["post", "status", "1795389726663-2573281-b1d8b9", "--wait"])
         self.assertEqual((code, seen.get("wait")), (0, 3600.0))
+
+
+class AFlagNameThatNearMissesTest(unittest.TestCase):
+    """A long flag one word off an option of the command runs as that option, as a choice's *value* has
+    since glaeda#2368. Measured 2026-11-22 (bg-965d52bc2c83), verbatim:
+
+        $ glaeda-gh wait pr teamleaderleo/... --until green --deadline 20m
+        usage: glaeda-gh [-h]
+                         {serve,status,wait,checks,post,log,read,budget,audit,search,runners,on-event,land,restart} ...
+        glaeda-gh: error: unrecognized arguments: --deadline 20m
+        next: glaeda-gh wait --help
+
+    The wait never happened, and a *background* wait that exits 64 at once reads as a wait that waited: the
+    lane believed it was watching its PR for the rest of a round trip. `--timeout` and `20m` were both
+    right; only the flag's name was not."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        self.enter = contextlib.redirect_stderr(self.err)
+        self.enter.__enter__()
+        self.addCleanup(self.enter.__exit__, None, None, None)
+
+    def test_the_deadline_that_lost_a_watch_is_the_timeout(self) -> None:
+        typed = ["wait", "pr", "teamleaderleo/leo-workspace#230", "--until", "green", "--deadline", "20m"]
+        fixed, refusal = gg.flag_near_miss_synonym(list(typed))
+        self.assertEqual(refusal, [])
+        self.assertEqual(fixed, ["wait", "pr", "teamleaderleo/leo-workspace#230", "--until", "green",
+                                 "--timeout", "20m"])
+        said = self.err.getvalue()
+        self.assertIn("`--deadline` is `--timeout`", said)
+        self.assertIn("--timeout 20m", said, "the whole call is said, so the next one is typed canonically")
+        self.assertNotIn("unrecognized arguments", said)
+
+    def test_the_value_of_a_resolved_flag_is_never_read_as_a_flag_of_its_own(self) -> None:
+        """`--timeout` takes its value in the next word, so that word is data in every spelling of the
+        flag: a body or a pattern that happens to be spelled like one of these names stays a value."""
+        self.assertEqual(gg.flag_near_miss_synonym(
+            ["post", "comment", "o/r#1", "--body", "--deadline", "--timeout", "60"])[0],
+            ["post", "comment", "o/r#1", "--body", "--deadline", "--timeout", "60"])
+
+    def test_a_synonym_only_counts_where_the_command_has_that_option(self) -> None:
+        """`status` has no `--timeout` at all, so `--deadline` means nothing there and argparse's own
+        refusal -- which names the word and a next step -- stands."""
+        typed = ["status", "pr", "o/r#1", "--deadline", "20m"]
+        self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (typed, []))
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_a_typo_of_an_option_of_this_command_runs_as_it(self) -> None:
+        for typed, want in ((["wait", "pr", "o/r#1", "--timout", "5"],
+                             ["wait", "pr", "o/r#1", "--timeout", "5"]),
+                            (["wait", "pr", "o/r#1", "--jsno"], ["wait", "pr", "o/r#1", "--json"]),
+                            (["wait", "pr", "o/r#1", "--ceiling", "1h"],
+                             ["wait", "pr", "o/r#1", "--max", "1h"])):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (want, []), typed)
+
+    def test_a_flag_as_near_to_two_options_is_refused_naming_both(self) -> None:
+        """The refusal `flag_spelling_synonym` already gives a spelling two options answer to: the word it
+        refused, both options, and a runnable `next:` line for each. Nothing is guessed."""
+        fixed, refusal = gg.flag_near_miss_synonym(["wait", "pr", "o/r#1", "--xone"])
+        self.assertEqual(fixed, ["wait", "pr", "o/r#1", "--xone"])
+        self.assertEqual(refusal[0], "glaeda-gh: `--xone` is no option of `wait` and is as near to "
+                                     "`--done` as to `--gone`: it is not guessed")
+        self.assertEqual(refusal[1:], ["next: glaeda-gh wait pr o/r#1 --done",
+                                       "next: glaeda-gh wait pr o/r#1 --gone"])
+
+    def test_a_flag_that_is_no_option_of_anything_is_still_refused(self) -> None:
+        """Not a parser that accepts anything: a word near nothing falls through to argparse, whose line
+        echoes it and names a next step. Checked through `main`, which is where that line is printed."""
+        said = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=said)), \
+                self.assertRaises(SystemExit) as caught:
+            gg.main(["wait", "pr", "o/r#1", "--totallyunknown", "5"])
+        self.assertEqual(caught.exception.code, 64)
+        said = said.getvalue()
+        self.assertIn("unrecognized arguments: --totallyunknown 5", said)
+        self.assertIn("next: glaeda-gh wait --help", said)
+
+    def test_a_flag_that_lives_on_another_command_keeps_the_line_that_names_it(self) -> None:
+        """`wait ... --notify` is `land`'s flag, and which command the caller meant is theirs to say:
+        `flag_elsewhere` names where it lives and offers the call without it. Never rewritten into some
+        near flag of `wait` instead."""
+        typed = ["wait", "run", "o/r/1", "--timeout", "1500", "--notify"]
+        self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (typed, []))
+        said = io.StringIO()
+        with mock.patch.object(gg, "say_waiting", lambda line: print(line, file=said)), \
+                self.assertRaises(SystemExit) as caught:
+            gg.main(list(typed))
+        self.assertEqual(caught.exception.code, 64)
+        said = said.getvalue()
+        self.assertIn("`--notify` is no option of `wait`: it is `land`'s", said)
+        self.assertIn("next: glaeda-gh wait run o/r/1 --timeout 1500", said)
+
+    def test_an_abbreviation_is_left_to_argparse(self) -> None:
+        """`allow_abbrev` is on, so the start of an option is argparse's word: it resolves a unique one and
+        refuses an ambiguous one by name. Reading it here could differ from argparse and would take that
+        decision off it."""
+        for typed in (["wait", "file", "/x", "--contain", "y"], ["wait", "pr", "o/r#1", "--time", "60"],
+                      ["wait", "pr", "o/r#1", "--j"], ["land", "o/r#1", "--match-head", "a" * 40]):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_every_call_that_works_today_is_left_exactly_as_typed(self) -> None:
+        """No currently-accepted flag changes meaning: a canonical call is untouched and says nothing."""
+        for typed in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1", "--timeout", "60"],
+                      ["wait", "pr", "o/r#1", "--max", "1h", "--sha", "a" * 40], ["land", "o/r#1"],
+                      ["post", "comment", "o/r#1", "--body", "hi"], ["log", "job", "o/r", "1"],
+                      ["search", "prs", "repo:o/r"], ["on-event", "status"], ["checks", "o/r", "a" * 40],
+                      ["gh", "pr", "view", "1", "--deadline"], ["coord-alert", "x"], ["wait-resume", "x"],
+                      ["--help"], ["-h"], [], ["o/r#1"], ["nonsense", "x"],
+                      ["post", "comment", "o/r#1", "--body", "hi", "--", "--deadline"]):
+            self.assertEqual(gg.flag_near_miss_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "")
 
 
 class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
