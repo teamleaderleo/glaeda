@@ -34509,10 +34509,82 @@ class AppPoolTest(Base):
     def test_a_benched_suite_is_read_in_a_chunk_of_its_own(self) -> None:
         self.pool.bench_nodes(["id:S2"], NOW + 600)
         asked: list[list[str]] = []
-        with mock.patch.object(self.daemon, "graphql", lambda q, v, route=None: (asked.append(v["suites"]) or
-                                                                                  ({"data": {"suiteRuns": []}}, None))):
+        with mock.patch.object(self.daemon, "graphql", lambda q, v, route=None: (
+                (q == gg.SUITE_RUNS and asked.append(v["suites"])) or ({"data": {"suiteRuns": []}}, None))):
             self.daemon.suite_runs(["S1", "S2", "S3"], paced=False, route=["manaflow-ai/cmux"])
         self.assertEqual(asked, [["S1", "S3"], ["S2"]])
+
+    # The broker host, 2026-11-22 23:39Z-00:46Z: 165 login-fallback lines, all last-real-attempt, 89 "refused" and 55
+    # "pool-resting". A suite another App made and never ran (its App's organization has an IP allow list) was asked
+    # `app { slug }` and refused, so it was benched and read on the login, and the bench was misnamed "pool-resting".
+    def suite_app(self, runs: dict[str, int], foreign: set[str]) -> tuple[list[str], list[list[str]]]:
+        """An App that counts RUNS (suite id -> check runs over every attempt) and refuses `app` of FOREIGN suites with
+        another organization's IP allow list, the way GitHub does. Returns (queries' kinds, suites asked by SUITE_RUNS)."""
+        kinds: list[str] = []
+        full: list[list[str]] = []
+        inner = self.daemon.transport
+        rate = {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))}
+
+        def transport(method, url, headers, body):
+            if headers["Authorization"] != f"Bearer {APP_TOKEN}" or not url.endswith("/graphql"):
+                return inner(method, url, headers, body)
+            self.app_calls.append((method, url))
+            doc = json.loads(body)
+            ids = doc["variables"]["suites"]
+            if doc["query"] == gg.SUITE_COUNTS:
+                kinds.append("count")
+                nodes = [{"id": i, "checkRuns": {"totalCount": runs[i]}} for i in ids]
+                return 200, rate, json.dumps({"data": {"suiteRuns": nodes}}).encode()
+            kinds.append("runs")
+            full.append(ids)
+            nodes, errors = [], []
+            for n, i in enumerate(ids):
+                nodes.append({"id": i, "conclusion": "SUCCESS", "app": None if i in foreign else {"slug": "github-actions"},
+                              "workflowRun": None, "checkRuns": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                                  {"id": f"R{i}{k}", "name": f"job{k}", "status": "COMPLETED", "conclusion": "SUCCESS",
+                                   "detailsUrl": None, "databaseId": k, "startedAt": None, "completedAt": None}
+                                  for k in range(runs[i])]}})
+                if i in foreign:
+                    errors.append({"type": "FORBIDDEN", "path": ["suiteRuns", n, "app"],
+                                   "message": self.FOREIGN.replace("other-org", "cursor")})
+            return 200, rate, json.dumps({"data": {"suiteRuns": nodes}, **({"errors": errors} if errors else {})}).encode()
+
+        self.daemon.transport = transport
+        return kinds, full
+
+    def test_a_suite_that_never_ran_is_answered_on_the_app_without_asking_another_orgs_app(self) -> None:
+        kinds, full = self.suite_app({"S1": 0, "S2": 2, "S3": 0}, foreign={"S1", "S3"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runs, _ = self.daemon.suite_runs(["S1", "S2", "S3"], paced=False, route=["manaflow-ai/cmux"])
+        self.assertEqual((runs["S1"], runs["S3"]), ([], []))
+        self.assertEqual([r["name"] for r in runs["S2"]], ["job0", "job1"])
+        self.assertEqual(kinds, ["count", "runs"])
+        self.assertEqual(full, [["S2"]], "only the suite that ran something is asked its App's slug")
+        self.assertEqual(self.gh.calls, [], "nothing on the login")
+        self.assertNotIn("login-fallback", out.getvalue())
+        self.assertEqual(self.pool.unreadable, {}, "nothing benched")
+
+    def test_another_orgs_suite_that_ran_something_still_goes_on_the_login_and_is_named_node_benched(self) -> None:
+        kinds, full = self.suite_app({"S1": 1, "S2": 0}, foreign={"S1"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            first, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
+            again, _ = self.daemon.suite_runs(["S1", "S2"], paced=False, route=["manaflow-ai/cmux"])
+        self.assertEqual((first["S2"], again["S2"]), ([], []))
+        self.assertEqual(set(self.pool.unreadable), {"node:id:S1"})
+        self.assertEqual(kinds, ["count", "runs", "count"], "the benched suite is not counted again on the App")
+        causes = [json.loads(l)["cause"] for l in out.getvalue().splitlines() if '"login-fallback"' in l]
+        self.assertEqual(causes, ["refused", "node-benched"], "a node bench is not a resting pool")
+        self.assertEqual(len(self.gh.calls), 2)
+
+    def test_a_count_the_app_could_not_read_is_read_with_suite_runs_never_greener(self) -> None:
+        answers = iter([({"data": {"suiteRuns": [None, {"id": "S2", "checkRuns": None}, {"id": "SX", "checkRuns":
+                                                                                      {"totalCount": 0}}]},
+                          "errors": [{"message": "x", "path": ["suiteRuns", 1, "checkRuns"]}]}, None)])
+        with mock.patch.object(self.daemon, "graphql", lambda q, v, route=None: next(answers)):
+            self.assertEqual(self.daemon.suites_never_ran(["S1", "S2", "S3"], ["manaflow-ai/cmux"]), {})
+        self.assertEqual(self.daemon.suites_never_ran(["S1"], None), {}, "no route: no App, no count")
 
     def test_a_missing_or_unreadable_bench_file_restores_nothing(self) -> None:
         pool = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,

@@ -1318,6 +1318,15 @@ SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cos
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
 checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
   detailsUrl databaseId startedAt completedAt } } } } }"""
+# Whether each suite ran anything in any attempt, asked of an App before SUITE_RUNS. Most suites whose newest attempt
+# ran nothing never ran anything (another App's suite that is requested and never run), and SUITE_RUNS's `app { slug }`
+# on a suite whose App another organization owns is that organization's IP allow list's FORBIDDEN: the suite was
+# node-benched (bench_nodes) and read on the login. The broker host, 2026-11-22 23:39Z-00:46Z: 165 login-fallback
+# lines, every one a last-real-attempt read, 89 "refused" and 55 more of those benched suites (then misnamed
+# "pool-resting"). This query asks no App node, so it stays on the App; a suite with no check run in any attempt is
+# answered here, empty, and only a suite that ran something is read with SUITE_RUNS (it needs the slug).
+SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
+... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
@@ -3441,24 +3450,30 @@ class AppPool:
         owner = next(iter(owners))
         return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
 
-    def passed_over(self, owner: str, scope: str) -> tuple[str, dict[str, str]]:
+    def passed_over(self, owner: str, scope: str, body: dict | None = None) -> tuple[str, dict[str, str]]:
         """Why no pool of the chain answers OWNER's SCOPE after pick() found none, without a mint or a request:
         (cause, {role: its own}). A role is "no-token" (this host holds none of it), "route-benched" (it refused
-        SCOPE lately, covers) or "pool-resting" (rate limited, under its floor, or a failed mint). The cause is
-        "no-token" when no role holds one, else "pool-resting" when any holder rests, else "route-benched"."""
+        SCOPE lately, covers), "node-benched" (it refused a node the GraphQL BODY asks, bench_nodes) or
+        "pool-resting" (rate limited, under its floor, or a failed mint). The cause is "no-token" when no role holds
+        one, else "pool-resting" when any holder rests, else "node-benched" when any holder benched a node, else
+        "route-benched". A node bench used to read as "pool-resting": the broker host, 2026-11-22 23:39Z-00:46Z, 55
+        last-real-attempt reads "pool-resting" on the login while every App of the chain had its points."""
         now = self.clock()
         each: dict[str, str] = {}
+        nodes = list(graphql_body_nodes(body).values()) if body is not None else []
         for pool in [self, *self.spares]:
             if not pool.covers(scope):
                 each[pool.role] = "route-benched"
             elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_cached():
                 each[pool.role] = "no-token"
+            elif nodes and pool.nodes_benched(nodes):
+                each[pool.role] = "node-benched"
             else:
                 each[pool.role] = "pool-resting"
         held = [c for c in each.values() if c != "no-token"]
         if not held:
             return "no-token", each
-        return ("pool-resting" if "pool-resting" in held else "route-benched"), each
+        return next(c for c in ("pool-resting", "node-benched", "route-benched") if c in held), each
 
     def ready_cached(self) -> bool:
         """ready_fn() (held_here: directory scans and token file reads) once per APP_POOL_TTL, for passed_over,
@@ -6754,7 +6769,7 @@ class Daemon:
         elif owner is None:
             cause = pool.owner_why(method, path, body)[1] or "other"
         else:
-            cause, pools = pool.passed_over(owner, scope)
+            cause, pools = pool.passed_over(owner, scope, body if path == "/graphql" else None)
         if cause == "write":
             return
         kind = (tuple(self.caller) + ("",))[0]
@@ -10442,11 +10457,11 @@ class Daemon:
         pool = self.app_pool
         benched = [s for s in suites if pool is not None and pool.chain_benched([f"id:{s}"])]
         held = frozenset(benched)
-        suites = [s for s in suites if s not in held] + benched
+        out: dict[str, list[dict] | str] = self.suites_never_ran([s for s in suites if s not in held], route)
+        suites = [s for s in suites if s not in held and s not in out] + benched
         starts = (list(range(0, len(suites) - len(benched), SUITE_RUNS_BATCH))
                   + list(range(len(suites) - len(benched), len(suites), SUITE_RUNS_BATCH)))
         ends = starts[1:] + [len(suites)]
-        out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start, end in zip(starts, ends):
@@ -10492,6 +10507,39 @@ class Daemon:
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
                                  for run in nodes]
         return out, None
+
+    def suites_never_ran(self, suites: list[str], route: "list[str] | None") -> dict[str, list]:
+        """{suite id: []} for each of SUITES an App says ran no check run in any attempt (SUITE_COUNTS), so
+        suite_runs reads only the rest with SUITE_RUNS. Asked only when an App answers it: on the login it would be
+        one more query, not one fewer. A suite it could not read (an error at its path, a null node, another id, no
+        count) is left out, and SUITE_RUNS reads it as before: never greener."""
+        found: dict[str, list] = {}
+        for start in range(0, len(suites), SUITE_RUNS_BATCH):
+            chunk = suites[start:start + SUITE_RUNS_BATCH]
+            if not route or not self.app_answers(SUITE_COUNTS, {"suites": chunk}, route):
+                break
+            reason, self.gql_reason = self.gql_reason, "last-real-attempt-count"
+            try:
+                doc, _ = self.graphql(SUITE_COUNTS, {"suites": chunk}, route)
+            finally:
+                self.gql_reason = reason
+            nodes = ((doc or {}).get("data") or {}).get("suiteRuns")
+            if not isinstance(nodes, list) or len(nodes) != len(chunk):
+                continue
+            hit: set[int] = set()
+            for e in (doc or {}).get("errors") or []:
+                path = e.get("path") if isinstance(e, dict) else None
+                if isinstance(path, list) and len(path) > 1 and path[0] == "suiteRuns" and type(path[1]) is int:
+                    hit.add(path[1])
+                else:
+                    hit.update(range(len(chunk)))
+            for n, (suite_id, node) in enumerate(zip(chunk, nodes)):
+                runs = node.get("checkRuns") if isinstance(node, dict) else None
+                total = runs.get("totalCount") if isinstance(runs, dict) else None
+                if n not in hit and isinstance(node, dict) and node.get("id") == suite_id and total == 0 \
+                        and type(total) is int:
+                    found[suite_id] = []
+        return found
 
     def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
                    extra: list[tuple[str, list[dict]]] = ()) -> dict | str:
