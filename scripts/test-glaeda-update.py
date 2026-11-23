@@ -1340,6 +1340,29 @@ class UpdateTest(unittest.TestCase):
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
 
+    def test_a_fast_patch_ahead_of_the_release_is_not_drift_until_the_release_includes_it(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        reclaim.write_text("#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n")
+        marker = self.root / "fast-patch-live.json"
+        newer = "f" * 40
+        marker.write_text(json.dumps({"commit": newer, "tools": {"glaeda-worktree-reclaim": gu.file_sha256(reclaim)}}))
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x")["tools"]["drift"], [])
+            self.assertNotIn("repair", self.apply(now + 1))
+            self.assertIn(b"fast-patch", reclaim.read_bytes())
+            # once the installed release includes the commit, the release's bytes are as new: drift again
+            gen = gu.generation(self.state, gu.load_state(self.state)["current"])
+            with open(gen / gu.ANCESTRY, "a", encoding="ascii") as file:
+                file.write(newer + "\n")
+            result = self.apply(now + 2)
+            self.assertEqual(result["repair"], "reinstalled glaeda-worktree-reclaim")
+            # bytes fast-patch did not name are drift as before
+            reclaim.write_text("#!/bin/sh\n# a hand install\nexit 0\n")
+            self.assertEqual(self.apply(now + 3)["repair"], "reinstalled glaeda-worktree-reclaim")
+
     def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
         self.server.publish(SOURCES[0])
         now = 1_800_000_000.0

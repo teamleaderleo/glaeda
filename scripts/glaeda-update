@@ -1193,6 +1193,26 @@ def file_sha256(path: Path) -> str | None:
         return None
 
 
+# leo-workspace tools/fast-patch puts a commit already on main live ahead of the ring (glaeda-gh re-execs onto it in
+# seconds) and names what it installed here: {"commit": SHA, "tools": {NAME: SHA256}}. Without this, the next full run
+# saw that install as drift and put the ring's older bytes back (gcp-agent-lane-10, 2026-11-23: fast-patch put
+# 4bcb452c live at 03:22:02Z, this updater reinstalled a02f5478 at 03:23:22Z). A tool whose installed bytes are the
+# ones named there is not drift until the installed release includes that commit (its ancestry.txt); then the
+# release is as new or newer and is put back as before.
+FAST_PATCH_LIVE = Path(os.environ.get("GLAEDA_FAST_PATCH_LIVE") or HOME / ".local/state/fast-patch/glaeda/live.json")
+
+
+def fast_patched(gen: Path, name: str, have_sha: str, path: Path | None = None) -> bool:
+    """NAME's installed bytes (HAVE_SHA) are fast-patch's install of a main commit the release GEN does not include."""
+    try:
+        doc = json.loads((path or FAST_PATCH_LIVE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    return (isinstance(tools, dict) and tools.get(name) == have_sha
+            and SHA_RE.fullmatch(str(doc.get("commit"))) is not None and not release_descends_from(gen, doc["commit"]))
+
+
 def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
     """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
     in the release is compared: a host profile need not install every tool, and setup owns which. A
@@ -1206,7 +1226,7 @@ def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, li
         if want_sha is None or have_sha is None:
             continue
         checked += 1
-        if want_sha != have_sha:
+        if want_sha != have_sha and not fast_patched(gen, name, have_sha):
             drift.append(name)
     # The fleet's glaeda-gh pacing (every profile installs it). Missing counts as drift too: without it the
     # daemon falls back to its own default REST share, which the fleet's shares are split to stay under.
