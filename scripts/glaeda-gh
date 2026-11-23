@@ -33187,6 +33187,48 @@ def log_errors_emit(repo: str, logs: list[tuple[int, bytes, str]], limit: int, a
     return EXIT_OK
 
 
+# The shared intent layer (leo-workspace tools/intent.py, vendored as scripts/intent.py by scripts/intent-sync, and
+# installed beside ~/.local/bin in ~/.local/share/glaeda/intent/ by glaeda-mini-setup). Leo, 2026-11-23: "we need to
+# have really powerful aliasing for intent." It runs only on a refusal (main's parse_with_intent), so a form that parses
+# costs nothing; failing to load it costs the refusal nothing either.
+INTENT_DIRS = (Path(__file__).resolve().parent, Path.home() / ".local/share/glaeda/intent")
+_intent_module: list = []
+
+
+def intent_layer():
+    """The shared intent module, loaded from INTENT_DIRS by path (this file runs under `python3 -I`, so a sibling is
+    no import), or None when none loads."""
+    if not _intent_module:
+        _intent_module.append(None)
+        for folder in INTENT_DIRS:
+            path = folder / "intent.py"
+            if not path.is_file():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location("intent", path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+                continue
+            _intent_module[0] = module
+            break
+    return _intent_module[0]
+
+
+def intent_trial() -> bool:
+    """Whether the intent layer is trying a form: then a refusal is its to read, and nothing is printed."""
+    module = _intent_module[0] if _intent_module else None
+    return bool(module is not None and getattr(module, "_state", {}).get("trial"))
+
+
+class Refused(Exception):
+    """A refusal parse_with_intent holds until the intent layer has read the call (Parser.defer)."""
+
+    def __init__(self, parser: "Parser", message: str):
+        super().__init__(message)
+        self.parser, self.message = parser, message
+
+
 class Parser(argparse.ArgumentParser):
     """`argparse`'s parser, with a bad argument exiting 64 instead of 2.
 
@@ -33198,8 +33240,16 @@ class Parser(argparse.ArgumentParser):
     writes to **stdout**, so a usage error became the first lines of a `--json` document."""
 
     argv: list[str] = []  # main() sets the raw arguments, for `next:` and --json
+    defer = False  # parse_with_intent: raise Refused rather than print, so the intent layer reads the call first
 
     def error(self, message: str) -> None:  # type: ignore[override]
+        if intent_trial():
+            argparse.ArgumentParser.error(self, message)  # the layer's own: ends its trial, prints nothing
+        if Parser.defer:
+            raise Refused(self, message)
+        self.refuse(message)
+
+    def refuse(self, message: str) -> None:
         hint, one_target = wait_extra_targets(message)
         elsewhere, without = flag_elsewhere(message)
         nxt = one_target or without or usage_next(Parser.argv, self.prog)
@@ -33222,6 +33272,8 @@ class Parser(argparse.ArgumentParser):
                 or not all(isinstance(c, str) for c in choices) or value in choices):
             return value
         meant, near = close_choice(value, choices)
+        if meant and intent_trial():
+            return meant  # the intent layer trying a form: said once, by the parse that runs
         if meant:
             name = action.option_strings[0] if action.option_strings else (action.metavar or action.dest)
             say_waiting(f"glaeda-gh: {name} `{value}` ran as `{meant}` (choices: {', '.join(choices)})")
@@ -34391,6 +34443,11 @@ def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[s
         out.append(word)
         i += 1
     return out
+# The commands that write to GitHub or to this host's daemon: a misspelling of one is refused with its exact form,
+# never run (command_spelling_synonym), and intent_aliases.json's cli.glaeda-gh.exact holds the same list.
+WRITE_COMMANDS = ("land", "post", "restart", "serve")
+
+
 def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """The first word as the one command it means: (argv, refusal lines).
 
@@ -34419,6 +34476,11 @@ def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                          *(f"next: {' '.join(['glaeda-gh', c] + raw[1:])}" for c in near)]
         return raw, []  # nothing near it: argparse refuses it with the commands, as it always has
     fixed = [meant] + raw[1:]
+    if meant in WRITE_COMMANDS:
+        # 2026-11-23: `lnad o/r#1` queued a land. A write is never run from a misspelling of it: the exact form is
+        # named and nothing runs (the intent layer's rule: never make a destructive command looser).
+        return raw, [f"glaeda-gh: `{word}` is no command, and `{meant}` writes to GitHub, so it is not guessed: "
+                     f"the exact form is needed", f"next: {typed_line(['glaeda-gh'] + fixed)}"]
     print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` (`{word}` is no command; `{meant}` is the "
           f"one it means)", file=sys.stderr)
     return fixed, []
@@ -34685,6 +34747,33 @@ def bare_wait_count(word: str) -> bool:
     return True
 
 
+def parse_with_intent(raw: list[str]) -> argparse.Namespace:
+    """RAW parsed; a refused RAW is first read by the shared intent layer (scripts/intent.py), which runs the one form
+    it meant and says so on stderr, prints the two or three it could mean, or, for a form that writes to GitHub
+    (merge, land, post, restart, ...: intent_aliases.json's unsafe words and its cli.glaeda-gh.exact list), prints the
+    exact form and runs nothing. Then this tool's own refusal, as before. INTENT_OFF=1 skips the layer."""
+    Parser.argv = raw
+    p = parser()
+    Parser.defer = True
+    try:
+        return p.parse_args(raw)
+    except Refused as refused:
+        held = refused
+    finally:
+        Parser.defer = False
+    layer = None if os.environ.get("INTENT_OFF") else intent_layer()
+    if layer is not None:
+        try:
+            meant = layer.fix(list(raw), p, "glaeda-gh")
+        except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            meant = raw
+        if meant != raw:
+            Parser.argv = meant
+            return parser().parse_args(meant)
+    held.parser.refuse(held.message)
+    raise SystemExit(64)  # refuse() exits; this only says so to the reader
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     for rewriter in (nesting_synonym, command_spelling_synonym):
@@ -34744,8 +34833,7 @@ def main(argv: list[str] | None = None) -> int:
     raw, inferred = infer_kind(raw)
     if inferred:
         print(inferred, file=sys.stderr)
-    Parser.argv = raw
-    args = parser().parse_args(raw)
+    args = parse_with_intent(raw)
     if getattr(args, "verbose", False):
         os.environ["AGENT_VERBOSE"] = "1"  # summary() and wait_request() read it, here and in the daemon's request
     try:
