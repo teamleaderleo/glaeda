@@ -430,6 +430,15 @@ DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentC
 # laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
 UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
+# A lane VM's name as its lane-gh broker knows it: the bootstrap's client mark (leo-workspace tools/lane-vm-bootstrap
+# CLIENT_MARK), written from the broker's ping answer and re-stamped from it at least daily. fs-agent-lane-12,
+# 2026-11-23: a Freestyle slot cloned from fs-agent-lane-11 kept lane-11's update.json ("host": "fs-agent-lane-11"),
+# so every land row named its requester fs-agent-lane-11/SESSION, hand_off passed it on as this VM's own, and the
+# broker refused all of them ("requester must be a session on this VM (fs-agent-lane-12/SESSION ...) a VM names
+# only its own sessions"): 5 of 5 rows stopped handoff_refused after 6 tries each, none ever reached the broker
+# host's queue. The broker's name is the one every broker check holds this VM to, so on a lane VM it wins.
+LANE_VM_NAME_FILE = Path.home() / ".cache/lane-gh/client"
+LANE_VM_NAME_SHAPE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
 # Falling back from the controller to REST is spend, not just a failure: on one developer workstation on
 # 2026-11-21 it ran a few times every ten minutes for hours, and only refresh-errors.log knew, which nobody
@@ -5500,7 +5509,14 @@ def _bounded(value: Any, default: float, low: float, high: float) -> float:
 
 
 def policy_host() -> str:
-    """This host's name in the fleet policy: update.json's host, else the short hostname."""
+    """This host's name in the fleet policy: on a lane VM the broker's name for it (LANE_VM_NAME_FILE), else
+    update.json's host, else the short hostname."""
+    try:
+        vm = LANE_VM_NAME_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        vm = ""
+    if LANE_VM_NAME_SHAPE.fullmatch(vm):
+        return vm
     doc = read_json(UPDATE_CONFIG)
     host = doc.get("host") if isinstance(doc, dict) else None
     return host if isinstance(host, str) and host else socket.gethostname().split(".")[0].lower()
@@ -18050,9 +18066,15 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
-                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
-                # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
+            elif self.refresh_held():
+                pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
+            elif self.busy() >= self.workers():
+                # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
+                # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
+                # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
+                self.gated(e, ready=True)
+            else:
+                # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again)
                 w["readAt"] = w["directAt"] = self.now
                 e["refresh"] = {"at": self.now, "age": round(self.now - max(reads)) if reads else None,
                                 **self.refresh_starting(e["key"])}
@@ -18243,7 +18265,8 @@ class LandQueue:
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
         if self.busy() >= self.workers():
-            return True  # read on a free worker, a later tick; judged after it
+            self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
+            return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
