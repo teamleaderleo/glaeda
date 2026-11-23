@@ -20527,6 +20527,9 @@ class LandQueue:
                 if got.returncode == 0:
                     if whys:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
+                    # every delivered notice, so a flood is counted from this log, not only from its receiver's
+                    log({"event": "land-notified", "key": e["key"], "to": to, "class": cls or LAND_NOTICE_CLASS,
+                         "severity": severity, "message": land_trim(message, 160)})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
                 if LAND_NOTIFY_GONE.search(whys[-1]):
