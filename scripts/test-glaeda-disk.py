@@ -2665,6 +2665,42 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), runner_build))
         self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), spm))
 
+    def test_the_second_seed_root_is_its_own_family_under_its_own_lock(self) -> None:
+        """2026-11-23: 7 of 15 cold 60-min fast-tier timeouts in 6 h had the one seed root held, so cmux's
+        owned_spm_scratch.py takes a second root, /Users/runner/_work/cmux-2, seeded at its own path. Its builds are
+        a family of their own id (apply maps families by id), marked the same way, and go only under its own lock:
+        a job holding the first root does not keep the second's builds, nor the other way round."""
+        first, second = self.root / "runner/_work/cmux", self.root / "runner/_work/cmux-2"
+        builds = {}
+        for seed in (first, second):
+            builds[seed] = make(seed / "cmux/Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
+            (seed / gd.SEED_ROOT_MARKER).touch()
+            (seed / gd.SEED_ROOT_LOCK).touch()
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", first), mock.patch.object(gd, "CMUX_SECOND_SEED_ROOT", second):
+            fams = [f for f in gd.fleet_families(ci) if f.id in gd.SEED_ROOT_FAMILIES]
+            self.assertEqual([(f.id, f.root) for f in fams],
+                             [(gd.SEED_ROOT_FAMILY, first / "cmux/Packages"),
+                              (gd.SECOND_SEED_ROOT_FAMILY, second / "cmux/Packages")])
+            (second / gd.SEED_ROOT_MARKER).unlink()
+            self.assertEqual([f.id for f in gd.fleet_families(ci) if f.id in gd.SEED_ROOT_FAMILIES],
+                             [gd.SEED_ROOT_FAMILY], "unmarked, the second root is not a seed root")
+            (second / gd.SEED_ROOT_MARKER).touch()
+        self.assertTrue(all(gd.build_cache_family(f) for f in fams))
+        held = open(first / gd.SEED_ROOT_LOCK, "a")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(held.close)
+        verdicts = {i.path: i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(verdicts, {os.fspath(builds[first]): "in-use", os.fspath(builds[second]): "reclaimable"})
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        self.assertTrue(builds[first].exists())
+        self.assertFalse(builds[second].exists())
+        self.assertEqual([p.name for p in second.iterdir() if gd.DELETING_RE.fullmatch(p.name)], [],
+                         "its aside tree went beside its own lock and was deleted")
+
     def test_a_fresh_seed_root_build_goes_only_below_a_floor(self) -> None:
         """Review of glaeda#2137: nearly every fast-tier job rewrites the seed root's builds, so they never age past
         the idle window. Below the runner floor (the floor hold) or the emergency floor they go once no job holds
