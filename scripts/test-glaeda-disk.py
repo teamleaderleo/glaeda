@@ -8038,6 +8038,119 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.compact_shared_mirrors(receipt, home)
         self.assertEqual(gd.git_pack_count(mirror), 1)
 
+    def _seed_fold(self, post, put=None) -> tuple[Path, list[str], dict]:
+        """Fold a 4-pack wt mirror with seed_release_url set and post/put standing in for the controller; returns
+        the mirror, the packs it held before and the receipt row."""
+        home, mirror, loose = self._shared_mirror(4)
+        before = gd.mirror_fold_packs(mirror)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.dict(gd.POLICY, {"seed_release_url": "http://controller.test:8080/"}), \
+                mock.patch.object(gd, "_seed_post", post), \
+                mock.patch.object(gd, "_seed_put", put or (lambda url, path: self.fail("no upload expected"))):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "cat-file", "-t", loose).strip(), "blob")
+        return mirror, before, json.loads(receipt.read_text().splitlines()[-1])
+
+    def test_seed_release_is_off_by_default_and_the_fold_runs_as_before(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["seed_release_url"], "")
+        home, mirror, _ = self._shared_mirror(4)
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "_seed_post", lambda url, doc: self.fail("no call while unset")):
+            gd.compact_shared_mirrors(self.receipt(), home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        policy = self.root / "disk-policy.json"
+        policy.write_text('{"seed_release_url": "http://controller.test:8080"}')
+        self.assertEqual(gd.policy_overrides(policy), {"seed_release_url": "http://controller.test:8080"})
+        policy.write_text('{"seed_release_url": ""}')
+        self.assertEqual(gd.policy_overrides(policy), {"seed_release_url": ""})
+
+    def test_seed_release_names_the_mirror_and_every_pack_the_fold_deletes(self) -> None:
+        # RFD 0008 "Eviction and glaeda-disk": "before glaeda-disk drops a pack ... it asks the controller
+        # `POST /v1/seeds/release` with the pack names"
+        asked = []
+
+        def post(url, doc):
+            asked.append((url, doc))
+            return {"packs": [{"pack": p, "answer": "ok", "why": "another live holder has it"} for p in doc["packs"]]}
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(len(before), 4)
+        self.assertEqual(asked, [("http://controller.test:8080/v1/seeds/release",
+                                  {"host": gd.platform.node(), "repo": "o/r", "packs": before})])
+        self.assertEqual((rec["outcome"], gd.git_pack_count(mirror)), ("reclaimed", 1))
+
+    def test_seed_release_unreachable_controller_keeps_the_packs(self) -> None:
+        # "a host that cannot reach the controller keeps the pack and evicts something else"
+        def post(url, doc):
+            raise OSError("connection refused")
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("did not answer", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_keep_answer_keeps_the_packs(self) -> None:
+        def post(url, doc):
+            return {"packs": [{"pack": p, "answer": "ok" if i else "keep",
+                               "why": "no other live holder and the artifact store is not configured"}
+                              for i, p in enumerate(doc["packs"])]}
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("1 of 4 packs answered keep", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_uploads_sole_packs_then_asks_again(self) -> None:
+        # the controller answers upload with a signed PUT for a sole pack, then ok once R2 has it
+        stored: set[str] = set()
+        put_bytes: dict[str, int] = {}
+
+        def post(url, doc):
+            return {"packs": [{"pack": p, "answer": "ok" if p in stored or p.endswith(("0", "2", "4", "6", "8"))
+                               else "upload", "put_url": f"https://r2.test/git-packs/o/r/{p}.pack"}
+                              for p in doc["packs"]]}
+
+        def put(url, path):
+            put_bytes[path.stem] = path.stat().st_size
+            stored.add(path.stem)
+            self.assertEqual(url, f"https://r2.test/git-packs/o/r/{path.stem}.pack")
+        mirror, before, rec = self._seed_fold(post, put)
+        sole = [p for p in before if not p.endswith(("0", "2", "4", "6", "8"))]
+        self.assertEqual(sorted(put_bytes), sole)
+        self.assertTrue(all(n > 0 for n in put_bytes.values()))
+        self.assertEqual((rec["outcome"], gd.git_pack_count(mirror)), ("reclaimed", 1))
+
+    def test_seed_release_failed_upload_or_still_sole_keeps_the_packs(self) -> None:
+        def always_upload(url, doc):
+            return {"packs": [{"pack": p, "answer": "upload", "put_url": "https://r2.test/x"} for p in doc["packs"]]}
+        _, before, rec = self._seed_fold(always_upload, lambda url, path: None)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("still sole after their upload", rec["reasons"][0])
+
+        def failing_put(url, path):
+            raise OSError("403")
+        self.root = self.root / "again"
+        mirror, before, rec = self._seed_fold(always_upload, failing_put)
+        self.assertIn("failed (OSError: 403)", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_asks_at_most_256_packs_at_once_and_checks_every_answer(self) -> None:
+        packs = [f"pack-{n:040x}" for n in range(300)]
+        sizes = []
+
+        def post(url, doc):
+            sizes.append(len(doc["packs"]))
+            return {"packs": [{"pack": p, "answer": "ok"} for p in doc["packs"]]}
+        self.assertEqual(gd.seed_release("http://c", "h", "o/r", self.root, packs, post=post), "")
+        self.assertEqual(sizes, [256, 44])
+        short = gd.seed_release("http://c", "h", "o/r", self.root, packs[:2],
+                                post=lambda url, doc: {"packs": [{"pack": packs[0], "answer": "ok"}]})
+        self.assertIn("does not name every pack", short)
+        self.assertIn("did not answer", gd.seed_release("http://c", "h", "o/r", self.root, packs[:1],
+                                                         post=lambda url, doc: {"no": "packs"}))
+        self.assertEqual(gd.mirror_repo(Path("/h/Projects/.wt-mirrors/manaflow-ai/cmux.git")), "manaflow-ai/cmux")
+        self.assertEqual(gd.mirror_repo(Path("/h/cmux/.git")), "")
+
     def test_shared_mirror_compact_waits_for_room_for_its_peak(self) -> None:
         # an agent lane host, 2026-11-12: a pressure repack of the 49 GB shared cmux mirror on a 97% full disk took free
         # space to 113 MB and the host's review service refused a review; a repack starts only with room for its peak

@@ -129,7 +129,11 @@ from (tools/wt's bare mirrors, <root>/.wt-mirrors/<owner>/<repo>.git) into one p
 `git repack -a -d -k -l` (keeps every object), the one with the most object bytes and at least four packs per
 pass, after the eviction lock is released. It holds objects/maintenance.lock while git runs, and waits only while
 another repack, gc or git maintenance run works on that mirror. Fetches (a fetch loop too) and worktree reads go
-on beside it.
+on beside it. With the policy's seed_release_url set (the fleet controller), the fold first asks the controller's
+POST /v1/seeds/release about every pack it would delete (cmuxterm-hq RFD 0008 "Eviction and glaeda-disk"): an
+"upload" answer's pack is PUT to its signed URL and asked about again; the fold runs only when every pack answers
+"ok". A controller that cannot be reached, a "keep", or a failed upload keeps the mirror's packs (receipt
+blocked:seed-release) and the pass evicts something else. Unset (the default), the fold runs as before.
 A repack or gc (this one, home-clone-gc, runner-checkout-repack) starts only when free space covers its peak, the
 whole object store written beside the old packs, plus the larger of 4 GiB and 2% of the filesystem; an archive or
 bundle written before a tree goes needs its own bytes plus 256 MiB. One without room is skipped, its receipt line
@@ -2598,6 +2602,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "cargo_stale_roots": ["~/Projects", "~/.wt/checkouts", "~/.cache/cargo-target", "~/lanes", "~/lane-scratch",
                           "~/lab-target"],
     "cargo_stale_hours": 6.0,
+    # The fleet controller's base URL (http://host:port, over the tailnet). Set, shared-mirror-compact asks its
+    # POST /v1/seeds/release before a fold deletes a mirror's packs and folds only on "ok" (seed_release_veto).
+    # "" (the default): no call; the seed heartbeat that fills the controller's holder index is not built yet, so
+    # every pack would read as this host's sole copy.
+    "seed_release_url": "",
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
 # Why this run reclaims out of band (OUT_OF_BAND), "" for every other run. apply() reads it: such a run deletes
@@ -2610,7 +2619,7 @@ DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
 
 # String keys whose "" is a setting (an opt-out), not a missing value
-POLICY_EMPTY_STRINGS = frozenset({"nightly_next_dedicated_label"})
+POLICY_EMPTY_STRINGS = frozenset({"nightly_next_dedicated_label", "seed_release_url"})
 
 
 def policy_overrides(path: Path | None = None) -> dict[str, Any]:
@@ -7395,6 +7404,109 @@ def release_abandoned_compact_lock(lock: Path) -> bool:
     return False
 
 
+# cmuxterm-hq docs/rfd/0008-fleet-blob-seeding.md "Eviction and glaeda-disk": "before glaeda-disk drops a pack (a
+# pressure eviction, a mirror repack that drops objects, a VM teardown that deletes its disk), it asks the controller
+# `POST /v1/seeds/release` with the pack names", and "a host that cannot reach the controller keeps the pack and
+# evicts something else". The controller side is cmuxterm-hq build-fleet/cmd/controller/seeds.go (contract in
+# build-fleet/PEER-SEEDS.md): {"host","repo","packs"} in, at most 256 packs; per pack "ok", "upload" with put_url
+# (PUT the pack, then ask again), or "keep".
+SEED_RELEASE_PATH = "/v1/seeds/release"
+SEED_RELEASE_MAX_PACKS = 256  # seeds.go seedMaxReleasePacks
+SEED_RELEASE_TIMEOUT_S = 45  # the controller's own store HEADs take up to 30 s
+SEED_RELEASE_PUT_TIMEOUT_S = 1800  # one pack's upload to R2; a 3.5 GiB pack at 20 Mbit/s is about 25 minutes
+SEED_PACK_NAME = re.compile(r"pack-(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def mirror_repo(gitdir: Path) -> str:
+    """owner/name of a tools/wt mirror (<root>/.wt-mirrors/<owner>/<name>.git), or ""."""
+    if gitdir.suffix != ".git" or gitdir.parent.parent.name != ".wt-mirrors":
+        return ""
+    return f"{gitdir.parent.name}/{gitdir.stem}"
+
+
+def mirror_fold_packs(gitdir: Path) -> list[str]:
+    """The packs a fold (SHARED_MIRROR_REPACK_ARGS: -a -d) deletes: every pack-<checksum>.pack in objects/pack
+    without a .keep beside it, by name, sorted."""
+    names = []
+    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
+        for e in it:
+            stem = e.name[:-len(".pack")] if e.name.endswith(".pack") else ""
+            if SEED_PACK_NAME.fullmatch(stem) and not os.path.lexists(gitdir / "objects/pack" / f"{stem}.keep"):
+                names.append(stem)
+    return sorted(names)
+
+
+def _seed_post(url: str, doc: dict) -> dict:
+    import urllib.request
+    req = urllib.request.Request(url, data=json.dumps(doc).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=SEED_RELEASE_TIMEOUT_S) as resp:
+        return json.loads(resp.read(4 << 20))
+
+
+def _seed_put(put_url: str, path: Path) -> None:
+    import urllib.request
+    with path.open("rb") as f:
+        req = urllib.request.Request(put_url, data=f, method="PUT",
+                                     headers={"Content-Length": str(path.stat().st_size),
+                                              "Content-Type": "application/octet-stream"})
+        with urllib.request.urlopen(req, timeout=SEED_RELEASE_PUT_TIMEOUT_S) as resp:
+            if resp.status // 100 != 2:
+                raise OSError(f"upload answered {resp.status}")
+
+
+def seed_release(base_url: str, host: str, repo: str, gitdir: Path, packs: list[str], post=None, put=None) -> str:
+    """Ask the controller whether packs may go; upload the sole ones it asks for, then ask again. "" when every
+    pack answered ok, else why the packs stay (unreachable, keep, a failed upload, an answer that names a pack
+    wrongly)."""
+    post = _seed_post if post is None else post
+    put = _seed_put if put is None else put
+    url = base_url.rstrip("/") + SEED_RELEASE_PATH
+    for i in range(0, len(packs), SEED_RELEASE_MAX_PACKS):
+        chunk = packs[i:i + SEED_RELEASE_MAX_PACKS]
+        for attempt in (1, 2):
+            try:
+                doc = post(url, {"host": host, "repo": repo, "packs": chunk})
+                if not isinstance(doc, dict) or not isinstance(doc.get("packs"), list):
+                    raise ValueError("its answer has no packs list")
+            except Exception as e:  # noqa: BLE001 - any failure to hear "ok" keeps the packs
+                return f"seed release: the controller did not answer ({e.__class__.__name__}: {e}); packs kept"
+            answers = {a.get("pack"): a for a in doc["packs"] if isinstance(a, dict)}
+            if set(answers) != set(chunk):
+                return "seed release: the controller's answer does not name every pack asked; packs kept"
+            if (keep := sorted(p for p, a in answers.items() if a.get("answer") not in ("ok", "upload"))):
+                why = answers[keep[0]].get("why") or answers[keep[0]].get("answer")
+                return f"seed release: {len(keep)} of {len(chunk)} packs answered keep ({why}); packs kept"
+            uploads = sorted(p for p, a in answers.items() if a.get("answer") == "upload")
+            if not uploads:
+                break
+            if attempt == 2:
+                return f"seed release: {len(uploads)} packs still sole after their upload; packs kept"
+            for p in uploads:
+                put_url = answers[p].get("put_url")
+                if not isinstance(put_url, str) or not put_url.startswith(("https://", "http://")):
+                    return f"seed release: no upload URL for {p}; packs kept"
+                try:
+                    put(put_url, gitdir / "objects/pack" / f"{p}.pack")
+                except Exception as e:  # noqa: BLE001
+                    return f"seed release: uploading {p} failed ({e.__class__.__name__}: {e}); packs kept"
+    return ""
+
+
+def seed_release_veto(gitdir: Path, cache: dict[str, str]) -> str:
+    """Why a fold must not delete this mirror's packs yet (seed_release), or ""; asked once per mirror per pass.
+    Off (always "") without the policy's seed_release_url, or for a git dir that is no tools/wt mirror."""
+    base = str(POLICY.get("seed_release_url") or "")
+    repo = mirror_repo(gitdir)
+    if not base or not repo:
+        return ""
+    key = os.fspath(gitdir)
+    if key not in cache:
+        packs = mirror_fold_packs(gitdir)
+        cache[key] = seed_release(base, platform.node(), repo, gitdir, packs) if packs else ""
+    return cache[key]
+
+
 def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -> int:
     """Under the floor, fold the shared mirror with the most object bytes once it has SHARED_MIRROR_COMPACT_PACKS
     packs into one pack (SHARED_MIRROR_REPACK_ARGS: every object kept). It holds objects/maintenance.lock while
@@ -7408,9 +7520,11 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
         if packs >= SHARED_MIRROR_COMPACT_PACKS and not one_pack_dominates(gitdir):
             clones.append((git_object_bytes(gitdir), packs, gitdir))
     clones.sort(key=lambda c: (-c[0], -c[1]))
+    released: dict[str, str] = {}
     return _gc_clones(receipt, [(packs, gitdir, gitdir) for _, packs, gitdir in clones], SHARED_MIRROR_COMPACT_FAMILY,
                       lambda tree: list(SHARED_MIRROR_REPACK_ARGS),
-                      lambda tree, gitdir, index, cmds, now: shared_mirror_veto(gitdir, index, cmds, now),
+                      lambda tree, gitdir, index, cmds, now: (shared_mirror_veto(gitdir, index, cmds, now)
+                                                              or seed_release_veto(gitdir, released)),
                       halt, lock=lambda gitdir: gitdir / "objects/maintenance.lock",
                       record=lambda gitdir: gitdir / SHARED_MIRROR_REPACKED_FILE)
 
@@ -7495,7 +7609,8 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             except OSError as e:
                 why, held = f"cannot take {os.path.relpath(held, gitdir)}: {e.__class__.__name__}", None
         if why:
-            rec.update(outcome="blocked:no-room" if why.startswith("no room") else "changed:in-use",
+            rec.update(outcome="blocked:no-room" if why.startswith("no room")
+                       else "blocked:seed-release" if why.startswith("seed release:") else "changed:in-use",
                        verdict="blocked", reasons=[why], bytes=0)
         else:
             before = git_object_bytes(gitdir)
