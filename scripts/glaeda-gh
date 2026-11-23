@@ -34,6 +34,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
     glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
+                                                        OWNER/REPO#N instead: a comment on that PR
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
     glaeda-gh budget [--json] [--local]                 who spent the login's quota this hour, per host
@@ -22785,9 +22786,10 @@ def wait_command(req: dict) -> str:
 # dies ... We can listen for success outputs"). `--timeout S` was a total wall-clock bound: a run that was still
 # starting jobs and finishing steps at S ended "timeout" all the same, and its `next:` was the same wait again, so an
 # agent re-waited a run that had never stopped moving. Now --timeout is "no progress for S": the deadline is S past
-# the last time the waited thing's observed state changed (wait_progress_mark: a PR's checks, head or state; a run's
-# status, attempt, updated_at and, with --jobs, its jobs and steps; a comment thread's comments; a file's size and
-# mtime; a process's CPU time). A wait whose target does not move still ends at S, exactly as before. --max is the
+# the last time the waited thing moved toward a verdict (wait_progress_mark, wait_verdict_facts: a PR's checks
+# completing, its mergeable resolving, its rollup concluding; a run's, job's and step's conclusions; a comment
+# thread's comments; a file's size and mtime; a process's CPU time). A wait whose target does not move still ends at
+# S, exactly as before. --max is the
 # hard ceiling from the wait's start (default WAIT_MAX_TIMES x --timeout), so a target that keeps moving forever is
 # still not waited on forever. The outcome says which ended it: `ended_by` success, failure, ..., no-progress or
 # ceiling.
@@ -22855,18 +22857,120 @@ def wait_progress_print(kind: str, entry: dict | None) -> str | None:
     return hashlib.sha256(json.dumps(mark, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def wait_progress_mark(req: dict, mark: str | None, now: float, seen: str = "") -> bool:
-    """Note what the wait sees now in REQ["moved"] ({"print", "at", "seen"}); True when it changed since the last
-    look. The first thing read is where it starts, not a change: a target that never moves ends at --timeout."""
-    if mark is None:
+# A no-progress deadline that any churn resets is not a bound. One real `wait pr` on this fleet, 2026-11-22, ran
+# 3700 s and ended with no verdict, its deadline moving every time it was about to fire:
+#   deadline 01:07:04Z -> 01:23:43Z -> 01:33:33Z -> 01:37:18Z -> 01:42:45Z   (ceiling 03:53:48Z)
+# Every reset was a real difference in the fingerprint above, and not one of them was the PR getting closer to a
+# verdict: over those same 3700 s its head advanced (4ce5d07926 -> ca12962280) and its check set gained and lost
+# members, so "the rendered state differs from the last read" kept being true while nothing decided anything. With a
+# ceiling nearly three hours out, that slides almost indefinitely and the leash stops being a leash.
+#
+# So the leash does not move on difference; it moves on movement toward the verdict the wait was asked for. A wait
+# keeps the set of verdict facts it has ever observed (wait_verdict_facts) and its deadline moves only when a read
+# brings one it had never seen: a check starting, a check reaching a conclusion, a mergeable resolving, a rollup
+# concluding, the PR reaching a terminal state, a run's job or step concluding. The set only ever grows, so losing a
+# member is never progress and regaining one is never progress twice, and nothing outside it buys a window at all --
+# not a head advancing, not a check appearing or disappearing while it is still queued, not a queue position, not a
+# startedAt or an updated_at ticking.
+#
+# Two decisions this encodes, both deliberate.
+#
+# A head change neither extends the leash nor ends the wait. It does not extend it because a fact is named by the
+# check and the conclusion, never by the head it was observed under: when a new head re-runs the same contexts to the
+# same conclusions, the wait has seen all of it and buys nothing, which is what closes the slide above. A conclusion
+# it had not seen (a red that went green) is progress, because that is the part that can decide the PR. It does not
+# end the wait either: a rebase or a push is the ordinary way a PR reaches a verdict, `--sha` already exists for a
+# caller that means one exact head (another head stops that path, head_moved), and ending every unpinned wait on a
+# teammate's push would turn one agent's push into another agent's failure. The defect was the extension, not the
+# continuation; removing the extension bounds it, and --max still bounds a head that keeps advancing.
+#
+# A required check that is legitimately still running is never cut short by this. Both steps of a check's life count
+# -- it starting, and it concluding -- so a PR working through its checks is exactly as patient as it was before this
+# rule, and a lone pending check still ends its wait --timeout past the last real movement, with stuck_note naming
+# it. What is gone is only the window that used to be bought by things that were never movement.
+WAIT_FACTS_MAX = 256  # how many distinct verdict facts one wait remembers: REQ["moved"] stays bounded and typed
+
+
+def pr_verdict_facts(data: dict) -> list[str]:
+    """What of a PR read is movement toward a `wait pr` verdict: a terminal PR state, a mergeable that has resolved,
+    a rollup that has concluded, and each check that has started or concluded. Named by the check and the value, not
+    by the head: the same contexts re-running to the same conclusions on a new head is work already accounted for."""
+    facts = []
+    if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+        facts.append(f"state:{str(data.get('state')).upper()}")
+    if str(data.get("mergeable") or "").upper() in ("MERGEABLE", "CONFLICTING"):
+        facts.append(f"mergeable:{str(data.get('mergeable')).upper()}")
+    rollup = str(data.get("checkState") or "").upper()
+    if rollup and rollup not in ("PENDING", "EXPECTED"):
+        facts.append(f"rollup:{rollup}")
+    for c in data.get("checks") or []:
+        if not isinstance(c, dict):
+            continue
+        status = str(c.get("status") or "").upper()
+        if status == "COMPLETED":
+            facts.append(f"check:{label(c)}:{str(c.get('conclusion') or '').upper()}")
+        elif status and status not in ("QUEUED", "WAITING", "PENDING", "REQUESTED"):
+            facts.append(f"check:{label(c)}:started")  # a queued check that got a runner: one step, counted once
+    return facts
+
+
+def run_verdict_facts(data: dict, jobs: Any) -> list[str]:
+    """What of a run read is movement toward a `wait run` verdict: the run concluding, and (with --jobs) each job and
+    step that has started or concluded. Its updated_at is a clock, not a verdict."""
+    facts = []
+    if str(data.get("status") or "").lower() == "completed":
+        facts.append(f"run:{data.get('conclusion')}")
+    for j in jobs if isinstance(jobs, list) else []:
+        if not isinstance(j, dict):
+            continue
+        for what, number, item in [("job", "", j)] + [("step", s.get("number"), s) for s in j.get("steps") or []
+                                                      if isinstance(s, dict)]:
+            status = str(item.get("status") or "").lower()
+            where = f"{what}:{j.get('id')}:{number}"
+            if status == "completed":
+                facts.append(f"{where}:{item.get('conclusion')}")
+            elif status and status not in ("queued", "waiting", "pending", "requested"):
+                facts.append(f"{where}:started")
+    return facts
+
+
+def wait_verdict_facts(kind: str, entry: dict | None) -> list[str] | None:
+    """Every verdict fact a `wait pr|run|comment` read carries, or None before anything was read. Read times are left
+    out on purpose, and so is everything else that can change without bringing a verdict closer."""
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+    if kind == "run":
+        return run_verdict_facts(data, (entry or {}).get("jobs"))
+    if kind == "comment":
+        # a comment wait ends on a comment; one arriving, or being edited into the match, is the movement there
+        return [f"comment:{c.get('id')}:{c.get('updatedAt') or c.get('createdAt')}"
+                for c in data.get("comments") or [] if isinstance(c, dict)]
+    return pr_verdict_facts(data)
+
+
+def fact_mark(fact: str) -> str:
+    return hashlib.sha256(fact.encode()).hexdigest()[:16]
+
+
+def wait_progress_mark(req: dict, facts: list[str] | None, now: float, seen: str = "") -> bool:
+    """Note what the wait has now seen in REQ["moved"] ({"facts", "at", "seen", "changes"}); True when this read
+    brought a verdict fact the wait had not seen before. What was already true at the first read is where it starts,
+    not a change: a target that never moves ends at --timeout. Past WAIT_FACTS_MAX facts the set stops growing and
+    so does the deadline -- a bound only ever tightens."""
+    if facts is None:
         return False
+    marks = {fact_mark(f) for f in facts}
     moved = req.get("moved") if isinstance(req.get("moved"), dict) else None
     if moved is None:
-        req["moved"] = {"print": mark, "at": float(req["began"]), "seen": seen, "changes": 0}
+        req["moved"] = {"facts": sorted(marks)[:WAIT_FACTS_MAX], "at": float(req["began"]), "seen": seen,
+                        "changes": 0}
         return False
-    if moved.get("print") == mark:
+    known = set(moved.get("facts") or [])
+    if marks <= known or len(known) >= WAIT_FACTS_MAX:
         return False
-    req["moved"] = {"print": mark, "at": now, "seen": seen, "changes": int(moved.get("changes") or 0) + 1}
+    req["moved"] = {"facts": sorted(known | marks)[:WAIT_FACTS_MAX], "at": now, "seen": seen,
+                    "changes": int(moved.get("changes") or 0) + 1}
     return True
 
 
@@ -23145,7 +23249,9 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
     pending and how long each has been (the age is the load-bearing part -- "pending" alone reads the same at 20 s and
-    at 14 min), that their siblings have finished when they have, and a next step for a check that is not moving.
+    at 14 min), that their siblings have finished when they have, that a required check has already failed and so
+    decided it when one has, and a next step for whichever check the reader should look at: the one that decided it if
+    any did, else the one that is not moving.
 
     None while there is nothing to say: the state has not been still that long, the target is not a PR (a run's status
     is its own state), or nothing is pending. Never the blind read of glaeda#2316, which is the opposite case: there
@@ -23188,19 +23294,31 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
              and not groups["held"] else "")
     # The rollup can already be red while a `--until done` wait goes on (it ends on the checks, not on the rollup):
     # cmux#48834 said PENDING against a rollup FAILURE for 25 minutes and never said the two were not the same test.
+    # A required check that has already failed decided this wait, whatever its siblings are still doing.
+    # teamleaderleo/glaeda#2564 (3700 s) said "not moving: Verify / scripts pending 11m" on every progress line while
+    # `ci-status / Require every Verify job` had already failed: the words named the slowest check instead of the
+    # deciding one, so a reader kept waiting on a verdict that was already in. `required` is on every check this wait
+    # has already read, so naming it costs no extra read, and this changes no exit code and no verdict mapping.
+    decided = [c for c in groups["failed"] if c.get("required")]
+    gate = (f" {label(decided[0])} is required and has already failed"
+            + (f" (and {len(decided) - 1} more required check(s) with it)" if len(decided) > 1 else "")
+            + ": the decision is already in, and nothing still pending can change it."
+            if decided else "")
     rollup = str(data.get("checkState") or "").upper()
     disagrees = (f" GitHub's rollup already says {rollup}; this wait ends on the checks it counts, not on the rollup, "
                  "so a red there does not end it." if rollup in COUNT_BAD else "")
     stands = (f"{len(pending)} of {len(data['checks'])} checks are still pending" if pending
               else f"every one of the {len(data['checks'])} checks it can read has finished")
     lines = [f"glaeda-gh: WARNING: {key_name(key)} has not changed for {span(unchanged)}: "
-             f"{stands}{siblings}.{alone}{disagrees}"]
+             f"{stands}{siblings}.{gate}{alone}{disagrees}"]
     if pending:
         lines.append(f"  not moving: {named}{more}")
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    lines.append(f"next: {stuck_next(oldest[0], key) if pending else unseen_next(data, key)}")
+    nxt = (stuck_next(decided[0], key) if decided
+           else stuck_next(oldest[0], key) if pending else unseen_next(data, key))
+    lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
 
@@ -23815,8 +23933,9 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                                  until, grace, bool(req.get("verbose")))
     data = (entry or {}).get("data")
     if fresh and data:
-        # a fresh read: whether the target moved since the last one stretches this wait's deadline (wait_deadline)
-        wait_progress_mark(req, wait_progress_print(kind, entry), now)
+        # a fresh read: a verdict fact it had not seen stretches this wait's deadline (wait_deadline). A difference
+        # that is not one does not; churn is not progress (wait_progress_mark).
+        wait_progress_mark(req, wait_verdict_facts(kind, entry), now)
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
@@ -31030,13 +31149,14 @@ def broker_post(item: dict) -> int:
     return 0
 
 
-def post_issue_names_an_existing_issue(target: str) -> str:
-    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+def post_target_number(target: str) -> str:
+    """The issue or pull request number a `post` target names, or "" where it names a repository.
 
-    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    Nothing is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
     that issue: the caller had the number from a wait or land line, not from this parser's help. Until
     2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
-    cost the refusal plus the same call typed again under another kind.
+    cost the refusal plus the same call typed again under another kind. `post pr OWNER/REPO#N` reads the same
+    way and was refused ("post pr takes OWNER/REPO") until 2026-11-23, measured on a comment for cmux#51063.
     """
     text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
     found = KEY_RES["comment"].fullmatch(text)
@@ -32309,8 +32429,9 @@ def parser() -> argparse.ArgumentParser:
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
-            s.add_argument("--timeout", type=seconds, default=3600,
-                           help="seconds with no change in what it waits on (default 3600): every change it sees "
+            s.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=3600,
+                           help="seconds with no change in what it waits on (default 3600; --wait is the same): "
+                                "every change it sees "
                                 "(a check or job started or finished, a comment, a file growing, CPU used) moves "
                                 "the deadline; exit 2 once nothing changed for this long, or at --max. `wait "
                                 "until` alone counts it from the start")
@@ -32342,8 +32463,9 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--max-age", type=float, default=HEAD_PENDING_TTL * 2, metavar="S",
                    help=f"checks still running are served from the cache if read this recently (default {HEAD_PENDING_TTL * 2}s); "
                         "finished heads are good for 12 minutes")
-    c.add_argument("--wait", type=float, default=30, metavar="S",
-                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
+    c.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=30, metavar="S",
+                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is); "
+                        "--timeout is the same")
     c.add_argument("--pr", type=int, metavar="N",
                    help="the PR whose head this is: a head with no entry is served from that PR's cached rollup "
                         "when it is of this head and all green (route pr-rollup)")
@@ -32361,8 +32483,9 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--reviewer", action="append", metavar="LOGIN", help="pr: request a review (repeatable)")
     po.add_argument("--event", choices=("comment", "approve", "request-changes"), default="comment",
                     help="review: the verdict (default comment)")
-    po.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session)")
+    po.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="seconds to wait for the URL (default 0: queue and return; the write survives the session); "
+                         "--timeout is the same")
     po.add_argument("--status-key", metavar="KEY",
                     help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
                          "this one in place while it is still the thread's last comment and nobody waits on it")
@@ -32457,8 +32580,9 @@ def parser() -> argparse.ArgumentParser:
                     help="replay: one finished run, as the controller's feed (/v1/github/events) or GitHub serves it")
     oe.add_argument("--jobs-file", type=Path, metavar="PATH",
                     help="replay: its attempt's jobs ({\"jobs\": [...]}, run-jobs' or GitHub's), instead of reading them")
-    oe.add_argument("--wait", type=float, default=0, metavar="S",
-                    help="replay: wait up to S seconds for the command to end, to print its exit code")
+    oe.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
+                    help="replay: wait up to S seconds for the command to end, to print its exit code; "
+                         "--timeout is the same")
     oe.add_argument("--json", action="store_true")
     ld = sub.add_parser("land", help="land a PR: the daemon takes each step land_judge names until it merges or stops "
                                      "(land status, land cancel)")
@@ -32798,7 +32922,10 @@ def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) ->
     if parent != "post":
         return True
     if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
-        return False
+        # Since 2026-11-23 `post pr OWNER/REPO#N` is a comment on that pull request, which takes a body and
+        # not --head/--base/--title. Without a body it is still a call `post` could only refuse.
+        return bool(post_target_number(target)) and bool(
+            {normalized_flag("--body"), normalized_flag("--body-file")} & typed)
     needs = NESTING_WRITE_INPUT.get((parent, word))
     return not needs or bool({normalized_flag(f) for f in needs} & typed)
 
@@ -33342,7 +33469,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
             if one == "issue":
-                numbered = post_issue_names_an_existing_issue(args.target)
+                numbered = post_target_number(args.target)
                 if numbered and args.title:
                     raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
                                      f"to comment on it, or pass OWNER/REPO to file a new issue")
@@ -33350,6 +33477,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
                           f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
                     args.kind, one = "comment", "comment"
+            if args.kind == "pr":
+                numbered = post_target_number(args.target)
+                opening = [f for f, v in (("--head", args.head), ("--base", args.base), ("--title", args.title)) if v]
+                if numbered and opening:
+                    raise WatchError(f"post pr {args.target} names pull request {numbered}, which exists: drop "
+                                     f"{', '.join(opening)} to comment on it, or pass OWNER/REPO to open a new one")
+                if numbered:
+                    print(f"glaeda-gh: post pr {args.target} names pull request {numbered}, which exists: this is "
+                          f"a comment on it (a new pull request takes OWNER/REPO with --head, --base and --title)",
+                          file=sys.stderr)
+                    args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:
