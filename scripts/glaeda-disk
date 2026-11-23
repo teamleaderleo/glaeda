@@ -17892,11 +17892,20 @@ def runner_account_argv(args: list[str]) -> list[str]:
     return [RUNNER_ACCOUNT_FLAG, *out]
 
 
-def _runner_account_python() -> str:
-    """An interpreter the other account can run: this one unless it lives in this account's home."""
-    exe = os.path.abspath(sys.executable or "/usr/bin/python3")
-    own = os.path.abspath(HOME)
-    return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
+# glaeda-python --install-root: the root-owned copy of the one pinned Python, which every account can run
+RUNNER_ACCOUNT_PYTHON = "/opt/glaeda-python/bin/python3.13"
+
+
+def _runner_account_python(executable: str | None = None, home: str | None = None) -> str:
+    """An interpreter the other account can run: this one unless it lives in this account's home (uv's
+    ~/.local/bin/python3.13), else the root-owned pinned copy; never Apple's python3. On Linux, the distro's."""
+    exe = os.path.abspath(executable or sys.executable or RUNNER_ACCOUNT_PYTHON)
+    own = os.path.abspath(home or HOME)
+    if not (exe == own or exe.startswith(own.rstrip("/") + "/")):
+        return exe
+    if sys.platform.startswith("linux") and not os.access(RUNNER_ACCOUNT_PYTHON, os.X_OK):
+        return "/usr/bin/python3"  # PY_PIN_EXEMPT: Linux, the distro python3
+    return RUNNER_ACCOUNT_PYTHON
 
 
 def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
