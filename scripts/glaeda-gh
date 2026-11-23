@@ -1512,6 +1512,21 @@ def branch_target_step(kind: str, text: str, cwd: str | None = None) -> str:
     return f"glaeda-gh search prs --repo {repo} head:{branch} --state open --field target,state"
 
 
+def repo_targets(kind: str, targets: str | list[str], repo: str) -> str | list[str]:
+    """TARGETS with each bare N or #N named in REPO (`--repo` of status and wait), the rest as typed. Measured
+    2026-11-16..23: `status pr N --repo R` was refused as "unrecognized arguments", the form gh itself takes."""
+    if kind not in ("pr", "run", "comment"):
+        raise WatchError(f"--repo names the repository of a bare number, which {kind} does not take")
+    if not re.fullmatch(rf"{NAME}/{NAME}", repo):
+        raise WatchError(f"--repo takes OWNER/REPO, not {repo!r}")
+
+    def one(text: str) -> str:
+        bare = BARE_NUMBER.fullmatch(drop_kind_prefix(text, kind))
+        return f"{repo}{'/' if kind == 'run' else '#'}{int(bare.group(1))}" if bare else text
+
+    return [one(t) for t in targets] if isinstance(targets, list) else one(targets)
+
+
 def parse_key(kind: str, text: str) -> str:
     """`pr:owner/repo#n`, `run:owner/repo/id` or `comment:owner/repo#n`, lowercased so every session
     shares one entry. A bare `N` or `#N` is that number in the repository the caller is standing in,
@@ -33485,6 +33500,15 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
         hand = post_elsewhere(words[1])
         if hand:
             return hand
+    # `checks OWNER/REPO` with no commit and no --consumer (measured 2026-11-16..23): no default is safe (which commit
+    # is the caller's to say), so the refusal is the form that runs in a checkout, and the read a PR's checks have.
+    if words[:1] == ["checks"] and prog in ("glaeda-gh", "glaeda-gh checks"):
+        repo = next((w for w in words[1:] if re.fullmatch(rf"{NAME}/{NAME}", w)), "OWNER/REPO")
+        shas = [w for w in words[1:] if SHA40.fullmatch(w)]
+        consumer = os.environ.get("ACPMUX_SESSION_NAME") or "NAME"
+        sha = " ".join(shas) or '"$(git rev-parse HEAD)"'
+        return (f"`glaeda-gh checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
+                f"name, so none is assumed; a pull request's checks: `glaeda-gh status pr {repo}#N`)")
     if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
         return f"glaeda-gh {words[0]} --help"
@@ -33695,6 +33719,9 @@ def parser() -> argparse.ArgumentParser:
                                                  "with or without the kind before it")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
+        s.add_argument("--repo", metavar="OWNER/REPO",
+                       help="the repository a bare N or #N names, instead of the origin of the directory you are in "
+                            "(`status pr 7 --repo o/r` is `status pr o/r#7`)")
         s.add_argument("--verbose", action="store_true",
                        help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
@@ -34935,6 +34962,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.pr is not None and (args.pr <= 0 or len(args.shas) != 1):
                 raise WatchError("--pr takes the PR number (1 or more) of the one head asked for")
             return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json, pr=args.pr)
+        if args.command in ("status", "wait") and args.repo is not None:
+            args.target = repo_targets(args.kind, args.target, args.repo)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json, fields=parse_fields(args.field))
         if args.rescue_grace < 0:
