@@ -1268,7 +1268,7 @@ PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid 
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
-parents(first: 1) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
+parents(first: 3) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
@@ -2667,6 +2667,64 @@ def graphql_login() -> str:
     return found.group(1) if found else "default"
 
 
+# GitHub quotes the token's numeric account id in its own quota refusal ("API rate limit already exceeded for user
+# ID NNNN"), and quotes the caller's address when the call carried no token ("API rate limit exceeded for 203.0.113.9").
+# Both are personal data, and every line this tool prints is pasted into PR bodies, issue comments and ledger rows by
+# the agents that read it: on 2026-11-22 `status pr` printed "checks INCONCLUSIVE (partial: 80 of 219 read; check
+# pages held: graphql: last real attempt: API rate limit already exceeded for user ID NNNNNNNN...)". A downstream
+# guard (leo-workspace tools/public_body_guard.py) refuses the id in a body, but scrubbing after the fact is the
+# wrong layer: the refusal must never carry the id. gh_said is the one place GitHub's own words become text this
+# tool prints, stores or logs, so the id is dropped where it arrives and nowhere else -- what a reader needs in
+# order to act is *whose* bucket is spent (so whose work pauses or moves), which is a login, never an id. The
+# actionable words -- which limit, and the reset -- are kept.
+GH_SAID_MAX = 200  # the length every message site already cut GitHub's sentence to
+GH_USER_ID = re.compile(r"\b(users?)(?:\s+id)?\s+\d{3,}\b", re.I)
+# An App's own bucket: no login holds it, and the id names an installation, so the phrase names the holder instead.
+GH_INSTALL_ID = re.compile(r"\b(installations?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_CALLER_IP = re.compile(r"\bfor (?:IP\s+)?(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]*::[0-9a-f:]*[0-9a-f])\b", re.I)
+
+
+def gh_quota_holder() -> str:
+    """The login whose per-user quota a refusal names: the github.com login this host's token belongs to
+    (graphql_login), else "" when no login can be read here. Never raises, never an id."""
+    login = graphql_login()
+    return login if login and login != "default" else ""
+
+
+GH_NO_HOLDER = "(this host's gh login)"  # neutral, and still a per-user bucket: not the repository's, not an App's
+
+
+def gh_quota_label() -> str:
+    """What stands where GitHub wrote an account id: the holder's login, else GH_NO_HOLDER. Read only when a
+    message carries an id (gh_sanitize substitutes through this), so a clean message costs nothing."""
+    return gh_quota_holder() or GH_NO_HOLDER
+
+
+def gh_sanitize(text: Any) -> str:
+    """TEXT with GitHub's personal identifiers replaced by the holder they stand for (GH_USER_ID's comment).
+
+    A numeric user id becomes the login whose bucket it is, and -- when this host cannot read a login -- the neutral
+    "this host's gh login", which still says the spent bucket is a per-user one rather than the repository's or an
+    App's. A login is written bare, never "@login": an @name in a PR or issue body notifies that account."""
+    out = GH_USER_ID.sub(lambda m: f"{m.group(1)} {gh_quota_label()}", str(text or ""))
+    out = GH_INSTALL_ID.sub(r"\1 (an App of this repository's owner)", out)
+    return GH_CALLER_IP.sub("for an unauthenticated caller", out)
+
+
+def gh_said(error: Any, limit: int | None = GH_SAID_MAX, default: str = "") -> str:
+    """GitHub's own words from ERROR as a line this tool may print, store or log (gh_sanitize), cut to LIMIT.
+
+    ERROR is an error node or a response body (its "message", else its "type"), or a string already read out of one;
+    DEFAULT stands in when GitHub said nothing. LIMIT None keeps the whole sentence (the caller trims it).
+    Every site that reads a "message" out of GitHub's answer goes through here -- test-glaeda-gh asserts it."""
+    if isinstance(error, dict):
+        text = error.get("message") or error.get("type") or ""
+    else:
+        text = error if isinstance(error, str) else "" if error is None else str(error)
+    out = gh_sanitize(text).strip() or default
+    return out if limit is None or len(out) <= limit else out[:limit]
+
+
 def graphql_slot_wanted(want: Path) -> bool:
     """Whether a priority taker (the daemon) waits for a slot now: its want mark is GRAPHQL_SLOT_WANT_FRESH fresh."""
     try:
@@ -3137,7 +3195,7 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
     for e in errors:
         if not isinstance(e, dict) or protection_forbidden(e):
             continue
-        text = str(e.get("type") or "") + " " + str(e.get("message") or "")
+        text = gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""), limit=None)
         if not app_graphql_refused(text):
             continue
         org = APP_POOL_IP_ALLOW_LIST.search(text)
@@ -5294,7 +5352,7 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
         if not isinstance(e, dict):
             continue
         if e.get("message"):  # GitHub wrote the sentence; its code adds nothing to it
-            parts.append(str(e["message"]))
+            parts.append(gh_said(e["message"], limit=None))
             continue
         where = ".".join(str(e[k]) for k in ("resource", "field") if e.get(k))
         code = str(e.get("code") or "")
@@ -6753,10 +6811,11 @@ class Daemon:
                 doc = None
             if isinstance(doc, dict):
                 errors = doc.get("errors")
-                error_text = " ".join(str(e.get("type") or "") + " " + str(e.get("message") or "")
+                error_text = " ".join(gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""),
+                                               limit=None)
                                       for e in errors if isinstance(e, dict) and not protection_forbidden(e)
                                       ) if isinstance(errors, list) else ""
-                message = " ".join(filter(None, (str(doc.get("message") or ""), error_text)))
+                message = " ".join(filter(None, (gh_said(doc.get("message"), limit=None), error_text)))
             else:
                 message = ""
             errors = doc.get("errors") if isinstance(doc, dict) else None
@@ -6862,7 +6921,7 @@ class Daemon:
             doc = json.loads(raw) if raw else None
         except ValueError:
             doc = None
-        message = str(doc.get("message") or "") if isinstance(doc, dict) else ""
+        message = gh_said(doc.get("message"), limit=None) if isinstance(doc, dict) else ""
         limited = bucket == "graphql" and isinstance(doc, dict) and any(
             isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in doc.get("errors") or [])
         if status in {403, 429} and ((SECONDARY.search(message) and not (content and CONTENT_ONLY.search(message))) or (
@@ -7658,7 +7717,7 @@ class Daemon:
         """GitHub's own failure answered as HTTP 200 (an internal error, a timeout): retried like a 5xx. A refusal
         that names the request (NOT_FOUND, FORBIDDEN, a validation error) still fails the write."""
         return bool(errors) and not any(e.get("type") in GQL_REFUSALS for e in errors) and all(
-            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(str(e.get("message") or ""))
+            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(gh_said(e.get("message"), limit=None))
             for e in errors)
 
     def rest_out(self, status: int, h: dict, text: str) -> bool:
@@ -7726,7 +7785,7 @@ class Daemon:
                 if (status >= 500 or not isinstance(doc, dict) or not doc.get("errors")
                         or self.gql_transient([e for e in doc["errors"] if isinstance(e, dict)])):
                     return self.post_retry(path, item, f"graphql subject: HTTP {status}")
-                message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "")[:200]
+                message = gh_said(((doc.get("errors") or [{}])[0] or {}).get("message"))
                 return self.post_finish(path, item, error=f"graphql: {message or 'no such issue or pull request'}")
             subject = subjects[thread] = node["id"]
             write_json(BASE / POST_SUBJECTS, dict(list(subjects.items())[-2000:]))
@@ -7784,7 +7843,7 @@ class Daemon:
             self.note_status({**item, "status": None}, None, None, None)  # deleted: post it as a new comment
             write_json(path, item)
             return None
-        said = "; ".join(str(e.get("message") or e.get("type")) for e in errors) or str(doc.get("message") or "")
+        said = "; ".join(gh_said(e, limit=None) for e in errors) or gh_said(doc.get("message"), limit=None)
         return self.post_finish(path, item, error=f"graphql: HTTP {status}: {said}"[:300])
 
     def post_prune(self) -> None:
@@ -9791,7 +9850,7 @@ class Daemon:
             return error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):  # GitHub reports a timeout as 200 with data null
-            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            message = "graphql: " + gh_said(doc["errors"][0], default="no message")
             self.fail(entries, message)
             return message
         problems: dict[str, dict] = {}
@@ -9800,7 +9859,7 @@ class Daemon:
             path = err.get("path") or [""]
             problems[str(path[0])] = err
             if err.get("type") == RESOURCE_LIMITS:
-                limits.setdefault(str(path[0]), str(err.get("message") or RESOURCE_LIMITS)[:200])
+                limits.setdefault(str(path[0]), gh_said(err.get("message"), default=RESOURCE_LIMITS))
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
         if kind == "pr":
             for err in doc.get("errors") or []:
@@ -9872,7 +9931,7 @@ class Daemon:
             err = problems.get(f"{alias}{i}") or {}
             what = "pull request" if kind == "pr" else "issue or pull request"
             # only GitHub saying NOT_FOUND for this alias means it does not exist (or is not visible)
-            self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
+            self.store(e["key"], e["cache"], error=gh_said(err.get("message"), default=f"no data for this {what}"),
                        missing=err.get("type") == "NOT_FOUND")
 
     def unchanged_paged(self, e: dict, node: dict) -> bool:
@@ -10253,7 +10312,7 @@ class Daemon:
             return [], error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):
-            return [], "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            return [], "graphql: " + gh_said(doc["errors"][0], default="no message")
         failed = {str((err.get("path") or [""])[0]) for err in doc.get("errors") or [] if isinstance(err, dict)}
         changed = []
         for i, e in enumerate(entries):
@@ -10281,7 +10340,7 @@ class Daemon:
             return error or "graphql: no response"
         data = doc.get("data") or {}
         if not data and doc.get("errors"):
-            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            message = "graphql: " + gh_said(doc["errors"][0], default="no message")
             self.fail(entries, message)
             for e in entries:
                 self.refund(e["key"])
@@ -10306,7 +10365,7 @@ class Daemon:
                 failed = [err for err in doc.get("errors") or [] if (err.get("path") or [None])[0] == f"m{i}"]
                 if failed:
                     self.store(e["key"], e["cache"],
-                               error="graphql: " + str(failed[0].get("message") or "check-of-record read failed")[:200])
+                               error="graphql: " + gh_said(failed[0].get("message"), default="check-of-record read failed"))
                     self.refund(e["key"])
                     continue
                 # A commit the fork does not have yet (sync-main pushes there within a minute) adds nothing, as does a
@@ -10392,8 +10451,8 @@ class Daemon:
                 break
             found = (doc.get("data") or {}).get("suiteRuns")
             errors = [e for e in doc.get("errors") or [] if isinstance(e, dict)]
-            message = "graphql: last real attempt: " + str(
-                (errors[0] if errors else {}).get("message") or "a suite could not be read")[:200]
+            message = "graphql: last real attempt: " + gh_said(
+                (errors[0] if errors else {}).get("message"), default="a suite could not be read")
             # a nested error names its suite by path (["suiteRuns", i, ...]); one with no such path names them all
             hit: set[int] = set()
             for e in errors:
@@ -10445,7 +10504,8 @@ class Daemon:
                     return error or "graphql: no response"
                 rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
                 if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
-                    return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
+                    return "graphql: " + gh_said(((more.get("errors") or [{}])[0] or {}).get("message"),
+                                                default="no further page")
                 contexts = rollup.get("contexts") or {}
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
@@ -10624,13 +10684,14 @@ class Daemon:
         data = doc.get("data") or {}
         problems = {str((err.get("path") or [""])[0]): err for err in doc.get("errors") or [] if isinstance(err, dict)}
         if not data and problems:  # the whole query failed (a schema change, say): say what GitHub said
-            message = "graphql: " + str(next(iter(problems.values())).get("message"))[:200]
+            message = "graphql: " + gh_said(next(iter(problems.values())).get("message"), default="no message")
             self.fail(entries, message)
             return message
         for i, e in enumerate(entries):
             node = data.get(f"w{i}")
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
-                message = "graphql: " + str((problems.get(f"w{i}") or {}).get("message") or "no workflow run at this URL")[:200]
+                message = "graphql: " + gh_said((problems.get(f"w{i}") or {}).get("message"),
+                                                default="no workflow run at this URL")
                 problem = problems.get(f"w{i}") or {}
                 # null with no problem of its own, or NOT_FOUND: GraphQL cannot see it (a timeout or a 5xx says nothing)
                 if (not problem or problem.get("type") == "NOT_FOUND") \
@@ -13147,6 +13208,32 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# A ci_never_ran refusal at a head this land itself made is a "not yet", not a refusal to act on. GitHub creates a
+# push's workflow runs asynchronously, and a fast pull_request_target run can be the only run at a head for minutes
+# after the push; land_judge's ci_never_ran compares the runs it reads at the head against what PRs into the base run
+# (its evidence is that comparison, which is how an unwired branch is told from a quiet one), and at a head pushed
+# seconds ago that comparison has no answer yet.
+# efficiency-standing-lane, 2026-11-21 08:39Z, `glaeda-gh land manaflow-ai/cmuxterm-hq#16382 --wait 2700`: the queue
+# sent the pinned update-branch at c46607e8da6f, GitHub's own update had already made the merge head 70420e0bfe85 (the
+# send was refused "expected head sha didn't match current head ref"), the entry judged that brand-new head, and
+# land_judge refused ci_never_ran because no pull_request run was behind it yet. The entry stopped with ~45 min of the
+# caller's wait budget unspent, and the caller had to notice, re-arm a wait and land again by hand: three calls for a
+# PR that was going to be green.
+# manaflow-ai/cmuxterm-hq#19554, 2026-11-22, the same failure from the other producer: this land's own base merge made
+# d3e8c81b5adf (a lander-bot merge commit, "Merge branch 'main' into ...", parents the PR head and main), the judgment
+# at it refused ci_never_ran with only "pull_request_target: Test integrity" read, and minutes later four of the
+# pull_request workflows the refusal itself named (lane-gh-broker tests, Skills tests, fleet-reconcilers tests,
+# Polling guard) were in progress at that same head. So the predicate is "this land made this head", by any way it
+# makes one (land_own_head_at), not "its update-branch step made it".
+# Such a refusal waits on the PR at that head for the repo's own pull_request run to appear (the run's checks move the
+# cache, and the judgment after it is the usual one, merge included) while the bound has time left, and stays terminal
+# where it should be: a head this land did not make (nothing is starting the repo's CI for it on its own, which is
+# what hq#11655 was about) stops at the first refusal, as before, and a head whose run never showed up stops at the
+# bound. Either stop says which case it is, how long was waited and the call that takes the PR from there. While the
+# bound has time left the refusal's own step is never named: it pushes an empty commit, which at a head whose runs are
+# being created moves the head, orphans them and starts the race again. The gate itself is untouched: a head with no
+# pull_request run is still never merged, here or in land_judge.
+LAND_CI_START = 600.0  # how long the repo's own pull_request run may take to appear at a head this land made
 # A judgment that merged the base into the PR itself: land_judge's stale_main_update and stale_ci_update (leo-workspace
 # tools/land_judge/engine.py) send update_branch pinned to the judged head inside the judgment and answer the running
 # checks' wait at that head ("checks still running at HEAD: main (TIP) was merged into the PR: ..."). The queue never
@@ -13810,12 +13897,9 @@ def land_day(at: float) -> str:
     return dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%d")
 
 
-# GitHub's numeric account id, which gh quotes in its own rate-limit error ("API rate limit already exceeded for user
-# ID NNNN"). It is personal data, and the queue's text is pasted into PR and issue bodies by every agent that reads
-# `land status` (leo-workspace tools/public_body_guard.py refuses it there), so the daemon drops the id where it
-# captures the error (LandQueue.call) and where it reads a park an older daemon stored (land_queue_parked). The
-# actionable words -- which limit, and the reset -- are kept.
-LAND_USER_ID = re.compile(r"\b(user(?:\s+id)?)\s+\d{3,}\b", re.I)
+# The land path captures GitHub's words from git's and gh's streams (LandQueue.call) and reads back a park an older
+# daemon stored (land_queue_parked); both go through the one substitution every printed and stored GitHub message
+# does (gh_said's comment), so a quota refusal in the queue names the login whose bucket is spent, never an id.
 
 
 # A word every shell hands on as typed: shlex's own safe set, plus `#` anywhere but the first character.
@@ -13837,8 +13921,9 @@ def typed_line(words: Any) -> str:
 
 
 def land_redact(text: Any) -> str:
-    """TEXT with GitHub's numeric user id dropped (LAND_USER_ID)."""
-    return LAND_USER_ID.sub(r"\1 <redacted>", str(text or ""))
+    """TEXT with GitHub's account id replaced by the login whose bucket it is (gh_sanitize), the one substitution
+    every printed and stored GitHub message goes through."""
+    return gh_sanitize(text)
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
@@ -14050,6 +14135,70 @@ def land_fetch_origin(url: str) -> str:
     """OWNER/REPO a github.com remote URL names (https, ssh:// or scp form), else ""."""
     m = LAND_FETCH_ORIGIN.fullmatch(url.strip())
     return m.group(1) if m else ""
+
+
+# The steps of this land that make a new head: the pinned update-branch (GitHub's base merge), the merge step whose
+# own land_judge run merged the base in first (stale_main_update, recorded by note_judge_update), and the local base
+# merge pushed when GitHub's update-branch refused a conflict (union_merge, claimed as update_branch).
+LAND_OWN_HEAD_STEPS = frozenset({"update_branch", "merge"})
+
+
+def land_when(value: object) -> float | None:
+    """VALUE as a time this queue wrote on an entry, or None for anything else (a bool is not a time)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def land_own_head_at(e: dict, head: str) -> float | None:
+    """When this land itself made HEAD, the head judged now -- the latest moment it is known to have pushed the base
+    merge HEAD can only be -- else None: nothing here shows HEAD is this land's own (LAND_CI_START's comment).
+
+    Every way this land makes a head records the send on the entry as e["updateSent"], naming the head it was sent AT
+    and never the head it makes: the queue's pinned update-branch (push_step), the local base merge it pushes when
+    GitHub refuses that update (union_merge), and the base merge land_judge made inside a judgment or a step's
+    refusal (note_judge_update). So a head that is not the head such a send was sent at is the head that send made.
+    e["updatedHead"], written once a read showed the new head is that base merge (its first parent is the pin:
+    pin_follow, base_merge_check, the head_change wait), is the same fact proven, and counts at the time it was read.
+    A send with no time, and an entry carrying neither, answer None. The caller bounds the answer in time
+    (LAND_CI_START), so a send from an hour ago decides nothing."""
+    head = str(head or "").lower()
+    if not SHA40.fullmatch(head):
+        return None
+    made: list[float] = []
+    sent = e.get("updateSent") or {}
+    if isinstance(sent, dict) and str(sent.get("head") or "").lower() not in ("", head):
+        at = land_when(sent.get("at"))
+        if at is not None:
+            made.append(at)
+    action = e.get("lastAction") or {}
+    kind = action.get("kind") if isinstance(action, dict) else None
+    if kind in LAND_OWN_HEAD_STEPS and str(action.get("before") or "").lower() not in ("", head):
+        # The step ended after its send was recorded, so its time is the one to wait from. The update-branch step
+        # makes the head whether GitHub took the send or refused it because its own update had already made that head
+        # (hq#16382: such a send is refused and no updateSent is kept), so that step counts on its own. A merge step
+        # counts only with the send recorded: land_judge merged the base inside it (note_judge_update), while a merge
+        # refused for any other reason made no head at all.
+        at = land_when(action.get("endedAt"))
+        if at is not None and (kind == "update_branch" or made):
+            made.append(at)
+    if str(e.get("updatedHead") or "").lower() == head:
+        at = land_when(e.get("updatedHeadAt"))
+        if at is not None:
+            made.append(at)
+    return max(made) if made else None
+
+
+def land_ci_start_left(e: dict, act: dict, answer: dict, head: str, now: float) -> float | None:
+    """Seconds left for the repo's own pull_request run to appear at HEAD when ANSWER is a ci_never_ran refusal of a
+    head this land made and the bound has time left, else None: the refusal is terminal (LAND_CI_START's comment).
+    Only the ci_never_ran code, so the conflicts_base shape of that same refusal -- a conflicted head, for which
+    GitHub builds no refs/pull/N/merge and no push starts a run at all -- keeps its own stop and its own step."""
+    if str(answer.get("code") or "") != "ci_never_ran" or act.get("kind") not in ("command", "stop"):
+        return None
+    at = land_own_head_at(e, head)
+    if at is None:
+        return None
+    left = at + LAND_CI_START - now
+    return left if left > 0 else None
 
 
 def land_fallback(answer: dict, head: str) -> dict:
@@ -16271,7 +16420,9 @@ class LandQueue:
             # After a push-making step: never judge (or pin) a head read before it.
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
-                    e["updatedHead"] = head  # this queue's own base merge made it (update_again)
+                    # this queue's own base merge made it (update_again); the time it was read is when this land is
+                    # known to have made that head (land_own_head_at).
+                    e["updatedHead"], e["updatedHeadAt"] = head, self.now
                     if self.pin_follow(e, head, data):
                         return  # the new head's first parent is not read yet: not judged on it
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp, why="head_moved")
@@ -16819,7 +16970,7 @@ class LandQueue:
             return (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) do not include {sent[:12]}, "
                     "where this queue's update_branch was sent: a push, not that update's base merge")
         e["pinSha"] = head
-        e["updatedHead"] = head
+        e["updatedHead"], e["updatedHeadAt"] = head, self.now
         self.history(e, "repin_own_update", pin=pin[:12], head=head[:12],
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
@@ -16938,7 +17089,7 @@ class LandQueue:
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
                 return False
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
-            e["updatedHead"] = head
+            e["updatedHead"], e["updatedHeadAt"] = head, self.now
             e.pop("pinWait", None)
             self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
             self.save(e)
@@ -17409,6 +17560,10 @@ class LandQueue:
                 # The refusal's step is the pinned update (any code: LAND_UPDATE_ONCE's comment): taken, never counted
                 # toward the identical-refusal stop. update_branch sends it once per head and bounds the rest.
                 pass
+            elif land_ci_start_left(e, act, answer, head, self.now) is not None:
+                # ci_never_ran at a head this land itself made, inside the bound: ci_never_ran_step waits on the PR
+                # for the repo's own run to appear, so this is not a refusal of the PR's to count (LAND_CI_START).
+                e["streak"] = None
             elif self.streak(e, f"{answer.get('code')}|{head}|{act.get('kind')}", act.get("kind") in LAND_RETRY_KINDS,
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
@@ -17619,6 +17774,38 @@ class LandQueue:
                   f"{land_reason(reason, 200)}", land_trim(nxt))
         return True
 
+    def ci_never_ran_step(self, e: dict, act: dict, answer: dict, head: str, why: str, nxt: str) -> None:
+        """land_judge refused ci_never_ran at HEAD (LAND_CI_START's comment). Off the lock. While a step of this land
+        made HEAD and the bound has time left, E waits on the PR for the repo's own pull_request run to appear there;
+        otherwise E stops, as it always did, naming which of the two cases it is, how long was waited and the call
+        that takes the PR from there. Nothing is merged either way: the gate is land_judge's."""
+        with self.lock:
+            self.check(e)
+            left = land_ci_start_left(e, act, answer, head, self.now)
+            at = land_own_head_at(e, head)
+            if left is not None:
+                waited = LAND_CI_START - left
+                self.history(e, "ci_start_wait", head=head[:12], waited=round(waited), left=round(left))
+                # The refusal's own step (push an empty commit) is deliberately not named while this wait stands: at a
+                # head whose runs GitHub is still creating it moves the head, orphans them and starts the race again.
+                self.wait(e, {"kind": "pr", "sha": head, "until": "done", "why": f"the repo's own pull_request run "
+                              f"has not appeared at {head[:12]} yet ({waited:.0f} s of {LAND_CI_START:.0f} s since "
+                              "this land made that head)"}, left)
+                e["seen"] = land_fingerprint(self.cache_of(e["key"]))  # judged again once the checks move, or at the wake
+                self.save(e)
+                return
+            if at is None:
+                said = (f"and no step of this land made {head[:12] or '?'}, so nothing is going to start that run "
+                        "on its own")
+                step = nxt  # a genuinely unwired head: the refusal's own step (an empty commit, or the wiring) stands
+            else:
+                said = (f"and none ever appeared at {head[:12]} in the {LAND_CI_START:.0f} s after this land made "
+                        "that head")
+                step = land_trim(f"{nxt}, then glaeda-gh land {e['repo']}#{e['number']} "
+                                 f"--wait {LAND_WAIT_DEFAULT:.0f}") if nxt else \
+                    f"glaeda-gh land {e['repo']}#{e['number']} --wait {LAND_WAIT_DEFAULT:.0f}"
+            self.stop(e, "ci_never_ran", f"{land_reason(why)} ({said})", land_trim(step))
+
     def claim(self, e: dict, kind: str, **args: Any) -> None:
         """Written before the step starts: a restart sees it and judges again instead of running it on its own."""
         self.check(e)
@@ -17668,6 +17855,11 @@ class LandQueue:
                 with self.lock:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
                 self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+                return
+            if cls == "ci_never_ran":
+                # Not terminal on its own at a head this land just made: ci_never_ran_step waits for the run GitHub
+                # has not created yet, and stops with the same clarity where no run is coming (LAND_CI_START).
+                self.ci_never_ran_step(e, act, answer, head, land_reason(why), land_trim(nxt or answer.get("next")))
                 return
             with self.lock:
                 self.stop(e, cls, land_reason(why), land_trim(nxt or answer.get("next")))
@@ -22024,7 +22216,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         # A partial rollup (check pages held, a context GitHub could not read) says so on the checks line: its
         # PENDING is the unread pages', and a required name not shown is unread, not missing (cmux#43194).
         partial = (f" (partial: {len(checks)} of {data.get('checksTotal') or '?'} read; "
-                   f"check pages held: {data['checksPageError']})") if data.get("checksPageError") else ""
+                   f"check pages held: {gh_said(data['checksPageError'], limit=None)})"
+                   ) if data.get("checksPageError") else ""
         if checks:
             # the headline is this tool's own reading, the one `wait` decides by; GitHub's rollup also
             # counts superseded attempts and checks that are not required
@@ -22668,7 +22861,7 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            "none (merge or rebase onto the base and push; checks run after that push)")
     if result == EXIT_INCONCLUSIVE:
         if data.get("checksPageError") or req.get("runsUnread"):
-            why = data.get("checksPageError") or "its Actions runs could not be read"
+            why = gh_said(data.get("checksPageError"), limit=None) or "its Actions runs could not be read"
             blocked = blocked_now(kind)
             return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
                                blocked_next(req, blocked) if blocked else wait_command(req))
@@ -23345,7 +23538,7 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         extra.update(fail_fields("blocked", f"{key_name(key)} cannot be read before this wait's deadline: "
                                            f"{blocked['text']}", blocked_next(req, blocked)))
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
-    unread = (data or {}).get("checksPageError") or (
+    unread = gh_said((data or {}).get("checksPageError"), limit=None) or (
         "the head's Actions runs could not be read (actions/runs?head_sha)" if req.get("runsUnread") else None)
     if now >= deadline and kind == "pr" and until in ("done", "green") and data and unread:
         # the deadline passed on a read that never came back whole: not a pass and not a plain timeout

@@ -24708,6 +24708,18 @@ class LandTest(Base):
         self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
 
+    def test_the_pr_read_asks_for_enough_parents_to_see_a_base_merge_on_the_pin(self):
+        # 2026-11-22 22:55-23:55Z: the read asked parents(first: 1), so every cached head had one parent, a base merge
+        # on the pin was never seen as one (0 repin_base_merge, 22 of 31 head_moved stops were such merges).
+        asked = re.search(r"parents\(first: (\d+)\)", gg.PR_FIELDS)
+        self.assertGreaterEqual(int(asked.group(1)), 3)  # three, so an octopus merge is not taken for a two-parent one
+        node = {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+            "oid": LB, "parents": {"nodes": [{"oid": LA}, {"oid": LC}]}}}]}}
+        parents = gg.head_parents(node)
+        self.assertEqual(parents, [LA, LC])
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": parents}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA, LC, "d" * 40]}), "")
+
     def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
         # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
         # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read
@@ -26344,6 +26356,110 @@ class LandTest(Base):
                                       nxt=f"gh api -X PUT repos/o/r/pulls/1/update-branch -f expected_head_sha={LA}"))
         e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("api")), ("stopped", "teammate", []))
+
+    # land_judge's ci_never_ran refusal at HEAD, as it answers it: a "command" step whose text starts CI by hand.
+    CI_NEVER_NEXT = ("test \"$(git rev-parse HEAD)\" = %s && git commit --allow-empty --only -m "
+                     "'ci: start CI now that the base is set' && git push && glaeda-gh wait pr o/r#1 --until done "
+                     "--timeout 1800")
+
+    def ci_never_ran(self, head: str) -> tuple[int, dict]:
+        nxt = self.CI_NEVER_NEXT % head
+        return refusal("ci_never_ran", head, {"kind": "command", "text": nxt}, nxt=nxt,
+                       reason=f"land-judge: refused: the repo's own CI never ran at {head}: it has no pull_request "
+                              "Actions run (its only PR runs are pull_request_target: Test integrity), while PRs into "
+                              "main run Polling guard, Skills tests")
+
+    def updated_to(self, new_head: str, refused: bool = False) -> dict:
+        """A land whose own update-branch at LA made NEW_HEAD, judged there. REFUSED: GitHub's own update had made it
+        first, so the pinned send came back "expected head sha didn't match current head ref" (hq#16382's shape)."""
+        self.pr(LA)
+        self.land()
+        if refused:
+            self.w.gh_rc["update"] = 1
+            self.w.gh_err["update"] = ('{"message":"expected head sha didn\u2019t match current head ref.",'
+                                       '"status":"422"}')
+        self.w.answers.append(refusal("red_not_excused", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                              "needs_newer_base": ["ci"]}))
+        self.tick()
+        self.w.gh_rc.pop("update", None)
+        self.pr(new_head, checks=[])
+        self.w.answers.append(self.ci_never_ran(new_head))
+        return self.tick(60)
+
+    def test_ci_never_ran_at_the_head_this_land_made_waits_for_the_run_to_start(self):
+        # efficiency-standing-lane, 2026-11-21 08:39Z (LAND_CI_START's comment): `glaeda-gh land
+        # manaflow-ai/cmuxterm-hq#16382 --wait 2700` ran its own update-branch, judged the merge head it made 70 s
+        # later, and stopped ci_never_ran with ~45 min of the caller's wait unspent, for a PR that went green.
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                e = self.updated_to(LB, refused=refused)
+                self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB),
+                                 e.get("stop"))
+                # Waited from the moment that head is known to be this land's: the read that found it (updatedHeadAt)
+                # when the send went through, the refused send's own step 60 s earlier when it did not.
+                self.assertAlmostEqual(e["wakeAt"] - self.t, gg.LAND_CI_START - (60 if refused else 0), delta=5)
+                self.assertEqual([h["event"] for h in e["history"]][-1], "ci_start_wait")
+                # The refusal's own step is an empty commit, which would move this head and orphan the runs being
+                # created at it: nothing names it to the caller while the wait stands.
+                self.assertIsNone(e.get("stop"))
+                self.assertNotIn("allow-empty", json.dumps(e["wait"]))
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_the_base_merge_land_judge_itself_made_waits_too(self):
+        # manaflow-ai/cmuxterm-hq#19554, 2026-11-22 (LAND_CI_START's comment): the same race from the other producer
+        # -- this land's own base merge (land_judge's stale_main_update inside the judgment, recorded by
+        # note_judge_update, no update_branch step at all) made d3e8c81b5adf, the judgment at it refused ci_never_ran
+        # with only pull_request_target read, and minutes later four of the pull_request workflows that refusal named
+        # were in progress at that head. One predicate (land_own_head_at) answers for every producer.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(self.judge_merged_base(LA))
+        e = self.tick()
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIsNone((e.get("lastAction") or {}).get("kind"))  # no step of the queue's: the judgment merged it
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[]), self.t + 5)
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(self.ci_never_ran(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB), e.get("stop"))
+        self.assertIn("ci_start_wait", [h["event"] for h in e["history"]])
+        self.assertIsNone(e.get("stop"))
+        self.assertNotIn("allow-empty", json.dumps(e["wait"]))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_the_run_appearing_at_that_head_is_judged_as_usual(self):
+        e = self.updated_to(LB)
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the repo's own pull_request run started
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 2))
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(30)
+        self.assert_merged_at(LB)
+
+    def test_ci_never_ran_stops_once_no_run_has_appeared_within_the_bound(self):
+        e = self.updated_to(LB)
+        e = self.run_hour(lambda: self.ci_never_ran(LB), seconds=gg.LAND_CI_START + 600, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "ci_never_ran"))
+        self.assertIn("none ever appeared at " + LB[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --wait", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_a_head_no_step_of_this_land_made_stops_at_once(self):
+        # hq#11655's shape (a head carrying only pull_request_target checks that nothing of this land's made):
+        # nothing is going to start the repo's CI for it, so the refusal stays one refusal, never a wait.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.ci_never_ran(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.explains())), ("stopped", "ci_never_ran", 1))
+        self.assertIn("no step of this land made " + LA[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_no_update_branch_while_the_heads_checks_run(self):
         self.pr(LA)
@@ -28070,9 +28186,9 @@ class LandTest(Base):
         stored = json.dumps([gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE), e,
                              gg.land_queue_parked(self.t), gg.land_line(e, self.t, latch=None)])
         self.assertNotIn("4242424242", stored)
-        self.assertIn("user ID <redacted>", stored)
+        self.assertIn(f"user {gg.gh_quota_label()}", stored)  # the login, not the id (gh_said)
         self.assertIn(f"retry after {at}Z", stored)  # the actionable words are kept
-        self.assertEqual(gg.land_redact("for user ID 4242424242."), "for user ID <redacted>.")
+        self.assertEqual(gg.land_redact("for user ID 4242424242."), f"for user {gg.gh_quota_label()}.")
         self.assertEqual(gg.land_redact('{"user": 4242424242}'), '{"user": 4242424242}')  # only gh's own sentence
 
     def test_a_park_an_older_daemon_stored_is_redacted_on_the_way_out(self):
@@ -28081,7 +28197,7 @@ class LandTest(Base):
         gg.write_json(gg.land_dir() / gg.LAND_QUOTA_FILE, {
             "until": self.t + 1800, "at": self.t,
             "reason": "land-judge: refused: quota: gh: API rate limit already exceeded for user ID 4242424242."})
-        self.assertIn("user ID <redacted>", gg.land_queue_parked(self.t)["reason"])
+        self.assertIn(f"user {gg.gh_quota_label()}", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", self.queue().queue_quota_reason)
 
@@ -37130,6 +37246,103 @@ class InCallRaceTest(Base):
         self.daemon.transport = overlapped
         self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertIs(self.daemon.in_call, other)
+
+
+# The line `glaeda-gh status pr` printed on 2026-11-22, with the id replaced by a fake: the shape gh and GitHub both
+# use, and the one every assertion below reads, so the sanitized text is written down once and cannot drift.
+SAID_ID = "4242424242"  # a fake account id
+SAID_RAW = f"API rate limit already exceeded for user ID {SAID_ID}."
+SAID_LOGIN = "cmux-agents-lander"
+SAID_SAFE = f"API rate limit already exceeded for user {SAID_LOGIN}."
+HELD_RAW = f"graphql: last real attempt: {SAID_RAW}"
+HELD_SAFE = f"graphql: last real attempt: {SAID_SAFE}"
+
+
+class GitHubSaidTest(unittest.TestCase):
+    """GitHub's own words reach a printed line, a stored cache field and the shared log; its quota refusal quotes the
+    token's numeric account id, which is personal data and must never be in text an agent pastes into a PR body."""
+
+    def setUp(self) -> None:
+        holder = mock.patch.object(gg, "gh_quota_holder", lambda: SAID_LOGIN)
+        holder.start()
+        self.addCleanup(holder.stop)
+
+    def test_a_quota_refusal_names_the_login_whose_bucket_is_spent(self) -> None:
+        """The whole point: the refusal says whose quota is spent -- which is what a reader acts on, whose work
+        pauses or moves -- and not an id. The limit and the reset are what is left untouched."""
+        self.assertEqual(gg.gh_said(SAID_RAW), SAID_SAFE)
+        self.assertEqual(gg.gh_said(HELD_RAW), HELD_SAFE)
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED", "message": SAID_RAW}), SAID_SAFE)
+        self.assertNotIn(SAID_ID, gg.gh_said(SAID_RAW))
+        self.assertIn(SAID_LOGIN, gg.gh_said(SAID_RAW))  # actionable, not vague
+
+    def test_every_sibling_form_of_an_account_id_goes_too(self) -> None:
+        """gh and GitHub write the same refusal several ways, and an unauthenticated read is refused by address."""
+        for raw, want in (
+                (f"API rate limit exceeded for user {SAID_ID}.", f"API rate limit exceeded for user {SAID_LOGIN}."),
+                (f"API rate limit exceeded for user id {SAID_ID}", f"API rate limit exceeded for user {SAID_LOGIN}"),
+                (f"gh: API rate limit already exceeded for user ID {SAID_ID}.", f"gh: {SAID_SAFE}"),
+                ("API rate limit exceeded for 203.0.113.9. (But here is the good news: Authenticated requests get a "
+                 "higher rate limit.)",
+                 "API rate limit exceeded for an unauthenticated caller. (But here is the good news: Authenticated "
+                 "requests get a higher rate limit.)"),
+                (f"You have exceeded a secondary rate limit for installation ID {SAID_ID}.",
+                 "You have exceeded a secondary rate limit for installation (an App of this repository's owner)."),
+                # an id-shaped number that is not an account: a time, a count, a run id in a path
+                ("read at 12:08:00 for 2 checks", "read at 12:08:00 for 2 checks"),
+                ("no workflow run at actions/runs/12345678901", "no workflow run at actions/runs/12345678901")):
+            with self.subTest(raw=raw):
+                self.assertEqual(gg.gh_said(raw, limit=None), want)
+
+    def test_a_refusal_with_no_login_to_name_still_says_whose_bucket_it_is(self) -> None:
+        """A host whose gh has no login in hosts.yml cannot name one; the phrase that stands in must still say the
+        spent bucket is a per-user one (not the repository's, not an App's), so the reader knows what to do."""
+        with mock.patch.object(gg, "gh_quota_holder", lambda: ""):
+            said = gg.gh_said(SAID_RAW)
+        self.assertEqual(said, f"API rate limit already exceeded for user {gg.GH_NO_HOLDER}.")
+        self.assertNotIn(SAID_ID, said)
+        self.assertIn("user", said)
+
+    def test_no_printed_line_of_a_partial_read_carries_an_account_id(self) -> None:
+        """The surface the defect was measured on: `status pr` printed "checks INCONCLUSIVE (partial: 80 of 219
+        read; check pages held: graphql: last real attempt: API rate limit already exceeded for user ID ...)". A
+        cache an older daemon wrote still holds the id, so the printed line drops it on the way out too."""
+        data = {"state": "OPEN", "headRefOid": "a" * 40, "checksTotal": 219, "checksPageError": HELD_RAW,
+                "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS", "required": True}]}
+        text = gg.summary("pr:o/r#1", {"data": data})
+        self.assertNotIn(SAID_ID, text)
+        self.assertRegex(text, r"checks INCONCLUSIVE \(partial: 1 of 219 read; check pages held: "
+                               + re.escape(HELD_SAFE) + r"\)")
+        self.assertNotRegex(text, r"\buser(?:\s+ID)?\s+\d{3,}\b")  # no bare id on any printed line
+        for line in text.splitlines():
+            self.assertNotRegex(line, r"\b\d{9,}\b", line)
+
+    def test_a_stored_field_and_a_log_line_carry_the_login_too(self) -> None:
+        """Not only the print: the error is stored in the cache and logged, and both are read back into text."""
+        self.assertEqual(gg.gh_said(HELD_RAW, limit=None), HELD_SAFE)
+        self.assertEqual(gg.land_redact(SAID_RAW), SAID_SAFE)  # the land queue's own capture, same substitution
+        self.assertEqual(gg.gh_said(SAID_RAW, limit=20), SAID_SAFE[:20])  # the length every site already cut to
+        self.assertEqual(gg.gh_said(None, default="no message"), "no message")
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED"}), "RATE_LIMITED")
+
+    def test_every_github_message_is_read_through_the_chokepoint(self) -> None:
+        """One function, not N regex strips: a site that reads "message" out of GitHub's answer and formats it
+        itself is how the id came back, so every such site names gh_said on its own line. gh_said's own body is
+        where the field is read, and the line that only tests for a message is not formatting it."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()
+        inside = False
+        for n, line in enumerate(source, 1):
+            if line.startswith("def gh_said("):
+                inside = True
+            elif inside and line.startswith(("def ", "class ")):
+                inside = False
+            if inside or not re.search(r'\["message"\]|\(\s*"message"\s*\)', line):
+                continue
+            if re.fullmatch(r'\s*if e\.get\("message"\):.*', line):  # a test for one, then the fields instead
+                continue
+            statement = line if "gh_said" in line else source[n - 2] + line  # the call may open the line before
+            self.assertIn("gh_said", statement, f"scripts/glaeda-gh:{n} formats GitHub's message itself")
+
 
 if __name__ == "__main__":
     unittest.main()
