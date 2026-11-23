@@ -13892,6 +13892,16 @@ LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the wr
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
 LAND_HANDOFF_DEADLINE = 60.0
+# A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
+# read its PR again, so it never learned that the far host merged it, closed it or lost it. Finding hq#19725
+# (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
+# median 8.6 h; 9 had MERGED on GitHub while still "forwarded" here, and 61 had gone to an executor that later
+# answered not_executor and were never sent again. Now each such row is looked at from the daemon's cache (no GitHub
+# read of its own) at most once per LAND_FORWARD_LOOK_EVERY (forwards_follow): MERGED ends it merged and tells its
+# requester as a merge here does, CLOSED stops it, a moved pin stops it head_moved, and one still OPEN this long past
+# its last hand-off is handed off again, once per LAND_FORWARD_RESEND (the far host applies a repeated request once).
+LAND_FORWARD_RESEND = 1800.0
+LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files, not one per daemon tick
 
 
 def land_session_lane(name: str) -> str:
@@ -14667,6 +14677,7 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
         self.overflow_after = float("-inf")
@@ -14954,6 +14965,7 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        self.forwards_follow()  # cache reads and a broker call, no read of this login's: a park holds none of it
         if self.queue_quota_parked():
             # The park holds only the steps that need the login it spent: a judgment, a read, a watch or a nudge.
             # Every step that needs none runs on: a PR the cache shows ended leaves the queue (retire_ended), a row
@@ -15129,6 +15141,7 @@ class LandQueue:
                 if e["state"] in LAND_DONE and self.now - float(e.get("updated") or 0) > LAND_KEEP:
                     (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                     del self.entries[key]
+        self.forwards_follow(executor=True)  # a row re-queued for a re-send goes in this pass's batch
         if self.forward_thread is not None and self.forward_thread.is_alive():
             return
         if self.now < self.forward_after:
@@ -15519,6 +15532,79 @@ class LandQueue:
                     self.retire_from_cache(self.entries[key])
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def forwards_follow(self, executor: bool = False) -> None:
+        """At most once per LAND_FORWARD_LOOK_EVERY: every forwarded row no worker holds is looked at in the daemon's
+        cache (forward_follow, LAND_FORWARD_RESEND's comment). EXECUTOR: this host forwards its lands (forward_tick)."""
+        if self.now < self.forward_look_at:
+            return
+        self.forward_look_at = self.now + LAND_FORWARD_LOOK_EVERY
+        for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
+                    and k not in self.sending and k not in self.overflowing]:
+            try:
+                with self.lock:
+                    self.forward_follow(self.entries[key], executor)
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def forwarded_since(self, e: dict) -> float:
+        """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
+        times = [float((e.get("handedOff") or {}).get("at") or 0), float((e.get("forwardResent") or {}).get("at") or 0)]
+        times += [float(h.get("at") or 0) for h in e.get("history") or []
+                  if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
+        return max(times) or float(e.get("updated") or 0)
+
+    def forward_follow(self, e: dict, executor: bool) -> None:
+        """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
+        does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
+        (stop_moved_pin); one still OPEN past LAND_FORWARD_RESEND since its last hand-off is handed off again: a lane
+        VM's to the broker host (hand_off_now), an executor-forwarding host's re-queued for its next forward batch.
+        A row a peer took as overflow is followed to its end, never re-sent: this host judges its own late rows."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        host = str(e.get("forwardedTo") or "the host it was handed to")
+        at = c.get("dataAt")
+        read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        if state == "MERGED":
+            merge = data.get("mergeCommit")
+            sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+            self.merged(e, sha or e.get("mergeSha") or "", f"forwarded to {host}: the cache shows it merged")
+            return
+        if state == "CLOSED":
+            if read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen (retire_from_cache)
+                self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
+                          f"closed); nothing is merged", "")
+            return
+        if state != "OPEN" or self.stop_moved_pin(e, c, data):
+            return
+        since = self.forwarded_since(e)
+        if self.now - since <= LAND_FORWARD_RESEND:
+            return
+        last = e.get("forwardResent") or {}
+        n = int(last.get("n") or 0) + 1
+        why = (f"still open {self.now - since:.0f} s after it was handed to {host}, with no outcome there: "
+               f"handed off again (LAND_FORWARD_RESEND)")
+        if executor:
+            e["forwardResent"] = {"at": self.now, "n": n, "to": host}
+            self.history(e, "forward_resent", to=host, n=n, why=why)
+            log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n})
+            e.update(state="queued", wait=None, wakeAt=None, action=None)  # forward_batch sends it on this pass
+            self.save(e)
+            return
+        done = e.get("handedOff") or {}
+        if not done or not self.broker_client():
+            return  # a peer's overflow, or a row from before this host was a broker client: followed, not re-sent
+        head = str(e.get("pinSha") or "").lower()
+        cached = str(data.get("headRefOid") or "").lower()
+        if not head:
+            head = cached if SHA40.fullmatch(cached) and read_at >= float(done.get("at") or 0) \
+                else str(done.get("head") or "").lower()
+        if not SHA40.fullmatch(head):
+            return
+        e["forwardResent"] = {"at": self.now, "n": n, "to": host}
+        log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
+        self.hand_off_now(e, head, why, "forward_resent")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its

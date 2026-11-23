@@ -26827,9 +26827,10 @@ class LandTest(Base):
         self.assertTrue(any(h.get("event") == "handed_off" for h in e["history"]), e["history"])
         # handed off is no wake: the requester hears from huge-blue's queue when it merges or stops
         self.assertFalse(any("handed to huge-blue" in c[-1] for c in self.w.sent()), self.w.sent())
-        # nothing more here: no judgment, no step, no second hand-off
-        for _ in range(5):
-            self.tick(600)
+        # nothing more here inside LAND_FORWARD_RESEND: no judgment, no step, no second hand-off (past it, an open PR is
+        # handed off again: test_a_forwarded_land_still_open_past_the_bound_is_handed_off_again_once_per_bound)
+        for _ in range(int(gg.LAND_FORWARD_RESEND // 600)):
+            self.tick(599)
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
         # queued again at the same head: refused the same way, handed off never again (idempotent per PR and head)
         with mock.patch.object(gg, "policy_host", lambda: "host"):
@@ -27806,6 +27807,73 @@ class LandTest(Base):
         self.assertEqual(len(self.handoffs()), 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--match-head-commit {LB}", e["stop"]["next"])
+
+    def forwarded_row(self, sha: str = "") -> dict:
+        """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
+        read nothing: the row is "forwarded" (finding hq#19725's rows)."""
+        self.broker = True
+        host = mock.patch.object(gg, "policy_host", lambda: "host")
+        host.start()
+        self.addCleanup(host.stop)
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", **({"sha": sha} if sha else {}))
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("forwardedTo"), len(self.handoffs())), ("forwarded", "huge-blue", 1))
+        return e
+
+    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_and_tells_its_requester(self):
+        # hq#19725: 9 rows MERGED on GitHub stayed "forwarded" on the lane VM for hours.
+        self.forwarded_row()
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")  # still open: nothing to say yet
+        self.pr(LA, state="MERGED")
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        [said] = [c for c in self.w.sent() if "merged" in c[-1]]
+        self.assertEqual(said[3], "host/lane")
+        self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
+        self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+
+    def test_a_forwarded_land_the_cache_shows_closed_stops_saying_so(self):
+        self.forwarded_row()
+        self.pr(LA, state="CLOSED")
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertIn("closed unmerged while handed to huge-blue", e["stop"]["reason"])
+        self.tick(gg.LAND_FORWARD_RESEND + 1)
+        self.assertEqual((len(self.handoffs()), self.q.entries[self.KEY]["state"]), (1, "stopped"))
+
+    def test_a_forwarded_land_still_open_past_the_bound_is_handed_off_again_once_per_bound(self):
+        # hq#19725: 61 rows went to an executor that later answered not_executor and were never sent again.
+        e = self.forwarded_row()
+        first = e["handedOff"]["at"]
+        self.tick(gg.LAND_FORWARD_RESEND / 2)
+        self.assertEqual(len(self.handoffs()), 1)  # inside the bound: the far host may still be judging it
+        e = self.tick(gg.LAND_FORWARD_RESEND / 2 + 1)
+        self.assertEqual(len(self.handoffs()), 2)
+        self.assertEqual(json.loads(self.handoffs()[-1][4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual((e["state"], e["forwardResent"]["n"]), ("forwarded", 1))
+        self.assertGreater(e["handedOff"]["at"], first)
+        [row] = [h for h in e["history"] if h.get("event") == "forward_resent"]
+        self.assertIn("handed off again", row["why"])
+        for _ in range(int(gg.LAND_FORWARD_RESEND // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(len(self.handoffs()), 2)  # once per bound, however often the rows are looked at
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
+        self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
+
+    def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
+        self.forwarded_row(sha=LA)
+        self.pr(LB)
+        self.w.cache[self.KEY]["data"]["headParents"] = [LC]  # a push on another commit, not a base merge on the pin
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(LB, e["stop"]["next"])
+        self.tick(gg.LAND_FORWARD_RESEND + 1)
+        self.assertEqual(len(self.handoffs()), 1)
 
     def test_a_handed_off_teammates_pr_is_still_refused_by_the_executors_daemon(self):
         # On the broker host the hand-off is a plain queued land: land_judge's teammate rule stops it there, nothing
@@ -32054,6 +32122,24 @@ class LandForwardTest(Base):
         self.executor_serve(self.sent_batches[0])
         self.exec_tick(x)
         self.assertEqual(x.entries[self.KEY]["state"], "merged")
+
+    def test_a_forward_still_open_past_the_bound_is_sent_to_the_executor_again_and_a_merge_ends_it(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        self.assertEqual((len(self.sent_batches), self.q.entries[self.KEY]["state"]), (1, "forwarded"))
+        self.tick(gg.LAND_FORWARD_RESEND / 2)
+        self.assertEqual(len(self.sent_batches), 1)
+        e = self.tick(gg.LAND_FORWARD_RESEND / 2 + 1)
+        self.assertEqual(len(self.sent_batches), 2)
+        self.assertEqual(self.sent_batches[1]["requests"][0]["id"], self.sent_batches[0]["requests"][0]["id"])
+        self.assertEqual((e["state"], e["forwardResent"]["n"]), ("forwarded", 1))
+        self.pr(LA, state="MERGED")
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+        self.assertEqual(len(self.sent_batches), 2)
 
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
