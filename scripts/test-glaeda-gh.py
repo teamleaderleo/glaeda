@@ -24708,6 +24708,18 @@ class LandTest(Base):
         self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
 
+    def test_the_pr_read_asks_for_enough_parents_to_see_a_base_merge_on_the_pin(self):
+        # 2026-11-22 22:55-23:55Z: the read asked parents(first: 1), so every cached head had one parent, a base merge
+        # on the pin was never seen as one (0 repin_base_merge, 22 of 31 head_moved stops were such merges).
+        asked = re.search(r"parents\(first: (\d+)\)", gg.PR_FIELDS)
+        self.assertGreaterEqual(int(asked.group(1)), 3)  # three, so an octopus merge is not taken for a two-parent one
+        node = {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+            "oid": LB, "parents": {"nodes": [{"oid": LA}, {"oid": LC}]}}}]}}
+        parents = gg.head_parents(node)
+        self.assertEqual(parents, [LA, LC])
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": parents}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA, LC, "d" * 40]}), "")
+
     def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
         # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
         # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read

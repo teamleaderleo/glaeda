@@ -1268,7 +1268,7 @@ PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid 
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
-parents(first: 1) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
+parents(first: 3) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
