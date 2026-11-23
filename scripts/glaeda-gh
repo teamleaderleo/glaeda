@@ -34476,6 +34476,11 @@ def own_kinds_flags(argv: list[str], kind: str, by_option: dict[str, frozenset[s
 WRITE_COMMANDS = ("land", "post", "restart", "serve")
 
 
+def writes(raw: list[str]) -> bool:
+    """RAW is a call that can change GitHub or this host: a write command, but not its `status` read."""
+    return bool(raw) and raw[0] in WRITE_COMMANDS and raw[1:2] != ["status"]
+
+
 def command_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """The first word as the one command it means: (argv, refusal lines).
 
@@ -34666,6 +34671,12 @@ def flag_near_miss_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 + ": it is not guessed",
                 *(f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [option + joined + value] + fixed[i + 1:])}"
                   for option in near)]
+        if meant and writes(raw):
+            # 2026-11-23: `land o/r#1 --jsn` queued a land, read as `--json`. A write never runs from a flag
+            # nobody typed (the intent layer's rule: never make a destructive command looser): name the form.
+            return raw, [f"glaeda-gh: `{name}` is no option of `{typed}`, and `{typed}` writes, so `{meant}` is "
+                         f"not guessed: the exact form is needed",
+                         f"next: {typed_line(['glaeda-gh'] + fixed[:i] + [meant + joined + value] + fixed[i + 1:])}"]
         if meant:
             fixed[i] = meant + joined + value
             said.append(f"`{name}` is `{meant}`")

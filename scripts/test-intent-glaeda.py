@@ -159,6 +159,25 @@ class Writes(Base):
                 self.assertIn("is destructive or outward, so nothing ran: the exact form is needed", err)
                 self.assertIn(f"  {exact}", err)
 
+    def test_a_write_with_a_typo_is_refused_through_main_too(self) -> None:
+        """2026-11-23: `land o/r#1 --jsn` queued a land: glaeda-gh's own flag_near_miss_synonym, which runs in
+        main before any parse, read `--jsn` as `--json`. The whole call path is what must refuse."""
+        for argv, exact, cmd in ((["land", "o/r#1", "--jsn"], "glaeda-gh land o/r#1 --json", "cmd_land"),
+                                 (["post", "comment", "o/r#1", "--bdy", "hi"],
+                                  "glaeda-gh post comment o/r#1 --body hi", "cmd_post"),
+                                 (["restart", "--forse"], "glaeda-gh restart --force", "cmd_restart")):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), mock.patch.object(
+                        gg, cmd, side_effect=AssertionError("must not run")):
+                    self.assertEqual(gg.main(list(argv)), 64)
+                self.assertIn("the exact form is needed", err.getvalue())
+                self.assertIn(exact, err.getvalue())
+
+    def test_a_read_under_a_write_command_still_takes_its_typo(self) -> None:
+        fixed, refusal = gg.flag_near_miss_synonym(["post", "status", "ID", "--jsn"])
+        self.assertEqual((fixed, refusal), (["post", "status", "ID", "--json"], []))
+
     def test_a_misspelled_write_command_is_refused_not_run(self) -> None:
         """2026-11-23: `lnad o/r#1` queued a land, read as `land` by command_spelling_synonym."""
         for typed, meant in (("lnad", "land"), ("pots", "post"), ("restrat", "restart")):
