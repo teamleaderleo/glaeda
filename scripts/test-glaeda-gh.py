@@ -29048,6 +29048,40 @@ class LandTest(Base):
         [sent] = self.quiet_notices()
         self.assertIn("no read of the PR here says it ended", sent[-1])
 
+    def test_a_requeue_after_a_no_verdict_notice_hands_the_land_off_again(self):
+        # The notice says "queue it again", but owner_refused saw the same head handed off before and marked the row
+        # forwarded with no call, so the re-queue did nothing (glaeda#2540, finding 2).
+        self.handed_off()
+        self.assertEqual(len(self.handoffs()), 1)
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.pr(LA)
+        self.tick()
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = {}
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual(len(self.handoffs()), 2, "handed off again")
+        self.assertEqual(e["state"], "forwarded")
+        # a re-queue with no notice since the hand-off is still the one call: marked forwarded again, no second call
+        self.land()
+        for _ in range(3):
+            e = self.tick()
+        self.assertEqual(len(self.handoffs()), 2)
+
+    def test_forward_reads_are_capped_per_tick_and_off_while_parked_on_quota(self):
+        keys = [f"pr:o/r#{n}" for n in range(1, gg.LAND_FORWARD_READS + 4)]
+        for n, key in enumerate(keys, 1):
+            self.q.entries[key] = {"key": key, "repo": "o/r", "number": n, "state": "forwarded", "requester": "host/lane",
+                                   "forwardedTo": "far", "forwardedAt": self.t, "history": []}
+            self.q.save(self.q.entries[key])
+        self.q.queue_quota_until, self.q.queue_quota_at = self.t + 10 * gg.LAND_FORWARD_QUIET, self.t
+        with mock.patch.object(self.q, "queue_park_voided_by", return_value=None):
+            self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.assertEqual(self.w.watched, [], "no read while the queue is parked on quota")
+
     def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
         self.broker = True
         self.pr(LA)

@@ -15542,9 +15542,10 @@ class LandQueue:
         recovery = self.now >= self.recovery_at
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
-        self.forwards_unjudged()
         executor = land_executor(self.config())
         if executor is not None:
+            if not self.queue_quota_parked():
+                self.forwards_unjudged()  # its one-off reads need the login a quota park says is spent
             self.forward_tick(executor)
             return
         self.ingest()
@@ -15552,6 +15553,8 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        if not self.queue_quota_parked():
+            self.forwards_unjudged()  # its one-off reads need the login a quota park says is spent
         self.forwards_follow()  # cache reads and a broker call, no read of this login's: a park holds none of it
         if self.queue_quota_parked():
             # The park holds only the steps that need the login it spent: a judgment, a read, a watch or a nudge.
