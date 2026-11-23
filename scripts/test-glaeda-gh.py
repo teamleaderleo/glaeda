@@ -6730,6 +6730,31 @@ class OverloadTest(Base):
         restarted.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old + 10, "waitBegan": old + 5}], set())
         self.assertEqual(restarted.waited_since[keys[0]], began)
 
+    def test_a_restart_keeps_the_stale_clock_of_a_wait_with_no_persisted_start(self) -> None:
+        """A land's waited watch carries no waitBegan, so a restart counted every one of them from zero: cmux-cp-1,
+        2026-11-22 20:19Z, a restart "cleared" a FIRE at 1823 s while 223 of 346 waited PRs stayed over 600 s old. The
+        daemon keeps waited_since in WAITED_SINCE_FILE, and the next one counts from it; a file older than WAIT_INTEREST
+        (a daemon down longer than any wait's interest) is not read."""
+        keys = self.watch(1)
+        gg.register(keys[0], waited=True, reader="tool:glaeda-land")  # a land's watch: no waitBegan
+        self.daemon.tick(NOW)
+        cache = gg.read_cache(keys[0])
+        begun = self.daemon.waited_since.get(keys[0])
+        self.assertIsNotNone(begun)
+        kept = gg.read_json(gg.BASE / gg.WAITED_SINCE_FILE)
+        self.assertEqual(kept["since"][keys[0]], begun)
+        old = begun + 3 * gg.STALE_DATA_AFTER
+        with mock.patch.object(gg.time, "time", return_value=kept["at"] + 5):
+            restarted = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        restarted.now = old
+        restarted.oldest_data([{"key": keys[0], "cache": {**cache, "dataAt": begun}, "waitedAt": old}], set())
+        self.assertEqual(restarted.waited_since[keys[0]], begun)
+        self.assertGreater(restarted.stale_waited["pr"], gg.STALE_DATA_AFTER)
+        self.assertIsNotNone(restarted.stale_alarm())
+        with mock.patch.object(gg.time, "time", return_value=kept["at"] + gg.WAIT_INTEREST + 1):
+            lapsed = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        self.assertEqual(lapsed.waited_since, {})
+
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
@@ -18141,6 +18166,26 @@ class SpendAlarmTest(AlarmBase):
         self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
         self.assertIn("restarting itself now", self.told_lines()[-1])
 
+    def test_the_valve_restarts_for_a_backlog_of_many_stale_keys_though_some_are_fresh(self) -> None:
+        # cmux-cp-1, 2026-11-22 19:15-20:19Z: 181 of 318 waited PRs past the bound, "backlog: 263 pr reads stored",
+        # FIRE at 1823 s, and the valve answered one_key every tick because some waited PR was fresh
+        self.policy()
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 1823.0}, {"pr": "pr:o/r#5"}
+        self.daemon.fresh_waited = {"pr": 30.0}
+        self.daemon.read_done = {**self.daemon.read_done, "pr": [NOW - 30] * 263}
+        self.daemon.stale_count = {"pr": gg.STALE_ONE_KEY_COUNT}  # a few: still one key's case
+        self.daemon.now = NOW
+        verdict = self.daemon.stale_valve(("warn", "x", {"kind": "pr", "key": "pr:o/r#5"}), self.daemon.policy["alarms"])
+        verdict = self.daemon.stale_valve(verdict, self.daemon.policy["alarms"])
+        self.assertEqual(verdict[2]["valve"], "one_key")
+        self.daemon.stale_count = {"pr": 181}
+        for i in range(2):
+            self.daemon.now = NOW + i * gg.TICK
+            self.daemon.check_alarms()
+        self.assertIsNotNone(self.daemon.valve_due, "181 stale waited keys are a backlog a restart is tried on")
+        self.assertIn("restarting itself now", self.told_lines()[-1])
+
     def test_the_valve_waits_for_a_daemon_to_have_had_its_chance_and_obeys_policy(self) -> None:
         self.policy()
         stale = ("warn", "x", {"kind": "pr"})
@@ -23191,7 +23236,8 @@ class LandWorld:
             return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=timeout,
                                   env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
-                                       "GIT_CONFIG_NOSYSTEM": "1"})
+                                       "GIT_CONFIG_NOSYSTEM": "1",
+                                       **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
@@ -27466,6 +27512,148 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
 
+    def stacked_origin(self, squash: bool = True, conflict: bool = False) -> dict[str, str]:
+        """A real origin for o/r (LAND_UNION_URL pointed at it), as manaflow-ai/cmux-quillet-look stood on 2026-11-22:
+        #2 (stack/a onto main) merged, squashed unless SQUASH is False (a merge commit); #1 (stack/b) still onto
+        stack/a with one commit of its own; refs/pull/2/head kept as GitHub keeps it. CONFLICT: main changed #1's
+        line too after #2 merged. The shas by name: main, a (#2's head), b (#1's head)."""
+        origin = Path(self.tmp.name) / "stacked-origin"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str, **more: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(origin), *args], check=True, capture_output=True,
+                                  text=True, env={**env, **more}).stdout.strip()
+        origin.mkdir()
+        git("init", "-q", "-b", "main")
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "uploadpack.allowAnySHA1InWant", "true")
+        git("config", "receive.denyCurrentBranch", "ignore")
+        (origin / "a.txt").write_text("one\n")
+        (origin / "b.txt").write_text("one\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("checkout", "-qb", "stack/a")
+        (origin / "a.txt").write_text("one\ntwo\n")
+        git("commit", "-qam", "#2's change")
+        a = git("rev-parse", "HEAD")
+        git("update-ref", "refs/pull/2/head", a)
+        git("checkout", "-qb", "stack/b")
+        (origin / "b.txt").write_text("one\nthe lane's line\n")
+        git("commit", "-qam", "#1's own change", GIT_AUTHOR_NAME="Lane Author", GIT_AUTHOR_EMAIL="lane@x",
+            GIT_AUTHOR_DATE="1700000000 +0000")
+        b = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        if squash:
+            git("merge", "-q", "--squash", "stack/a")
+            git("commit", "-qm", "#2's change (#2)")
+        else:
+            git("merge", "-q", "--no-ff", "-m", "Merge #2", "stack/a")
+        if conflict:
+            (origin / "b.txt").write_text("one\nmain's own line\n")
+            git("commit", "-qam", "main changes b.txt")
+        main = git("rev-parse", "HEAD")
+        url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
+        url.start()
+        self.addCleanup(url.stop)
+        self.w.real_git = True
+        self.origin_git = git
+        self.w.api["repos/o/r/pulls?head=o:stack%2Fa"] = json.dumps(
+            [{"number": 2, "merged_at": "2026-11-22T18:00:00Z", "sha": a}])
+        return {"main": main, "a": a, "b": b}
+
+    def stacked_tick(self, head: str) -> dict:
+        """#1 landed pinned at HEAD, onto stack/a, and land_judge refused it stacked_base naming the retarget."""
+        owners = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))  # the test repo is o/r
+        owners.start()
+        self.addCleanup(owners.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "stack/b", "baseRefName": "stack/a"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("stacked_base", head, {"kind": "retarget", "base": "main"},
+                                      "gh pr edit 1 -R o/r --base main"))
+        return self.tick()
+
+    def retargets(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls() if c[:4] == ["api", "-X", "PATCH", "repos/o/r/pulls/1"]
+                or c[:2] == ["pr", "edit"]]
+
+    def test_a_stacked_pr_whose_base_squash_merged_is_rebased_off_it_then_retargeted(self):
+        """manaflow-ai/cmux-quillet-look#3, 2026-11-22 18:05Z: #2 (its base's PR) squash-merged; the land stopped
+        "stacked_base: 3 identical refusals in a row" (each `gh pr edit --base` refused for classic projects), and
+        retargeted by hand it read CONFLICTING until a person rebased it --onto main off #2's head. The queue now
+        rebases its own commit off #2's head, pushes it leased at the judged head, retargets it through REST, and the
+        pin follows the head it made."""
+        sha = self.stacked_origin()
+        e = self.stacked_tick(sha["b"])
+        new = self.origin_git("rev-parse", "refs/heads/stack/b")
+        self.assertNotEqual(new, sha["b"], e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", new).split()[1:], [sha["main"]])
+        self.assertEqual(self.origin_git("diff", "--name-only", sha["main"], new), "b.txt")  # its own diff only
+        self.assertEqual(self.origin_git("show", f"{new}:b.txt"), "one\nthe lane's line")
+        self.assertEqual(self.origin_git("log", "-1", "--format=%an <%ae> %at %s", new),
+                         "Lane Author <lane@x> 1700000000 #1's own change")
+        self.assertEqual(self.retargets(), [["api", "-X", "PATCH", "repos/o/r/pulls/1", "-f", "base=main", "--jq",
+                                             ".base.ref"]])
+        done = [h for h in e["history"] if h["event"] == "stacked_rebased"]
+        self.assertEqual([(h["head"], h["rebased"], h["after"], h["pull"], h["commits"]) for h in done],
+                         [(sha["b"][:12], new[:12], sha["a"][:12], 2, 1)])
+        self.assertEqual(e["pinSha"], new)
+        self.assertIn(f"{sha['b'][:12]} -> {new[:12]}", e["stackedRebase"])
+        # GitHub shows it onto main at the new head: judged ok and merged pinned, the merge notice saying the rebase
+        self.w.set_pr(self.KEY, {**land_pr(new), "headRefName": "stack/b", "baseRefName": "main"}, self.t)
+        self.w.answers.append(ok_answer(new))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(new)
+        said = " ".join(" ".join(c) for c in self.w.sent())
+        self.assertIn("rebased its 1 own commit after #2's head", said)
+
+    def test_a_stacked_pr_whose_base_merged_with_a_merge_commit_is_only_retargeted(self):
+        sha = self.stacked_origin(squash=False)
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
+        self.assertEqual(len(self.retargets()), 1, e.get("stop"))
+        self.assertEqual([h for h in e["history"] if h["event"] == "stacked_rebased"], [])
+        self.assertEqual(e["pinSha"], sha["b"])
+
+    def test_a_stacked_rebase_that_conflicts_stops_pushes_nothing_and_names_the_hand_step(self):
+        sha = self.stacked_origin(conflict=True)
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "retarget_conflict"))
+        self.assertIn(f"conflicts at {sha['b'][:12]} in b.txt", e["stop"]["reason"])
+        self.assertIn("git rebase --onto origin/main <the base PR's last head>", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])
+        self.assertEqual(self.retargets(), [])  # the base is not changed either
+
+    def test_a_stacked_rebase_whose_read_fails_is_a_refused_step_not_a_bare_retarget(self):
+        """A failure decides nothing: the base is not changed (which would leave it conflicting with no stacked_base
+        refusal to come back to), the step backs off and the next judgment names it again."""
+        sha = self.stacked_origin()
+        self.w.api["repos/o/r/pulls?head=o:stack%2Fa"] = None
+        e = self.stacked_tick(sha["b"])
+        self.assertEqual(self.retargets(), [])
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"].startswith("stacked_rebase")],
+                         ["stacked_rebase_failed"])
+
+    def test_a_stacked_pr_of_an_owner_this_queue_never_pushes_to_is_only_retargeted(self):
+        sha = self.stacked_origin()
+        with mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"manaflow-ai"})):
+            self.w.set_pr(self.KEY, {**land_pr(sha["b"]), "headRefName": "stack/b", "baseRefName": "stack/a"}, self.t)
+            gg.land_request("land", "o/r#1", [], "host/lane", sha=sha["b"])
+            self.w.answers.append(refusal("stacked_base", sha["b"], {"kind": "retarget", "base": "main"}))
+            self.tick()
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])
+        self.assertEqual(len(self.retargets()), 1)
+
+    def test_retarget_goes_through_rest_not_gh_pr_edit_on_a_host(self):
+        """gh 2.45's `pr edit` reads classic project cards first and GitHub refuses that read."""
+        self.assertEqual(gg.land_retarget_args("o/r", "3", "main", False)[:4], ["api", "-X", "PATCH",
+                                                                                "repos/o/r/pulls/3"])
+        self.assertEqual(gg.land_retarget_args("o/r", "3", "main", True), ["pr", "edit", "3", "-R", "o/r", "--base",
+                                                                           "main"])
+
     def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
         """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
         head, base = self.union_origin()
@@ -30643,6 +30831,45 @@ class LandTest(Base):
         self.retries(60)
         self.tick(30)
         self.assertEqual(self.explained()[:2], ["2000", "2001"])
+
+    def test_the_waited_window_is_no_wider_than_the_read_loop_keeps_fresh(self):
+        """cmux-cp-1, 2026-11-22 19:15-20:19Z: the adaptive pool at 74 to 157 workers held 150-300 due lands waited
+        (LAND_WATCH_AHEAD per worker) against 263-298 PR reads stored per 600 s, and p50 waited data was 1,034 s old.
+        The window is the workers' or the daemon's read room (LAND_WATCH_SHARE of its PR reads), whichever is less."""
+        calls: list[tuple[str, bool, bool]] = []
+
+        def register(key: str, waited: bool = False, once: bool = False, **kw: Any) -> None:
+            if not key.startswith("head:"):
+                calls.append((key, waited, once))
+        p = mock.patch.object(gg, "register", register)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 10
+        room = [3]
+        self.q = gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, nudge=self.nudge_read, inline=True,
+                              config=self.w.config, reads_upstream=lambda: False, refresh=self.refresh,
+                              behind=lambda *a: None, broker_client=lambda: False, snapshot_of=self.snaps.get,
+                              read_room=lambda: room[0])
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        for i in range(10):
+            self.q.jobs[f"pr:o/r#{90 + i}"] = Busy()
+        keys = [self.stuck(2000 + i, 3600 - 30 * i) for i in range(60)]  # due, oldest wake first
+        self.tick(30)
+        self.assertEqual({k for k, w, _ in calls if w}, set(keys[:3]))
+        self.assertEqual(self.q.lean, set(keys[3:]))
+        room[0] = 1000  # room past the workers' window: the workers' window holds
+        calls.clear()
+        self.tick(gg.LAND_TOUCH)
+        self.assertEqual(self.q.lean, set(keys[10 * gg.LAND_WATCH_AHEAD:]))
+        # the daemon's room: a share of its PR reads over the window, never under the floor
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.read_done = NOW, {"pr": [NOW - 30] * 300 + [NOW - gg.READ_PROGRESS_WINDOW - 1] * 500}
+        self.assertEqual(d.land_read_room(), int(300 * gg.LAND_WATCH_SHARE))
+        d.read_done = {"pr": []}
+        self.assertEqual(d.land_read_room(), gg.LAND_WATCH_FLOOR)
 
     def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
         """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
@@ -36267,9 +36494,9 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
     def test_a_repository_target_still_files_a_new_issue_and_a_title_with_a_number_refuses(self) -> None:
         """The number is the whole signal, and only without --title: `post issue o/r --title T` is untouched,
         and a title *with* a number is the one ambiguous call, so it refuses naming both writes."""
-        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r"), "")
-        self.assertEqual(gg.post_issue_names_an_existing_issue(""), "")
-        self.assertEqual(gg.post_issue_names_an_existing_issue("o/r#15832"), "15832")
+        self.assertEqual(gg.post_target_number("o/r"), "")
+        self.assertEqual(gg.post_target_number(""), "")
+        self.assertEqual(gg.post_target_number("o/r#15832"), "15832")
         self.assertEqual(self.one_call(["post", "issue", "o/r", "--title", "T", "--body", "B"]),
                          ["issue", "create", "-R", "o/r", "--title", "T", "--body", "B"])
         lines: list[str] = []
@@ -36279,6 +36506,53 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         said = "\n".join(lines)
         self.assertIn("drop --title to comment on it", said)
         self.assertIn("pass OWNER/REPO to file a new issue", said)
+
+    def test_a_pr_target_that_names_a_number_is_a_comment_on_that_pull_request(self) -> None:
+        """No pull request is opened at a number, so `post pr o/r#5 --body B` can only mean a comment on #5.
+        Measured 2026-11-23: `post pr manaflow-ai/cmux#51063 --body-file ...` was refused ("post pr takes
+        OWNER/REPO"), and the comment cost a second call under `post comment`."""
+        for target in ("o/r#5", "o/r/5", "pr:o/r#5", "https://github.com/o/r/pull/5", "5"):
+            with self.subTest(target):
+                queued: list[dict] = []
+                with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                        mock.patch.object(gg, "cmd_gh", lambda gh: self.fail("a PR was opened in one call")), \
+                        mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                        mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                        mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                        mock.patch.object(gg, "daemon_running", lambda *a, **k: True), \
+                        mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                        mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                        mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gg.main(["post", "pr", target, "--body", "B"]), 0)
+                self.assertEqual([(i["kind"], i["repo"], i["number"]) for i in queued], [("comment", "o/r", 5)])
+                self.assertIn("which exists: this is a comment on it", err.getvalue())
+                self.assertIn("a new pull request takes OWNER/REPO", err.getvalue())
+
+    def test_opening_a_pull_request_is_untouched_and_a_number_with_its_flags_refuses(self) -> None:
+        """The number is the whole signal, and only without the flags that open one: `post pr o/r --head ...`
+        is queued as before, and a number *with* --title is the one ambiguous call, refused naming both."""
+        queued: list[dict] = []
+        with mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                mock.patch.object(gg, "daemon_running", lambda *a, **k: True), \
+                mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
+            self.assertEqual(gg.main(["post", "pr", "o/r", "--head", "h", "--base", "b", "--title", "T",
+                                      "--body", "B"]), 0)
+        self.assertEqual([(i["kind"], i["repo"], i["head"], i["title"]) for i in queued],
+                         [("pr", "o/r", "h", "T")])
+        lines: list[str] = []
+        with mock.patch.object(gg, "cwd_repo", lambda *a, **k: "o/r"), \
+                mock.patch.object(gg, "say_waiting", lambda text, *a, **k: lines.append(str(text))):
+            self.assertEqual(gg.main(["post", "pr", "o/r#5", "--title", "T", "--body", "B"]), 64)  # a refusal
+        said = "\n".join(lines)
+        self.assertIn("names pull request 5, which exists: drop --title", said)
+        self.assertIn("pass OWNER/REPO to open a new one", said)
+        self.assertEqual(gg.post_target_number("o/r"), "")
+        self.assertEqual(gg.post_target_number("o/r#51063"), "51063")
 
     def test_a_merge_is_named_not_made(self) -> None:
         """The one write still printed, and why: a merge is pinned to a head sha this parser does not take."""
@@ -36695,6 +36969,8 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
             self.assertIn(f"`glaeda-gh wait {argv[0]}`", said, "the blocking sibling is named, not hidden")
         # The narrowing is the parent's own contract, asserted directly so the reason survives a refactor.
         self.assertFalse(gg.nesting_parent_fits("post", "pr", "o/r#5", set()))
+        # `post pr o/r#5 --body-file F` is a comment on #5 since 2026-11-23, so `post` fits that one
+        self.assertTrue(gg.nesting_parent_fits("post", "pr", "o/r#5", {"bodyfile"}))
         self.assertTrue(gg.nesting_parent_fits("post", "pr", "o/r", {"title"}))
         self.assertFalse(gg.nesting_parent_fits("post", "comment", "o/r#5", set()))
         self.assertTrue(gg.nesting_parent_fits("post", "comment", "o/r#5", {"bodyfile"}))
@@ -37021,6 +37297,61 @@ class ABareWaitFlagTest(unittest.TestCase):
         with mock.patch.object(gg, "cmd_post_status", fake_post_status):
             code = gg.main(["post", "status", "1795389726663-2573281-b1d8b9", "--wait"])
         self.assertEqual((code, seen.get("wait")), (0, 3600.0))
+
+
+class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
+    """`--wait S` and `--timeout S` are one flag wherever this tool waits for something to end.
+
+    Measured 2026-11-23, waiting for a queued PR's number: `glaeda-gh post status ID --wait --timeout 600`
+    printed "read as `glaeda-gh post status ID --wait 3600 --timeout 600`" -- the bare-wait reader had
+    already given the first spelling its default -- and then exited 2 with "unrecognized arguments:
+    --timeout 600", with nothing waited for; the wait was retyped in a second call. `land` has declared
+    both spellings on one destination since 2026-11-22, and `post`, `checks`, `on-event` and `wait` each
+    declared one of the two, so which spelling worked depended on the command."""
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        enter = contextlib.redirect_stderr(self.err)
+        enter.__enter__()
+        self.addCleanup(enter.__exit__, None, None, None)
+
+    def test_every_command_that_waits_answers_to_both_spellings(self) -> None:
+        """The structural claim, so a command added later cannot take only one of them: the set of commands
+        owning `--wait` is the set owning `--timeout`."""
+        self.assertEqual(gg.flag_commands("--wait"), gg.flag_commands("--timeout"))
+        self.assertIn("post", gg.flag_commands("--timeout"))  # the fixture: the command that was refused
+
+    def test_a_timeout_on_a_command_that_spelled_it_wait_is_that_wait(self) -> None:
+        """And a duration with a unit, which `seconds` reads: `type=float` refused `20m` as not a number."""
+        for typed, dest, want in (
+                (["post", "status", "17953-44-03", "--timeout", "600"], "wait", 600.0),
+                (["post", "status", "17953-44-03", "--timeout", "20m"], "wait", 1200.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--timeout", "45"], "wait", 45.0),
+                (["on-event", "replay", "--timeout", "90s"], "wait", 90.0),
+                (["wait", "pr", "o/r#1", "--wait", "5m"], "timeout", 300.0)):
+            self.assertEqual(getattr(gg.parser().parse_args(typed), dest), want, typed)
+
+    def test_main_waits_the_number_for_the_call_that_was_refused(self) -> None:
+        """End to end, the exact argv measured 2026-11-23: one wait of 600 seconds, in this call."""
+        seen: dict[str, object] = {}
+
+        def fake_post_status(key: str, wait: float, *a: object, **kw: object) -> int:
+            seen["wait"] = wait
+            return 0
+
+        with mock.patch.object(gg, "cmd_post_status", fake_post_status):
+            code = gg.main(["post", "status", "1795398633920-445750-03874f", "--wait", "--timeout", "600"])
+        self.assertEqual((code, seen.get("wait")), (0, 600.0))
+
+    def test_a_deadline_the_loop_cannot_honour_is_still_refused(self) -> None:
+        """What `seconds` buys on the commands that read `type=float`: `inf` is a wait nobody is waiting for
+        and `nan` never reaches its deadline."""
+        for typed in (["post", "status", "ID", "--wait", "inf"], ["post", "status", "ID", "--timeout", "nan"],
+                      ["checks", "o/r", "a" * 40, "--consumer", "x", "--wait", "-5"],
+                      ["on-event", "replay", "--timeout", "nan"]):
+            with self.assertRaises(SystemExit) as exit_:
+                gg.parser().parse_args(typed)
+            self.assertNotEqual(exit_.exception.code, 0, typed)
 
 
 class AFlagsCaseConventionTest(unittest.TestCase):
