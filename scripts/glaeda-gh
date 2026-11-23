@@ -34644,6 +34644,18 @@ class ShorthandFlag(argparse.Action):
         say_waiting(f"glaeda-gh: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
 
 
+class IgnoredConsumer(argparse.Action):
+    """`--consumer NAME` on a command that charges no consumer. Only `checks` reads a head on a named consumer's
+    budget; `status` and `wait` read the shared cache of a PR, run or comment, which no caller pays for by name. A
+    session that typed it for `checks` and then typed it here used to get a usage error and nothing else, so the
+    flag is accepted, ignored, and said on stderr (2026-11-23)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        say_waiting(f"glaeda-gh: {parser.prog} charges no consumer, so --consumer {values} is ignored "
+                    f"(only `glaeda-gh checks` reads a head on a consumer's budget)")
+
+
 class OptionalJobId(argparse.Action):
     """JOB_ID when `--job ID` may stand for it: an absent JOB_ID leaves what `--job` set, whichever came first."""
 
@@ -34683,6 +34695,8 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("--verbose", action="store_true",
                        help="list up to 10 superseded attempts and up to 20 failed checks (as AGENT_VERBOSE=1); "
                             "by default the summary counts the superseded ones and lists 10 failures")
+        s.add_argument("--consumer", metavar="NAME", action=IgnoredConsumer, default=None,
+                       help=argparse.SUPPRESS)  # accepted and ignored: only `checks` charges a consumer
         if name == "wait":
             until = s.add_mutually_exclusive_group()
             until.add_argument("--until", choices=("green", "done", "required", "merged"), default=None,

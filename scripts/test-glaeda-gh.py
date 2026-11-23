@@ -5831,6 +5831,26 @@ class ClientTest(Base):
             self.assertEqual(waited.sha, sha)
             self.assertEqual(vars(waited), vars(gg.parser().parse_args(["wait", kind, target, "--sha", sha])))
 
+    def test_status_and_wait_accept_the_consumer_a_session_typed_for_checks(self) -> None:
+        """A session that had just run `glaeda-gh checks OWNER/REPO SHA --consumer NAME`, which requires it, typed
+        `glaeda-gh status pr OWNER/REPO N --consumer NAME` and got "unrecognized arguments: --consumer NAME" and no
+        state at all (2026-11-23). status and wait charge no consumer, so the flag is accepted, ignored, and said on
+        stderr; the parse is otherwise the one without it."""
+        for argv in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1"], ["wait", "run", "o/r/12"]):
+            plain = gg.parser().parse_args(list(argv))
+            said = io.StringIO()
+            with self.diagnostics_in(said):
+                args = gg.parser().parse_args([*argv, "--consumer", "autoland-conflict-fix"])
+            self.assertEqual(args.consumer, "autoland-conflict-fix", argv)
+            self.assertEqual({k: v for k, v in vars(args).items() if k != "consumer"},
+                             {k: v for k, v in vars(plain).items() if k != "consumer"}, argv)
+            self.assertIn("charges no consumer", said.getvalue(), argv)
+            self.assertIn("autoland-conflict-fix", said.getvalue(), argv)
+        # `checks` still requires it: the flag means something there, and this change does not make it optional.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                gg.parser().parse_args(["checks", "o/r", "a" * 40])
+
     def test_land_pin_queues_with_the_shared_quota_spent(self):
         """transcript-lessons (cmuxterm-hq#16805): `land --sha` refused "cannot read OWNER/REPO#N's head to check
         --match-head-commit" while the shared quota was short. Every gh read refused (gh-quota's exit 3): the pinned
