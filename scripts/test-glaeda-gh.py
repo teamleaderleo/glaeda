@@ -7419,7 +7419,8 @@ class FleetBudgetTest(Base):
         self.assertEqual(gg.fetch_host("far", False)["budget"], {})
         args = Path(gg.REACH_CMD + ".args").read_text().splitlines()
         self.assertEqual(args[:3], ["far", "sh", "-c"])
-        self.assertEqual(shlex.split("\n".join(args[3:])), [gg.FLEET_HOST_SCRIPT])
+        self.assertEqual(shlex.split("\n".join(args[3:])),
+                         [gg.remote_self_bounded(gg.FLEET_HOST_SCRIPT, gg.FLEET_HOST_TIMEOUT)])
         gg.REACH_CMD = self.script("reach", 'echo "reach: no route to far" >&2; exit 4\n')
         self.assertEqual(gg.fetch_host("far", False)["error"], "unreachable (exit 4: reach: no route to far)")
         gg.REACH_CMD = self.script("reach", "sleep 30\n")
@@ -7591,6 +7592,153 @@ class BoundedSubprocessTest(unittest.TestCase):
     def test_an_answer_within_the_deadline_is_returned(self) -> None:
         result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+
+
+class ChildReapingTest(unittest.TestCase):
+    """cosmic-gray 2026-11-22: 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days (alert sends
+    nobody waited for, many started by an image the daemon had execv'd away) and 55 `reach` probes of the budget
+    sweep alive 29 minutes past their 25 s bound, the bound held only by a caller that was gone. Every child serve
+    does not wait for is reaped each tick, the old image's by PID; a bounded child ends at its bound on its own."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("SELF_BOUND_SLACK", "SELF_BOUND_KILL"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+        gg.SELF_BOUND_SLACK = 0.3
+        gg.SELF_BOUND_KILL = 1
+        self.addCleanup(self.forget)
+
+    def forget(self) -> None:
+        with gg.DETACHED_LOCK:
+            gg.DETACHED.clear()
+            gg.INHERITED.clear()
+
+    def tool(self, body: str) -> str:
+        path = Path(self.tmp.name) / f"tool-{len(os.listdir(self.tmp.name))}"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def stat(self, pid: int) -> str:
+        done = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def zombie(self, pid: int) -> bool:
+        return self.stat(pid).startswith("Z")
+
+    def gone(self, pid: int, within: float) -> bool:
+        """PID no longer runs (absent, or a zombie of a parent that is not this test) within WITHIN seconds."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if not self.stat(pid) or self.zombie(pid):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_no_timeout_or_no_bound_leaves_the_argv_alone(self) -> None:
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: ""}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], None), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], math.inf), ["sh", "-c", "true"])
+        absent = os.fspath(Path(self.tmp.name) / "absent")
+        self.assertEqual(gg.self_bounded([absent], 5), [absent])  # Popen's OSError names it, not timeout's 127
+        fake = self.tool("exec \"$@\"\n")
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: fake}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), [fake, "-k", "1", "5.3", "sh", "-c", "true"])
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_the_bound_ends_the_whole_group_after_its_caller_is_gone(self) -> None:
+        """The caller never waits (it is gone: an execv, a SIGKILL); the child and the grandchild holding its pipes
+        still end at the bound."""
+        marker = Path(self.tmp.name) / "grandchild.pid"
+        tool = self.tool(f"sleep 60 &\necho $! > {marker}\nsleep 60\n")
+        proc = subprocess.Popen(gg.self_bounded([tool], 0.2), start_new_session=True, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        deadline = time.monotonic() + 5
+        while not (marker.exists() and marker.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(marker.read_text())
+        self.assertTrue(self.gone(grandchild, 8), "the grandchild outlived its bound")
+        self.assertIsNotNone(proc.wait(8))
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_run_bounded_answers_as_before_under_its_own_bound(self) -> None:
+        result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+        self.assertEqual(gg.run_bounded(["cat"], 10, input_text="in\n").stdout, "in\n")
+        with self.assertRaises(OSError):
+            gg.run_bounded([os.fspath(Path(self.tmp.name) / "absent")], 10)
+
+    def test_the_remote_script_bounds_itself_where_the_host_has_timeout(self) -> None:
+        done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo \"@@x 'q'\"", 5)], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.stdout, "@@x 'q'\n")
+        if any(os.access(p, os.X_OK) for p in gg.TIMEOUT_PATHS):
+            started = time.monotonic()
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("sleep 30", 0.3)], capture_output=True,
+                                  timeout=30)
+            self.assertEqual(done.returncode, 124)
+            self.assertLess(time.monotonic() - started, 10)
+        with mock.patch.object(gg, "TIMEOUT_PATHS", (os.fspath(Path(self.tmp.name) / "none"),)):
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo plain", 5)], capture_output=True,
+                                  text=True, timeout=30)
+        self.assertEqual(done.stdout, "plain\n")  # a host with no timeout runs it as it is
+
+    def until_zombie(self, pid: int) -> bool:
+        deadline = time.monotonic() + 5
+        while not self.zombie(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.zombie(pid)
+
+    def test_detached_children_are_reaped_and_never_left_defunct(self) -> None:
+        first = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertTrue(self.until_zombie(first.pid), "it ended, and nothing waited for it yet")
+        second = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertFalse(self.zombie(first.pid), "the next spawn reaps what ended")
+        self.assertTrue(self.until_zombie(second.pid))
+        self.assertEqual(gg.reap_children(), 0)  # what serve's tick does
+        self.assertFalse(self.zombie(second.pid))
+        self.assertEqual(gg.DETACHED, [])
+
+    def test_a_bounded_child_carries_its_deadline_for_the_reaper(self) -> None:
+        before = time.time()
+        env = gg.deadline_env({"PATH": "/usr/bin:/bin"}, 10)
+        self.assertEqual(env["CMUX_DEADLINE_OWNER"], "glaeda-gh")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertTrue(before + 10 <= int(env["CMUX_DEADLINE"]) <= time.time() + 10 + 0.3 + 1 + 1, env)
+        self.assertIsNone(gg.deadline_env(None, None))
+        self.assertEqual(gg.deadline_env({"A": "1"}, math.inf), {"A": "1"})
+        seen = gg.run_bounded(["sh", "-c", 'echo "$CMUX_DEADLINE_OWNER $CMUX_DEADLINE"'], 10).stdout.split()
+        self.assertEqual(seen[0], "glaeda-gh")
+        self.assertGreaterEqual(int(seen[1]), int(before) + 10)
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_a_bounded_detached_child_ends_at_its_bound(self) -> None:
+        proc = gg.spawn_detached(["sleep", "30"], bound=0.2, stdin=subprocess.DEVNULL)
+        self.assertIsNotNone(proc.wait(10))
+        self.assertEqual(gg.reap_children(), 0)
+
+    def test_the_previous_images_children_are_adopted_by_pid_and_reaped(self) -> None:
+        """An execv keeps the PID and its children; the new image holds no Popen for them."""
+        pids = [os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ) for _ in range(2)]
+        pids.append(os.posix_spawn("/bin/sh", ["sh", "-c", "sleep 1"], os.environ))
+        self.assertLessEqual(set(pids), gg.child_pids(os.getpid()))
+        with mock.patch.object(gg, "child_pids", return_value=set(pids)):
+            self.assertEqual(gg.adopt_inherited(), 3)
+        deadline = time.monotonic() + 5
+        while not all(self.zombie(p) for p in pids[:2]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(gg.reap_children(), 1)  # the sleeping one still runs
+        self.assertFalse(any(self.zombie(p) for p in pids[:2]))
+        deadline = time.monotonic() + 10
+        while gg.reap_children() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(gg.INHERITED, set())
+        with mock.patch.object(gg, "child_pids", return_value={999999}):
+            gg.adopt_inherited()
+        self.assertEqual(gg.reap_children(), 0)  # not ours: dropped, never retried
 
 
 class TickBudgetTest(Base):
@@ -26357,6 +26505,110 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], self.w.gh_calls("api")), ("stopped", "teammate", []))
 
+    # land_judge's ci_never_ran refusal at HEAD, as it answers it: a "command" step whose text starts CI by hand.
+    CI_NEVER_NEXT = ("test \"$(git rev-parse HEAD)\" = %s && git commit --allow-empty --only -m "
+                     "'ci: start CI now that the base is set' && git push && glaeda-gh wait pr o/r#1 --until done "
+                     "--timeout 1800")
+
+    def ci_never_ran(self, head: str) -> tuple[int, dict]:
+        nxt = self.CI_NEVER_NEXT % head
+        return refusal("ci_never_ran", head, {"kind": "command", "text": nxt}, nxt=nxt,
+                       reason=f"land-judge: refused: the repo's own CI never ran at {head}: it has no pull_request "
+                              "Actions run (its only PR runs are pull_request_target: Test integrity), while PRs into "
+                              "main run Polling guard, Skills tests")
+
+    def updated_to(self, new_head: str, refused: bool = False) -> dict:
+        """A land whose own update-branch at LA made NEW_HEAD, judged there. REFUSED: GitHub's own update had made it
+        first, so the pinned send came back "expected head sha didn't match current head ref" (hq#16382's shape)."""
+        self.pr(LA)
+        self.land()
+        if refused:
+            self.w.gh_rc["update"] = 1
+            self.w.gh_err["update"] = ('{"message":"expected head sha didn\u2019t match current head ref.",'
+                                       '"status":"422"}')
+        self.w.answers.append(refusal("red_not_excused", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                              "needs_newer_base": ["ci"]}))
+        self.tick()
+        self.w.gh_rc.pop("update", None)
+        self.pr(new_head, checks=[])
+        self.w.answers.append(self.ci_never_ran(new_head))
+        return self.tick(60)
+
+    def test_ci_never_ran_at_the_head_this_land_made_waits_for_the_run_to_start(self):
+        # efficiency-standing-lane, 2026-11-21 08:39Z (LAND_CI_START's comment): `glaeda-gh land
+        # manaflow-ai/cmuxterm-hq#16382 --wait 2700` ran its own update-branch, judged the merge head it made 70 s
+        # later, and stopped ci_never_ran with ~45 min of the caller's wait unspent, for a PR that went green.
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                e = self.updated_to(LB, refused=refused)
+                self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB),
+                                 e.get("stop"))
+                # Waited from the moment that head is known to be this land's: the read that found it (updatedHeadAt)
+                # when the send went through, the refused send's own step 60 s earlier when it did not.
+                self.assertAlmostEqual(e["wakeAt"] - self.t, gg.LAND_CI_START - (60 if refused else 0), delta=5)
+                self.assertEqual([h["event"] for h in e["history"]][-1], "ci_start_wait")
+                # The refusal's own step is an empty commit, which would move this head and orphan the runs being
+                # created at it: nothing names it to the caller while the wait stands.
+                self.assertIsNone(e.get("stop"))
+                self.assertNotIn("allow-empty", json.dumps(e["wait"]))
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_the_base_merge_land_judge_itself_made_waits_too(self):
+        # manaflow-ai/cmuxterm-hq#19554, 2026-11-22 (LAND_CI_START's comment): the same race from the other producer
+        # -- this land's own base merge (land_judge's stale_main_update inside the judgment, recorded by
+        # note_judge_update, no update_branch step at all) made d3e8c81b5adf, the judgment at it refused ci_never_ran
+        # with only pull_request_target read, and minutes later four of the pull_request workflows that refusal named
+        # were in progress at that head. One predicate (land_own_head_at) answers for every producer.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.w.answers.append(self.judge_merged_base(LA))
+        e = self.tick()
+        self.assertEqual((e.get("updateSent") or {}).get("head"), LA)
+        self.assertIsNone((e.get("lastAction") or {}).get("kind"))  # no step of the queue's: the judgment merged it
+        self.w.set_pr(self.KEY, land_pr(LB, parent=LA, checks=[]), self.t + 5)
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, "d" * 40], headParent=LA)
+        self.w.answers.append(self.ci_never_ran(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", LB), e.get("stop"))
+        self.assertIn("ci_start_wait", [h["event"] for h in e["history"]])
+        self.assertIsNone(e.get("stop"))
+        self.assertNotIn("allow-empty", json.dumps(e["wait"]))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_the_run_appearing_at_that_head_is_judged_as_usual(self):
+        e = self.updated_to(LB)
+        self.pr(LB, checks=[("ci", "IN_PROGRESS", None)])  # the repo's own pull_request run started
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 2))
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(30)
+        self.assert_merged_at(LB)
+
+    def test_ci_never_ran_stops_once_no_run_has_appeared_within_the_bound(self):
+        e = self.updated_to(LB)
+        e = self.run_hour(lambda: self.ci_never_ran(LB), seconds=gg.LAND_CI_START + 600, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "ci_never_ran"))
+        self.assertIn("none ever appeared at " + LB[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertIn("glaeda-gh land o/r#1 --wait", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_ci_never_ran_at_a_head_no_step_of_this_land_made_stops_at_once(self):
+        # hq#11655's shape (a head carrying only pull_request_target checks that nothing of this land's made):
+        # nothing is going to start the repo's CI for it, so the refusal stays one refusal, never a wait.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.ci_never_ran(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.explains())), ("stopped", "ci_never_ran", 1))
+        self.assertIn("no step of this land made " + LA[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_no_update_branch_while_the_heads_checks_run(self):
         self.pr(LA)
         self.land()
@@ -27877,6 +28129,42 @@ class LandTest(Base):
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
 
+    def test_a_prs_own_ci_job_rate_limit_parks_only_its_entry_and_never_halves_the_pool(self):
+        """cmux-cp-1, 2026-11-22 17:42-21:00Z: 10 of 11 host-wide parks were land_judge's "base_red_excuse.py job
+        rate-limited at HEAD" (one PR's CI job printed only its repo installation's API refusal), worded as a quota
+        refusal with a reset. Each stopped every land 2-4 min and halved the pool, though no pool this host reads was
+        spent. That PR waits for the time it names; the next PR is judged on the same pass; the pool keeps its size."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        retry = self.t + 1500
+        at = time.strftime("%H:%M", time.gmtime(retry))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 1500}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: base_red_excuse.py job "
+            f"rate-limited at {LA} (exit 1): job-rate-limited: run 45060196034; job 130862862041; no attempt before "
+            f"{at}Z. Rerun run 45060196034 (job 130862862041) no sooner than {at}Z; the repo installation's API limit "
+            "refused only that hand-off job")))
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        refused_before = self.q.quota_refused
+        self.tick()
+        e = self.q.entries[self.KEY]
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"].get("own")), ("waiting", "quota", True))
+        self.assertEqual(e["wakeAt"], said + gg.land_jitter(self.KEY, said))
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        self.assertEqual(self.q.quota_refused, refused_before)  # adapt_pool does not halve on it
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged on the same pass
+
+    def test_the_job_quota_words_are_land_judges_own(self):
+        """LAND_JOB_QUOTA matches land_judge's fixed lead only, not a reset that merely mentions a job."""
+        self.assertTrue(gg.LAND_JOB_QUOTA.search("base_red_excuse.py job rate-limited at 908aa0087803ab6f006c9a77fb"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("quota: not judged, retry after 09:00Z (reset): GraphQL spent"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("base_red_excuse.py was rate-limited at 908aa0087803"))
+
     def test_a_ci_jobs_rate_limit_parks_only_its_entry_never_the_queue(self):
         """land_judge's "job rate-limited" quota answer names one CI job's rerun time on the installation's limit:
         its row waits for it, and the next row is judged on the same pass (LAND_JOB_QUOTA)."""
@@ -28112,9 +28400,9 @@ class LandTest(Base):
         stored = json.dumps([gg.read_json(gg.land_dir() / gg.LAND_QUOTA_FILE), e,
                              gg.land_queue_parked(self.t), gg.land_line(e, self.t, latch=None)])
         self.assertNotIn("4242424242", stored)
-        self.assertIn("user ID <redacted>", stored)
+        self.assertIn(f"user {gg.gh_quota_label()}", stored)  # the login, not the id (gh_said)
         self.assertIn(f"retry after {at}Z", stored)  # the actionable words are kept
-        self.assertEqual(gg.land_redact("for user ID 4242424242."), "for user ID <redacted>.")
+        self.assertEqual(gg.land_redact("for user ID 4242424242."), f"for user {gg.gh_quota_label()}.")
         self.assertEqual(gg.land_redact('{"user": 4242424242}'), '{"user": 4242424242}')  # only gh's own sentence
 
     def test_a_park_an_older_daemon_stored_is_redacted_on_the_way_out(self):
@@ -28123,7 +28411,7 @@ class LandTest(Base):
         gg.write_json(gg.land_dir() / gg.LAND_QUOTA_FILE, {
             "until": self.t + 1800, "at": self.t,
             "reason": "land-judge: refused: quota: gh: API rate limit already exceeded for user ID 4242424242."})
-        self.assertIn("user ID <redacted>", gg.land_queue_parked(self.t)["reason"])
+        self.assertIn(f"user {gg.gh_quota_label()}", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", gg.land_queue_parked(self.t)["reason"])
         self.assertNotIn("4242424242", self.queue().queue_quota_reason)
 
@@ -37131,6 +37419,141 @@ class InCallRaceTest(Base):
         self.daemon.transport = overlapped
         self.daemon.request("GET", "/repos/o/r/pulls/1")
         self.assertIs(self.daemon.in_call, other)
+
+
+# The line `glaeda-gh status pr` printed on 2026-11-22, with the id replaced by a fake: the shape gh and GitHub both
+# use, and the one every assertion below reads, so the sanitized text is written down once and cannot drift.
+SAID_ID = "4242424242"  # a fake account id
+SAID_RAW = f"API rate limit already exceeded for user ID {SAID_ID}."
+SAID_LOGIN = "cmux-agents-lander"
+SAID_SAFE = f"API rate limit already exceeded for user {SAID_LOGIN}."
+HELD_RAW = f"graphql: last real attempt: {SAID_RAW}"
+HELD_SAFE = f"graphql: last real attempt: {SAID_SAFE}"
+
+
+class GitHubSaidTest(unittest.TestCase):
+    """GitHub's own words reach a printed line, a stored cache field and the shared log; its quota refusal quotes the
+    token's numeric account id, which is personal data and must never be in text an agent pastes into a PR body."""
+
+    def setUp(self) -> None:
+        holder = mock.patch.object(gg, "gh_quota_holder", lambda: SAID_LOGIN)
+        holder.start()
+        self.addCleanup(holder.stop)
+
+    def test_a_quota_refusal_names_the_login_whose_bucket_is_spent(self) -> None:
+        """The whole point: the refusal says whose quota is spent -- which is what a reader acts on, whose work
+        pauses or moves -- and not an id. The limit and the reset are what is left untouched."""
+        self.assertEqual(gg.gh_said(SAID_RAW), SAID_SAFE)
+        self.assertEqual(gg.gh_said(HELD_RAW), HELD_SAFE)
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED", "message": SAID_RAW}), SAID_SAFE)
+        self.assertNotIn(SAID_ID, gg.gh_said(SAID_RAW))
+        self.assertIn(SAID_LOGIN, gg.gh_said(SAID_RAW))  # actionable, not vague
+
+    def test_every_sibling_form_of_an_account_id_goes_too(self) -> None:
+        """gh and GitHub write the same refusal several ways, and an unauthenticated read is refused by address."""
+        for raw, want in (
+                (f"API rate limit exceeded for user {SAID_ID}.", f"API rate limit exceeded for user {SAID_LOGIN}."),
+                (f"API rate limit exceeded for user id {SAID_ID}", f"API rate limit exceeded for user {SAID_LOGIN}"),
+                (f"gh: API rate limit already exceeded for user ID {SAID_ID}.", f"gh: {SAID_SAFE}"),
+                ("API rate limit exceeded for 203.0.113.9. (But here is the good news: Authenticated requests get a "
+                 "higher rate limit.)",
+                 "API rate limit exceeded for an unauthenticated caller. (But here is the good news: Authenticated "
+                 "requests get a higher rate limit.)"),
+                (f"You have exceeded a secondary rate limit for installation ID {SAID_ID}.",
+                 "You have exceeded a secondary rate limit for installation (an App of this repository's owner)."),
+                # an id-shaped number that is not an account: a time, a count, a run id in a path
+                ("read at 12:08:00 for 2 checks", "read at 12:08:00 for 2 checks"),
+                ("no workflow run at actions/runs/12345678901", "no workflow run at actions/runs/12345678901")):
+            with self.subTest(raw=raw):
+                self.assertEqual(gg.gh_said(raw, limit=None), want)
+
+    def test_a_refusal_with_no_login_to_name_still_says_whose_bucket_it_is(self) -> None:
+        """A host whose gh has no login in hosts.yml cannot name one; the phrase that stands in must still say the
+        spent bucket is a per-user one (not the repository's, not an App's), so the reader knows what to do."""
+        with mock.patch.object(gg, "gh_quota_holder", lambda: ""):
+            said = gg.gh_said(SAID_RAW)
+        self.assertEqual(said, f"API rate limit already exceeded for user {gg.GH_NO_HOLDER}.")
+        self.assertNotIn(SAID_ID, said)
+        self.assertIn("user", said)
+
+    def test_no_printed_line_of_a_partial_read_carries_an_account_id(self) -> None:
+        """The surface the defect was measured on: `status pr` printed "checks INCONCLUSIVE (partial: 80 of 219
+        read; check pages held: graphql: last real attempt: API rate limit already exceeded for user ID ...)". A
+        cache an older daemon wrote still holds the id, so the printed line drops it on the way out too."""
+        data = {"state": "OPEN", "headRefOid": "a" * 40, "checksTotal": 219, "checksPageError": HELD_RAW,
+                "checks": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS", "required": True}]}
+        text = gg.summary("pr:o/r#1", {"data": data})
+        self.assertNotIn(SAID_ID, text)
+        self.assertRegex(text, r"checks INCONCLUSIVE \(partial: 1 of 219 read; check pages held: "
+                               + re.escape(HELD_SAFE) + r"\)")
+        self.assertNotRegex(text, r"\buser(?:\s+ID)?\s+\d{3,}\b")  # no bare id on any printed line
+        for line in text.splitlines():
+            self.assertNotRegex(line, r"\b\d{9,}\b", line)
+
+    def test_a_stored_field_and_a_log_line_carry_the_login_too(self) -> None:
+        """Not only the print: the error is stored in the cache and logged, and both are read back into text."""
+        self.assertEqual(gg.gh_said(HELD_RAW, limit=None), HELD_SAFE)
+        self.assertEqual(gg.land_redact(SAID_RAW), SAID_SAFE)  # the land queue's own capture, same substitution
+        self.assertEqual(gg.gh_said(SAID_RAW, limit=20), SAID_SAFE[:20])  # the length every site already cut to
+        self.assertEqual(gg.gh_said(None, default="no message"), "no message")
+        self.assertEqual(gg.gh_said({"type": "RATE_LIMITED"}), "RATE_LIMITED")
+
+    def test_an_exception_carrying_githubs_words_drops_the_id_where_it_is_raised(self) -> None:
+        """describe() hands a WatchError's text on as written, so a refused `gh api` child's stderr tail, a
+        broker's forwarded refusal and a land executor's reason all reach a person through one constructor.
+
+        Detector: test_every_github_message_is_read_through_the_chokepoint (widened here to count
+        `.get("message", ...)`, the shape that let the REST refusal body back out)."""
+        self.assertEqual(gg.describe(gg.WatchError(f"gh api /repos/o/r: gh: {SAID_RAW} (HTTP 403)")),
+                         f"gh api /repos/o/r: gh: {SAID_SAFE} (HTTP 403)")
+        self.assertNotIn(SAID_ID, str(gg.WatchError(f"upstream: lane-gh: {SAID_RAW}")))
+        self.assertIn(SAID_LOGIN, str(gg.WatchError(f"upstream: lane-gh: {SAID_RAW}")))
+        # the other direction: a message with no identifier in it is raised byte for byte, words and all
+        for clean in ("rest: HTTP 404", "land executor: not_executor: this host is not the executor",
+                      "search was not answered: {\"type\": \"NOT_FOUND\"}", "more than 100 check runs"):
+            with self.subTest(clean=clean):
+                self.assertEqual(str(gg.WatchError(clean)), clean)
+
+    def test_a_stored_cache_error_and_the_refresh_log_drop_the_id_at_their_sink(self) -> None:
+        """`error` is the one cache field GitHub's sentence reaches and every surface that prints an entry prints
+        it; the refresh log is read back by `budget` and `status`. Both sanitize where they are written, so an
+        upstream host that stored an id cannot propagate it here either."""
+        self.assertEqual(gg.gh_sanitize(f"HTTP 403 {SAID_RAW}"), f"HTTP 403 {SAID_SAFE}")
+        self.assertEqual(gg.gh_sanitize("HTTP 404 Not Found"), "HTTP 404 Not Found")  # unchanged, not swallowed
+
+    def test_a_write_refusals_own_top_level_message_drops_the_id_too(self) -> None:
+        """write_failure sanitized each per-error message but formatted the body's own one itself; a 403 on a
+        write is exactly where a spent quota speaks."""
+        line = gg.write_failure({"kind": "comment", "repo": "o/r", "number": 1}, 403, {"message": SAID_RAW})
+        self.assertNotIn(SAID_ID, line)
+        self.assertIn(SAID_LOGIN, line)
+        self.assertIn("403", line)  # the failing operation and its status are still named
+
+    def test_every_github_message_is_read_through_the_chokepoint(self) -> None:
+        """One function, not N regex strips: a site that reads "message" out of GitHub's answer and formats it
+        itself is how the id came back, so every such site names gh_said on its own line. gh_said's own body is
+        where the field is read, and the line that only tests for a message is not formatting it."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text().splitlines()
+        inside = False
+        for n, line in enumerate(source, 1):
+            if line.startswith("def gh_said("):
+                inside = True
+            elif inside and line.startswith(("def ", "class ")):
+                inside = False
+            # #2582's own detector matched only ["message"] and ("message"), so `.get("message", "")` -- the REST
+            # refusal body in Reader.get, the one that printed "HTTP 403 ... for user ID NNNN" -- slipped past it and
+            # the id came back. Every way of reading the field counts now, default argument or not.
+            if inside or not re.search(r'\["message"\]|\(\s*["\']message["\']\s*(?:,[^)]*)?\)', line):
+                continue
+            if re.fullmatch(r'\s*if e\.get\("message"\):.*', line):  # a test for one, then the fields instead
+                continue
+            # land_trim is the land path's own sanitizing sink (it calls land_redact, the same substitution), so a
+            # land string cut there is sanitized as surely as one read through gh_said.
+            sinks = ("gh_said", "gh_sanitize", "land_trim", "land_redact")
+            statement = line if any(s in line for s in sinks) else source[n - 2] + line  # the call may open above
+            self.assertTrue(any(s in statement for s in sinks),
+                            f"scripts/glaeda-gh:{n} formats GitHub's message itself: {statement.strip()}")
+
 
 if __name__ == "__main__":
     unittest.main()
