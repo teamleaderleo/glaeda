@@ -14336,6 +14336,19 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
 # what to do, and its requester is told as any stop tells it.
 LAND_FORWARD_GIVE_UP = 7200.0
+# The give-up above stopped a row from what this host's own cache held, so a PR the far host had merged hours before
+# stopped "forward_no_outcome" whenever the cache held no read of it, and every such stop went to its requester as a
+# [blocker]. cosmic-gray, huge-blue and cmux-cp-1, 2026-11-23 07:45-07:56Z: about 30 of them, hq#12849 (merged
+# 11-17), lw#5691 (11-20) and cmux#45210 (11-17) among them. Now the give-up first resolves the row off the tick
+# (forward_resolve): it asks the receiving queue for its row (`land serve` status through the same executor or
+# overflow program the hand-off went through), then reads the PR's state (the gh-quota shim, which answers from
+# glaeda's cache before any quota is spent). A merged or closed PR ends the row with no message; a row the receiver
+# still holds gets another LAND_FORWARD_GIVE_UP, at most LAND_FORWARD_ALIVE_MAX times; an open PR the receiver lost
+# is handed to it again pinned to its head, at most LAND_FORWARD_REQUEUES times. Only what none of that ends stops,
+# with no wake, and its requester gets one fyi digest per pass naming every such row (LAND_FORWARD_DIGEST_CLASS).
+LAND_FORWARD_ALIVE_MAX = 4
+LAND_FORWARD_REQUEUES = 1
+LAND_FORWARD_DIGEST_CLASS = "fyi"
 
 
 def land_session_lane(name: str) -> str:
@@ -15148,6 +15161,9 @@ class LandQueue:
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
         self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
+        self.resolve_due: dict[str, bool] = {}  # key -> executor: forwarded rows past the give-up (forward_resolve)
+        self.resolving: set[str] = set()  # keys a forward_resolve pass holds
+        self.resolve_thread: threading.Thread | None = None
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
         self.overflow_after = float("-inf")
@@ -15701,7 +15717,9 @@ class LandQueue:
                 # PARENT/CHILD would read as a session on the executor's host
                 | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
                 | ({"override": e["override"]} if e.get("override") else {})
-                | ({"nominated": e["nominated"]} if e.get("nominated") is not None else {}))
+                | ({"nominated": e["nominated"]} if e.get("nominated") is not None else {})
+                # a pinned land stays pinned on the far host (forward_requeue pins a lost row to its head)
+                | ({"sha": e["pinSha"]} if SHA40.fullmatch(str(e.get("pinSha") or "")) else {}))
 
     # -- overflow to peer land hosts (land_overflow): this host judges, and hands its late rows on
 
@@ -16054,12 +16072,179 @@ class LandQueue:
             return
         self.forward_look_at = self.now + LAND_FORWARD_LOOK_EVERY
         for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
-                    and k not in self.sending and k not in self.overflowing]:
+                    and k not in self.sending and k not in self.overflowing and k not in self.resolving]:
             try:
                 with self.lock:
                     self.forward_follow(self.entries[key], executor)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.forward_resolve_start()
+
+    def forward_resolve_start(self) -> None:
+        """The rows forward_follow found past the give-up are resolved off the tick (forward_resolve), one pass at a
+        time: each asks another host and may read GitHub, which no lock is held across."""
+        if not self.resolve_due or (self.resolve_thread is not None and self.resolve_thread.is_alive()):
+            return
+        with self.lock:
+            due, self.resolve_due = dict(self.resolve_due), {}
+            self.resolving = set(due)
+        if self.inline:
+            self.forward_resolve(due)
+        else:
+            self.resolve_thread = threading.Thread(target=self.forward_resolve, args=(due,), name="land-resolve",
+                                                   daemon=True)
+            self.resolve_thread.start()
+
+    def receiver_command(self, e: dict, executor: bool) -> list[str] | None:
+        """The program that reaches the queue E was handed to (its `land serve`): this host's executor, the overflow
+        peer it went to, or the executor's redirect target; None when this host has none (a lane VM's broker host is
+        asked through the PR's state alone)."""
+        host = str(e.get("forwardedTo") or "")
+        config = self.config()
+        command = land_executor(config)
+        for peer in ([command] if command else []) + land_overflow(config):
+            if land_forward_name(peer) == host:
+                return peer
+        if command and executor:
+            return land_redirected(command, host) or command
+        return None
+
+    def read_outcome(self, e: dict) -> tuple[str, str, str, str]:
+        """Outside the lock. (state, merge commit, head, why not) of E's PR: the daemon's copy when it has ended,
+        else one read through the gh-quota shim, which answers from glaeda's cache before it spends quota."""
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        state = str(data.get("state") or "").upper()
+        if state == "MERGED":
+            merge = data.get("mergeCommit")
+            return state, str(merge.get("oid") or "") if isinstance(merge, dict) else "", "", ""
+        gh = self.gh()
+        if gh is None:
+            return "", "", "", "no gh to read the PR's state with"
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "state,mergeCommit,headRefOid"],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError):
+            doc = json.loads(got.stdout or "")
+            state = str(doc.get("state") or "")
+            if got.returncode == 0 and state in ("OPEN", "MERGED", "CLOSED"):
+                return (state, str((doc.get("mergeCommit") or {}).get("oid") or ""),
+                        str(doc.get("headRefOid") or "").lower(), "")
+        return "", "", "", land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip() or f"exit {got.returncode}", 200)
+
+    def forward_resolve(self, due: dict[str, bool]) -> None:
+        """Off the tick. Each forwarded row of DUE (key -> executor) is past LAND_FORWARD_GIVE_UP: resolve it from
+        the receiver's row and the PR's state (LAND_FORWARD_ALIVE_MAX's comment), and send its requester one fyi
+        digest of the rows nothing resolved."""
+        digest: dict[str, list[tuple[dict, str]]] = {}
+        try:
+            for key, executor in due.items():
+                try:
+                    self.forward_resolve_one(key, executor, digest)
+                except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                    log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        finally:
+            with self.lock:
+                self.resolving = set()
+        for to, rows in digest.items():
+            lines = "; ".join(f"{self.url(e)}: {land_reason(why, 220)}" for e, why in rows[:20])
+            more = f" (+{len(rows) - 20} more)" if len(rows) > 20 else ""
+            self.notify(rows[0][0], to, f"glaeda land on {policy_host()}: {len(rows)} forwarded land(s) with no "
+                        f"outcome anyone could read, stopped (fyi; `glaeda-gh land status` shows each, `glaeda-gh "
+                        f"land OWNER/REPO#N --sha HEAD` lands one again): {lines}{more}",
+                        cls=LAND_FORWARD_DIGEST_CLASS, severity="info")
+
+    def forward_resolve_one(self, key: str, executor: bool, digest: dict[str, list[tuple[dict, str]]]) -> None:
+        with self.lock:
+            e = self.entries.get(key)
+            if not e or e["state"] != LAND_FORWARDED or key in self.jobs:
+                return
+            gen = int(e.get("gen") or 0)
+            host = str(e.get("forwardedTo") or "the host it was handed to")
+            command = self.receiver_command(e, executor)
+            snap = dict(e)
+        remote: dict | None = None
+        asked = f"{host}'s queue was not asked: this host has no program that reaches it"
+        if command is not None:
+            try:
+                doc = self.forward(command, {"op": "status", "target": key_name(key)}, LAND_FORWARD_DEADLINE)
+                rows = [r for r in doc.get("entries") or [] if isinstance(r, dict) and r.get("key") == key] \
+                    if doc.get("ok") else []
+                remote = max(rows, key=lambda r: float(r.get("updated") or 0)) if rows else {}
+                asked = (f"{host}'s queue holds it {remote.get('state')}" if remote else
+                         f"{host}'s queue holds no row of it" if doc.get("ok") else
+                         f"{host}'s queue did not answer: {land_trim(doc.get('reason') or doc.get('code'), 120)}")
+                if not doc.get("ok"):
+                    remote = None
+            except Exception as error:  # noqa: BLE001  an unreachable receiver is one route of two
+                asked = f"{host}'s queue did not answer: {land_trim(str(error), 120)}"
+        rstate = str((remote or {}).get("state") or "")
+        settled = rstate == "merged" or (rstate and rstate not in LAND_DONE)
+        state, merge, head, why = ("", "", "", "") if settled else self.read_outcome(snap)
+        with self.lock:
+            e = self.entries.get(key)
+            if not e or e["state"] != LAND_FORWARDED or int(e.get("gen") or 0) != gen or key in self.jobs:
+                return
+            self.history(e, "forward_resolve", receiver=land_trim(asked, 160), state=state or "unread")
+            if rstate == "merged" or state == "MERGED":
+                sha = str((remote or {}).get("mergeSha") or "") if rstate == "merged" else merge
+                self.merged(e, sha or e.get("mergeSha") or "", f"forwarded to {host}: "
+                            + ("its queue merged it" if rstate == "merged" else "the PR reads merged"), tell=False)
+                return
+            if state == "CLOSED":
+                self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue", "", tell=False)
+                return
+            alive = int(e.get("forwardAlive") or 0)
+            if rstate and rstate not in LAND_DONE and alive < LAND_FORWARD_ALIVE_MAX:
+                # the receiver still works on it (waiting on checks, judging): its own outcome will come
+                e["forwardAlive"] = alive + 1
+                e["forwardFirst"] = self.now
+                self.history(e, "forward_alive", on=host, state=rstate)
+                self.save(e)
+                return
+            rstop = (remote or {}).get("stop") or {}
+            if state == "OPEN" and rstate == "stopped" and rstop.get("code") not in (None, "", "forward_no_outcome"):
+                # the receiver stopped it and told the requester itself (the hand-off carries the requester)
+                self.stop(e, "forward_stopped_there", f"{host}'s land queue stopped it: {rstop.get('code')}: "
+                          f"{land_reason(str(rstop.get('reason') or ''), 200)}", str(rstop.get("next") or ""), tell=False)
+                return
+            pin = str(e.get("pinSha") or "").lower()
+            if pin and SHA40.fullmatch(head) and land_head_moved(pin, head):
+                self.stop(e, "head_moved", land_moved_clause(head, pin),
+                          f"glaeda-gh land {key_name(key)} --sha {head}")
+                return
+            head = pin or head
+            n = int(e.get("forwardRequeued") or 0)
+            if state == "OPEN" and SHA40.fullmatch(head) and n < LAND_FORWARD_REQUEUES and \
+                    (executor or command is not None or (e.get("handedOff") and self.broker_client())):
+                self.forward_requeue(e, head, n + 1, host, asked, executor, command is not None)
+                return
+            why = f"{asked}; " + (f"the PR is still {state.lower()}" if state else
+                                  f"its state could not be read ({why or 'no answer'})")
+            if state == "OPEN" and n:
+                why += f"; handed to {host} again {n} time(s) pinned at {head[:12]} with no outcome"
+            self.stop(e, "forward_no_outcome", f"handed to {host}'s land queue with no outcome: {why}",
+                      f"glaeda-gh land {key_name(key)}" + (f" --sha {head}" if SHA40.fullmatch(head) else ""),
+                      tell=False)
+            digest.setdefault(land_notify_target(e, e.get("requester") or ""), []).append((e, why))
+
+    def forward_requeue(self, e: dict, head: str, n: int, host: str, asked: str, executor: bool,
+                        peer: bool) -> None:
+        """Under the lock. E's PR is open and its receiver lost it: hand it again pinned to HEAD, under a request id
+        the receiver has never applied (a repeated id is applied once there). An executor-forwarding host sends it in
+        its next forward batch; an overflowed row comes back to this queue, judged here or overflowed again; a lane
+        VM hands it to the broker host (hand_off_now)."""
+        why = f"{asked}, and the PR is open: handed to it again pinned at {head[:12]} (re-queue {n})"
+        e["forwardRequeued"] = n
+        e["forwardFirst"] = self.now
+        e["pinSha"] = head
+        e["pinSince"] = e.get("pinSince") or self.now
+        e["requestId"] = f"requeue-{file_name(e['key'])[:16]}-{n}-{int(self.now)}"
+        log({"event": "land-forward-requeued", "key": e["key"], "to": host, "head": head[:12], "n": n})
+        if executor or peer:
+            self.history(e, "forward_requeued", to=host, head=head[:12], why=why)
+            e.update(state="queued", wait=None, wakeAt=None, action=None)
+            self.save(e)
+            return
+        self.hand_off_now(e, head, why, "forward_requeued")
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -16099,7 +16284,7 @@ class LandQueue:
             e["forwardFirst"] = first
             self.save(e)
         if self.now - first > LAND_FORWARD_GIVE_UP:
-            self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
+            self.resolve_due[e["key"]] = executor  # forward_resolve, off the tick: never stopped from the cache alone
             return
         if state != "OPEN":
             return
@@ -16130,23 +16315,6 @@ class LandQueue:
         e["forwardResent"] = {"at": self.now, "n": n, "to": host}
         log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
         self.hand_off_now(e, head, why, "forward_resent")
-
-    def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool) -> None:
-        """Under the lock. A forwarded E with no outcome LAND_FORWARD_GIVE_UP after it was first forwarded stops
-        forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on."""
-        if state:
-            cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
-        else:
-            cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
-        if resends:
-            cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
-        elif not executor and not ((e.get("handedOff") or {}).get("key") and self.broker_client()):
-            cause += "; this host cannot hand it off again (no hand-off record of its own)"
-        self.stop(e, "forward_no_outcome",
-                  f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
-                  f"still merge it; nothing here does",
-                  f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -20014,11 +20182,13 @@ class LandQueue:
     def url(e: dict) -> str:
         return f"https://github.com/{e['repo']}/pull/{e['number']}"
 
-    def merged(self, e: dict, merge_sha: str, how: str) -> None:
+    def merged(self, e: dict, merge_sha: str, how: str, tell: bool = True) -> None:
+        """E ended merged at MERGE_SHA; its requester told, unless TELL is False (an outcome found late, by
+        forward_resolve: logged and in `land status`, never a message)."""
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
         self.history(e, "merged", sha=merge_sha, how=how)
         self.save(e)
-        self.notify(e, e.get("requester") or "",
+        self.notify(e, e.get("requester") or "", wake=tell, message=
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""))
 
@@ -20099,7 +20269,7 @@ class LandQueue:
                           f"again in {after:.0f} s"}, after)
             return False
 
-    def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
+    def stop(self, e: dict, code: str, reason: str, nxt: str, tell: bool = True) -> None:
         self.check(e)
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
@@ -20121,9 +20291,11 @@ class LandQueue:
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
         # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
-        self.notify(e, e.get("requester") or "", msg, wake=not infra)
+        # TELL False: forward_resolve's stops, whose requester hears one fyi digest instead (LAND_FORWARD_DIGEST_CLASS)
+        self.notify(e, e.get("requester") or "", msg, wake=tell and not infra)
 
-    def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
+    def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str = LAND_NOTICE_CLASS,
+               severity: str = "") -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -20150,9 +20322,9 @@ class LandQueue:
         # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
         # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
         title = land_trim(message, 200)
-        severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
+        severity = severity or ("info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn")
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--class", LAND_NOTICE_CLASS, "--title", title, message]
+                "--class", cls, "--title", title, message]
 
         def send() -> None:
             whys: list[str] = []

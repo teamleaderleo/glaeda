@@ -23531,6 +23531,7 @@ class LandWorld:
         self.merged_on_merge = True
         self.view_state: str | None = None  # what a `pr view --json state,...` answers (None: OPEN, or MERGED after a merge)
         self.view_err: str | None = None  # a state read that fails, with these words
+        self.view_head: str | None = None  # the headRefOid a `pr view --json ...headRefOid` answers (None: none)
         self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
         self.raise_on: str | None = None
         self.nudged: list[str] = []
@@ -23633,7 +23634,8 @@ class LandWorld:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
                 return subprocess.CompletedProcess(argv, 0, json.dumps(
-                    {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
+                    {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}
+                    | ({"headRefOid": self.view_head} if self.view_head and "headRefOid" in words[-1] else {})), "")
             kind = "merge" if words[:2] == ["pr", "merge"] or (words[:3] == ["api", "-X", "PUT"]
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
@@ -28800,32 +28802,71 @@ class LandTest(Base):
         self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
 
-    def test_a_forwarded_land_with_no_outcome_past_the_give_up_stops_naming_why_and_tells_its_requester(self):
-        # A pinned land handed to the executor sat 260 min with no outcome: nothing ended it. Still open, re-sent
-        # twice, no answer: it stops forward_no_outcome, the requester told, the far host named.
-        self.forwarded_row()
-        for _ in range(int(1.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+    def past_give_up(self) -> dict:
+        """Tick the forwarded row past LAND_FORWARD_GIVE_UP since it was first forwarded, until it leaves "forwarded"
+        or the bound has passed twice over."""
+        for _ in range(int(2.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
             if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
                 break
-        e = self.q.entries[self.KEY]
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
-        self.assertEqual(e["forwardResent"]["n"], 2)
-        self.assertIn("handed off again 2 times", e["stop"]["reason"])
-        self.assertIn("huge-blue", e["stop"]["reason"])
-        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
-        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
-        self.assertEqual(said[3], "host/lane")
+        return self.q.entries[self.KEY]
 
-    def test_a_forwarded_land_the_cache_never_read_stops_at_the_give_up_instead_of_staying_forwarded(self):
-        # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on
+    def blockers(self) -> list[list[str]]:
+        return [c for c in self.w.sent() if c[c.index("--class") + 1] == "block" and "o/r/pull/1" in c[-1]]
+
+    def test_a_forwarded_land_the_cache_never_read_but_github_shows_merged_ends_merged_with_no_message(self):
+        # cosmic-gray, huge-blue, cmux-cp-1, 2026-11-23 07:45-07:56Z: ~30 [blocker] forward_no_outcome stops, "this
+        # host's cache holds no read of the PR", for PRs merged days before (hq#12849 on 11-17). Before stopping, the
+        # give-up reads the PR's state: merged ends the row merged, and nobody is woken for it.
         self.forwarded_row()
         self.w.cache.pop(self.KEY, None)
-        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
-        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
-        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.w.view_state = "MERGED"
+        sent = len(self.w.sent())
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        self.assertNotIn("stop", e)
+        self.assertEqual(len(self.w.sent()), sent)  # silent: no blocker, no merged notice
+        self.assertTrue(any(h.get("event") == "forward_resolve" for h in e["history"]), e["history"])
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)  # one state read, at the give-up only
+
+    def test_a_forwarded_land_github_shows_closed_at_the_give_up_stops_closed_with_no_message(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_state = "CLOSED"
+        sent = len(self.w.sent())
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len(self.w.sent()), sent)
+
+    def test_an_open_forwarded_land_the_receiver_lost_is_handed_again_pinned_then_stops_as_one_fyi(self):
+        # Open on GitHub, no outcome from the broker host: handed to it again once, pinned to the head GitHub names.
+        # Still nothing past the next give-up: it stops, and its requester gets an fyi digest, never a [blocker].
+        self.forwarded_row()
+        self.w.view_state, self.w.view_head = "OPEN", LA
+        e = self.past_give_up()
+        self.assertEqual(e["state"], "forwarded")
+        self.assertEqual((e["forwardRequeued"], e["pinSha"]), (1, LA))
+        self.assertEqual(json.loads(self.handoffs()[-1][4])["sha"], LA)
+        self.assertTrue(any(h.get("event") == "forward_requeued" for h in e["history"]), e["history"])
+        e = self.past_give_up()
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
-        self.assertIn("holds no read of the PR", e["stop"]["reason"])
-        self.assertEqual(len(self.handoffs()), 1)
+        self.assertIn("still open", e["stop"]["reason"])
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])
+        self.assertEqual(self.blockers(), [])
+        [fyi] = [c for c in self.w.sent() if "forwarded land(s) with no outcome" in c[-1]]
+        self.assertEqual((fyi[3], fyi[fyi.index("--class") + 1], fyi[fyi.index("--severity") + 1]),
+                         ("host/lane", "fyi", "info"))
+        self.assertIn("o/r/pull/1", fyi[-1])
+
+    def test_a_forwarded_land_whose_state_cannot_be_read_stops_as_an_fyi_naming_both_routes(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.view_err = "gh-quota: refused: the shared REST quota is under its low-water floor"
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("could not be read", e["stop"]["reason"])
+        self.assertIn("was not asked", e["stop"]["reason"])  # a lane VM has no program that reaches the broker's queue
+        self.assertEqual(self.blockers(), [])
+        self.assertEqual(len([c for c in self.w.sent() if "with no outcome" in c[-1]]), 1)
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
