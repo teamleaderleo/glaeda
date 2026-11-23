@@ -1388,7 +1388,17 @@ TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,2048}|github_pat_[A-Za-z0-9
 
 
 class WatchError(RuntimeError):
-    pass
+    """Our own message, which describe() hands on as written -- so GitHub's personal identifiers come out of it
+    where it is raised, not at each print.
+
+    Every GitHub or `gh` sentence that reaches a person through an exception reaches it here, because describe()
+    reduces anything that is not ours to a type name: the stderr tail of a refused `gh api` child, a broker's or
+    an upstream's forwarded refusal, a land executor's reason, a search that was not answered. gh_sanitize names
+    the login whose bucket a quota refusal spent and is idempotent, so a message with no identifier in it is
+    raised byte for byte and the words stay GitHub's own."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*(gh_sanitize(a) if isinstance(a, str) else a for a in args))
 
 
 # ---------------------------------------------------------------- keys and files
@@ -2888,7 +2898,9 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     open for as long as it lives. Here the child leads its own process group and the whole group is
     killed. Raises subprocess.TimeoutExpired or OSError."""
     timeout = SUBPROCESS_DEADLINE if timeout is None else timeout
-    with subprocess.Popen(argv, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
+    env = deadline_env(env, timeout)
+    with subprocess.Popen(self_bounded(argv, timeout, env),
+                          stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
         try:
             out, err = proc.communicate(input=input_text, timeout=timeout)
@@ -2904,6 +2916,132 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
                     stream.close()
             raise subprocess.TimeoutExpired(argv, timeout) from None
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+# A bound held only by its caller (communicate(timeout=) then killpg) ends with the caller: the daemon's execv (an
+# update, the stale valve) or a killed `budget` drops every thread mid-wait, and the child, in its own session, runs
+# on. cosmic-gray 2026-11-22: 55 `reach HOST sh -c '... @@budget ...'` probes (bound FLEET_HOST_TIMEOUT, 25 s) alive
+# 29 minutes, and 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days, started by an image the
+# daemon had execv'd away (cmuxterm-hq handbook: mirror-read-outlives-its-bound.md). So the bound also lives in the
+# child: coreutils `timeout` leads its process group and signals the whole group at the bound, whoever the parent is.
+SELF_BOUND_SLACK = 5.0  # the child's own bound is this long past its caller's, so a live caller always acts first
+SELF_BOUND_KILL = 5  # timeout -k: SIGKILL this long after the SIGTERM
+TIMEOUT_PATHS = ("/opt/homebrew/bin/timeout", "/usr/local/bin/timeout", "/usr/bin/timeout", "/bin/timeout",
+                 "/opt/homebrew/bin/gtimeout", "/usr/local/bin/gtimeout")
+TIMEOUT_ENV = "GLAEDA_GH_TIMEOUT_CMD"  # a test's or an operator's coreutils timeout; empty turns the self-bound off
+DETACHED_BOUND = 600.0  # a fire-and-forget alert send (tell-coordinator, coord-alert) running longer is hung
+
+
+DEADLINE_ENV = "CMUX_DEADLINE"  # unix seconds past which this process tree is over its bound (agent-orphan-reaper)
+DEADLINE_OWNER_ENV = "CMUX_DEADLINE_OWNER"  # the tool that set it
+DEADLINE_OWNER = "glaeda-gh"
+
+
+def deadline_env(env: dict | None, seconds: float | None) -> dict | None:
+    """ENV (None: this process's) plus CMUX_DEADLINE, the epoch second the child's self-bound has killed it by, and
+    CMUX_DEADLINE_OWNER: the shared contract by which leo-workspace's agent-orphan-reaper prunes any tool's child
+    that outlived its bound, whatever tool started it. ENV unchanged with no finite bound."""
+    if seconds is None or not math.isfinite(seconds):
+        return env
+    base = dict(os.environ if env is None else env)
+    base[DEADLINE_ENV] = str(math.ceil(time.time() + max(0.0, seconds) + SELF_BOUND_SLACK + SELF_BOUND_KILL))
+    base[DEADLINE_OWNER_ENV] = DEADLINE_OWNER
+    return base
+
+
+def coreutils_timeout() -> str | None:
+    """The coreutils `timeout` this host has (GLAEDA_GH_TIMEOUT_CMD, else the first of TIMEOUT_PATHS), or None."""
+    if TIMEOUT_ENV in os.environ:
+        named = os.environ[TIMEOUT_ENV]
+        return named if named and os.access(named, os.X_OK) else None
+    return next((p for p in TIMEOUT_PATHS if os.access(p, os.X_OK)), None)
+
+
+def self_bounded(argv: list[str], seconds: float | None, env: dict | None = None) -> list[str]:
+    """ARGV run under `timeout -k SELF_BOUND_KILL SECONDS+SELF_BOUND_SLACK`, so it ends at its bound even when its
+    caller is gone first. ARGV unchanged with no bound, no timeout on this host, or an ARGV[0] that does not resolve
+    (Popen's OSError then names it, as the callers expect, instead of timeout's exit 127)."""
+    tool = coreutils_timeout()
+    if not argv or seconds is None or not math.isfinite(seconds) or tool is None:
+        return list(argv)
+    if shutil.which(argv[0], path=(env if env is not None else os.environ).get("PATH")) is None:
+        return list(argv)
+    return [tool, "-k", str(SELF_BOUND_KILL), f"{max(0.0, seconds) + SELF_BOUND_SLACK:g}", *argv]
+
+
+def remote_self_bounded(script: str, seconds: float) -> str:
+    """A `sh -c` SCRIPT for another host that bounds itself there: under that host's coreutils timeout (the first of
+    TIMEOUT_PATHS; ssh's PATH has no Homebrew) at SECONDS, so a remote side whose ssh or caller died ends too; run
+    as it is where the host has none."""
+    inner = shlex.quote(script)
+    found = " ".join(shlex.quote(p) for p in TIMEOUT_PATHS)
+    return (f'for t in {found}; do if [ -x "$t" ]; then exec "$t" -k {SELF_BOUND_KILL} {seconds:g} sh -c {inner}; '
+            f'fi; done; {script}')
+
+
+# Every child serve starts and does not wait for is reaped here, each tick (reap_children). An unreaped child is a
+# zombie until the daemon exits, and the daemon re-executes itself instead of exiting: the new image holds no Popen
+# for the old image's children, so serve adopts them by PID when it starts (adopt_inherited) and reaps those too.
+DETACHED: list[subprocess.Popen] = []
+INHERITED: set[int] = set()
+DETACHED_LOCK = threading.Lock()
+
+
+def spawn_detached(argv: list[str], bound: float | None = None, **kwargs: Any) -> subprocess.Popen:
+    """Popen(ARGV) in a session of its own, not waited for, kept for reap_children; with BOUND, self_bounded. Raises
+    OSError as Popen does."""
+    reap_children()
+    if bound is not None:
+        kwargs["env"] = deadline_env(kwargs.get("env"), bound)
+    proc = subprocess.Popen(self_bounded(argv, bound, kwargs.get("env")), start_new_session=True, **kwargs)
+    with DETACHED_LOCK:
+        DETACHED.append(proc)
+    return proc
+
+
+def child_pids(parent: int) -> set[int]:
+    """PARENT's child processes now (zombies included), from one ps."""
+    try:
+        done = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in done.stdout.splitlines():
+        words = line.split()
+        if len(words) == 2 and words[1] == str(parent) and words[0].isdigit():
+            pids.add(int(words[0]))
+    return pids
+
+
+def adopt_inherited() -> int:
+    """serve's first step: every child this PID has before the new image starts any is the previous image's (an
+    execv keeps the PID and its children), kept for reap_children. The count adopted."""
+    found = child_pids(os.getpid())
+    with DETACHED_LOCK:
+        INHERITED.update(found)
+    return len(found)
+
+
+def reap_children() -> int:
+    """Wait for every detached and inherited child that ended (never blocking); the count still running."""
+    with DETACHED_LOCK:
+        alive = []
+        for proc in DETACHED:
+            with contextlib.suppress(Exception):  # a test's stand-in, or a poll the OS refused: dropped
+                if proc.poll() is None:
+                    alive.append(proc)
+        DETACHED[:] = alive
+        for pid in list(INHERITED):
+            try:
+                ended, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                ended = pid  # reaped already, or not ours
+            except OSError:
+                continue
+            if ended:
+                INHERITED.discard(pid)
+        return len(DETACHED) + len(INHERITED)
 
 
 def internal_env() -> dict:
@@ -3911,7 +4049,7 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         status = answer.get("status")
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
-            return 502, {}, json.dumps({"message": f"direct: {why}"[:UPSTREAM_ERROR_MAX]}).encode()
+            return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
         return status, {}, json.dumps(answer.get("data")).encode()
     return send
 
@@ -5359,7 +5497,7 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
         part = f"{where}: {code}" if where and code else where or code
         if part:  # an error dict with none of the three says nothing; empty parens say less than no parens
             parts.append(part)
-    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip().rstrip(":")  # a body with no message: no bare colon
+    line = f"HTTP {status}: {gh_said(doc.get('message'), limit=None)}".rstrip().rstrip(":")  # a body with no message: no bare colon
     if parts:
         line += f" ({'; '.join(parts)})"
     if repo:
@@ -6383,11 +6521,10 @@ class Daemon:
             log({"event": "alarm-unsent", "alarm": name, "why": f"no {ALARM_CMD}"})
             return
         try:
-            self.alarm_procs.append(subprocess.Popen(
+            self.alarm_procs.append(spawn_detached(
                 [os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level,
-                 *(["--source-key", source_key] if source_key else []), text],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True))
+                 *(["--source-key", source_key] if source_key else []), text], bound=DETACHED_BOUND,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         except OSError as error:
             log({"event": "alarm-unsent", "alarm": name, "why": describe(error)})
 
@@ -7388,7 +7525,7 @@ class Daemon:
             found, _ = self.post_find(item, actor)
             self.post_finish(path, item, url=found.get("html_url") if found else None,
                              note="a pull request for this head is already open",
-                             error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
+                             error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
 
@@ -7403,7 +7540,8 @@ class Daemon:
             return f"reviewers not requested: {describe(error) if isinstance(error, WatchError) else 'out of time'}"
         if 200 <= status < 300:
             return None
-        return f"reviewers not requested: HTTP {status} {(answer or {}).get('message', '') if isinstance(answer, dict) else ''}".strip()
+        said = gh_said(answer.get("message"), limit=None) if isinstance(answer, dict) else ""
+        return f"reviewers not requested: HTTP {status} {said}".strip()
 
     def post_delivered(self, path: Path, item: dict, doc: dict | None = None, note: str | None = None) -> None:
         """Checkpoint delivery before follow-up effects: a failed/interrupted regrade never replays content."""
@@ -9696,6 +9834,10 @@ class Daemon:
             self.beat = self.now
 
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
+        # `error` is the one field of a cache entry GitHub's own sentence reaches (a REST refusal, an upstream's
+        # forwarded one), and every surface that prints an entry prints it; the id goes here, once, for all of them.
+        if isinstance(fields.get("error"), str):
+            fields = {**fields, "error": gh_sanitize(fields["error"])}
         cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         cache = cache_dir() / file_name(key)
         with bounded_lock(cache_dir() / ".write.lock") as held:
@@ -10610,7 +10752,7 @@ class Daemon:
             return "same", None, etag
         if status == 200 and isinstance(doc, (dict, list)):  # .../rules/branches/B answers a list
             return "fresh", doc, h.get("etag")
-        message = (doc or {}).get("message", "") if isinstance(doc, dict) else ""
+        message = gh_said(doc.get("message"), limit=None) if isinstance(doc, dict) else ""
         return "error", f"HTTP {status} {message}".strip()[:200], None
 
     def fetch_run(self, e: dict) -> None:
@@ -13115,7 +13257,9 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
 # installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
 # never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
-# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it. Nor does it halve the
+# adaptive pool (park_quota sets no quota_refused): no pool this host reads was spent. cmux-cp-1, 17:42-21:00Z: 10 of
+# 11 host parks were this refusal, each halving the pool (157 to 78, 149 to 74, 175 to 87), ~10 min to grow back.
 LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
@@ -13903,7 +14047,12 @@ def land_redact(text: Any) -> str:
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
-    text = " ".join(str(text or "").split())
+    """TEXT on one line, cut to LIMIT, with GitHub's account id out of it (land_redact).
+
+    Every land string a person reads is cut here -- a judge's refusal reason, an escalation notice, a peer's
+    "why" -- and a judge quotes gh's own refusal in its reason ("quota: gh: API rate limit already exceeded for
+    user ID NNNN"), so this is where that id stops. The substitution is idempotent, so clean text is unchanged."""
+    text = land_redact(" ".join(str(text or "").split()))
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
@@ -15450,7 +15599,9 @@ class LandQueue:
         only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
-        self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
+        own = not host or bool(LAND_JOB_QUOTA.search(text or ""))  # its PR's own CI job's limit, not this host's
+        if not own:
+            self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
         if said is not None:
             jitter = land_jitter(e["key"], said)
@@ -15459,7 +15610,9 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None and host:
+        if own:
+            w["own"] = True  # its PR's CI job's limit: this row alone waits for it
+        if said is not None and not own:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -17263,7 +17416,8 @@ class LandQueue:
 
     @staticmethod
     def _run_real(argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
-        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env = deadline_env(env, timeout)  # its bound in the child too: the queue's caller can execv mid-step
+        with subprocess.Popen(self_bounded(argv, timeout, env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True, env=env,
                               cwd=os.environ.get("HOME") or "/") as proc:
             try:
@@ -18785,9 +18939,9 @@ class LandQueue:
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
                 try:
                     with open(logs / f"review-{repo.replace('/', '_')}-{number}-{head[:12]}.log", "ab") as sink:
-                        subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
-                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(e), start_new_session=True,
-                                         close_fds=True, cwd=os.environ.get("HOME") or "/")
+                        spawn_detached([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
+                                       stdout=sink, stderr=subprocess.STDOUT, env=self.env(e),
+                                       close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
                     e["reviewed"] = [h for h in e["reviewed"] if h != key]
@@ -20302,6 +20456,7 @@ def utc_stamp(at: float) -> str:
 def refresh_log_write(line: str) -> None:
     """One refresh-failure line on stderr and in BASE/REFRESH_LOG, cut to its newest half past REFRESH_LOG_MAX.
     Never raises: writing down a failure must not become one."""
+    line = gh_sanitize(line)  # the reasons here are GitHub's own words (refresh_note)
     with contextlib.suppress(Exception):
         print(line, file=sys.stderr, flush=True)
     path = BASE / REFRESH_LOG
@@ -20610,6 +20765,9 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 def serve(foreground_ok: bool = False) -> int:
+    inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
+    for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
+        os.environ.pop(name, None)
     lock = hold_daemon_lock()
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
@@ -20622,7 +20780,7 @@ def serve(foreground_ok: bool = False) -> int:
     seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid()})
+    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -20644,6 +20802,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.tick_failed(describe(error), site)
             except Exception as report:  # noqa: BLE001  e.g. a full disk: keep serving
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
+        with contextlib.suppress(Exception):  # noqa: BLE001  a reap that fails is tried again next tick
+            reap_children()
         time.sleep(TICK)
         watchdog.beat()
         try:
@@ -21628,9 +21788,9 @@ def incident_send(text: str, level: str, source_key: str, to: str = "", cls: str
     if ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK):
         route = (["--to", to] if to else []) + (["--class", cls] if cls else [])
         try:
-            subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
-                              source_key, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
+                            source_key, text], bound=DETACHED_BOUND, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "to": to or None, "text": text})
             return
         except OSError as error:
@@ -21830,9 +21990,8 @@ def coord_alert_spawn(text: str) -> None:
         coord_alert_missing(text)
         return
     try:
-        subprocess.Popen([*self_argv(), "coord-alert", text],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([*self_argv(), "coord-alert", text], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": describe(error), "text": text})
 
@@ -21849,9 +22008,8 @@ def coord_alert_missing(text: str) -> None:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT} and no {ALARM_CMD}", "text": text})
         return
     try:
-        subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT}; {ALARM_CMD}: {describe(error)}", "text": text})
         return
@@ -25202,7 +25360,8 @@ def fetch_host(host: str, local: bool) -> dict:
     if local:
         return local_host_report()
     try:
-        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(FLEET_HOST_SCRIPT)], timeout=FLEET_HOST_TIMEOUT)
+        script = remote_self_bounded(FLEET_HOST_SCRIPT, FLEET_HOST_TIMEOUT)  # its own bound there, too
+        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(script)], timeout=FLEET_HOST_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"error": f"unreachable (no answer in {FLEET_HOST_TIMEOUT:g}s)"}
     except OSError as error:
@@ -28922,7 +29081,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
     if done.returncode != 0:
-        return None, f"{where} not read ({(done.stderr or '').strip()[:120]})"
+        return None, f"{where} not read ({gh_said((done.stderr or '').strip(), limit=120)})"
     try:
         doc = json.loads(gzip.decompress(base64.b64decode(done.stdout.strip(), validate=True)))
     except (ValueError, OSError, EOFError, zlib.error) as error:
@@ -30876,7 +31035,7 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         err = done.stderr.decode(errors="replace").strip()
         if not (flags and "unknown flag" in err):
             break
-    return False, b"", (err or f"gh api exited {done.returncode}")[-300:]
+    return False, b"", (gh_said(err, limit=None) or f"gh api exited {done.returncode}")[-300:]
 
 
 def job_log_finished(text: bytes) -> bool:

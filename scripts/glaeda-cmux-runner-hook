@@ -1365,6 +1365,17 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # "RUNNER_JOBS_HOLD start free_gib=F need_gib=N reserve_gib=10 jobs_in_flight=J" and "RUNNER_JOBS_HOLD end ...".
 RUNNER_JOBS_HOLD_OFF_ENV = "GLAEDA_RUNNER_JOBS_HOLD_OFF"
 RUNNER_JOBS_HOLD_OFF_FILE = "runner-jobs-hold.off"
+# OWN_NEED_HOLD (2026-11-23): JOB_DISK_OWN_NEED refuses a job at setup, but the listener that took it went straight
+# back to listening on the same short disk, so the next job of the same kind landed on it and was refused again: in
+# 21:12-23:23Z 11-22, 141 of 186 bad cmux-next fast tier PR jobs were such setup refusals, from five minis (cmux23 57,
+# mac-mini-6 29, cmux22 21, cmux19 14, cmux18 13) that ran none of them. A refusal now leaves its need here (in this
+# account's state dir, which every runner of the account reads), and each pool listener of the account takes no job
+# while free disk is under it, reclaiming meanwhile, at most OWN_NEED_HOLD_S from the refusal; room or the bound ends
+# it. A small runner, a gateway runner, the nightly's own and a dedicated builder never hold for it. Off switch: the
+# RUNNER_JOBS_HOLD one. Its start and end each log one countable line ("OWN_NEED_HOLD start|end ...").
+OWN_NEED_FILE = "own-need-refused.json"
+OWN_NEED_HOLD_S = 15 * 60.0
+OWN_NEED = "OWN_NEED_HOLD"
 RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
 RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
 RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
@@ -2672,6 +2683,51 @@ def runner_jobs_hold_off(capacity_dir: Path | None = None) -> str | None:
     if capacity_dir is not None and (capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE).exists():
         return f"{capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE} exists"
     return None
+
+
+def own_need_record(state_dir: Path | None, need_gib: float, key: str, now: float | None = None) -> None:
+    """OWN_NEED_HOLD: leave a JOB_DISK_OWN_NEED refusal's need for this account's listeners; the larger of a live
+    record's need and this one is kept, with this refusal's time. Never fails the hook."""
+    if state_dir is None:
+        return
+    now = time.time() if now is None else now
+    with contextlib.suppress(Exception):
+        held = own_need_held(state_dir, None, now)
+        if held is not None and held["need_gib"] > need_gib:
+            need_gib, key = held["need_gib"], held["key"]
+        path = state_dir / OWN_NEED_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps({"need_gib": round(float(need_gib), 1), "key": str(key), "at": now}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def own_need_held(state_dir: Path | None, free: float | None, now: float | None = None) -> dict[str, Any] | None:
+    """OWN_NEED_HOLD: the live refusal record ({need_gib, key, at}) while free disk is under its need, else None. A
+    record past OWN_NEED_HOLD_S, unreadable, or met by free disk is removed; free None (unread) only reads it."""
+    if state_dir is None:
+        return None
+    path = state_dir / OWN_NEED_FILE
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(read_bounded(path) or b"")
+        need, at = data["need_gib"], data["at"]
+        if isinstance(need, bool) or isinstance(at, bool) or not isinstance(need, (int, float)) \
+                or not isinstance(at, (int, float)):
+            raise ValueError("bad record")
+        record = {"need_gib": float(need), "key": str(data.get("key") or ""), "at": float(at)}
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001  an unreadable record holds nothing
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    if now - record["at"] >= OWN_NEED_HOLD_S or now < record["at"] - 60 or (free is not None and free >= record["need_gib"]):
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    return record
 
 
 def sim_off(capacity_dir: Path | None = None) -> str | None:
@@ -10204,7 +10260,8 @@ def job_disk_peak_hold(path: str, state_dir: Path, own_pid: int | None, key: str
         return f"runner jobs' disk check skipped: {type(error).__name__}"
 
 
-def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None) -> str | None:
+def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
+                         state_dir: Path | None = None) -> str | None:
     """JOB_DISK_OWN_NEED, after job_disk_peak_hold's pass: the refusal when free disk is under RUNNER_JOBS_FLOOR_GIB +
     this job's own learned peak (job_peak_gib), else None. Started there, the job runs out of disk mid-build (cmux22,
     cmux17 and mac-mini-6 failed daemon tests with ENOSPC at 33-38 GiB free after "the disk budget is spent; started
@@ -10230,6 +10287,7 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None) ->
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
+        own_need_record(state_dir, need, key)  # OWN_NEED_HOLD: this account's listeners wait for this much
         return (f"disk: {free:.1f} GiB free after the reclaim pass, under this job's own need of {need:g} GiB "
                 f"({RUNNER_JOBS_FLOOR_GIB:g} GiB margin + its {own:g} GiB peak, {source}); refused at setup so the "
                 "rescue places it on a mini with room, not started into ENOSPC (JOB_DISK_OWN_NEED)")
@@ -10729,6 +10787,7 @@ class Gate:
         self.nightly_slot = runner_scope(runner_dir).nightly
         self.capacity_dir = capacity_dir
         self.fit_units = fit_units
+        self.own_need_started: float | None = None  # OWN_NEED_HOLD: monotonic start of the hold in force
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
         self.claim_fd: int | None = None  # this gate's listen claim (LISTEN_CLAIM) while it listens
         self.first_fd: int | None = None  # SESSION_FIRST_LOCK while this session runner listens without room
@@ -11682,6 +11741,12 @@ class Gate:
             # reclaim or a job's end frees the line. The reason is the same words every poll; the numbers log at
             # most every GATE_DISK_NOTE_S. A small runner's jobs are measured under the per-job p95 (its own peak
             # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
+            if (held := self.own_need_hold(path, scope)) is not None:
+                self.disk_short = None
+                self.evict_in_background(path, max(floor, held, aim))
+                # the same words every poll while the record stands: the gate logs the hold once
+                return (f"disk: a job refused here (JOB_DISK_OWN_NEED) needs {held:g} GiB free; reclaiming, taking no "
+                        f"job until it fits, at most {OWN_NEED_HOLD_S / 60:g} min from the refusal ({OWN_NEED})")
             crowded = self.runner_jobs_short(path)
             self.disk_held = None
             hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
@@ -11728,6 +11793,27 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def own_need_hold(self, path: str, scope: Any) -> float | None:
+        """OWN_NEED_HOLD: the need (GiB) this pool listener holds for after a JOB_DISK_OWN_NEED refusal here, or None.
+        A small runner and the off switch never hold; the caller already leaves out the nightly's own listeners, a
+        dedicated builder, a gateway runner and a runner with no disk floor. Logs one line at a hold's start and one
+        at its end."""
+        record = None
+        if not scope.small and runner_jobs_hold_off(self.capacity_dir) is None:
+            record = own_need_held(self.state_dir, free_or_none(path))
+        started = getattr(self, "own_need_started", None)
+        now = time.monotonic()
+        if record is not None and started is None:
+            free = free_or_none(path)
+            gate_log(f"{OWN_NEED} start free_gib={free if free is None else round(free, 1)} "
+                     f"need_gib={record['need_gib']:g} key={record['key']}")
+            self.own_need_started = now
+        elif record is None and started is not None:
+            free = free_or_none(path)
+            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} held_s={round(now - started)}")
+            self.own_need_started = None
+        return None if record is None else record["need_gib"]
 
     def suite_first(self, busy: bool = False) -> str | None:
         """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
@@ -15463,7 +15549,7 @@ def main(argv: list[str] | None = None) -> int:
             # JOB_DISK_OWN_NEED: a home job whose own learned peak does not fit is refused for the rescue to place
             # elsewhere; a guest has no rescue, so it starts as before
             if not is_guest(repo, args.home_repo):
-                why = job_disk_own_refusal(disk_path, peak_key, args.job_log)
+                why = job_disk_own_refusal(disk_path, peak_key, args.job_log, args.state_dir)
                 if why:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
