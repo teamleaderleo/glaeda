@@ -1346,6 +1346,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "774a28dc9143a1f0496954a1500a53b9a41026d193a859a2b2d1a3206f5bd844",
     "f7e6ab44787e5a3cff88b4a053705a853a92b13a557242f71ef9579734bcbd09",
     "1ce4c03ed98484700e221db0067a56f18c74b2627503afe198871db040984e53",
+    "e086936669eca0a96cc84a68635f8bbb04fc00fe7719a4eab175b8872bc76481",
+    "08961a67d6469c324c8483af59fc8506a0f971ba2d3f120623af7c9beddc928e",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2624,6 +2626,14 @@ ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None 
 # runner's _work, whatever family discovered it.
 OUT_OF_BAND_RUN = ""
 ROLE = "fleet-mini"
+# Where cmux acts, glaeda-disk stands down (cmuxterm-hq docs/design/glaeda-into-cmux.md, move 2). With the cmux setting
+# `worktrees.cleanBuildCaches` on, cmux's worktree care (cmux-worktree-care caches.rs, manaflow-ai/cmux#50468) reclaims
+# these machine build caches itself, so on a devbox glaeda-disk keeps each item at or inside one of them and says why.
+# The roots are cmux's `caches::default_families`, relative to HOME.
+CMUX_BUILD_CACHES_SETTING = "worktrees.cleanBuildCaches"
+CMUX_OWNED_CACHE_ROOTS = ("Library/Developer/Xcode/DerivedData", "Library/Caches/org.swift.swiftpm",
+                          ".npm/_cacache", ".bun/install/cache")
+CMUX_OWNED_REASON = f"cmux cleans it ({CMUX_BUILD_CACHES_SETTING} is on): glaeda-disk stands down"
 DEVBOX_TRANSCRIPT_DAYS = 30
 DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
@@ -5811,6 +5821,85 @@ def stale_tmp_claims(path: Path, now: float | None = None) -> bool:
         return False
     cutoff = (time.time() if now is None else now) - stale_tmp_hours() * 3600
     return max(st.st_mtime, st.st_ctime if STALE_TMP_CTIME else 0.0) < cutoff
+
+
+def cmux_settings_paths() -> list[Path]:
+    """The cmux settings files, first that exists wins, as cmux's acpmux reads them (cmux-config location.rs,
+    acpmux user_settings.rs): CMUX_NEXT_CONFIG_FILE alone, else ~/.config/cmux/cmux-next.json, then classic cmux.json."""
+    override = os.environ.get("CMUX_NEXT_CONFIG_FILE", "")
+    if override:
+        return [HOME / override[2:] if override.startswith("~/") else Path(override)]
+    return [HOME / ".config/cmux/cmux-next.json", HOME / ".config/cmux/cmux.json"]
+
+
+def strip_jsonc(text: str) -> str:
+    """JSONC to JSON, as cmux's settings reader takes it: a BOM, // and /* */ comments outside strings, and a
+    trailing comma before } or ] go."""
+    text = text.removeprefix("\ufeff")
+    out: list[str] = []
+    i, n, in_str = 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        else:
+            if c in "}]":
+                j = len(out)
+                while j and out[j - 1].isspace():
+                    j -= 1
+                if j and out[j - 1] == ",":
+                    del out[j - 1]
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def cmux_build_caches_on() -> bool:
+    """Whether cmux reclaims the machine build caches here: its `worktrees.cleanBuildCaches` setting, flat or nested,
+    in the first settings file that exists. Off (glaeda-disk acts) when no file has it on or the file cannot be read,
+    the answer cmux gives itself (acpmux worktree_care.rs clean_build_caches_enabled)."""
+    for path in cmux_settings_paths():
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError):
+            return False
+        try:
+            doc = json.loads(strip_jsonc(text))
+        except ValueError:
+            return False
+        if not isinstance(doc, dict):
+            return False
+        value = doc.get(CMUX_BUILD_CACHES_SETTING)
+        if value is None:
+            node: Any = doc
+            for part in CMUX_BUILD_CACHES_SETTING.split("."):
+                node = node.get(part) if isinstance(node, dict) else None
+            value = node
+        return value is True
+    return False
+
+
+def cmux_owned_cache(path: Path) -> bool:
+    """An item at or inside one of the build cache roots cmux's worktree care reclaims (CMUX_OWNED_CACHE_ROOTS)."""
+    return any(path == (root := HOME / rel) or root in path.parents for rel in CMUX_OWNED_CACHE_ROOTS)
 
 
 def default_families(role: str = "fleet-mini") -> list[Family]:
@@ -12207,6 +12296,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     opened = open_index(cwds)
     references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
+    cmux_acts = ROLE == "devbox" and cmux_build_caches_on()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
         # the verdicts' socket, lock and git checks count against the judge deadline too: what is judged by then
         # is kept (and may be deleted), the rest is left out
@@ -12300,7 +12390,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
-        if fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
+        if cmux_acts and fam.reclaimable and cmux_owned_cache(path):
+            verdict = "kept"
+            reasons.append(CMUX_OWNED_REASON)
+        elif fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
             verdict = "kept"
         elif not fam.reclaimable:
             verdict = "report-only"
@@ -14784,6 +14877,9 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
            notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None,
            accounting: list[dict[str, Any]] | None = None) -> None:
     print(f"role {ROLE}")
+    if ROLE == "devbox" and cmux_build_caches_on():
+        print(f"cmux acts here ({CMUX_BUILD_CACHES_SETTING} on): glaeda-disk keeps "
+              + ", ".join("~/" + r for r in CMUX_OWNED_CACHE_ROOTS) + " for cmux's worktree care")
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
@@ -17746,6 +17842,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     fill_holds([*items, *tooling])
     if a.json:
         print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
+                          "cmux_acts": ROLE == "devbox" and cmux_build_caches_on(),
                           "total": shown[0].total, "idle_hours": idle, "tmp_test_residue": tmp_residue,
                           "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
