@@ -28718,6 +28718,21 @@ class LandTest(Base):
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
 
+    def test_a_forwarded_land_with_no_read_since_its_hand_off_asks_for_one_and_ends_merged(self):
+        # 2026-11-23: rows whose PR the far host had merged hours before stopped forward_no_outcome, because nothing
+        # asked this host's daemon to read the PR. Now the follow asks, and the read it brings ends the row merged.
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.nudged.clear()
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertIn(self.KEY, self.w.nudged)
+        self.pr(LA, state="MERGED")
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": LC}
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assertEqual(len(self.handoffs()), 1)
+
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
         self.pr(LB)

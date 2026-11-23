@@ -16076,6 +16076,12 @@ class LandQueue:
         host = str(e.get("forwardedTo") or "the host it was handed to")
         at = c.get("dataAt")
         read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        if state not in ("MERGED", "CLOSED") and read_at < self.forwarded_since(e):
+            # No copy, or one older than the hand-off: ask the daemon to read it (its read scheduler paces and bounds
+            # the read), so the far host's merge ends this row merged instead of forward_no_outcome. 2026-11-23
+            # 07:25-07:55Z: 11 rows on two fleet hosts stopped "this host's cache holds no read of the
+            # PR" for PRs merged 9-17 h before (hq#19220, hq#18897, lw#8393 ...): nothing had asked for a read.
+            self.nudge(e["key"])
         if state == "MERGED":
             merge = data.get("mergeCommit")
             sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
