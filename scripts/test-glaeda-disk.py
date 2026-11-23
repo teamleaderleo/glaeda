@@ -8879,6 +8879,24 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
             self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
 
+    def test_a_devbox_spares_a_fresh_xcode_build_under_pressure_a_fleet_mini_does_not(self) -> None:
+        # 2026-11-23: a devbox pressure pass deleted a live check's 14.5 GB DerivedData 0.1 h after its build
+        path = self.root / "cmux-try48231"
+        home = self.root / "home"
+        (home / "Library/Developer/Xcode/DerivedData").mkdir(parents=True)
+        with mock.patch.object(gd, "HOME", home):
+            devbox = next(f for f in gd.default_families("devbox") if f.id == "xcode-derived-data")
+            mini = next(f for f in gd.default_families("fleet-mini") if f.id == "xcode-derived-data")
+        pressure_idle = gd.POLICY["pressure_idle_hours"]
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+                window = gd.item_window(devbox, path, pressure_idle)
+                self.assertEqual(window, gd.FRESH_BUILD_HOURS)
+                self.assertFalse(gd.item_due(devbox, 1.0, window)[0])
+                self.assertTrue(gd.item_due(devbox, gd.FRESH_BUILD_HOURS + 0.5, window)[0])
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):  # Leo's no-window rule stands on a mini
+                self.assertTrue(gd.item_due(mini, 0.1, gd.item_window(mini, path, pressure_idle))[0])
+
     def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
         dd = gd.Family("ci-derived-data", self.root, True, "rebuild")
         scratch = gd.Family("tmp", self.root, True, "rebuild")

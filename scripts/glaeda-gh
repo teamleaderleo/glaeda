@@ -3544,6 +3544,27 @@ def app_pool_tool() -> Path | None:
     return None
 
 
+# Creates on the App of their purpose (ci-217x-dictator's design, 2026-11-23; Leo: "use more of the apps then. go make
+# more"). A new issue goes on the issues App, and a new PR in a repo gh-app-roles.json's bot_authored_write_repos opts
+# in goes on the lander App while the login's create pause holds, so neither waits on one login's pause. Each kind has
+# exactly one App, the one whose purpose it is (machines/github-apps.md "Why per purpose": never N copies of one App,
+# never "the App with the most budget left"). manaflow-ai/cmux's CLA counts a PR's opener as a signer, so no create
+# there leaves the login. A refused or throttled App create goes on the login; the App's throttle is the App's own
+# cooldown (app_create_hold), never reported as the login's pause. GLAEDA_APP_CREATES=0 (in the daemon's environment,
+# or the caller's when it queues) turns this off: an issue is made in one `gh` call again and a PR waits out the
+# login's pause as before.
+APP_CREATES_ENV = "GLAEDA_APP_CREATES"
+APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
+APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
+APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
+
+
+def app_creates_on(env: Any = None) -> bool:
+    """Whether creates may go on the App of their purpose here (APP_CREATES_ENV, on unless it is "0")."""
+    return str((os.environ if env is None else env).get(APP_CREATES_ENV, "1")).strip() != "0"
+
+
 def app_pool_pushed_path(role: str, owner: str) -> Path:
     """The key home's pushed token filename for ROLE and OWNER."""
     owner = owner.lower()
@@ -5911,6 +5932,8 @@ class Daemon:
         # GitHub's secondary limit holds the outbox until then
         self.post_hold = saved_hold(held.get("holdUntil"), time.time())
         self.post_backoff = POST_BACKOFF  # the next hold without a Retry-After
+        self.app_create_hold: dict[str, float] = {}  # role -> until: that App's own create cooldown (app_create_refused)
+        self.app_actors: dict[tuple[str, str], tuple[float, dict | None]] = {}  # (op, repo) -> (asked, actor)
         self.pause_until = 0.0  # the login's create pause (content_pause_until), as last read
         self.pause_next = float("-inf")  # when it may next be asked
         self.pause_ask: threading.Thread | None = None  # the ask in flight (content_pause_until)
@@ -7387,43 +7410,95 @@ class Daemon:
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
 
+    def login_create_paused(self) -> bool:
+        """Whether the login's creates are held: its create pause (content_pause_until, or not known), or this
+        daemon's own hold after the login's create was throttled (post_hold)."""
+        return self.now < self.post_hold or self.now < self.content_pause_until() or self.content_pause_unknown()
+
+    def app_create_due(self, item: dict) -> bool:
+        """Whether ITEM is a create that may go on the App of its purpose now (APP_CREATE_ROLE), the login aside:
+        on (app_creates_on, and the item was not queued with it off), never in APP_CREATE_NEVER, not refused by
+        that App already, and that App not in its own cooldown (app_create_hold)."""
+        op = APP_CREATE_OP.get(str(item.get("kind")))
+        if not op or not app_creates_on() or item.get("appCreates") is False:
+            return False
+        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+            return False
+        return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
+
     def outbox_actor(self, item: dict) -> dict | None:
         """Pick the installed writer on the same host as the login. No token goes in the outbox."""
-        op = {"pr": "create", "comment": "comment"}.get(item.get("kind"))
+        op = {"pr": "create", "comment": "comment", "issue": "issue"}.get(item.get("kind"))
         if (not op or self.upstream() is not None or item.get("status") or item.get("delivered") or item.get("reviewers") or
                 os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
             return None
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        role = "lander" if op == "create" else "review"
+        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+            return None
+        role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
         if saved is None and (item.get("uncertain") or item.get("attempts")):
             return None  # the first send was already attempted by the login
         if saved not in (None, role):
             return None
+        if saved is None and op in APP_CREATE_ROLE and item.get("appRefused"):
+            return None  # that App refused it: the login makes it
         state = latch_state_dir()
         def held(identity):
             doc = read_json(state / ("rest-exhausted" + identity + ".json")) or {}
             until = doc.get("until") if isinstance(doc, dict) else None
             return doc if isinstance(until, (int, float)) and until > self.clock() and not doc.get("share") and \
                 doc.get("counter") in (None, "core") else {}
-        if not saved and held("").get("source") not in ("x-ratelimit-reset", "said"):
+        # A new issue goes on the issues App whenever creates on Apps are on; a new PR when the login's REST quota is
+        # spent, or (on) while the login's create pause holds. Anything else keeps the login.
+        by_purpose = self.app_create_due(item) and (op == "issue" or self.login_create_paused())
+        if not saved and not by_purpose and held("").get("source") not in ("x-ratelimit-reset", "said"):
             return None
-        if held("@app-" + role):
+        if held("@app-" + role) or self.app_create_hold.get(role, 0.0) > self.clock():
             return None
         tool = app_pool_tool()
         if not tool:
             return None
+        key = (op, str(item["repo"]).lower())
+        cached = self.app_actors.get(key)
+        if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
+            return cached[1]
+        actor = None
         try:
             result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
-            actor = json.loads(result.stdout) if not result.returncode else None
-            if isinstance(actor, dict) and actor.get("role") == role and isinstance(actor.get("note"), str) and \
-                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(actor.get("token", ""))):
-                return actor
+            found = json.loads(result.stdout) if not result.returncode else None
+            if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
+                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
+                actor = found
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
-        return None
+        self.app_actors[key] = (self.clock(), actor)
+        return actor
+
+    def app_create_refused(self, path: Path, item: dict, role: str, status: int, h: dict, text: str) -> None:
+        """An App create GitHub refused before making anything (its rate limit, its credential, a permission or an
+        install it lacks): the item goes on the login on its next turn. A throttle rests that App alone
+        (app_create_hold, its own cooldown): the login's pause is neither set nor reported for it."""
+        throttled = status == 429 or (status == 403 and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0"
+                                                         or THROTTLED.search(text)))
+        if throttled:
+            try:
+                wait = (retry_after_seconds(h["retry-after"]) or 0.0) if h.get("retry-after") else (
+                    float(h.get("x-ratelimit-reset", 0)) - self.now if h.get("x-ratelimit-remaining") == "0" else 0.0)
+            except ValueError:
+                wait = 0.0
+            wait = POST_BACKOFF if math.isnan(wait) or wait <= 0 else min(wait, PACE_HOLD_MAX)
+            self.app_create_hold[role] = max(self.app_create_hold.get(role, 0.0), self.clock() + wait)
+        else:
+            item["appRefused"] = role
+        item.pop("appWriter", None)  # nothing was made: the login may make it
+        self.app_actors.clear()
+        write_json(path, item)
+        log({"event": "post-app-refused", "id": item["id"], "role": role, "status": status,
+             "throttled": bool(throttled), **({"wait": round(self.app_create_hold[role] - self.clock())}
+                                              if throttled else {})})
 
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
@@ -7433,8 +7508,9 @@ class Daemon:
         self.adopt_pace_hold()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
-        if self.now < max(self.post_hold, self.post_at + POST_SPACING):
+        if self.now < self.post_at + POST_SPACING:
             return
+        paused = None  # the login's create pause, asked once and only when a write is due (login_create_paused)
         for path, item in self.retire_superseded(outbox_queue()):
             if not isinstance(item, dict) or item.get("id") != path.stem:
                 with contextlib.suppress(OSError):
@@ -7445,9 +7521,15 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
-            if self.now < self.content_pause_until() or self.content_pause_unknown():
-                return  # shared content/secondary cooldown also holds an App-authored write
-            actor = self.outbox_actor(item)
+            paused = self.login_create_paused() if paused is None else paused
+            if paused:
+                # The login's create pause holds the login's writes and the review App's comments. A create goes on the
+                # App of its purpose meanwhile (app_create_due), so it never waits on the login's pause.
+                actor = self.outbox_actor(item) if self.app_create_due(item) else None
+                if not actor:
+                    continue  # the login's write waits out its pause; a create behind it may still go on its App
+            else:
+                actor = self.outbox_actor(item)
             if item.get("appWriter") and not actor and not item.get("delivered"):
                 continue  # never replay an App-authored POST with the login
             broker = not actor and lane_vm_poster()  # the broker paces its own writes: this host's REST backoff is moot
@@ -7748,6 +7830,9 @@ class Daemon:
             if item["kind"] == "comment":
                 self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
+        elif actor and item["kind"] in APP_CREATE_OP and (status in (401, 403, 404, 429) or (
+                status == 422 and THROTTLED.search(text))):
+            self.app_create_refused(path, item, actor["role"], status, h, text)
         elif actor and status in (403, 429) and h.get("x-ratelimit-remaining") == "0" and not h.get("retry-after") and not THROTTLED.search(text):
             reset = str(h.get("x-ratelimit-reset", ""))
             item["notBefore"] = max(self.now + POST_SPACING, min(self.now + PACE_HOLD_MAX, int(reset)) if reset.isdigit() else 0)
@@ -7922,6 +8007,9 @@ class Daemon:
             api = f"/repos/{repo}/pulls?state=open&head={urllib.parse.quote(head)}&base={urllib.parse.quote(item['base'])}"
         elif item["kind"] == "comment":
             api = f"/repos/{repo}/issues/{item['number']}/comments?per_page=100&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        elif item["kind"] == "issue":
+            api = (f"/repos/{repo}/issues?state=all&sort=created&direction=asc&per_page=100"
+                   f"&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}")
         else:
             api = f"/repos/{repo}/pulls/{item['number']}/reviews?per_page=100"
         try:
@@ -7934,6 +8022,9 @@ class Daemon:
         if status != 200 or not isinstance(doc, list):
             return None, False
         for found in reversed(doc):
+            if item["kind"] == "issue" and isinstance(found, dict) and (
+                    found.get("pull_request") or found.get("title") != item["title"]):
+                continue
             if isinstance(found, dict) and (item["kind"] == "pr" or (found.get("body") or "") == item["body"]):
                 if found.get("html_url"):
                     return found, True
@@ -9260,6 +9351,9 @@ class Daemon:
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None,
                              "pause": self.content_pause_status()}}
+        app_holds = {r: round(t, 3) for r, t in self.app_create_hold.items() if t > self.now}
+        if app_holds:  # an App resting from creates: its own cooldown, never the login's holdUntil or pause
+            status["outbox"]["appHolds"] = app_holds
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
         if self.read_pool is not None:  # never a token: how many keys it read, and why the last repo got none
@@ -13978,6 +14072,11 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # scratch merge: nothing checked out, nothing to clean up). Only a PR whose branch lives on the base repository
 # (forks never: union_plan reads the branch from github.com/<base repo> and requires it at the judged head) of an
 # owner in LAND_MERGE_OWNERS is pushed to; a plain merge commit, fast-forward only, never a force-push.
+# The pinned merge's own conflict refusal ("Pull Request has merge conflicts (mergePullRequest)") takes the same base
+# merge, once per head: a land judged mergeable whose base moved before the merge went straight to merge_conflict, so
+# cmuxterm-hq findings and reading PRs that only appended a line to docs/findings/CLAIMED.md stopped again and again
+# (2026-11-23, hq#20862 and hq#20882 three times each; cmuxterm-hq
+# docs/findings/2026-11-23-land-merge-conflict-skips-union.md). Its stop names the merge step, as before.
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
@@ -16660,8 +16759,9 @@ class LandQueue:
                 if past:
                     self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
                     return False
+                # quiet: whoever closed it knows (2026-11-23 09:32Z: a closed PR woke its requester as a [blocker])
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
-                          f"closed); nothing is merged", "")
+                          f"closed); nothing is merged", "", tell="quiet")
                 return False
             return past or self.forward_state_wanted(e)  # a copy older than the row: read live
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
@@ -16744,7 +16844,7 @@ class LandQueue:
                 return
             if state == "CLOSED":
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); "
-                          "nothing is merged", "")
+                          "nothing is merged", "", tell="quiet")  # whoever closed it knows
                 return
             self.save(e)
             return
@@ -18509,7 +18609,7 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def follow_own_update(self, e: dict, head: str) -> str | None:
+    def follow_own_update(self, e: dict, head: str, read: list | None = None) -> str | None:
         """Move E's pin to HEAD when HEAD is the base merge this queue's own update_branch made at the pinned head;
         None when it moved (or nothing was pinned elsewhere), else why HEAD still stops the land (head_moved).
         hq#14568 (glaeda#2377) followed it only when the cache showed the new head right after an update that returned
@@ -18530,6 +18630,8 @@ class LandQueue:
         parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
         if parents is None and str(data.get("headRefOid") or "").lower() == head and data.get("headParent"):
             parents = [data["headParent"]]  # pr_head_parent's first parent (pin_follow's read) says it as well
+        if parents is None and isinstance(read, list):
+            parents = read  # a read of HEAD's commit the caller made (repin_parents): the cache does not show HEAD
         unread = [h for h in e.get("history") or [] if h.get("event") == "pin_parent_unread" and h.get("head") == head[:12]]
         if not isinstance(parents, list) and unread:  # glaeda#2364: pin_follow waited for its parent and none came
             return "no read of this head said its first parent within the wait, so it is not known to be this update"
@@ -18542,6 +18644,27 @@ class LandQueue:
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
         return None
+
+    def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
+        """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
+        (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
+        the pin (follow_own_update): an update was sent at the pin, the head named is another, and the cache does not
+        show it (a cached read carries its own parents). None: no such case, or the read did not answer."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        gh = self.gh()
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha) or not sent \
+                or land_head_moved(pin, sent) or gh is None:
+            return None
+        if str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower() == sha:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{sha}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def old_pin_wait(self, e: dict, head: str) -> bool:
         """Under the lock. True while HEAD, which is not E's pin, is a pin E's own queue already followed away from
@@ -18711,8 +18834,12 @@ class LandQueue:
         if land_base_merge_parent(pin, head, data):
             return True
         head = str(head or "").lower()
-        return bool(pin) and SHA40.fullmatch(head) is not None and str(data.get("headRefOid") or "").lower() == head \
-            and not isinstance(data.get("headParents"), list) and self.gh() is not None
+        if not bool(pin) or SHA40.fullmatch(head) is None or str(data.get("headRefOid") or "").lower() != head \
+                or self.gh() is None:
+            return False
+        parents = data.get("headParents")
+        # a merge whose first parent is not the pin may sit on top of other base merges (land_base_merge_chain)
+        return not isinstance(parents, list) or len(parents) == 2
 
     def base_merge_check(self, e: dict, check: dict) -> bool:
         """On a worker, before the judgment: whether CHECK's head is only a base merge on its pin, from two compare
@@ -18737,21 +18864,27 @@ class LandQueue:
         why = "" if gh and base else "no gh-quota shim or base branch to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
         parents: Any = None
+        chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
         if kept:
             why = kept  # read before, for this head and pin (ancestry_record): not read again
         elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
-            got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
-            try:
-                parents = json.loads(got.stdout or "") if got.returncode == 0 else None
-            except ValueError:
-                parents = None
-            if not isinstance(parents, list):
-                why, unread = f"the read of {path} failed (exit {got.returncode}), so its parents are not known", True
-                said = f"{got.stdout or ''}\n{got.stderr or ''}"
+            if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+                parents = data["headParents"]  # the cache read them: no call
             else:
+                got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
+                try:
+                    parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+                except ValueError:
+                    parents = None
+                if not isinstance(parents, list):
+                    why = f"the read of {path} failed (exit {got.returncode}), so its parents are not known"
+                    unread, said = True, f"{got.stdout or ''}\n{got.stderr or ''}"
+            if isinstance(parents, list):
                 parent = land_base_merge_parent(pin, head, {"headRefOid": head, "headParents": parents})
-                if not parent:
+                if not parent and len(parents) == 2:
+                    parent, why, unread, said, chain = self.base_merge_chain(e, head, pin, base)
+                elif not parent:
                     why = (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) are not the pinned head "
                            "and then one more commit: a push, not a base merge on it")
         for path in ([f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{head}",
@@ -18796,9 +18929,43 @@ class LandQueue:
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
             e["updatedHead"], e["updatedHeadAt"] = head, self.now
             e.pop("pinWait", None)
-            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
+            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12],
+                         **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def base_merge_chain(self, e: dict, head: str, pin: str, base: str) -> tuple[str, str, bool, str, int]:
+        """On a worker, from base_merge_check: whether HEAD is a run of base merges on PIN (land_base_merge_chain), from
+        one compare PIN...HEAD (its commits and their parents) and one compare of each merge's second parent with BASE
+        (an ancestor of it). (the top merge's second parent, "", False, "", merges) when it is; else ("", why, unread,
+        said, 0): unread when a read did not answer (base_merge_unread's case), not when an answer says no."""
+        gh = self.gh()
+        if not gh or not base:
+            return "", "no gh-quota shim or base branch to read it with", False, "", 0
+        path = f"repos/{e['repo']}/compare/{pin}...{head}"
+        got = self.call([gh, "api", path, "--jq", LAND_CHAIN_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            return ("", f"the read of {path} failed (exit {got.returncode}), so its commits are not known", True,
+                    f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+        seconds, why = land_base_merge_chain(pin, head, doc)
+        for s in dict.fromkeys(seconds) if not why else ():
+            path = f"repos/{e['repo']}/compare/{s}...{urllib.parse.quote(base, safe='')}"
+            got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+            try:
+                ans = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                ans = None
+            if not isinstance(ans, dict) or not isinstance(ans.get("s"), str):
+                return ("", f"the read of {path} failed (exit {got.returncode}), so it is not shown to be on {base}",
+                        True, f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+            if not (ans["s"] == "identical" or (ans["s"] == "ahead" and ans.get("b") == 0)):
+                why = f"its merged commit {s[:12]} is not on {base}: not a merge of {base}"
+                break
+        return ("", why, False, "", 0) if why else (seconds[0], "", False, "", len(seconds))
 
     def base_merge_unread(self, e: dict, head: str, why: str, said: str) -> bool:
         """Under the lock, from base_merge_check: its read of HEAD did not answer (WHY; SAID is the read's output).
@@ -19709,6 +19876,7 @@ class LandQueue:
         if kind == "review":
             self.do_review(e, head, answer)
             return
+        parents = self.repin_parents(e, act, head) if kind == "repin" else None
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
@@ -19736,6 +19904,17 @@ class LandQueue:
                 sha = str(act.get("sha") or "").lower()
                 cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
+                    # The head land_judge read is this queue's own update_branch's base merge on the pin: the pin
+                    # follows it now (follow_own_update; a push by anyone else is not followed). Without this, a row
+                    # with no cached PR read is judged at its full pin again and again (fresh_head: land_full_pin),
+                    # the repin wait's sha is never read (tick's no-data branch), and the same "pin" refusal reaches
+                    # the stop. manaflow-ai/cmux-platform#1771, 2026-11-23: update_branch at the pin 2f3e4212176e
+                    # (11:58:07Z, exit 0) made a11cfabd1bde; 13 judgments at 2f3e4212176e followed, and at 12:03:51Z it
+                    # stopped "pin: 3 identical refusals in a row: ... PR read head 'a11cfabd...' does not match
+                    # pinned head 2f3e4212...". glaeda#2649 stopped the same way that morning.
+                    # Only on a read of that head's parents (repin_parents): with none, nothing is followed here.
+                    if parents is not None and self.follow_own_update(e, sha, parents) is None:
+                        e["streak"] = None  # the refusal named the head the queue made itself: nothing to count
                     self.wait(e, {"kind": "repin", "sha": sha}, None)
                 elif SHA40.fullmatch(sha) and sha == head == cached:
                     # land_judge's judge_again(), its fallback for a refusal with no step of its own: judge this same
@@ -20161,6 +20340,7 @@ class LandQueue:
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
+        kind = str((e.get("unionMerge") or {}).get("kind") or "update_branch")  # the step GitHub refused
         with self.lock:
             # Tried from here on: only a merge that began ends the once-per-head retry (the refusal path's check). A
             # restart between the refusal and this line once stopped cmux#51491 as a conflict with no merge tried
@@ -20176,7 +20356,7 @@ class LandQueue:
                 if (e.get("unionMerge") or {}).get("retry") or why.startswith("git ") or "timed out" in why:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
-                self.conflict_stop(e, "update_branch", head, said, why)
+                self.conflict_stop(e, kind, head, said, why)
             return
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
@@ -20203,7 +20383,7 @@ class LandQueue:
                 e.pop("updateSent", None)
                 why = f"the push of the base merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
                 self.history(e, "union_merge_skipped", head=head[:12], why=why)
-                self.conflict_stop(e, "update_branch", head, said, why)
+                self.conflict_stop(e, kind, head, said, why)
                 return
             e.pop("stepFail", None)
             e.pop("stepTransient", None)
@@ -20364,10 +20544,13 @@ class LandQueue:
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
             tried = e.get("unionMerge") or {}
-            if kind == "update_branch" and (tried.get("head") != head or not tried.get("tried")):
-                # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
-                # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
-                e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
+            if kind in ("update_branch", "merge") and (tried.get("head") != head or not tried.get("tried")):
+                # GitHub's update-branch and merge ignore .gitattributes and the 422 is often stale: a base merge git
+                # makes cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
+                # The merge step too: a pinned land refused at the merge for a conflict only in merge=union files
+                # (cmuxterm-hq docs/findings/2026-11-23-land-merge-conflict-skips-union.md) was stopped unmerged.
+                e["unionMerge"] = {"head": head, "at": self.now, "kind": kind,
+                                   "out": land_trim(land_tail(out), 200)}
                 self.save(e)
                 return "union_merge"
             self.conflict_stop(e, kind, head, land_trim(land_tail(out), 200))
@@ -20710,6 +20893,8 @@ class LandQueue:
             self.hand_off(e, sha)
         elif named == "update_branch":
             self.update_branch(e, sha)
+        elif named == "union_merge":
+            self.union_merge(e, sha)
 
     def review_hold_claim(self, e: dict, head: str, answer: dict) -> bool:
         """A chat or iOS hold whose PR body claims a release (a Chat-hold: or iOS-hold: line) passes only with a SHIP
@@ -21378,6 +21563,37 @@ def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
     if not SHA40.fullmatch(first) or land_head_moved(pin, first) or not SHA40.fullmatch(second):
         return ""
     return second
+
+
+# A run of base merges on a pinned head: the lander bot merged the base twice (95d7a2428 -> 429b4ab2fc -> 694409d218,
+# hq#17489, six head_moved stops in a day) before the queue read the PR, so HEAD's first parent was a base merge and not
+# the pin. The pin follows HEAD when walking its first parents reaches the pin, every commit passed is a merge (two
+# parents) and every second parent is an ancestor of the base branch (base_merge_chain reads that). A non-merge commit
+# anywhere on the walk, or a merge of a commit not on the base, stops it head_moved as before. The diff rule
+# (land_base_merge_why) then holds the whole run to the pin's own diff.
+LAND_CHAIN_JQ = "{s: .status, n: .total_commits, c: [.commits[]? | {s: .sha, p: [.parents[]?.sha]}]}"
+LAND_CHAIN_MAX = 20  # merges one pin follows in one step
+
+
+def land_base_merge_chain(pin: str, head: str, doc: dict) -> tuple[list[str], str]:
+    """(the second parents of the merges from HEAD down to PIN along first parents, top first, "") when DOC, GitHub's
+    compare PIN...HEAD as LAND_CHAIN_JQ shapes it, shows every commit on that walk a two-parent merge and the walk
+    reaches PIN; else ([], why not). Whether those second parents are on the base is for the caller's reads."""
+    head = str(head or "").lower()
+    commits = (doc or {}).get("c")
+    if not isinstance(commits, list) or (doc or {}).get("s") != "ahead" or (doc or {}).get("n") != len(commits):
+        return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
+    parents = {str((c or {}).get("s") or "").lower(): [str(p or "").lower() for p in (c or {}).get("p") or []]
+               for c in commits if isinstance(c, dict)}
+    seconds, cur = [], head
+    while land_head_moved(pin, cur):
+        ps = parents.get(cur)
+        if ps is None or len(ps) != 2 or not all(SHA40.fullmatch(p) for p in ps) or len(seconds) >= LAND_CHAIN_MAX:
+            return [], (f"{cur[:12]} between the pin and the head is not a merge of the base (parents "
+                        f"{', '.join(p[:12] for p in ps or []) or 'unlisted'}): a push, not base merges on the pin")
+        seconds.append(ps[1])
+        cur = ps[0]
+    return seconds, ""
 
 
 def land_diff_lines(patch: str) -> tuple[str, ...]:
@@ -32991,6 +33207,9 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     if item["kind"] == "pr":
         return "POST", f"/repos/{repo}/pulls", {"title": item["title"], "head": item["head"], "base": item["base"],
                                                 "body": item["body"], "draft": False}
+    if item["kind"] == "issue":
+        return "POST", f"/repos/{repo}/issues", {"title": item["title"], "body": item["body"],
+                                                 **({"labels": item["labels"]} if item.get("labels") else {})}
     raise WatchError(f"unknown write kind {item['kind']!r}")
 
 
@@ -33017,6 +33236,15 @@ def post_item(args: argparse.Namespace) -> dict:
         if not args.head or not args.base or not args.title:
             raise WatchError("post pr needs --head, --base and --title")
         item.update(repo=args.target, head=args.head, base=args.base, title=args.title, reviewers=args.reviewer or [])
+    elif args.kind == "issue":
+        # queued only where the daemon makes it (post_issue_queued): on the issues App, the login if that refuses
+        if not re.fullmatch(rf"{NAME}/{NAME}", args.target or ""):
+            raise WatchError(f"post issue takes OWNER/REPO (with --title T and --body-file F), not {args.target!r}")
+        if not args.title:
+            raise WatchError("post issue needs --title (and --body-file F, or --body)")
+        if args.head or args.base or args.reviewer:
+            raise WatchError("--head, --base and --reviewer are for post pr")
+        item.update(repo=args.target, title=args.title, labels=post_one_call_labels(args))
     else:
         # `pr:o/r#5` and `comment:o/r#5` (this tool's own notation for the thread) name the same thread here,
         # whichever of them the caller copied out of a wait line, so both are accepted for either kind.
@@ -33052,8 +33280,18 @@ def post_item(args: argparse.Namespace) -> dict:
         item.update(repo=f"{m.group(1)}/{m.group(2)}" if m else f"{owner}/{repo}", number=int(number))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
+    if not app_creates_on():
+        item["appCreates"] = False  # queued with GLAEDA_APP_CREATES=0: the daemon keeps it on the login
     item["id"] = f"{time.time_ns() // 1_000_000:013d}-{os.getpid()}-{os.urandom(3).hex()}"
     return item
+
+
+def post_issue_queued() -> bool:
+    """Whether `post issue` queues (and the daemon makes it on the issues App, APP_CREATE_ROLE) rather than run one
+    `gh issue create`: creates on Apps on (app_creates_on), this host's own login behind the daemon (no upstream, not
+    a lane VM, whose `gh` reaches the broker that makes it), and the daemon running, so the issue is not left waiting
+    on a daemon that is down."""
+    return app_creates_on() and upstream_command() is None and not lane_vm_poster() and daemon_running(DOWN_GRACE)
 
 
 def post_state(post_id: str) -> dict | None:
@@ -33534,6 +33772,7 @@ JOB_LOG_TMP_KEEP = 3600.0  # a writer's temporary file this old was left by a cr
 JOB_LOG_DONE = b"Cleaning up orphan processes"
 LOG_CONTROLLER_TIMEOUT = 8  # the controller's job-log read (it may read GitHub itself first)
 LOG_REST_TIMEOUT = 18  # one `gh api .../logs` read (a redirect to blob storage, which gh follows)
+LOG_ERRORS_BUDGET = 120  # `log errors`'s whole wall clock, run id or job (log_read_seconds)
 
 
 def job_log_path(repo: str, job: int) -> Path:
@@ -33609,15 +33848,34 @@ def kept_evict(root: Path, suffix: str, max_bytes: int, now: float | None = None
     return {"removed": removed, "bytes": total}
 
 
-def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, bytes]:
+def log_read_seconds(deadline: float | None, cap: float) -> float:
+    """How long one log read may take: CAP, or what is left of DEADLINE when that is less. 0.0 when the budget is
+    spent, which every caller reads as "do not make this call".
+
+    `log errors` had no whole-command bound, only a timeout per step, and a run id makes many steps: one doomed
+    job-log read for the number itself (8 s controller + 18 s REST, because a run id and a job id are the same
+    bare integer) and then one per failed job the run has, up to `--reads`. Measured 2026-11-23 on
+    manaflow-ai/cmux/44919951254: `timeout 180 glaeda-gh log errors` was killed with nothing printed (rc 124).
+    This command is the designated "why did this run fail" front door, so its never answering is why a red
+    triage falls back to `gh run view --log-failed | grep -i error` -- which on a Rust job returns passing
+    lines, acpmux's own test names holding the word "error"."""
+    if deadline is None:
+        return cap
+    return max(0.0, min(cap, deadline - time.monotonic()))
+
+
+def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
     """(HTTP status, body) of the controller's GET /v1/github/job-log: 200 is a finished job's log; 0 when it did not
     answer. 404 (unknown job, or an older controller), 409 (still running), 410 (GitHub expired it) and 429 (its log
     reads are spent) carry no log."""
     headers = {"Authorization": f"Bearer {ctl.token}"} if ctl.token else {}
     url = f"{ctl.base}/v1/github/job-log?repo={urllib.parse.quote(repo, safe='/')}&id={int(job)}"
+    left = log_read_seconds(deadline, LOG_CONTROLLER_TIMEOUT)
+    if not left:  # the caller's budget is spent: a read that cannot finish is not started
+        return 0, b""
     try:
-        with hard_deadline(LOG_CONTROLLER_TIMEOUT + 1), \
-                OPENER.open(urllib.request.Request(url, headers=headers), timeout=LOG_CONTROLLER_TIMEOUT) as response:
+        with hard_deadline(left + 1), \
+                OPENER.open(urllib.request.Request(url, headers=headers), timeout=left) as response:
             return response.status, response.read(JOB_LOG_RAW_MAX + 1)
     except urllib.error.HTTPError as error:
         return error.code, b""
@@ -33625,7 +33883,7 @@ def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, byt
         return 0, b""
 
 
-def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
+def rest_job_log(repo: str, job: int, deadline: float | None = None) -> tuple[bool, bytes, str]:
     """One `gh api repos/REPO/actions/jobs/JOB/logs` through the PATH gh (so the quota guard and a lane's broker see
     it; gh follows the redirect to blob storage, which no quota counts): (ok, log bytes, why not)."""
     gh = find_gh()
@@ -33633,9 +33891,12 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         return False, b"", "gh not found"
     route = f"repos/{repo}/actions/jobs/{int(job)}/logs"
     for flags in (["--allow-escape-sequences"], []):  # newer gh strips a log's colour codes without it; older lacks it
+        left = log_read_seconds(deadline, LOG_REST_TIMEOUT)
+        if not left:
+            return False, b"", "the command's time budget was spent"
         try:
             done = subprocess.run([gh, "api", *flags, route], stdin=subprocess.DEVNULL, capture_output=True,
-                                  timeout=LOG_REST_TIMEOUT, check=False)
+                                  timeout=left, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             return False, b"", f"gh api: {type(error).__name__}"
         if done.returncode == 0:
@@ -33650,10 +33911,12 @@ def job_log_finished(text: bytes) -> bool:
     return JOB_LOG_DONE in text[-4096:]
 
 
-def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log
-                 ) -> tuple[bytes | None, str, str]:
+def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log,
+                 deadline: float | None = None) -> tuple[bytes | None, str, str]:
     """(log, source, why not) for JOB: kept here, else from the build controller, else one REST read. rest=None
-    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota."""
+    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota.
+    DEADLINE is the caller's whole budget (monotonic): each read takes the smaller of its own timeout and what is
+    left of it, so a command that makes several reads cannot outlive the bound it published."""
     repo = repo.lower()
     text = job_log_get(repo, job)
     if text is not None:
@@ -33661,7 +33924,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     ctl = Controller.from_env() if controller == "env" else controller
     status = 0
     if ctl is not None:
-        status, body = controller_job_log(ctl, repo, job)
+        status, body = controller_job_log(ctl, repo, job, deadline)
         if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
             with contextlib.suppress(OSError):
                 job_log_put(repo, job, body)  # the controller serves only a finished job's log
@@ -33673,7 +33936,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     if rest is None:
         return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
             status, "not kept by the controller")
-    ok, body, why = rest(repo, job)
+    ok, body, why = rest(repo, job, deadline)
     if not ok:
         return None, "", why
     if job_log_finished(body):
@@ -34151,14 +34414,21 @@ def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool | str
 
 
 def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
-                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS) -> int:
+                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS,
+                   budget: float = LOG_ERRORS_BUDGET) -> int:
     """One job's error-level lines by step, not its whole log. A run id here reads the newest READS failed jobs of
     that run, because the two kinds of id are indistinguishable (run_jobs_typed_as_a_job). Exit 0 with a log read
-    (a log with no error line prints a count of 0), 1 with none."""
+    (a log with no error line prints a count of 0), 1 with none.
+
+    BUDGET is the whole command's wall clock (`--timeout`): every read inside it takes the smaller of its own
+    timeout and what is left (log_read_seconds), and a job the budget cannot reach is named unread with its own
+    command, like one past `--reads`. Without it the per-step timeouts added up unannounced and the command could
+    answer nothing at all."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
-    text, source, why = job_log_read(repo, job, controller, rest)
+    deadline = time.monotonic() + budget if budget > 0 else None
+    text, source, why = job_log_read(repo, job, controller, rest, deadline)
     if text is not None:
         return log_errors_emit(repo, [(job, text, source)], limit, as_json, None)
     try:
@@ -34182,11 +34452,22 @@ def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, 
                 f"{'its' if not over else f'the newest {len(take)} of its'} {len(failed)} failed job(s)")
     read, unread = [], []
     for r in take:
-        one, src, reason = job_log_read(repo, int(r["id"]), controller, rest)
+        jid = int(r["id"])
+        if not log_read_seconds(deadline, 1):
+            # The budget is spent. A kept copy costs nothing, so it is still served; anything that would need a
+            # read is named unread, with its own command, rather than making a call that cannot finish.
+            kept = job_log_get(repo, jid)
+            if kept is None:
+                unread.append({"job": jid, "why": f"unread: the command's {budget:g} s budget was spent "
+                                                  f"(`glaeda-gh log errors {repo} {jid}` reads this one)"})
+                continue
+            read.append((jid, kept, "cache"))
+            continue
+        one, src, reason = job_log_read(repo, jid, controller, rest, deadline)
         if one is None:
-            unread.append({"job": int(r["id"]), "why": reason})
+            unread.append({"job": jid, "why": reason})
         else:
-            read.append((int(r["id"]), one, src))
+            read.append((jid, one, src))
     if over:
         # Bounded like `run_id_hint`'s own offer: a next step has to be readable to be a next step (95
         # commands, 3001 characters measured on a 100-failed-job run).
@@ -34852,6 +35133,9 @@ def parser() -> argparse.ArgumentParser:
     le.add_argument("--reads", type=reads_cap, default=LOG_ERRORS_RUN_READS, metavar="N",
                     help="given a run id, how many of its failed jobs to read, newest first (default "
                          "%(default)s; the rest are named with their own commands)")
+    le.add_argument("--timeout", "--budget", dest="budget", type=seconds, default=LOG_ERRORS_BUDGET, metavar="S",
+                    help="the whole command's wall clock (default %(default)s); a failed job it cannot reach in "
+                         "time is named with its own command, never waited for silently")
     le.add_argument("--json", action="store_true")
     for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
                                   "on the controller, never REST)"),
@@ -35955,7 +36239,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             if args.kind == "errors":
-                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads)
+                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads,
+                                      budget=args.budget)
             if args.kind == "search":
                 return cmd_log_search(args.repo, args.pattern, args.since, args.job, args.workflow, args.seg,
                                       args.conclusion, args.reads, args.limit, args.json)
@@ -36026,6 +36311,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
+            elif one == "issue" and post_issue_queued():
+                args.kind = "issue"  # queued like a PR: the daemon makes it on the issues App (APP_CREATE_ROLE)
             elif one:
                 return cmd_post_one_call(one, args)
             return cmd_post(args)
