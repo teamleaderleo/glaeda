@@ -2649,6 +2649,8 @@ class HookTest(unittest.TestCase):
             # JOB_OWN_NEED_ALONE: a peak learned only beside other jobs counts their writes too: no refusal
             crowded = self.peak_log([(100.0, 45.0, False)] * 20)
             self.assertIn("p90 of 20 runs here", hook.learned_job_peaks(hook.job_log_tail(crowded))[self.PEAK_KEY][1])
+            self.assertEqual(hook.learned_job_peaks(hook.job_log_tail(crowded), alone_only=True), {})
+            self.assertIn(self.PEAK_KEY, hook.learned_job_peaks(hook.job_log_tail(log), alone_only=True))
             with mock.patch.object(hook, "free_gib", return_value=17.2):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded))
             with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):

@@ -10167,9 +10167,11 @@ JOB_PEAK_RECENT = 20
 JOB_PEAK_MAX_GIB = RUNNER_JOB_DISK_MAX_GIB
 
 
-def learned_job_peaks(records: list[dict[str, Any]]) -> dict[str, tuple[float, str]]:
+def learned_job_peaks(records: list[dict[str, Any]], alone_only: bool = False) -> dict[str, tuple[float, str]]:
     """{job key: (its learned peak in GiB, where it came from)} from job-log records (job_log_tail), for each job with
-    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest."""
+    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest. alone_only keeps only
+    the peaks learned from runs with no other runner job beside them (JOB_OWN_NEED_ALONE), never the fallback over
+    every run, whose free-disk drop counts the neighbours' writes too."""
     runs: dict[str, list[tuple[float, bool]]] = {}
     for record in records:
         if record.get("event") != "completed" or not (key := _job_key(record)):
@@ -10183,7 +10185,7 @@ def learned_job_peaks(records: list[dict[str, Any]]) -> dict[str, tuple[float, s
         rows = rows[-JOB_PEAK_RECENT:]
         alone = [growth for growth, solo in rows if solo]
         values, kind = (alone, "alone") if len(alone) >= JOB_PEAK_MIN_SAMPLES else ([g for g, _ in rows], "any")
-        if len(values) < JOB_PEAK_MIN_SAMPLES:
+        if len(values) < JOB_PEAK_MIN_SAMPLES or (alone_only and kind != "alone"):
             continue
         peak = min(JOB_PEAK_MAX_GIB, math.ceil(round(_p90(values) * 10, 6)) / 10)
         peaks[key] = (peak, f"p90 of {len(values)} runs here{' alone' if kind == 'alone' else ''}")
@@ -10273,17 +10275,16 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
         free = free_or_none(path)
         if free is None:
             return None
-        peaks = learned_job_peaks(job_log_tail(log))
+        peaks = learned_job_peaks(job_log_tail(log), alone_only=True)
         if key is None or key not in peaks:
-            return None  # no history here: the flat default is a guess, not this job's need
+            # no history here (the flat default is a guess), or a peak learned only beside other jobs: not its need
+            return None
         own, source = peaks[key]
-        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks' "alone") is its own need. The
+        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks alone_only) is its own need. The
         # fallback p90 over every run measures free_start - free_min, which counts the jobs writing beside it: a fast
         # tier learned 54.7 GiB ("p90 of 20 runs here", 2026-11-22 22:02Z, refused at 17.2 GiB free on cmux23 against a
         # fleet-measured 5.3 GiB p95 per job), a need no carrier of its label had, so the rescue's re-runs never
         # found a runner. Such a peak stays the in-flight warning (job_disk_peak_hold) and never refuses.
-        if not source.endswith(" alone"):
-            return None
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
