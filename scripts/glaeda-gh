@@ -15699,7 +15699,10 @@ class LandQueue:
                     path.unlink(missing_ok=True)
                     continue
                 e = self.entries.get(key)
-                if key in self.sending or e is None or e["state"] in LAND_DONE:
+                # A request over a row that ended here (stopped, merged, cancelled) is applied here: it starts the row
+                # over (apply: fresh), and the next batch hands that row off. Left for forward_batch it was sent on
+                # and the row stayed as it ended (2026-11-23: a re-request over a forward_no_outcome stop did nothing).
+                if key in self.sending or e is None or e["state"] == LAND_FORWARDED:
                     continue  # forwarded after the handoff in flight, or as it is (forward_batch)
                 try:
                     self.apply(req, key, repo, number)

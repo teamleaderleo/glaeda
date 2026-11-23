@@ -33509,6 +33509,29 @@ class LandForwardTest(Base):
         self.assertNotEqual(last["id"], self.sent_batches[0]["requests"][0]["id"])
         self.assertEqual(len(self.w.sent()), sent)
 
+    def test_a_new_request_over_a_row_stopped_forward_no_outcome_is_a_live_row_handed_off_with_a_fresh_clock(self):
+        # 2026-11-23: `land o/r#N --sha NEW` on a forwarding host answered "requested" and the row stayed stopped at
+        # its old head: forward_tick left a request over a finished row for forward_batch, which sent it on and
+        # never applied it here.
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land(requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        self.w.cache.pop(self.KEY, None)
+        self.q.stop(self.q.entries[self.KEY], "forward_no_outcome", "no outcome", "land again")
+        self.q.entries[self.KEY]["forwardGaveUp"] = self.t
+        self.q.entries[self.KEY]["forwardFirst"] = self.t - gg.LAND_FORWARD_GIVE_UP - 100
+        self.assertEqual(self.q.entries[self.KEY]["state"], "stopped")
+        gg.land_request("land", "o/r#1", [], "cosmic/coord", sha=LB)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"], e["forwardFirst"]), ("forwarded", LB, None))
+        self.assertGreater(e["forwardedAt"], e["created"])
+        self.assertEqual(self.sent_batches[-1]["requests"][0]["sha"], LB)
+        self.assertEqual(len(self.sent_batches), 2)
+        self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)  # not given up again at once on the old clock
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
+
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
         self.land(requester="cosmic/coord")
