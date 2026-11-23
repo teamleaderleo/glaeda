@@ -16606,8 +16606,9 @@ class LandQueue:
                 if past:
                     self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
                     return False
+                # quiet: whoever closed it knows (2026-11-23 09:32Z: a closed PR woke its requester as a [blocker])
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
-                          f"closed); nothing is merged", "")
+                          f"closed); nothing is merged", "", tell="quiet")
                 return False
             return past or self.forward_state_wanted(e)  # a copy older than the row: read live
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
@@ -16690,7 +16691,7 @@ class LandQueue:
                 return
             if state == "CLOSED":
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); "
-                          "nothing is merged", "")
+                          "nothing is merged", "", tell="quiet")  # whoever closed it knows
                 return
             self.save(e)
             return
