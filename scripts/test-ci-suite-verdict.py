@@ -20,8 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
-# The helper and the two patterns it reads, as one run of lines ending at the function's closing brace.
-BLOCK = re.compile(r"^ *VERDICT=.*?^ *\}\n", re.S | re.M)
+# The per-suite bound, the two patterns, and the helper, as one run of lines ending at its closing brace.
+# scripts/test-ci-suite-bound.py lifts the same block from the same first line, so the two tests cannot
+# end up checking different fragments of the step.
+BLOCK = re.compile(r"^ *suite_seconds=.*?^ *\}\n", re.S | re.M)
 
 
 def helper() -> str:
@@ -34,7 +36,7 @@ def helper() -> str:
 def run_suites(*commands: str) -> subprocess.CompletedProcess[str]:
     """Run the helper over `commands`, each a shell line, the way the workflow's step does (bash -e)."""
     body = "\n".join(f"suite bash -c {command!r}" for command in commands)
-    script = ("set -e\nfailed=()\n" + helper() + body
+    script = ("set -e\nfailed=()\ntimings=()\n" + helper() + body
               + '\nprintf "failed=%s\\n" "${#failed[@]}"\nfor f in "${failed[@]}"; do echo "- $f"; done\n')
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp, "step.sh")
@@ -48,6 +50,7 @@ class CiSuiteVerdict(unittest.TestCase):
         self.assertIn("suite() {", text)
         self.assertIn("no verdict printed", text)
         self.assertIn("PIPESTATUS", text, "the suite's own exit code, not tee's, decides a failure")
+        self.assertIn("timeout --kill-after", text, "the bound and the verdict check are one helper")
 
     def test_a_suite_that_prints_its_verdict_passes(self) -> None:
         out = run_suites('echo ..; echo "Ran 3 tests in 0.1s"; echo OK',

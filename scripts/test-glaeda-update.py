@@ -1340,6 +1340,29 @@ class UpdateTest(unittest.TestCase):
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
 
+    def test_a_fast_patch_ahead_of_the_release_is_not_drift_until_the_release_includes_it(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        reclaim.write_text("#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n")
+        marker = self.root / "fast-patch-live.json"
+        newer = "f" * 40
+        marker.write_text(json.dumps({"commit": newer, "tools": {"glaeda-worktree-reclaim": gu.file_sha256(reclaim)}}))
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x")["tools"]["drift"], [])
+            self.assertNotIn("repair", self.apply(now + 1))
+            self.assertIn(b"fast-patch", reclaim.read_bytes())
+            # once the installed release includes the commit, the release's bytes are as new: drift again
+            gen = gu.generation(self.state, gu.load_state(self.state)["current"])
+            with open(gen / gu.ANCESTRY, "a", encoding="ascii") as file:
+                file.write(newer + "\n")
+            result = self.apply(now + 2)
+            self.assertEqual(result["repair"], "reinstalled glaeda-worktree-reclaim")
+            # bytes fast-patch did not name are drift as before
+            reclaim.write_text("#!/bin/sh\n# a hand install\nexit 0\n")
+            self.assertEqual(self.apply(now + 3)["repair"], "reinstalled glaeda-worktree-reclaim")
+
     def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
         self.server.publish(SOURCES[0])
         now = 1_800_000_000.0
@@ -1852,6 +1875,52 @@ class ReleaseTest(unittest.TestCase):
             archive.write_bytes(raw)
             gu.safe_extract(archive, Path(tmp) / "out")
             self.assertTrue((Path(tmp) / "out/glaeda/scripts/glaeda_release.py").is_file())
+
+
+# The refusal gh passes on from GitHub, with the id replaced by a fake. glaeda-update renders gh's streams into its
+# own status lines, which agents paste into PR bodies and ledger rows, so the id must not survive the render.
+UPDATE_ID = "4242424242"  # a fake account id
+UPDATE_RAW = f"API rate limit already exceeded for user ID {UPDATE_ID}."
+
+
+class GhSaidTest(unittest.TestCase):
+    """gh's streams become this updater's status text, and GitHub's quota refusal quotes the token's numeric
+    account id, which is personal data and must never be in a line an agent pastes into a PR body.
+
+    Detector for the whole class: test-glaeda-gh's test_every_github_message_is_read_through_the_chokepoint,
+    which refuses a site in glaeda-gh that formats GitHub's message without a sanitizing sink. This file carries
+    the drift check for the copy below, because an updater cannot import the tool it replaces."""
+
+    def test_a_quota_refusal_in_a_status_line_names_no_account_id(self) -> None:
+        """The id goes; which limit was hit stays, because that is what the reader acts on."""
+        said = gu.gh_said(f"gh: {UPDATE_RAW} (HTTP 403)")
+        self.assertNotIn(UPDATE_ID, said)
+        self.assertEqual(said, f"gh: API rate limit already exceeded for user {gu.GH_NO_HOLDER}. (HTTP 403)")
+        self.assertIn("rate limit", said)  # the operational meaning, not swallowed
+        # gh_output is the sink every gh call in this file goes through
+        result = subprocess.CompletedProcess([], 1, "", f"gh: {UPDATE_RAW} (HTTP 403)")
+        self.assertNotIn(UPDATE_ID, gu.gh_output(result))
+        self.assertEqual(gu.gh_kind(gu.gh_output(result)), "rate-limited")  # still classified as a spent quota
+
+    def test_a_message_with_no_identifier_is_passed_through_unchanged(self) -> None:
+        """The other direction: gh's words stay gh's own, byte for byte, and the function is idempotent."""
+        for clean in ("HTTP 502: Bad Gateway", "HTTP 403: Resource not accessible by integration",
+                      "release 1.2.3 is not current", "read at 12:08:00 for 2 checks"):
+            with self.subTest(clean=clean):
+                self.assertEqual(gu.gh_said(clean), clean)
+        once = gu.gh_said(UPDATE_RAW)
+        self.assertEqual(gu.gh_said(once), once)
+
+    def test_this_copy_of_the_substitution_cannot_drift_from_glaeda_ghs(self) -> None:
+        """glaeda-update replaces glaeda-gh, so it cannot import gh_said and says the substitution again. The two
+        are the same text or this fails: a shape added to one must be added to the other."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text()
+        for name in ("GH_USER_ID", "GH_INSTALL_ID", "GH_CALLER_IP"):
+            with self.subTest(name=name):
+                mine = next(line for line in (ROOT / "scripts" / "glaeda-update").read_text().splitlines()
+                            if line.startswith(f"{name} = "))
+                self.assertIn(mine, source, f"{name} differs from glaeda-gh's")
+        self.assertIn(f'GH_NO_HOLDER = "{gu.GH_NO_HOLDER}"', source)
 
 
 if __name__ == "__main__":
