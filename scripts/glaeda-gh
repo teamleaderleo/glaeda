@@ -15929,7 +15929,7 @@ class LandQueue:
                             "busy": len(self.jobs), "loadPerCore": None if load is None else round(load, 2)}
             self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
                          workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
-                         holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
+                         holders=",".join(self.holder(k) for k in list(self.jobs)[:8]))
             self.save(e)
         elif (dl := e.get("dueLate")) and dl.get("why") != why \
                 and self.now - float(dl.get("whyAt") or dl.get("at") or 0) >= LAND_LATE_WHY_EVERY:
@@ -15939,6 +15939,18 @@ class LandQueue:
             load = land_load_per_core()
             dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
+
+    def holder(self, key: str) -> str:
+        """One job holding a worker, for a due_late row: its PR, what it runs (judging, or acting and the step's kind)
+        and for how many seconds. The executor of forwarded lands, 2026-11-23 00:20Z: a row due 30 min named 8 of 24
+        holders by PR only, so whether they were judgments or merge steps, and how long each had held, had to be
+        read off the host while it was still happening."""
+        e = self.entries.get(key) or {}
+        what = str(e.get("state") or "?")
+        if what == "acting":
+            what += " " + str((e.get("action") or {}).get("kind") or "?")
+        at = (self.job_started.get(key) or (None,))[0]
+        return f"{key_name(key)} {what}" + ("" if at is None else f" {round(self.now - at)}s")
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,

@@ -29904,11 +29904,15 @@ class LandTest(Base):
             def done(self) -> bool:
                 return False
         self.q.jobs["pr:o/r#99"] = Busy()
+        self.q.job_started["pr:o/r#99"] = (self.q.now - 700, "job")
         key = self.stuck(11, 3 * 3600)
         self.tick(30)
         self.tick(30)
         e = self.q.entries[key]
         self.assertEqual([h["event"] for h in e["history"]].count("due_late"), 1)
+        # the row names each holder's job and how long it has held its worker, not only its PR
+        late = next(h for h in e["history"] if h["event"] == "due_late")
+        self.assertRegex(late["holders"], r"^o/r#99 \? 7\d\ds$")
         self.assertIn("every worker busy", gg.land_line(e, self.t))
         pool = [r for r in logs if r.get("event") == "land-pool"][-1]
         self.assertEqual((pool["gated"], pool["dueLate"], pool["firstGated"]), (1, 1, "o/r#11"))
