@@ -37,6 +37,13 @@ PROPOSED = {
         "aliases": [{"under": [], "from": ["land-status"], "to": ["land", "status"]}],
         "default": {"log": "job"},
         "exact": ["on-event", "serve"],  # `on-event replay` runs the on-event commands; replay is a choice, not a subcommand
+        # glaeda-gh's reads the shared `reads` list does not name: a read-only meaning among them may run as the best one
+        "safe": ["checks", "budget", "audit", "runners", "job", "errors", "flaky"],
+    },
+    "glaeda-disk": {
+        "aliases": [{"from": ["status"], "to": ["report"]}],  # for the PreToolUse rewrite, which reads no parser
+        "safe": ["report"],
+        "exact": ["keepup"],  # keepup --apply deletes
     },
 }
 
@@ -103,9 +110,10 @@ class MeasuredMisses(Base):
 
     def test_log_with_no_kind_is_listed_then_runs_as_log_job_with_the_default(self) -> None:
         args, err, code = self.parse(["log", "o/r", "123"])
-        self.assertEqual((args, code), (None, 64), "without the table's default, three kinds fit: nothing runs")
-        self.assertIn("could mean (nothing ran)", err)
-        self.assertIn("glaeda-gh log job o/r 123", err)
+        # a805a3c4: a missing verb is supplied only when it reads, and of log's kinds only `search` is in the shared
+        # reads list, so with no glaeda-gh entry the one read that fits runs (a search, harmless, said on stderr)
+        self.assertEqual((code, args.kind), (None, "search"))
+        self.assertIn(f"ran `{line('log', 'search', 'o/r', '123')}`", err)
         self.with_proposed()
         args, err, code = self.parse(["log", "o/r", "123"])
         self.assertEqual((code, args.kind, args.job), (None, "job", 123))
@@ -177,6 +185,18 @@ class Writes(Base):
     def test_a_read_under_a_write_command_still_takes_its_typo(self) -> None:
         fixed, refusal = gg.flag_near_miss_synonym(["post", "status", "ID", "--jsn"])
         self.assertEqual((fixed, refusal), (["post", "status", "ID", "--json"], []))
+
+    def test_no_write_is_ever_a_read_only_best_guess(self) -> None:
+        """a805a3c4 runs the best of several read-only meanings: no glaeda-gh write is ever read-only to it."""
+        self.with_proposed()
+        intent, parser = layer(), gg.parser()
+        for argv in (["land", "o/r#1"], ["land", "cancel", "o/r#1"], ["post", "comment", "o/r#1", "--body", "hi"],
+                     ["post", "close", "o/r#1"], ["restart"], ["serve"], ["on-event", "replay"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(intent._read_only(parser, argv, self.table, "glaeda-gh"))
+        args, err, code = self.parse(["land", "cancel", "o/r#1", "--jsn"])
+        self.assertEqual((args, code), (None, 64))
+        self.assertIn("nothing ran", err)
 
     def test_a_misspelled_write_command_is_refused_not_run(self) -> None:
         """2026-11-23: `lnad o/r#1` queued a land, read as `land` by command_spelling_synonym."""
@@ -275,7 +295,7 @@ class Drift(unittest.TestCase):
         here fails this; `scripts/intent-sync LEO_WORKSPACE_CHECKOUT` refreshes both files and the record."""
         recorded = dict(reversed(line.split()) for line in (SCRIPTS / "intent.sha256").read_text().splitlines()
                         if line.strip())
-        for name in ("intent.py", "intent_aliases.json"):
+        for name in ("intent.py", "intent_aliases.json", "intent_vectors.json"):
             self.assertEqual(hashlib.sha256((SCRIPTS / name).read_bytes()).hexdigest(), recorded.get(name), name)
         done = subprocess.run([sys.executable, os.fspath(SCRIPTS / "intent-sync"), "--check"], capture_output=True,
                               text=True, timeout=60)

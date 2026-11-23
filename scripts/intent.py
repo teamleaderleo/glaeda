@@ -370,8 +370,9 @@ def _sub_edits(parser, argv: list, walk: dict, tbl: dict, prog: str) -> list:
     if default and default in choices:
         out.append(("missing verb", argv[:i] + [default] + argv[i:], f"`{default}` (the default verb)"))
     elif not out:
-        for c in choices:  # the one subcommand under which the rest parses
-            if not unsafe_word(c, tbl):
+        part = (tbl.get("cli") or {}).get(prog, {})
+        for c in choices:  # the one reading subcommand under which the rest parses: a write's verb is never supplied
+            if c in (tbl.get("reads") or []) + (part.get("safe") or []) and not _exact_path(prog, path + [c], tbl):
                 out.append(("missing verb", argv[:i] + [c] + argv[i:], f"`{c}` (the one verb that takes the rest)"))
     return out
 
@@ -428,6 +429,18 @@ def _unsafe(parser, argv: list, tbl: dict, prog: str) -> str | None:
     return next((w for w in words if unsafe_word(w, tbl)), None)
 
 
+def _read_only(parser, argv: list, tbl: dict, prog: str) -> bool:
+    """Whether ARGV runs a subcommand that only reads: its last subcommand word is one of the table's `reads` (or
+    the CLI's `safe`), is not on the CLI's `exact` list, and the form holds no unsafe word. A CLI with no
+    subcommand is never read-only here: nothing names what it does."""
+    walk = _walk(parser, argv)
+    path = [argv[lv["sub"]] for lv in walk["levels"] if lv["sub"] is not None]
+    if not path or _exact_path(prog, path, tbl) or _unsafe(parser, argv, tbl, prog):
+        return False
+    part = (tbl.get("cli") or {}).get(prog, {})
+    return path[-1] in (tbl.get("reads") or []) or path[-1] in (part.get("safe") or [])
+
+
 def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None) -> dict:
     """What ARGV, which PARSER refuses, meant. {"outcome": "ran" | "candidates" | "exact" | "none" | "ok",
     "argv": the one form to run (ran), "candidates": [{argv, notes}] (at most MAX_SHOWN), "error": the refusal}."""
@@ -476,6 +489,11 @@ def repair(parser, argv: list, prog: str | None = None, tbl: dict | None = None)
         if word:
             return {"outcome": "exact", "argv": argv, "candidates": parsed, "error": first, "word": word}
         return {"outcome": "ran", "argv": parsed[0]["argv"], "candidates": parsed, "error": first}
+    if all(_read_only(parser, p["argv"], tbl, prog) for p in parsed) and not any(
+            w.startswith("-") and unsafe_word(w, tbl) for w in argv):
+        also = ", ".join(f"`{_show(prog, p['argv'])}`" for p in parsed[1:])
+        best = dict(parsed[0], notes=parsed[0]["notes"] + [f"the best of {len(parsed)} read-only forms; also {also}"])
+        return {"outcome": "ran", "argv": best["argv"], "candidates": [best], "error": first, "others": parsed[1:]}
     return {"outcome": "candidates", "argv": argv, "candidates": parsed, "error": first}
 
 
@@ -526,6 +544,106 @@ def fix(argv: list, parser, prog: str | None = None, err=None) -> list:
     return result["argv"]
 
 
+# ---- a parser as data: what the PreToolUse rewrite reads instead of starting the tool ----------------------------
+
+def spec_of(parser) -> dict:
+    """PARSER's tree in the vectors' spec form (tools/intent_vectors.json `about`), plus nargs for words that take
+    several. What the spec cannot say (a custom type, an exclusive group) it leaves out, so the parser built from it
+    refuses no more than PARSER does."""
+    flags, required, args = {}, [], []
+    for a in parser._actions:  # noqa: SLF001
+        if isinstance(a, (argparse._HelpAction, argparse._SubParsersAction)):  # noqa: SLF001
+            continue
+        if a.option_strings:
+            if not _takes_value(a):
+                kind = "switch"
+            elif a.nargs in ("*", "+", "?", argparse.REMAINDER) or isinstance(a.nargs, int):
+                kind = "many"
+            elif a.choices is not None and all(isinstance(c, str) for c in a.choices):
+                kind = list(a.choices)
+            else:
+                kind = "int" if a.type is int else "value"
+            flags[",".join(a.option_strings)] = kind
+            if a.required:
+                required.append(a.option_strings[0])
+            continue
+        arg = {"name": a.dest}
+        if a.choices is not None and all(isinstance(c, str) for c in a.choices):
+            arg["choices"] = list(a.choices)
+        if a.type is int:
+            arg["int"] = True
+        if a.nargs == "?":
+            arg["optional"] = True
+        elif a.nargs is not None:
+            arg["nargs"] = a.nargs
+        args.append(arg["name"] if len(arg) == 1 else arg)
+    spec: dict = {}
+    if flags:
+        spec["flags"] = flags
+    if required:
+        spec["required"] = required
+    if args:
+        spec["args"] = args
+    sub = _sub_action(parser)
+    if sub is not None:
+        spec["subs"] = {name: spec_of(child) for name, child in sub.choices.items()}
+        if not sub.required:
+            spec["subs_optional"] = True
+    if not parser.allow_abbrev:
+        spec["abbrev"] = False
+    return spec
+
+
+def parser_of(spec: dict, prog: str = "t"):
+    """The argparse parser a spec describes (spec_of's inverse, and the vectors' parsers)."""
+    parser = argparse.ArgumentParser(prog=prog, allow_abbrev=spec.get("abbrev", True))
+    _fill(parser, spec)
+    return parser
+
+
+def _fill(parser, spec: dict) -> None:
+    for names, kind in (spec.get("flags") or {}).items():
+        names = names.split(",")
+        required = names[0] in (spec.get("required") or [])
+        if kind == "switch":
+            parser.add_argument(*names, action="store_true")
+        elif kind == "many":
+            parser.add_argument(*names, nargs="*", required=required)
+        elif isinstance(kind, list):
+            parser.add_argument(*names, choices=kind, required=required)
+        else:
+            parser.add_argument(*names, type=int if kind == "int" else str, required=required)
+    for n, arg in enumerate(spec.get("args") or []):
+        arg = {"name": arg} if isinstance(arg, str) else arg
+        kw: dict = {}
+        if arg.get("choices"):
+            kw["choices"] = arg["choices"]
+        if arg.get("int"):
+            kw["type"] = int
+        if arg.get("optional"):
+            kw["nargs"] = "?"
+        elif "nargs" in arg:
+            kw["nargs"] = arg["nargs"]
+        parser.add_argument(f"arg{n}_{arg['name']}".replace("-", "_"), metavar=arg["name"], **kw)
+    if spec.get("subs"):
+        subs = parser.add_subparsers(dest="cmd", required=not spec.get("subs_optional"))
+        for name, inner in spec["subs"].items():
+            _fill(subs.add_parser(name, allow_abbrev=inner.get("abbrev", True)), inner)
+
+
+def alias(argv: list, prog: str, tbl: dict | None = None):
+    """(ARGV with the table's first matching alias of PROG applied, the rule), or None. For a CLI with no spec: the
+    words agents typed and the words that then worked (tools/intent_table.py). Never with an unsafe word on a side."""
+    tbl = table() if tbl is None else tbl
+    for rule in (tbl.get("cli") or {}).get(prog, {}).get("aliases") or []:
+        under, frm, to = rule.get("under") or [], rule.get("from") or [], rule.get("to") or []
+        at = len(under)
+        if frm and to and argv[:at] == under and argv[at:at + len(frm)] == frm and not any(
+                unsafe_word(t, tbl) for t in frm + to) and not _exact_path(prog, under + to, tbl):
+            return argv[:at] + list(to) + argv[at + len(frm):], rule
+    return None
+
+
 # ---- argparse: install ------------------------------------------------------------------------------------------
 
 def _wrap(name: str):
@@ -534,6 +652,10 @@ def _wrap(name: str):
     def parse(self, args=None, namespace=None):
         if _state["trial"] or _state["depth"]:
             return original(self, args, namespace)
+        if os.environ.get("INTENT_SPEC_OUT"):  # tools/intent_table.py specs: the parser as data, nothing runs
+            with open(os.environ["INTENT_SPEC_OUT"], "w", encoding="utf-8") as fh:
+                json.dump(dict(spec_of(self), prog=self.prog, loose=name == "parse_known_args"), fh)
+            raise SystemExit(0)
         given = list(sys.argv[1:] if args is None else args)
         _state.update(depth=1, top=self, argv=given)
         try:
@@ -601,6 +723,13 @@ def uninstall() -> None:
         _state.update(installed=False, done=False, prog=None)
 
 
+def _exact_path(prog: str, path: list, tbl: dict) -> bool:
+    """Whether the table's per-CLI `exact` list names PATH (its words, or its last word): a subcommand that is
+    destructive or outward by what it does, not by an unsafe word in its name."""
+    exact = (tbl.get("cli") or {}).get(prog, {}).get("exact") or []
+    return " ".join(path) in exact or (bool(path) and path[-1] in exact)
+
+
 # ---- hand-rolled CLIs ---------------------------------------------------------------------------------------
 
 def word(tok: str, known: list, prog: str, kind: str = "synonyms", tbl: dict | None = None, under: list | None = None,
@@ -635,7 +764,7 @@ def word(tok: str, known: list, prog: str, kind: str = "synonyms", tbl: dict | N
     if len(cands) > 1:
         result["outcome"] = "candidates"
         print(f"{prog}: `{tok}` could mean (nothing ran): " + ", ".join(f"`{s}`" for s in shown), file=err)
-    elif unsafe_word(cands[0], tbl) or unsafe_word(tok, tbl):
+    elif unsafe_word(cands[0], tbl) or unsafe_word(tok, tbl) or _exact_path(prog, (under or []) + [cands[0]], tbl):
         result["outcome"] = "exact"
         print(f"{prog}: `{tok}` is not a form of {prog}, and `{shown[0]}` is destructive or outward, so nothing ran: "
               f"the exact form is needed. Did you mean `{shown[0]}`?", file=err)

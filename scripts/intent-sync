@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """intent-sync: refresh the vendored intent layer from a leo-workspace checkout, and record its sha256.
 
-    scripts/intent-sync LEO_WORKSPACE_CHECKOUT      copy tools/intent.py and tools/intent_aliases.json here
+    scripts/intent-sync LEO_WORKSPACE_CHECKOUT      copy tools/intent.py, intent_aliases.json, intent_vectors.json here
     scripts/intent-sync --check                     exit 1 when the vendored files differ from intent.sha256
 
-The source of truth is leo-workspace tools/intent.py and tools/intent_aliases.json (the shared layer every CLI of
+The source of truth is leo-workspace tools/intent.py, tools/intent_aliases.json and tools/intent_vectors.json (its
+test vectors; the shared layer every CLI of
 ours takes: a mistyped or wishful form runs as the one form it meant, and says so). The copies here are byte-identical
 to it; scripts/test-intent-glaeda.py fails when they drift from intent.sha256, and this is the one command that
 refreshes both. Every glaeda-* CLI loads scripts/intent.py beside itself, or the copy glaeda-mini-setup installs in
@@ -18,7 +19,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FILES = ("intent.py", "intent_aliases.json")
+FILES = ("intent.py", "intent_aliases.json", "intent_vectors.json")
 RECORD = HERE / "intent.sha256"
 
 
