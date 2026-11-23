@@ -5785,6 +5785,30 @@ class ClientTest(Base):
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
 
+    def test_land_sha_head_pins_the_prs_current_head(self) -> None:
+        """Leo: "You guys should now as standing rules start noticing and fixing tool calls ... Mistakes should also
+        be auto fixed and ran properly". The forward_no_outcome stop says "--sha HEAD to pin it"; the tool refused it."""
+        head = "c" * 40
+        calls = []
+        def read(argv):
+            calls.append(argv)
+            return head
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_cached_head", return_value=""), mock.patch("sys.stderr", out):
+            for word in ("HEAD", "head"):
+                self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", word, read), head)
+        self.assertIn(f"--sha HEAD: pinned to {head}", out.getvalue())
+        self.assertEqual(calls[0][:3], ["gh", "api", "repos/o/r/pulls/1"])
+        with mock.patch.object(gg, "land_cached_head", return_value="d" * 40), mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", "HEAD", read), "d" * 40)
+            self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", "abc1234", read), "abc1234")
+            self.assertIsNone(gg.land_resolve_head_word("o/r", 1, "k", None, read))
+        with mock.patch.object(gg, "land_cached_head", return_value=""):
+            with self.assertRaises(gg.WatchError):
+                gg.land_resolve_head_word("o/r", 1, "k", "HEAD", lambda a: None)
+        with self.assertRaises(gg.WatchError):
+            gg.check_land_pin_shape("not-a-sha")
+
     def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
         """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
         --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
