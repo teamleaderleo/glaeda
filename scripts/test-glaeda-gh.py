@@ -92,8 +92,12 @@ gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpi
 gg.COORD_ALERT = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "coord_alert.py"
 # Nor may a pool alarm run the host's own gh-quota for its spenders list.
 gg.SPENDERS_CMD = os.fspath(Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-spenders-{os.getpid()}" / "gh-quota")
-# Nor may the outbox ask (or extend) the host's own create pause: only a test that names a command has one.
-gg.CONTENT_PAUSE_NAMES = ()
+# Give ordinary outbox tests a working isolated authority; pause regressions replace it.
+_PAUSE = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-authority-")
+_PAUSE_CMD = Path(_PAUSE.name) / "gh-quota"
+_PAUSE_CMD.write_text("#!/bin/sh\necho '{\"blocked_until\": 0}'\n")
+_PAUSE_CMD.chmod(0o755)
+gg.CONTENT_PAUSE_NAMES = (os.fspath(_PAUSE_CMD),)
 os.environ.pop(gg.CONTENT_PAUSE_ENV, None)
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
 
@@ -15952,6 +15956,33 @@ class PostTest(unittest.TestCase):
         self.assertEqual([c[1] for c in t.calls], ["/repos/o/r/issues/1/comments", "/repos/o/r/issues/2/comments"])
         self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
 
+    def test_each_create_rechecks_a_previously_clear_authority(self) -> None:
+        first = self.queue("comment", "o/r#1", "--body", "one")
+        second = self.queue("comment", "o/r#2", "--body", "two")
+        calls = self.pause_cmd(0)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        with mock.patch.object(gg, "POST_SPACING", 1):
+            self.step(d, NOW)
+            (calls.parent / "pause.json").write_text(json.dumps({"blocked_until": NOW + 100}))
+            self.step(d, NOW + 1)  # within the former clear-answer TTL
+        self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+        self.assertEqual(gg.post_state(second["id"])["state"], "queued")
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+
+    def test_an_expired_short_hold_is_rechecked_before_sending(self) -> None:
+        item = self.queue("comment", "o/r#1", "--body", "one")
+        calls = self.pause_cmd(NOW + 1)
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.clock_real = False
+        self.step(d, NOW)
+        (calls.parent / "pause.json").write_text(json.dumps({"blocked_until": NOW + 100}))
+        self.step(d, NOW + 2)
+        self.assertEqual(t.calls, [])
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.assertEqual(calls.read_text().splitlines(), ["content-pause"] * 2)
+
     def test_a_failed_pause_read_keeps_the_last_answer(self) -> None:
         self.queue("comment", "o/r#1", "--body", "one")
         calls = self.pause_cmd(NOW + 100)
@@ -16133,18 +16164,17 @@ class PostTest(unittest.TestCase):
         self.assertEqual(gg.post_state(item["id"])["state"], "queued")
         self.assertEqual(d.pause_until, NOW + 120)
 
-    def test_no_pause_command_posts_as_before(self) -> None:
+    def test_no_pause_command_keeps_writes_queued(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
-        d, t = self.daemon((403, {"retry-after": "120"}, {"message": "temporarily blocked from content creation"}),
-                           (201, {}, {"html_url": "u"}))
-        self.assertIsNone(gg.content_pause_cmd())
-        with mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no pause command to run")):
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: ""}), \
+                mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no command to run")):
+            self.assertIsNone(gg.content_pause_cmd())
             self.step(d, NOW)
-            self.step(d, NOW + 120)
-        self.assertEqual(len(t.calls), 2)
-        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
-        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: ""}):
-            self.assertIsNone(gg.content_pause_cmd())  # an empty setting turns it off
+            self.step(d, NOW + 3600)
+            self.assertTrue(d.content_pause_status()["holding"])
+        self.assertEqual(t.calls, [])
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
 
     def test_an_infinite_or_absurd_retry_after_keeps_the_write_and_holds_an_hour_at_most(self) -> None:
         # float("inf") parses: int(math.ceil(inf)) in the report raised OverflowError, which dropped the write as a
@@ -16195,7 +16225,8 @@ class PostTest(unittest.TestCase):
             self.assertIsNone(gg.content_pause_cmd())
             self.step(d, NOW)
             self.step(d, NOW + gg.POST_SPACING)
-        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["posted", "posted"])
+        self.assertEqual([gg.post_state(i["id"])["state"] for i in (first, second)], ["queued", "queued"])
+        self.assertEqual(t.calls, [])
         self.assertEqual(len([e for e in lines if e.get("event") == "content-pause-cmd"]), 1)
 
     def test_a_timed_out_ask_is_not_repeated_for_a_minute_and_the_last_answer_stands(self) -> None:
@@ -16247,9 +16278,8 @@ class PostTest(unittest.TestCase):
         self.assertEqual((d.pause_failures, t.calls), (0, []))
         self.assertGreaterEqual(gg.CONTENT_PAUSE_SLOW_DEADLINE, 10)
 
-    def test_asks_that_keep_failing_hold_creates_for_a_bound_and_status_shows_them(self) -> None:
-        # With no answer, the pause is unknown: creates wait rather than go out into one other writers reported, for
-        # CONTENT_PAUSE_BLIND_MAX past the last answer at most, so a keeper broken for good stops nothing for long.
+    def test_asks_that_keep_failing_never_release_creates_and_status_shows_them(self) -> None:
+        # Passing the former ten-minute outage bound must leave the write queued until an answer arrives.
         item = self.queue("comment", "o/r#1", "--body", "one")
         calls = self.pause_cmd(0, level=0)
         (calls.parent / "hang").touch()
@@ -16281,17 +16311,21 @@ class PostTest(unittest.TestCase):
             self.assertIn("last answer never", line)
             self.assertIn("creates wait until the pause is known", line)
             self.assertRegex(line, r"GitHub holds writes for (89|90)s;")  # a length, not an epoch's age
-            at(NOW + gg.CONTENT_PAUSE_BLIND_MAX + 1)  # past the bound: it posts as a host with no keeper
-            self.assertEqual(len(t.calls), 1)
+            at(NOW + 601)  # elapsed time never authorizes the queued write
+            self.assertEqual(t.calls, [])
+            self.assertEqual(gg.post_state(item["id"])["state"], "queued")
             self.assertEqual(len([e for e in lines if e.get("event") == "post-pause-unknown"]), 1)
             (calls.parent / "hang").unlink()
-            clock[0] = NOW + gg.CONTENT_PAUSE_BLIND_MAX + gg.CONTENT_PAUSE_RETRY + 2  # the keeper answers again
-            d.content_pause_until()  # the outbox is empty, so no pass asks: ask as one would
+            clock[0] = NOW + 600 + gg.CONTENT_PAUSE_RETRY + 2  # the keeper answers again
+            d.content_pause_until()  # ask again after the keeper recovers
             d.content_pause_settle(10)
         self.assertEqual((d.pause_failures, d.pause_timeouts, d.content_pause_unknown()), (0, 0, False))
         self.assertEqual(d.content_pause_status()["answeredAgo"], 0)
+        self.step(d, clock[0])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(len(t.calls), 1)
 
-    def test_a_keeper_without_content_pause_is_no_keeper_and_is_asked_again(self) -> None:
+    def test_a_keeper_without_content_pause_holds_writes_and_is_asked_again(self) -> None:
         # cosmic-gray, 2026-11-18: the installed gh-quota had no content-pause. Each ask's usage error counted as a
         # failed ask, so `post pr` sat held ("pause ask failed 9 in a row ... creates wait until the pause is known").
         first = self.queue("comment", "o/r#1", "--body", "one")
@@ -16314,11 +16348,11 @@ class PostTest(unittest.TestCase):
             d.clock = lambda: clock[0]
             self.step(d, NOW)
             d.content_pause_settle(10)
-            self.step(d, NOW)  # the answer is in: no keeper, so the create goes out at once
-            self.assertEqual(gg.post_state(first["id"])["state"], "posted")
+            self.step(d, NOW)  # a usage error is no authority answer
+            self.assertEqual(gg.post_state(first["id"])["state"], "queued")
             status = d.content_pause_status()
             self.assertEqual({k: status[k] for k in ("failures", "holding", "absent", "lastError")},
-                             {"failures": 0, "holding": False, "absent": True, "lastError": None})
+                             {"failures": 0, "holding": True, "absent": True, "lastError": None})
             self.assertIn("has no content-pause", " ".join(gg.pause_line(status)))
             self.assertFalse(any(e.startswith("content pause") for e in d.errors))
             d.report_content_pause(NOW + 30, "comment")  # a throttle is this daemon's own: no --hold it cannot take
@@ -16328,7 +16362,7 @@ class PostTest(unittest.TestCase):
                 clock[0] = at
                 self.step(d, at)
                 d.content_pause_settle(10)
-            self.assertEqual(gg.post_state(second["id"])["state"], "posted")
+            self.assertEqual(gg.post_state(second["id"])["state"], "queued")
             self.assertEqual((root / "calls").read_text().splitlines(), ["content-pause"])  # not re-asked yet
             # the keeper gains the command: the next probe hears it, and its pause holds creates again
             (root / "pause.json").write_text(json.dumps({"blocked_until": NOW + 2000, "level": 1}))
@@ -16339,7 +16373,7 @@ class PostTest(unittest.TestCase):
             self.step(d, clock[0])
         self.assertEqual(gg.post_state(third["id"])["state"], "queued")
         self.assertEqual((d.pause_absent, d.pause_until), (False, NOW + 2000))
-        self.assertEqual(len(t.calls), 2)
+        self.assertEqual(t.calls, [])
         absent = [e for e in lines if e.get("event") == "content-pause-absent"]
         self.assertEqual(len(absent), 2)  # once when it went missing, once when it came back
         self.assertIn("invalid choice: 'content-pause'", absent[0]["error"])
@@ -16629,7 +16663,9 @@ class PostTest(unittest.TestCase):
         d, t = self.daemon((201, {}, {"html_url": "u"}))
         status = d.tick(now=NOW)
         self.assertEqual(len(t.calls), 1)
-        self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None, "pause": None})  # no keeper, no ask
+        self.assertEqual(status["outbox"]["queued"], 1)
+        self.assertIsNone(status["outbox"]["holdUntil"])
+        self.assertFalse(status["outbox"]["pause"]["holding"])
 
 
 class PauseKeeperNeverStallsReadsTest(Base):
