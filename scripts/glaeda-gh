@@ -32371,7 +32371,7 @@ def broker_post_unsent(item: dict, chosen: tuple[str, dict] | None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(item["body"])
     lacks = "the lane-gh broker has no tool for this write" if chosen is not None else "no lane-gh runs here"
-    why = no_login_refusal(item, path) or "this host has no login to post with"
+    why = no_login_refusal(item, path) or f"this host has no login to post with; {broker_post_next(item, path)}"
     print(f"glaeda-gh: not queued: {why} ({lacks}; its body is kept at {path})", file=sys.stderr)
     return 3
 
