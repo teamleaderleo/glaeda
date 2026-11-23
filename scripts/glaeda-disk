@@ -2743,10 +2743,12 @@ def running_job_hours() -> float:
     return _RUNNING_JOB_HOURS
 
 
-# A per-checkout Xcode build used this recently is a live check's or agent's, about to be run or rebuilt on: no mode
-# deletes it, not pressure, not the fleet mini's unwindowed build caches (air-blue, 2026-11-23 14:01:48Z: a pressure
-# pass deleted DerivedData/cmux-try48231, 14.5 GB, 0.1 h after a live check's build finished, while caches and
-# mirrors still held space). Process, open-file and socket evidence still hold an older one a run still uses.
+# On a devbox (a person's Mac, where agents' try builds and live checks build), a per-checkout Xcode build used this
+# recently is about to be run or rebuilt on: pressure's short idle window does not reach it (2026-11-23 14:01:48Z: a
+# pressure pass deleted DerivedData/cmux-try48231, 14.5 GB, 0.1 h after a live check's build finished, while caches
+# and mirrors still held space). A fleet mini's build caches keep no window (BUILD_CACHES_UNWINDOWED; Leo,
+# 2026-11-18: "these build caches, if they're not being used, they're not useful"). Process, open-file and socket
+# evidence still hold an older build a run still uses.
 FRESH_BUILD_HOURS = 3.0
 FRESH_BUILD_FAMILY_IDS = frozenset({"xcode-derived-data"})
 
@@ -2762,8 +2764,6 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     A build cache with no age window (build_cache_unwindowed) is due at once, sweep or pressure: no job count and
     no running job's age keep it, only its own live evidence (judged by the caller and again by apply)."""
     jobs = jobs_since_use(fam, idle_hours)
-    if fam.id in FRESH_BUILD_FAMILY_IDS and idle_hours < FRESH_BUILD_HOURS:
-        return False, None
     if fam.id in BUILD_STATE_FAMILY_IDS:  # stale only by hours untouched: a busy host's job count never shortens it
         return idle_hours >= window, None
     if window <= 0 and build_cache_unwindowed(fam):
@@ -5925,7 +5925,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, platform="macos"),
+               build_output=True, platform="macos",
+               min_idle_hours=FRESH_BUILD_HOURS if role == "devbox" else 0.0),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
