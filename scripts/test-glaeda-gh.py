@@ -28714,6 +28714,9 @@ class LandTest(Base):
         self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual(e["state"], "forwarded")  # a GitHub read is asked for first: a merged PR is never told this
+        self.assertIn(self.KEY, self.w.watched)
+        e = self.tick(gg.LAND_FORWARD_READ_WAIT + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
@@ -33041,13 +33044,14 @@ class LandForwardTest(Base):
         self.q = self.queue()
         self.exec_base = Path(self.tmp.name) / "exec-gh"
         self.sent_batches: list[dict] = []
+        self.asks: list[dict] = []  # the forwarding host's "outcomes" questions (forward_ask), apart from its sends
         self.exec_down = False
 
     def executor_serve(self, request: dict) -> dict:
         """The executor's `land serve` in this process, over its own BASE and with no executor of its own."""
         if self.exec_down:
             raise gg.WatchError("land executor: reach: ssh: connect to host big-exec: Connection refused")
-        self.sent_batches.append(copy.deepcopy(request))
+        (self.asks if request.get("op") == "outcomes" else self.sent_batches).append(copy.deepcopy(request))
         saved = gg.BASE
         gg.BASE = self.exec_base
         try:
@@ -33121,11 +33125,22 @@ class LandForwardTest(Base):
         self.exec_tick(x)
         self.assertEqual(x.entries[self.KEY]["state"], "merged")
 
+    def older_executor(self) -> None:
+        """The executor runs a glaeda-gh from before `land serve` answered "outcomes": it refuses the op."""
+        serve = self.q.forward
+        self.q.forward = lambda cmd, req, deadline: (
+            serve(cmd, req, deadline) if req.get("op") != "outcomes"
+            else gg.land_forward_once(cmd, req, deadline, lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 1, json.dumps({"ok": False, "code": "bad_request", "reason": "land serve takes one JSON line "
+                                     "with an op of land, withdraw, status, batch, room"}) + "\n", "")))
+
     def test_a_forward_still_open_past_the_bound_is_sent_to_the_executor_again_and_a_merge_ends_it(self):
+        # an executor that cannot say what became of it (an older one): the re-send bound decides
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
         self.land("o/r#1", requester="cosmic/coord")
         self.tick()
         self.q = self.forwarding()
+        self.older_executor()
         self.tick()
         self.assertEqual((len(self.sent_batches), self.q.entries[self.KEY]["state"]), (1, "forwarded"))
         self.tick(gg.LAND_FORWARD_RESEND / 2)
@@ -33138,6 +33153,143 @@ class LandForwardTest(Base):
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual(e["state"], "merged")
         self.assertEqual(len(self.sent_batches), 2)
+
+    def test_the_forward_host_is_never_a_flag_or_a_flags_value(self):
+        # huge-blue, 2026-11-22: `ssh -o ... HOST` was named "-o", and 412 rows said "handed to -o's land queue"
+        for command, host in ((["ssh", "-o", "BatchMode=yes", "cmux-cp-1", "glaeda-gh"], "cmux-cp-1"),
+                              (["ssh", "-oBatchMode=yes", "-p", "22", "cmux-cp-1", "x"], "cmux-cp-1"),
+                              (["reach", "--timeout", "30", "cmux-cp-1", "x"], "cmux-cp-1"),
+                              (["reach", "--via-ssh", "--remote-nice=5", "cmux-cp-1", "x"], "cmux-cp-1"),
+                              (["/usr/local/bin/reach", "air-blue", "x"], "air-blue")):
+            self.assertEqual(gg.land_forward_name(command), host, command)
+        for command in (["ssh", "-o"], ["ssh", "-o", "X=1"], ["reach", "--timeout", "30"], ["reach", "30", "x"]):
+            self.assertIsNone(gg.land_command_host(command), command)
+            self.assertNotIn(gg.land_forward_name(command), ("-o", "30", "X=1"))
+        self.assertFalse(gg.land_host_word("-o"))
+        self.assertTrue(gg.land_host_word("cmux-cp-1"))
+
+    def forwarded_to_executor(self) -> dict:
+        """o/r#1 at LA, checks running, landed here for cosmic/coord and handed to big-exec (the executor)."""
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        e = self.tick()
+        self.assertEqual((e["state"], e["forwardedTo"], len(self.sent_batches)), ("forwarded", "big-exec", 1))
+        self.w.cache.pop(self.KEY, None)  # a forwarding host reads nothing of the PRs it forwards
+        self.w.watched.clear()  # from here a key in it is a read the forwarded row asked for (outcome_read)
+        return e
+
+    def test_a_forward_the_executor_merged_ends_merged_with_no_notice_from_here(self):
+        # lw#8459 and glaeda#2526 had merged on the executor; the forwarding host, with no read of either, said
+        # "forward_no_outcome" to their requesters 12 h later
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+        self.w.cache.pop(self.KEY, None)
+        told = len(self.w.sent())  # the executor told cosmic/coord it merged
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual([a["targets"] for a in self.asks], [[self.KEY]])
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertIn("forwarded to big-exec: its land queue merged it", e["history"][-1]["how"])
+        self.assertEqual(len(self.w.sent()), told)  # nothing more said here
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_forward_the_executor_stopped_ends_stopped_quietly_with_its_words(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock:
+            x.stop(x.entries[self.KEY], "checks_red", "ci failed at LA", "fix ci")
+        told = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertIn("big-exec's land queue stopped it (checks_red): ci failed at LA", e["stop"]["reason"])
+        self.assertEqual(e["stop"]["next"], "fix ci")
+        self.assertEqual(len(self.w.sent()), told)
+
+    def test_a_forward_the_executor_holds_open_is_never_given_up_and_never_re_sent(self):
+        self.forwarded_to_executor()
+        for _ in range(int(1.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "forwarded")  # waiting in big-exec's requests/: its queue's to end
+        self.assertEqual(e["forwardHeld"]["state"], "requested")
+        self.assertEqual(len(self.sent_batches), 1)
+        self.assertGreater(len(self.asks), 10)
+        self.assertFalse([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
+
+    def test_a_forward_the_executor_never_got_is_sent_again_then_stops_lost_within_minutes(self):
+        self.forwarded_to_executor()
+        serve = self.q.forward
+        self.q.forward = lambda cmd, req, deadline: (  # a batch taken and lost there: big-exec never holds it
+            {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": "big-exec"}
+            if req.get("op") == "batch" else serve(cmd, req, deadline))
+        shutil.rmtree(self.exec_base / "land" / "requests")
+        began = self.t
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual((e["state"], e["forwardMissing"]["n"], e["forwardResent"]["n"]), ("forwarded", 1, 1))
+        while e["state"] == "forwarded" and self.t - began < gg.LAND_FORWARD_GIVE_UP:
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if self.KEY in self.w.watched and self.KEY not in self.w.cache:
+                self.pr(LA)  # the one GitHub read outcome_read asked for lands: still open
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_lost"))
+        self.assertLess(self.t - began, 30 * 60)
+        self.assertIn("big-exec's land queue holds no row of it", e["stop"]["reason"])
+        [said] = [c for c in self.w.sent() if "forward_lost" in c[-1]]
+        self.assertEqual(said[3], "cosmic/coord")
+
+    def test_a_lost_forward_that_github_shows_merged_ends_merged_not_lost(self):
+        self.forwarded_to_executor()
+        serve = self.q.forward
+        self.q.forward = lambda cmd, req, deadline: (
+            {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": "big-exec"}
+            if req.get("op") == "batch" else serve(cmd, req, deadline))
+        shutil.rmtree(self.exec_base / "land" / "requests")
+        e = {}
+        for _ in range(40):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if e["state"] != "forwarded":
+                break
+            if self.KEY in self.w.watched and self.KEY not in self.w.cache:
+                self.pr(LA, state="MERGED")  # merged by hand: the read outcome_read asked for shows it
+        self.assertEqual(e["state"], "merged")
+        self.assertFalse([c for c in self.w.sent() if "forward_lost" in c[-1] or "no_outcome" in c[-1]])
+
+    def test_a_row_named_by_a_flag_is_named_again_and_its_executor_asked(self):
+        e = self.forwarded_to_executor()
+        e["forwardedTo"] = "-o"
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual(e["forwardedTo"], "big-exec")
+        self.assertEqual([h["was"] for h in e["history"] if h.get("event") == "forward_target_named"], ["-o"])
+        self.assertEqual(len(self.asks), 1)
+        self.assertEqual(e["forwardHeld"]["state"], "requested")
+
+    def test_an_unreachable_executor_and_no_read_waits_for_a_github_read_before_giving_up(self):
+        self.forwarded_to_executor()
+        self.exec_down = True
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
+        self.assertEqual(e["state"], "forwarded")  # no read yet: one is asked for first
+        self.assertIn(self.KEY, self.w.watched)
+        e = self.tick(gg.LAND_FORWARD_READ_WAIT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("big-exec could not be asked", e["stop"]["reason"])
+        self.assertIn("never landed", e["stop"]["reason"])
+
+    def test_land_serve_outcomes_answers_rows_requests_and_nothing(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.land("o/r#2")  # not here: asked as a key it never got
+        doc = self.executor_serve({"op": "outcomes", "targets": [self.KEY, "pr:o/r#9", "o/r#1", "nonsense"]})
+        self.assertTrue(doc["ok"])
+        self.assertEqual(doc["outcomes"][self.KEY]["state"], "waiting")
+        self.assertEqual(doc["outcomes"]["o/r#1"]["state"], "waiting")
+        self.assertIsNone(doc["outcomes"]["pr:o/r#9"])
+        self.assertNotIn("nonsense", doc["outcomes"])
 
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
