@@ -2519,6 +2519,8 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Read what this account cannot (other users' /proc entries, root-only folders the census meets) with
     # `sudo -n` where sudo needs no password; false: never
     "sudo_reads": True,
+    # false: an --apply pass never runs a pass in another runner account's home (RUNNER_ACCOUNTS)
+    "runner_accounts": True,
     # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
     "build_caches_unwindowed": True,
     "fleet_claims_expire": True,  # a person's VM claim on a fleet mini holds only until its "until" (vm_claim)
@@ -13921,6 +13923,10 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
         for row in top:
             if isinstance(row, dict) and isinstance(row.get("path"), str) and isinstance(row.get("bytes"), int):
                 sized_rows.append((Path(census_canon(row["path"])), row["bytes"], "sized"))
+        # RUNNER_ACCOUNTS: each other runner account's home as its own pass sized it (this account cannot read it);
+        # ahead of the census rows, so a sized home wins over the census's unreadable lower bound for the same path
+        account_homes = [] if RUNNER_CACHE_PROFILE or root_census else runner_account_sizes(fs.dev, now)
+        sized_rows.extend((Path(census_canon(home)), size, "sized") for home, _, size in account_homes)
         sized_rows.extend(root_census_catalogue(root_census) if root_census else census_catalogue(census))
         outermost = top_level_catalogued(sorted(sized_rows, key=lambda row: (len(row[0].parts), str(row[0]))))
         volumes = None if RUNNER_CACHE_PROFILE else apfs_sibling_volumes(fs.mount, now)
@@ -13952,7 +13958,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
         coverage = [row for row in coverage
                     if row.get("scope") not in (CENSUS_SCOPE, APFS_VOLUMES_SCOPE, SIM_RUNTIME_SCOPE,
-                                                ROOT_CENSUS_SCOPE, ROOT_CENSUS_OWNERS_SCOPE)]
+                                                ROOT_CENSUS_SCOPE, ROOT_CENSUS_OWNERS_SCOPE, RUNNER_ACCOUNT_SCOPE)]
         unclassified = max(0, used - measured)
         # The shared-runner coverage rows have no paths: subtract only what they hold beyond the sized
         # paths already measured inside /Users/Shared, or the same bytes would leave the gap twice.
@@ -13961,6 +13967,11 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             coverage = [*coverage, *root_census_coverage(root_census)]
         elif census is not None:
             coverage = [*coverage, census_coverage_row(census)]
+        if account_homes:
+            coverage = [*coverage, {"scope": RUNNER_ACCOUNT_SCOPE, "complete": True, "at": now, "platform": "macos",
+                                    "children": [{"category": f"runner-account/{name}:{home}", "bytes": size,
+                                                  "private": False, "classification": "runner-account",
+                                                  "account": name} for home, name, size in account_homes]}]
         if DARWIN and not RUNNER_CACHE_PROFILE and (sim := sim_runtime_row(now)):
             coverage = [*coverage, sim]
         if volumes:
@@ -17778,6 +17789,227 @@ def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     return freed
 
 
+# RUNNER_ACCOUNTS: a Mac whose PR runners run in their own account (runner.poolUser, cmuxterm-hq#18007) or whose
+# trusted runner.dedicated entry has its own user keeps those runners' _work, DerivedData and caches in that account's
+# home, which glaeda-cmux-runner makes 0700. Every family here is $HOME-relative and the pool account has no
+# glaeda-disk of its own (glaeda-cmux-runner-fleet stages none there, so its hooks skip disk pressure), so nothing
+# counted or reclaimed that home: on an EC2 Mac the pool account's home reached 190 GiB while the fleet user's
+# --dead --apply freed 0.0G and named 167.5G "accounting gap" (2026-11-23). Leo: "Idle means there's something
+# fucking wrong". Now every --apply pass that is not a runner hook's runs one pass in each other runner account,
+# as that account (`sudo -n -u ACCOUNT -H`, never root): this script's bytes are copied into that account's
+# ~/.cache/glaeda-disk/runner-account/ and run there with the same mode flags plus --runner-account. That pass sees
+# the account's own enrolled runners, takes its own evict lock (the one its hooks take) and judges every item by the
+# same vetoes, so it can only remove that account's rebuildable files. It acts only where the home proves a glaeda
+# runner account (an actions-runner* with .runner and glaeda-hooks); otherwise it deletes nothing. A candidate is
+# a non-admin account with uid >= 500 and a home directly in /Users, not this account and not one with its own
+# glaeda-runner-hygiene job (that account keeps its narrow profile). The pass reports its home's size, which the
+# volume accounting counts as measured (runner-accounts.json), so that home's growth is no longer gap.
+RUNNER_ACCOUNT_FLAG = "--runner-account"
+RUNNER_ACCOUNT_LINE = "glaeda-disk runner-account: "
+RUNNER_ACCOUNT_TIMEOUT_S = 1500.0  # one account's pass, under the LaunchAgent's 900 s cadence plus a slow delete
+RUNNER_ACCOUNT_INSTALL_TIMEOUT_S = 30.0
+RUNNER_ACCOUNT_COPY_DIR = ".cache/glaeda-disk/runner-account"
+RUNNER_ACCOUNTS_STATE = HOME / ".cache/glaeda-disk/runner-accounts.json"
+RUNNER_ACCOUNT_SIZE_MAX_AGE_S = 6 * 3600.0
+RUNNER_ACCOUNT_SCOPE = "runner-accounts"
+USERS_ROOT = Path("/Users")
+RUNNER_HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
+RUNNER_HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"
+SUDO = "/usr/bin/sudo"
+RUNNER_ACCOUNT_ADMIN_GROUPS = ("admin", "wheel", "sudo")
+RUNNER_ACCOUNT_MODE = False  # set in the pass run inside another account: it never delegates again
+_RUNNER_ACCOUNTS_ENABLED = True  # the test suite turns it off, so no test ever reaches sudo
+_RUNNER_ACCOUNT_INSTALL = ('set -eu; d="$1"; umask 077; mkdir -p "$d"; t="$d/glaeda-disk.$$"; cat > "$t"; '
+                           'chmod 700 "$t"; mv -f "$t" "$d/glaeda-disk"')
+
+
+def _account_is_admin(entry: Any) -> bool:
+    """Whether the passwd ENTRY is an admin (in an admin, wheel or sudo group, primary group included). Unreadable
+    group data counts as an admin, so the account is never a candidate."""
+    try:
+        import grp
+        for name in RUNNER_ACCOUNT_ADMIN_GROUPS:
+            try:
+                g = grp.getgrnam(name)
+            except KeyError:
+                continue
+            if entry.pw_gid == g.gr_gid or entry.pw_name in g.gr_mem:
+                return True
+    except (ImportError, OSError):
+        return True
+    return False
+
+
+def runner_account_candidates(entries: list[Any] | None = None, own_uid: int | None = None) -> list[Any]:
+    """The other accounts whose homes a pass may hold a glaeda runner account's state (RUNNER_ACCOUNTS): uid at
+    least DARWIN_LOGIN_UID_MIN, a home directly in USERS_ROOT (never Shared) that is a real directory, not this
+    account or its home, not an admin, and with no glaeda-runner-hygiene job of its own. macOS only."""
+    if not (DARWIN and _RUNNER_ACCOUNTS_ENABLED) or RUNNER_ACCOUNT_MODE or not POLICY.get("runner_accounts", True):
+        return []
+    own_uid = os.getuid() if own_uid is None else own_uid
+    try:
+        entries = pwd.getpwall() if entries is None else entries
+    except OSError:
+        return []
+    out, seen = [], set()
+    own_home = os.path.abspath(HOME)
+    for e in sorted(entries, key=lambda e: e.pw_uid):
+        home = Path(os.path.abspath(e.pw_dir or "/"))
+        if (e.pw_uid in seen or e.pw_uid == own_uid or e.pw_uid < DARWIN_LOGIN_UID_MIN
+                or home.parent != USERS_ROOT or home.name in ("Shared", "Guest") or os.fspath(home) == own_home):
+            continue
+        try:
+            if home.is_symlink() or not home.is_dir():
+                continue
+        except OSError:
+            continue
+        if _account_is_admin(e) or (RUNNER_HYGIENE_DAEMONS / f"{RUNNER_HYGIENE_LABEL}.{e.pw_uid}.plist").exists():
+            continue
+        seen.add(e.pw_uid)
+        out.append(e)
+    return out
+
+
+def runner_account_argv(args: list[str]) -> list[str]:
+    """This run's arguments for the pass in another account: its own receipt, snapshot and output stay its own."""
+    drop_value = {"--receipt", "--root-override", "--refresh-lock-fd", "--refresh-budget-s"}
+    drop = {"--json", "--runner-caches", "--no-snapshot", RUNNER_ACCOUNT_FLAG}
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        name = arg.split("=", 1)[0]
+        if name in drop_value:
+            skip = "=" not in arg
+            continue
+        if arg in drop:
+            continue
+        out.append(arg)
+    return [RUNNER_ACCOUNT_FLAG, *out]
+
+
+def _runner_account_python() -> str:
+    """An interpreter the other account can run: this one unless it lives in this account's home."""
+    exe = os.path.abspath(sys.executable or "/usr/bin/python3")
+    own = os.path.abspath(HOME)
+    return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
+
+
+def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """One pass in ENTRY's account (RUNNER_ACCOUNTS): copy this script into its home as it, run it there as it with
+    ARGS, and return its summary row. Never raises."""
+    row: dict[str, Any] = {"account": entry.pw_name, "home": entry.pw_dir}
+    dest = Path(entry.pw_dir) / RUNNER_ACCOUNT_COPY_DIR
+    sudo = [SUDO, "-n", "-u", entry.pw_name, "-H"]
+    try:
+        source = Path(os.path.abspath(__file__)).read_bytes()
+        put = run([*sudo, "/bin/sh", "-c", _RUNNER_ACCOUNT_INSTALL, "sh", os.fspath(dest)], input=source,
+                  capture_output=True, timeout=RUNNER_ACCOUNT_INSTALL_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {**row, "state": "not reached", "why": f"{type(e).__name__}: {e}"[:200]}
+    if put.returncode != 0:
+        why = (put.stderr or b"").decode(errors="replace").strip()[-200:] or f"exit {put.returncode}"
+        return {**row, "state": "not reached", "why": why}
+    argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
+            _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
+    try:
+        done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
+    except subprocess.TimeoutExpired:
+        return {**row, "state": "timeout", "why": f"its pass ran past {RUNNER_ACCOUNT_TIMEOUT_S:.0f} s"}
+    except (OSError, subprocess.SubprocessError) as e:
+        return {**row, "state": "failed", "why": f"{type(e).__name__}: {e}"[:200]}
+    out = (done.stdout or b"").decode(errors="replace")
+    summary = None
+    for line in reversed(out.splitlines()):
+        if line.startswith(RUNNER_ACCOUNT_LINE):
+            with contextlib.suppress(ValueError):
+                summary = json.loads(line[len(RUNNER_ACCOUNT_LINE):])
+            break
+    if not isinstance(summary, dict):
+        why = ((done.stderr or b"").decode(errors="replace") or out).strip()[-200:] or f"exit {done.returncode}"
+        return {**row, "state": "failed", "why": why}
+    return {**row, **summary, "exit": done.returncode}
+
+
+def save_runner_account_sizes(rows: list[dict[str, Any]], now: float | None = None,
+                              path: Path | None = None) -> None:
+    """Keep each runner account home's measured size for the volume accounting (runner_account_sizes)."""
+    path = RUNNER_ACCOUNTS_STATE if path is None else path
+    now = time.time() if now is None else now
+    try:
+        state = json.loads(path.read_text())
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+    for row in rows:
+        if isinstance(row.get("home_bytes"), int) and row.get("home"):
+            state[row["home"]] = {"account": row.get("account"), "bytes": row["home_bytes"], "at": now}
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, path)
+
+
+def runner_account_sizes(dev: int, now: float, path: Path | None = None) -> list[tuple[str, str, int]]:
+    """(home, account, bytes) for each runner account home on DEV measured within RUNNER_ACCOUNT_SIZE_MAX_AGE_S."""
+    path = RUNNER_ACCOUNTS_STATE if path is None else path
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for home, rec in (state.items() if isinstance(state, dict) else ()):
+        if not (isinstance(rec, dict) and isinstance(rec.get("bytes"), int) and isinstance(rec.get("at"), (int, float))
+                and now - rec["at"] < RUNNER_ACCOUNT_SIZE_MAX_AGE_S):
+            continue
+        try:
+            if Path(home).stat().st_dev != dev:
+                continue
+        except OSError:
+            continue
+        out.append((home, str(rec.get("account") or Path(home).name), rec["bytes"]))
+    return sorted(out)
+
+
+def delegate_runner_accounts(args: list[str], run: Callable[..., Any] = subprocess.run) -> list[dict[str, Any]]:
+    """RUNNER_ACCOUNTS: one pass in each other runner account, one at a time; their rows, also printed."""
+    rows = []
+    for entry in runner_account_candidates():
+        row = run_runner_account(entry, args, run=run)
+        rows.append(row)
+        if row.get("state") == "not a runner account":
+            continue
+        size = f", home {gib(row['home_bytes']).strip()}" if isinstance(row.get("home_bytes"), int) else ""
+        freed = f"reclaimed {gib(int(row.get('reclaimed_bytes') or 0)).strip()}" if row.get("state") == "ran" else ""
+        print(f"runner account {row['account']}: {row.get('state')}"
+              f"{': ' + freed if freed else ''}{size}"
+              f"{' (' + str(row['skipped']) + ')' if row.get('skipped') else ''}"
+              f"{' (' + str(row['why']) + ')' if row.get('why') else ''}", flush=True)
+    save_runner_account_sizes(rows)
+    return rows
+
+
+def runner_account_main(args: list[str]) -> int:
+    """The pass inside another runner account (RUNNER_ACCOUNTS): only where this home has enrolled glaeda runners;
+    ends with one RUNNER_ACCOUNT_LINE summary for the account that started it."""
+    global RUNNER_ACCOUNT_MODE
+    RUNNER_ACCOUNT_MODE = True
+    args = [a for a in args if a != RUNNER_ACCOUNT_FLAG]
+    runners = enrolled_runners(HOME)
+    if not runners:
+        print(RUNNER_ACCOUNT_LINE + json.dumps({"state": "not a runner account"}), flush=True)
+        return 0
+    status = _logged_main(args)
+    home_bytes = du_bytes(HOME, record_timeout=False)
+    print(RUNNER_ACCOUNT_LINE + json.dumps({
+        "state": "ran", "runners": len(runners), "status": status,
+        "reclaimed_bytes": int(RUN.get("released", 0) or 0), "skipped": RUN.get("skipped"),
+        "blocked": RUN.get("blocked", {}), "home_bytes": home_bytes}), flush=True)
+    return status
+
+
 def write_run_line(started: float, free_before: int | None) -> None:
     """The run's one line in RUN_LOG; a log that cannot be written never fails the run."""
     after = _home_free()
@@ -17804,6 +18036,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass
+        row["runner_accounts"] = RUN["runner_accounts"]
     if RUN.get("cache_budget"):  # a budgeted pressure pass: used against budget per volume (cache_budget_rows)
         row["cache_budget"] = RUN["cache_budget"]
     with contextlib.suppress(OSError):
@@ -17837,6 +18071,12 @@ def _logged_main(args: list[str]) -> int:
             launch_background_census()
         if RUN.get("apply") and not RUN.get("off"):
             refill_full_disk_reserve()
+            # RUNNER_ACCOUNTS: the other runner accounts' homes, never from a runner hook's own bounded pass
+            if (not RUNNER_ACCOUNT_MODE and os.environ.get(HOOK_PASS_ENV) != "1"
+                    and not any(a == "--need" or a.startswith("--need=") for a in args)):
+                if rows := delegate_runner_accounts(args):
+                    RUN["runner_accounts"] = [{k: r.get(k) for k in ("account", "state", "reclaimed_bytes",
+                                                                     "home_bytes", "why")} for r in rows]
         return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")
@@ -17857,6 +18097,8 @@ def main(argv: list[str] | None = None) -> int:
         return root_census_main(args)
     if "--own-runner-checkout" in args:
         return own_runner_checkout_main(args)
+    if RUNNER_ACCOUNT_FLAG in args:
+        return runner_account_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)

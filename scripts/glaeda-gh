@@ -14859,6 +14859,7 @@ class LandQueue:
         # takes the next of them (refill), not the next pass (LAND_REFILL_EVERY)
         self.next_up: list[str] = []
         self.pass_wanted: list[str] = []
+        self.pass_ready: set[str] = set()  # of pass_wanted, the rows ready to judge on a worker (gated ready=True)
         self.pass_ended: float | None = None  # the pass's latch end (land_latch_spread): no refill inside its spread
         self.pool_logged = float("-inf")
         self.green_wait: dict | None = None  # the wait clock as the last land-pool line read it (land_green_waits)
@@ -15149,13 +15150,18 @@ class LandQueue:
             window = max(1, min(window, int(room)))  # what the read loop keeps fresh (LAND_WATCH_SHARE)
         self.lean = set(due_keys[window:])
         self.pass_wanted = []
+        self.pass_ready = set()
         self.pass_ended = ended
         for key in order:
             if self.queue_quota_parked():
                 break  # a worker parked the host while this pass was submitting judgments
             self.pass_one(key, latch, ended)
         # what refill hands the workers that free before the next pass, in this pass's order
-        self.next_up = [] if latch is not None else self.pass_wanted
+        # a row ready to judge first, then the rest in the pass's order: a row whose snapshot the daemon has not read
+        # yet can only start a snapshot wait on a refill, which needs no worker (refill)
+        self.next_up = [] if latch is not None else \
+            [k for k in self.pass_wanted if k in self.pass_ready] + \
+            [k for k in self.pass_wanted if k not in self.pass_ready]
         self.adapt_pool()
         self.log_pool()
 
@@ -15203,11 +15209,11 @@ class LandQueue:
         so every gate (latch, park, fresh head, snapshot, login share, pace) still holds; at most LAND_REFILL_TRIES
         rows per free worker are considered, so a refill costs a few rows' work, never a pass's sort."""
         self.now = time.time() if now is None else now
+        self.reap()  # a job that ended frees its worker now, row or no row to hand it (busy counts judging workers)
         if not self.next_up or self.pass_latch is not None or self.refused is not None:
             return 0
         if self.pass_ended is not None:
             return 0  # the reset spread after a latch: the pass's own stagger decides who goes
-        self.reap()
         free = self.workers() - len(self.jobs)
         if free <= 0:
             return 0
@@ -16042,6 +16048,15 @@ class LandQueue:
                 log({"event": "land-slot-held", "key": key, "job": job, "state": state, "heldS": round(self.now - at),
                      "workers": self.workers(), "busy": len(self.jobs)})
 
+    def busy(self) -> int:
+        """The workers holding a job, reaped first when they all look busy: a job ends on its worker thread, and until
+        a reap it kept its worker, so a pass (seconds under a long queue) read "every worker busy" for workers that
+        were judging nothing. 2026-11-22/23 23:50-00:25Z: every land-pool line read busy 24 of 24 while judgments
+        took 35 % of the worker time; 8 of the 16 jobs it listed were rows already back to "waiting"."""
+        if len(self.jobs) >= self.workers():
+            self.reap()
+        return len(self.jobs)
+
     def slot_held(self) -> dict | None:
         """The job holding its worker longest (the land-pool line's "slotHeld"), or None while no job runs."""
         live = [(at, key, job) for key, (at, job) in self.job_started.items() if key in self.jobs]
@@ -16271,13 +16286,16 @@ class LandQueue:
             on_login += 0 if seen and seen[1] else 1
         return on_login < cap
 
-    def gated(self, e: dict, why: str = "every worker busy") -> None:
-        """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line."""
+    def gated(self, e: dict, why: str = "every worker busy", ready: bool = False) -> None:
+        """E was due a judgment this pass and waits for a worker (judge): counted for the pass's land-pool line.
+        READY: past every gate but the worker count, its snapshot ready or needing none (first for refill)."""
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
         if why == "every worker busy":
-            self.pass_wanted.append(e["key"])  # ready for a worker: the next one that frees (refill)
+            self.pass_wanted.append(e["key"])  # waiting for a worker: one that frees takes it (refill)
+            if ready:
+                self.pass_ready.add(e["key"])
         self.note_late(e, why)
 
     def note_late(self, e: dict, why: str) -> None:
@@ -16963,7 +16981,7 @@ class LandQueue:
                     self.pin_wait(e, again, str((again.get("data") or {}).get("headRefOid") or "").lower())
                     self.changed_entries.add(e["key"])
                     return True
-            elif len(self.jobs) < self.workers() and not self.refresh_held():  # no free worker: a later pass
+            elif self.busy() < self.workers() and not self.refresh_held():  # no free worker: a later pass
                 # (also where a nudge went unanswered for NUDGE_MIN: the PR is read directly, not nudged again;
                 # held (LAND_REFRESH_BROKER_HOLD), it waits for the hold's end, no failure counted)
                 w["readAt"] = w["directAt"] = self.now
@@ -17098,7 +17116,7 @@ class LandQueue:
         if self.refresh_held():
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
-        if len(self.jobs) >= self.workers():
+        if self.busy() >= self.workers():
             return True  # read on a free worker, a later tick; judged after it
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
@@ -17521,10 +17539,12 @@ class LandQueue:
             self.note_late(e, "the login's reset stagger")
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
-        free = len(self.jobs) < workers
+        free = self.busy() < workers
         room = len(self.jobs) + self.snapshot_places(free) < workers * (1 + LAND_SNAPSHOT_AHEAD)
         if not free and not room and not e.get("snapshotWait"):
-            self.gated(e)
+            # whether its snapshot is ready (read only, nothing nudged): a ready row goes first for a worker that
+            # frees before the next pass, ahead of rows that could only start a snapshot wait (refill)
+            self.gated(e, ready=self.snapshot(e["key"], sha)[1] != "wait")
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
         pin = self.fresh_head(e, sha, free)
         if pin is None:
@@ -17541,15 +17561,16 @@ class LandQueue:
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
-            if not free or self.snapshot(e["key"], sha)[1] == "wait":
+            waits = self.snapshot(e["key"], sha)[1] == "wait"
+            if not free or waits:
                 self.gated(e, "every worker busy" if not free else
-                          "snapshot waits ahead fill the room (snapshotWaiting)")
+                          "snapshot waits ahead fill the room (snapshotWaiting)", ready=not waits)
                 return False
         elif self.snapshot_wait(e, sha, free):
             self.note_late(e, "waiting for the daemon's snapshot of its head")
             return False  # judged on the daemon's next read of this head (one read, shared), not on land_judge's own
         if not free:
-            self.gated(e)  # a judgment it could start: ready, waiting for a worker
+            self.gated(e, ready=True)  # a judgment it could start: ready, waiting for a worker
             return False
         if self.jobs and (held := self.headroom_why()):
             self.gated(e, held)  # LAND_HEADROOM, read once a pass; the first judgment always runs
