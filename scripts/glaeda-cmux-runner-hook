@@ -6133,6 +6133,13 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
         print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
     deadline = time.monotonic() + max(0.0, wait_s)
+    try:  # a dedicated-only mini may have no ledger yet: its admission never took one
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
+    except OSError as error:
+        print(f"{PREFIX}: take-root: cannot open the capacity dir {capacity_dir} ({type(error).__name__})",
+              file=sys.stderr)
+        return 1
     want = capacity_dir / f"{name}.want-{os.getpid()}"
     try:
         while True:
