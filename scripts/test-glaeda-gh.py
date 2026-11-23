@@ -16014,6 +16014,48 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW + 91)
         self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (2, "posted"))
 
+    def test_a_lane_vm_reading_through_lane_gh_is_a_broker_poster_and_another_upstream_is_not(self) -> None:
+        """gcp-codex-swarm-10, 2026-11-23: a lane VM whose upstream is `lane-gh glaeda-read` was no lane_vm_poster,
+        so `post pr` made one synchronous broker call, a limit answered "rate limited, retry after 633s", exit 1, and
+        nothing was kept: four refusals in 40 minutes, each retried by hand."""
+        chain = Path(self.tmp.name) / "chain" / "gh"
+        chain.parent.mkdir(parents=True)
+        chain.write_text("#!/bin/sh\nexec \"$HOME/.local/bin/lane-gh-credential\" gh \"$@\"\n")
+        chain.chmod(0o755)
+        lane_gh = Path(self.tmp.name) / "lane-gh"
+        lane_gh.write_text("#!/bin/sh\nexit 0\n")
+        lane_gh.chmod(0o755)
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_LANE_CHAIN": str(chain)}), \
+                mock.patch.object(gg, "LANE_GH_CMD", str(lane_gh)):
+            for upstream, poster in ((None, True), (["/home/u/.local/bin/lane-gh", "glaeda-read"], True),
+                                     (["ssh", "huge-blue", "glaeda-gh", "upstream"], False)):
+                with self.subTest(upstream=upstream), mock.patch.object(gg, "upstream_command", return_value=upstream):
+                    self.assertEqual(gg.lane_vm_poster(), poster)
+
+    def test_a_lane_vm_post_through_a_lane_gh_upstream_is_queued_not_sent_where_the_caller_is(self) -> None:
+        args = gg.parser().parse_args(["post", "pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t",
+                                       "--body", "why"])
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no broker call where the caller is")), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.cmd_post(args), 0)
+        queued = list(gg.outbox_dir().glob("*.json"))
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(gg.post_state(queued[0].stem)["state"], "queued")
+
+    def test_an_upstream_tick_on_a_lane_vm_sends_the_queue_through_the_broker_instead_of_failing_it(self) -> None:
+        """Until 2026-11-23 upstream_tick failed every queued write ("has no login to post with") before reading, so
+        a lane VM reading through lane-gh could not queue one at all."""
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"url": "https://github.com/o/r/pull/7#issuecomment-1"}}))
+        d.now = NOW
+        with mock.patch.object(d, "watches", return_value=[]):
+            d.upstream_tick(lambda _request: {})
+        self.assertEqual(ran[0][1:4], ["call", "comment", "o/r"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
     def test_a_lane_vm_write_left_uncertain_by_a_token_less_attempt_is_sent(self) -> None:
         """The queue's earlier attempts on a lane VM marked it uncertain and then failed for want of a token, before
         any POST: the broker now sends it rather than looking it up forever."""

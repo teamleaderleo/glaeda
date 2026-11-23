@@ -9440,7 +9440,14 @@ class Daemon:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
-        self.upstream_refuse_posts()
+        if lane_vm_poster():
+            try:
+                with self.phase("outbox"):
+                    self.post_tick()  # a lane VM reading through lane-gh writes through it too (lane_vm_poster)
+            except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
+                self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        else:
+            self.upstream_refuse_posts()
         with self.phase("watches"):
             entries = self.watches()
         due = []
@@ -33238,12 +33245,24 @@ BROKER_OUTBOX_DEADLINE = 120.0  # one queued write the daemon makes through the 
 BROKER_RATE_LIMITED_EXIT = 75  # lane-gh's exit for a write GitHub's or the broker's limit refused (nothing was made)
 
 
+def upstream_is_lane_gh() -> bool:
+    """Whether UPSTREAM_CONFIG reads through lane-gh's `glaeda-read`: the lane-gh broker, which also makes writes."""
+    command = upstream_command()
+    return command is not None and len(command) == 2 and Path(command[0]).name == "lane-gh" and \
+        command[1] == "glaeda-read"
+
+
 def lane_vm_poster() -> bool:
-    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream
-    and a runnable lane-gh. Such a host holds no login, so the daemon's own `gh auth token` post can never succeed:
-    fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh
-    signed in?" while the caller had been told the daemon posts it."""
-    return upstream_command() is None and lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
+    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream,
+    or with lane-gh's own `glaeda-read` as its upstream, and a runnable lane-gh. Such a host holds no login, so the
+    daemon's own `gh auth token` post can never succeed: fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued;
+    0 ahead; last attempt: gh auth token exited 1; is gh signed in?" while the caller had been told the daemon posts
+    it. A lane VM reading through lane-gh counts too: until 2026-11-23 its `post` made one synchronous broker call and
+    a limit answered "rate limited, retry after 633s", exit 1, nothing kept, so the caller retried by hand or a loop
+    (gcp-codex-swarm-10, a leo-workspace `post pr` refused 4 times in 40 minutes). Queued, the daemon makes it once
+    the limit lets it (post_through_broker's notBefore)."""
+    return (upstream_command() is None or upstream_is_lane_gh()) and lane_vm_gh() is not None and \
+        os.access(LANE_GH_CMD, os.X_OK)
 
 
 def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
@@ -33436,10 +33455,11 @@ def cmd_post(args: argparse.Namespace) -> int:
     if why:
         print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
         return 3
-    if upstream_command() is not None:
+    if lane_vm_poster():
+        if broker_post_args(item) is None:
+            return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for it
+    elif upstream_command() is not None:
         return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
-    if lane_vm_poster() and broker_post_args(item) is None:
-        return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
     missing = post_route_missing()
     if missing:
         return post_unrouted(item, missing)
