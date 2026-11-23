@@ -70,18 +70,19 @@ user_install() {
   printf '%s\n' "$USER_PYTHON"
 }
 
-# Every directory from / to PATH's real file: root-owned and writable by nobody else.
+# Every directory from / to PATH's real file: root-owned and writable by nobody else. WHY names the first that is not.
+WHY=
 root_owned_chain() {
   p=$1
   while :; do
-    [ -e "$p" ] || return 1
+    [ -e "$p" ] || { WHY="$p is missing"; return 1; }
     if [ -h "$p" ]; then
-      [ "$(stat -c %u "$p" 2>/dev/null || stat -f %u "$p")" = 0 ] || return 1
+      [ "$(stat -c %u "$p" 2>/dev/null || stat -f %u "$p")" = 0 ] || { WHY="$p is a link not owned by root"; return 1; }
     else
       set -- $(stat -c '%u %a' "$p" 2>/dev/null || stat -f '%u %Lp' "$p")
-      [ "$1" = 0 ] || return 1
+      [ "$1" = 0 ] || { WHY="$p is owned by uid $1, not root"; return 1; }
       # writable by others only with the sticky bit (/tmp): then only root may rename what root owns there
-      case $2 in *[2367]?|*[2367]) [ -k "$p" ] || return 1 ;; esac
+      case $2 in *[2367]?|*[2367]) [ -k "$p" ] || { WHY="$p is writable by group or other (mode $2)"; return 1; } ;; esac
     fi
     [ "$p" = / ] && return 0
     p=$(dirname "$p")
@@ -89,7 +90,7 @@ root_owned_chain() {
 }
 
 root_ok() {
-  runs "$ROOT_PYTHON" || return 1
+  runs "$ROOT_PYTHON" || { WHY="$ROOT_PYTHON does not run Python $VERSION"; return 1; }
   real=$(cd "$(dirname "$ROOT_PYTHON")" && cd "$(dirname "$(readlink "$ROOT_PYTHON" || echo "$ROOT_PYTHON")")" && pwd -P)
   root_owned_chain "$ROOT_PYTHON" && root_owned_chain "$real"
 }
@@ -120,14 +121,14 @@ root_install() {
   mv "$stage" "$ROOT_DIR/$name"
   ln -sfn "../$name/bin/python$VERSION" "$ROOT_PYTHON.new"
   mv -f "$ROOT_PYTHON.new" "$ROOT_PYTHON"
-  root_ok || die "$ROOT_PYTHON is not a root-owned, runnable Python $VERSION after install (is a parent of $ROOT_DIR writable by another account?)"
+  root_ok || die "$ROOT_PYTHON is not a root-owned, runnable Python $VERSION after install: $WHY"
   printf '%s\n' "$ROOT_PYTHON"
 }
 
 case "${1:-}" in
   --path) runs "$USER_PYTHON" && printf '%s\n' "$USER_PYTHON" ;;
   --install) user_install ;;
-  --root-path) root_ok && printf '%s\n' "$ROOT_PYTHON" ;;
+  --root-path) if root_ok; then printf '%s\n' "$ROOT_PYTHON"; else say "$WHY"; exit 1; fi ;;
   --install-root) root_install ;;
   -h|--help) sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
   *) die "usage: glaeda-python --path | --install | --root-path | --install-root" ;;

@@ -542,11 +542,14 @@ jobs:
           echo "python-path=$py" >> "$GITHUB_OUTPUT"
 
       - name: Test the root-owned copy (glaeda-python --install-root)
+        env:
+          # under / itself: a hosted runner's /opt is not the root-only directory a mini's is
+          GLAEDA_ROOT_PYTHON_DIR: /glaeda-python-ci
         run: |
-          sudo -n env GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci SUDO_USER="$USER" sh scripts/glaeda-python --install-root
-          test "$(GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci sh scripts/glaeda-python --root-path)" = /opt/glaeda-python-ci/bin/python3.13
-          test "$(stat -c %u "$(readlink -f /opt/glaeda-python-ci/bin/python3.13)")" = 0
-          if GLAEDA_ROOT_PYTHON_DIR=/opt/glaeda-python-ci sh -c 'sudo -n chmod o+w /opt/glaeda-python-ci/bin && sh scripts/glaeda-python --root-path'; then
+          sudo -n env GLAEDA_ROOT_PYTHON_DIR="$GLAEDA_ROOT_PYTHON_DIR" SUDO_USER="$USER" sh scripts/glaeda-python --install-root
+          test "$(sh scripts/glaeda-python --root-path)" = "$GLAEDA_ROOT_PYTHON_DIR/bin/python3.13"
+          test "$(stat -c %u "$(readlink -f "$GLAEDA_ROOT_PYTHON_DIR/bin/python3.13")")" = 0
+          if sudo -n chmod o+w "$GLAEDA_ROOT_PYTHON_DIR/bin" && sh scripts/glaeda-python --root-path; then
             echo "a root copy another account can write must not count" >&2; exit 1
           fi
 
