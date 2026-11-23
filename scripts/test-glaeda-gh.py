@@ -1050,7 +1050,7 @@ class PinnedHeadStatedTest(Base):
 
 
 class UnseenPinnedShaTest(Base):
-    """big-red/efficiency-standing-lane, 2026-11-23: a wait on teamleaderleo/leo-workspace#9346 was armed with a full
+    """efficiency-standing-lane, 2026-11-23: a wait on teamleaderleo/leo-workspace#9346 was armed with a full
     id padded out of a short one -- a commit that exists in no checkout and that GitHub never showed -- and it was
     accepted, to wait out all 3600 s and then print a note naming the head it had seen the whole time. A full id may
     be a push GitHub has not seen (resolve_sha), but one that is in no checkout here either is a typo or another
