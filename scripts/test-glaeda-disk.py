@@ -13645,6 +13645,42 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-29T00:00:00Z")), "", "lapsed")
         self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-25T21:59:59Z")), "", "not yet")
 
+    def test_an_expired_list_is_released_and_only_a_live_entry_in_it_holds(self) -> None:
+        """2026-11-23: a list 24 h past its expires printed "fleet reservations expired at ...; kept as reserved" on a
+        mini at 90% used, so keepup --runner-caches --dedupe-builds neither deduped nor evicted. Expired means
+        released: an expired list holds nothing unless an entry in it is still live by its own from/until."""
+        doc = json.loads(self.list.read_text())
+        after = gd.reservation_time("2026-10-28T00:00:00Z")  # past expires (10-27T13:00Z), inside r1 (to 10-28T23:59Z)
+        late = gd.reservation_time("2026-10-29T06:00:00Z")  # past expires and past r1
+        for absent in ([], [dict(doc["reservations"][0], hosts=["cmux31"])]):
+            with self.subTest(expired_absent=absent):  # expired, no entry naming this host: not reserved
+                self.list.write_text(json.dumps(dict(doc, reservations=absent)))
+                self.assertEqual(self.reserved({"cmux30"}, after), "")
+                self.assertIsNone(gd.RESERVATION_SINCE)
+        self.list.write_text(json.dumps(doc))
+        self.assertEqual(self.reserved({"cmux30"}, late), "", "expired list, its only entry lapsed: released")
+        self.assertEqual(self.reserved({"cmux31"}, after), "", "expired list, entry for another host: released")
+        held = self.reserved({"cmux30"}, after)  # expired list, entry still live: the live reservation still holds
+        self.assertEqual(held, "reserved for someone until 2026-10-28T23:59:59Z (r1) "
+                               "(list expired at 2026-10-27T13:00:00Z)")
+        self.assertEqual(gd.RESERVATION_SINCE, gd.reservation_time("2026-10-25T22:00:00Z"))
+        live = self.reserved({"cmux30"})  # a live list and entry: exactly today's message
+        self.assertEqual(live, "reserved for someone until 2026-10-28T23:59:59Z (r1)")
+        now = int(after)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}, after),
+                      "an expired list still reads the host-local marker")
+        self.local.unlink()
+        self.list.write_text(json.dumps(dict(doc, reservations=[{"hosts": "cmux31"}])))
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "expired and malformed: fails closed")
+        self.list.write_text(json.dumps({"reservations": []}))
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "no expires at all: fails closed")
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "absent on a worker host: fails closed")
+        with mock.patch.object(gd, "controller_worker_host", return_value=False):
+            self.assertEqual(self.reserved({"cmux31"}, after), "", "absent with no worker: no reservations")
+
     def test_an_unreadable_list_fails_closed(self) -> None:
         self.list.write_text("{nope")
         self.assertIn("unreadable", self.reserved({"cmux31"}))
@@ -13679,10 +13715,9 @@ class HostReservationTest(unittest.TestCase):
                                               "since": now - 60, "until": now + 60}))
             self.assertIn("host reservation by fleet", self.reserved({"cmux31"}), "a host-local marker still holds")
             self.local.unlink()
-            for broken in ("{nope", json.dumps({"reservations": []}), json.dumps(
-                    {"reservations": [], "expires": "2026-10-26T00:00:00Z"})):
+            for broken in ("{nope", json.dumps({"reservations": []})):
                 with self.subTest(broken=broken):
-                    self.list.write_text(broken)  # there but unreadable, malformed or expired: fails closed
+                    self.list.write_text(broken)  # there but unreadable or malformed: fails closed
                     self.assertIn("kept as reserved", self.reserved({"cmux31"}))
             self.list.write_bytes(b"\xff\xfe")
             self.assertIn("kept as reserved", self.reserved({"cmux31"}), "undecodable bytes")
@@ -13774,7 +13809,7 @@ class HostReservationTest(unittest.TestCase):
         fresh = "2026-10-27T13:00:00Z"
         self.list.write_text(json.dumps({"reservations": [good], "expires": fresh}))
         self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
-        for expires in (None, "2026-10-26T23:59:59Z", "soon", 12):
+        for expires in (None, "soon", 12):  # an expired one is released (test_an_expired_list_is_released_...)
             with self.subTest(expires=expires):
                 doc = {"reservations": [good]} if expires is None else {"reservations": [good], "expires": expires}
                 self.list.write_text(json.dumps(doc))

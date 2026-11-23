@@ -2568,7 +2568,8 @@ It acts only where all of the following hold. Otherwise it reports and changes n
 - `/Library/Application Support/cmux-fleet-ops` already exists, because a root install made it.
 - The host is not reserved. The pass reads `~/.local/share/glaeda/fleet-reservations.json`
   (`glaeda-fleet-reservations/v1`) from the home of the user who owns `/Users/Shared/cmux-build-fleet`. A list that
-  is missing, unreadable, or past its own `expires` counts as reserved. So does an active entry naming this host
+  is missing or unreadable counts as reserved; one past its own `expires` is released, and holds only by an entry
+  still live by its own `from`/`until`. So does an active entry naming this host
   (its machine name or the host in `~/.config/glaeda/update.json`, plus the list's aliases), and so does an active
   `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
   bytes installed are the pinned ones.
