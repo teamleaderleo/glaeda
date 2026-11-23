@@ -349,7 +349,8 @@ What `--apply` does:
      glaeda-disk's free-space target, so unused build caches go on finish. Start and listener
      triggers may skip above the target. Triggers that arrive while a pass runs leave one
      `hook-pass.pending` the running pass serves with a single follow-up; skips and coalescing
-     get a line in glaeda-disk's run log. The disk policy still checks live use and role keeps.
+     get a line in glaeda-disk's run log. The disk policy preserves live/queued work and one
+     working cache per kind; `outlived_build_caches.bytes` measures remaining finished caches.
      Only that queued pass waits for a running job: every other `--pressure --apply` run (a manual
      one, the disk-pressure LaunchAgent's, idle-repair's, the hook's own floor evictions) reclaims
      out of band instead of queueing behind it -- the families no job owns

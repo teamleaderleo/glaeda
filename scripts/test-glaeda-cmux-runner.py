@@ -8624,6 +8624,20 @@ class DiskPassCoalesceTest(unittest.TestCase):
         self.assertEqual(self.run_count(), 0)
         self.assertEqual(self.logged()[-1], hook.HOOK_SKIP_ABOVE_TARGET)
 
+    def test_completion_above_target_coalesces_into_the_running_pass(self) -> None:
+        disk = self.fake_disk()
+        self.write_target(0.001)
+        with self.lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for _ in range(5):
+                self.assertIn("coalesced", hook.disk_pressure_detached(os.fspath(disk), job_completed=True))
+            self.assertTrue(self.pending.exists())
+            self.assertEqual(self.run_count(), 0)
+            self.assertEqual(self.logged().count(hook.HOOK_SKIP_COALESCED), 5)
+        self.assertEqual(self.bound(disk).wait(30), 0)
+        self.assertEqual(self.run_count(), 1)
+        self.assertFalse(self.waiting())
+
     def test_the_detached_pass_never_keeps_the_job_workspace_as_its_cwd(self) -> None:
         """cmux8s-mac-mini, 2026-10-27: the pass forked from job-completed kept the runner checkout it started in as
         its cwd, so glaeda-disk's checkout evictions read that checkout as in use."""
