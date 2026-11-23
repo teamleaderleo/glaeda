@@ -878,6 +878,25 @@ class ExpectedUnpostedTest(Base):
         unread["requiredUnread"] = ["ws-check"]
         self.assertEqual(gg.expected_unposted(unread, NOW), [])
 
+    def test_the_detector_that_names_a_stuck_check_also_names_the_one_never_posted(self) -> None:
+        """One enumeration of the absences: #2564's lone pending check got "usually stuck, not slow", which check and
+        a run to look at; #8794's never-posted context got silence. Same detector, both absences."""
+        done = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1)
+        note = gg.stuck_note(self.KEY, {"data": done}, gg.WAIT_STUCK_AFTER, gg.RESCUE_GRACE, NOW)
+        self.assertIsNotNone(note)
+        self.assertIn("never posted: ws-check", note)
+        self.assertIn("ends without it", note)
+        self.assertIn(f"next: {self.LAND}", note)
+        self.assertNotIn("glaeda-gh wait pr", note)
+        # and while it may still arrive, the step is the bound after which this tool answers differently
+        young = self.head(NOW - 1590)
+        soon = gg.stuck_note(self.KEY, {"data": young}, gg.WAIT_STUCK_AFTER, gg.RESCUE_GRACE, NOW)
+        self.assertIn("never posted: ws-check", soon)
+        self.assertIn("may still arrive", soon)
+        self.assertIn("next: glaeda-gh wait until ", soon)
+        self.assertIn("glaeda-gh status pr", soon)
+        self.assertNotIn("glaeda-gh wait pr", soon)
+
     def test_a_check_that_is_genuinely_still_running_keeps_the_wait(self) -> None:
         data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1, check_run("GitGuardian Security Checks"),
                          check_run("build", "IN_PROGRESS", None), rollup="PENDING")
@@ -957,11 +976,50 @@ class TimeoutNextStepTest(Base):
     def test_a_wait_still_moving_at_its_ceiling_may_name_itself(self) -> None:
         """The one allowed self-naming, kept honest: a wait whose target kept changing can end next time."""
         req = self.request()
+        req["began"] = NOW - 9601  # at its --max, and still moving ten seconds ago
         req["moved"] = {"at": NOW - 10, "changes": 7}
         self.assertEqual(gg.wait_ended_by(req, NOW), "ceiling")
         out = gg.wait_outcome(req, gg.EXIT_TIMEOUT, {"data": self.head(check_run("build", "IN_PROGRESS", None))}, 9601)
         self.assertEqual(out["next"], gg.wait_command(req))
         self.assertIn("still changing", out["reason"])
+
+
+class PinnedHeadStatedTest(Base):
+    """teamleaderleo/glaeda#2564 (3700 s, 2026-11-23): the wait was pinned `--sha 41092a54...`, which was never the
+    head in those 3700 s. Every line it printed was about 4ce5d079 and later ca129622, and none of them said the state
+    being reported was not the commit the caller pinned. A pin is an assertion about which commit matters; a wait may
+    wait for a push GitHub has not seen, but not silently."""
+
+    PIN = "41092a541e1b43d4c696f2d5704a7f1c8803a943"
+    HEAD = "4ce5d07926" + "0" * 30
+    KEY = "pr:teamleaderleo/glaeda#2564"
+
+    def data(self, head: str) -> dict:
+        node = pr_node(2564, rollup="PENDING", checks=[check_run("Verify / scripts", "IN_PROGRESS", None)])
+        node.update(url="https://github.com/teamleaderleo/glaeda/pull/2564", headRefOid=head)
+        return gg.parse_pr(node)
+
+    def test_a_pinned_commit_that_is_not_the_head_is_named_beside_the_head_it_reports(self) -> None:
+        said = gg.progress_state(self.KEY, {"data": self.data(self.HEAD)}, "done", gg.RESCUE_GRACE, self.PIN)
+        self.assertIn(self.PIN[:10], said)
+        self.assertIn(self.HEAD[:10], said)
+        self.assertIn("is not the head GitHub shows", said)
+
+    def test_it_says_nothing_when_the_pin_is_the_head_or_is_no_full_commit(self) -> None:
+        entry = {"data": self.data(self.PIN)}
+        self.assertIsNone(gg.pin_mismatch(self.PIN, entry["data"]))
+        self.assertNotIn("is not the head GitHub shows",
+                         gg.progress_state(self.KEY, entry, "done", gg.RESCUE_GRACE, self.PIN))
+        for pin in (None, "", "41092a5", "green", "HEAD"):
+            self.assertIsNone(gg.pin_mismatch(pin, self.data(self.HEAD)), pin)
+
+    def test_the_wait_itself_carries_it_on_its_first_progress_line(self) -> None:
+        req = gg.wait_request("pr", "teamleaderleo/glaeda#2564", "done", 1800.0, False, False, self.PIN, True,
+                              gg.RESCUE_GRACE, ceiling=9600.0)
+        seen: dict = {}
+        first = gg.progress_update(seen, req, {"data": self.data(self.HEAD)}, NOW)
+        self.assertIn(self.PIN[:10], first or "")
+        self.assertIn(self.HEAD[:10], first or "")
 
 
 class StatusStateTest(unittest.TestCase):
@@ -35322,8 +35380,11 @@ class WaitBlockedByQuotaTest(Base):
         self.assertIsNone(gg.read_blocked("pr"))
         self.assertEqual(gg.progress_state("pr:o/r#7208", None), "o/r#7208: no data yet")
         self.assertIsNone(gg.blocked_start_line("pr:o/r#7208", "pr"))
-        self.assertEqual(gg.wait_outcome(self.request(), gg.EXIT_TIMEOUT, None, 1800)["next"],
-                         gg.wait_command(self.request()))
+        # and it still never names itself: a wait that read nothing for its whole --timeout cannot be its own next
+        # step (leo-workspace#8794 burned 2401 s that way), so it names the read that would explain the silence
+        nxt = gg.wait_outcome(self.request(), gg.EXIT_TIMEOUT, None, 1800)["next"]
+        self.assertEqual(nxt, "glaeda-gh status pr o/r#7208 --verbose")
+        self.assertNotIn("glaeda-gh wait", nxt)
 
     def test_no_records_at_all_claims_nothing(self) -> None:
         self.assertIsNone(gg.read_blocked("pr"))

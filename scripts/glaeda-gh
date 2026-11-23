@@ -22693,16 +22693,38 @@ def blocked_start_line(key: str, kind: str) -> str | None:
     return f"glaeda-gh: {key_name(key)} cannot be read right now: {blocked['text']}.{resumes}"
 
 
-def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
-    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line). When nothing
-    is being read for its kind (read_blocked) and the data is not fresh, the line names the bucket and the reset
-    as well: "no data yet" alone reads as "its CI has not started", which is the one thing it does not mean."""
+def pin_mismatch(pin: str | None, data: object) -> str | None:
+    """What a wait says when the caller pinned a full commit and that commit is not the head GitHub shows: both shas,
+    named, every time the state is said. None when there is no pin, the pin is not a full id, or it is the head.
+
+    A pin is an assertion about which commit the caller cares about. teamleaderleo/glaeda#2564 (3700 s, 2026-11-23)
+    was pinned to 41092a54, which was never the head in those 3700 s: every line it printed was about 4ce5d079 and
+    later ca129622, and it never said the head it reported was not the head it was asked about. A wait may legitimately
+    wait for a pinned push GitHub has not seen yet -- it may not do that silently, because the words it prints then
+    describe work the caller never asked about."""
+    if not isinstance(data, dict) or not pin or not re.fullmatch(r"[0-9a-f]{40}", str(pin)):
+        return None
+    head = str(data.get("headRefOid") or "")
+    if not head or head == str(pin):
+        return None
+    return (f"pinned --sha {str(pin)[:10]} is not the head GitHub shows ({head[:10]}), so this state is "
+            f"{head[:10]}'s, and this wait cannot end on {str(pin)[:10]} until that commit becomes the head")
+
+
+def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE,
+                   pin: str | None = None) -> str:
+    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line), and the pin it was
+    asked about whenever that is not the head this state is about (pin_mismatch). When nothing is being read for its
+    kind (read_blocked) and the data is not fresh, the line names the bucket and the reset as well: "no data yet" alone
+    reads as "its CI has not started", which is the one thing it does not mean."""
     lines = [line.strip() for line in summary(key, entry, until, grace, False).splitlines()]
     keep = lines[:2] if split_key(key)[0] == "pr" else lines[:1]
     state = "; ".join(line for line in keep if line and not line.startswith("http"))
     at = (entry or {}).get("dataAt")
     fresh = (entry or {}).get("data") and isinstance(at, (int, float)) and not isinstance(at, bool) \
         and time.time() - at < WAIT_PROGRESS_EVERY
+    mismatch = pin_mismatch(pin, (entry or {}).get("data"))
+    state = f"{state}; {mismatch}" if mismatch else state
     blocked = None if fresh else blocked_now(split_key(key)[0])
     return f"{state}; {blocked['text']}" if blocked is not None else state
 
@@ -22812,7 +22834,13 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     # it can see and the count it cannot are in the same breath. A read that did not happen is unknown
     # (docs/handbook/missing-read-counted-as-a-value.md): the wait names that part as unseen instead of absorbing it.
     unseen = max(0, pending_on_every_page(data) - len(pending) - len(groups["held"]))
-    if not pending and not unseen:
+    # The third absence, enumerated here with the other two instead of in a detector of its own: a context every head
+    # of this repo gets (expected_contexts) that was never posted holds the wait exactly as a pending check does, but
+    # it is in no group classify() returns, so this branch returned None and teamleaderleo/leo-workspace#8794 spent
+    # 2401 s with nothing said at all -- while a check merely *pending* beside finished siblings got a named warning
+    # and a run to look at. One kind of absence cannot get a name while the other gets silence.
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if not pending and not unseen and not missing:
         return None
 
     def since(c: dict) -> float | None:
@@ -22846,7 +22874,28 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    lines.append(f"next: {stuck_next(oldest[0], key) if pending else unseen_next(data, key)}")
+    if missing:
+        unposted = expected_unposted(data, now)
+        pushed = pushed_by(data)
+        age = f" {span(now - pushed)} after the push" if pushed is not None else ""
+        verdictless = ("; nothing requires it, so this wait ends without it and says so" if unposted
+                       else "; it may still arrive, and until then it holds this wait as a required check would")
+        lines.append(f"  never posted: {', '.join(missing)}{age}; nothing has reported it on head "
+                     f"{str(data.get('headRefOid') or '')[:10]}, so it is in no pending check this wait can "
+                     f"name{verdictless}")
+    if pending:
+        nxt = stuck_next(oldest[0], key)
+    elif unseen:
+        nxt = unseen_next(data, key)
+    elif expected_unposted(data, now):
+        nxt = expected_unposted_next(key, data)
+    else:
+        # the bound after which this tool answers differently about the same state: a wait past it ends without the
+        # context instead of holding. Never this same wait (docs/handbook/wait-that-cannot-end.md)
+        pushed = pushed_by(data) or now
+        nxt = (f"glaeda-gh wait until {utc_clock(pushed + EXPECTED_UNPOSTED_AFTER)} && "
+               f"glaeda-gh status pr {key_name(key)} --verbose")
+    lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
 
@@ -22858,7 +22907,8 @@ def progress_update(seen: dict, req: dict, entry: dict | None, now: float | None
     request, and its blocker drops a line it already printed the same way."""
     now = time.time() if now is None else now
     grace = float(req.get("grace", RESCUE_GRACE))
-    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace)
+    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace,
+                           str(req.get("sha") or "") if req.get("exact", True) else None)
     if state != seen.get("state"):
         seen.update(state=state, at=now, stuck=False)
         return state
@@ -22885,7 +22935,8 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            f"waited {waited} s for {name}, which is {data.get('state')}",
                            f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
-        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
+        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)),
+                               str(req.get("sha") or "") if req.get("exact", True) else None)
         deadline = utc_clock(wait_deadline(req))
         blocked = blocked_now(kind)
         now = time.time()
