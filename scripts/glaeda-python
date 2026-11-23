@@ -12,7 +12,7 @@
 #
 # USER_PYTHON (~/.local/bin/python3.13) is what the login user's LaunchAgents and ssh commands run. ROOT_PYTHON
 # (/opt/glaeda-python/bin/python3.13) is what root LaunchDaemons and anything run as the runner user run: a copy no
-# account but root can write, which is why /usr/bin/python3 (SIP-protected) was used before. Apple's /usr/bin/python3
+# account but root can write, which is why Apple's SIP-protected python3 was used before. Apple's python3
 # (Xcode's or the Command Line Tools' 3.9) is not used by glaeda anywhere. Local Network privacy no longer tells
 # Apple's python from this one (cmux15, macOS 27.0.1, 2026-11-23: both get EHOSTUNREACH in-process, both let a
 # /usr/bin/nc child connect), so the LAN agents keep their /bin/sh parent (glaeda-mini-setup LAN_PARENT) and run
