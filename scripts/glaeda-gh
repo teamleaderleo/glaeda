@@ -34,6 +34,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
     glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
+                                                        OWNER/REPO#N instead: a comment on that PR
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
     glaeda-gh budget [--json] [--local]                 who spent the login's quota this hour, per host
@@ -31120,13 +31121,14 @@ def broker_post(item: dict) -> int:
     return 0
 
 
-def post_issue_names_an_existing_issue(target: str) -> str:
-    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+def post_target_number(target: str) -> str:
+    """The issue or pull request number a `post` target names, or "" where it names a repository.
 
-    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    Nothing is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
     that issue: the caller had the number from a wait or land line, not from this parser's help. Until
     2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
-    cost the refusal plus the same call typed again under another kind.
+    cost the refusal plus the same call typed again under another kind. `post pr OWNER/REPO#N` reads the same
+    way and was refused ("post pr takes OWNER/REPO") until 2026-11-23, measured on a comment for cmux#51063.
     """
     text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
     found = KEY_RES["comment"].fullmatch(text)
@@ -32888,7 +32890,10 @@ def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) ->
     if parent != "post":
         return True
     if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
-        return False
+        # Since 2026-11-23 `post pr OWNER/REPO#N` is a comment on that pull request, which takes a body and
+        # not --head/--base/--title. Without a body it is still a call `post` could only refuse.
+        return bool(post_target_number(target)) and bool(
+            {normalized_flag("--body"), normalized_flag("--body-file")} & typed)
     needs = NESTING_WRITE_INPUT.get((parent, word))
     return not needs or bool({normalized_flag(f) for f in needs} & typed)
 
@@ -33432,7 +33437,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
             if one == "issue":
-                numbered = post_issue_names_an_existing_issue(args.target)
+                numbered = post_target_number(args.target)
                 if numbered and args.title:
                     raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
                                      f"to comment on it, or pass OWNER/REPO to file a new issue")
@@ -33440,6 +33445,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
                           f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
                     args.kind, one = "comment", "comment"
+            if args.kind == "pr":
+                numbered = post_target_number(args.target)
+                opening = [f for f, v in (("--head", args.head), ("--base", args.base), ("--title", args.title)) if v]
+                if numbered and opening:
+                    raise WatchError(f"post pr {args.target} names pull request {numbered}, which exists: drop "
+                                     f"{', '.join(opening)} to comment on it, or pass OWNER/REPO to open a new one")
+                if numbered:
+                    print(f"glaeda-gh: post pr {args.target} names pull request {numbered}, which exists: this is "
+                          f"a comment on it (a new pull request takes OWNER/REPO with --head, --base and --title)",
+                          file=sys.stderr)
+                    args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:
