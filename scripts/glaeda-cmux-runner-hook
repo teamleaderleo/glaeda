@@ -7998,6 +7998,11 @@ def plain_side_runner(args: argparse.Namespace) -> bool:
 # root (no .cmux-seed-root) or held. The refusal is not for capacity, so FAST_TIER_BUSY does not admit it; it costs
 # under a minute where the cold build cost the whole limit, and the rescue places the re-run again. The probe is
 # glaeda-disk's seed_root_held: exclusive, non-blocking, released at once; an unreadable lock counts as held.
+# Off switch: SIDE_SEED_FREE_OFF_ENV=1 in the runner's environment, or a SIDE_SEED_FREE_OFF_FILE in the capacity
+# ledger (touch it on the mini, live), admits the fast tier as before (SIDE_FAST_FIT, FAST_TIER_BUSY). Each refusal
+# logs "refused: seed root:", which the cut read counts.
+SIDE_SEED_FREE_OFF_ENV = "GLAEDA_SIDE_SEED_FREE_OFF"
+SIDE_SEED_FREE_OFF_FILE = "side-seed-free.off"
 CMUX_SEED_ROOTS = (Path("/Users/runner/_work/cmux"), Path("/Users/runner/_work/cmux-2"))
 SEED_ROOTS_ENV = "GLAEDA_CMUX_SEED_ROOTS"  # tests: os.pathsep-joined roots instead of CMUX_SEED_ROOTS
 SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
@@ -8026,9 +8031,13 @@ def seed_root_held(root: Path) -> bool:
     return False
 
 
-def seed_root_refusal(roots: tuple[Path, ...] | None = None) -> str | None:
+def seed_root_refusal(roots: tuple[Path, ...] | None = None, capacity_dir: Path | None = None) -> str | None:
     """Why the fast tier would build cold on this mini (SIDE_SEED_FREE), or None when a seed root is free: the first
-    unheld, or a later one that is a seed root (its marker) and unheld."""
+    unheld, or a later one that is a seed root (its marker) and unheld. None too when its off switch is set."""
+    if (os.environ.get(SIDE_SEED_FREE_OFF_ENV) or "").strip() == "1":
+        return None
+    if capacity_dir is not None and (capacity_dir / SIDE_SEED_FREE_OFF_FILE).exists():
+        return None
     roots = seed_roots() if roots is None else roots
     if not roots:
         return None
@@ -15711,7 +15720,7 @@ def main(argv: list[str] | None = None) -> int:
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS
-                and (why := seed_root_refusal())):
+                and (why := seed_root_refusal(capacity_dir=args.capacity_dir))):
             return refused(why)  # SIDE_SEED_FREE: refused before it takes anything; never admitted busy
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):

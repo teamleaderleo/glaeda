@@ -4402,6 +4402,10 @@ class HookTest(unittest.TestCase):
             self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal(tuple(roots)) or "",
                           "an unmarked second root is no seed: the job would build cold")
             self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal((roots[0], self.dir / "absent")) or "")
+            with mock.patch.dict(os.environ, {hook.SIDE_SEED_FREE_OFF_ENV: "1"}):
+                self.assertIsNone(hook.seed_root_refusal((roots[0],)), "the off switch admits as before")
+            (self.dir / hook.SIDE_SEED_FREE_OFF_FILE).touch()
+            self.assertIsNone(hook.seed_root_refusal((roots[0],), capacity_dir=self.dir), "the live off file too")
         self.assertIsNone(hook.seed_root_refusal(tuple(roots)), "the first root unheld")
         self.assertIsNone(hook.seed_root_refusal((self.dir / "never-taken",)), "no lock file: no job ever took it")
 
