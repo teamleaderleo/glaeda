@@ -12822,11 +12822,11 @@ def land_command_host(command: list[str]) -> int | None:
         if word == "--":
             return i + 1 if i + 1 < len(command) else None
         if word.startswith("-") and len(word) > 1:
-            # -o VALUE, or -oVALUE / a cluster of flags with no value
-            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
-                i += 2
-            else:
-                i += 1
+            # -o VALUE, -oVALUE, a cluster of flags with no value, or one ending in a value flag (-4o VALUE): as
+            # getopt reads it, the first value flag takes the rest of its word, else the next word
+            flag = None if word.startswith("--") else next(
+                (j for j, ch in enumerate(word[1:], 1) if ch in SSH_VALUE_FLAGS), None)
+            i += 2 if flag == len(word) - 1 else 1
             continue
         return i
     return None
@@ -15472,6 +15472,8 @@ class LandQueue:
         sent = req.get("at")
         e["requestedAt"] = min(float(sent), self.now) \
             if isinstance(sent, (int, float)) and not isinstance(sent, bool) else self.now
+        if pin and pin != str(e.get("pinSha") or "").lower() and not fresh:
+            self.drop_older_heads(e, pin)
         if pin:
             e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
         else:
@@ -15512,6 +15514,22 @@ class LandQueue:
         self.entries[key] = e
         self.save(e)
         self.changed_entries.add(key)
+
+    def drop_older_heads(self, e: dict, pin: str) -> None:
+        """Under the lock, from apply: a re-request of open E pinned at PIN, another head than it had. What E kept from
+        judging another head goes, so the next pass reads the head the cache shows for PIN (pin_wait) and judges that:
+        a wait naming a head that is not PIN (a repin land_judge named, a wait_pr at an older head) is queued again,
+        and the base merge check, stale-head and old-pin waits made for the earlier pin are dropped. glaeda#2611,
+        2026-11-23 08:02Z: land_judge named a repin to one head, a newer head was pushed and pinned before that wait
+        was judged, and the row stopped "the head is <the repin's head>, not the --sha <the new pin>" on the old wait.
+        A wait naming no head (a retry, a quota park, a run or a comment) is kept: it is about the PR, not a head."""
+        w = e.get("wait") or {}
+        sha = str(w.get("sha") or "").lower()
+        if e.get("state") == "waiting" and sha and land_head_moved(pin, sha):
+            e.update(state="queued", wait=None, wakeAt=None, dueAt=self.now)
+            self.history(e, "older_head_dropped", kind=w.get("kind"), head=sha[:12], pin=pin[:12])
+        for field in ("baseMergeCheck", "staleHead", "oldPinWait"):
+            e.pop(field, None)
 
     # -- the tick
 
@@ -18764,7 +18782,9 @@ class LandQueue:
             check = e.pop("baseMergeCheck", None)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
-        if isinstance(check, dict) and check.get("head") == sha and not self.base_merge_check(e, check):
+        # only a check made for E's pin now: one made for an earlier pin compares this head with a pin E no longer has
+        if isinstance(check, dict) and check.get("head") == sha and check.get("pin") == str(e.get("pinSha") or "") \
+                and not self.base_merge_check(e, check):
             return  # not only a base merge on the pin: stopped head_moved, as before
         # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
         # so without this line no log on the land host says how long a judgment took, and a change meant to make
