@@ -9,6 +9,7 @@ reaches an argv, a file, or the output.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import copy
 import datetime
@@ -34,6 +35,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.parse
@@ -19991,6 +19993,276 @@ class PoolUserRunnerTest(unittest.TestCase):
         self.assertIsNone(fleet_labels.member_pool_user(pool_manifest("root"), "mini-std")[0])
         self.assertIsNone(fleet_labels.member_pool_user(pool_manifest("cmux"), "mini-std")[0], "the ssh_user")
         self.assertIn("glaeda-side-std-xcode-26.6", default["labels"] + default["sidePools"])
+
+
+FAKE_SUDO = FAKE_LOG_HEADER + r'''
+argv = sys.argv[1:]
+log("sudo", argv)
+rule = os.path.exists(os.path.join(state, "sudoers"))  # the root step's drop-in (RUNNER_SUDOERS) is in place
+if argv[:2] == ["-n", "-l"]:
+    sys.exit(0 if rule and "bootstrap" in argv else 1)  # never a plist write: that is the root step's
+if argv[:1] == ["-n"]:
+    argv = argv[1:]
+if not rule:
+    print("sudo: a terminal is required to read the password"); sys.exit(1)
+os.execv(argv[0], argv)
+'''
+
+
+def daemon_root_module():
+    """The Python half of scripts/glaeda-runner-daemon-root (the heredoc), loaded without running its main."""
+    text = (ROOT / "scripts" / "glaeda-runner-daemon-root").read_text()
+    body = text.split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY\n", 1)[0]
+    body = body.replace("\nsys.exit(main(sys.argv[1:]))", "\n")
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    with tmp:
+        tmp.write(body)
+    try:
+        return load("glaeda_runner_daemon_root", Path(tmp.name)), body
+    finally:
+        os.unlink(tmp.name)
+
+
+def role_manifest() -> dict:
+    """mini-std with two pool runners, a gateway runner (2) and a small runner (3)."""
+    manifest = copy.deepcopy(MANIFEST)
+    manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 2, "capacityUnits": 10, "compileSlots": 2,
+                                                          "canonicalRoots": 2, "gatewayRunners": 1,
+                                                          "smallRunners": 1}}}
+    return manifest
+
+
+class RoleDaemonTest(unittest.TestCase):
+    """ROLE_DAEMON. Leo, 2026-11-23, after cmuxs-mac-mini-5 lost its login session and all 17 of its runners went
+    down: "prevent these in the future across all". A gateway or small runner is a system LaunchDaemon on every host,
+    gui ones included; every other role stays a gui/<uid> LaunchAgent. A host whose sudo asks for a password gets one
+    root step (scripts/glaeda-runner-daemon-root through fleet-sudo); the apply moves the runner off its LaunchAgent
+    only when it is idle."""
+
+    setUp_runner, tearDown, build_release = RunnerTest.setUp, RunnerTest.tearDown, RunnerTest.build_release
+    invoke, log, by_kind = RunnerTest.invoke, RunnerTest.log, RunnerTest.by_kind
+
+    def setUp(self) -> None:
+        self.setUp_runner()
+        base = self.home.parent
+        self.daemons = base / "LaunchDaemons"
+        self.daemons.mkdir()
+        self.sudo = make_executable(self.bin / "sudo", FAKE_SUDO)
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home), pw_name="cmux", pw_uid=os.getuid())  # not a sandbox HOME
+        more = [mock.patch.object(cr, "SYSTEM_DAEMON_DIR", self.daemons),
+                mock.patch.object(cr, "SYSTEM_HELPER", base / "glaeda-headless-supervise"),
+                mock.patch.object(cr, "SUDO", os.fspath(self.sudo)),
+                mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw),
+                mock.patch.object(cr, "xcode_present", return_value=True),
+                mock.patch.dict(os.environ, {cr.ROLE_DAEMON_OFF_ENV: ""})]
+        for p in more:
+            p.start()
+        self.patches += more
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(role_manifest()))
+        self.manifest = os.fspath(path)
+
+    def run_instance(self, k: int, *extra: str, expect: int = 0) -> dict:
+        return self.invoke(*extra, "--manifest", self.manifest, "--member", "mini-std", "--instance", str(k),
+                           expect=expect)
+
+    def label(self, k: int) -> str:
+        return f"{cr.LABEL}.{k}"
+
+    def test_only_gateway_and_small_runners_are_role_daemons(self) -> None:
+        for gateway, small, extra, want in ((True, False, {}, True), (False, True, {}, True), (False, False, {}, False),
+                                            (True, False, {"sandbox": True}, False),
+                                            (True, False, {"skip_launchctl": True}, False),
+                                            (True, False, {"pool_user": "cmuxpool"}, False),
+                                            (False, True, {"dedicated": {"name": "x"}}, False)):
+            ctx = types.SimpleNamespace(**{"gateway_runner": gateway, "small_runner": small, "sandbox": False,
+                                           "skip_launchctl": False, "pool_user": None, "dedicated": None, **extra})
+            with self.subTest(gateway=gateway, small=small, extra=extra):
+                self.assertEqual(cr.role_daemon(ctx), want)
+        ctx = types.SimpleNamespace(gateway_runner=True, small_runner=False, sandbox=False, skip_launchctl=False,
+                                    pool_user=None, dedicated=None)
+        with mock.patch.dict(os.environ, {cr.ROLE_DAEMON_OFF_ENV: "0"}):
+            self.assertFalse(cr.role_daemon(ctx), "the kill switch")
+
+    def test_a_pool_runner_stays_a_launchagent_with_no_root_step(self) -> None:
+        plan = self.run_instance(0)
+        kinds = self.by_kind(plan)
+        self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents")
+        self.assertNotIn("root-step", kinds)
+        self.assertNotIn("agent-move", kinds)
+        self.assertFalse(plan.get("headless"))
+
+    def test_a_gateway_runner_on_a_password_host_stays_an_agent_and_names_the_fleet_sudo_root_step(self) -> None:
+        for k in (2, 3):  # the gateway and the small runner
+            with self.subTest(k=k):
+                plan = self.run_instance(k)
+                kinds = self.by_kind(plan)
+                self.assertEqual(Path(kinds["agent"]["path"]).parent, self.home / "Library/LaunchAgents",
+                                 "never left with neither: it runs as the LaunchAgent until the root step")
+                step = kinds["root-step"]
+                self.assertEqual(step["state"], "needed")
+                self.assertEqual(plan["actions"][-1]["kind"], "root-step", "last: nothing waits for it")
+                tail = (f"{{ echo 'set -- cmux {k}'; cat scripts/glaeda-runner-daemon-root; }} "
+                        "| fleet-sudo mini-std -f -")
+                self.assertTrue(step["note"].startswith("ROOT STEP NEEDED"), step["note"])
+                self.assertTrue(step["note"].endswith(tail), step["note"])
+                self.assertIn(tail, step["note"][-200:], "glaeda-cmux-runner-fleet shows a note's last 200 characters")
+        self.assertEqual(list(self.daemons.iterdir()), [], "a plan writes nothing")
+
+    def test_apply_stages_a_daemon_plist_the_root_step_accepts_and_fails_on_the_root_step(self) -> None:
+        receipt = self.run_instance(2, "--apply", expect=1)
+        kinds = self.by_kind(receipt)
+        self.assertEqual(kinds["root-step"]["state"], "failed")
+        self.assertTrue(kinds["root-step"]["staged"])
+        self.assertIn("root-step:", " ".join(receipt["blocking"]))
+        self.assertTrue(kinds["agent"]["applied"], "the LaunchAgent is installed and runs the runner meanwhile")
+        staged = self.home / ".local/state/glaeda/cmux-runner/instance-2" / cr.DAEMON_STAGE
+        doc = plistlib.loads(staged.read_bytes())
+        self.assertEqual(doc["Label"], self.label(2))
+        self.assertEqual(doc["UserName"], "cmux")
+        self.assertNotIn("StandardOutPath", doc)
+        self.assertNotIn("StandardErrorPath", doc)
+        runner = os.fspath(self.home / "actions-runner-glaeda-2")
+        logs = os.fspath(self.home / "Library/Logs/glaeda-cmux-runner-2")
+        self.assertEqual(doc["ProgramArguments"], [os.fspath(cr.SYSTEM_HELPER), runner, logs + ".log", logs + ".err"])
+        root, _ = daemon_root_module()
+        root.HELPER = os.fspath(cr.SYSTEM_HELPER)
+        data = root.checked(plistlib.loads(root.read_stage(os.fspath(staged), os.getuid())), "cmux",
+                            os.fspath(self.home), "2")
+        self.assertEqual(data, staged.read_bytes(), "the root step installs exactly what the apply staged")
+        self.assertEqual(list(self.daemons.iterdir()), [])
+
+    def test_after_the_root_step_the_apply_moves_an_idle_runner_off_its_launchagent(self) -> None:
+        (self.state / "loaded.json").write_text("[]")
+        self.run_instance(2, "--apply", expect=1)
+        agent = self.home / "Library/LaunchAgents" / f"{self.label(2)}.plist"
+        self.assertTrue(agent.exists())
+        # the root step: the plist, the supervisor, the sudoers rule, and the daemon loaded
+        staged = self.home / ".local/state/glaeda/cmux-runner/instance-2" / cr.DAEMON_STAGE
+        (self.daemons / f"{self.label(2)}.plist").write_bytes(staged.read_bytes())
+        (self.daemons / f"{self.label(2)}.plist").chmod(0o644)
+        (self.state / "sudoers").write_text("")
+        with mock.patch.object(cr, "helper_stale", return_value=False), \
+                mock.patch.object(cr, "ensure_headless_helper", lambda ctx: None):
+            receipt = self.run_instance(2, "--apply")
+        kinds = self.by_kind(receipt)
+        self.assertTrue(receipt["headless"])
+        self.assertEqual(kinds["agent"]["path"], os.fspath(self.daemons / f"{self.label(2)}.plist"))
+        self.assertEqual(kinds["agent"]["state"], "unchanged")
+        self.assertNotIn("root-step", kinds)
+        self.assertEqual(kinds["agent-move"]["state"], "moved", kinds["agent-move"])
+        self.assertFalse(agent.exists(), "the LaunchAgent plist is removed once it is booted out")
+        bootouts = [e["argv"] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] == "bootout"]
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{self.label(2)}"], bootouts)
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_the_move_goes_before_a_relabel_when_the_daemon_is_loaded_and_defers_it_otherwise(self) -> None:
+        ctx = types.SimpleNamespace(skip_launchctl=False, label="L", uid=501, pool_user=None, dedicated=None,
+                                    plist_path=self.home / "agent.plist")
+        ctx.plist_path.write_text("")
+
+        def plan(daemon_loaded: bool, agent_loaded: bool) -> list[dict]:
+            actions = [{"kind": "agent", "loaded": daemon_loaded}, {"kind": "register", "state": "relabel"},
+                       {"kind": "verify"}]
+            with mock.patch.object(cr, "run", return_value=(0 if agent_loaded else 113, "")):
+                cr.plan_agent_move(ctx, actions)
+            return actions
+        first = plan(True, True)
+        self.assertEqual([a["kind"] for a in first], ["agent", "agent-move", "register", "verify"])
+        self.assertEqual(first[2]["state"], "relabel", "the relabel then registers under the daemon")
+        later = plan(False, True)
+        self.assertEqual([a["kind"] for a in later], ["agent", "agent-move", "register", "verify"])
+        self.assertEqual((later[2]["state"], later[2]["deferred"]), ("unchanged", "relabel"))
+        ctx.plist_path.unlink()
+        self.assertEqual([a["kind"] for a in plan(True, False)], ["agent", "register", "verify"], "nothing to move")
+
+    def test_a_busy_runner_is_not_moved_and_drains(self) -> None:
+        agent = self.home / "agent.plist"
+        agent.write_text("")
+        ctx = mock.Mock(label="L")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=True), \
+                mock.patch.object(cr, "stop_if_idle", return_value=False), \
+                mock.patch.object(cr, "start_drain", return_value=True) as drain:
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "failed")
+        self.assertTrue(act["draining"])
+        drain.assert_called_once()
+        self.assertTrue(agent.exists(), "a job is never cancelled; the plist stays for a re-run")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=False):
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "failed")
+        self.assertIn("not loaded", act["note"])
+        self.assertTrue(agent.exists(), "no daemon: the LaunchAgent keeps the runner")
+        act = {"kind": "agent-move", "path": os.fspath(agent), "state": "move", "loaded": True, "note": ""}
+        with mock.patch.object(cr, "launchctl_loaded", return_value=True), \
+                mock.patch.object(cr, "stop_if_idle", return_value=True), \
+                mock.patch.object(cr, "end_drain", return_value=None):
+            cr.move_agent(ctx, act)
+        self.assertEqual(act["state"], "moved")
+        self.assertFalse(agent.exists())
+
+    def test_the_root_script_installs_the_installers_supervisor_and_parses_on_python_3_9(self) -> None:
+        root, body = daemon_root_module()
+        self.assertEqual(root.HELPER_BYTES, cr.HEADLESS_HELPER)
+        self.assertEqual(root.HELPER, "/usr/local/sbin/glaeda-headless-supervise")
+        self.assertEqual(root.SUDOERS, cr.RUNNER_SUDOERS)
+        ast.parse(body, feature_version=(3, 9))
+        script = (ROOT / cr.DAEMON_ROOT_SCRIPT).read_text()
+        self.assertIn("/usr/bin/python3 -I", script)
+        self.assertTrue(os.access(ROOT / cr.DAEMON_ROOT_SCRIPT, os.X_OK))
+
+    def test_the_root_script_refuses_any_plist_but_this_runners_daemon(self) -> None:
+        root, _ = daemon_root_module()
+        home = "/Users/cmux"
+        runner, logs = f"{home}/actions-runner-glaeda-14", f"{home}/Library/Logs/glaeda-cmux-runner-14"
+        good = {"Label": f"{cr.LABEL}.14", "UserName": "cmux", "WorkingDirectory": runner, "RunAtLoad": True,
+                "KeepAlive": True, "ProgramArguments": [root.HELPER, runner, logs + ".log", logs + ".err"],
+                "EnvironmentVariables": {"PATH": "/usr/bin"}, "ThrottleInterval": 10, "ProcessType": "Interactive",
+                "SessionCreate": True}
+        self.assertEqual(plistlib.loads(root.checked(good, "cmux", home, "14")), good)
+        for change in ({"UserName": "root"}, {"Label": f"{cr.LABEL}.15"}, {"GroupName": "wheel"},
+                       {"StandardOutPath": "/tmp/x"}, {"ProgramArguments": ["/bin/sh", "-c", "id"]},
+                       {"ProgramArguments": [root.HELPER, "/tmp/evil", logs + ".log", logs + ".err"]},
+                       {"WorkingDirectory": "/"}, {"EnvironmentVariables": {"A B": "x"}},
+                       {"EnvironmentVariables": {"PATH": 1}}, {"RunAtLoad": 1}, {"SessionCreate": False},
+                       {"ThrottleInterval": 0}, {"ProcessType": "x"}, {"Program": "/bin/sh"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                root.checked({**good, **change}, "cmux", home, "14")
+        with self.assertRaises(ValueError):
+            root.checked({k: v for k, v in good.items() if k != "UserName"}, "cmux", home, "14")
+        rules = root.sudoers_rules({("cmux", f"{cr.LABEL}.14")}).decode()
+        for command in (f"/bin/launchctl bootstrap system /Library/LaunchDaemons/{cr.LABEL}.14.plist",
+                        f"/bin/launchctl bootout system/{cr.LABEL}.14", f"/bin/launchctl kickstart system/{cr.LABEL}.14",
+                        f"/bin/rm -f /Library/LaunchDaemons/{cr.LABEL}.14.plist"):
+            self.assertIn(command, rules)
+        self.assertEqual(rules.count("NOPASSWD"), 1)
+        self.assertNotIn("ALL=(root) NOPASSWD: ALL", rules)
+        self.assertTrue(root.RULE_RE.match(f"# glaeda-runner-daemon-root: cmux {cr.LABEL}.14"))
+
+    def test_the_root_script_reads_only_a_regular_file_of_that_user(self) -> None:
+        root, _ = daemon_root_module()
+        target = self.home / "x.plist"
+        target.write_bytes(b"x")
+        link = self.home / "link.plist"
+        link.symlink_to(target)
+        with self.assertRaises(OSError):
+            root.read_stage(os.fspath(link), os.getuid())
+        with self.assertRaises(ValueError):
+            root.read_stage(os.fspath(target), os.getuid() + 1)
+        big = self.home / "big.plist"
+        big.write_bytes(b"x" * (root.STAGE_MAX + 1))
+        with self.assertRaises(ValueError):
+            root.read_stage(os.fspath(big), os.getuid())
+        self.assertEqual(root.read_stage(os.fspath(target), os.getuid()), b"x")
+
+    def test_a_headless_plist_names_no_log_path_and_its_supervisor_opens_the_logs(self) -> None:
+        self.assertIn(b'exec >>"$2" 2>>"$3"', cr.HEADLESS_HELPER)
+        receipt = self.run_instance(2, "--apply", expect=1)
+        self.assertNotIn("StandardOutPath", plistlib.loads(Path(self.by_kind(receipt)["root-step"]["path"]).read_bytes()))
+        agent = plistlib.loads(Path(self.by_kind(receipt)["agent"]["path"]).read_bytes())
+        self.assertIn("StandardOutPath", agent, "a LaunchAgent still logs through launchd")
 
 
 class PoolNodeViewTest(unittest.TestCase):
