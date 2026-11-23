@@ -28878,6 +28878,83 @@ class LandTest(Base):
         self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
 
+    def silent_rows(self, n: int = 3) -> list[str]:
+        """PRs o/r#1..#N on a lane VM, each handed to the broker host by a judgment that read nothing, all "forwarded"
+        to huge-blue (a lane VM, 2026-11-23: 32 rows forwarded to a peer that took each and answered none)."""
+        self.broker = True
+        host = mock.patch.object(gg, "policy_host", lambda: "host")
+        host.start()
+        self.addCleanup(host.stop)
+        keys = [f"pr:o/r#{i}" for i in range(1, n + 1)]
+        for i, key in enumerate(keys, 1):
+            self.pr(LA, key=key)
+            self.land(f"o/r#{i}")
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        for _ in range(4):
+            self.tick()
+        self.assertEqual([self.q.entries[k]["state"] for k in keys], ["forwarded"] * n)
+        self.assertEqual(len(self.handoffs()), n)
+        return keys
+
+    def test_a_peer_that_answers_no_hand_off_gets_its_rows_taken_back_and_no_new_one(self):
+        # A lane VM, 2026-11-23: every hand-off went to one far queue that took it and answered none; each row was
+        # re-sent there every 30 min and each new "unreadable" handed it one more. Past LAND_PEER_SILENT with no
+        # outcome from it, the rows handed for a judgment come back to be judged here, pinned, and stay here.
+        keys = self.silent_rows()
+        logged: list[dict] = []
+        for _ in range(len(keys)):
+            self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        with mock.patch.object(gg, "log", logged.append):
+            self.tick(gg.LAND_PEER_SILENT + 1)
+            for _ in range(4):
+                self.tick()
+        self.assertEqual(len(self.handoffs()), len(keys), "nothing re-sent to the silent peer, nothing new handed")
+        for key in keys:
+            e = self.q.entries[key]
+            self.assertNotEqual(e["state"], "forwarded", e["history"][-4:])
+            self.assertEqual(e["forwardReclaimed"]["from"], "huge-blue")
+            self.assertNotIn("handedOff", e)
+            [row] = [h for h in e["history"] if h.get("event") == "forward_reclaimed"]
+            self.assertIn("huge-blue is silent", row["why"])
+        self.assertEqual(len(self.w.explains()), 2 * len(keys), "each judged here again")
+        self.assertEqual([d["peer"] for d in logged if d.get("event") == "land-peer-silent"], ["huge-blue"])
+        self.assertIn("huge-blue", self.q.silent_peers())
+        # the hold ends: the next hand-off goes to the peer again (it may answer now)
+        self.tick(gg.LAND_PEER_SILENT_HOLD + 1)
+        self.assertEqual(self.q.silent_peers(), {})
+
+    def test_a_peer_that_ended_a_forwarded_row_lately_is_not_silent_and_its_rows_are_re_sent(self):
+        keys = self.silent_rows()
+        self.tick(gg.LAND_PEER_SILENT - 200)
+        self.pr(LA, key=keys[0], state="MERGED")  # the peer merged one: it answers
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["forwardOutcome"]["host"]), ("merged", "huge-blue"))
+        self.tick(200)
+        self.assertEqual(self.q.silent_peers(), {})
+        self.assertEqual(len(self.handoffs()), 3 + 2, "the two still open are re-sent, as before")
+        for key in keys[1:]:
+            self.assertEqual(self.q.entries[key]["state"], "forwarded")
+            self.assertNotIn("forwardReclaimed", self.q.entries[key])
+
+    def test_one_slow_row_never_makes_a_peer_silent(self):
+        e = self.forwarded_row()
+        self.tick(gg.LAND_PEER_SILENT + 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["forwardResent"]["n"]), ("forwarded", 1))
+        self.assertEqual(self.q.silent_peers(), {})
+
+    def test_an_ownership_hand_off_is_never_taken_back(self):
+        # this VM can never merge another lane's PR: the broker's queue is the only place that row can land
+        self.assertFalse(gg.LandQueue.handed_for_judgment({"handedOff": {"kind": "ownership"}}))
+        self.assertTrue(gg.LandQueue.handed_for_judgment({"handedOff": {"kind": "judgment"}}))
+        # rows handed before the kind was recorded: hand_off's reason for an owner refusal is "ownership"
+        self.assertFalse(gg.LandQueue.handed_for_judgment(
+            {"handedOff": {}, "history": [{"event": "handed_off", "why": "ownership"}]}))
+        self.assertTrue(gg.LandQueue.handed_for_judgment(
+            {"handedOff": {}, "history": [{"event": "handed_off", "why": "unreadable here"}]}))
+        e = self.handed_off()
+        self.assertEqual(e["handedOff"]["kind"], "ownership")
+
     def state_reads(self) -> list[list[str]]:
         return self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefOid,mergeCommit,state")
 
@@ -28969,7 +29046,8 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("landed again here", e["stop"]["reason"])
         self.assertIn("huge-blue", e["stop"]["reason"])
-        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+        self.assertIn(f"glaeda-gh land o/r#1 --match-head-commit {LA}", e["stop"]["next"])
+        self.assertNotIn("HEAD", e["stop"]["next"])  # `glaeda-gh land` refuses anything but a 40-hex head
         [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
         self.assertEqual(said[3], "host/lane")
         self.assertEqual(said[said.index("--class") + 1], "fyi")
@@ -31555,6 +31633,33 @@ class LandTest(Base):
         e = self.q.entries[key]
         self.assertEqual(e["state"], "waiting")
         self.assertEqual(self.q.overflowing, set())
+
+    def test_overflow_skips_a_peer_that_answers_none_of_the_rows_it_took(self):
+        # a peer that takes overflowed rows and ends none of them (LAND_PEER_SILENT) is skipped for the next peer
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "silent-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "idle-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[tuple[str, dict]] = []
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append((cmd[1], req))
+            if req["op"] == "room":
+                return {"ok": True, "room": 5, "host": cmd[1], "readable": {o: "" for o in req.get("owners") or []}}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+        for n in (21, 22, 23):
+            e = self.q.entries[self.stuck(n, 0, state="forwarded")]
+            e.update(forwardedTo="silent-peer", forwardedAt=self.t - 3600, forwardFirst=self.t - 3600)
+            e["history"].append({"event": "overflowed", "to": "silent-peer", "at": self.t - 3600})
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        self.assertEqual([h for h, _ in asked], ["idle-peer", "idle-peer"])
+        self.assertEqual(self.q.entries[key]["forwardedTo"], "idle-peer")
 
     def test_a_hosts_room_is_its_idle_workers_less_its_due_rows_from_a_fresh_pool_line(self):
         now = 1_000_000.0

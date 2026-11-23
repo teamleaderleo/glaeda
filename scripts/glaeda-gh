@@ -14363,6 +14363,20 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # no route could read LAND_FORWARD_STATE_TRIES times, stops forward_no_outcome, and its notice is an inbox fyi
 # (cmuxterm-hq docs/handbook/notice-flood.md: a program's message is an fyi, not a blocker).
 LAND_FORWARD_STATE_FRESH = 900.0
+# A peer that takes hand-offs and answers none. A lane VM, 2026-11-23: the broker host named its executor as the far
+# host of every hand-off, the executor's `land serve` took each one ("ok"), and none came back: 32 rows "forwarded"
+# there, each re-sent every 30 min to the same silent queue, while rows judged here again merged in minutes. Every
+# re-send went back to that peer, and every fresh "unreadable" answer handed one more row to it. Now a peer is silent
+# when at least LAND_PEER_SILENT_ROWS rows sit forwarded to it past LAND_PEER_SILENT and no outcome of a forwarded row
+# (merged, closed: forwardOutcome) has come from it within LAND_PEER_SILENT, and it stays silent for
+# LAND_PEER_SILENT_HOLD after rows were taken back from it, unless an outcome from it comes in after that
+# (silent_peers). While the broker's peer is silent a lane VM hands no judgment to it: the row stays here and keeps
+# retrying (unjudgeable_here, early_hand_off, infra_read_stop), and a forwarded row it handed for a judgment is taken
+# back to be judged here (forward_reclaim). An ownership hand-off still goes (no merge of another lane's PR is possible
+# here), and an overflow skips a silent peer for the next one (overflow_send).
+LAND_PEER_SILENT = 1800.0
+LAND_PEER_SILENT_ROWS = 3
+LAND_PEER_SILENT_HOLD = 7200.0
 LAND_FORWARD_STATE_READS = 20
 LAND_FORWARD_STATE_TRIES = 3
 LAND_FORWARD_FYI_CLASS = "fyi"
@@ -15200,6 +15214,9 @@ class LandQueue:
         self.forward_reading: set[str] = set()
         self.forward_state_thread: threading.Thread | None = None
         self.forward_name_now: str | None = None  # the executor's name as repair_forwarded names it, read once a load
+        self.peer_quiet: dict[str, str] = {}  # silent peers, each to why (silent_peers, LAND_PEER_SILENT)
+        self.peer_quiet_at = float("-inf")  # silent_peers reads the rows again after this
+        self.broker_peer = ""  # the far host the broker's last taken hand-off named
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -15819,7 +15836,10 @@ class LandQueue:
         if self.overflow_thread is not None and self.overflow_thread.is_alive():
             return
         with self.lock:
-            keys = self.overflow_due(live)
+            # a peer that takes rows and answers none is skipped for the next (LAND_PEER_SILENT's comment)
+            quiet = self.silent_peers()  # logs land-peer-silent once when a peer turns silent
+            peers = [p for p in peers if land_forward_name(p) not in quiet]
+            keys = self.overflow_due(live) if peers else []
             if not keys:
                 return
             self.overflow_after = self.now + LAND_OVERFLOW_EVERY
@@ -16286,6 +16306,88 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
+    def silent_peers(self) -> dict[str, str]:
+        """Under the lock. The far hosts that take forwarded rows and answer none (LAND_PEER_SILENT's comment), each to
+        why, from this queue's own rows (no read, no call), at most once per LAND_FORWARD_LOOK_EVERY. Also notes the
+        host the broker's newest taken hand-off named (broker_peer)."""
+        if self.now < self.peer_quiet_at:
+            return self.peer_quiet
+        self.peer_quiet_at = self.now + LAND_FORWARD_LOOK_EVERY
+        outcome: dict[str, float] = {}
+        reclaimed: dict[str, float] = {}
+        pending: dict[str, int] = {}
+        broker = (0.0, "")
+        for e in self.entries.values():
+            o = e.get("forwardOutcome") or {}
+            if o.get("host"):
+                outcome[str(o["host"])] = max(outcome.get(str(o["host"]), 0.0), float(o.get("at") or 0))
+            r = e.get("forwardReclaimed") or {}
+            if r.get("from"):
+                reclaimed[str(r["from"])] = max(reclaimed.get(str(r["from"]), 0.0), float(r.get("at") or 0))
+            done = e.get("handedOff") or {}
+            if done.get("host") and float(done.get("at") or 0) > broker[0]:
+                broker = (float(done.get("at") or 0), str(done["host"]))
+            host = str(e.get("forwardedTo") or "")
+            if e.get("state") == LAND_FORWARDED and host:
+                first = float(e.get("forwardFirst") or 0) or self.forwarded_at(e)
+                if first and self.now - first > LAND_PEER_SILENT:
+                    pending[host] = pending.get(host, 0) + 1
+        self.broker_peer = broker[1]
+        quiet: dict[str, str] = {}
+        for host in set(pending) | set(reclaimed):
+            last = outcome.get(host, 0.0)
+            ago = f"{(self.now - last) / 60:.0f} min ago" if last else "never, on record here"
+            if pending.get(host, 0) >= LAND_PEER_SILENT_ROWS and self.now - last > LAND_PEER_SILENT:
+                quiet[host] = (f"{pending[host]} rows handed to it over {LAND_PEER_SILENT / 60:.0f} min ago, and its "
+                               f"last outcome came {ago}")
+            elif reclaimed.get(host, 0.0) > last and self.now - reclaimed[host] < LAND_PEER_SILENT_HOLD:
+                quiet[host] = (f"rows were taken back from it {(self.now - reclaimed[host]) / 60:.0f} min ago and no "
+                               f"outcome has come from it since")
+        for host in sorted(set(quiet) - set(self.peer_quiet)):
+            log({"event": "land-peer-silent", "peer": host, "why": quiet[host]})
+        for host in sorted(set(self.peer_quiet) - set(quiet)):
+            log({"event": "land-peer-answering", "peer": host})
+        self.peer_quiet = quiet
+        return quiet
+
+    def broker_peer_silent(self) -> str:
+        """Under the lock. Why the far host the broker hands this lane VM's rows to is silent (silent_peers), or ""."""
+        if not self.broker_client():
+            return ""
+        quiet = self.silent_peers()
+        return quiet.get(self.broker_peer, "") if self.broker_peer else ""
+
+    def note_forward_outcome(self, e: dict, host: str) -> None:
+        """Under the lock: a forwarded E ended with an outcome from HOST (merged or closed), which says HOST answers."""
+        if host and e.get("forwardedTo"):
+            e["forwardOutcome"] = {"host": host, "at": self.now}
+
+    @staticmethod
+    def handed_for_judgment(e: dict) -> bool:
+        """Whether E's last hand-off was for a judgment this VM could not make (this host may judge it again), not
+        for the broker's ownership refusal of a write step (which this host can never take)."""
+        done = e.get("handedOff") or {}
+        if done.get("kind"):
+            return done.get("kind") == "judgment"
+        why = next((str(h.get("why") or "") for h in reversed(e.get("history") or [])
+                    if h.get("event") == "handed_off"), "ownership")
+        return why != "ownership"  # hand_off's reason for an owner refusal (no reason of its own)
+
+    def forward_reclaim(self, e: dict, host: str, why: str) -> None:
+        """Under the lock. A row this lane VM handed to HOST for a judgment, HOST silent (WHY): taken back to be judged
+        here again at once, its pin kept. The far queue may still take it; a merge there ends it here as any
+        merge does (retire_from_cache)."""
+        for field in ("handedOff", "forwardResent", "forwardFirst", "forwardQuiet", "handoffDue"):
+            e.pop(field, None)
+        e["forwardedTo"] = None
+        e["forwardReclaimed"] = {"from": host, "at": self.now}
+        self.history(e, "forward_reclaimed", was=host, why=land_trim(f"{host} is silent: {why}", 200))
+        log({"event": "land-forward-reclaimed", "key": e["key"], "from": host})
+        # as wait() writes it, with no job's generation to check: this runs on the tick, not in a job
+        e.update(state="waiting", action=None, wakeAt=self.now,
+                 wait={"kind": "retry", "why": f"taken back from {host}, which answers no hand-off: judged here"})
+        self.save(e)
+
     def forward_follow(self, e: dict, executor: bool) -> bool:
         """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
         does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
@@ -16306,6 +16408,7 @@ class LandQueue:
         if state == "MERGED":
             merge = data.get("mergeCommit")
             sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+            self.note_forward_outcome(e, host)
             if past:  # the far host that merged it told its requester long ago (LAND_FORWARD_STATE_FRESH's comment)
                 self.forward_settle(e, "MERGED", sha, "", "", executor=executor, how="the cache shows it")
                 return False
@@ -16313,6 +16416,7 @@ class LandQueue:
             return False
         if state == "CLOSED":
             if read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen (retire_from_cache)
+                self.note_forward_outcome(e, host)
                 if past:
                     self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
                     return False
@@ -16324,6 +16428,11 @@ class LandQueue:
         if state == "OPEN" and not past and self.stop_moved_pin(e, c, data):
             return False
         last = e.get("forwardResent") or {}
+        if not executor and e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e):
+            quiet = self.silent_peers().get(str(e.get("forwardedTo") or ""))
+            if quiet:  # re-sending to a peer that answers none only waits longer (LAND_PEER_SILENT's comment)
+                self.forward_reclaim(e, host, quiet)
+                return False
         if not e.get("forwardFirst"):
             e["forwardFirst"] = first
             self.save(e)
@@ -16377,12 +16486,14 @@ class LandQueue:
         e["forwardStateAt"] = self.now
         if state == "MERGED":
             sha = merge_sha or e.get("mergeSha") or ""
+            self.note_forward_outcome(e, host)
             e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
             self.history(e, "merged", sha=sha, how=f"forwarded to {host}: {how} merged", quiet="forward_give_up")
             self.save(e)
             log({"event": "land-forward-settled", "key": e["key"], "state": "merged", "how": how})
             return
         if state == "CLOSED":
+            self.note_forward_outcome(e, host)
             self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); nothing is "
                       f"merged", "", tell="quiet")
             log({"event": "land-forward-settled", "key": e["key"], "state": "closed", "how": how})
@@ -16445,13 +16556,17 @@ class LandQueue:
         e["forwardGaveUp"] = self.now  # read before it stopped: repair_forwarded never reopens it
         cause = f"the PR is still {state.lower()}; {why}" if state else why
         resends = int((e.get("forwardResent") or {}).get("n") or 0)
+        # a full head to pin at: `glaeda-gh land --match-head-commit` takes a 40-hex id, never "HEAD"
+        pin = str((e.get("forwardRelanded") or {}).get("head") or e.get("pinSha")
+                  or (e.get("handedOff") or {}).get("head") or e.get("head") or "").lower()
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
                   f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="fyi")
+                  f"{key_name(e['key'])} --match-head-commit {pin if SHA40.fullmatch(pin) else '<its 40-hex head>'}",
+                  tell="fyi")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -17465,7 +17580,8 @@ class LandQueue:
         if self.ended(e, str(data.get("state") or ""), e.get("mergeSha") or "", "the cache shows it"):
             return
         infra = e.pop("infraHandoff", None)
-        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED:
+        if isinstance(infra, dict) and self.broker_client() and e["state"] != LAND_FORWARDED \
+                and not self.broker_peer_silent():
             # a stop that only said GitHub could not be read here (infra_read_stop): the broker host reads it instead,
             # unless the cache shows the unpinned head moved since (then it is judged here, at the new head)
             head = str(infra.get("head") or "")
@@ -18898,13 +19014,15 @@ class LandQueue:
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
             return ""
+        if self.broker_peer_silent():
+            return ""  # the broker's peer answers no hand-off (LAND_PEER_SILENT): judged here again, as any host
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
         """E is due a judgment: on a broker client that could not read GitHub in most of its last live judgments
         (LAND_EARLY_HANDOFF's comment), hand it at its full head to the broker host's land queue now, on a job of its
         own, with no judgment here and no wait for a worker or a pace slot; True when that job was started."""
-        if not self.broker_client() or e.get("state") == LAND_FORWARDED:
+        if not self.broker_client() or e.get("state") == LAND_FORWARDED or self.broker_peer_silent():
             return False
         recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
         if sum(recent) < LAND_EARLY_HANDOFF_BAD:
@@ -18948,7 +19066,7 @@ class LandQueue:
             or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
         why = land_trim(f"{code}: {land_reason(reason, 160)}", 200)
         hand = self.broker_client() and e.get("state") != LAND_FORWARDED and bool(SHA40.fullmatch(head)) \
-            and not land_head_moved(pin, head)
+            and not land_head_moved(pin, head) and not self.broker_peer_silent()
         r = e.get("infraRetry") or {}
         n = int(r.get("n") or 0) + 1 if r.get("head") == head else 1
         if not hand and n > LAND_INFRA_RETRY_CAP:
@@ -20069,7 +20187,9 @@ class LandQueue:
                 e.pop("handoffDue", None)
                 e.pop("handoffFail", None)
                 e["handedOff"] = {"key": e["key"], "head": head, "host": host, "at": self.now,
-                                  "request": str(doc.get("request") or "")}
+                                  "request": str(doc.get("request") or ""),
+                                  "kind": "judgment" if due.get("kind") == "judgment" else "ownership"}
+                self.peer_quiet_at = float("-inf")  # the broker's peer may be another now: silent_peers reads again
                 e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=host)
                 self.history(e, "handed_off", to=host, head=head[:12], why=reason)
                 self.save(e)
