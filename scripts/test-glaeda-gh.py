@@ -38083,6 +38083,120 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
         self.assertEqual(self.err.getvalue(), "", "a canonical call says nothing on stderr")
 
 
+class ATargetNamedByFlagsTest(unittest.TestCase):
+    """`--repo OWNER/REPO --pr N` -- the form `gh` itself takes and every sibling tool here takes -- read as
+    the positional target the command takes.
+
+    Measured 2026-11-23: `glaeda-gh land --repo teamleaderleo/leo-workspace --pr 9106 --match-head-commit
+    ef118a2c60e85dda9b2bcc9fbcfd3b0d6bf8cfda` printed "unrecognized arguments: --repo --pr 9106" and exited
+    64 with the land unqueued, so a correct, unambiguous call cost a `--help` round trip and a retry.
+    `--sha` had carried `--match-head-commit`, `--pin` and `--pinned` since 2026-11-22; the target itself
+    had no such courtesy."""
+
+    MEASURED = ["land", "--repo", "teamleaderleo/leo-workspace", "--pr", "9106",
+                "--match-head-commit", "ef118a2c60e85dda9b2bcc9fbcfd3b0d6bf8cfda"]
+
+    def setUp(self) -> None:
+        self.err = io.StringIO()
+        enter = contextlib.redirect_stderr(self.err)
+        enter.__enter__()
+        self.addCleanup(enter.__exit__, None, None, None)
+
+    def test_the_refused_call_now_resolves_to_the_same_target_as_the_positional(self) -> None:
+        fixed, refusal = gg.target_flag_synonym(list(self.MEASURED))
+        self.assertEqual(refusal, [])
+        self.assertEqual(fixed, ["land", "teamleaderleo/leo-workspace#9106", "--match-head-commit",
+                                 "ef118a2c60e85dda9b2bcc9fbcfd3b0d6bf8cfda"])
+        self.assertIn("read as `glaeda-gh land teamleaderleo/leo-workspace#9106", self.err.getvalue())
+        args = gg.parser().parse_args(fixed)
+        self.assertEqual((args.command, args.words, args.sha),
+                         ("land", ["teamleaderleo/leo-workspace#9106"],
+                          "ef118a2c60e85dda9b2bcc9fbcfd3b0d6bf8cfda"))
+
+    def test_the_flag_pair_runs_the_whole_way_through_main_as_the_positional_does(self) -> None:
+        """The rewrite is in the pipeline, not merely callable: `main` lands the same PR either way."""
+        got: list[tuple] = []
+        with mock.patch.object(gg, "cmd_land", lambda *a, **kw: got.append(a) or 0):
+            self.assertEqual(gg.main(["land", "--repo", "o/r", "--pr", "9106", "--sha", "a" * 40]), 0)
+            self.assertEqual(gg.main(["land", "o/r#9106", "--sha", "a" * 40]), 0)
+        self.assertEqual(got[0], got[1], "the flag pair and the positional reach cmd_land the same way")
+        self.assertEqual(got[0][0], "o/r#9106")
+
+    def test_the_pr_flag_carries_the_whole_target_on_its_own(self) -> None:
+        for flag in ("--pr", "--issue"):
+            self.assertEqual(gg.target_flag_synonym(["land", flag, "o/r#9106"]), (["land", "o/r#9106"], []))
+        self.assertEqual(gg.target_flag_synonym(["status", "pr", "--pr", "o/r#9106", "--json"]),
+                         (["status", "pr", "o/r#9106", "--json"], []))
+
+    def test_every_subcommand_with_an_owner_repo_target_takes_the_flags(self) -> None:
+        """One rewriter, so no command is left out: the target lands where it is typed, after the command's
+        own word where there is one."""
+        for typed, want in (
+                (["land", "--repo", "o/r", "--pr", "5"], ["land", "o/r#5"]),
+                (["land", "cancel", "--repo", "o/r", "--pr", "5"], ["land", "cancel", "o/r#5"]),
+                (["land", "status", "--repo", "o/r", "--issue", "5"], ["land", "status", "o/r#5"]),
+                (["status", "pr", "--repo", "o/r", "--pr", "5", "--json"],
+                 ["status", "pr", "o/r#5", "--json"]),
+                (["wait", "pr", "--repo", "o/r", "--pr", "5", "--until", "done"],
+                 ["wait", "pr", "o/r#5", "--until", "done"]),
+                (["post", "comment", "--repo", "o/r", "--pr", "5", "--body", "hi"],
+                 ["post", "comment", "o/r#5", "--body", "hi"]),
+                (["post", "pr", "--repo", "o/r", "--title", "t"], ["post", "pr", "o/r", "--title", "t"]),
+                (["log", "job", "--repo", "o/r", "--job", "12"], ["log", "job", "o/r", "--job", "12"]),
+                (["checks", "--repo", "o/r", "a" * 40, "--consumer", "x"],
+                 ["checks", "o/r", "a" * 40, "--consumer", "x"]),
+                (["land", "--repo=o/r", "--pr=5"], ["land", "o/r#5"]),
+                (["land", "-R", "o/r", "--pr", "#5"], ["land", "o/r#5"]),
+                (["land", "--Repo", "o/r", "--PR", "5"], ["land", "o/r#5"])):
+            fixed, refusal = gg.target_flag_synonym(list(typed))
+            self.assertEqual((fixed, refusal), (want, []), typed)
+            gg.parser().parse_args(fixed)
+
+    def test_two_targets_that_differ_are_refused_naming_both(self) -> None:
+        for typed in (["land", "o/r#5", "--repo", "other/repo", "--pr", "5"],
+                      ["status", "pr", "o/r#1", "--pr", "2"],
+                      ["land", "--repo", "o/r", "--pr", "other/repo#5"],
+                      ["land", "--repo", "o/r", "--pr", "5", "--issue", "6"],
+                      ["land", "--repo", "o/r", "--pr", "5", "--pr", "6"]):
+            fixed, refusal = gg.target_flag_synonym(list(typed))
+            self.assertEqual(fixed, typed, "argv is never half-rewritten when it refuses")
+            self.assertTrue(refusal, typed)
+            self.assertIn("not guessed", refusal[0], typed)
+        _, refusal = gg.target_flag_synonym(["land", "o/r#5", "--repo", "other/repo", "--pr", "5"])
+        self.assertIn("o/r#5", refusal[0])
+        self.assertIn("other/repo", refusal[0], "the refusal names both repositories")
+        self.assertEqual(refusal[1:], ["next: glaeda-gh land o/r#5", "next: glaeda-gh land other/repo#5"])
+        self.assertEqual(gg.main(["land", "o/r#5", "--repo", "other/repo", "--pr", "5"]), 64)
+
+    def test_two_targets_that_are_one_target_run_as_it(self) -> None:
+        self.assertEqual(gg.target_flag_synonym(["land", "o/r#5", "--repo", "o/r", "--pr", "5"]),
+                         (["land", "o/r#5"], []))
+        self.assertEqual(gg.target_flag_synonym(["land", "5", "--repo", "o/r"]), (["land", "o/r#5"], []))
+
+    def test_a_flag_the_command_really_has_keeps_its_own_meaning(self) -> None:
+        """Nothing hand-listed: a `--repo`, `--pr` or `--issue` the command declares itself is argparse's.
+        `checks --pr N` is the PR a head belongs to, and `search --repo` its repository filter."""
+        typed = ["checks", "o/r", "a" * 40, "--consumer", "x", "--pr", "5"]
+        self.assertEqual(gg.target_flag_synonym(list(typed)), (typed, []))
+        self.assertEqual(gg.parser().parse_args(typed).pr, 5)
+        self.assertEqual(gg.target_flag_synonym(["search", "prs", "--repo", "o/r"]),
+                         (["search", "prs", "--repo", "o/r"], []))
+
+    def test_every_call_that_works_today_is_left_exactly_as_typed(self) -> None:
+        for typed in (["status", "pr", "o/r#1"], ["wait", "pr", "o/r#1", "--timeout", "60"],
+                      ["wait", "pr", "o/r#1", "--max", "1h", "--sha", "a" * 40], ["land", "o/r#1"],
+                      ["land", "o/r#1", "--after", "o/r#2", "--notify", "host/lane"],
+                      ["land", "status"], ["land", "cancel", "o/r#1"],
+                      ["post", "comment", "o/r#1", "--body", "hi"], ["log", "job", "o/r", "1"],
+                      ["search", "prs", "repo:o/r"], ["on-event", "status"], ["checks", "o/r", "a" * 40],
+                      ["gh", "pr", "view", "1", "-R", "o/r"], ["coord-alert", "x"], ["wait-resume", "x"],
+                      ["--help"], ["-h"], [], ["o/r#1"], ["nonsense", "x"],
+                      ["post", "comment", "o/r#1", "--body", "--repo"],
+                      ["post", "comment", "o/r#1", "--body", "hi", "--", "--repo", "o/r"]):
+            self.assertEqual(gg.target_flag_synonym(list(typed)), (list(typed), []), typed)
+        self.assertEqual(self.err.getvalue(), "", "a canonical call says nothing on stderr")
+
+
 class TwoOfOneCommandsWordsInARowTest(unittest.TestCase):
     """The mirror image of the class above: there a word was typed one level too shallow, here an extra one
     is typed one level too deep. Measured 2026-11-21, `glaeda-gh post pr comment manaflow-ai/cmuxterm-hq#17050
