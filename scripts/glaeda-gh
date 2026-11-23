@@ -12924,8 +12924,8 @@ def land_forward_name(command: list[str]) -> str:
     """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
     words."""
     i = land_command_host(command)
-    if i is not None:
-        return command[i]
+    if i is not None and LAND_HOST_SHAPE.fullmatch(command[i]):
+        return command[i]  # never an option word: a row once said "handed to -o's land queue"
     return " ".join(command)[:120]
 
 
@@ -14336,6 +14336,20 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
 # what to do, and its requester is told as any stop tells it.
 LAND_FORWARD_GIVE_UP = 7200.0
+# The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
+# holds no read of a PR nobody here watches. huge-blue, 2026-11-23 07:45-07:56Z: 1,299 rows stopped forward_no_outcome
+# on deploy and about 35 requesters got a [blocker] notice each, hq#12849 (merged 11-17) and lw#8264 (merged that
+# morning) among them. So at the give-up the PR's state is read first: the cache when it shows the PR ended, or open in
+# a copy read within LAND_FORWARD_STATE_FRESH; else one live read through the gh shim (its own cache first, then
+# GraphQL), at most LAND_FORWARD_STATE_READS a pass and off the lock. Merged or closed: the row ends with that outcome
+# and tells nobody (the far host that merged it told its requester). Still open: this host lands it again itself,
+# pinned at the head it read, once (forwardRelanded), and tells nobody. Only a second give-up after that, or a state
+# no route could read LAND_FORWARD_STATE_TRIES times, stops forward_no_outcome, and its notice is an inbox fyi
+# (cmuxterm-hq docs/handbook/notice-flood.md: a program's message is an fyi, not a blocker).
+LAND_FORWARD_STATE_FRESH = 900.0
+LAND_FORWARD_STATE_READS = 20
+LAND_FORWARD_STATE_TRIES = 3
+LAND_FORWARD_FYI_CLASS = "fyi"
 
 
 def land_session_lane(name: str) -> str:
@@ -15151,6 +15165,9 @@ class LandQueue:
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
         self.overflow_after = float("-inf")
+        # keys whose PR state is being read live for a forwarded row past its give-up (forward_state_reads)
+        self.forward_reading: set[str] = set()
+        self.forward_state_thread: threading.Thread | None = None
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
@@ -15296,7 +15313,39 @@ class LandQueue:
                     e["wait"] = {"kind": "head_change", "before": before, "since": self.now}
                     e["wakeAt"] = self.now + LAND_HEAD_TIMEOUT
                 self.save(e)
+            if self.repair_forwarded(e):
+                self.save(e)
             self.entries[e["key"]] = e
+
+    def repair_forwarded(self, e: dict) -> bool:
+        """At load, two repairs of rows the forward path wrote wrong; True when E changed.
+        - A forwardedTo that is no host name (an ssh option: land_forward_name read `ssh -o ... HOST`'s "-o" as the
+          host before #2537; huge-blue held 416 such rows on 2026-11-23) is set to the executor land.json names now,
+          or cleared, and every history row naming it too.
+        - A row the first give-up stopped forward_no_outcome without reading the PR's state (LAND_FORWARD_STATE_FRESH's
+          comment) is forwarded again, past its give-up, so the next look reads its state: a merged or closed PR ends
+          quietly, an open one is landed again here. Once per row (forwardRepaired)."""
+        changed = False
+        to = e.get("forwardedTo")
+        if isinstance(to, str) and to and not LAND_HOST_SHAPE.fullmatch(to):
+            executor = land_executor(self.config())
+            name = land_forward_name(executor) if executor is not None else ""
+            good = name if LAND_HOST_SHAPE.fullmatch(name) else ""
+            e["forwardedTo"] = good
+            for h in e.get("history") or []:
+                if h.get("to") == to:
+                    h["to"] = good or "unknown"
+            self.history(e, "forwarded_to_repaired", was=to, to=good or "unknown")
+            changed = True
+        st = e.get("stop") or {}
+        if e.get("state") == "stopped" and st.get("code") == "forward_no_outcome" and not e.get("forwardRepaired") \
+                and not e.get("forwardRelanded") and not e.get("forwardGaveUp"):
+            at = float(st.get("at") or self.now)
+            e.update(state=LAND_FORWARDED, stop=None, forwardRepaired=self.now,
+                     forwardFirst=min(at, self.now) - LAND_FORWARD_GIVE_UP - 1)
+            self.history(e, "forward_stop_reopened", why="stopped before its PR's state was read")
+            changed = True
+        return changed
 
     def save(self, e: dict) -> None:
         e["updated"] = self.now
@@ -15414,7 +15463,10 @@ class LandQueue:
                      lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
-                     forwardFirst=None)  # and its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward
+                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
+            # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
+            if not str(rid or "").startswith("forward-reland-"):
+                e.pop("forwardRelanded", None)
             self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
                          **land_override_history(e))
         else:
@@ -15697,7 +15749,9 @@ class LandQueue:
                 # an entry from before the lane was recorded names none there: its requester's
                 # PARENT/CHILD would read as a session on the executor's host
                 | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                | ({"override": e["override"]} if e.get("override") else {}))
+                | ({"override": e["override"]} if e.get("override") else {})
+                # a pinned row's pin goes with it (forward_reland): the far queue lands that head or none
+                | ({"sha": str(e["pinSha"]).lower()} if LAND_PIN_SHA.fullmatch(str(e.get("pinSha") or "")) else {}))
 
     # -- overflow to peer land hosts (land_overflow): this host judges, and hands its late rows on
 
@@ -16045,17 +16099,68 @@ class LandQueue:
 
     def forwards_follow(self, executor: bool = False) -> None:
         """At most once per LAND_FORWARD_LOOK_EVERY: every forwarded row no worker holds is looked at in the daemon's
-        cache (forward_follow, LAND_FORWARD_RESEND's comment). EXECUTOR: this host forwards its lands (forward_tick)."""
+        cache (forward_follow, LAND_FORWARD_RESEND's comment). EXECUTOR: this host forwards its lands (forward_tick).
+        The rows past their give-up that the cache cannot settle are read live after, off the lock
+        (forward_state_reads)."""
         if self.now < self.forward_look_at:
             return
         self.forward_look_at = self.now + LAND_FORWARD_LOOK_EVERY
+        due: list[str] = []
         for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
-                    and k not in self.sending and k not in self.overflowing]:
+                    and k not in self.sending and k not in self.overflowing and k not in self.forward_reading]:
             try:
                 with self.lock:
-                    self.forward_follow(self.entries[key], executor)
+                    if self.forward_follow(self.entries[key], executor):
+                        due.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.forward_state_reads(due, executor)
+
+    def forward_state_reads(self, due: list[str], executor: bool) -> None:
+        """One live read of each of the first LAND_FORWARD_STATE_READS keys in DUE (forward_read_state), off the lock
+        and off the tick (inline: here), each settled under the lock (forward_settle)."""
+        if not due or (self.forward_state_thread is not None and self.forward_state_thread.is_alive()):
+            return
+        due.sort(key=lambda k: float(self.entries[k].get("forwardStateAt") or 0))  # the longest unread first
+        picked = due[:LAND_FORWARD_STATE_READS]
+        self.forward_reading = set(picked)
+
+        def read_all() -> None:
+            try:
+                for key in picked:
+                    try:
+                        got = self.forward_read_state(self.entries[key])
+                        with self.lock:
+                            self.forward_settle(self.entries[key], *got, executor=executor)
+                    except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                        log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+                    finally:
+                        self.forward_reading.discard(key)
+            finally:
+                self.forward_reading = set()
+
+        if self.inline:
+            read_all()
+        else:
+            self.forward_state_thread = threading.Thread(target=read_all, name="land-forward-state", daemon=True)
+            self.forward_state_thread.start()
+
+    def forward_read_state(self, e: dict) -> tuple[str, str, str, str]:
+        """One read of E's PR through the gh shim (its gh cache first, then GraphQL, as every `pr view` it answers):
+        (state, merge commit, head, why not), state empty when it could not be read."""
+        gh = self.gh()
+        if gh is None:
+            return "", "", "", "no gh to read the PR's state with"
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "headRefOid,mergeCommit,state"],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError):
+            doc = json.loads(got.stdout or "")
+            state = str(doc.get("state") or "")
+            if got.returncode == 0 and state in ("OPEN", "MERGED", "CLOSED"):
+                head = str(doc.get("headRefOid") or "").lower()
+                return state, str((doc.get("mergeCommit") or {}).get("oid") or ""), \
+                    head if SHA40.fullmatch(head) else "", ""
+        return "", "", "", land_tail(f"{got.stderr or ''} {got.stdout or ''}".strip() or f"exit {got.returncode}", 300)
 
     def forwarded_since(self, e: dict) -> float:
         """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
@@ -16064,45 +16169,57 @@ class LandQueue:
                   if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
         return max(times) or float(e.get("updated") or 0)
 
-    def forward_follow(self, e: dict, executor: bool) -> None:
+    def forward_follow(self, e: dict, executor: bool) -> bool:
         """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
         does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
         (stop_moved_pin); one still OPEN past LAND_FORWARD_RESEND since its last hand-off is handed off again: a lane
         VM's to the broker host (hand_off_now), an executor-forwarding host's re-queued for its next forward batch.
-        A row a peer took as overflow is followed to its end, never re-sent: this host judges its own late rows."""
+        A row a peer took as overflow is followed to its end, never re-sent: this host judges its own late rows.
+        Past LAND_FORWARD_GIVE_UP it is settled on its PR's state (forward_settle); True when that state needs the
+        live read the cache could not stand in for (forward_state_reads)."""
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
         state = str(data.get("state") or "").upper()
         host = str(e.get("forwardedTo") or "the host it was handed to")
         at = c.get("dataAt")
         read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        since = self.forwarded_since(e)
+        first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
+        past = self.now - first > LAND_FORWARD_GIVE_UP
         if state == "MERGED":
             merge = data.get("mergeCommit")
             sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+            if past:  # the far host that merged it told its requester long ago (LAND_FORWARD_STATE_FRESH's comment)
+                self.forward_settle(e, "MERGED", sha, "", "", executor=executor, how="the cache shows it")
+                return False
             self.merged(e, sha or e.get("mergeSha") or "", f"forwarded to {host}: the cache shows it merged")
-            return
+            return False
         if state == "CLOSED":
             if read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen (retire_from_cache)
+                if past:
+                    self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
+                    return False
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
                           f"closed); nothing is merged", "")
-            return
+            return False
         if state == "OPEN" and self.stop_moved_pin(e, c, data):
-            return
-        since = self.forwarded_since(e)
+            return False
         last = e.get("forwardResent") or {}
-        first = float(e.get("forwardFirst") or 0) or since  # a row forwarded before this field: from its last hand-off
         if not e.get("forwardFirst"):
             e["forwardFirst"] = first
             self.save(e)
-        if self.now - first > LAND_FORWARD_GIVE_UP:
-            self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
-            return
+        if past:
+            head = str(data.get("headRefOid") or "").lower()
+            if state == "OPEN" and self.now - read_at <= LAND_FORWARD_STATE_FRESH and SHA40.fullmatch(head):
+                self.forward_settle(e, "OPEN", "", head, "", executor=executor, how="the cache shows it")
+                return False
+            return True  # no copy that settles it: read live (forward_state_reads)
         if state != "OPEN":
-            return
+            return False
         # each re-send waits twice as long as the one before (30, 60, 120 min, to 8 h): a far host still waiting on
         # the PR's own checks is not asked again every bound, by every row it holds
         if self.now - since <= LAND_FORWARD_RESEND * 2 ** min(int(last.get("n") or 0), LAND_FORWARD_RESEND_DOUBLINGS):
-            return
+            return False
         n = int(last.get("n") or 0) + 1
         why = (f"still open {self.now - since:.0f} s after it was handed to {host}, with no outcome there: "
                f"handed off again (LAND_FORWARD_RESEND)")
@@ -16112,37 +16229,105 @@ class LandQueue:
             log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n})
             e.update(state="queued", wait=None, wakeAt=None, action=None)  # forward_batch sends it on this pass
             self.save(e)
-            return
+            return False
         done = e.get("handedOff") or {}
         if not done or not self.broker_client():
-            return  # a peer's overflow, or a row from before this host was a broker client: followed, not re-sent
+            return False  # a peer's overflow, or a row from before this host was a broker client: followed, not re-sent
         head = str(e.get("pinSha") or "").lower()
         cached = str(data.get("headRefOid") or "").lower()
         if not head:
             head = cached if SHA40.fullmatch(cached) and read_at >= float(done.get("at") or 0) \
                 else str(done.get("head") or "").lower()
         if not SHA40.fullmatch(head):
-            return
+            return False
         e["forwardResent"] = {"at": self.now, "n": n, "to": host}
         log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
         self.hand_off_now(e, head, why, "forward_resent")
+        return False
 
-    def forward_give_up(self, e: dict, state: str, host: str, first: float, resends: int, executor: bool) -> None:
-        """Under the lock. A forwarded E with no outcome LAND_FORWARD_GIVE_UP after it was first forwarded stops
-        forward_no_outcome (its requester told): the cause is named from what this host can tell, with the way on."""
-        if state:
-            cause = f"the PR is still {state.lower()} and {host}'s land queue has told this host nothing"
-        else:
-            cause = "this host's cache holds no read of the PR, so it cannot tell whether it ended"
+    def forward_settle(self, e: dict, state: str, merge_sha: str, head: str, why: str, executor: bool = False,
+                       how: str = "read live") -> None:
+        """Under the lock. A forwarded E past its give-up, on its PR's STATE (empty: unread, WHY says why):
+        - MERGED or CLOSED: ended with that outcome, nobody told.
+        - OPEN at HEAD: landed again on this host, pinned at HEAD, once (forward_reland), nobody told.
+        - OPEN after that re-land, or unread LAND_FORWARD_STATE_TRIES times: stopped forward_no_outcome, its requester
+          told as an inbox fyi (forward_give_up)."""
+        if e["state"] != LAND_FORWARDED:
+            return  # it moved on while its state was read
+        host = str(e.get("forwardedTo") or "the host it was handed to")
+        e["forwardStateAt"] = self.now
+        if state == "MERGED":
+            sha = merge_sha or e.get("mergeSha") or ""
+            e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
+            self.history(e, "merged", sha=sha, how=f"forwarded to {host}: {how} merged", quiet="forward_give_up")
+            self.save(e)
+            log({"event": "land-forward-settled", "key": e["key"], "state": "merged", "how": how})
+            return
+        if state == "CLOSED":
+            self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); nothing is "
+                      f"merged", "", tell="quiet")
+            log({"event": "land-forward-settled", "key": e["key"], "state": "closed", "how": how})
+            return
+        if state == "OPEN" and not e.get("forwardRelanded"):
+            pin = str(e.get("pinSha") or "").lower()
+            if SHA40.fullmatch(pin) and SHA40.fullmatch(head or "") and land_head_moved(pin, head):
+                self.stop(e, "head_moved", land_moved_clause(head, pin),
+                          f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}", tell="fyi")
+                return
+            if SHA40.fullmatch(head or ""):
+                self.forward_reland(e, head, host, executor)
+                return
+            state, why = "", why or "the read named no head to pin it at"
+        if state == "OPEN":
+            self.forward_give_up(e, "OPEN", host, executor, "it was landed again here at "
+                                 f"{str((e.get('forwardRelanded') or {}).get('head') or '?')[:12]} and that has no "
+                                 "outcome either")
+            return
+        fails = int(e.get("forwardStateFails") or 0) + 1
+        e["forwardStateFails"] = fails
+        self.history(e, "forward_state_unread", why=land_trim(why, 160), n=fails)
+        self.save(e)
+        if fails >= LAND_FORWARD_STATE_TRIES:
+            self.forward_give_up(e, "", host, executor, f"its state could not be read {fails} times: "
+                                 f"{land_trim(why, 160)}")
+
+    def forward_reland(self, e: dict, head: str, host: str, executor: bool) -> None:
+        """Under the lock. E's PR is still open at HEAD past its give-up: this host lands it again itself, pinned at
+        HEAD, as a fresh request from E's own requester (a new request id, so a far queue that holds the old one
+        applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request)."""
+        n = int((e.get("forwardRelanded") or {}).get("n") or 0) + 1
+        rid = f"forward-reland-{file_name(e['key'])[:16]}-{head[:12]}-{n}"
+        req = {"op": "land", "target": key_name(e["key"]), "after": [key_name(a) for a in e.get("after") or []],
+               "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
+               "queuedBy": e.get("queuedBy") or "", "id": rid, "sha": head, "at": self.now}
+        if e.get("lane"):
+            req.update(lane=e.get("lane"), laneHost=e.get("laneHost") or "")
+        if e.get("override"):
+            req["override"] = e["override"]
+        e.pop("handedOff", None)  # a lane VM hands it off afresh if its owner check refuses again (owner_refused)
+        self.apply(req, e["key"], e["repo"], int(e["number"]))
+        e = self.entries[e["key"]]
+        e["forwardRelanded"] = {"at": self.now, "head": head, "n": n, "from": host}
+        self.history(e, "forward_relanded", head=head[:12], was=host,
+                     why=f"still open with no outcome from {host} past the give-up: landed here again, pinned")
+        self.save(e)
+        log({"event": "land-forward-relanded", "key": e["key"], "head": head[:12], "was": host,
+             "executor": executor})
+
+    def forward_give_up(self, e: dict, state: str, host: str, executor: bool, why: str) -> None:
+        """Under the lock. A forwarded E nothing could end or land again (forward_settle) stops forward_no_outcome,
+        naming why and the way on; its requester is told as an inbox fyi, never a blocker."""
+        first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
+        e["forwardGaveUp"] = self.now  # read before it stopped: repair_forwarded never reopens it
+        cause = f"the PR is still {state.lower()}; {why}" if state else why
+        resends = int((e.get("forwardResent") or {}).get("n") or 0)
         if resends:
             cause += f"; it was handed off again {resends} time{'s' if resends != 1 else ''} with no answer"
-        elif not executor and not ((e.get("handedOff") or {}).get("key") and self.broker_client()):
-            cause += "; this host cannot hand it off again (no hand-off record of its own)"
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
                   f"read its row on {host} (glaeda-gh land status there), or land it again: glaeda-gh land "
-                  f"{key_name(e['key'])} (--sha HEAD to pin it)")
+                  f"{key_name(e['key'])} (--sha HEAD to pin it)", tell="fyi")
 
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
@@ -20088,7 +20273,9 @@ class LandQueue:
                           f"again in {after:.0f} s"}, after)
             return False
 
-    def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
+    def stop(self, e: dict, code: str, reason: str, nxt: str, tell: str = "") -> None:
+        """Stop E, its requester told: as notify's class by default, TELL "fyi" as an inbox fyi that wakes nobody,
+        TELL "quiet" not at all (a line in the log and E's history only)."""
         self.check(e)
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
@@ -20110,9 +20297,10 @@ class LandQueue:
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
         # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
-        self.notify(e, e.get("requester") or "", msg, wake=not infra)
+        self.notify(e, e.get("requester") or "", msg, wake=not infra and tell != "quiet",
+                    cls=LAND_FORWARD_FYI_CLASS if tell == "fyi" else None)
 
-    def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
+    def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -20139,9 +20327,10 @@ class LandQueue:
         # A notice from a named sender, never a bare send: acpmux records a bare send as the person's own words, and
         # leo-asks filed ~30 of these as Leo's asks (2026-11-19 12:28-12:31Z, Leo: "This needs to shut up").
         title = land_trim(message, 200)
-        severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
+        # CLS (an inbox fyi: forward_give_up) is held in the receiver's inbox and wakes nobody
+        severity = "info" if cls or message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--class", LAND_NOTICE_CLASS, "--title", title, message]
+                "--class", cls or LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
             whys: list[str] = []
