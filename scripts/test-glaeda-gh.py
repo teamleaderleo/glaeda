@@ -29593,6 +29593,35 @@ class LandTest(Base):
         self.assertTrue(gg.LAND_STEP_QUOTA.search("shared content-creation cooldown: every lane's creates wait"))
         self.assertIsNone(gg.LAND_QUOTA_REFUSAL.search("GitHub rate limit (HTTP 403)"))  # land_judge's reason: unchanged
 
+    def test_a_gh_quota_pace_is_not_a_merge_refusal_and_waits_for_its_seconds(self):
+        # leo-workspace#8104, 2026-11-23 08:06Z: "gh-quota: refused: content writes are paced until reset (#s; ...)"
+        # six times stopped a land_judge-approved PR merge_refused. A pace parks its row for the seconds it names.
+        self.pr(LA)
+        self.land()
+        real, refused = self.w.run, []
+
+        def paced_merge(argv, timeout, env):
+            if argv[1:3] == ["pr", "merge"]:
+                self.w.calls.append(list(argv))
+                refused.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "gh-quota: refused: content writes are paced until "
+                                                   "reset (45s; next: queue it instead of spending the pause)")
+            return real(argv, timeout, env)
+        self.q.run = paced_merge
+        for n in range(1, gg.LAND_STEP_STOP + 3):
+            self.w.answers.append(ok_answer(LA))
+            e = self.tick(0 if n == 1 else max(60, e["wakeAt"] - self.t + 1))
+            self.assertEqual((e["state"], (e.get("wait") or {}).get("kind")), ("waiting", "quota"), n)
+            self.assertGreaterEqual(e["wakeAt"], self.t + 40, n)
+            self.assertNotIn("stepFail", e)
+        self.assertEqual(len(refused), gg.LAND_STEP_STOP + 2)
+        self.assertNotIn("stopped", [h["event"] for h in e["history"]])
+        self.assertEqual(gg.land_quota_said("content writes are paced for 33s more (the login's x)", 1000.0), 1033.0)
+        self.assertEqual(gg.land_quota_said("content writes are paced until reset (300s; y)", 1000.0), 1300.0)
+        # a real refusal (branch rule, review) is not a pace
+        self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
+                                                    "have been met, add the --auto flag"))
+
     def test_a_held_latch_skips_every_judge(self):
         self.pr(LA)
         self.land()
