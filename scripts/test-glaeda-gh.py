@@ -37018,6 +37018,155 @@ class WaitLeashReplayTest(Base):
         self.assertEqual((end["code"], end["ended_by"], end["waited_s"]), (gg.EXIT_TIMEOUT, "ceiling", 2400))
 
 
+class WaitChurnIsNotProgressTest(Base):
+    """A no-progress deadline that any churn resets is not a bound. One real `wait pr` on this fleet, 2026-11-22,
+    ran 3700 s and ended with no verdict, its deadline moving every time it was about to fire:
+
+        deadline 01:07:04Z -> 01:23:43Z -> 01:33:33Z -> 01:37:18Z -> 01:42:45Z   (ceiling 03:53:48Z)
+
+    Every reset was a real difference in the rendered state, and none of them was the PR getting closer to a
+    verdict: its head advanced (4ce5d07926 -> ca12962280) and its check set gained and lost members throughout.
+    Each case here is one of those churn shapes as a fixture, driven through the one decider the client and the
+    daemon share (wait_step), read every 60 s. Each must end at --timeout from the start -- the bound the caller
+    asked for -- and before this rule each rode the ceiling instead (4x --timeout).
+
+    The last case is the opposite direction and the one that must not regress: a required check legitimately
+    pending for 35 minutes, beside siblings that keep finishing, still waits for it.
+
+    Measured (replay, --timeout 600, --max 2400, read every 60 s), before this rule / after it:
+
+        head advancing every 5 min, same two checks   ceiling 2400 s  ->  no-progress  600 s
+        check set gaining and losing members          ceiling 2400 s  ->  no-progress  600 s
+        startedAt restated at every read              ceiling 2400 s  ->  no-progress  600 s
+        a queue position counting down                ceiling 2400 s  ->  no-progress  600 s
+        one real pass, then re-run to it 7 more times ceiling 2400 s  ->  no-progress  900 s (the one pass)
+        a required check pending 35 min, 6 siblings    success 2100 s  ->  success     2100 s (unchanged)"""
+
+    READ_EVERY = 60
+    TIMEOUT = 600.0
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.t0 = float(int(time.time()))
+
+    @staticmethod
+    def stamp(t: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def drive(self, number: int, reading: Any, give_up: float = 4 * 3600) -> dict:
+        """One wait on PR NUMBER, where READING(t) is the PR node the daemon has cached at t. What ended it, after
+        how long, and how many times its deadline moved."""
+        key = f"pr:o/r#{number}"
+        req = gg.wait_request("pr", f"o/r#{number}", "green", self.TIMEOUT, False, True, None, True, gg.RESCUE_GRACE)
+        req["began"] = t = self.t0
+        while t - self.t0 < give_up:
+            t += self.READ_EVERY
+            gg.write_json(gg.cache_dir() / gg.file_name(key),
+                          {"key": key, "fetchedAt": t, "dataAt": t, "error": None,
+                           "data": gg.parse_pr(reading(t - self.t0))})
+            step = gg.wait_step(req, t)
+            if step is None:
+                continue
+            code, text = step
+            out = json.loads(text)
+            return {"code": code, "ended_by": out.get("ended_by"), "waited_s": out.get("waited_s"),
+                    "changes": out.get("progress_changes"), "deadline": gg.wait_deadline(req) - self.t0}
+        return {"code": None, "waited_s": give_up}
+
+    def bounded(self, got: dict, note: str) -> None:
+        """The wait ended where its caller's --timeout said, not at the ceiling it used to slide to."""
+        self.assertEqual((got["code"], got["ended_by"], got["waited_s"]),
+                         (gg.EXIT_TIMEOUT, "no-progress", int(self.TIMEOUT)), note)
+        self.assertEqual(got["changes"], 0, f"{note}: churn is not a progress change")
+
+    def test_a_head_that_keeps_advancing_does_not_buy_another_window(self) -> None:
+        """The reported case, as its own fixture: the head advances under the wait every five minutes and its two
+        checks re-run, same names, same state. The rendered state differs at every read; nothing is deciding."""
+        def reading(dt: float) -> dict:
+            node = pr_node(9300, checks=[{**check_run(n, "IN_PROGRESS", None), "startedAt": self.stamp(self.t0)}
+                                         for n in ("build", "test")])
+            return {**node, "headRefOid": f"{int(dt // 300):040x}"}
+        self.bounded(self.drive(9300, reading), "a head advancing is not movement toward the verdict asked about")
+
+    def test_a_check_set_that_gains_and_loses_members_does_not_buy_another_window(self) -> None:
+        """A rollup whose contexts come and go while none of them finishes: membership churn, not movement."""
+        def reading(dt: float) -> dict:
+            names = ["build", "test"] if int(dt // 120) % 2 else ["test", "build", "extra", "more"]
+            return pr_node(9301, checks=[check_run(n, "QUEUED", None) for n in names])
+        self.bounded(self.drive(9301, reading), "a check set gaining and losing members is not movement")
+
+    def test_a_timestamp_that_ticks_does_not_buy_another_window(self) -> None:
+        """One check, in progress, whose startedAt GitHub keeps restating. A clock is not a verdict."""
+        def reading(dt: float) -> dict:
+            return pr_node(9302, checks=[{**check_run("build", "IN_PROGRESS", None),
+                                          "startedAt": self.stamp(self.t0 + dt)}])
+        self.bounded(self.drive(9302, reading), "a timestamp ticking is not movement")
+
+    def test_a_queue_position_that_moves_does_not_buy_another_window(self) -> None:
+        """A queued check whose name carries its place in the queue, as a few providers' contexts do."""
+        def reading(dt: float) -> dict:
+            return pr_node(9303, checks=[check_run("build", "IN_PROGRESS", None),
+                                         check_run(f"queue (position {20 - int(dt // 60)})", "QUEUED", None)])
+        got = self.drive(9303, reading)
+        self.assertEqual((got["code"], got["ended_by"]), (gg.EXIT_TIMEOUT, "no-progress"))
+        self.assertLessEqual(got["waited_s"], self.TIMEOUT + self.READ_EVERY,
+                            "a queue position changing is not movement")
+
+    def test_a_rerun_to_the_same_conclusions_buys_one_window_not_one_per_rerun(self) -> None:
+        """`build` passes at 300 s -- real movement, and worth a window. It is then re-run and passes again, over and
+        over: the wait has seen that fact and buys nothing more, so it ends 600 s after the one real completion
+        rather than riding the ceiling as every re-run used to carry it."""
+        def reading(dt: float) -> dict:
+            if dt >= 300 and int(dt // 300) % 2:
+                return pr_node(9304, checks=[check_run("build"), check_run("test", "IN_PROGRESS", None)])
+            return pr_node(9304, checks=[check_run("build", "IN_PROGRESS", None),
+                                         check_run("test", "IN_PROGRESS", None)])
+        got = self.drive(9304, reading)
+        self.assertEqual((got["code"], got["ended_by"], got["waited_s"], got["changes"]),
+                         (gg.EXIT_TIMEOUT, "no-progress", 900, 1))
+
+    def test_a_conclusion_the_wait_has_not_seen_is_movement(self) -> None:
+        """Facts drop the head a check ran on, never the conclusion it reached. A context re-running on a new head to
+        a conclusion the wait has not seen is movement -- that is the part that can decide the PR -- and is the one
+        thing a head change is still allowed to bring."""
+        before = {"headRefOid": "a" * 40, "state": "OPEN", "mergeable": "MERGEABLE", "checkState": "PENDING",
+                  "checks": [check_run("build", "IN_PROGRESS", None), check_run("test", "IN_PROGRESS", None)]}
+        same_again = {**before, "headRefOid": "b" * 40}
+        resolved = {**same_again, "checks": [check_run("build", "COMPLETED", "FAILURE"),
+                                             check_run("test", "IN_PROGRESS", None)]}
+        req = gg.wait_request("pr", "o/r#9305", "done", 600, False, True, None, True, gg.RESCUE_GRACE)
+        req["began"] = 1000.0
+        self.assertFalse(gg.wait_progress_mark(req, gg.wait_verdict_facts("pr", {"data": before}), 1100.0),
+                         "the first read is where the wait starts, not a change")
+        self.assertFalse(gg.wait_progress_mark(req, gg.wait_verdict_facts("pr", {"data": same_again}), 1200.0),
+                         "a new head running the same contexts to the same place is not movement")
+        self.assertEqual(gg.wait_moved_at(req), 1000.0)
+        self.assertTrue(gg.wait_progress_mark(req, gg.wait_verdict_facts("pr", {"data": resolved}), 1300.0),
+                        "a conclusion the wait had not seen is movement")
+        self.assertEqual(gg.wait_moved_at(req), 1300.0)
+
+    def test_a_required_check_pending_a_long_legitimate_time_still_waits(self) -> None:
+        """The case this must never cut short. One required check runs 35 minutes while its siblings finish one by
+        one every five: the wait follows the siblings and is there when the long one lands, well past the 600 s a
+        total bound would have allowed."""
+        siblings = [(f"unit {i}", 300.0 * (i + 1)) for i in range(6)]
+        ends = 2100.0
+
+        def reading(dt: float) -> dict:
+            checks = [{**check_run("integration", "IN_PROGRESS", None), "startedAt": self.stamp(self.t0 + 30)}]
+            if dt >= ends:
+                checks = [{**check_run("integration"), "startedAt": self.stamp(self.t0 + 30),
+                           "completedAt": self.stamp(self.t0 + ends)}]
+            for name, done in siblings:
+                checks.append({**check_run(name), "completedAt": self.stamp(self.t0 + done)} if dt >= done
+                              else {**check_run(name, "IN_PROGRESS", None), "startedAt": self.stamp(self.t0)})
+            return pr_node(9306, rollup="SUCCESS" if dt >= ends else "PENDING", checks=checks)
+        got = self.drive(9306, reading)
+        self.assertEqual(got["code"], gg.EXIT_OK, "a legitimately slow required check is waited on, not timed out")
+        self.assertGreaterEqual(got["waited_s"], ends)
+        self.assertGreaterEqual(got["deadline"], ends, "every sibling finishing moved the deadline out with it")
+
+
 class LaneReadTokenTest(UpstreamTest):
     """A lane VM with the broker's read token reads its PRs and runs from GitHub itself; the rest goes upstream."""
 
