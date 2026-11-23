@@ -6343,6 +6343,27 @@ class ClientTest(Base):
         node = {**pr_node(2, rollup="SUCCESS", checks=green), "mergeStateStatus": "CLEAN"}
         self.assertEqual(gg.verdict("pr", gg.parse_pr(node), "green", now=NOW + 10_000), 0)
 
+    def test_a_cancelled_check_is_counted_apart_from_the_failed_ones(self) -> None:
+        """manaflow-ai/cmux#51251: "checks FAILURE: 72 passed, 1 failed, 1 pending" -- the one "failed"
+        was a cancelled suite, which gave no verdict at all. It is counted apart and named with the step
+        it needs, the way a superseded attempt already is. The verdict and exit code do not move."""
+        checks = [check_run(f"test {n}") for n in range(3)]
+        checks.append(check_run("cmux-tui spec inventory / changes", conclusion="CANCELLED"))
+        node = {**pr_node(51251, rollup="FAILURE", checks=checks), "mergeStateStatus": "BLOCKED"}
+        data = gg.parse_pr(node)
+        text = gg.summary("pr:manaflow-ai/cmux#51251", {"data": data}, "green", grace=0)
+        # nothing ran and said no, so the failed tally is 0 and the word is not FAILURE
+        self.assertIn("checks NO VERDICT: 3 passed, 0 failed, 1 cancelled (no verdict, not counted as failed), "
+                      "0 pending (of 4, 0 required); GitHub's rollup says FAILURE", text)
+        self.assertIn("  cancelled, no verdict (not counted as failed): cmux-tui spec inventory / changes: "
+                      "re-run it, or read the newer attempt that replaced it", text)
+        # routing is untouched: a cancelled check is still the PR's own red for every caller
+        self.assertEqual(gg.verdict("pr", data, "green", now=NOW + 10_000), 1)
+        # and a real red still reads as failed, with the state word GitHub's
+        red = gg.parse_pr({**pr_node(3, rollup="FAILURE", checks=[check_run("build", conclusion="FAILURE")]),
+                           "mergeStateStatus": "BLOCKED"})
+        self.assertIn("checks FAILURE: 0 passed, 1 failed, 0 pending", gg.summary("pr:o/r#3", {"data": red}, "green"))
+
     def test_the_checks_line_counts_skipped_checks_apart_and_names_them(self) -> None:
         """manaflow-ai/cmux#51140 at 1c521f6e: 117 of 158 checks were SKIPPED and the line read
         "159 passed", so a reader went looking for a lint that had never been emitted. A skipped
@@ -6354,9 +6375,9 @@ class ClientTest(Base):
         data = gg.parse_pr(node)
         text = gg.summary("pr:manaflow-ai/cmux#51140", {"data": data}, "green")
         self.assertIn("checks SUCCESS: 1 passed, 7 skipped (no verdict), 0 failed, 0 pending (of 8, 2 required)", text)
-        self.assertIn("  no verdict (skipped, nothing they would have judged was judged): "
-                      "clippy (changed cmux-tui packages), placement 0, placement 1, placement 2, "
-                      "placement 3, +2 more", text)
+        self.assertIn("  skipped, no verdict (nothing they would have judged was judged; nothing to re-run and "
+                      "no result to compare): clippy (changed cmux-tui packages), placement 0, placement 1, "
+                      "placement 2, placement 3, +2 more", text)
         # it is still no red: the PR was landable the whole time
         self.assertEqual(gg.verdict("pr", data, "green"), 0)
         # with nothing skipped the line is as it was
