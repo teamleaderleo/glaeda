@@ -118,6 +118,17 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         self.assertLess(took, 8, "it must refuse at once, not after waiting out the timeout")
 
     # a legitimate wait must still work
+    def test_cli_with_no_row_still_takes_the_normal_wait_path(self) -> None:
+        """The gate swallows nothing it must not: with no row for this PR, the command goes on to the wait it
+        always took. Here that path ends at the daemon check (exit 3, no daemon in a temp GLAEDA_GH_DIR), which is
+        proof enough that it got past the gate -- and it is the exit the unfixed tree gave for the held PR too."""
+        write_row(31, "waiting")  # a row for a different PR must not stand in for this one
+        env = {**os.environ, "GLAEDA_GH_DIR": HOME}
+        p = subprocess.run([sys.executable, "-I", os.fspath(SCRIPT), "wait", "pr", f"{REPO}#32",
+                            "--timeout", "8", "--json"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotEqual(p.returncode, 64, "a PR with no row here must not be refused")
+        self.assertNotIn("land_row_watching", p.stdout + p.stderr)
+
     def test_no_row_here_waits_as_before(self) -> None:
         gg.land_entries()  # an empty (or absent) queue is not an error
         self.assertIsNone(gg.land_row_watched_here(f"pr:{REPO}#21"))
