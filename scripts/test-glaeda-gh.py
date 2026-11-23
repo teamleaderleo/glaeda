@@ -2215,6 +2215,26 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 6 * gg.TICK + gg.CONTROLLER_ABSENT + 1)
         self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
 
+    def test_a_pending_commit_status_is_never_quiet_for_the_land_queue(self) -> None:
+        """The feed carries no commit-status delivery: a PR whose cached head shows a status pending is not quiet
+        (nothing says when it ends), whatever the feed delivered, and is quiet again once the status is done."""
+        sha, key = "b" * 40, "pr:o/r#1"
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        since = NOW + gg.TICK
+        pending = {"state": "OPEN", "headRefOid": sha, "checks": [
+            {"name": "ci", "workflow": "w", "id": "n1", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "deploy", "workflow": None, "status": "PENDING", "conclusion": None}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": pending, "dataAt": since})
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
+        done = {**pending, "checks": [{**pending["checks"][0]}, {**pending["checks"][1], "status": "COMPLETED"}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": done, "dataAt": since})
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        run_pending = {**pending, "checks": [{**pending["checks"][0], "status": "IN_PROGRESS"}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": run_pending, "dataAt": since})
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "a check run's events reach the feed")
+
     def test_the_feed_view_a_downstream_rules_with_is_kept_for_read(self) -> None:
         """save_feed_view / feed_view (UPSTREAM_FEED_FILE): the view `read` gives a downstream host says what
         land_feed_quiet says here, and says nothing once the feed is out."""
@@ -23531,6 +23551,7 @@ class LandWorld:
         self.merged_on_merge = True
         self.view_state: str | None = None  # what a `pr view --json state,...` answers (None: OPEN, or MERGED after a merge)
         self.view_err: str | None = None  # a state read that fails, with these words
+        self.view_head: str | None = None  # the headRefOid a `pr view --json headRefOid,...` answers (None: no field)
         self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
         self.raise_on: str | None = None
         self.nudged: list[str] = []
@@ -23633,7 +23654,8 @@ class LandWorld:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
                 return subprocess.CompletedProcess(argv, 0, json.dumps(
-                    {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}), "")
+                    {"state": state, "mergeCommit": {"oid": "f" * 40} if state == "MERGED" else None}
+                    | ({"headRefOid": self.view_head} if self.view_head else {})), "")
             kind = "merge" if words[:2] == ["pr", "merge"] or (words[:3] == ["api", "-X", "PUT"]
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
@@ -24824,6 +24846,37 @@ class LandTest(Base):
         self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())  # on the daemon's snapshot, not a live read
         self.assertTrue(all("--sha" in argv for argv in self.w.explains()))
         self.assert_merged_at(LA)
+
+    def test_a_new_pin_drops_a_repin_wait_on_an_older_head_and_judges_the_pin(self):
+        # glaeda#2611, 2026-11-23 08:02Z: land_judge named a repin to one head, a push and a land request pinned at the
+        # newer head came in before that wait was judged, and the row stopped head_moved comparing the new pin with the
+        # wait's older head. A new pin judges the head the cache shows for it, not a head a judgment before it named.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": LB}))
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], e["wait"]["sha"]), ("repin", LB))
+        self.pr(LC)  # pushed past LB, and the request pins the true head
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LC)
+        self.w.answers.append(ok_answer(LC))
+        e = self.tick()
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual(self.w.explains()[-1][-3:], ["--sha", LC, "--json"])
+        self.assert_merged_at(LC)
+
+    def test_a_new_pin_drops_a_base_merge_check_made_for_the_pin_before_it(self):
+        # The same class: a base merge check judge recorded against the old pin is not read against the new one.
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
+        self.tick()
+        self.q.entries[self.KEY]["baseMergeCheck"] = {"head": LC, "pin": LB, "parent": ""}
+        self.pr(LC)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LC)
+        self.w.answers.append(ok_answer(LC))
+        e = self.tick()
+        self.assertIsNone(e.get("stop"))
+        self.assertNotIn("baseMergeCheck", e)
+        self.assert_merged_at(LC)
 
     def test_a_repin_to_its_own_head_that_the_cache_does_not_hold_still_waits_for_the_cache(self):
         self.pr(LA)
@@ -27481,6 +27534,115 @@ class LandTest(Base):
         [env] = self.merge_envs()
         self.assertFalse(set(want) & set(env))
 
+    NOMINATED = {"path": "repo-autoland", "evidence": {"ship-receipt": {"head": LA, "why": ""}}}
+
+    def judge_envs(self) -> list[dict]:
+        return [env for c, env in zip(self.w.calls, self.w.envs) if c[1:3] == [self.w.mh, "explain"]]
+
+    def test_a_nominated_land_judges_and_merges_with_its_nomination_and_a_plain_one_without(self):
+        # ci-v2 step 12: the nomination rode only a mark on the host that filed the land, so a queue on another host
+        # judged the merge as a plain glaeda-land. Now every judgment and merge try carries it (LAND_NOMINATED_ENV).
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", self.NOMINATED))
+        self.assertEqual([h.get("nominated") for h in e["history"] if h["event"] == "queued"], ["repo-autoland"])
+        envs = self.judge_envs() + self.merge_envs()
+        self.assertGreaterEqual(len(envs), 2)
+        for env in envs:
+            self.assertEqual(json.loads(env[gg.LAND_NOMINATED_ENV]), self.NOMINATED)
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.w.config["env"] = {gg.LAND_NOMINATED_ENV: json.dumps(self.NOMINATED)}  # never inherited from land.json
+        self.q = self.queue()
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", None))
+        for env in self.judge_envs() + self.merge_envs():
+            self.assertNotIn(gg.LAND_NOMINATED_ENV, env)
+
+    def test_a_malformed_nomination_is_kept_unreadable_so_the_judge_refuses_it(self):
+        # never dropped: a request that says it was nominated is judged as a nomination it cannot read (refused)
+        for raw in ("repo-autoland", {"path": "Not A Path", "evidence": {}}, {"path": "next-autoland", "evidence": []},
+                    {"path": "next-autoland", "evidence": {"x": "y" * gg.LAND_NOMINATED_MAX}}):
+            with self.subTest(raw=str(raw)[:40]):
+                got = gg.land_nominated(raw)
+                self.assertEqual(set(got), {"unreadable"})
+                env = gg.land_nominated_env({"nominated": got})
+                self.assertIn("unreadable", json.loads(env[gg.LAND_NOMINATED_ENV]))
+        self.assertIsNone(gg.land_nominated(None))
+        self.assertEqual(gg.land_nominated_env({}), {})
+        # a served (forwarded) request with a malformed one keeps it as unreadable on the entry
+        self.pr(LA)
+        rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "requester": "host/lane", "nominated": 7})
+        self.assertTrue(rid, why)
+        self.w.answers.append(refusal("fast_gates", LA, {"kind": "stop", "stop": "fast_gates", "why": "unreadable"}))
+        e = self.tick()
+        self.assertEqual(set(e.get("nominated") or {}), {"unreadable"})
+        [env] = self.judge_envs()
+        self.assertIn("unreadable", json.loads(env[gg.LAND_NOMINATED_ENV]))
+        self.assertEqual(self.merge_envs(), [])
+
+    def test_the_nomination_travels_to_an_executor_an_overflow_peer_and_a_lane_vms_hand_off(self):
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+        # the outbox a forwarding host resends to its executor carries it
+        batch, _, _ = self.q.forward_batch()
+        self.assertEqual([r.get("nominated") for r in batch], [self.NOMINATED])
+        # the executor's end: `land serve` applies the forwarded request with its nomination
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.pr(LA)
+        handed = gg.LandQueue.handoff_request(self.KEY, {"key": self.KEY, "requestId": "", "gen": 1,
+                                                          "nominated": dict(self.NOMINATED)})
+        rid, why = gg.land_serve_one(handed)
+        self.assertTrue(rid, why)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("nominated")), ("merged", self.NOMINATED))
+        self.assertTrue(all(json.loads(env[gg.LAND_NOMINATED_ENV]) == self.NOMINATED
+                            for env in self.judge_envs() + self.merge_envs()))
+        # a plain handoff request names none
+        self.assertNotIn("nominated", gg.LandQueue.handoff_request(self.KEY, {"key": self.KEY, "gen": 1}))
+        # a lane VM's hand-off to the broker host sends it (a broker that does not know it refuses the hand-off)
+        shutil.rmtree(gg.land_dir(), ignore_errors=True)
+        self.w = LandWorld(self.tmp.name)
+        self.q = self.queue()
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            gg.land_request("land", "o/r#1", [], "host/lane", nominated=dict(self.NOMINATED))
+            self.w.gh_rc["merge"] = 1
+            self.w.gh_err["merge"] = self.NOT_OWNER
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane",
+                                               "nominated": self.NOMINATED})
+
+    def test_land_cli_queues_the_nomination_and_refuses_one_it_cannot_keep(self):
+        ev = json.dumps(self.NOMINATED["evidence"])
+        self.assertEqual(gg.land_nominated_given("repo-autoland", ev), self.NOMINATED)
+        self.assertEqual(gg.land_nominated_given("next-autoland", None), {"path": "next-autoland", "evidence": {}})
+        self.assertIsNone(gg.land_nominated_given(None, None))
+        for path, evidence in ((None, ev), ("repo-autoland", "{not json"), ("repo-autoland", "[]"), ("X Y", ev)):
+            with self.subTest(path=path, evidence=evidence[:10]):
+                with self.assertRaises(gg.WatchError):
+                    gg.land_nominated_given(path, evidence)
+        self.pr(LA)
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane"}), \
+                mock.patch.object(gg, "policy_host", return_value="host"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.main(["land", "o/r#1", "--nominated-path", "repo-autoland",
+                                      "--nominated-evidence", ev, "--json"]), 0)
+        self.w.answers.append(ok_answer(LA))
+        self.assertEqual(self.tick().get("nominated"), self.NOMINATED)
+
     def test_land_override_goes_to_the_brokers_land_as_its_override(self):
         self.broker = True
         self.pr(LA)
@@ -28617,6 +28779,62 @@ class LandTest(Base):
         self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
         self.assertEqual((e["state"], e["handoffFail"]["head"], e["handoffFail"]["count"]), ("waiting", LB, 1))
 
+    def handed_off(self) -> dict:
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = self.NOT_OWNER
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick()
+        self.assertEqual(e["state"], "forwarded")
+        return e
+
+    def quiet_notices(self) -> list[list[str]]:
+        return [c for c in self.w.sent() if "no verdict has come back" in c[-1]]
+
+    def test_a_forward_with_no_verdict_past_its_bound_is_read_once_and_its_requester_told_once(self):
+        # efficiency-scout, 2026-11-22: cmuxterm-hq#16865 forwarded 433 min with no verdict and its owner not told. A
+        # forwarded row is terminal here, so nothing looked again. Past LAND_FORWARD_QUIET the PR is read once, and a
+        # read that shows it still open tells the requester where it went and what to run, once per forward.
+        self.handed_off()
+        self.tick(gg.LAND_FORWARD_QUIET - 10)
+        self.assertEqual(self.quiet_notices(), [])
+        watched = len(self.w.watched)
+        self.tick(20)
+        self.assertEqual(self.w.watched[watched:], [self.KEY], "one read is asked")
+        self.assertEqual(self.quiet_notices(), [], "and the notice waits on it")
+        self.pr(LA)  # the read lands: still open at the handed head
+        e = self.tick()
+        [sent] = self.quiet_notices()
+        self.assertEqual(sent[2:4], ["--no-wait", "host/lane"])
+        self.assertIn("handed to ", sent[-1])
+        self.assertIn(f"still reads open at {LA[:12]}", sent[-1])
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.assertTrue(any(h.get("event") == "forward_quiet" for h in e["history"]), e["history"])
+        self.assertEqual(e["state"], "forwarded")
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(len(self.quiet_notices()), 1, "told once per forward")
+
+    def test_a_forward_whose_pr_ended_tells_nobody_and_one_whose_read_never_lands_still_tells(self):
+        e = self.handed_off()
+        self.pr(LA, state="MERGED")
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.tick()
+        self.assertEqual(self.quiet_notices(), [])
+        self.assertEqual(self.q.entries[self.KEY]["forwardQuiet"]["ended"], "MERGED")
+        # a fresh forward whose PR is never read again: told once the read's wait is out, saying no read ended it
+        self.w.cache.pop(self.KEY, None)
+        e = self.q.entries[self.KEY]
+        e.pop("forwardQuiet")
+        e["handedOff"]["at"] = self.t
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.assertEqual(self.quiet_notices(), [])
+        self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        [sent] = self.quiet_notices()
+        self.assertIn("no read of the PR here says it ended", sent[-1])
+
     def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
         self.broker = True
         self.pr(LA)
@@ -28690,6 +28908,156 @@ class LandTest(Base):
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
+
+    def state_reads(self) -> list[list[str]]:
+        return self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefOid,mergeCommit,state")
+
+    def past_give_up(self) -> dict:
+        """The forwarded row's first look past LAND_FORWARD_GIVE_UP, the cache holding no read of its PR (huge-blue's
+        rows on 2026-11-23: nobody there watched them)."""
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.assertEqual((self.q.entries[self.KEY]["state"], self.state_reads()), ("forwarded", []))
+        return self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+
+    def test_a_forwarded_land_past_the_give_up_whose_pr_merged_ends_merged_and_tells_nobody(self):
+        # huge-blue 2026-11-23 07:45-07:56Z: ~35 [blocker] forward_no_outcome notices, hq#12849 (merged 11-17) and
+        # lw#8264 (merged that morning) among them. The state is read first; merged ends the row with no word.
+        self.forwarded_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "MERGED"
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.state_reads()), 1)
+        self.assertEqual(len(self.w.sent()), sent)  # nobody told: the far host that merged it told its requester
+        self.assertEqual(e["history"][-1]["quiet"], "forward_give_up")
+
+    def test_a_forwarded_land_past_the_give_up_the_cache_shows_merged_reads_nothing_and_tells_nobody(self):
+        self.forwarded_row()
+        sent = len(self.w.sent())
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - 100)
+        self.pr(LA, state="MERGED")  # read here only once the row is past its give-up
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 101)
+        self.assertEqual((e["state"], self.state_reads(), len(self.w.sent())), ("merged", [], sent))
+
+    def test_a_forwarded_land_past_the_give_up_whose_cached_close_predates_it_is_read_live(self):
+        # a CLOSED copy older than the row may predate a reopen: past the give-up it is no reason to wait forever
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP - 100)
+        self.pr(LA, state="CLOSED")
+        self.w.cache[self.KEY]["dataAt"] = 0
+        self.w.view_state = "MERGED"
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 101)
+        self.assertEqual((e["state"], len(self.state_reads())), ("merged", 1))
+
+    def test_a_spent_quota_is_no_failed_state_read(self):
+        # the login's spent quota says nothing of the PR: 1,299 reopened rows must not give up in three minutes
+        self.forwarded_row()
+        self.w.view_err = "gh-quota: refused: GitHub GraphQL rate limit is spent"
+        e = self.past_give_up()
+        for _ in range(gg.LAND_FORWARD_STATE_TRIES + 1):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("forwardStateFails")), ("forwarded", None))
+        self.w.view_err, self.w.view_state = None, "MERGED"
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+
+    def test_a_forwarded_land_past_the_give_up_whose_pr_closed_stops_closed_and_tells_nobody(self):
+        self.forwarded_row()
+        sent = len(self.w.sent())
+        self.w.view_state = "CLOSED"
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len(self.w.sent()), sent)
+
+    def test_a_forwarded_land_still_open_past_the_give_up_is_landed_here_again_pinned_then_says_fyi(self):
+        # Still open: no notice, the row is landed again on this host pinned at the head it read. Only when that has
+        # no outcome either does it stop forward_no_outcome, and that notice is an inbox fyi, never a blocker.
+        self.forwarded_row()
+        sent = len(self.w.sent())
+        self.w.view_head = LA
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason=self.UNREAD))
+        e = self.past_give_up()
+        self.assertEqual((e["pinSha"], e["forwardRelanded"]["head"]), (LA, LA))
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertTrue(any(h.get("event") == "forward_relanded" for h in e["history"]), e["history"])
+        self.pr(LA)  # the re-landed row's watch reads the PR, as a pinned land waits for (pin_wait)
+        for _ in range(5):
+            if self.tick(5)["state"] == "forwarded":
+                break
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["state"], "forwarded")
+        self.assertEqual(len(self.handoffs()), 2)  # judged here again, and handed on pinned
+        self.assertEqual(json.loads(self.handoffs()[-1][4])["sha"], LA)
+        self.assertEqual([c for c in self.w.sent()[sent:] if "stopped" in c[-1]], [])
+        self.w.cache.pop(self.KEY, None)
+        for _ in range(int(1.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+                break
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("landed again here", e["stop"]["reason"])
+        self.assertIn("huge-blue", e["stop"]["reason"])
+        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(said[3], "host/lane")
+        self.assertEqual(said[said.index("--class") + 1], "fyi")
+        self.assertNotIn("block", said)
+
+    def test_a_forwarded_land_whose_state_no_route_reads_stops_after_its_tries_as_an_fyi(self):
+        self.forwarded_row()
+        self.w.view_err = "HTTP 502: Bad Gateway"
+        e = self.past_give_up()
+        self.assertEqual((e["state"], e["forwardStateFails"]), ("forwarded", 1))
+        for _ in range(gg.LAND_FORWARD_STATE_TRIES - 1):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("could not be read 3 times", e["stop"]["reason"])
+        self.assertEqual(len(self.state_reads()), gg.LAND_FORWARD_STATE_TRIES)
+        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(said[said.index("--class") + 1], "fyi")
+
+    def test_live_state_reads_are_capped_per_pass(self):
+        with mock.patch.object(gg, "LAND_FORWARD_STATE_READS", 0):
+            self.forwarded_row()
+            self.w.view_state = "MERGED"
+            e = self.past_give_up()
+        self.assertEqual((e["state"], self.state_reads()), ("forwarded", []))
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "merged")
+
+    def test_a_pinned_rows_hand_off_to_an_executor_carries_its_pin(self):
+        e = {"key": self.KEY, "requestId": "r1", "pinSha": LA, "requester": "host/lane"}
+        self.assertEqual(gg.LandQueue.handoff_request(self.KEY, e)["sha"], LA)
+        self.assertNotIn("sha", gg.LandQueue.handoff_request(self.KEY, {**e, "pinSha": ""}))
+
+    def test_an_ssh_option_is_never_named_as_the_far_host(self):
+        # lw#7909: "handed to -o's land queue"
+        self.assertEqual(gg.land_forward_name(["ssh", "-o", "ConnectTimeout=5", "cmux-cp-1", "glaeda-gh"]), "cmux-cp-1")
+        self.assertEqual(gg.land_forward_name(["ssh", "-oBatchMode=yes", "-p", "22", "h1", "x"]), "h1")
+        self.assertNotEqual(gg.land_forward_name(["reach", "-o"]), "-o")
+        self.assertEqual(gg.land_forward_name(["ssh", "-p", "22", "leo@h1", "x"]), "leo@h1")
+
+    def test_a_row_the_flag_parse_or_the_unread_give_up_wrote_is_repaired_at_load(self):
+        # huge-blue 2026-11-23: 416 rows named "-o" as their far host, and 1,299 stopped forward_no_outcome unread
+        e = {"key": self.KEY, "repo": "o/r", "number": 1, "state": "stopped", "forwardedTo": "-o", "created": self.t,
+             "requester": "host/lane", "history": [{"at": self.t, "event": "handed_off", "to": "-o"}],
+             "stop": {"code": "forward_no_outcome", "at": self.t, "reason": "handed to -o's land queue"}}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
+        other = {**e, "key": "pr:o/r#2", "number": 2, "forwardedTo": "air-blue", "forwardGaveUp": self.t}
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name("pr:o/r#2"), other)
+        self.w.config["executor"] = ["ssh", "-o", "ConnectTimeout=5", "cmux-cp-1", "glaeda-gh", "land", "serve"]
+        q = self.queue()
+        got = q.entries[self.KEY]
+        self.assertEqual((got["state"], got["forwardedTo"], got["history"][0]["to"]),
+                         (gg.LAND_FORWARDED, "cmux-cp-1", "cmux-cp-1"))
+        self.assertLess(got["forwardFirst"], self.t - gg.LAND_FORWARD_GIVE_UP)
+        self.assertEqual(q.entries["pr:o/r#2"]["state"], "stopped")  # read before it stopped: left as it is
+        # once only: a second load leaves the reopened row's marks alone
+        again = self.queue().entries[self.KEY]
+        self.assertEqual(again["forwardRepaired"], got["forwardRepaired"])
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
@@ -30795,6 +31163,48 @@ class LandTest(Base):
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(121)  # not a checks_running wait: its timeout judges
         self.assertEqual(len(self.w.judgments()), 4)
+
+    def seconds_to_judged(self, limit: float = 2 * gg.LAND_FEED_QUIET_MAX, step: float = 10.0) -> float:
+        """Seconds from now until a judgment is asked for (one more than there are), ticking every STEP."""
+        judged, began = len(self.w.judgments()), self.t
+        while self.t - began < limit:
+            self.tick(step)
+            if len(self.w.judgments()) > judged:
+                return self.t - began
+        return float("inf")
+
+    def test_a_checks_running_wait_ends_when_the_cache_shows_the_checks_done_with_no_feed_event(self):
+        """A commit status going green reaches the feed as no event (it carries runs, suites and comments), so with
+        the feed quiet the green copy was held and the row slept until LAND_FEED_QUIET_MAX after its checks_running
+        verdict. Before: 1800 s from green to judged here; after: the next tick."""
+        self.feed()  # quiet throughout: no event arrives
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.tick(30)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("status / ci", "COMPLETED", "SUCCESS")])  # the status went green
+        self.w.answers.append(ok_answer(LA))
+        seconds = self.seconds_to_judged()
+        print(f"\nfeed-quiet green-to-judged: {seconds:.0f} s")
+        self.assertLessEqual(seconds, 30)
+        self.assert_merged_at(LA)
+
+    def test_a_checks_running_timer_still_waits_while_the_cache_shows_the_checks_running(self):
+        """The wake above is the cache's own read of finished checks: a copy that still shows a check running (or
+        was read before the verdict) keeps the timer held."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        for _ in range(5):
+            self.tick(121)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertEqual(events, [])
 
     def test_a_feed_held_wait_is_judged_past_the_bound(self):
         self.feed()
@@ -33112,6 +33522,24 @@ class LandForwardTest(Base):
         self.assertEqual(e["state"], "merged")
         self.assertEqual(len(self.sent_batches), 2)
 
+    def test_a_forward_still_open_past_the_give_up_is_sent_again_pinned_under_a_new_id_telling_nobody(self):
+        # huge-blue's shape (it forwards every land to cmux-cp-1): past the give-up with no read of the PR here, the
+        # state is read live; still open, the row is landed again from here, pinned at that head, as a new request
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land("o/r#1", requester="cosmic/coord")
+        self.tick()
+        self.q = self.forwarding()
+        self.tick()
+        self.w.cache.pop(self.KEY, None)
+        sent = len(self.w.sent())
+        self.w.view_head = LA
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
+        self.assertEqual((e["state"], e["pinSha"], e["forwardRelanded"]["head"]), ("forwarded", LA, LA))
+        last = self.sent_batches[-1]["requests"][0]
+        self.assertEqual(last["sha"], LA)
+        self.assertNotEqual(last["id"], self.sent_batches[0]["requests"][0]["id"])
+        self.assertEqual(len(self.w.sent()), sent)
+
     def test_a_running_step_ends_here_before_its_entry_is_handed_off(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
         self.land(requester="cosmic/coord")
@@ -33383,6 +33811,11 @@ class LandForwardTest(Base):
         self.assertEqual(gg.land_forward_name(["ssh", "-T", "-oBatchMode=yes", "h2", "x"]), "h2")
         self.assertEqual(gg.land_forward_name(list(self.EXEC)), "big-exec")
         self.assertEqual(gg.land_forward_name(["/opt/bin/serve-land", "--x"]), "/opt/bin/serve-land --x")
+        # a cluster ending in a value flag takes the next word as its value, as ssh's getopt does
+        self.assertEqual(gg.land_forward_name(["ssh", "-4o", "BatchMode=yes", "h3", "x"]), "h3")
+        self.assertEqual(gg.land_forward_name(["ssh", "-Tp22", "h4", "x"]), "h4")
+        for argv in (ssh, ["ssh", "-4o", "BatchMode=yes", "h3"], ["ssh", "-i", "k", "-o", "A=b", "-l", "u", "h5"]):
+            self.assertFalse(gg.land_forward_name(argv).startswith("-"), argv)
         with mock.patch.object(gg, "policy_host", return_value="me"):
             self.assertEqual(gg.land_redirected(ssh, "other-exec"),
                              ["ssh", "-o", "BatchMode=yes", "other-exec", ".local/bin/glaeda-gh", "land", "serve"])
@@ -33451,6 +33884,20 @@ class LandForwardTest(Base):
         self.assertFalse(self.q.forward_misrouted)
         self.assertEqual(len(list(gg.LandQueue.requests_dir().glob("*.json"))), 0)
 
+
+    def test_land_forward_name_skips_ssh_options_and_their_arguments(self):
+        # huge-blue, 2026-11-22 17:24Z: an executor `ssh -o ... HOST` was said as "forwards its own lands to -o"
+        for command, name in ((["reach", "huge-blue", "glaeda-gh", "land", "serve"], "huge-blue"),
+                              (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "huge-blue", "glaeda-gh"],
+                               "huge-blue"),
+                              (["/usr/bin/ssh", "-oBatchMode=yes", "-T", "-i", "/k", "cmux@huge-blue", "x"],
+                               "cmux@huge-blue"),
+                              (["ssh", "-At", "-p", "22", "-l", "cmux", "air-blue", "x"], "air-blue"),
+                              (["ssh", "--", "host-after-dashes", "x"], "host-after-dashes"),
+                              (["ssh", "-o"], "ssh -o"),
+                              (["/opt/glaeda-gh", "land", "serve"], "/opt/glaeda-gh land serve")):
+            with self.subTest(command=command):
+                self.assertEqual(gg.land_forward_name(command), name)
 
 class WaitFromBytecodeTest(unittest.TestCase):
     """A wait re-runs itself once from cached bytecode: the compile heap was 54 MB of each waiter's 57 MB."""

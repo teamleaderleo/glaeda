@@ -967,11 +967,17 @@ and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
 cmux-next.yml's fast tier waits at most `FAST_TIER_CAPACITY_WAIT_S` (60 s) for units or
-tokens, on any runner, then is refused (FAST_TIER_WAIT). Its 20-minute timeout counts the
+tokens, on any runner (FAST_TIER_WAIT), then is admitted busy with no unit beside the mini's
+other jobs (FAST_TIER_BUSY, hq#17742) instead of refused. Its 20-minute timeout counts the
 wait in "Set up runner", and a run after admission takes 866 s p50: of 191 fast tiers that
 waited 60 s or more (2026-11-16 to 11-19), 3 passed, and 141 timeouts had spent 68202 s of
-their caps waiting. cmux's owned-pool rescue re-runs a refusal; it never re-runs a PR job
-GitHub timed out.
+their caps waiting. A refusal's re-run went back to the same label and was refused again,
+and nothing re-runs a PR job GitHub timed out.
+
+Its generated files job waits at most `GENERATED_FILES_CAPACITY_WAIT_S` (240 s) the same way
+(GENERATED_FILES_WAIT): its 70-minute timeout counts the wait too, and on 2026-11-22 03-05Z
+eight ran it out mostly waiting (up to 69.9 of 70 minutes). Past the bound it is admitted
+busy like the fast tier (FAST_TIER_BUSY), not refused.
 
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
@@ -1812,7 +1818,8 @@ in at the producer's root. So one root job per root per mini:
   `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
-  display worker and leaves its PNG archive in fleet storage); job-started refuses any other job at once. Its gate is never held
+  display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which
+  submits the cmux Dev device-app build `try.sh` reuses); job-started refuses any other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
   Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
@@ -2568,7 +2575,8 @@ It acts only where all of the following hold. Otherwise it reports and changes n
 - `/Library/Application Support/cmux-fleet-ops` already exists, because a root install made it.
 - The host is not reserved. The pass reads `~/.local/share/glaeda/fleet-reservations.json`
   (`glaeda-fleet-reservations/v1`) from the home of the user who owns `/Users/Shared/cmux-build-fleet`. A list that
-  is missing, unreadable, or past its own `expires` counts as reserved. So does an active entry naming this host
+  is missing or unreadable counts as reserved; one past its own `expires` is released, and holds only by an entry
+  still live by its own `from`/`until`. So does an active entry naming this host
   (its machine name or the host in `~/.config/glaeda/update.json`, plus the list's aliases), and so does an active
   `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
   bytes installed are the pinned ones.
