@@ -673,7 +673,8 @@ class HookTest(unittest.TestCase):
                 "job": "integrations-production", "run_attempt": "1"}
         self.assertIsNone(hook.trusted_refusal(**args))
         self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": "2"}), "a re-run of main's dispatch")
-        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml"):
+        for name in ("fleet-reconciler-now.yml", "synthetic-probes-environments-production.yml", "next-dogfood.yml",
+                     "screen-share-zero-touch-probe.yml", "new-tab-startup-probe.yml"):
             self.assertIsNone(hook.trusted_refusal(**{**args, "workflow_ref": wf.replace("synthetic-probes.yml", name)}))
         self.assertIsNone(hook.trusted_refusal(**{**args, "trusted_repo": "Manaflow-AI/cmuxterm-hq"}))
         for event_name, event_payload in (("push", {"ref": main, "repository": hq}), ("schedule", {"repository": hq})):

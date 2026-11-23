@@ -3223,8 +3223,11 @@ TRUSTED_EVENTS = ("push", "schedule")
 # let a dispatcher put main's code with their own inputs here; a new workflow for these runners is added here.
 HQ_DISPATCH_REPO = "manaflow-ai/cmuxterm-hq"
 HQ_DISPATCH_REF = "refs/heads/main"
+# The two probes take no inputs, and their dispatch on main routes here (runs-on: fleet_route_lan / hq-fleet-route when
+# vars.HQ_OWNED_DISPATCH is 'live'); left out, every dispatch was refused at setup (hq run 45270411254, 2026-11-23).
 HQ_DISPATCH_WORKFLOWS = ("fleet-reconciler-*", "fleet-selfheal.yml", "freestyle-runners.yml", "next-dogfood.yml",
-                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml")
+                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml",
+                         "screen-share-zero-touch-probe.yml", "new-tab-startup-probe.yml")
 
 
 def hq_dispatch_workflow(workflow_path: str) -> bool:
