@@ -37595,5 +37595,136 @@ class GitHubSaidTest(unittest.TestCase):
                             f"scripts/glaeda-gh:{n} formats GitHub's message itself: {statement.strip()}")
 
 
+class ATallySaysWhenItsBasisChangedTest(Base):
+    """A count of checks is a count over a set, and the set changes. One `wait pr` printed, 120 s apart,
+       checks FAILURE: 16 passed, 2 failed, 0 pending (of 18, 0 required)
+       checks PENDING: 16 passed, 0 failed, 1 pending (of 17, 0 required)
+    -- two lines of the same shape, both reading as facts about one set, while the set had lost the two checks the
+    first verdict was about. The second line must say that, and a vanished *failure* by name; a reorder must stay
+    silent, because a false positive here is worse than the silence it replaces."""
+
+    FAILED_PAIR = ("Verify / unit-tests", "Verify / ci-status")
+
+    def read_a(self):
+        """The 18 of the real first line: 16 passed and the 2 that failed."""
+        checks = [check_run(f"shard{i:02d}") for i in range(16)]
+        checks += [check_run(name, conclusion="FAILURE") for name in self.FAILED_PAIR]
+        return gg.parse_pr(pr_node(1, rollup="FAILURE", checks=checks))
+
+    def read_b(self):
+        """The 17 of the real second line: those 16, the 2 failures gone, and one check pending that was not there."""
+        checks = [check_run(f"shard{i:02d}") for i in range(16)]
+        checks += [check_run("Verify / rerun", status="IN_PROGRESS", conclusion=None)]
+        return gg.parse_pr(pr_node(1, rollup="PENDING", checks=checks))
+
+    def entry(self, *reads, now=None):
+        """READS stored one after another through the daemon's own write path, 120 s apart, as consecutive fetches
+        of one key -- the real cadence of the pair of lines this is about."""
+        now = NOW if now is None else now
+        for i, data in enumerate(reads):
+            self.daemon.now = now - (len(reads) - 1 - i) * 120.0
+            self.daemon.store("pr:o/r#1", gg.read_cache("pr:o/r#1"), data=data, dataAt=self.daemon.now)
+        return gg.read_cache("pr:o/r#1")
+
+    def test_the_eighteen_to_seventeen_pair_says_the_set_changed(self):
+        entry = self.entry(self.read_a(), self.read_b())
+        text = gg.summary("pr:o/r#1", entry)
+        checks_line = next(line for line in text.splitlines() if line.startswith("checks "))
+        self.assertIn("16 passed, 0 failed, 1 pending (of 17", checks_line)  # the tally is unchanged
+        self.assertIn("basis changed", checks_line)
+        self.assertIn("18 -> 17 checks", checks_line)
+        self.assertIn("not comparable with the earlier read", checks_line)
+        moved = [line for line in text.splitlines() if line.startswith("  basis moved ")]
+        self.assertEqual(len(moved), 1, text)
+        for name in self.FAILED_PAIR:
+            self.assertIn(name, moved[0])
+        self.assertIn("new: Verify / rerun", moved[0])
+
+    def test_a_failed_check_that_vanished_is_named_as_having_no_verdict(self):
+        text = gg.summary("pr:o/r#1", self.entry(self.read_a(), self.read_b()))
+        self.assertIn("2 failed check(s) left it with no verdict", text)
+        self.assertIn("a failed check that disappeared has no verdict -- not a pass, and not a red to chase either",
+                      text)
+        # and it stays a reading, never a verdict: the exit code is the one the 17 checks give on their own
+        entry = self.entry(self.read_a(), self.read_b())
+        self.assertIsNone(gg.check_verdict(entry["data"], "green"))
+        self.assertIsNone(gg.verdict("pr", entry["data"], "done"))
+
+    def test_a_check_that_appeared_is_said_too(self):
+        """17 -> 18: the other direction. A set that grew is not comparable either."""
+        text = gg.summary("pr:o/r#1", self.entry(self.read_b(), self.read_a()))
+        self.assertIn("17 -> 18 checks", text)
+        self.assertIn("new: ", text)
+        self.assertNotIn("left it with no verdict", text)  # nothing that had failed went anywhere
+
+    def test_a_reorder_of_the_same_members_stays_quiet(self):
+        """Order is not membership, and neither is a state that changed inside a member. Both must say nothing."""
+        a = self.read_a()
+        shuffled = {**a, "checks": list(reversed(a["checks"]))}
+        entry = self.entry(a, shuffled)
+        self.assertNotIn("basis", gg.summary("pr:o/r#1", entry))
+        self.assertIsNone(entry.get("churn"))
+        passing = gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run(f"shard{i:02d}") for i in range(16)]
+                                      + [check_run(name) for name in self.FAILED_PAIR]))
+        self.assertNotIn("basis", gg.summary("pr:o/r#1", self.entry(a, passing)))
+
+    def test_a_first_read_and_a_cleared_cache_read_exactly_as_before(self):
+        """The memory is never a correctness dependency: cold, the output is the output of today's code."""
+        cold = gg.summary("pr:o/r#1", {"data": self.read_b(), "dataAt": time.time()})
+        warm = gg.summary("pr:o/r#1", self.entry(self.read_b()))
+        self.assertNotIn("basis", cold)
+        self.assertEqual([line for line in warm.splitlines() if line.startswith("checks ")],
+                         [line for line in cold.splitlines() if line.startswith("checks ")])
+
+    def test_a_partial_read_is_never_a_disappearance(self):
+        """A read that did not happen is unknown (docs/handbook/missing-read-counted-as-a-value.md): a held check
+        page or a rollup past its first page drops members it never read, which is not the set changing."""
+        a = self.read_a()
+        self.assertIsNone(gg.membership_change(a, {**self.read_b(), "checksTruncated": True}, time.time()))
+        self.assertIsNone(gg.membership_change(a, {**self.read_b(), "checksPageError": "HTTP 502"}, time.time()))
+        self.assertIsNone(gg.membership_change({**a, "checksTruncated": True}, self.read_b(), time.time()))
+
+    def test_a_new_head_commit_is_allowed_to_replace_the_basis(self):
+        """A push legitimately brings a new set, and the head is on the headline above the counts already."""
+        pushed = {**self.read_b(), "headRefOid": "b" * 40}
+        self.assertIsNone(gg.membership_change(self.read_a(), pushed, time.time()))
+
+    def test_the_memory_is_bounded_and_typed(self):
+        """glaeda's own rule: human and JSON output stay bounded. Names are capped with a count of the rest, a key
+        keeps CHURN_EVENTS changes, and each is dropped CHURN_KEEP after it happened."""
+        now = time.time()
+        wide = gg.parse_pr(pr_node(1, checks=[check_run(f"other{i:02d}", conclusion="FAILURE") for i in range(30)]))
+        change = gg.membership_change(wide, self.read_b(), now)
+        self.assertEqual(len(change["gone"]), gg.CHURN_NAMED)
+        self.assertEqual(change["goneMore"], 30 - gg.CHURN_NAMED)
+        self.assertEqual(change["goneTotal"], 30)
+        self.assertEqual(len(gg.churn_lines([change], now)), 1)
+        self.assertLess(len(gg.churn_lines([change], now)[0]), 400)
+        self.assertIn(f"+{30 - gg.CHURN_NAMED} more", gg.churn_lines([change], now)[0])
+        log = [dict(change, at=now - i) for i in range(10)]
+        self.assertEqual(len(gg.churn_events(log, now)), gg.CHURN_EVENTS)
+        self.assertEqual(gg.churn_events([dict(change, at=now - gg.CHURN_KEEP - 1)], now), [])
+        self.assertEqual(gg.churn_clause([dict(change, at=now - gg.CHURN_KEEP - 1)], now), "")
+        for field in ("at", "before", "after", "goneTotal", "newTotal", "lostFailedTotal"):
+            self.assertIsInstance(change[field], (int, float))
+        for field in ("gone", "new", "lostFailed"):
+            self.assertTrue(all(isinstance(n, str) for n in change[field]))
+
+    def test_a_change_survives_the_reads_that_did_not_print(self):
+        """The pair that cost the time was two *prints* 120 s apart; the read where the set moved was neither of
+        them. A change stays sayable for CHURN_KEEP, so a reader on that cadence cannot step over it."""
+        entry = self.entry(self.read_a(), self.read_b(), self.read_b())
+        self.assertIn("basis changed", gg.summary("pr:o/r#1", entry))
+        self.assertEqual(len(entry["churn"]), 1)
+
+    def test_json_carries_the_memory_typed(self):
+        entry = self.entry(self.read_a(), self.read_b())
+        doc = json.loads(gg.render("pr:o/r#1", entry, True))
+        self.assertEqual(doc["churn"][0]["before"], 18)
+        self.assertEqual(doc["churn"][0]["after"], 17)
+        self.assertEqual(doc["churn"][0]["lostFailedTotal"], 2)
+
+
+
 if __name__ == "__main__":
     unittest.main()

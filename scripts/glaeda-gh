@@ -9866,6 +9866,14 @@ class Daemon:
                 seen = old.get("headSeenAt") if head and old.get("headRefOid") == head else None
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
+            if key.startswith("pr:"):
+                # What this read's counts are a count over, kept beside them so the next line can say what moved
+                # (churn_log). Carried over a write that brought no data (an error, a jobs-only write), so a
+                # transient failure does not erase the comparison; absent when there is nothing to say.
+                churn = churn_log((base or {}).get("churn"), (base or {}).get("data"), entry["data"], self.now) \
+                    if "data" in fields and isinstance(entry.get("data"), dict) else (base or {}).get("churn")
+                if churn_events(churn, self.now):
+                    entry["churn"] = churn
             write_json(cache, entry)
         if key.startswith("pr:") and "data" in fields:
             if self.land_queue is not None:
@@ -22303,6 +22311,150 @@ def outcome(conclusion: str | None) -> str:
     return "failed" if text in {"failure", "error", ""} else text
 
 
+# ---------------------------------------------------------------- what a tally is a tally of
+
+# A count of checks is a count over a set, and the set changes while nobody is looking at it. One `wait pr` printed
+# these two lines 120 s apart, with nothing between them (teamleaderleo/leo-workspace, 2026-11-22):
+#   checks FAILURE: 16 passed, 2 failed, 0 pending (of 18, 0 required)
+#   checks PENDING: 16 passed, 0 failed, 1 pending (of 17, 0 required)
+# Both lines have the same shape, so both read as facts about one set; but the second set is not the first one with
+# newer states in it -- the two checks the FAILURE verdict was about had left it, and a check that was not there
+# before had arrived. The reader (human or agent) takes away either a red that no longer exists or a green that never
+# ruled on the thing that failed. No single read can say this: the counts are a function of one read, and `summary`
+# had no memory of the one before it. So each read's membership is remembered beside the read (`churn_log`, written
+# at the one place every cache entry is written) and the next line says what came, what went and that the counts are
+# not comparable -- naming a *failed* check that disappeared first, because that is the one that turns a red into a
+# green with no verdict in between (docs/handbook/missing-read-counted-as-a-value.md: a check with no verdict is
+# unknown, never a pass; it must not be read as a red either, which is why this says "not comparable" and invents no
+# verdict of its own).
+#
+# The memory is advisory only, in both directions: no verdict, exit code, `wait` end or land decision reads it, and
+# an entry that does not carry it (a first read, a cleared cache, an entry written by an older daemon) prints exactly
+# what it printed before. It is bounded by CHURN_* at every step: the names of a change are capped with a count of
+# the rest, a key keeps at most CHURN_EVENTS of them, and each is dropped CHURN_KEEP seconds after it happened.
+
+CHURN_KEEP = 300.0  # how long a membership change is still worth saying (two 120 s progress intervals, and slack:
+# a reader printing on that cadence must not be able to step over one)
+CHURN_NAMED = 3     # checks named per direction per change; the rest are counted
+CHURN_EVENTS = 3    # changes remembered per key
+
+
+def check_ident(c: dict) -> str:
+    """How a check is identified from one read to the next: workflow and name, as `parse_pr` keys its latest attempt
+    (so same-named jobs of different workflows stay separate, and a rerun is the same member, not a new one)."""
+    return f"{c.get('workflow') or ''}\0{c.get('name')}"
+
+
+def ident_label(ident: str) -> str:
+    workflow, _, name = str(ident).partition("\0")
+    return f"{workflow} / {name}" if workflow else name
+
+
+def members(data: Any) -> dict[str, str]:
+    """One read's check set: each member's identity -> passed, failed or pending, from its own fields only. Never
+    `classify`'s groups: `held` is this read's rendering of a failed check, not a different membership."""
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return out
+    for c in data.get("checks") or []:
+        if isinstance(c, dict):
+            done = c.get("status") == "COMPLETED"
+            failed = (c.get("conclusion") or "").upper() in FAILED
+            out[check_ident(c)] = "pending" if not done else "failed" if failed else "passed"
+    return out
+
+
+def whole_read(data: Any) -> bool:
+    """A read that holds the whole check set. A partial one (check pages held, a rollup past its first page) is
+    missing members it never read, and a read that did not happen is unknown, never a disappearance."""
+    return (isinstance(data, dict) and isinstance(data.get("checks"), list)
+            and not data.get("checksPageError") and not data.get("checksTruncated"))
+
+
+def membership_change(old: Any, new: Any, now: float) -> dict | None:
+    """What NEW's check set gained and lost against OLD's, bounded and typed, or None when there is nothing to say:
+    the same members in any order (a reorder is not a change, and saying so would be worse than today's silence), a
+    state that changed without the set changing, a first read, either read partial, a set that was empty (nothing to
+    compare against), or a different head commit -- a push is allowed to replace the basis, and the head is on the
+    headline above these counts already."""
+    if not whole_read(old) or not whole_read(new) or old.get("headRefOid") != new.get("headRefOid"):
+        return None
+    before, after = members(old), members(new)
+    gone = sorted(k for k in before if k not in after)
+    came = sorted(k for k in after if k not in before)
+    if not before or (not gone and not came):
+        return None
+    lost = [k for k in gone if before[k] == "failed"]
+
+    def few(keys: list[str]) -> list[str]:
+        return [ident_label(k) for k in keys[:CHURN_NAMED]]
+
+    return {"at": float(now), "before": len(before), "after": len(after),
+            "gone": few(gone), "goneMore": max(0, len(gone) - CHURN_NAMED), "goneTotal": len(gone),
+            "new": few(came), "newMore": max(0, len(came) - CHURN_NAMED), "newTotal": len(came),
+            "lostFailed": few(lost), "lostFailedMore": max(0, len(lost) - CHURN_NAMED),
+            "lostFailedTotal": len(lost)}
+
+
+def churn_log(prior: Any, old: Any, new: Any, now: float, keep: float = CHURN_KEEP) -> list[dict]:
+    """A key's recent membership changes: the ones still inside KEEP, plus this read's change when it has one, at
+    most CHURN_EVENTS of them. The log, rather than the previous read alone, is what a reader on a 120 s cadence
+    needs: the pair of lines that cost the time were two *prints*, and the read where the set moved was neither."""
+    log = churn_events(prior, now, keep)
+    change = membership_change(old, new, now)
+    if change is not None:
+        log.append(change)
+    return log[-CHURN_EVENTS:]
+
+
+def churn_events(log: Any, now: float | None = None, keep: float = CHURN_KEEP) -> list[dict]:
+    """The remembered changes still worth saying, oldest first; [] for anything else, so a cache without this memory
+    reads exactly as it did before there was one."""
+    now = time.time() if now is None else now
+    if not isinstance(log, list):
+        return []
+    return [e for e in log if isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+            and not isinstance(e.get("at"), bool) and now - e["at"] < keep][-CHURN_EVENTS:]
+
+
+def churn_names(event: dict, field: str) -> str:
+    names = [str(n) for n in event.get(field) or []]
+    more = int(event.get(f"{field}More") or 0)
+    return f"{', '.join(names)}{f' +{more} more' if more else ''}" if names else "?"
+
+
+def churn_clause(log: Any, now: float | None = None) -> str:
+    """The note the checks line carries when its own basis moved, or "" when nothing moved. It rides on that line
+    rather than taking one of its own because a wait's progress keeps only the first two lines (`progress_state`),
+    and the counts this is about are on the second of them."""
+    events = churn_events(log, now)
+    if not events:
+        return ""
+    lost = sum(int(e.get("lostFailedTotal") or 0) for e in events)
+    danger = f"; {lost} failed check(s) left it with no verdict" if lost else ""
+    return (f"; basis changed {age(events[0]['at'])} ({events[0].get('before')} -> {events[-1].get('after')} "
+            f"checks){danger}: these counts are not comparable with the earlier read")
+
+
+def churn_lines(log: Any, now: float | None = None) -> list[str]:
+    """One line per remembered change, what went before what came, and a vanished failure named as unknown."""
+    lines = []
+    for e in churn_events(log, now):
+        parts = []
+        gone, lost = int(e.get("goneTotal") or 0), int(e.get("lostFailedTotal") or 0)
+        if gone:
+            had = (" (all of them had failed)" if lost and lost == gone
+                   else f" ({lost} of them had failed: {churn_names(e, 'lostFailed')})" if lost else "")
+            parts.append(f"gone: {churn_names(e, 'gone')}{had}")
+        if lost:
+            parts.append("a failed check that disappeared has no verdict -- not a pass, and not a red to chase either")
+        if e.get("newTotal"):
+            parts.append(f"new: {churn_names(e, 'new')}")
+        lines.append(f"  basis moved {age(e['at'])}: {e.get('before')} -> {e.get('after')} checks; "
+                     + "; ".join(parts))
+    return lines
+
+
 # What a text summary lists by default. Agents read it, so it names the checks that need action and counts the rest:
 # a superseded attempt is not counted toward the verdict, so it is one count line, not one line each (a green
 # cmux PR printed seven of them, half its summary). --verbose or AGENT_VERBOSE=1 lists them all, as before; --json
@@ -22363,6 +22515,12 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             left = settling(data, now)
             lines.append("checks: none reported yet for this head commit"
                          + (f" (not started; settles in {int(left)}s)" if left is not None else "") + partial)
+        # The line just appended is this read's tally (either branch above appends exactly one). A tally whose
+        # basis moved says so on that same line, and then what moved; nothing here changes a verdict.
+        basis = churn_clause(entry.get("churn"), now)
+        if basis:
+            lines[-1] += basis
+            lines += churn_lines(entry.get("churn"), now)
         if data.get("state") == "OPEN" and expected_missing(data):
             lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
         if data.get("requiredMissing"):
