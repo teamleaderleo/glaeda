@@ -33230,6 +33230,16 @@ class RefreshStallTest(AlarmBase):
         gg.first_heartbeat()
         self.assertNotIn("stalled", gg.read_json(gg.BASE / "daemon.json"))
 
+    def test_heartbeats_name_the_script_bytes_the_daemon_runs(self) -> None:
+        """fast-patch (leo-workspace tools/fast-patch) reads which bytes a re-exec'd daemon runs from daemon.json:
+        the first heartbeat and every later one carry serve's scriptSha256."""
+        with mock.patch.dict(gg.RUNNING_SCRIPT, {"scriptSha256": "ab" * 32, "scriptSince": 1.0}, clear=True):
+            gg.first_heartbeat()
+            self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["scriptSha256"], "ab" * 32)
+            daemon = gg.Daemon()
+            daemon.tick()
+            self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["scriptSha256"], "ab" * 32)
+
 
 class ResetPaceTest(unittest.TestCase):
     """gh-quota-spiral, 2026-11-17: the login's REST hour reset at 15:48:36Z and ~5000 calls spent it before 15:49:30Z;

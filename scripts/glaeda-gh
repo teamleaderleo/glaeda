@@ -603,6 +603,10 @@ RESTART_COOLDOWN = 180  # `glaeda-gh restart` within this long of the last one w
 RESTART_SETTLE = 45  # how long `restart` waits for a new daemon's heartbeat
 BOOTSTRAP_RETRY = 10  # launchctl bootstrap is retried this long after bootout
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
+# What this daemon runs, in every heartbeat: the sha256 of the script's bytes when serve started (the bytes
+# script_changed compares) and when. leo-workspace tools/fast-patch reads it to know a swapped-in release is the one
+# running, instead of inferring it from a start after the swap; `glaeda-gh status` readers can name the build too.
+RUNNING_SCRIPT: dict = {}
 # A request's socket timeout bounds each read, not the request: a server that trickles bytes, or a tick
 # of many slow reads, kept one 10-20 daemon silent for 20 minutes. So every request also has a hard
 # wall-clock deadline, a tick stops starting requests after TICK_BUDGET (the rest go first next tick),
@@ -8975,7 +8979,7 @@ class Daemon:
         self.fed_repos = {r: t for r, t in self.fed_repos.items() if self.now - t < FED_REPO_KEEP}
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
-        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
+        status = {**RUNNING_SCRIPT, "pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
                   "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   # `fedRepos` and `okAt` are Daemon.fed's own two inputs, published so a client can tell whether a
@@ -20936,7 +20940,7 @@ def first_heartbeat(now: float | None = None) -> None:
     if isinstance(before, dict):
         last = before if before.get("state") in ("held", "stale") else before.get("last")
         status["stale"] = {"state": "starting", **({"last": last} if isinstance(last, dict) else {})}
-    write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
+    write_json(BASE / "daemon.json", {**status, **RUNNING_SCRIPT, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
 
@@ -21169,6 +21173,9 @@ def serve(foreground_ok: bool = False) -> int:
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
     lock = hold_daemon_lock()
+    me = Path(__file__).resolve()
+    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
+    RUNNING_SCRIPT.update(scriptSha256=seen["sha"], scriptSince=time.time())
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
     os.environ.pop(GRAPHQL_SLOT_ENV, None)
@@ -21176,11 +21183,9 @@ def serve(foreground_ok: bool = False) -> int:
         swept = sweep_temp_files()
         if swept:
             log({"event": "swept", "tempFiles": swept})
-    me = Path(__file__).resolve()
-    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
+    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
