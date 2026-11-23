@@ -21789,6 +21789,30 @@ class StaleDataTest(Base):
         self.assertEqual(seen[0][0][-2:], ["o/r", "-"])
         self.assertEqual(seen[0][1], "glaeda-upstream")
 
+    def test_one_broker_get_has_its_own_share_of_a_direct_reads_budget(self) -> None:
+        """A lane VM, 2026-11-22: one GET waiting on the broker socket spent a whole 60 s land refresh. Each GET has
+        DIRECT_GET_SHARE, then one more try in what is left; two spent shares end the read, saying which GET."""
+        timeouts = []
+
+        def fake(argv, timeout=None, input_text=None, env=None):
+            timeouts.append(timeout)
+            if len(timeouts) == 1 or answers == "never":
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "status": 200, "data": {"id": 1}}), "")
+        answers = "second"
+        with mock.patch.object(gg, "run_bounded", fake):
+            send = gg.broker_transport(["/home/cmux/.local/bin/lane-gh", "call", "get"], lambda: time.monotonic() + 60)
+            status, _, body = send("GET", "https://api.github.com/repos/o/r/pulls/9", {}, None)
+            self.assertEqual((status, json.loads(body)), (200, {"id": 1}))
+            self.assertEqual(len(timeouts), 2)
+            self.assertLessEqual(max(timeouts), gg.DIRECT_GET_SHARE)
+            timeouts.clear()
+            answers = "never"
+            with self.assertRaises(gg.OutOfTime) as stop:
+                send("GET", "https://api.github.com/repos/o/r/pulls/9", {}, None)
+        self.assertEqual(len(timeouts), 2)
+        self.assertIn("GET pulls/9: no answer in its 25s share, twice", str(stop.exception))
+
     def test_a_direct_read_never_writes_the_daemons_rest_spend(self) -> None:
         """The client's Daemon read rest-spend.json at construction; charging a REST read wrote that old copy back over
         the minutes the daemon counted since."""
@@ -24725,6 +24749,18 @@ class LandTest(Base):
         self.assertEqual(gg.pr_head_parent(node(LB, []), node(LB, [])["commits"]["nodes"]), "")
         self.assertEqual(gg.pr_head_parent({"headRefOid": LB}, [{}]), "")
 
+    def test_the_pr_read_asks_for_enough_parents_to_see_a_base_merge_on_the_pin(self):
+        # 2026-11-22 22:55-23:55Z: the read asked parents(first: 1), so every cached head had one parent, a base merge
+        # on the pin was never seen as one (0 repin_base_merge, 22 of 31 head_moved stops were such merges).
+        asked = re.search(r"parents\(first: (\d+)\)", gg.PR_FIELDS)
+        self.assertGreaterEqual(int(asked.group(1)), 3)  # three, so an octopus merge is not taken for a two-parent one
+        node = {"headRefOid": LB, "commits": {"nodes": [{"commit": {
+            "oid": LB, "parents": {"nodes": [{"oid": LA}, {"oid": LC}]}}}]}}
+        parents = gg.head_parents(node)
+        self.assertEqual(parents, [LA, LC])
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": parents}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA, LC, "d" * 40]}), "")
+
     def test_a_pin_that_is_another_checkouts_head_is_refused_at_request_time(self):
         # `--match-head-commit $(git rev-parse HEAD)` run from a worktree of another repository pins the land to a sha
         # the target does not have. Detected with two local git calls and no GitHub read; the refusal names the read
@@ -24850,6 +24886,38 @@ class LandTest(Base):
         self.assertEqual(len(self.compares()), 2)  # once per head
         self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
         self.assert_merged_at(LB)
+
+    def test_a_copy_showing_a_pin_already_followed_away_from_is_a_stale_read_not_a_moved_head(self):
+        # glaeda#2540, 2026-11-22 22:08Z: followed 023cd7fc -> f745a168, then stopped on a copy still showing 023cd7fc
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("waiting", LB))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # a lagging copy: the pin it left
+        e = self.tick(700)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.assertIn("old_pin_seen", [h["event"] for h in e["history"]])
+        self.pr(LB, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.cache[self.KEY]["data"].update(headParents=[LA, self.LD], headParent=LA, baseRefName="main")
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(60)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LB)
+
+    def test_a_branch_left_on_a_pin_already_followed_away_from_stops_after_the_wait(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(refusal("checks_running", LB, {"kind": "wait_pr", "sha": LB, "until": "done",
+                                                              "timeout_s": 600}))
+        self.tick(30)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        e = self.tick(700)
+        self.assertIsNone(e.get("stop"))
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
         # pin_wait's stop (a read since the request shows another head) defers to the same check
@@ -30585,6 +30653,100 @@ class LandTest(Base):
         self.tick()  # judged on the copy it has
         self.assert_merged_at(LA)
         self.assertEqual(self.w.refreshed, [self.KEY])
+
+    def held_refresh_queue(self, error: list) -> tuple[list, list]:
+        """An upstream host's queue whose refresh answers ERROR[0] (None: a read that stores LA), with two stale
+        entries, KEY and o/r#2; (keys refreshed, land-refresh rows)."""
+        self.upstream = True
+        self.q = self.queue()
+        self.q.now = self.t
+        refreshed: list = []
+
+        def refresh(key: str) -> str | None:
+            refreshed.append(key)
+            if error[0] is None:
+                self.w.set_pr(key, land_pr(LA), self.q.now)
+            return error[0]
+        self.q.refresh = refresh
+        for key in (self.KEY, "pr:o/r#2"):
+            self.pr(LA, key=key)
+            self.w.cache[key]["dataAt"] = self.t - 3600
+            self.q.entries[key] = {"key": key, "repo": "o/r", "number": key[-1], "state": "queued"}
+        rows: list = []
+        logged = mock.patch.object(gg, "log", rows.append)
+        logged.start()
+        self.addCleanup(logged.stop)
+        return refreshed, rows
+
+    def due(self, key: str) -> bool:
+        return self.q.refresh_due(self.q.entries[key], self.w.cache[key])
+
+    def test_a_broker_refresh_failure_holds_every_refresh_then_one_probe_ends_it(self):
+        """A lane VM, 2026-11-22: 503 refreshes "no answer within 60s" against 120 answered, failing in pairs in the
+        same second: each worker spent its own 60 s on one broker outage. One such failure holds the host's
+        refreshes (doubling), one probe goes past the hold's end, and an answer ends it."""
+        error = ["no answer within 60s (GET pulls/1: no answer in its 25s share, twice)"]
+        refreshed, rows = self.held_refresh_queue(error)
+        two = "pr:o/r#2"
+        self.assertTrue(self.due(self.KEY))
+        hold = self.q.refresh_hold
+        self.assertEqual((hold["kind"], hold["n"], hold["until"]), ("broker", 1, self.q.now + 30))
+        self.assertEqual(rows[-1]["hold"], {"kind": "broker", "until": gg.utc_clock(self.q.now + 30), "n": 1})
+        self.assertEqual((rows[-1]["event"], rows[-1]["key"], rows[-1]["error"]), ("land-refresh", self.KEY, error[0]))
+        self.assertFalse(self.due(two))  # held: judged on its copy, no read
+        self.assertEqual(refreshed, [self.KEY])
+        self.q.now += 31
+        self.assertTrue(self.due(two))  # the probe
+        self.assertTrue(rows[-1]["probe"])
+        self.assertEqual((self.q.refresh_hold["n"], self.q.refresh_hold["until"]), (2, self.q.now + 60))
+        self.assertIsNone(self.q.refresh_probe)
+        self.q.now += 61
+        self.assertEqual(self.q.refresh_starting("x"), {"probe": True})  # one probe at a time: the rest held
+        self.assertTrue(self.q.refresh_held())
+        self.q.refresh_probe = None
+        error[0] = None
+        self.q.now += gg.LAND_REFRESH_AFTER
+        self.assertTrue(self.due(self.KEY))
+        self.assertIsNone(self.q.refresh_hold)
+        self.assertNotIn("hold", rows[-1])
+        self.assertTrue(self.due(two))  # answered: nothing held
+        self.assertEqual(refreshed, [self.KEY, two, self.KEY, two])
+
+    def test_a_refresh_failure_that_is_not_the_brokers_holds_nothing(self):
+        refreshed, rows = self.held_refresh_queue(["rest: HTTP 404 Not Found"])
+        self.assertTrue(self.due(self.KEY))
+        self.assertIsNone(self.q.refresh_hold)
+        self.assertTrue(self.due("pr:o/r#2"))
+        self.assertNotIn("hold", rows[-1])
+
+    def test_a_quota_refusal_naming_its_reset_holds_every_refresh_until_it(self):
+        at = time.gmtime(self.t + 600)
+        clock = f"{at.tm_hour:02d}:{at.tm_min:02d}Z"
+        error = [f"rest: HTTP 403 GitHub's REST rate limit is spent for read-pool until {clock} (reset); not sent, "
+                 f"retry after {clock}"]
+        refreshed, rows = self.held_refresh_queue(error)
+        said = gg.land_quota_said(error[0], self.q.now)
+        self.assertTrue(self.due(self.KEY))
+        self.assertEqual((self.q.refresh_hold["kind"], self.q.refresh_hold["until"]), ("quota", said))
+        self.assertEqual(rows[-1]["hold"]["kind"], "quota")
+        self.q.now = said - 1
+        self.assertFalse(self.due("pr:o/r#2"))
+        self.q.now = said + 1
+        error[0] = None
+        self.assertTrue(self.due("pr:o/r#2"))
+        self.assertIsNone(self.q.refresh_hold)
+        self.assertEqual(refreshed, [self.KEY, "pr:o/r#2"])
+
+    def test_land_status_names_an_entry_whose_refreshes_never_answered(self):
+        refreshed, rows = self.held_refresh_queue(["rest: HTTP 502 direct: GitHub GET pulls/1: timed out"])
+        for _ in range(3):
+            self.q.refresh_job(self.KEY)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(rows[-1]["unanswered"], 3)
+        line = gg.land_line(e, self.q.now, latch=None)
+        self.assertIn("refresh unanswered 3x (never answered): rest: HTTP 502 direct: GitHub GET pulls/1", line)
+        e["refreshUnanswered"] = 2
+        self.assertNotIn("refresh unanswered", gg.land_line(e, self.q.now, latch=None))
 
     def test_refresh_pacing_and_only_on_upstream_hosts(self):
         self.pr(LA)
