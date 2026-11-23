@@ -15880,6 +15880,14 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     marker.unlink()
         elif args.dedicated_admit:
+            # A dedicated runner's job may take a root too (cmux's DerivedData seed on a trusted-main runner runs
+            # `glaeda-canonical-root take`), so it links the shim and drops a crashed job's records as a ledger
+            # runner does. Without it a dedicated-only mini (cmux7s) never had the helper, and its two seed roots
+            # were held by nothing.
+            with contextlib.suppress(OSError):
+                roots_file(args.state_dir).unlink(missing_ok=True)
+                gui_file(args.state_dir).unlink(missing_ok=True)
+            ensure_root_shim(Path(FLEET_DIR) / "bin")
             held, note = True, ""
             if args.yield_to_exclusive:
                 held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
