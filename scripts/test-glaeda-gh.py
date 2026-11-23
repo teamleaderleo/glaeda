@@ -28862,20 +28862,51 @@ class LandTest(Base):
         self.assertIn("handed to ", sent[-1])
         self.assertIn(f"still reads open at {LA[:12]}", sent[-1])
         self.assertIn(f"glaeda-gh land o/r#1 --sha {LA}", sent[-1])
+        self.assertEqual(sent[sent.index("--class") + 1], "fyi")  # an inbox fyi, never a blocker
+        self.assertEqual(sent[sent.index("--severity") + 1], "info")
         self.assertTrue(any(h.get("event") == "forward_quiet" for h in e["history"]), e["history"])
         self.assertEqual(e["state"], "forwarded")
         for _ in range(3):
             self.tick(gg.LAND_FORWARD_QUIET)
         self.assertEqual(len(self.quiet_notices()), 1, "told once per forward")
+        # huge-blue 2026-11-23: cmux#18775 told three times, once per hand-off. A new hand-off of the same PR (a
+        # re-send, a re-land) is no new word: one per PR, kept on the row across passes and restarts
+        e = self.q.entries[self.KEY]
+        e["handedOff"]["at"] = self.t
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        self.assertEqual(len(self.quiet_notices()), 1, "told once per PR")
+        on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
+        self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
-    def test_a_forward_whose_pr_ended_tells_nobody_and_one_whose_read_never_lands_still_tells(self):
+    def test_a_forward_told_it_had_no_verdict_gives_up_with_no_second_notice(self):
+        e = self.handed_off()
+        e["forwardQuietTold"] = {"at": self.t, "since": self.t, "to": "huge-blue"}
+        sent = len(self.w.sent())
+        self.q.forward_give_up(e, "OPEN", "huge-blue", False, "it was landed again here and that has no outcome")
+        e = self.tick(1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual([c for c in self.w.sent()[sent:] if "forward_no_outcome" in c[-1]], [])
+
+    def test_a_row_told_before_the_once_per_pr_mark_is_not_told_again(self):
+        # a huge-blue row told under the per-hand-off rule carries forwardQuiet.to and no forwardQuietTold
+        e = self.handed_off()
+        e["forwardQuiet"] = {"since": 1.0, "at": 2.0, "to": "huge-blue", "head": LA, "read": True}
+        self.pr(LA)
+        self.tick(gg.LAND_FORWARD_QUIET + 10)
+        self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
+        self.assertEqual(self.quiet_notices(), [])
+
+    def test_a_forward_whose_pr_ended_or_whose_read_never_lands_tells_nobody(self):
         e = self.handed_off()
         self.pr(LA, state="MERGED")
         self.tick(gg.LAND_FORWARD_QUIET + 10)
         self.tick()
         self.assertEqual(self.quiet_notices(), [])
         self.assertEqual(self.q.entries[self.KEY]["forwardQuiet"]["ended"], "MERGED")
-        # a fresh forward whose PR is never read again: told once the read's wait is out, saying no read ended it
+        # a fresh forward whose PR is never read again: once the read's wait is out nobody is told on a state nobody
+        # read (huge-blue 2026-11-23: most of the ~20 [blocker]s in 10 min said only "no read of the PR here says it
+        # ended"); forward_follow's give-up reads it live
         self.w.cache.pop(self.KEY, None)
         e = self.q.entries[self.KEY]
         e.pop("forwardQuiet")
@@ -28883,8 +28914,13 @@ class LandTest(Base):
         self.tick(gg.LAND_FORWARD_QUIET + 10)
         self.assertEqual(self.quiet_notices(), [])
         self.tick(gg.LAND_FORWARD_READ_WAIT + 10)
-        [sent] = self.quiet_notices()
-        self.assertIn("no read of the PR here says it ended", sent[-1])
+        self.assertEqual(self.quiet_notices(), [])
+        e = self.q.entries[self.KEY]
+        self.assertTrue(e["forwardQuiet"]["unread"])
+        self.assertNotIn("forwardQuietTold", e)
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(self.quiet_notices(), [])
 
     def test_a_pinned_land_whose_pin_is_not_the_brokers_head_stops_naming_it(self):
         self.broker = True
