@@ -13680,7 +13680,15 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # "GitHub rate limit (HTTP 403) on the broker host's gh login" twice, each judgment after it counted, and the entry
 # stopped "3 identical refusals in a row" at 19:17Z on a quota that reset minutes later.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
-                             r"|rate limit is spent|secondary rate limit|content-creation cooldown", re.I)
+                             r"|rate limit is spent|secondary rate limit|content-creation cooldown"
+                             r"|content writes are paced", re.I)
+# The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
+# next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
+# paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
+# never counts toward a stop. teamleaderleo/leo-workspace#8104, 2026-11-23 08:06Z: six paced merges in a row stopped
+# a land_judge-approved PR merge_refused; update-branch rows stopped update_branch_conflict / update_branch_refused.
+LAND_PACE = re.compile(r"content writes are paced (?:until reset \((\d+)\s*s\b|for (\d+)\s*s more)", re.I)
+LAND_PACE_ANY = re.compile(r"content writes are paced", re.I)
 # The time a refusal names, in gh_latch.reset_from's order: land_judge's "no attempt before", then "retry after" /
 # "until" (the latch SENTENCE). HH:MMZ with no seconds is the end of that minute, as gh_latch reads it.
 LAND_QUOTA_SAID = (re.compile(r"\bno attempt before\s+(\d{2}):(\d{2})(?::(\d{2}))?Z"),
@@ -14895,6 +14903,10 @@ def land_quota_said(text: str, now: float) -> float | None:
     """The reset a quota refusal's TEXT names (HH:MM[:SS]Z, see LAND_QUOTA_SAID), as the next such time at or after
     NOW (a time up to 120 s past is this window's, just gone, as gh_latch._next_at reads it), or None: no time, or one
     more than LAND_QUOTA_MAX_S ahead."""
+    m = LAND_PACE.search(text or "")
+    if m:  # the pacer names seconds: the reset is that long from NOW (same bound as a clock time)
+        sec = float(m.group(1) or m.group(2))
+        return now + sec if sec <= LAND_QUOTA_MAX_S else None
     for pattern in LAND_QUOTA_SAID:
         m = pattern.search(text or "")
         if not m:
@@ -16231,7 +16243,8 @@ class LandQueue:
         only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
-        own = not host or bool(LAND_JOB_QUOTA.search(text or ""))  # its PR's own CI job's limit, not this host's
+        # its PR's own CI job's limit, or the pacer on content writes: not this host's reads
+        own = not host or bool(LAND_JOB_QUOTA.search(text or "") or LAND_PACE_ANY.search(text or ""))
         if not own:
             self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
