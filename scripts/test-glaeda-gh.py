@@ -6326,6 +6326,46 @@ class ClientTest(Base):
         self.assertIsNone(gg.verdict("pr", gg.parse_pr({**pr_node(1, rollup="PENDING", checks=slow),
                                                        "mergeStateStatus": "CLEAN"}), "green"))
 
+    def test_each_conclusion_lands_on_one_group(self) -> None:
+        """A skipped check is neither passed nor failed: it decided it had nothing to do."""
+        checks = [check_run("ok"), check_run("red", conclusion="FAILURE"),
+                  check_run("nothing-to-do", conclusion="SKIPPED"),
+                  check_run("stopped", conclusion="CANCELLED"),
+                  check_run("still-going", "IN_PROGRESS", None)]
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=checks))
+        groups = gg.classify(data, NOW + 10_000)  # past the rescue grace: nothing is held
+        self.assertEqual({k: [c["name"] for c in v] for k, v in groups.items()},
+                         {"passed": ["ok"], "skipped": ["nothing-to-do"], "failed": ["red", "stopped"],
+                          "pending": ["still-going"], "held": []})
+        # the verdict does not move: a skipped check was no failure before and is none now
+        self.assertEqual(gg.verdict("pr", data, "green", now=NOW + 10_000), 1)
+        green = [c for c in checks if c["conclusion"] not in ("FAILURE", "CANCELLED") and c["status"] == "COMPLETED"]
+        node = {**pr_node(2, rollup="SUCCESS", checks=green), "mergeStateStatus": "CLEAN"}
+        self.assertEqual(gg.verdict("pr", gg.parse_pr(node), "green", now=NOW + 10_000), 0)
+
+    def test_the_checks_line_counts_skipped_checks_apart_and_names_them(self) -> None:
+        """manaflow-ai/cmux#51140 at 1c521f6e: 117 of 158 checks were SKIPPED and the line read
+        "159 passed", so a reader went looking for a lint that had never been emitted. A skipped
+        check gave no verdict: it is counted apart and named, bounded, required first."""
+        checks = [{**check_run("build"), "isRequired": True},
+                  {**check_run("clippy (changed cmux-tui packages)", conclusion="SKIPPED"), "isRequired": True}]
+        checks += [{**check_run(f"placement {n}", conclusion="SKIPPED"), "isRequired": False} for n in range(6)]
+        node = {**pr_node(51140, rollup="SUCCESS", checks=checks), "mergeStateStatus": "CLEAN"}
+        data = gg.parse_pr(node)
+        text = gg.summary("pr:manaflow-ai/cmux#51140", {"data": data}, "green")
+        self.assertIn("checks SUCCESS: 1 passed, 7 skipped (no verdict), 0 failed, 0 pending (of 8, 2 required)", text)
+        self.assertIn("  no verdict (skipped, nothing they would have judged was judged): "
+                      "clippy (changed cmux-tui packages), placement 0, placement 1, placement 2, "
+                      "placement 3, +2 more", text)
+        # it is still no red: the PR was landable the whole time
+        self.assertEqual(gg.verdict("pr", data, "green"), 0)
+        # with nothing skipped the line is as it was
+        plain = gg.parse_pr({**pr_node(2, rollup="SUCCESS", checks=[{**check_run("build"), "isRequired": True}]),
+                             "mergeStateStatus": "CLEAN"})
+        plain_text = gg.summary("pr:o/r#2", {"data": plain}, "green")
+        self.assertIn("checks SUCCESS: 1 passed, 0 failed, 0 pending (of 1, 1 required)", plain_text)
+        self.assertNotIn("no verdict", plain_text)
+
 
     # -- comments
 
