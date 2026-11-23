@@ -2648,6 +2648,11 @@ class HookTest(unittest.TestCase):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), None, log))
             with mock.patch.object(hook, "free_gib", return_value=40.0):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+            # JOB_OWN_NEED_ALONE: a peak learned only beside other jobs counts their writes too: no refusal
+            crowded = self.peak_log([(100.0, 45.0, False)] * 20)
+            self.assertIn("p90 of 20 runs here", hook.learned_job_peaks(hook.job_log_tail(crowded))[self.PEAK_KEY][1])
+            with mock.patch.object(hook, "free_gib", return_value=17.2):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded))
             with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
             with mock.patch.object(hook, "free_gib", return_value=5.0), \
@@ -12637,7 +12642,13 @@ class GateTest(unittest.TestCase):
 
     def test_job_disk_own_refusal_leaves_its_need_for_the_listeners(self) -> None:
         """The refusal itself writes the record the listener gate reads (OWN_NEED_HOLD); admitted, it writes none."""
+        # JOB_OWN_NEED_ALONE: a peak learned beside other jobs neither refuses nor leaves a record for the listeners
         with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here")}), \
+                mock.patch.object(hook, "job_log_tail", return_value=""), \
+                mock.patch.object(hook, "free_gib", return_value=18.0):
+            self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
+        self.assertIsNone(hook.own_need_held(self.state, 18.0))
+        with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here alone")}), \
                 mock.patch.object(hook, "job_log_tail", return_value=""):
             with mock.patch.object(hook, "free_gib", return_value=70.0):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
