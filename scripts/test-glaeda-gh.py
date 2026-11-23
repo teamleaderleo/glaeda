@@ -28691,6 +28691,33 @@ class LandTest(Base):
         self.assertEqual((len(self.handoffs()), e["forwardResent"]["n"]), (3, 2))
         self.assertEqual(len(self.w.explains()), 1)  # nothing judged here: only handed on
 
+    def test_a_forwarded_land_with_no_outcome_past_the_give_up_stops_naming_why_and_tells_its_requester(self):
+        # A pinned land handed to the executor sat 260 min with no outcome: nothing ended it. Still open, re-sent
+        # twice, no answer: it stops forward_no_outcome, the requester told, the far host named.
+        self.forwarded_row()
+        for _ in range(int(1.5 * gg.LAND_FORWARD_GIVE_UP // (gg.LAND_FORWARD_LOOK_EVERY + 1))):
+            if self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)["state"] != "forwarded":
+                break
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual(e["forwardResent"]["n"], 2)
+        self.assertIn("handed off again 2 times", e["stop"]["reason"])
+        self.assertIn("huge-blue", e["stop"]["reason"])
+        self.assertIn("glaeda-gh land o/r#1", e["stop"]["next"])
+        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(said[3], "host/lane")
+
+    def test_a_forwarded_land_the_cache_never_read_stops_at_the_give_up_instead_of_staying_forwarded(self):
+        # the case no re-send reaches: this host has no read of the PR, so forward_follow had nothing to act on
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("holds no read of the PR", e["stop"]["reason"])
+        self.assertEqual(len(self.handoffs()), 1)
+
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
         self.pr(LB)
