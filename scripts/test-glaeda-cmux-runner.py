@@ -4379,7 +4379,8 @@ class HookTest(unittest.TestCase):
         side runner refuses it before taking anything, and FAST_TIER_BUSY does not admit it busy."""
         self.fleet()
         roots, stack = self.held_seed_roots()
-        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots))}
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "0"}
         with stack:
             try:
                 side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
@@ -4394,6 +4395,59 @@ class HookTest(unittest.TestCase):
             self.assertNotIn("seed root:", side.stdout)
         finally:
             self.finish("s2")
+
+    def test_a_fast_tier_with_every_seed_root_held_waits_for_one_to_free_then_runs(self) -> None:
+        """SIDE_SEED_WAIT: after #2665, 57-69% of PR fast tiers an hour were refused at setup (12-18Z 11-23), each
+        re-run waiting out the Mac queue again. The side runner waits for a seed root instead, and runs on it."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "60"}
+        timer = threading.Timer(1.0, stack.close)
+        timer.start()
+        try:
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("SIDE_SEED_WAIT start", side.stdout)
+            self.assertIn("SIDE_SEED_WAIT end: free after", side.stdout)
+            self.assertNotIn("refused", side.stdout)
+        finally:
+            timer.cancel()
+            stack.close()
+            self.finish("s2")
+        self.assertEqual(list(self.dir.glob(hook.SIDE_SEED_WAITER + "*")), [], "the waiter marker is gone")
+
+    def test_a_seed_wait_past_its_bound_or_with_every_waiter_slot_taken_is_refused_as_before(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            why, cause = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=0.2,
+                                             poll=0.05)
+            self.assertEqual((why, cause), ("SIDE_SEED_FREE x", None))
+            self.assertIn("SIDE_SEED_WAIT end: refused", out.getvalue())
+            live = [subprocess.Popen(["sleep", "30"]) for _ in roots]
+            try:
+                for proc in live:
+                    (self.dir / f"{hook.SIDE_SEED_WAITER}{proc.pid}").touch()
+                (self.dir / f"{hook.SIDE_SEED_WAITER}999999999").touch()  # a dead hook's marker counts for nothing
+                self.assertEqual(hook.side_seed_waiters(self.dir), len(roots))
+                self.assertFalse((self.dir / f"{hook.SIDE_SEED_WAITER}999999999").exists())
+                start = time.monotonic()
+                why, _ = hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30)
+                self.assertEqual(why, "SIDE_SEED_FREE x", "one waiter per seed root: the next is refused at once")
+                self.assertLess(time.monotonic() - start, 5)
+            finally:
+                for proc in live:
+                    proc.kill()
+                    proc.wait()
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots),
+                                                 bound=0), ("SIDE_SEED_FREE x", None), "bound 0: as before")
+
+    def test_a_seed_wait_gives_up_when_its_job_is_gone(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: "cancelled", tuple(roots),
+                                                 bound=30, poll=0.05), (None, "cancelled"))
+            self.assertIn("SIDE_SEED_WAIT end: abandoned", out.getvalue())
 
     def test_a_seed_root_is_free_when_the_first_is_unheld_or_a_marked_second_is(self) -> None:
         roots, stack = self.held_seed_roots(second=False)

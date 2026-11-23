@@ -8051,6 +8051,88 @@ def seed_root_refusal(roots: tuple[Path, ...] | None = None, capacity_dir: Path 
             "this one would build cold past its limit (SIDE_SEED_FREE)")
 
 
+# SIDE_SEED_WAIT (2026-11-23): SIDE_SEED_FREE's refusal fails the job, and its re-run waits out the Mac queue (about
+# 40 min) again: after #2665 (11:25Z) 57-69% of the PR "cmux-next fast tier" jobs an hour were refused at setup, 12-18Z
+# 11-23 (controller timing feed; 26 of 30 sampled logs read SIDE_SEED_FREE), from 0-7% an hour 03-11Z. A seed root
+# frees when its job ends; a fast tier that runs takes 21 min p50 (1250 jobs, 11-22 12Z to 11-23 18Z), so with two
+# held, the first frees in about a third of that (7 min) on average, well inside the 40 min the re-run's queue costs.
+# So the side runner now waits for a free seed root, before it takes anything, at most SIDE_SEED_WAIT_S, and
+# is refused as before only past it. At most one waiter per seed root on a mini (SIDE_SEED_WAITER marker files in the
+# capacity ledger, each a live hook's pid): another waiter is refused at once, as before. A cancelled or gone job
+# gives the wait up. Each wait logs "SIDE_SEED_WAIT start" and one end line with its seconds and outcome.
+SIDE_SEED_WAIT = "SIDE_SEED_WAIT"
+SIDE_SEED_WAIT_S = 15 * 60.0
+SIDE_SEED_WAIT_ENV = "GLAEDA_SIDE_SEED_WAIT_S"  # another bound (tests; 0 refuses at once, as before)
+SIDE_SEED_POLL_S = 5.0
+SIDE_SEED_WAITER = "side-seed-waiter-"
+
+
+def side_seed_wait_bound() -> float:
+    raw = (os.environ.get(SIDE_SEED_WAIT_ENV) or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else SIDE_SEED_WAIT_S
+    except ValueError:
+        return SIDE_SEED_WAIT_S
+
+
+def side_seed_waiters(capacity_dir: Path) -> int:
+    """The live SIDE_SEED_WAIT waiters on this mini; a dead hook's marker is removed."""
+    n = 0
+    with contextlib.suppress(OSError):
+        for marker in capacity_dir.glob(SIDE_SEED_WAITER + "*"):
+            try:
+                pid = int(marker.name[len(SIDE_SEED_WAITER):])
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError):
+                with contextlib.suppress(OSError):
+                    marker.unlink()
+                continue
+            except PermissionError:
+                pass
+            n += 1
+    return n
+
+
+def side_seed_wait(why: str, capacity_dir: Path | None, gone: Callable[[], str | None],
+                   roots: tuple[Path, ...] | None = None, bound: float | None = None,
+                   poll: float = SIDE_SEED_POLL_S) -> tuple[str | None, str | None]:
+    """SIDE_SEED_WAIT: wait for a free seed root. Returns (refusal, None) past the bound or with every waiter slot
+    taken, (None, cause) when gone() names a cause to give up, and (None, None) once a seed root is free."""
+    bound = side_seed_wait_bound() if bound is None else bound
+    slots = len(seed_roots() if roots is None else roots)
+    if bound <= 0 or capacity_dir is None:
+        return why, None
+    if side_seed_waiters(capacity_dir) >= slots:
+        print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: {slots} waiter(s) already wait for a seed root here", flush=True)
+        return why, None
+    marker = capacity_dir / f"{SIDE_SEED_WAITER}{os.getpid()}"
+    start = time.monotonic()
+    print(f"{PREFIX}: {SIDE_SEED_WAIT} start: every seed root is held; waiting at most {bound:g} s for one to free "
+          "instead of refusing (a re-run waits out the Mac queue again)", flush=True)
+    outcome, result = "refused", (why, None)
+    try:
+        with contextlib.suppress(OSError):
+            capacity_dir.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        while True:
+            cause = gone()
+            if cause:
+                outcome, result = "abandoned", (None, cause)
+                break
+            if seed_root_refusal(roots, capacity_dir) is None:
+                outcome, result = "free", (None, None)
+                break
+            left = bound - (time.monotonic() - start)
+            if left <= 0:
+                break
+            time.sleep(min(poll, left))
+    finally:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        print(f"{PREFIX}: {SIDE_SEED_WAIT} end: {outcome} after {time.monotonic() - start:.0f} s", flush=True)
+    return result
+
+
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
@@ -15723,7 +15805,16 @@ def main(argv: list[str] | None = None) -> int:
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS
                 and (why := seed_root_refusal(capacity_dir=args.capacity_dir))):
-            return refused(why)  # SIDE_SEED_FREE: refused before it takes anything; never admitted busy
+            # SIDE_SEED_WAIT: wait for a seed root first; SIDE_SEED_FREE refuses before it takes anything, never busy
+            def seed_wait_gone() -> str | None:
+                if owner is not None and owner.gone():
+                    return OWNER_GONE
+                return JOB_CANCELLED if job_cancel_requested(job_runner_dir(JOB_CWD)) else None
+            why, cause = side_seed_wait(why, args.capacity_dir, seed_wait_gone)
+            if cause:
+                return abandoned("" if cause == OWNER_GONE else cause)
+            if why:
+                return refused(why)
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
             # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
