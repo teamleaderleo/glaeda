@@ -28,7 +28,7 @@
 # It never touches the drain marker, the gate or any other runner, and changes nothing for an instance it refuses.
 set -euo pipefail
 if [ "$(/usr/bin/id -u)" != 0 ]; then
-    echo "glaeda-runner-daemon-root: run as root: { echo 'set -- USER K'; cat $0; } | fleet-sudo HOST -f -" >&2
+    echo "glaeda-runner-daemon-root: run as root: { echo 'set -- USER K'; cat scripts/glaeda-runner-daemon-root; } | fleet-sudo HOST -f -" >&2
     exit 2
 fi
 if [ "$#" -lt 2 ]; then
