@@ -11453,7 +11453,8 @@ def vm_file_read(path: Path, limit: int, offset: int = 0) -> bytes | None:
 def vm_claim(path: Path) -> tuple[str, str]:
     """(why a VM's ROLE_KEEP_MARKER claims it, why that claim is stale), "" each. An owner that is a launchd label
     claims it while that job is installed (launchd_job_installed; unknown keeps it) and is stale once the job is
-    gone; an owner that is no label (a person), no owner, or an unreadable or malformed marker still claims it."""
+    gone; an owner that is no label (a person), no owner, or an unreadable or malformed marker still claims it.
+    On a fleet mini (FLEET_CLAIMS_EXPIRE) every claim, a launchd job's too, holds only until its "until"."""
     marker = path / ROLE_KEEP_MARKER
     if not os.path.lexists(marker):
         return "", ""
@@ -11465,9 +11466,13 @@ def vm_claim(path: Path) -> tuple[str, str]:
     why = doc.get("why") if isinstance(doc, dict) else None
     note = f": {why.strip()[:120]}" if isinstance(why, str) and why.strip() else ""
     person = not isinstance(owner, str) or not owner.strip() or not LAUNCHD_LABEL.fullmatch(owner.strip())
-    if person and FLEET_CLAIMS_EXPIRE:
-        # A fleet mini keeps nothing by hand (Leo, 2026-11-22: "it's the fleet. they dont have anything
-        # protected"): a person's claim, or a marker naming no owner, holds only until its "until" (epoch seconds).
+    if not person and FLEET_CLAIMS_EXPIRE and launchd_job_installed(owner.strip()) is False:
+        return "", f"claim by {owner.strip()} is stale: no such launchd job"
+    if FLEET_CLAIMS_EXPIRE:
+        # A fleet mini keeps nothing by hand or by job (Leo, 2026-11-22: "it's the fleet. they dont have anything
+        # protected"): a person's claim, a marker naming no owner, or a launchd job's claim (the Linux VM supervisor
+        # writes its slot's state record here, until = stopped + 30 min, RFD 0028) holds only until its "until"
+        # (epoch seconds). A running VM stays by ha.pid; the base by LIMA_BASE_NAMES.
         until = doc.get("until") if isinstance(doc, dict) else None
         who = owner.strip()[:80] if isinstance(owner, str) and owner.strip() else "no owner"
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until > time.time():

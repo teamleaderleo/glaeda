@@ -14751,6 +14751,40 @@ class TartLimaReferencesTest(unittest.TestCase):
         policy.write_text(json.dumps({"fleet_claims_expire": False}))
         self.assertEqual(gd.disk_policy(policy)["fleet_claims_expire"], False, "one host can turn it off")
 
+    def test_a_launchd_jobs_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """RFD 0028 rule 1, no protected VMs: the Linux VM supervisor's slot record (until = stopped + 30 min) is
+        a claim like a person's on a fleet mini; the base stays by name and a running slot by its ha.pid."""
+        now = time.time()
+
+        def slot(name: str, until: float | None) -> Path:
+            path = self.lima_vm(name, 26 * 24)
+            doc: dict[str, object] = {"owner": self.LVM_LABEL, "why": "Linux worker VM slot", "state": "stopped"}
+            if until is not None:
+                doc["until"] = until
+            (path / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+            self.age(path, 26 * 24)
+            return path
+
+        slot("cmux21-lvm-1", now + 600)  # stopped 20 min ago: inside its bound
+        slot("cmux21-lvm-2", now - 60)  # stopped 31 min ago
+        slot("cmux21-lvm-3", None)  # an old supervisor's claim, no until
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-1"].verdict, "kept", items["cmux21-lvm-1"].reasons)
+            self.assertIn(f"claimed by {self.LVM_LABEL} until", items["cmux21-lvm-1"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "reclaimable", items["cmux21-lvm-2"].reasons)
+            self.assertIn("its until has passed", items["cmux21-lvm-2"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
+            self.assertIn("it names no until", items["cmux21-lvm-3"].reasons[-1])
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept", items["cmux-linux-bake"].reasons)
+            self.assertIn("the Linux worker VMs' base", "; ".join(items["cmux-linux-bake"].reasons))
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "kept", "off a fleet mini an installed job's claim holds")
+
     def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
         base = self.tart_vm("ubase", 30 * 24, self.ECID)
         clone = self.tart_vm("vm0", 26 * 24, self.ECID)  # stopped since 2026-10-19 (cmux23), cloned from ubase
