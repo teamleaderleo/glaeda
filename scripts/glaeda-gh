@@ -603,6 +603,10 @@ RESTART_COOLDOWN = 180  # `glaeda-gh restart` within this long of the last one w
 RESTART_SETTLE = 45  # how long `restart` waits for a new daemon's heartbeat
 BOOTSTRAP_RETRY = 10  # launchctl bootstrap is retried this long after bootout
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
+# What this daemon runs, in every heartbeat: the sha256 of the script's bytes when serve started (the bytes
+# script_changed compares) and when. leo-workspace tools/fast-patch reads it to know a swapped-in release is the one
+# running, instead of inferring it from a start after the swap; `glaeda-gh status` readers can name the build too.
+RUNNING_SCRIPT: dict = {}
 # A request's socket timeout bounds each read, not the request: a server that trickles bytes, or a tick
 # of many slow reads, kept one 10-20 daemon silent for 20 minutes. So every request also has a hard
 # wall-clock deadline, a tick stops starting requests after TICK_BUDGET (the rest go first next tick),
@@ -1245,6 +1249,11 @@ PULL_REUSE_MAX = 300
 # required check passing before its workflow ends) shows within PR_REST_FULL_EVERY rather than the next cycle. Only
 # the REST route: GraphQL's rollup is one read already.
 PR_REST_FULL_EVERY = 300
+# A full REST read whose head's check suites are unchanged (a 304, or the same slimmed answer: the gate's test) takes
+# the check-run pages its last read kept, with no request, while those were read within PR_REST_FULL_EVERY: the gate's
+# own bound. Never for `--jobs`, which the gate never takes either. gcp-agent-lane-11's direct ledger, 2026-11-22 14:36-19:52Z: glaeda-upstream asked check-suites 325 and
+# check-runs 291 times in 4 h, mostly the full read that follows a gate broken by the issue (a comment) on an
+# unchanged head. The check-runs part keeps "at", when it was last read or confirmed.
 # A failed head with every check finished (settled) passes the same gate for this long after its last full read: its
 # check runs can change only through a suite (a rerun queues the suite again, a new push is a new head the pull and
 # issue show), so the gate's three reads see every change a full read would. Under a backlog no read came within
@@ -1631,7 +1640,25 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
             "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
                               "counted": r["counted"], "waiters": r["waiters"]} for r in by_caller(rest, "counted")],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
-                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")]}
+                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")],
+            "graphqlLoginWhy": login_why_rows(gql, top)}
+
+
+def login_why_rows(gql: list[dict], top: int = SPEND_TOP) -> list[dict]:
+    """The login's GraphQL points by why no App took them (note_login_fallback's cause) and query, most first: the
+    detector for a daemon whose GraphQL stays on the login while its Apps have their hour. Every point graphql()
+    books is the login's (an App's answer is never in spend), so these rows sum to graphql.points less rows an older
+    build wrote without a cause. Before, spendBy said which query spent the login (graphqlByQuery) but not why: the
+    login carried 26% of an hour's GraphQL with the Apps at 11.4k-12.5k of 12.5k left, the daemons on three hosts
+    spending 173-274 points/h of it, and nothing on the census could tell an owner no App serves from a resting pool."""
+    merged: dict[tuple, dict] = {}
+    for r in gql:
+        if not r.get("why"):
+            continue
+        row = merged.setdefault((r["why"], r["name"]), {"why": r["why"], "query": r["name"], "queries": 0, "points": 0})
+        row["queries"] += r["requests"]
+        row["points"] += r["points"]
+    return sorted(merged.values(), key=lambda r: (-r["points"], -r["queries"], r["why"], r["query"]))[:top]
 
 
 def waiters_text(r: dict, field: str) -> str:
@@ -4669,6 +4696,12 @@ def suites_path(root: str, sha: str) -> str:
     return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
 
 
+def check_runs_path(root: str, sha: str) -> str:
+    """A head's first check-run page (filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes
+    both alike); page N is this with &page=N."""
+    return f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
+
+
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
     """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
     return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
@@ -5006,6 +5039,21 @@ def parse_pr(node: dict) -> dict:
         else:
             superseded.append(check)
     checks = [check for _, check in latest.values()]
+    # A concurrency group shared across workflows cancels one workflow's job for another's: manaflow-ai/cmux#50693 at
+    # f4620c79 (2026-11-22), "pr-red-checks / comment" ran in three workflow runs on the head; the "CI" one (run
+    # 45046534087) was cancelled at 16:56:14Z and another workflow's started 16:56:32Z and passed, yet status counted
+    # the cancel as failed and `wait pr --sha` exited 1. A cancelled check run is superseded by a same-named one of
+    # another workflow that started at or after it and passed; a real failure, or a cancel with no such twin, counts.
+    passed_at: dict[str, list[str]] = {}
+    for c in checks:
+        if c.get("workflow") and c.get("startedAt") and (c.get("conclusion") or "").upper() in {"SUCCESS", "NEUTRAL"}:
+            passed_at.setdefault(str(c.get("name")), []).append(str(c["startedAt"]))
+    def cancelled_by_twin(c: dict) -> bool:
+        started = c.get("startedAt")
+        return (bool(c.get("workflow") and started) and (c.get("conclusion") or "").upper() == "CANCELLED"
+                and any(at >= str(started) for at in passed_at.get(str(c.get("name")), [])))
+    superseded.extend(c for c in checks if cancelled_by_twin(c))
+    checks = [c for c in checks if not cancelled_by_twin(c)]
     # only the ones that would have counted against the PR are worth keeping. One that ran nothing (GitHub
     # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
@@ -5611,6 +5659,28 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
 
 
 class Daemon:
+    # Which credential this thread's last request() used, and its App pool: per thread, never one field on the daemon.
+    # graphql() reads them right after its request() returns, while the outbox, the content-pause ask and the land
+    # threads send their own requests on the same daemon (request's in_call comment: huge-blue 2026-11-22). A shared
+    # field let another thread's login request flip "app" to "login" in between, so an App's GraphQL answer was booked
+    # as login spend (gql_log, note_spend "graphql", spend.json's daemon:glaeda-gh) and its rateLimit as the login's
+    # budget. Leo, 2026-11-22: "this is clearly not measured properly".
+    @property
+    def last_request_source(self) -> str:
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "source", "login")
+
+    @last_request_source.setter
+    def last_request_source(self, value: str) -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).source = value
+
+    @property
+    def last_app_pool(self) -> "AppPool | None":
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "pool", None)
+
+    @last_app_pool.setter
+    def last_app_pool(self, value: "AppPool | None") -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).pool = value
+
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         # The clock comes first: the pool built below reads it (restore_bench), and a clock set afterwards
@@ -5619,6 +5689,7 @@ class Daemon:
         self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
+        self.login_cause = ""  # why the most recent request went on the login (note_login_fallback's cause), or ""
         # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
         # every read on the login.
         chain = app_pool_chain(APP_POOL_SPARES)
@@ -6048,11 +6119,14 @@ class Daemon:
              **{k: cause[k] for k in ("verdict", "reads", "top", "slotS", "githubS", "inCall", "lastCall", "deferral",
                                       "text")}})
 
-    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0) -> None:
+    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0, why: str = "") -> None:
         """One request in the spend log: NAME is a REST route template or a GraphQL query name; COUNTED is 1 when
-        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged."""
+        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged. WHY is a
+        login GraphQL query's note_login_fallback cause: the key's sixth field, so spendBy.graphqlLoginWhy can say
+        why the login's points went there and not to an App."""
         kind, repo, waiter = (tuple(self.caller) + ("", "", ""))[:3]
-        key = "\t".join((bucket, name, kind, repo) + ((waiter.replace("\t", " "),) if waiter else ()))
+        tail = (waiter.replace("\t", " "),) if waiter or why else ()
+        key = "\t".join((bucket, name, kind, repo) + tail + ((why,) if why else ()))
         row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
         row[0] += 1
         row[1] += counted
@@ -6072,9 +6146,9 @@ class Daemon:
                     mine[2] += points
         out = []
         for key, (requests, counted, points) in total.items():
-            bucket, name, kind, repo, waiter = (key.split("\t") + ["", "", "", "", ""])[:5]
+            bucket, name, kind, repo, waiter, why = (key.split("\t") + ["", "", "", "", "", ""])[:6]
             out.append({"bucket": bucket, "name": name, "kind": kind, "repo": repo, "waiter": waiter, "requests": requests,
-                        "counted": counted, "points": points})
+                        "counted": counted, "points": points, **({"why": why} if why else {})})
         return out
 
     def spend_by(self, seconds: float = 3600.0) -> dict:
@@ -6965,6 +7039,7 @@ class Daemon:
         logged: a write is the login's by design) and AppPool.passed_over's. A write logs nothing."""
         query = str(body.get("query") or "") if isinstance(body, dict) else ""
         if not (method == "GET" or (method == "POST" and path == "/graphql" and not re.match(r"\s*mutation\b", query))):
+            self.login_cause = "write"  # the login's by design: logged nothing, booked as such
             return
         pool, pools = self.app_pool, None
         if free:
@@ -6981,6 +7056,7 @@ class Daemon:
             cause, pools = pool.passed_over(owner, scope, body if path == "/graphql" else None)
         if cause == "write":
             return
+        self.login_cause = cause  # graphql() books the login's points under it (spendBy.graphqlLoginWhy)
         kind = (tuple(self.caller) + ("",))[0]
         log({"event": "login-fallback", "kind": kind, "cause": cause, "route": route_of(method, path),
              **({"query": self.gql_reason} if path == "/graphql" and self.gql_reason else {}),
@@ -6996,6 +7072,7 @@ class Daemon:
         free: /rate_limit, which counts against no primary limit. Counting it as a REST request
         would overstate the spend of the very call that reads the spend."""
         self.last_request_source = "login"
+        self.login_cause = ""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         self.land_refill()  # between two of the read phase's requests: a freed land worker takes its next row
@@ -9051,7 +9128,7 @@ class Daemon:
         self.fed_repos = {r: t for r, t in self.fed_repos.items() if self.now - t < FED_REPO_KEEP}
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
-        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
+        status = {**RUNNING_SCRIPT, "pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
                   "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   # `fedRepos` and `okAt` are Daemon.fed's own two inputs, published so a client can tell whether a
@@ -9151,6 +9228,10 @@ class Daemon:
         daemon stored over the last READ_PROGRESS_WINDOW, so a slower GitHub narrows the window instead of leaving
         every waited PR older than STALE_DATA_AFTER; at least LAND_WATCH_FLOOR."""
         reads = sum(1 for t in self.read_done.get("pr", []) if self.now - t < READ_PROGRESS_WINDOW)
+        started = getattr(self, "started_tick", None)
+        up = None if started is None else self.now - started
+        if up is not None and 0 < up < READ_PROGRESS_WINDOW:  # a daemon just started has read for up s, not the window
+            reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
     def land_tick(self) -> None:
@@ -10100,7 +10181,7 @@ class Daemon:
                 self.last_app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
             self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
-            self.note_spend("graphql", self.gql_reason, 1, points)
+            self.note_spend("graphql", self.gql_reason, 1, points, why=self.login_cause or "unlogged")
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
         if rate and self.last_request_source != "app":
@@ -11120,6 +11201,11 @@ class Daemon:
             return new[path]["doc"]
         if state == "error":
             raise WatchError(doc)
+        if state == "fresh" and not etag and kept.get("etag") and "doc" in kept and slim(doc) == kept["doc"]:
+            # An answer with no ETag (broker_transport: the lane-gh broker answers none) that says what the kept one
+            # says keeps the kept ETag: a 304 on it vouches for that same slimmed answer. Storing None instead made
+            # the next read-token read of the path a counted 200 after every broker fallback.
+            state = "same"
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
         return new[path]["doc"]
 
@@ -11190,7 +11276,9 @@ class Daemon:
                 # (a settled failed head's too: PR_REST_SETTLED_FULL_EVERY gates it on its suites)
                 with contextlib.suppress(WatchError):
                     self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
-            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha,
+                                                               not e.get("jobs")
+                                                               and self.runs_unchanged(old, parts, root, sha))
             if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
                 # every check finished, and something changed since the kept pull: the merge state is final now
                 pull, _ = self.rest_pull(old, parts, root, number, reuse=False)
@@ -11472,15 +11560,45 @@ class Daemon:
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
 
-    def rest_head(self, old: dict, parts: dict, root: str, sha: str) -> tuple[dict, list, list, dict]:
+    def runs_unchanged(self, old: dict, parts: dict, root: str, sha: str) -> bool:
+        """Whether this read's check-suites answer for SHA (in PARTS) is the kept one (a 304, or the same slimmed
+        answer) and every check-run page the last read kept for SHA was read within PR_REST_FULL_EVERY: then rest_head
+        takes those pages and asks nothing. No request."""
+        suites = suites_path(root, sha)
+        now, was = parts.get(suites), old.get(suites)
+        if not isinstance(now, dict) or not isinstance(was, dict) or "doc" not in now or "doc" not in was:
+            return False
+        if now.get("unavailable") or now.get("gone") or now["doc"] != was["doc"]:
+            return False
+        path = check_runs_path(root, sha)
+        first = old.get(path)
+        at = first.get("at") if isinstance(first, dict) else None
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= self.now - at < PR_REST_FULL_EVERY \
+                or not isinstance(first.get("doc"), dict):
+            return False
+        pages = min(REST_CHECK_PAGES, -(-(first["doc"].get("total_count") or 0) // 100))
+        return all(isinstance(old.get(f"{path}&page={p}"), dict) and "doc" in old[f"{path}&page={p}"]
+                   for p in range(2, pages + 1))
+
+    def rest_head(self, old: dict, parts: dict, root: str, sha: str,
+                  runs_kept: bool = False) -> tuple[dict, list, list, dict]:
         """A commit's check runs (every attempt, up to REST_CHECK_PAGES pages), statuses, workflow runs and the
-        repository's workflow names, each a conditional read kept in `parts`. Raises WatchError."""
-        # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
-        path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
-        checks = self.head_part(old, parts, path, slim_check_runs)
+        repository's workflow names, each a conditional read kept in `parts`. RUNS_KEPT (runs_unchanged): the check
+        runs are the pages OLD keeps, not asked. Raises WatchError."""
+        path = check_runs_path(root, sha)
+        if runs_kept:
+            def run_page(page_path: str) -> dict:
+                parts[page_path] = old[page_path]
+                return old[page_path]["doc"]
+        else:
+            def run_page(page_path: str) -> dict:
+                return self.head_part(old, parts, page_path, slim_check_runs)
+        checks = run_page(path)
+        if not runs_kept:  # read (or confirmed by a 304) now: runs_unchanged's bound counts from here
+            parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}
         listed = list(checks.get("check_runs") or [])
         for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-            listed += self.head_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+            listed += run_page(f"{path}&page={page}").get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
         statuses: list[dict] = []
         total = 0
@@ -12654,9 +12772,63 @@ def land_overflow_readable(owners: Any, queue: Any = None) -> dict[str, str]:
     return out
 
 
-def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
-                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
-    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError."""
+# The redirect: an executor that forwards its own lands names where. 2026-11-22 17:16-17:32Z: the executor's land.json
+# named an executor of its own (a cutover to a new host), so its `land serve` answered not_executor to every host
+# forwarding to it; one forwarder's outbox grew 4 -> 12 requests over 18 min, each retry backing off, with one warn
+# notice that named the next host as "-o" (land_forward_name read ssh's first option as the host). Now `land serve`'s
+# not_executor answer carries "executor": the host it forwards to, and a forwarder whose command is `reach HOST ...`
+# or `ssh ... HOST ...` sends the same request there, once (LAND_REDIRECT_HOPS: the far host's answer is final, so
+# two hosts never pass a request back and forth, and a host never redirects to itself). Every redirect says so (a
+# land-forward-redirected notice naming both hosts and the land.json to fix); a refusal with no usable redirect is a
+# "fire" notice at once, since a config that points at a non-executor never heals by retrying.
+LAND_REDIRECT_HOPS = 1
+LAND_HOST_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+# ssh's options that take a value (ssh(1)): their value is never the host
+SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+class LandNotExecutor(WatchError):
+    """The far host's `land serve` refused: it forwards its own lands (to REDIRECT, a host name, when it said one)."""
+
+    def __init__(self, text: str, redirect: str = "") -> None:
+        super().__init__(text)
+        self.redirect = redirect
+
+
+def land_command_host(command: list[str]) -> int | None:
+    """The index of the host word in COMMAND (`reach HOST ...`, `ssh [OPTIONS] HOST ...`), or None for another
+    program."""
+    if not command or Path(command[0]).name not in ("reach", "ssh"):
+        return None
+    i = 1
+    while i < len(command):
+        word = command[i]
+        if word == "--":
+            return i + 1 if i + 1 < len(command) else None
+        if word.startswith("-") and len(word) > 1:
+            # -o VALUE, or -oVALUE / a cluster of flags with no value
+            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
+                i += 2
+            else:
+                i += 1
+            continue
+        return i
+    return None
+
+
+def land_redirected(command: list[str], host: Any) -> list[str] | None:
+    """COMMAND aimed at HOST instead (the host word replaced), or None: no host word, HOST not a host name, the same
+    host, or this host itself."""
+    i = land_command_host(command)
+    if i is None or not isinstance(host, str) or not LAND_HOST_SHAPE.fullmatch(host):
+        return None
+    if host in (command[i], policy_host()):
+        return None
+    return [*command[:i], host, *command[i + 1:]]
+
+
+def land_forward_once(command: list[str], request: dict, deadline: float,
+                      run: Callable[..., subprocess.CompletedProcess] | None) -> dict:
     exe = program_path(command[0])
     argv = [exe, *command[1:]]
     try:
@@ -12674,9 +12846,36 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
     if not isinstance(answer, dict):
         tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
         raise WatchError(f"land executor: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
-    if not answer.get("ok") and answer.get("code") in ("not_executor", "bad_request"):
+    if not answer.get("ok") and answer.get("code") == "not_executor":
+        to = answer.get("executor") if isinstance(answer.get("executor"), str) else ""
+        raise LandNotExecutor(f"land executor: not_executor: {land_trim(answer.get('reason'), 200)}", to)
+    if not answer.get("ok") and answer.get("code") == "bad_request":
         raise WatchError(f"land executor: {answer.get('code')}: {land_trim(answer.get('reason'), 200)}")
     return answer
+
+
+def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
+                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
+    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError.
+    An executor that forwards its own lands (not_executor) and names where gets the request sent there, at most
+    LAND_REDIRECT_HOPS times (LAND_REDIRECT_HOPS's comment); the answer then carries "redirectedTo", that host."""
+    hops: list[str] = []
+    while True:
+        try:
+            answer = land_forward_once(command, request, deadline, run)
+        except LandNotExecutor as error:
+            target = land_redirected(command, error.redirect) if len(hops) < LAND_REDIRECT_HOPS else None
+            if target is None or error.redirect in hops:
+                via = f" (redirected from {land_forward_name(command)} via {', '.join(hops)})" if hops else ""
+                raise LandNotExecutor(f"{error}{via}", error.redirect) from None
+            log({"event": "land-forward-redirect", "from": land_forward_name(command), "to": error.redirect,
+                 "op": request.get("op")})
+            hops.append(error.redirect)
+            command = target
+            continue
+        if hops:
+            answer["redirectedTo"] = hops[-1]
+        return answer
 
 
 # A forward is one small control-plane request, never a background client: the host's fan-out admission (the reach
@@ -12708,9 +12907,11 @@ def land_forward_pending(name: str, now: float) -> str:
 
 
 def land_forward_name(command: list[str]) -> str:
-    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
-    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
-        return command[1]
+    """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
+    words."""
+    i = land_command_host(command)
+    if i is not None:
+        return command[i]
     return " ".join(command)[:120]
 
 
@@ -14923,6 +15124,8 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
+        self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
@@ -15414,6 +15617,18 @@ class LandQueue:
                                                    daemon=True)
             self.forward_thread.start()
 
+    def forward_redirected(self, name: str, to: str) -> None:
+        """A forward EXECUTOR NAME refused went on to TO (land_forward): said once per pair, so the land.json that
+        names NAME gets fixed."""
+        if (name, to) in self.forward_redirects:
+            return
+        self.forward_redirects.add((name, to))
+        with contextlib.suppress(Exception):
+            self.notice("land-forward-redirected", "warn", f"glaeda land on {policy_host()}: its executor {name} "
+                        f"forwards its lands to {to}, so this host's requests go to {to}; point "
+                        f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at {to}",
+                        {"executor": name, "to": to})
+
     def forward_batch(self) -> tuple[list[dict], list[tuple[str, Path]], list[tuple[str, int]]]:
         """(the requests to send, (id, file) of each from requests/, (key, gen) of each entry handed off): the entries
         open here first (none whose step still runs), then requests/ in order, at most LAND_FORWARD_BATCH."""
@@ -15568,6 +15783,9 @@ class LandQueue:
                                   LAND_FORWARD_DEADLINE)
             if not answer.get("ok"):
                 raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+            if isinstance(answer.get("redirectedTo"), str):
+                self.forward_redirected(name, answer["redirectedTo"])
+                name = answer["redirectedTo"]
             accepted = {str(a) for a in answer.get("accepted") or []}
             refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
                        if isinstance(r, dict) and r.get("id")}
@@ -15582,6 +15800,14 @@ class LandQueue:
                                                             "at": self.now, "pending": len(batch),
                                                             "retryAt": self.forward_after})
             log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
+            if isinstance(error, LandNotExecutor) and not self.forward_misrouted:
+                # never heals by retrying: land.json names a host that executes nothing (LAND_REDIRECT_HOPS)
+                self.forward_misrouted = True
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-misrouted", "fire", f"glaeda land on {policy_host()}: its executor "
+                                f"{name} executes no lands ({why}); {len(batch)} request(s) wait here. Point "
+                                f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at the live executor",
+                                {"executor": name, "error": why, "pending": len(batch)})
             if self.forward_fails == 1:
                 with contextlib.suppress(Exception):
                     self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(batch)} request(s) "
@@ -15591,6 +15817,7 @@ class LandQueue:
         with self.lock:
             self.sending = set()
             self.forward_fails = 0
+            self.forward_misrouted = False
             self.forward_after = float("-inf")
             for rid, path in files:
                 if rid in accepted:
@@ -16347,8 +16574,16 @@ class LandQueue:
             self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
+        # Every worker's judgment holds its PR waited, so the pool is demand on the read loop too: no more workers
+        # than the reads it keeps fresh (read_room, LAND_WATCH_SHARE). cmux-cp-1, 2026-11-22: 175 workers, 262 waited
+        # PRs, 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old.
+        room = self.read_room()
+        if room is not None:
+            ceiling = max(1.0, min(ceiling, float(room)))
         if self.quota_refused > last:
             size, why = max(1.0, size / 2), "a quota refusal"
+        elif size > ceiling and room is not None and int(ceiling) == int(room):
+            size, why = ceiling, "more workers than the read loop keeps fresh"
         elif len(self.jobs) >= int(size) and self.pass_gated:
             size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
         else:
@@ -16449,7 +16684,7 @@ class LandQueue:
                             "busy": len(self.jobs), "loadPerCore": None if load is None else round(load, 2)}
             self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
                          workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
-                         holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
+                         holders=",".join(self.holder(k) for k in list(self.jobs)[:8]))
             self.save(e)
         elif (dl := e.get("dueLate")) and dl.get("why") != why \
                 and self.now - float(dl.get("whyAt") or dl.get("at") or 0) >= LAND_LATE_WHY_EVERY:
@@ -16459,6 +16694,18 @@ class LandQueue:
             load = land_load_per_core()
             dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
+
+    def holder(self, key: str) -> str:
+        """One job holding a worker, for a due_late row: its PR, what it runs (judging, or acting and the step's kind)
+        and for how many seconds. The executor of forwarded lands, 2026-11-23 00:20Z: a row due 30 min named 8 of 24
+        holders by PR only, so whether they were judgments or merge steps, and how long each had held, had to be
+        read off the host while it was still happening."""
+        e = self.entries.get(key) or {}
+        what = str(e.get("state") or "?")
+        if what == "acting":
+            what += " " + str((e.get("action") or {}).get("kind") or "?")
+        at = (self.job_started.get(key) or (None,))[0]
+        return f"{key_name(key)} {what}" + ("" if at is None else f" {round(self.now - at)}s")
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
@@ -18275,7 +18522,12 @@ class LandQueue:
         recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
         if sum(recent) < LAND_EARLY_HANDOFF_BAD:
             return False
-        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")).lower()
+        # A PR this host has no read of yet (consider's no_data) is handed off at its full pin: it is the head the
+        # caller's merge is pinned to, so the broker host judges exactly what was asked. Without it every no_data
+        # entry was judged here first, and on a host whose reads time out that is a 300 s explain_failed: 140 of 355
+        # lane-VM judgments, 2026-11-22 14:11-17:42Z, 10 GCP and Freestyle lane VMs, were no_data, the median 300.1 s.
+        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")
+                or str(e.get("pinSha") or "")).lower()
         if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
             return False
         why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
@@ -21059,7 +21311,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
 def cmd_land_serve(text: str) -> int:
     """`land serve`: the executor's end of land.json's "executor" on a forwarding host. One JSON request line on stdin
     ({"op": "land" | "withdraw" | "status" | "batch", ...}), one JSON answer line on stdout. A host that forwards its
-    own lands is no executor: it refuses, so two hosts never hand a PR back and forth."""
+    own lands relays the request to its executor once (LAND_SERVE_RELAYED), so two hosts never hand a PR back and forth."""
     try:
         req = json.loads(text)
     except ValueError:
@@ -21075,13 +21327,16 @@ def cmd_land_serve(text: str) -> int:
             answer = land_forward(executor, {**req, LAND_SERVE_RELAY_KEY: policy_host()})
         except WatchError as error:
             print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands "
-                              f"to {land_forward_name(executor)}, which did not take this one: {error}"}))
+                              f"to {land_forward_name(executor)}, which did not take this one: {error}",
+                              "executor": land_forward_name(executor)}))
             return EXIT_FAIL
         print(json.dumps(answer, sort_keys=True))
         return EXIT_OK if answer.get("ok") else EXIT_FAIL
     if executor is not None:
+        # "executor" names where: glaeda-gh's own forwarders follow it once (LAND_REDIRECT_HOPS)
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
+                          f"{land_forward_name(executor)} (land.json executor); it serves none",
+                          "executor": land_forward_name(executor)}))
         return EXIT_FAIL
     op = req["op"]
     if op == "room":
@@ -21264,7 +21519,7 @@ def first_heartbeat(now: float | None = None) -> None:
     if isinstance(before, dict):
         last = before if before.get("state") in ("held", "stale") else before.get("last")
         status["stale"] = {"state": "starting", **({"last": last} if isinstance(last, dict) else {})}
-    write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
+    write_json(BASE / "daemon.json", {**status, **RUNNING_SCRIPT, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
 
@@ -21497,6 +21752,9 @@ def serve(foreground_ok: bool = False) -> int:
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
     lock = hold_daemon_lock()
+    me = Path(__file__).resolve()
+    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
+    RUNNING_SCRIPT.update(scriptSha256=seen["sha"], scriptSince=time.time())
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
     os.environ.pop(GRAPHQL_SLOT_ENV, None)
@@ -21504,11 +21762,9 @@ def serve(foreground_ok: bool = False) -> int:
         swept = sweep_temp_files()
         if swept:
             log({"event": "swept", "tempFiles": swept})
-    me = Path(__file__).resolve()
-    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
+    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -26134,6 +26390,9 @@ def spend_lines(spend: Any) -> list[str]:
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
                    f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "points"))
+    for r in spend.get("graphqlLoginWhy") or []:
+        out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
+                   f"on the login: {r.get('why')}")
     return out
 
 

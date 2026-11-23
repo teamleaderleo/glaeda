@@ -14637,6 +14637,44 @@ def job_scratch_end(env: Mapping[str, str] | None = None, base: Path | None = No
     return [note] if note else []
 
 
+# DERIVED_DATA_SLOT (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2): Xcode DerivedData must not live on
+# the per-job scratch (a cold DerivedData costs minutes per build), so it lives in a registered cache, one slot per
+# stream: config/disk-registry.toml's derived-data, DERIVED_DATA_SLOT_DIR/<stream>, held to its budget LRU by
+# scripts/glaeda-disk-registry. job-started tells the job its slot as CMUX_DERIVED_DATA_SLOT (for xcodebuild
+# -derivedDataPath); the stream is the PR's base branch, else the pushed branch, '/' as '-'. Opt-in with the
+# registry's own flag, GLAEDA_DISK_REGISTRY=1; unset or anything else exports nothing.
+DISK_REGISTRY_ENV = "GLAEDA_DISK_REGISTRY"
+DERIVED_DATA_SLOT_DIR = Path(FLEET_DIR) / "dd"
+DERIVED_DATA_SLOT_EXPORT = "CMUX_DERIVED_DATA_SLOT"
+DERIVED_DATA_STREAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def derived_data_stream(env: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if env is None else env
+    ref = env.get("GITHUB_BASE_REF") or env.get("GITHUB_REF_NAME") or ""
+    stream = ref.replace("/", "-")
+    return stream if DERIVED_DATA_STREAM.fullmatch(stream) and ".." not in stream else None
+
+
+def derived_data_slot_start(env: Mapping[str, str] | None = None, base: Path | None = None) -> list[str]:
+    """job-started: create this job's stream slot and export CMUX_DERIVED_DATA_SLOT. Off (no flag): nothing."""
+    env = os.environ if env is None else env
+    if env.get(DISK_REGISTRY_ENV, "") != "1":
+        return []
+    stream = derived_data_stream(env)
+    if stream is None:
+        return ["derived data slot: skipped: no plain GITHUB_BASE_REF or GITHUB_REF_NAME"]
+    slot = (DERIVED_DATA_SLOT_DIR if base is None else base) / stream
+    try:
+        slot.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if slot.is_symlink() or not slot.is_dir():
+            return [f"derived data slot: skipped: {slot} is not a plain directory"]
+    except OSError as error:
+        return [f"derived data slot: none for this job: {error.strerror or error}"]
+    return [f"derived data slot: {slot}; "
+            f"{export_job_env(DERIVED_DATA_SLOT_EXPORT, os.fspath(slot), 'glaeda-derived-data-slot')}"]
+
+
 def cleanup_job_leftovers(work: str | None = None) -> list[str]:
     """job-completed: end processes left running from this runner's _work. Each pid is signalled only while
     its command is unchanged, so a reused pid is never hit."""
@@ -15808,6 +15846,9 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # JOB_SCRATCH: best effort, never fails an admitted job
             for scratch in job_scratch_start():
                 print(f"{PREFIX}: {scratch}", flush=True)
+        with contextlib.suppress(Exception):  # DERIVED_DATA_SLOT: best effort, never fails an admitted job
+            for slot_note in derived_data_slot_start():
+                print(f"{PREFIX}: {slot_note}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
