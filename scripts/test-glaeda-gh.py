@@ -7469,7 +7469,8 @@ class FleetBudgetTest(Base):
         self.assertEqual(gg.fetch_host("far", False)["budget"], {})
         args = Path(gg.REACH_CMD + ".args").read_text().splitlines()
         self.assertEqual(args[:3], ["far", "sh", "-c"])
-        self.assertEqual(shlex.split("\n".join(args[3:])), [gg.FLEET_HOST_SCRIPT])
+        self.assertEqual(shlex.split("\n".join(args[3:])),
+                         [gg.remote_self_bounded(gg.FLEET_HOST_SCRIPT, gg.FLEET_HOST_TIMEOUT)])
         gg.REACH_CMD = self.script("reach", 'echo "reach: no route to far" >&2; exit 4\n')
         self.assertEqual(gg.fetch_host("far", False)["error"], "unreachable (exit 4: reach: no route to far)")
         gg.REACH_CMD = self.script("reach", "sleep 30\n")
@@ -7641,6 +7642,153 @@ class BoundedSubprocessTest(unittest.TestCase):
     def test_an_answer_within_the_deadline_is_returned(self) -> None:
         result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+
+
+class ChildReapingTest(unittest.TestCase):
+    """cosmic-gray 2026-11-22: 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days (alert sends
+    nobody waited for, many started by an image the daemon had execv'd away) and 55 `reach` probes of the budget
+    sweep alive 29 minutes past their 25 s bound, the bound held only by a caller that was gone. Every child serve
+    does not wait for is reaped each tick, the old image's by PID; a bounded child ends at its bound on its own."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("SELF_BOUND_SLACK", "SELF_BOUND_KILL"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+        gg.SELF_BOUND_SLACK = 0.3
+        gg.SELF_BOUND_KILL = 1
+        self.addCleanup(self.forget)
+
+    def forget(self) -> None:
+        with gg.DETACHED_LOCK:
+            gg.DETACHED.clear()
+            gg.INHERITED.clear()
+
+    def tool(self, body: str) -> str:
+        path = Path(self.tmp.name) / f"tool-{len(os.listdir(self.tmp.name))}"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def stat(self, pid: int) -> str:
+        done = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def zombie(self, pid: int) -> bool:
+        return self.stat(pid).startswith("Z")
+
+    def gone(self, pid: int, within: float) -> bool:
+        """PID no longer runs (absent, or a zombie of a parent that is not this test) within WITHIN seconds."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if not self.stat(pid) or self.zombie(pid):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_no_timeout_or_no_bound_leaves_the_argv_alone(self) -> None:
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: ""}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], None), ["sh", "-c", "true"])
+        self.assertEqual(gg.self_bounded(["sh", "-c", "true"], math.inf), ["sh", "-c", "true"])
+        absent = os.fspath(Path(self.tmp.name) / "absent")
+        self.assertEqual(gg.self_bounded([absent], 5), [absent])  # Popen's OSError names it, not timeout's 127
+        fake = self.tool("exec \"$@\"\n")
+        with mock.patch.dict(os.environ, {gg.TIMEOUT_ENV: fake}):
+            self.assertEqual(gg.self_bounded(["sh", "-c", "true"], 5), [fake, "-k", "1", "5.3", "sh", "-c", "true"])
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_the_bound_ends_the_whole_group_after_its_caller_is_gone(self) -> None:
+        """The caller never waits (it is gone: an execv, a SIGKILL); the child and the grandchild holding its pipes
+        still end at the bound."""
+        marker = Path(self.tmp.name) / "grandchild.pid"
+        tool = self.tool(f"sleep 60 &\necho $! > {marker}\nsleep 60\n")
+        proc = subprocess.Popen(gg.self_bounded([tool], 0.2), start_new_session=True, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        deadline = time.monotonic() + 5
+        while not (marker.exists() and marker.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(marker.read_text())
+        self.assertTrue(self.gone(grandchild, 8), "the grandchild outlived its bound")
+        self.assertIsNotNone(proc.wait(8))
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_run_bounded_answers_as_before_under_its_own_bound(self) -> None:
+        result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+        self.assertEqual(gg.run_bounded(["cat"], 10, input_text="in\n").stdout, "in\n")
+        with self.assertRaises(OSError):
+            gg.run_bounded([os.fspath(Path(self.tmp.name) / "absent")], 10)
+
+    def test_the_remote_script_bounds_itself_where_the_host_has_timeout(self) -> None:
+        done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo \"@@x 'q'\"", 5)], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.stdout, "@@x 'q'\n")
+        if any(os.access(p, os.X_OK) for p in gg.TIMEOUT_PATHS):
+            started = time.monotonic()
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("sleep 30", 0.3)], capture_output=True,
+                                  timeout=30)
+            self.assertEqual(done.returncode, 124)
+            self.assertLess(time.monotonic() - started, 10)
+        with mock.patch.object(gg, "TIMEOUT_PATHS", (os.fspath(Path(self.tmp.name) / "none"),)):
+            done = subprocess.run(["sh", "-c", gg.remote_self_bounded("echo plain", 5)], capture_output=True,
+                                  text=True, timeout=30)
+        self.assertEqual(done.stdout, "plain\n")  # a host with no timeout runs it as it is
+
+    def until_zombie(self, pid: int) -> bool:
+        deadline = time.monotonic() + 5
+        while not self.zombie(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.zombie(pid)
+
+    def test_detached_children_are_reaped_and_never_left_defunct(self) -> None:
+        first = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertTrue(self.until_zombie(first.pid), "it ended, and nothing waited for it yet")
+        second = gg.spawn_detached(["true"], stdin=subprocess.DEVNULL)
+        self.assertFalse(self.zombie(first.pid), "the next spawn reaps what ended")
+        self.assertTrue(self.until_zombie(second.pid))
+        self.assertEqual(gg.reap_children(), 0)  # what serve's tick does
+        self.assertFalse(self.zombie(second.pid))
+        self.assertEqual(gg.DETACHED, [])
+
+    def test_a_bounded_child_carries_its_deadline_for_the_reaper(self) -> None:
+        before = time.time()
+        env = gg.deadline_env({"PATH": "/usr/bin:/bin"}, 10)
+        self.assertEqual(env["CMUX_DEADLINE_OWNER"], "glaeda-gh")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertTrue(before + 10 <= int(env["CMUX_DEADLINE"]) <= time.time() + 10 + 0.3 + 1 + 1, env)
+        self.assertIsNone(gg.deadline_env(None, None))
+        self.assertEqual(gg.deadline_env({"A": "1"}, math.inf), {"A": "1"})
+        seen = gg.run_bounded(["sh", "-c", 'echo "$CMUX_DEADLINE_OWNER $CMUX_DEADLINE"'], 10).stdout.split()
+        self.assertEqual(seen[0], "glaeda-gh")
+        self.assertGreaterEqual(int(seen[1]), int(before) + 10)
+
+    @unittest.skipUnless(gg.coreutils_timeout(), "no coreutils timeout on this host")
+    def test_a_bounded_detached_child_ends_at_its_bound(self) -> None:
+        proc = gg.spawn_detached(["sleep", "30"], bound=0.2, stdin=subprocess.DEVNULL)
+        self.assertIsNotNone(proc.wait(10))
+        self.assertEqual(gg.reap_children(), 0)
+
+    def test_the_previous_images_children_are_adopted_by_pid_and_reaped(self) -> None:
+        """An execv keeps the PID and its children; the new image holds no Popen for them."""
+        pids = [os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ) for _ in range(2)]
+        pids.append(os.posix_spawn("/bin/sh", ["sh", "-c", "sleep 1"], os.environ))
+        self.assertLessEqual(set(pids), gg.child_pids(os.getpid()))
+        with mock.patch.object(gg, "child_pids", return_value=set(pids)):
+            self.assertEqual(gg.adopt_inherited(), 3)
+        deadline = time.monotonic() + 5
+        while not all(self.zombie(p) for p in pids[:2]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(gg.reap_children(), 1)  # the sleeping one still runs
+        self.assertFalse(any(self.zombie(p) for p in pids[:2]))
+        deadline = time.monotonic() + 10
+        while gg.reap_children() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(gg.INHERITED, set())
+        with mock.patch.object(gg, "child_pids", return_value={999999}):
+            gg.adopt_inherited()
+        self.assertEqual(gg.reap_children(), 0)  # not ours: dropped, never retried
 
 
 class TickBudgetTest(Base):
@@ -27991,6 +28139,42 @@ class LandTest(Base):
         self.tick(300)
         self.assertEqual(self.reads(), reads)
         self.assertEqual(self.q.entries[key2]["state"], "queued")
+
+    def test_a_prs_own_ci_job_rate_limit_parks_only_its_entry_and_never_halves_the_pool(self):
+        """cmux-cp-1, 2026-11-22 17:42-21:00Z: 10 of 11 host-wide parks were land_judge's "base_red_excuse.py job
+        rate-limited at HEAD" (one PR's CI job printed only its repo installation's API refusal), worded as a quota
+        refusal with a reset. Each stopped every land 2-4 min and halved the pool, though no pool this host reads was
+        spent. That PR waits for the time it names; the next PR is judged on the same pass; the pool keeps its size."""
+        key2 = "pr:o/r#2"
+        self.pr(LA)
+        self.land()
+        self.pr(LB, key=key2)
+        self.land("o/r#2")
+        retry = self.t + 1500
+        at = time.strftime("%H:%M", time.gmtime(retry))
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 1500}, reason=(
+            f"quota: not judged, retry after {at}Z (reset); no attempt before {at}Z: base_red_excuse.py job "
+            f"rate-limited at {LA} (exit 1): job-rate-limited: run 45060196034; job 130862862041; no attempt before "
+            f"{at}Z. Rerun run 45060196034 (job 130862862041) no sooner than {at}Z; the repo installation's API limit "
+            "refused only that hand-off job")))
+        self.w.answers.append(ok_answer(LB))
+        self.w.answers[-1][1]["action"].update(number=2)
+        refused_before = self.q.quota_refused
+        self.tick()
+        e = self.q.entries[self.KEY]
+        said = gg.land_quota_said(f"no attempt before {at}Z", self.t)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"].get("own")), ("waiting", "quota", True))
+        self.assertEqual(e["wakeAt"], said + gg.land_jitter(self.KEY, said))
+        self.assertEqual(self.q.queue_quota_until, 0.0)
+        self.assertFalse((gg.land_dir() / gg.LAND_QUOTA_FILE).exists())
+        self.assertEqual(self.q.quota_refused, refused_before)  # adapt_pool does not halve on it
+        self.assertEqual([c[4] for c in self.w.explains()], ["1", "2"])  # #2 judged on the same pass
+
+    def test_the_job_quota_words_are_land_judges_own(self):
+        """LAND_JOB_QUOTA matches land_judge's fixed lead only, not a reset that merely mentions a job."""
+        self.assertTrue(gg.LAND_JOB_QUOTA.search("base_red_excuse.py job rate-limited at 908aa0087803ab6f006c9a77fb"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("quota: not judged, retry after 09:00Z (reset): GraphQL spent"))
+        self.assertIsNone(gg.LAND_JOB_QUOTA.search("base_red_excuse.py was rate-limited at 908aa0087803"))
 
     def test_a_ci_jobs_rate_limit_parks_only_its_entry_never_the_queue(self):
         """land_judge's "job rate-limited" quota answer names one CI job's rerun time on the installation's limit:
