@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import collections
 import contextlib
@@ -54,6 +55,34 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+# A real os.exec* in this process replaces the unittest runner: the suite then ends at the exec'd
+# program's exit code with no `Ran N tests` line, and every test queued after it never runs. Measured
+# 2026-11-22 (glaeda#2565): broker_create_handoff hands a create over with os.execve, which
+# BrokerMergeGuardTest did not mock (it mocked os.execv only), so the stand-in guard (`exit 0`) ran in
+# place of the runner and this suite exited 0 after 567 lines with 22 tests unrun -- green in CI.
+# So every exec entry point refuses here, loudly, in the test that reached it. A test that exercises a
+# hand-off mocks the entry point it means to exercise and reads what that call was handed.
+def _no_real_exec(name: str):
+    def refuse(path, argv=(), *rest):  # noqa: ANN001, ANN202
+        raise AssertionError(f"os.{name}({path!r}, {list(argv)[:4]!r}) in the test process would replace "
+                             "the unittest runner: mock this entry point in the test and read what it was handed")
+    return refuse
+
+
+for _exec_name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
+    mock.patch.object(os, _exec_name, _no_real_exec(_exec_name)).start()
+def post_args(*argv: str) -> argparse.Namespace:
+    """`post` arguments as the shipped parser builds them: one spelling of the flags, one set of defaults.
+
+    A bare `mock.Mock` answers every flag the parser grows with a truthy Mock. On 2026-11-22 that read as
+    `--label` typed on a `post comment` and four BrokerAnswerCacheTest tests refused with "--label and
+    --remove-label are for post label and post issue" -- unseen in CI, because this suite had already
+    exited 0 at an unmocked exec before reaching them (glaeda#2565). Built here from `gg.parser()`, a flag
+    added to `post` defaults in these tests the way it defaults for a person.
+    """
+    return gg.parser().parse_args(["post", *argv])
+
+
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
 LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
@@ -674,10 +703,9 @@ class Base(unittest.TestCase):
         self.saved_reader, gg._reader = gg._reader, "tool:test"
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
-        # A `wait pr|run` against a daemon that serves waits execs into bash: never the test runner.
-        execv = mock.patch.object(gg.os, "execv", side_effect=AssertionError("os.execv in a test process"))
-        execv.start()
-        self.addCleanup(execv.stop)
+        # A `wait pr|run` against a daemon that serves waits execs into bash: never the test runner. Every
+        # exec entry point already refuses module-wide (_no_real_exec); this base adds no narrower patch of
+        # its own, which would shadow the net for one entry point and leave the rest able to replace the runner.
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
@@ -12828,15 +12856,23 @@ class BrokerMergeGuardTest(BrokerBase):
         os.environ.pop(gg.BROKER_DEPTH, None)
 
         def execv(path: str, argv: list[str]) -> None:
-            execed.append((path, argv))
+            # A merge mutates this process's PATH and then execs: the environment the guard sees is this one.
+            execed.append((path, argv, dict(os.environ)))
             raise SystemExit(0)
 
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
+        def execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+            # A create (and any other call the guard hands back) goes over execve so the guard's directory on
+            # PATH and the hop mark belong to the started process, not to this one: read the env it was handed.
+            execed.append((path, argv, dict(env)))
+            raise SystemExit(0)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
                 code = None
+        self.handed_env = execed[0][2] if execed else None
         return code, err.getvalue(), (execed[0][0] if execed else None), (execed[0][1][1:] if execed else None)
 
     def test_every_merge_route_goes_to_the_guard(self) -> None:
@@ -12924,7 +12960,11 @@ class BrokerMergeGuardTest(BrokerBase):
                 self.assertIsNone(code)
                 self.assertEqual(path, str(self.guard))
                 self.assertEqual(passed, args)
-                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                self.assertEqual(self.handed_env["PATH"].split(os.pathsep)[0], str(self.guard.parent),
+                                 "the guard's directory leads the PATH the started process is handed")
+                self.assertEqual(self.handed_env.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()))
+                self.assertNotIn("GLAEDA_GH_QUOTA_HOP", os.environ,
+                                 "a create goes over execve: this process's own environment is left alone")
 
     def test_a_comment_in_combined_short_flags_is_a_create(self) -> None:
         # `-dc x` is --delete-branch then --comment x; `-cx` is --comment x: both close with a comment, which creates.
@@ -12945,6 +12985,26 @@ class BrokerMergeGuardTest(BrokerBase):
                      ["issue", "close", "7", "-R", "o/r", "--reason", "-c"]):
             with self.subTest(args=args):
                 self.assertFalse(gg.broker_create_call(args))
+
+    def test_no_exec_entry_point_can_replace_this_suites_runner(self) -> None:
+        """glaeda#2565: a hand-off this suite did not mock exec'd the stand-in guard (`exit 0`) in place of the
+        unittest runner, so the suite exited 0 with no `Ran N tests` line and CI read it green while 22 tests
+        never ran. Every entry point that can replace this process refuses in the test that reached it, so the
+        suite still prints a verdict -- FAILED -- and names the call. Keep this list exec-complete."""
+        for name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
+            with self.subTest(entry=name):
+                self.assertTrue(hasattr(os, name), f"os.{name} is gone: the guard list needs rereading")
+                with self.assertRaises(AssertionError) as caught:
+                    getattr(os, name)(str(self.guard), [str(self.guard), "pr", "view"])
+                self.assertIn("would replace", str(caught.exception))
+                self.assertIn(name, str(caught.exception))
+
+    def test_the_create_hand_off_goes_over_the_call_that_leaves_this_process_alone(self) -> None:
+        """The hand-off is execve, not execv: it must not leave this process's PATH led by the guard. A helper
+        mocking only execv let the real execve run, which is how the runner got replaced."""
+        with mock.patch.object(os, "execv", side_effect=AssertionError("a create must not go over execv")):
+            _code, _err, path, _passed = self.route(["pr", "comment", "7", "-R", "o/r", "--body", "x"])
+        self.assertEqual(path, str(self.guard))
 
     def test_a_create_the_guard_judged_passes_to_the_real_gh(self) -> None:
         os.environ["GH_QUOTA_CHECKED"] = "1"
@@ -14084,20 +14144,30 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.addCleanup(patch.stop)
 
     def first_exec(self, args: list[str] | None = None) -> tuple[str | None, list[str] | None]:
-        """(the path cmd_gh exec'd, the argv it handed it), as a fresh process would see it."""
-        seen: list[tuple[str, list[str]]] = []
+        """(the path cmd_gh exec'd, the argv it handed it), as a fresh process would see it.
+
+        `self.handed_env` is the environment that process would start with: the hand-off back to the guard
+        goes over execve and so leaves this process's own environment alone."""
+        seen: list[tuple[str, list[str], dict[str, str]]] = []
 
         def execv(path: str, argv: list[str]) -> None:
-            seen.append((path, argv))
+            seen.append((path, argv, dict(os.environ)))
+            raise SystemExit(0)
+
+        def execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+            seen.append((path, argv, dict(env)))
             raise SystemExit(0)
 
         for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
             if name not in self.kept:
                 os.environ.pop(name, None)
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
+        self.handed_env: dict[str, str] = {}
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 gg.cmd_gh(list(args if args is not None else self.READ))
+        if seen:
+            self.handed_env = seen[0][2]
         return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
 
     READ = ("pr", "view", "7", "-R", "o/r", "--json", "state")
@@ -14109,10 +14179,12 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
         self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
                          "the line it is handed is the line that was typed")
-        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+        self.assertEqual(self.handed_env.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
                          "the pass back here knows it has been round")
-        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+        self.assertEqual(self.handed_env["PATH"].split(os.pathsep)[0], str(guard.parent),
                          "led by the guard's own directory, so it finds the gh after it as usual")
+        self.assertNotIn("GLAEDA_GH_QUOTA_HOP", os.environ,
+                         "execve hands the mark to the started process: an in-process caller keeps its own env")
 
     def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
         """One hop, not a loop: the guard exports GH_QUOTA_CHECKED, and this hand-off's own mark carries the pid in
@@ -19070,10 +19142,24 @@ class BrokerAnswerCacheTest(CountingGhBase):
         self.assertIn(b"stopped", err)
         self.assertLess(time.monotonic() - started, 10)
 
+    def test_post_arguments_come_from_the_shipped_parser_not_a_bare_mock(self) -> None:
+        """A `mock.Mock` answers a flag it has never heard of with a truthy Mock, so a flag added to `post`
+        turns these tests red for a reason that is not in the code under test: on 2026-11-22 `--label` read as
+        typed and four tests here refused (glaeda#2565). post_args carries the parser's own names and defaults,
+        and this keeps the file from growing another bare stand-in for an argparse namespace."""
+        built = vars(post_args("comment", "O/R#7", "--body", "hi"))
+        self.assertEqual((built["kind"], built["target"], built["body"], built["event"], built["wait"]),
+                         ("comment", "O/R#7", "hi", "comment", 0))
+        for flag in ("label", "remove_label", "head", "base", "title", "reviewer", "body_file", "status_key"):
+            self.assertIsNone(built[flag], f"--{flag} is not typed here and must not read as typed")
+        # Split so the needle is not in this file's own source, which would match itself.
+        stand_in = "mock.Mock(" + "kind="
+        self.assertNotIn(stand_in, Path(__file__).read_text(encoding="utf-8"),
+                         "build post arguments with post_args(): a bare Mock makes every unknown flag truthy")
+
     def test_a_queued_post_stamps_its_repository(self) -> None:
         no_guard(self)
-        args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+        args = post_args("comment", "O/R#7", "--body", "hi")
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
@@ -19084,8 +19170,8 @@ class BrokerAnswerCacheTest(CountingGhBase):
         the write and upstream_refuse_posts failed it a tick later, so the PR was never opened and `post pr` said
         nothing was wrong. The broker writes it with a token minted for the call."""
         no_guard(self)
-        args = mock.Mock(kind="pr", target="O/R", body="why", body_file=None, wait=0, json=False,
-                         head="lane/x", base="main", title="a title", reviewer=None, event="comment")
+        args = post_args("pr", "O/R", "--body", "why", "--head", "lane/x", "--base", "main",
+                         "--title", "a title")
         ran: list[list[str]] = []
 
         def answer(argv, **_kw):
@@ -19105,8 +19191,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
 
     def test_a_write_the_broker_cannot_make_is_refused_with_its_body_and_the_command_for_it(self) -> None:
         no_guard(self)
-        args = mock.Mock(kind="review", target="O/R#7", body="the review body", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+        args = post_args("review", "O/R#7", "--body", "the review body", "--event", "comment")
         err = io.StringIO()
         with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
                 mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no call for a review")), \
@@ -19133,10 +19218,8 @@ class BrokerAnswerCacheTest(CountingGhBase):
                                    ("pr", "O/R",
                                     "gh pr create --repo O/R --base main --head lane/x --title t --body-file {body}")):
             with self.subTest(kind=kind):
-                made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
-                    "head": None, "base": None, "title": None}
-                args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
-                                 reviewer=None, event="comment", **made)
+                made = ["--head", "lane/x", "--base", "main", "--title", "t"] if kind == "pr" else []
+                args = post_args(kind, target, "--body", "hi", *made)
                 err = io.StringIO()
                 with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
                         contextlib.redirect_stderr(err):
