@@ -62,10 +62,26 @@ loader.exec_module(gg)
 # place of the runner and this suite exited 0 after 567 lines with 22 tests unrun -- green in CI.
 # So every exec entry point refuses here, loudly, in the test that reached it. A test that exercises a
 # hand-off mocks the entry point it means to exercise and reads what that call was handed.
+class RealExecInTestProcess(BaseException):
+    """Raised by the exec net below. A BaseException, deliberately, and not an AssertionError.
+
+    The hand-off sites this net guards sit inside `except Exception ... broker_note(...)` blocks that go on to
+    `return None  # the call runs as before` (scripts/glaeda-gh, the create hand-off at the `os.execve` call).
+    An AssertionError is an Exception, so the net's first shape was swallowed there and the broker call fell
+    through and kept retrying: measured 2026-11-23 (glaeda#2565), `Verify / scripts` hung from 01:32:58 until
+    the job was cancelled at 01:38:09, repeating one `login-fallback` refresh line, and the same change ran the
+    remote suite past its 1800s bound. A BaseException crosses those handlers untouched.
+
+    unittest still records it: its test part executor catches BaseException, so this ends one test as an ERROR,
+    the next test runs, and the suite prints `Ran N tests` / `FAILED` -- which is the whole point of the net.
+    """
+
+
 def _no_real_exec(name: str):
     def refuse(path, argv=(), *rest):  # noqa: ANN001, ANN202
-        raise AssertionError(f"os.{name}({path!r}, {list(argv)[:4]!r}) in the test process would replace "
-                             "the unittest runner: mock this entry point in the test and read what it was handed")
+        raise RealExecInTestProcess(
+            f"os.{name}({path!r}, {list(argv)[:4]!r}) in the test process would replace "
+            "the unittest runner: mock this entry point in the test and read what it was handed")
     return refuse
 
 
@@ -12994,10 +13010,24 @@ class BrokerMergeGuardTest(BrokerBase):
         for name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
             with self.subTest(entry=name):
                 self.assertTrue(hasattr(os, name), f"os.{name} is gone: the guard list needs rereading")
-                with self.assertRaises(AssertionError) as caught:
+                with self.assertRaises(RealExecInTestProcess) as caught:
                     getattr(os, name)(str(self.guard), [str(self.guard), "pr", "view"])
                 self.assertIn("would replace", str(caught.exception))
                 self.assertIn(name, str(caught.exception))
+        # The net is only a net if the code it guards cannot catch it. Every hand-off site wraps its exec in
+        # `except Exception ... broker_note(...)` and then runs the call as before, so an Exception here is
+        # noted and swallowed and the caller retries: that is the hang this suite was cancelled for on
+        # 2026-11-23, not a red. Keep this a BaseException.
+        self.assertFalse(issubclass(RealExecInTestProcess, Exception),
+                         "a production `except Exception` would swallow the net and the caller would retry")
+        swallowed = False
+        try:
+            os.execv(str(self.guard), [str(self.guard), "pr", "view"])
+        except Exception:  # noqa: BLE001 - exactly what the guarded code does
+            swallowed = True
+        except RealExecInTestProcess:
+            pass
+        self.assertFalse(swallowed, "the net crossed a bare `except Exception`, as the real hand-off sites have")
 
     def test_the_create_hand_off_goes_over_the_call_that_leaves_this_process_alone(self) -> None:
         """The hand-off is execve, not execv: it must not leave this process's PATH led by the guard. A helper
