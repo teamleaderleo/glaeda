@@ -16653,8 +16653,9 @@ class LandQueue:
                 if past:
                     self.forward_settle(e, "CLOSED", "", "", "", executor=executor, how="the cache shows it")
                     return False
+                # quiet: whoever closed it knows (2026-11-23 09:32Z: a closed PR woke its requester as a [blocker])
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
-                          f"closed); nothing is merged", "")
+                          f"closed); nothing is merged", "", tell="quiet")
                 return False
             return past or self.forward_state_wanted(e)  # a copy older than the row: read live
         # 3: past the give-up a moved pin is forward_settle's to stop, as an fyi
@@ -16737,7 +16738,7 @@ class LandQueue:
                 return
             if state == "CLOSED":
                 self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue ({how} closed); "
-                          "nothing is merged", "")
+                          "nothing is merged", "", tell="quiet")  # whoever closed it knows
                 return
             self.save(e)
             return
@@ -18502,7 +18503,7 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def follow_own_update(self, e: dict, head: str) -> str | None:
+    def follow_own_update(self, e: dict, head: str, read: list | None = None) -> str | None:
         """Move E's pin to HEAD when HEAD is the base merge this queue's own update_branch made at the pinned head;
         None when it moved (or nothing was pinned elsewhere), else why HEAD still stops the land (head_moved).
         hq#14568 (glaeda#2377) followed it only when the cache showed the new head right after an update that returned
@@ -18523,6 +18524,8 @@ class LandQueue:
         parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
         if parents is None and str(data.get("headRefOid") or "").lower() == head and data.get("headParent"):
             parents = [data["headParent"]]  # pr_head_parent's first parent (pin_follow's read) says it as well
+        if parents is None and isinstance(read, list):
+            parents = read  # a read of HEAD's commit the caller made (repin_parents): the cache does not show HEAD
         unread = [h for h in e.get("history") or [] if h.get("event") == "pin_parent_unread" and h.get("head") == head[:12]]
         if not isinstance(parents, list) and unread:  # glaeda#2364: pin_follow waited for its parent and none came
             return "no read of this head said its first parent within the wait, so it is not known to be this update"
@@ -18535,6 +18538,27 @@ class LandQueue:
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
         return None
+
+    def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
+        """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
+        (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
+        the pin (follow_own_update): an update was sent at the pin, the head named is another, and the cache does not
+        show it (a cached read carries its own parents). None: no such case, or the read did not answer."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        gh = self.gh()
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha) or not sent \
+                or land_head_moved(pin, sent) or gh is None:
+            return None
+        if str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower() == sha:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{sha}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def old_pin_wait(self, e: dict, head: str) -> bool:
         """Under the lock. True while HEAD, which is not E's pin, is a pin E's own queue already followed away from
@@ -18704,8 +18728,12 @@ class LandQueue:
         if land_base_merge_parent(pin, head, data):
             return True
         head = str(head or "").lower()
-        return bool(pin) and SHA40.fullmatch(head) is not None and str(data.get("headRefOid") or "").lower() == head \
-            and not isinstance(data.get("headParents"), list) and self.gh() is not None
+        if not bool(pin) or SHA40.fullmatch(head) is None or str(data.get("headRefOid") or "").lower() != head \
+                or self.gh() is None:
+            return False
+        parents = data.get("headParents")
+        # a merge whose first parent is not the pin may sit on top of other base merges (land_base_merge_chain)
+        return not isinstance(parents, list) or len(parents) == 2
 
     def base_merge_check(self, e: dict, check: dict) -> bool:
         """On a worker, before the judgment: whether CHECK's head is only a base merge on its pin, from two compare
@@ -18730,21 +18758,27 @@ class LandQueue:
         why = "" if gh and base else "no gh-quota shim or base branch to read it with"
         unread, said = False, ""  # unread: WHY is a read that did not answer, not an answer that says no
         parents: Any = None
+        chain = 0  # base merges between the pin and HEAD when HEAD sits on several (base_merge_chain)
         if kept:
             why = kept  # read before, for this head and pin (ancestry_record): not read again
         elif not why and not parent:
             path = f"repos/{e['repo']}/commits/{head}"
-            got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
-            try:
-                parents = json.loads(got.stdout or "") if got.returncode == 0 else None
-            except ValueError:
-                parents = None
-            if not isinstance(parents, list):
-                why, unread = f"the read of {path} failed (exit {got.returncode}), so its parents are not known", True
-                said = f"{got.stdout or ''}\n{got.stderr or ''}"
+            if str(data.get("headRefOid") or "").lower() == head and isinstance(data.get("headParents"), list):
+                parents = data["headParents"]  # the cache read them: no call
             else:
+                got = self.call([gh, "api", path, "--jq", "[.parents[]?.sha]"], LAND_GH_DEADLINE)
+                try:
+                    parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+                except ValueError:
+                    parents = None
+                if not isinstance(parents, list):
+                    why = f"the read of {path} failed (exit {got.returncode}), so its parents are not known"
+                    unread, said = True, f"{got.stdout or ''}\n{got.stderr or ''}"
+            if isinstance(parents, list):
                 parent = land_base_merge_parent(pin, head, {"headRefOid": head, "headParents": parents})
-                if not parent:
+                if not parent and len(parents) == 2:
+                    parent, why, unread, said, chain = self.base_merge_chain(e, head, pin, base)
+                elif not parent:
                     why = (f"its parents ({', '.join(str(p)[:12] for p in parents) or 'none'}) are not the pinned head "
                            "and then one more commit: a push, not a base merge on it")
         for path in ([f"repos/{e['repo']}/compare/{urllib.parse.quote(base, safe='')}...{head}",
@@ -18789,9 +18823,43 @@ class LandQueue:
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
             e["updatedHead"], e["updatedHeadAt"] = head, self.now
             e.pop("pinWait", None)
-            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12])
+            self.history(e, "repin_base_merge", was=pin[:12], head=head[:12], base=parent[:12],
+                         **({"merges": chain} if chain > 1 else {}))
             self.save(e)
             return True
+
+    def base_merge_chain(self, e: dict, head: str, pin: str, base: str) -> tuple[str, str, bool, str, int]:
+        """On a worker, from base_merge_check: whether HEAD is a run of base merges on PIN (land_base_merge_chain), from
+        one compare PIN...HEAD (its commits and their parents) and one compare of each merge's second parent with BASE
+        (an ancestor of it). (the top merge's second parent, "", False, "", merges) when it is; else ("", why, unread,
+        said, 0): unread when a read did not answer (base_merge_unread's case), not when an answer says no."""
+        gh = self.gh()
+        if not gh or not base:
+            return "", "no gh-quota shim or base branch to read it with", False, "", 0
+        path = f"repos/{e['repo']}/compare/{pin}...{head}"
+        got = self.call([gh, "api", path, "--jq", LAND_CHAIN_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        if not isinstance(doc, dict):
+            return ("", f"the read of {path} failed (exit {got.returncode}), so its commits are not known", True,
+                    f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+        seconds, why = land_base_merge_chain(pin, head, doc)
+        for s in dict.fromkeys(seconds) if not why else ():
+            path = f"repos/{e['repo']}/compare/{s}...{urllib.parse.quote(base, safe='')}"
+            got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+            try:
+                ans = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                ans = None
+            if not isinstance(ans, dict) or not isinstance(ans.get("s"), str):
+                return ("", f"the read of {path} failed (exit {got.returncode}), so it is not shown to be on {base}",
+                        True, f"{got.stdout or ''}\n{got.stderr or ''}", 0)
+            if not (ans["s"] == "identical" or (ans["s"] == "ahead" and ans.get("b") == 0)):
+                why = f"its merged commit {s[:12]} is not on {base}: not a merge of {base}"
+                break
+        return ("", why, False, "", 0) if why else (seconds[0], "", False, "", len(seconds))
 
     def base_merge_unread(self, e: dict, head: str, why: str, said: str) -> bool:
         """Under the lock, from base_merge_check: its read of HEAD did not answer (WHY; SAID is the read's output).
@@ -19702,6 +19770,7 @@ class LandQueue:
         if kind == "review":
             self.do_review(e, head, answer)
             return
+        parents = self.repin_parents(e, act, head) if kind == "repin" else None
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
@@ -19729,6 +19798,17 @@ class LandQueue:
                 sha = str(act.get("sha") or "").lower()
                 cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
+                    # The head land_judge read is this queue's own update_branch's base merge on the pin: the pin
+                    # follows it now (follow_own_update; a push by anyone else is not followed). Without this, a row
+                    # with no cached PR read is judged at its full pin again and again (fresh_head: land_full_pin),
+                    # the repin wait's sha is never read (tick's no-data branch), and the same "pin" refusal reaches
+                    # the stop. manaflow-ai/cmux-platform#1771, 2026-11-23: update_branch at the pin 2f3e4212176e
+                    # (11:58:07Z, exit 0) made a11cfabd1bde; 13 judgments at 2f3e4212176e followed, and at 12:03:51Z it
+                    # stopped "pin: 3 identical refusals in a row: ... PR read head 'a11cfabd...' does not match
+                    # pinned head 2f3e4212...". glaeda#2649 stopped the same way that morning.
+                    # Only on a read of that head's parents (repin_parents): with none, nothing is followed here.
+                    if parents is not None and self.follow_own_update(e, sha, parents) is None:
+                        e["streak"] = None  # the refusal named the head the queue made itself: nothing to count
                     self.wait(e, {"kind": "repin", "sha": sha}, None)
                 elif SHA40.fullmatch(sha) and sha == head == cached:
                     # land_judge's judge_again(), its fallback for a refusal with no step of its own: judge this same
@@ -21371,6 +21451,37 @@ def land_base_merge_parent(pin: str, head: str, data: dict) -> str:
     if not SHA40.fullmatch(first) or land_head_moved(pin, first) or not SHA40.fullmatch(second):
         return ""
     return second
+
+
+# A run of base merges on a pinned head: the lander bot merged the base twice (95d7a2428 -> 429b4ab2fc -> 694409d218,
+# hq#17489, six head_moved stops in a day) before the queue read the PR, so HEAD's first parent was a base merge and not
+# the pin. The pin follows HEAD when walking its first parents reaches the pin, every commit passed is a merge (two
+# parents) and every second parent is an ancestor of the base branch (base_merge_chain reads that). A non-merge commit
+# anywhere on the walk, or a merge of a commit not on the base, stops it head_moved as before. The diff rule
+# (land_base_merge_why) then holds the whole run to the pin's own diff.
+LAND_CHAIN_JQ = "{s: .status, n: .total_commits, c: [.commits[]? | {s: .sha, p: [.parents[]?.sha]}]}"
+LAND_CHAIN_MAX = 20  # merges one pin follows in one step
+
+
+def land_base_merge_chain(pin: str, head: str, doc: dict) -> tuple[list[str], str]:
+    """(the second parents of the merges from HEAD down to PIN along first parents, top first, "") when DOC, GitHub's
+    compare PIN...HEAD as LAND_CHAIN_JQ shapes it, shows every commit on that walk a two-parent merge and the walk
+    reaches PIN; else ([], why not). Whether those second parents are on the base is for the caller's reads."""
+    head = str(head or "").lower()
+    commits = (doc or {}).get("c")
+    if not isinstance(commits, list) or (doc or {}).get("s") != "ahead" or (doc or {}).get("n") != len(commits):
+        return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
+    parents = {str((c or {}).get("s") or "").lower(): [str(p or "").lower() for p in (c or {}).get("p") or []]
+               for c in commits if isinstance(c, dict)}
+    seconds, cur = [], head
+    while land_head_moved(pin, cur):
+        ps = parents.get(cur)
+        if ps is None or len(ps) != 2 or not all(SHA40.fullmatch(p) for p in ps) or len(seconds) >= LAND_CHAIN_MAX:
+            return [], (f"{cur[:12]} between the pin and the head is not a merge of the base (parents "
+                        f"{', '.join(p[:12] for p in ps or []) or 'unlisted'}): a push, not base merges on the pin")
+        seconds.append(ps[1])
+        cur = ps[0]
+    return seconds, ""
 
 
 def land_diff_lines(patch: str) -> tuple[str, ...]:
