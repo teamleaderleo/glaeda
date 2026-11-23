@@ -18447,7 +18447,7 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
-    def follow_own_update(self, e: dict, head: str) -> str | None:
+    def follow_own_update(self, e: dict, head: str, read: list | None = None) -> str | None:
         """Move E's pin to HEAD when HEAD is the base merge this queue's own update_branch made at the pinned head;
         None when it moved (or nothing was pinned elsewhere), else why HEAD still stops the land (head_moved).
         hq#14568 (glaeda#2377) followed it only when the cache showed the new head right after an update that returned
@@ -18468,6 +18468,8 @@ class LandQueue:
         parents = data.get("headParents") if str(data.get("headRefOid") or "").lower() == head else None
         if parents is None and str(data.get("headRefOid") or "").lower() == head and data.get("headParent"):
             parents = [data["headParent"]]  # pr_head_parent's first parent (pin_follow's read) says it as well
+        if parents is None and isinstance(read, list):
+            parents = read  # a read of HEAD's commit the caller made (repin_parents): the cache does not show HEAD
         unread = [h for h in e.get("history") or [] if h.get("event") == "pin_parent_unread" and h.get("head") == head[:12]]
         if not isinstance(parents, list) and unread:  # glaeda#2364: pin_follow waited for its parent and none came
             return "no read of this head said its first parent within the wait, so it is not known to be this update"
@@ -18480,6 +18482,27 @@ class LandQueue:
                      parents="checked" if isinstance(parents, list) else "unread")
         self.save(e)
         return None
+
+    def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
+        """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
+        (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
+        the pin (follow_own_update): an update was sent at the pin, the head named is another, and the cache does not
+        show it (a cached read carries its own parents). None: no such case, or the read did not answer."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        sent = str((e.get("updateSent") or {}).get("head") or "").lower()
+        gh = self.gh()
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha) or not sent \
+                or land_head_moved(pin, sent) or gh is None:
+            return None
+        if str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower() == sha:
+            return None
+        got = self.call([gh, "api", f"repos/{e['repo']}/commits/{sha}", "--jq", "[.parents[]?.sha]"],
+                        LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            return None
+        return [str(p).lower() for p in parents] if isinstance(parents, list) else None
 
     def old_pin_wait(self, e: dict, head: str) -> bool:
         """Under the lock. True while HEAD, which is not E's pin, is a pin E's own queue already followed away from
@@ -19644,6 +19667,7 @@ class LandQueue:
         if kind == "review":
             self.do_review(e, head, answer)
             return
+        parents = self.repin_parents(e, act, head) if kind == "repin" else None
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
@@ -19671,6 +19695,17 @@ class LandQueue:
                 sha = str(act.get("sha") or "").lower()
                 cached = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
                 if SHA40.fullmatch(sha) and sha != head:
+                    # The head land_judge read is this queue's own update_branch's base merge on the pin: the pin
+                    # follows it now (follow_own_update; a push by anyone else is not followed). Without this, a row
+                    # with no cached PR read is judged at its full pin again and again (fresh_head: land_full_pin),
+                    # the repin wait's sha is never read (tick's no-data branch), and the same "pin" refusal reaches
+                    # the stop. manaflow-ai/cmux-platform#1771, 2026-11-23: update_branch at the pin 2f3e4212176e
+                    # (11:58:07Z, exit 0) made a11cfabd1bde; 13 judgments at 2f3e4212176e followed, and at 12:03:51Z it
+                    # stopped "pin: 3 identical refusals in a row: ... PR read head 'a11cfabd...' does not match
+                    # pinned head 2f3e4212...". glaeda#2649 stopped the same way that morning.
+                    # Only on a read of that head's parents (repin_parents): with none, nothing is followed here.
+                    if parents is not None and self.follow_own_update(e, sha, parents) is None:
+                        e["streak"] = None  # the refusal named the head the queue made itself: nothing to count
                     self.wait(e, {"kind": "repin", "sha": sha}, None)
                 elif SHA40.fullmatch(sha) and sha == head == cached:
                     # land_judge's judge_again(), its fallback for a refusal with no step of its own: judge this same
