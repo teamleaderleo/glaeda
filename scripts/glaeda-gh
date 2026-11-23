@@ -22212,8 +22212,18 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             held += f", {past} more unfinished past the first 100" if past else ""
             # A skipped check gave no verdict; counted in `passed` it read as a check that ran (cmux#51140).
             skipped = f", {len(groups['skipped'])} skipped (no verdict)" if groups["skipped"] else ""
-            lines.append(f"checks {state}{partial}: {len(groups['passed'])} passed{skipped}, "
-                         f"{len(groups['failed'])} failed, "
+            # A cancelled check gave no verdict either: it stopped before it judged. Counted as "failed" it read
+            # as a check that ran and said no (cmux#51251: "1 failed" was one cancelled suite, and the PR was
+            # landable). It is counted apart and not in the failed tally, as a superseded attempt already is.
+            stopped = [c for c in groups["failed"] if str(c.get("conclusion") or "").upper() == "CANCELLED"]
+            judged_no = [c for c in groups["failed"] if c not in stopped]
+            cancelled = f", {len(stopped)} cancelled (no verdict, not counted as failed)" if stopped else ""
+            # The word is the verdict's, except that a rollup whose only red is an absence is no red: it says so
+            # here. The `checks.state` field and every exit code are unchanged (see `checks_state`); which PRs
+            # merge is not this line's to decide.
+            word = "NO VERDICT" if state == "FAILURE" and stopped and not judged_no else state
+            lines.append(f"checks {word}{partial}: {len(groups['passed'])} passed{skipped}, "
+                         f"{len(judged_no)} failed{cancelled}, "
                          f"{len(groups['pending'])} pending{held} (of {len(checks)}{more}, "
                          f"{sum(1 for c in checks if c.get('required'))} required){differs}")
         else:
@@ -22226,7 +22236,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             skipped = sorted(groups["skipped"], key=lambda c: (marked and not c.get("required"), label(c)))
             names = ", ".join(label(c) for c in skipped[:SKIPPED_NAMED])
             rest = f", +{len(skipped) - SKIPPED_NAMED} more" if len(skipped) > SKIPPED_NAMED else ""
-            lines.append(f"  no verdict (skipped, nothing they would have judged was judged): {names}{rest}")
+            lines.append("  skipped, no verdict (nothing they would have judged was judged; nothing to re-run "
+                         f"and no result to compare): {names}{rest}")
         if data.get("state") == "OPEN" and expected_missing(data):
             lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
         if data.get("requiredMissing"):
@@ -22237,10 +22248,11 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if until in ("done", "merged"):
             cut = straggler_cut(data, now)
             lines += straggler_lines(cut if cut is not None else data, now)
-        # Required checks first, then real failures before cancelled ones: the capped list leads with what to fix.
-        own_failed, inherited_failed = split_inherited(data, groups["failed"], now)
-        bad = sorted(own_failed, key=lambda c: (marked and not c.get("required"),
-                                                str(c.get("conclusion") or "").lower() == "cancelled"))
+        # Required checks first: the capped list leads with what to fix. Cancelled checks are not in it -- they
+        # gave no verdict and need a different step (below), not a fix.
+        own_failed, inherited_failed = split_inherited(
+            data, [c for c in groups["failed"] if str(c.get("conclusion") or "").upper() != "CANCELLED"], now)
+        bad = sorted(own_failed, key=lambda c: (marked and not c.get("required"),))
         for c in bad[:shown_failed]:
             optional = " (not required)" if marked and not c.get("required") else ""
             lines.append(f"  {outcome(c.get('conclusion'))}: {label(c)}{steps_note(c)}{optional}  {c.get('url') or ''}".rstrip())
@@ -22252,6 +22264,15 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines.append(f"  inherited from {data.get('baseRefName')}: {names}{more}: {INHERITED_ADVICE}")
             if not own_failed:
                 lines.append("  every red here is inherited: nothing to do on this PR for them")
+        # An absence names its own next step: a cancelled check has to run again (or its superseding run read),
+        # where a skipped one has nothing to re-run and no result to compare (cmux#51251, cmux#51140).
+        stopped_own = [c for c in groups["failed"] if str(c.get("conclusion") or "").upper() == "CANCELLED"]
+        for c in stopped_own[:shown_failed]:
+            optional = " (not required)" if marked and not c.get("required") else ""
+            lines.append(f"  cancelled, no verdict (not counted as failed): {label(c)}{steps_note(c)}{optional}: "
+                         f"re-run it, or read the newer attempt that replaced it  {c.get('url') or ''}".rstrip())
+        if len(stopped_own) > shown_failed:
+            lines.append(f"  ... {len(stopped_own) - shown_failed} more cancelled (--json lists them)")
         for c in groups["held"][:shown_failed]:
             refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
             why = ("cancelled before any step ran" if cancelled_unstarted(c)
