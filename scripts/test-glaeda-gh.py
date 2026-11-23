@@ -28713,10 +28713,55 @@ class LandTest(Base):
         self.w.cache.pop(self.KEY, None)
         self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
+        self.w.view_err = "HTTP 502: Bad Gateway"  # and the second route (a state read) cannot read it either
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
-        self.assertIn("holds no read of the PR", e["stop"]["reason"])
+        self.assertIn("holds no read of the PR and a state read failed (HTTP 502", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
+        # it cannot tell, so it says so as an fyi, never a [blocker]
+        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(said[said.index("--class") + 1], "fyi")
+
+    def give_up_unread(self, view_state: str) -> dict:
+        """A forwarded row this host's cache never read, past LAND_FORWARD_GIVE_UP, whose second read answers
+        VIEW_STATE."""
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        self.w.view_state = view_state
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "view")), 1)  # one read, once
+        self.assertFalse([c for c in self.w.sent() if "forward_no_outcome" in c[-1]], self.w.sent())
+        return e
+
+    def test_a_forwarded_land_the_cache_never_read_but_github_shows_merged_ends_merged_as_one_fyi(self):
+        # 2026-11-23: six forward_no_outcome [blocker]s in ~10 min, four of them on PRs merged hours before
+        # (cmuxterm-hq#18714, #18748, #19592, cmux-platform#1673): the cache was the only route read.
+        e = self.give_up_unread("MERGED")
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        self.assertIn("a state read shows it merged", e["history"][-1]["how"])
+        [said] = [c for c in self.w.sent() if "merged" in c[-1]]
+        self.assertEqual((said[3], said[said.index("--class") + 1]), ("host/lane", "fyi"))
+        self.assertEqual(said[-1].count("\n"), 0)
+        self.tick(gg.LAND_FORWARD_GIVE_UP)
+        self.assertEqual((len(self.w.sent()), len(self.w.gh_calls("pr", "view"))), (1, 1))
+
+    def test_a_forwarded_land_the_cache_never_read_but_github_shows_closed_stops_closed_as_an_fyi(self):
+        e = self.give_up_unread("CLOSED")
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertIn("a state read shows it closed", e["stop"]["reason"])
+        [said] = self.w.sent()
+        self.assertEqual(said[said.index("--class") + 1], "fyi")
+
+    def test_a_forwarded_land_still_open_by_its_second_read_stops_forward_no_outcome_as_a_blocker(self):
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertIn("the PR is still open", e["stop"]["reason"])
+        [said] = [c for c in self.w.sent() if "forward_no_outcome" in c[-1]]
+        self.assertEqual(said[said.index("--class") + 1], gg.LAND_NOTICE_CLASS)
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
