@@ -21328,6 +21328,82 @@ class ReexecDrainTest(Base):
         # one gap and one drain, 10 min at most.
         self.assertLessEqual(gg.REEXEC_UPDATE_GAP + gg.REEXEC_DRAIN_MAX, 600.0)
 
+    def test_a_judgment_past_half_its_bound_finishes_within_that_bound(self) -> None:
+        # A lane VM, 2026-11-21..22: 25 of 101 re-execs cut a judgment still running at REEXEC_DRAIN_MAX.
+        limit = 100.0 + gg.REEXEC_DRAIN_MAX
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit, finish_until=limit + 60), "finish")
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit + 59, finish_until=limit + 60), "finish")
+        cut = gg.reexec_due(True, True, 100.0, limit + 60, finish_until=limit + 60)
+        self.assertNotIn(cut, (None, "defer", "reexec", "finish"), "bounded by the judgment's own end")
+        self.assertNotIn(gg.reexec_due(True, True, 100.0, limit, finish_until=0.0), (None, "defer", "finish"))
+        self.assertEqual(gg.reexec_due(True, False, 100.0, limit, finish_until=limit + 60), "reexec", "it ended")
+        self.assertEqual(gg.reexec_due(True, True, 100.0, limit - 1, finish_until=limit + 60), "defer")
+
+    def test_same_bytes_reinstalled_do_not_reexec(self) -> None:
+        """A lane VM, 2026-11-21..22: 40 of 175 release installs left glaeda-gh byte-identical, and each re-exec'd the
+        daemon on its mtime. Only a change of content does now; the file is hashed only when its stat moved."""
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        seen = {"stat": gg.script_stat(path), "sha": gg.hashlib.sha256(b"one").hexdigest()}
+        self.assertFalse(gg.script_changed(path, seen))
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"one")
+        os.utime(later, ns=(seen["stat"][0] + 10**9, seen["stat"][0] + 10**9))
+        later.replace(path)  # an install: same bytes, new inode and mtime
+        self.assertNotEqual(gg.script_stat(path), seen["stat"])
+        self.assertFalse(gg.script_changed(path, seen))
+        self.assertEqual(seen["stat"], gg.script_stat(path), "the new stat is remembered")
+        with mock.patch.object(gg.hashlib, "sha256", side_effect=AssertionError("hashed an unmoved stat")):
+            self.assertFalse(gg.script_changed(path, seen))
+        path.write_bytes(b"two")
+        os.utime(path, ns=(seen["stat"][0] + 2 * 10**9, seen["stat"][0] + 2 * 10**9))
+        self.assertTrue(gg.script_changed(path, seen))
+        with mock.patch.object(gg.hashlib, "sha256", side_effect=AssertionError("hashed the same changed stat")):
+            self.assertTrue(gg.script_changed(path, seen))
+        path.write_bytes(b"one")  # reverted: nothing to re-exec for
+        os.utime(path, ns=(seen["stat"][0] + 3 * 10**9, seen["stat"][0] + 3 * 10**9))
+        self.assertFalse(gg.script_changed(path, seen))
+
+    def serve_over(self, rewrite: bytes) -> list:
+        """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
+        script = Path(self.tmp.name) / "bin" / "glaeda-gh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_bytes(b"# the daemon's code\n")
+
+        class Stop(Exception):
+            pass
+
+        class Idle:
+            valve_due, reexec_waiting, reexec_finish_until, ticks = None, False, None, 0
+
+            def tick(self) -> dict:
+                self.ticks += 1
+                if self.ticks == 2:
+                    new = script.with_name("glaeda-gh.new")
+                    new.write_bytes(rewrite)
+                    os.utime(new, (time.time() + 60, time.time() + 60))
+                    new.replace(script)  # how an install lands: a new file renamed over the old
+                if self.ticks > 4:
+                    raise Stop
+                return {"modes": {}, "paths": {}, "errors": []}
+
+            def land_busy(self) -> bool:
+                return False
+
+        execs: list = []
+        with mock.patch.object(gg, "__file__", os.fspath(script)), mock.patch.object(gg, "Daemon", Idle), \
+                mock.patch.object(gg, "Watchdog", mock.MagicMock()), mock.patch.object(gg, "TICK", 0), \
+                mock.patch.object(gg, "error_site", side_effect=Stop), \
+                mock.patch.object(gg.os, "execv", side_effect=lambda *a: execs.append(a)), self.assertRaises(Stop):
+            gg.serve()
+        return execs
+
+    def test_serve_reexecs_on_new_content_not_on_a_same_bytes_install(self) -> None:
+        self.assertEqual(self.serve_over(b"# the daemon's code\n"), [], "same bytes, new mtime and inode")
+        execs = self.serve_over(b"# new code\n")
+        self.assertTrue(execs, "new content re-execs")
+        self.assertEqual(execs[0][1][1:], [os.fspath(Path(self.tmp.name) / "bin" / "glaeda-gh"), "serve"])
+
     def test_a_waiting_reexec_starts_no_land_step(self) -> None:
         queue = mock.Mock()
         self.daemon.land_queue = queue
@@ -23207,6 +23283,31 @@ class LandTest(Base):
         self.assertEqual(heads[-1], f"head:o/r@{LB}")
         self.assertEqual(len(heads), 3)
 
+    def test_a_running_judgment_is_known_with_its_start_and_bound(self):
+        """A re-exec drain at REEXEC_DRAIN_MAX lets a judgment past half its bound finish (LandQueue.finishing): the
+        queue knows each running explain's start and timeout, and forgets it when the call returns."""
+        seen: list[dict] = []
+        run = self.w.run
+
+        def watching(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if "explain" in argv:
+                seen.append({**self.q.judging, "timeout": timeout})
+            return run(argv, timeout, env)
+
+        self.q.run = watching
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(len(seen), 1)
+        start, bound = seen[0][self.KEY]
+        self.assertEqual(bound, seen[0]["timeout"])
+        self.assertEqual(self.q.judging, {}, "a finished judgment is forgotten")
+        self.q.judging[self.KEY] = (start, bound)
+        self.assertEqual(self.q.finishing(start + bound / 2 - 1), 0.0, "under half its bound: not let finish")
+        self.assertEqual(self.q.finishing(start + bound / 2), start + bound)
+        self.assertEqual(self.q.finishing(start + bound), 0.0, "past its own bound: nothing to wait for")
+
     def test_tip_merge_update_branch_head_race_then_merge(self):
         self.pr(LA)
         self.land()
@@ -24526,8 +24627,10 @@ class LandTest(Base):
 
     def test_sha_pin_stops_when_the_head_is_another(self):
         self.pr(LB)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC])  # the cache read no parents: one read says a push
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
-        e = self.tick()
+        self.tick()
+        e = self.tick(30)  # a worker read the head's parents first
         self.assertEqual((e["state"], e["stop"]["code"], self.w.explains(), self.w.gh_calls("pr", "merge")),
                          ("stopped", "head_moved", [], []))
         self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
@@ -24778,13 +24881,61 @@ class LandTest(Base):
         self.assertIn("not a merge of main", e["stop"]["reason"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
-    def test_a_base_merge_whose_compare_cannot_be_read_still_stops_head_moved(self):
+    def unread_events(self, e: dict) -> list[int]:
+        return [h["n"] for h in e["history"] if h["event"] == "base_merge_unread"]
+
+    def test_a_base_merge_whose_compare_cannot_be_read_waits_and_is_read_again(self):
+        # 2026-11-22 23:25Z: three pinned lands stopped head_moved on the lander's base merge with the rule live;
+        # one failed compare read stopped the land. It waits now, and the next read that answers moves the pin.
         self.pinned_and_waiting()
         self.base_merged(was=None)
         e = self.tick(30)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("waiting", None, LA))
+        self.assertEqual((e["wait"]["kind"], self.unread_events(e)), ("retry", [1]))
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+        self.base_merged()  # the compare answers now
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(gg.LAND_BASE_MERGE_UNREAD_WAIT + 1)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertNotIn("baseMergeUnread", e)
+        self.assert_merged_at(LB)
+
+    def test_a_base_merge_whose_compare_never_answers_stops_head_moved_after_its_reads(self):
+        self.pinned_and_waiting()
+        self.base_merged(was=None)
+        e = self.tick(30)
+        for _ in range(gg.LAND_BASE_MERGE_UNREAD_MAX + 2):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertIn("failed", e["stop"]["reason"])
-        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.assertEqual(self.unread_events(e), list(range(1, gg.LAND_BASE_MERGE_UNREAD_MAX + 1)))
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_head_the_cache_read_without_parents_has_them_read_and_is_followed(self):
+        # a probe or a REST read of the PR carries no parents (head_parents): the worker reads the head commit's
+        self.pinned_and_waiting()
+        self.base_merged()
+        del self.w.cache[self.KEY]["data"]["headParents"]
+        self.w.cache[self.KEY]["data"].pop("headParent", None)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA, self.LD])
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual(len(self.compares()), 2)
+        self.assert_merged_at(LB)
+
+    def test_a_head_read_without_parents_that_is_a_push_stops_with_no_compare_read(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        del self.w.cache[self.KEY]["data"]["headParents"]
+        self.w.cache[self.KEY]["data"].pop("headParent", None)
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LA])  # one parent: a commit pushed on the pin
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("a push, not a base merge", e["stop"]["reason"])
+        self.assertEqual((self.compares(), self.w.explains()), ([], []))
 
     def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
         self.pinned_and_waiting()
@@ -29185,6 +29336,9 @@ class LandTest(Base):
         self.w.set_pr(self.KEY, land_pr(LC), self.t + 5)
         with self.q.lock:
             self.assertFalse(self.q.retire_from_cache({**e, "updateSent": {"head": LB}}))  # pin_follow's case
+            self.assertFalse(self.q.retire_from_cache(e))  # no parents read: maybe a base merge, a worker reads them
+        self.w.cache[self.KEY]["data"]["headParents"] = [LA]  # a read that carried them: a push on another commit
+        with self.q.lock:
             self.assertTrue(self.q.retire_from_cache(e))
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
         self.assertIn(f"--sha {LC}", e["stop"]["next"])
@@ -29494,8 +29648,10 @@ class LandTest(Base):
     def test_a_full_pin_the_cache_contradicts_still_stops(self):
         """The trust is in the pin, not over a read: a cached head that is not the pin still stops head_moved."""
         self.pr(LA)
+        self.w.api[f"repos/o/r/commits/{LA}"] = json.dumps([LC])  # the cache read no parents: one read says a push
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LB)
-        e = self.tick(1)
+        self.tick(1)
+        e = self.tick(30)  # a worker read the head's parents first
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
         self.assertEqual(e.get("state"), "stopped")
         self.assertIn("head_moved", json.dumps(e))
@@ -36262,6 +36418,39 @@ class ABareWaitFlagTest(unittest.TestCase):
         with mock.patch.object(gg, "cmd_land", fake_land):
             code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "--timeout", "3600"])
         self.assertEqual((code, seen.get("called")), (0, True))
+
+    def test_a_seconds_flag_the_table_never_listed_still_takes_its_own_default(self) -> None:
+        """The drift a hand table leaves: `post status ID --wait` (called so 2026-11-22, waiting for a queued
+        PR's number) exited 2 with "argument --wait: expected one argument", because the table had no
+        ("post", "--wait") row -- while the parser has declared that flag, with its own default, all along.
+        Every flag the parser spells in seconds (metavar S) is read off its own action now, so one the table
+        never listed works, and so does one added after this. A count that is not seconds (`log errors --max`
+        is lines, metavar N) is left for argparse, and a flag standing in another flag's value slot
+        (`--body --wait`) is that value, which the case above this one holds."""
+        for typed, dest, want in (
+                (["post", "status", "1795389726663-2573281-b1d8b9", "--wait"], "wait", 3600.0),
+                (["post", "comment", "o/r#1", "--body-file", "/p", "--wait"], "wait", 3600.0),
+                (["checks", "o/r", "a" * 40, "--consumer", "x", "--max-age"], "max_age",
+                 float(gg.HEAD_PENDING_TTL * 2))):
+            self.err.truncate(0), self.err.seek(0)
+            fixed, refusal = gg.bare_wait_synonym(list(typed))
+            self.assertEqual(refusal, [], typed)
+            self.assertEqual(getattr(gg.parser().parse_args(fixed), dest), want, typed)
+            self.assertIn("with no number is its default", self.err.getvalue())
+        self.assertEqual(gg.bare_wait_synonym(["log", "errors", "o/r", "--max"]),
+                         (["log", "errors", "o/r", "--max"], []))
+
+    def test_main_reaches_the_post_request_for_the_call_that_was_refused(self) -> None:
+        """End to end, the exact argv measured 2026-11-22: `post status ID --wait` waits instead of exiting 2."""
+        seen: dict[str, object] = {}
+
+        def fake_post_status(key: str, wait: float, *a: object, **kw: object) -> int:
+            seen["wait"] = wait
+            return 0
+
+        with mock.patch.object(gg, "cmd_post_status", fake_post_status):
+            code = gg.main(["post", "status", "1795389726663-2573281-b1d8b9", "--wait"])
+        self.assertEqual((code, seen.get("wait")), (0, 3600.0))
 
 
 class AFlagsCaseConventionTest(unittest.TestCase):
