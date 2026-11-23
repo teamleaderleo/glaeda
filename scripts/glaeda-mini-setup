@@ -210,6 +210,9 @@ DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of ma
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
 FLEET_SERVICES_SOURCE = REPO / "config/fleet-services.json"  # the owned non-glaeda launchd services (unmanaged_service)
 GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
+# The shared intent layer every glaeda CLI loads (leo-workspace tools/intent.py, vendored by scripts/intent-sync): the
+# copies in ~/.local/bin have no scripts/ beside them, so they read it from ~/.local/share/glaeda/intent/ (every profile)
+INTENT_SOURCES = (REPO / "scripts/intent.py", REPO / "scripts/intent_aliases.json")
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -1186,12 +1189,12 @@ def agent_names(ctx: Context) -> list[str]:
                 if (not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
                     or label == LABEL_PREFIX + "disk-pressure")
                 and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)
-                and not (is_reclaim_agent(label) and reclaim_owned_elsewhere(ctx))]
+                and not (owned_by_reconciler(ctx, label) and reclaim_owned_elsewhere(ctx))]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
     return [name for name in LINUX_UNITS
             if ((ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS)
-            and not (is_reclaim_agent(name) and reclaim_owned_elsewhere(ctx))]
+            and not (owned_by_reconciler(ctx, name) and reclaim_owned_elsewhere(ctx))]
 
 
 # leo-workspace's hygiene reconciler (tools/host-baseline) runs worktree reclaim where it is installed and retires
@@ -1199,7 +1202,20 @@ def agent_names(ctx: Context) -> list[str]:
 # each hourly OTA rerun reinstalled glaeda-worktree-reclaim, each ws-sync deleted it, and a run whose unit file
 # vanished mid-sweep was killed at systemd's default 90 s start timeout and left `not-found failed`. One owner:
 # where the reconciler is installed, setup leaves its reclaim agent out (and removes the one it owns).
+#
+# The same holds for the macOS disk-pressure agent: on a glaeda_pressure host (every glaeda hygiene host) the
+# reconciler's pressure pass runs `glaeda-disk --pressure --idle --apply --top 0` itself, and host-baseline retires
+# com.teamleaderleo.glaeda.disk-pressure as a legacy scheduler (leo-workspace machines/worktree-reclaim.json
+# glaeda.legacy_schedulers.Darwin). Leo's Mac, 2026-11-22/23: setup reinstalled it, the next ws-sync removed it,
+# launchd-loaded reloaded it in between and paged NOW 5 times in 19 h. Linux keeps glaeda-disk-pressure.timer: nothing
+# retires it there, and leo-workspace host-baseline.json glaeda_ota.timers requires it active.
 RECONCILER_LABEL = "ai.leo-workspace.hygiene-reconciler"
+RECONCILER_OWNED_MACOS = (LABEL_PREFIX + "disk-pressure",)
+
+
+def owned_by_reconciler(ctx: Context, label: str) -> bool:
+    """An agent the hygiene reconciler takes over where it is installed (reclaim_owned_elsewhere)."""
+    return is_reclaim_agent(label) or (ctx.platform != "linux" and label in RECONCILER_OWNED_MACOS)
 
 
 def reclaim_owned_elsewhere(ctx: Context) -> bool:
@@ -1268,6 +1284,11 @@ def fleet_services_path(ctx: Context) -> Path:
 def gh_policy_path(ctx: Context) -> Path:
     """config/gh-daemon.json, where glaeda-gh reads it (every profile: every host may run the daemon)."""
     return ctx.home / ".local/share/glaeda/gh-daemon.json"
+
+
+def intent_dir(ctx: Context) -> Path:
+    """Where the glaeda CLIs in ~/.local/bin load the shared intent layer from (their INTENT_DIRS)."""
+    return ctx.home / ".local/share/glaeda/intent"
 
 
 def is_update_agent(label: str) -> bool:
@@ -1561,7 +1582,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE)):
+    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
+                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)

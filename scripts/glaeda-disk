@@ -352,7 +352,8 @@ EVICT_YIELD_MARK = "evict.lock yielded to a waiting eviction"  # the hook's DISK
 FLOOR_WAIT_ENV = "GLAEDA_DISK_FLOOR_WAIT_UNTIL"
 
 RUNNER_WORK_DIR = "_work"  # <runner>/_work: a job's workspace, its RUNNER_TEMP and its build output, all job-owned
-UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
+HOST_SATURATED = "host_saturated"  # an apply skipped before its walks: saturation_halt would hold every delete
+UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci", HOST_SATURATED)  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
@@ -1348,6 +1349,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "1ce4c03ed98484700e221db0067a56f18c74b2627503afe198871db040984e53",
     "e086936669eca0a96cc84a68635f8bbb04fc00fe7719a4eab175b8872bc76481",
     "08961a67d6469c324c8483af59fc8506a0f971ba2d3f120623af7c9beddc928e",
+    "83892d97432ccb27614d9b1eafde53333532deaa7e42e1febe984bd08ac24377",
+    "0ac8d18181eb9c21066f730bc52650d2913ea9b6562c616a58b7070e86877a42",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2738,6 +2741,16 @@ def running_job_hours() -> float:
                 oldest = max(oldest, secs / 3600)
         _RUNNING_JOB_HOURS = oldest
     return _RUNNING_JOB_HOURS
+
+
+# On a devbox (a person's Mac, where agents' try builds and live checks build), a per-checkout Xcode build used this
+# recently is about to be run or rebuilt on: pressure's short idle window does not reach it (2026-11-23 14:01:48Z: a
+# pressure pass deleted DerivedData/cmux-try48231, 14.5 GB, 0.1 h after a live check's build finished, while caches
+# and mirrors still held space). A fleet mini's build caches keep no window (BUILD_CACHES_UNWINDOWED; Leo,
+# 2026-11-18: "these build caches, if they're not being used, they're not useful"). Process, open-file and socket
+# evidence still hold an older build a run still uses.
+FRESH_BUILD_HOURS = 3.0
+FRESH_BUILD_FAMILY_IDS = frozenset({"xcode-derived-data"})
 
 
 def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int | None]:
@@ -5912,7 +5925,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, platform="macos"),
+               build_output=True, platform="macos",
+               min_idle_hours=FRESH_BUILD_HOURS if role == "devbox" else 0.0),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,
@@ -15349,6 +15363,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             return (0, math.inf, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
             return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
+        if ACTIVITY_MODE == "pressure" and i.family in FRESH_BUILD_FAMILY_IDS:
+            # a person's or agent's build costs its owner a cold rebuild: after the caches and mirrors that are due
+            return (-0.25, i.idle_hours, i.bytes, 0)
         return (0, value(i, families[i.family]), 0, 0)
     for i in sorted(items, key=order, reverse=True):
         if i.verdict != "reclaimable":
@@ -17492,6 +17509,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
+    # A saturated host deletes nothing: the apply's halt (saturation_halt) stops it at its first item. So ask the halt
+    # before the walks, not after them: on an agent host held at load 21-29 (2026-11-23 08:40Z) the
+    # 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU sizing trees it then never touched, and its walks'
+    # reads and the snapshot rewrites competed with the sessions that saturated it. Below the emergency floor (the
+    # floor-lifted one) the halt is None, so that pass runs as before; a skipped idle sweep leaves its stamp, so the
+    # next pass that finds the host unsaturated sweeps.
+    if (a.apply and (a.pressure or sweep) and not a.cmux_next_drain
+            and not (sweep and POLICY["defer_during_ci"])
+            and (saturated := saturation_halt(fss, a.emergency, floor_gib)) is not None
+            and (why := saturated())):
+        return deferred(HOST_SATURATED, f"{why}: an apply would delete nothing; skipped before measuring")
     # One plain pressure apply per host at a time (pressure_pass_lock), taken as soon as the run knows it is under
     # pressure: before the floor and evict.lock queue waits, the cap's du and the hook-pass branch that narrows
     # --family. The evict.lock queue serves one deletion at a time but lets its waiters pile up: on one mini
@@ -18542,5 +18570,29 @@ def main(argv: list[str] | None = None) -> int:
             release_refresh_lock(_REFRESH_HANDLE)
 
 
+def install_intent(prog: str) -> None:
+    """The shared intent layer (leo-workspace tools/intent.py, vendored as scripts/intent.py; glaeda-mini-setup installs
+    it in ~/.local/share/glaeda/intent/ for the copy in ~/.local/bin): a refused call runs as the one form it meant and
+    says so (`glaeda-disk status` is `glaeda-disk report`), lists two or three, or for a destructive form (--apply)
+    names the exact form and runs nothing. Leo, 2026-11-23: "we need to have really powerful aliasing for intent."
+    Only for the program itself, never at import (tests load this file); failing to load costs nothing."""
+    for folder in (Path(__file__).resolve().parent, Path.home() / ".local/share/glaeda/intent"):
+        path = folder / "intent.py"
+        if not path.is_file():
+            continue
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("intent", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module  # registered before it runs, as a normal import does
+            spec.loader.exec_module(module)
+            module.install(prog)
+        except Exception:  # noqa: BLE001  the layer failing never costs a call its own refusal
+            sys.modules.pop("intent", None)
+            continue
+        return
+
+
 if __name__ == "__main__":
+    install_intent("glaeda-disk")
     sys.exit(main())

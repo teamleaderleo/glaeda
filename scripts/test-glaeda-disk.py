@@ -145,6 +145,19 @@ def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
     return path
 
 
+_LOAD = mock.patch.object(os, "getloadavg", return_value=(0.0, 0.0, 0.0))
+
+
+def setUpModule() -> None:
+    # An apply asks saturation_halt before its walks: the test host's own load never decides a test (a test that
+    # wants a load patches getloadavg itself)
+    _LOAD.start()
+
+
+def tearDownModule() -> None:
+    _LOAD.stop()
+
+
 class GlaedaDiskTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -7181,6 +7194,40 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
             self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
 
+    def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
+        """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
+        sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""
+        saturated = mock.patch.object(gd.os, "getloadavg", return_value=(64.0, 64.0, 64.0))
+        cores = mock.patch.object(gd.os, "cpu_count", return_value=16)
+        with saturated, cores:
+            # under pressure, above the emergency floor (50 GiB on this 460 GiB volume): no walk, nothing deleted
+            status, rows, survey, apply = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        survey.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertIn(gd.HOST_SATURATED, gd.UNSERVED, "a runner hook's trigger stays for a pass that can delete")
+        self.assertIn("skipped before measuring", self.said)
+        with saturated, cores:
+            # below the emergency floor nothing holds: the pass walks and deletes as before
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        survey.assert_called()
+        self.assertNotEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        stamp = self.root / "idle.last"
+        with saturated, cores, mock.patch.object(gd, "IDLE_STAMP", stamp), \
+                mock.patch.object(gd, "host_busy", return_value=""):
+            # no pressure: the idle sweep skips too and leaves its stamp, so the next unsaturated pass sweeps
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertFalse(stamp.exists())
+        with cores, mock.patch.object(gd.os, "getloadavg", return_value=(4.0, 4.0, 4.0)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_called()
+        self.assertEqual(rows[-1]["mode"], "idle")
+
     def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
         # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
@@ -8831,6 +8878,24 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertNotEqual(gd.item_window(dd, path, 1.0), 0.0)  # one working cache per builder, by role
         with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
             self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
+
+    def test_a_devbox_spares_a_fresh_xcode_build_under_pressure_a_fleet_mini_does_not(self) -> None:
+        # 2026-11-23: a devbox pressure pass deleted a live check's 14.5 GB DerivedData 0.1 h after its build
+        path = self.root / "cmux-try48231"
+        home = self.root / "home"
+        (home / "Library/Developer/Xcode/DerivedData").mkdir(parents=True)
+        with mock.patch.object(gd, "HOME", home):
+            devbox = next(f for f in gd.default_families("devbox") if f.id == "xcode-derived-data")
+            mini = next(f for f in gd.default_families("fleet-mini") if f.id == "xcode-derived-data")
+        pressure_idle = gd.POLICY["pressure_idle_hours"]
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+                window = gd.item_window(devbox, path, pressure_idle)
+                self.assertEqual(window, gd.FRESH_BUILD_HOURS)
+                self.assertFalse(gd.item_due(devbox, 1.0, window)[0])
+                self.assertTrue(gd.item_due(devbox, gd.FRESH_BUILD_HOURS + 0.5, window)[0])
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):  # Leo's no-window rule stands on a mini
+                self.assertTrue(gd.item_due(mini, 0.1, gd.item_window(mini, path, pressure_idle))[0])
 
     def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
         dd = gd.Family("ci-derived-data", self.root, True, "rebuild")

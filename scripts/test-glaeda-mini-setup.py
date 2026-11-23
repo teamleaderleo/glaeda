@@ -1023,6 +1023,9 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
         self.assertEqual((self.home / ".local/share/glaeda/gh-daemon.json").read_bytes(),
                          (ROOT / "config/gh-daemon.json").read_bytes())  # the daemon's share, on a gh-only host too
+        for name in ("intent.py", "intent_aliases.json"):  # the shared intent layer the CLIs in ~/.local/bin load
+            self.assertEqual((self.home / ".local/share/glaeda/intent" / name).read_bytes(),
+                             (ROOT / "scripts" / name).read_bytes(), name)
         self.assertFalse((self.home / "Projects").exists())
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker
@@ -1341,6 +1344,45 @@ class MiniSetupTest(unittest.TestCase):
                 self.assertTrue(names)  # the rest of the profile stays
         unit = (ms.REPO / "ops/systemd/glaeda-worktree-reclaim.service").read_text()
         self.assertIn("TimeoutStartSec=", unit)
+
+    def test_macos_disk_pressure_agent_is_left_to_the_hygiene_reconciler_where_it_is_installed(self) -> None:
+        """Leo's Mac, 2026-11-22/23: setup installed com.teamleaderleo.glaeda.disk-pressure, leo-workspace's
+        host-baseline (after every ws-sync) retired it as a legacy scheduler (machines/worktree-reclaim.json
+        glaeda.legacy_schedulers.Darwin, the reconciler runs glaeda-disk --pressure itself), and launchd-loaded
+        reloaded it in between: 5 NOW pages in 19 h. Setup must agree with that list on macOS, and only there: Linux's
+        glaeda-disk-pressure timer is required by host-baseline.json glaeda_ota.timers and retired by nobody."""
+        # the labels leo-workspace retires on a Mac as legacy glaeda schedulers (worktree-reclaim.json)
+        retired_on_macos = {"com.teamleaderleo.glaeda.worktree-reclaim", "com.teamleaderleo.glaeda.disk-pressure"}
+        for gh_only in (False, True):
+            for platform, marker, kept_without, left_out in (
+                    ("macos", "Library/LaunchAgents/ai.leo-workspace.hygiene-reconciler.plist",
+                     {"com.teamleaderleo.glaeda.disk-pressure"}, retired_on_macos),
+                    ("linux", ".config/systemd/user/ai.leo-workspace.hygiene-reconciler.timer",
+                     {"glaeda-disk-pressure.timer"}, {"glaeda-worktree-reclaim.service", "glaeda-worktree-reclaim.timer"})):
+                with self.subTest(platform=platform, gh_only=gh_only):
+                    ctx = ms.Context(self.home, gh_only, "/usr/bin/python3", True, self.reclaim, None, None,
+                                     ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name=platform)
+                    with mock.patch.object(ms, "has_glaeda_runner", lambda *_: True):
+                        without = set(ms.agent_names(ctx))
+                        path = self.home / marker
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("")
+                        try:
+                            names = set(ms.agent_names(ctx))
+                            # an earlier setup's own plist is removed, so no orphan is left for launchd-loaded
+                            owned = {label: "sha" for label in without}
+                            with mock.patch.object(ms, "sha256_file", lambda *_: "sha"), \
+                                    mock.patch.object(ms, "agent_loaded", lambda *_: True):
+                                removed = {a["label"] for a in ms.stale_agent_actions(ctx, names, owned)
+                                           if a["state"] == "remove"}
+                        finally:
+                            path.unlink()
+                    if not gh_only or platform == "macos":
+                        self.assertTrue(kept_without <= without)
+                    self.assertFalse(left_out & names)
+                    self.assertEqual(removed, without & left_out)
+                    if platform == "linux" and not gh_only:
+                        self.assertIn("glaeda-disk-pressure.timer", names)
 
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
