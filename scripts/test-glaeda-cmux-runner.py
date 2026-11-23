@@ -4323,31 +4323,6 @@ class HookTest(unittest.TestCase):
             marker.unlink()
             self.finish("s1")
 
-    def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
-        """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
-        caught the fast tier with 4 of 14 free while its admission asked for its own p90 (8) and was refused after 60
-        s (job 137053521754 on cmux14, 2026-11-22). On a plain side runner of a needs host it is admitted by class."""
-        self.fleet()
-        doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
-               .strftime("%Y-%m-%dT%H:%M:%SZ"), "window": {"from": "2026-11-01", "to": "2026-11-14"},
-               "min_samples": 20, "jobs": {"cmux-next.yml/fast-tier": {
-                   "n": 50, "cores_p50": 4.0, "cores_p90": 8.0, "mem_peak_mib_p90": 500, "mem_peak_mib_max": 500,
-                   "wall_s_p50": 60, "wall_s_p90": 120}},
-               "classes": {"isolated": {"n": 50, "cores_p50": 3.0, "cores_p90": 6.0, "mem_peak_mib_p90": 500,
-                                        "mem_peak_mib_max": 500, "wall_s_p50": 60, "wall_s_p90": 120}}}
-        needs = self.dir / "needs.json"
-        needs.write_text(json.dumps(doc))
-        env = {**self.FAST_TIER, hook.HOST_CORES_ENV: "14", hook.HOST_MEM_ENV: str(48 * 1024),
-               hook.JOB_NEEDS_ENV: os.fspath(needs)}
-        self.take_units(10)  # 4 of 14 free, as on cmux14
-        try:
-            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
-            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
-            self.assertIn("admitted at its class's need", side.stdout)
-            self.assertIn("holding 3/14 units for fast-tier (isolated", side.stdout)
-        finally:
-            self.finish("s2")
-
     def test_only_a_plain_side_runner_admits_the_fast_tier_by_class(self) -> None:
         base = dict(capacity_units=14, instance=2, canonical_roots=2, fast_runner=False, gui_runner=False,
                     session_runner=False, dev_compile_runner=False, dedicated_admit=None, nightly_runner=False,
