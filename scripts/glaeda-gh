@@ -3473,7 +3473,7 @@ def foreign_app_forbidden(owner: str, error: Any) -> bool:
     path = error.get("path")
     if not (isinstance(path, list) and len(path) > 1 and path[-1] == APP_FIELD):
         return False
-    org = APP_POOL_IP_ALLOW_LIST.search(str(error.get("message") or ""))
+    org = APP_POOL_IP_ALLOW_LIST.search(gh_said(error, None))  # (sanitized: the org name survives)
     return bool(org) and org.group(1).lower() != str(owner or "").lower()
 
 
@@ -10256,7 +10256,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "stepsOwed", "updatedAtAt")
                               if k in base})
             if key == self.resume_key and fields.get("dataAt") == self.now:
                 fields = {**fields, "dataAt": self.resume_from}  # its oldest part's tick: no newer than that
@@ -11519,9 +11519,9 @@ class Daemon:
                               missing=not parts and str(error).startswith("HTTP 404"))
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
-        self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
+        owed = self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
         self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest",
-                   restFullAt=min(self.now, self.resume_from))
+                   restFullAt=min(self.now, self.resume_from), stepsOwed=owed)
 
     def rest_gate_holds(self, e: dict, prior: dict, old: dict, root: str, number: Any) -> bool:
         """The REST PR read's gate (PR_REST_FULL_EVERY): True when the issue, the head's check suites and its first
@@ -11557,8 +11557,29 @@ class Daemon:
                     return False
         except WatchError:
             return False  # the full read says what failed
-        self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest")
+        more = self.owed_steps_gated(e, prior, old, root, sha)
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest", **more)
         return True
+
+    def owed_steps_gated(self, e: dict, prior: dict, old: dict, root: str, sha: str) -> dict:
+        """The steps a held read still owes (stepsOwed: a 5xx, a refusal past STEPS_RETRY, a read left for later),
+        read now by fill_steps_rest from the kept check runs, without the full read the gate saves: {} when none is
+        due, else the store fields. The settled failed head the gate holds for PR_REST_SETTLED_FULL_EVERY is the one
+        whose steps decide a rescue, and its steps were read only on a full read: a 502 on them stood for 30 min."""
+        owed = prior.get("stepsOwed")
+        if not isinstance(owed, list) or not owed or not any(
+                self.now - self.steps_failed.get(j, self.now - STEPS_RETRY) >= STEPS_RETRY for j in owed):
+            return {}
+        path = check_runs_path(root, sha)
+        listed: list = []
+        for page in range(1, REST_CHECK_PAGES + 1):
+            kept = old.get(path if page == 1 else f"{path}&page={page}")
+            if not isinstance(kept, dict) or not isinstance(kept.get("doc"), dict):
+                break
+            listed += kept["doc"].get("check_runs") or []
+        data = json.loads(json.dumps(prior["data"]))
+        still = self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
+        return {"data": data, "stepsOwed": still}
 
     def rest_gate_due(self, e: dict, prior: dict) -> bool:
         """Whether E's REST PR read goes to its gate (rest_gate_holds) rather than straight to a full read: an open,
@@ -11608,6 +11629,11 @@ class Daemon:
                         and bool((old.get(f"{root}/issues/{number}") or {}).get("etag")))
             unlikely = f"{root}/pulls/{number}" if reusable else f"{root}/issues/{number}"
             paths = [path for path in paths if path != unlikely]
+            checks = data.get("checks") or []
+            if (checks and data.get("checkState") != "FAILURE"
+                    and all(str(c.get("status") or "").upper() == "COMPLETED" for c in checks)):
+                # a settled head: fetch_pr_rest reads no gate baseline for it, so its kept suites answer is not asked
+                paths = [path for path in paths if path != suites_path(root, str(data.get("headRefOid") or ""))]
         out = []
         for path in paths:
             kept = old.get(path) if isinstance(old.get(path), dict) else {}
@@ -11893,7 +11919,7 @@ class Daemon:
         self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=parse_comments(rest_issue_node(issue, comments)),
                    restParts=parts, via="rest")
 
-    def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> None:
+    def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> list:
         """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped). An Actions
         check run's id is its job's id, and a run's job list names every job's steps. A completed job does not
         change, so each is read once. Steps come, cheapest first, from the PR's own cache, the run watch's cached
@@ -11902,7 +11928,10 @@ class Daemon:
         names (a run past REST_JOB_PAGES pages) is read alone, GET .../actions/jobs/ID. At most REST_STEPS_MAX
         reads per PR read, and the rest on the next one. Without its steps a refused or never-started check
         cannot be held. On 2026-11-11 huge-blue's daemon sent 22 jobs/{id} reads in an hour, one per failed job
-        of a few runs."""
+        of a few runs. Returns the job ids whose steps are still owed (a 5xx, a refusal waiting STEPS_RETRY, a
+        read left for the next one): rest_gate_due sends the next read on in full while one is due, so a gated
+        settled head still asks again."""
+        owed: list = []
         known = known_steps([(e, data)])
         left = REST_STEPS_MAX
         self.steps_failed = {j: t for j, t in self.steps_failed.items() if self.now - t < STEPS_RETRY}
@@ -11919,6 +11948,7 @@ class Daemon:
             if not job_id or not c.get("runId") or self.mode("rest") == "stop":
                 continue
             if job_id in self.steps_failed:
+                owed.append(job_id)
                 continue
             got = self.run_cache_job(owner, repo, c["runId"], job_id)
             if got is None and left > 0 and self.rest_room(1):
@@ -11926,26 +11956,29 @@ class Daemon:
                     got, sent = self.run_list_job(root, c["runId"], job_id, left)
                 except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
                     self.deferred.add(e["key"])
-                    return
+                    return owed + [job_id]
                 left -= sent
             if got is not None:
                 c["failedSteps"], c["stepCount"] = got
                 continue
             if left <= 0 or not self.rest_room(1):
+                owed.append(job_id)
                 continue
             left -= 1
             try:
                 state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
             except OutOfTime:
                 self.deferred.add(e["key"])
-                return
+                return owed + [job_id]
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
                 if STEPS_GONE.match(str(doc)):
                     self.steps_failed[job_id] = self.now
+                owed.append(job_id)
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
+        return owed
 
     @staticmethod
     def run_cache_job(owner: str, repo: str, run_id: Any, job_id: Any) -> list | None:
@@ -33276,6 +33309,9 @@ def post_item(args: argparse.Namespace) -> dict:
     item: dict[str, Any] = {"kind": args.kind, "body": read_body(args.body, args.body_file), "queuedAt": time.time(),
                             "attempts": 0, "by": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("ACPMUX_SESSION")
                             or os.getcwd()}
+    lane = post_queue_lane()
+    if lane:
+        item["lane"] = lane  # the lane a lane VM's daemon writes it as (post_lane_env): the caller's, not its own
     if args.kind == "pr":
         if not re.fullmatch(rf"{NAME}/{NAME}", args.target):
             raise WatchError("post pr takes OWNER/REPO")
@@ -33549,13 +33585,39 @@ def lane_vm_poster() -> bool:
         os.access(LANE_GH_CMD, os.X_OK)
 
 
+# The lane a queued write is made as. lane-gh fences every broker write (pr_create, comment: BROKER_POST_TOOLS) with a
+# lease taken in the calling lane's name (leo-workspace tools/lane-gh lease_for_write, from LANE_GH_LANE or the acpmux
+# session: tools/lease_client.py owner()) and refuses with none: "lease acquisition requires a lane session", before
+# the broker. The daemon that replays a queued write runs as no session, so until 2026-11-23 every write gh-quota
+# queued on the login's create pause (queue_paced_write) and this daemon later sent through the broker failed that
+# way: on gcp-agent-lane-11 3 of 3 queued creates of lane/quiet-connect-cloud-carry in manaflow-ai/cmux, from two
+# sessions, while the same create sent directly was made. So `post` records the caller's lane in the entry ("lane",
+# post_queue_lane, read as lane-gh reads its own: LANE_GH_LANE, the acpmux session's name, else ACPMUX_FROM, a timer's
+# sending name) and the replay names it (post_lane_env). The land queue does the same for its steps (LAND_LANE_ENV).
+# An entry with no lane (queued before this, or by a process with no session) is sent as before, and lane-gh says so.
+POST_LANE_KEYS = (*LAND_LANE_KEYS, "ACPMUX_FROM")  # lease_client.owner()'s order
+
+
+def post_queue_lane(env: dict | None = None) -> str:
+    """The lane of the process queuing a write, as lane-gh would name it for its own write, or "" with none."""
+    env = os.environ if env is None else env
+    return land_session_lane(next((env[k] for k in POST_LANE_KEYS if str(env.get(k) or "").strip()), ""))
+
+
+def post_lane_env(item: dict) -> dict[str, str] | None:
+    """The environment a queued ITEM's `lane-gh call` runs with: this process's, with ITEM's recorded lane as
+    LANE_GH_LANE (lane-gh's first key), or None (this process's as is) when it recorded none."""
+    lane = land_session_lane(str(item.get("lane") or ""))
+    return {**os.environ, LAND_LANE_ENV: lane} if lane else None
+
+
 def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
     """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
     nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
     tool, call_args = chosen
     argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
     try:
-        done = run_bounded(argv, timeout=timeout)
+        done = run_bounded(argv, timeout=timeout, env=post_lane_env(item))
     except subprocess.TimeoutExpired:
         return "lost", f"the lane-gh broker gave no answer in {timeout:g}s"
     except (OSError, subprocess.SubprocessError) as error:

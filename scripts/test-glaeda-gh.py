@@ -3963,6 +3963,13 @@ class BalanceTest(Base):
         self.gh.prs[("o", "r", number)] = first
         self.gh.heads[("o", "r", "a" * 40)] = checks
 
+    def probed_until(self, at: float) -> None:
+        """Probes confirmed pr:o/r#12 every cycle until AT (dataAt moves, fullAt stays), so its reads are not behind
+        (pr_behind, #2440: data older than PR_FULL_EVERY lets a probe stand in for the full read)."""
+        entry = gg.read_cache("pr:o/r#12")
+        entry["dataAt"] = at - gg.CYCLE
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#12"), entry)
+
     def test_an_unchanged_paged_pr_keeps_its_whole_answer_without_its_pages(self) -> None:
         """cosmic-gray, 2026-11-11 15:40Z: 7 of 74 PRs sat partial ("PR check pages wait for the per-minute ceiling"),
         were never probed, and were read in full every cycle. A full read whose first page agrees with the whole
@@ -3979,6 +3986,7 @@ class BalanceTest(Base):
         calls = len(self.gh.gql_calls())
         # past PR_FULL_EVERY: the full read is due, and the pace has no room for its pages
         later = NOW + gg.PR_FULL_EVERY + gg.CYCLE
+        self.probed_until(later)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (later, later))
         self.daemon.gql_log = [(later - 1, "other", self.daemon.policy.get("graphqlPerMinute", gg.GRAPHQL_PER_MINUTE) - 2)]
         self.daemon.tick(later)
@@ -3993,6 +4001,7 @@ class BalanceTest(Base):
                                    for c in entry["data"]["checks"]]
         gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#12"), entry)
         third = later + gg.PR_FULL_EVERY + gg.CYCLE
+        self.probed_until(third)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (third, third))
         self.daemon.gql_log = []
         self.daemon.tick(third)
@@ -4001,6 +4010,7 @@ class BalanceTest(Base):
                          ["SUCCESS"])
         # kept answers are read whole again at PR_WHOLE_EVERY, however often a first page confirms them
         bound = third + gg.PR_WHOLE_EVERY
+        self.probed_until(bound)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (bound, bound))
         self.daemon.tick(bound)
         self.assertEqual(gg.read_cache("pr:o/r#12")["via"], "graphql")
@@ -4593,7 +4603,6 @@ class BalanceTest(Base):
         gg.register("pr:o/r#4")
         self.daemon.tick(NOW + gg.CYCLE)
         data = gg.read_cache("pr:o/r#4")["data"]
-        print("DEBUG", [c[:2] for c in self.gh.calls], self.daemon.errors if hasattr(self.daemon,"errors") else None, data["checks"], self.daemon.paths, file=sys.stderr)
         self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
         self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
 
@@ -9095,8 +9104,11 @@ class TickBudgetTest(Base):
         inner, spent = self.daemon.transport, [0.0]
 
         def transport(method, url, headers, body):
-            self.daemon.tick_deadline -= request_s  # the request's share of the tick's budget
-            spent[0] += request_s
+            # the request's share of the tick's budget: a read's own, sent in turn. A prefetch (prefetch_rest, #2421)
+            # goes on its pool alongside the reads, so it takes no turn of the tick's
+            if threading.current_thread() is threading.main_thread():
+                self.daemon.tick_deadline -= request_s
+                spent[0] += request_s
             return inner(method, url, headers, body)
         self.daemon.transport = transport
         worst, stored = 0.0, {"plain": 0, "waited": 0}
@@ -16071,6 +16083,54 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
+        """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
+        login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
+        acquisition requires a lane session". lane-gh takes the lease in the lane its environment names (LANE_GH_LANE,
+        ACPMUX_SESSION_NAME, ACPMUX_SESSION, ACPMUX_FROM) and the daemon runs as no session. A fake lane-gh with the
+        real one's rule replays each write kind the broker carries (BROKER_POST_TOOLS) in an environment that names no
+        lane: each is made, in the queuing session's lane."""
+        lane_gh = Path(self.tmp.name) / "lane-gh"
+        lane_gh.write_text(
+            "#!/bin/sh\n"
+            "lane=${LANE_GH_LANE:-${ACPMUX_SESSION_NAME:-${ACPMUX_SESSION:-$ACPMUX_FROM}}}\n"
+            "lane=${lane##*/}\n"
+            "if [ -z \"$lane\" ]; then echo \"lane-gh: $2: lease acquisition requires a lane session\" >&2; exit 1; fi\n"
+            "printf '{\"ok\": true, \"data\": {\"url\": \"https://github.com/o/r/pull/9\", \"number\": 9, "
+            "\"lane\": \"%s\"}}\\n' \"$lane\" > \"$0.$2\"\n"
+            "cat \"$0.$2\"\n")
+        lane_gh.chmod(0o755)
+        argvs = {"pr": ("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why"),
+                 "comment": ("comment", "o/r#7", "--body", "x")}
+        self.assertEqual(set(argvs), set(gg.BROKER_POST_TOOLS))  # every kind the broker makes
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        bare = {k: v for k, v in os.environ.items() if k not in lanes}
+        for kind, argv in argvs.items():
+            with self.subTest(kind=kind):
+                d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)  # no spacing between kinds
+                with mock.patch.dict(os.environ, {**bare, "ACPMUX_SESSION_NAME": "gcp-agent-lane-11/quiet-lane"},
+                                     clear=True):
+                    item = self.queue(*argv)
+                with mock.patch.dict(os.environ, bare, clear=True), \
+                        mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                        mock.patch.object(gg, "LANE_GH_CMD", str(lane_gh)):
+                    self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual(state["state"], "posted", state)
+                made = json.loads(Path(f"{lane_gh}.{gg.BROKER_POST_TOOLS[kind]}").read_text())
+                self.assertEqual(made["data"]["lane"], "quiet-lane")
+                self.assertEqual(d.transport.calls, [])
+
+    def test_a_queued_write_with_no_lane_runs_lane_gh_as_before(self) -> None:
+        """No session at queue time: nothing is recorded and the replay's environment is the daemon's own."""
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in lanes}, clear=True):
+            item = self.queue("comment", "o/r#7", "--body", "x")
+        self.assertNotIn("lane", item)
+        self.assertIsNone(gg.post_lane_env(item))
+        self.assertEqual(gg.post_queue_lane({"ACPMUX_FROM": "ws-sync"}), "ws-sync")  # a timer's sending name
+        self.assertEqual(gg.post_queue_lane({"LANE_GH_LANE": "a", "ACPMUX_SESSION_NAME": "h/b"}), "a")
+
     def test_a_lane_vm_write_the_broker_rate_limits_waits_its_retry_after_and_then_goes(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
         d, ran = self.lane_vm((75, {"ok": False, "status": 403, "retry_after": 90, "error": "secondary"}),
@@ -19216,12 +19276,12 @@ class SpendAlarmTest(AlarmBase):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
         on = {"stale": True, "staleRestart": True}
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5,
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5, "landWait": True,
                                                         "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000,
                                                            "paceShare": 0.25}}))
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25,
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25, "landWait": True,
                                                         "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         # the stale alarm and its valve each turn off (alarms.stale was dropped by the parser, so it never could)
@@ -20839,7 +20899,8 @@ class RunnersTest(BrokerBase):
             self.assertEqual(gg.cmd_runners("o", None, True), 0)
         argv = ran.call_args[0][0]
         self.assertIn("orgs/o/actions/runners?per_page=100", argv)
-        self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        self.assertEqual(argv[:len(gg.self_argv())], gg.self_argv(), "this file, run again through its loader")
+        self.assertEqual(argv[len(gg.self_argv()):][:2], ["gh", "api"], "read through this broker, so the cache shares it")
         # The daemon's own reads carry the internal mark, so they keep this route instead of being handed to the
         # host's quota guard; a fake answer that does not take env= is no longer this caller.
         self.assertEqual(ran.call_args.kwargs["env"][gg.GLAEDA_INTERNAL], "1")
@@ -21505,7 +21566,7 @@ class LandSnapshotTest(Base):
                 {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
         self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None, *, dirty=None: None,
-                                          reap=lambda: None,
+                                          reap=lambda: None, refill=lambda now=None: None,
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
 
@@ -38378,7 +38439,7 @@ class SearchTest(Base):
 
     def test_search_reads_graphql_through_this_broker_and_no_rest(self) -> None:
         text, argv = self.search("prs", ["flaky"], ["o/r"], "all", None, 20, False)
-        self.assertEqual(argv[2:5], ["gh", "api", "graphql"],
+        self.assertEqual(argv[len(gg.self_argv()):][:3], ["gh", "api", "graphql"],
                          "read through this broker, so the cache shares it with every session on the host")
         self.assertNotIn("search/issues", " ".join(argv), "never GitHub's REST search")
         query = next(a[len("query="):] for a in argv if a.startswith("query="))

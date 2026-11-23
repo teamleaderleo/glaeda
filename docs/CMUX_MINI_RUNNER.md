@@ -1844,7 +1844,7 @@ in at the producer's root. So one root job per root per mini:
   runners between them.
 - With `canonicalRoots` above 1, consumers (gui and product jobs) take no root at job start. Their restore
   step runs `/Users/Shared/cmux-build-fleet/bin/glaeda-canonical-root take <root> --wait 1800` for the
-  producer's root (the path from the product receipt, or N). The job-started hook links that path to its
+  producer's root (the path from the product receipt, or N). The job-started hook (of every runner, a dedicated one too) links that path to its
   runner's generated shim, which runs the hook's `take-root`: an exclusive `root-N.token` held by a second
   detached holder tied to the job's Runner.Worker and released by job-completed. A re-take of a root the
   same job already holds (a compile restoring its own product) is a no-op. It exits 1 when the root is

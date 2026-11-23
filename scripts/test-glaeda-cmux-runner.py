@@ -5353,6 +5353,37 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
 
+    def test_dedicated_job_started_links_the_root_shim_too(self) -> None:
+        # cmux7s runs only dedicated runners; its trusted-main seed calls glaeda-canonical-root take, which was missing
+        fleet = self.fleet()
+        (fleet / "bin").mkdir()
+        hooks = self.dir / "hooks"
+        hooks.mkdir()
+        shutil.copy(HOOK, hooks / "glaeda-cmux-runner-hook")
+        (hooks / "glaeda-canonical-root").write_text("#!/bin/sh\n")
+        admit = hooks / "admit.sh"
+        admit.write_text("#!/bin/sh\nexit 0\n")
+        admit.chmod(0o755)
+        state = self.dir / "state"
+        state.mkdir(exist_ok=True)
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0", "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(fleet),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(event(self.dir, "push", {"repository": CMUX})),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "seed", "RUNNER_NAME": "d0"}
+        stale = state / "host-lock-holder-d0.roots"  # a crashed job's record
+        stale.write_text("root-1\n")
+        run = subprocess.run([sys.executable, os.fspath(hooks / "glaeda-cmux-runner-hook"), "job-started",
+                              "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--dedicated-admit", os.fspath(admit),
+                              "--capacity-dir", os.fspath(self.dir / "capacity"), "--state-dir", os.fspath(state),
+                              "--watch-pid", str(os.getpid())], env=environ, capture_output=True, text=True, timeout=30)
+        try:
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            link = fleet / "bin" / "glaeda-canonical-root"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), os.fspath((hooks / "glaeda-canonical-root").resolve()))
+            self.assertFalse(stale.exists())
+        finally:
+            self.finish("d0")
+
     def test_capacity_one_root_job_per_canonical_root(self) -> None:
         # a consumer's rm -rf of <root>/src must never meet a compile or another consumer in that root
         self.fleet()

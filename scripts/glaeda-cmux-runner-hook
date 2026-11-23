@@ -6133,6 +6133,13 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
         print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
     deadline = time.monotonic() + max(0.0, wait_s)
+    try:  # a dedicated-only mini may have no ledger yet: its admission never took one
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
+    except OSError as error:
+        print(f"{PREFIX}: take-root: cannot open the capacity dir {capacity_dir} ({type(error).__name__})",
+              file=sys.stderr)
+        return 1
     want = capacity_dir / f"{name}.want-{os.getpid()}"
     try:
         while True:
@@ -15880,6 +15887,19 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     marker.unlink()
         elif args.dedicated_admit:
+            # A dedicated runner's job may take a root too (cmux's DerivedData seed on a trusted-main runner runs
+            # `glaeda-canonical-root take`), so it links the shim and drops a crashed job's records as a ledger
+            # runner does. Without it a dedicated-only mini (cmux7s) never had the helper, and its two seed roots
+            # were held by nothing. Only the account that owns the fleet bin links it: a dedicated runner under
+            # its own user (runner.dedicated `user`) has a 0700 home and its own state dir, so its shim would
+            # break every member job's take on that mini.
+            with contextlib.suppress(OSError):
+                roots_file(args.state_dir).unlink(missing_ok=True)
+                gui_file(args.state_dir).unlink(missing_ok=True)
+            bin_dir = Path(FLEET_DIR) / "bin"
+            with contextlib.suppress(OSError):
+                if bin_dir.stat().st_uid == os.getuid():
+                    ensure_root_shim(bin_dir)
             held, note = True, ""
             if args.yield_to_exclusive:
                 held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
