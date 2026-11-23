@@ -1023,6 +1023,9 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
         self.assertEqual((self.home / ".local/share/glaeda/gh-daemon.json").read_bytes(),
                          (ROOT / "config/gh-daemon.json").read_bytes())  # the daemon's share, on a gh-only host too
+        for name in ("intent.py", "intent_aliases.json"):  # the shared intent layer the CLIs in ~/.local/bin load
+            self.assertEqual((self.home / ".local/share/glaeda/intent" / name).read_bytes(),
+                             (ROOT / "scripts" / name).read_bytes(), name)
         self.assertFalse((self.home / "Projects").exists())
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker

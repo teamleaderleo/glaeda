@@ -145,6 +145,19 @@ def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
     return path
 
 
+_LOAD = mock.patch.object(os, "getloadavg", return_value=(0.0, 0.0, 0.0))
+
+
+def setUpModule() -> None:
+    # An apply asks saturation_halt before its walks: the test host's own load never decides a test (a test that
+    # wants a load patches getloadavg itself)
+    _LOAD.start()
+
+
+def tearDownModule() -> None:
+    _LOAD.stop()
+
+
 class GlaedaDiskTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -7180,6 +7193,40 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIsNone(gd.saturation_halt({}, "10%"))
         with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
             self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
+
+    def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
+        """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
+        sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""
+        saturated = mock.patch.object(gd.os, "getloadavg", return_value=(64.0, 64.0, 64.0))
+        cores = mock.patch.object(gd.os, "cpu_count", return_value=16)
+        with saturated, cores:
+            # under pressure, above the emergency floor (50 GiB on this 460 GiB volume): no walk, nothing deleted
+            status, rows, survey, apply = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        survey.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertIn(gd.HOST_SATURATED, gd.UNSERVED, "a runner hook's trigger stays for a pass that can delete")
+        self.assertIn("skipped before measuring", self.said)
+        with saturated, cores:
+            # below the emergency floor nothing holds: the pass walks and deletes as before
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        survey.assert_called()
+        self.assertNotEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        stamp = self.root / "idle.last"
+        with saturated, cores, mock.patch.object(gd, "IDLE_STAMP", stamp), \
+                mock.patch.object(gd, "host_busy", return_value=""):
+            # no pressure: the idle sweep skips too and leaves its stamp, so the next unsaturated pass sweeps
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertFalse(stamp.exists())
+        with cores, mock.patch.object(gd.os, "getloadavg", return_value=(4.0, 4.0, 4.0)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_called()
+        self.assertEqual(rows[-1]["mode"], "idle")
 
     def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
         # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
@@ -17007,6 +17054,83 @@ class UndeclaredGrowthTest(unittest.TestCase):
                     mock.patch.dict(gd._DISK_REGISTRY_MEM, clear=True):
                 got = gd.undeclared_for_volume(1, [], None, 0, "x")
         self.assertIn("registry not loaded", got["error"])
+
+
+class CmuxStandsDownTest(unittest.TestCase):
+    """cmuxterm-hq docs/design/glaeda-into-cmux.md move 2: `glaeda-disk --role devbox` skips the build caches cmux's
+    worktree care cleans (manaflow-ai/cmux#50468) when cmux's `worktrees.cleanBuildCaches` is on, and says so."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        for name, value in (("HOME", self.home), ("ROLE", "devbox"), ("process_evidence", lambda: ([], ""))):
+            patcher = mock.patch.object(gd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.dd = self.home / "Library/Developer/Xcode/DerivedData"
+        make(self.dd / "proj-abc", mib=2)
+
+    def settings(self, text: str, name: str = "cmux-next.json") -> Path:
+        path = self.home / ".config/cmux" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def verdicts(self) -> dict[str, tuple[str, list[str]]]:
+        fams = [gd.Family("xcode-derived-data", self.dd, True, "rebuilds", build_output=True)]
+        return {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey(fams, 24, 1 << 20)}
+
+    def test_derived_data_stays_for_cmux_only_with_the_setting_on(self) -> None:
+        self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")  # no settings file: glaeda acts
+        self.settings('{"worktrees": {"cleanBuildCaches": false}}')
+        self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")
+        self.settings('{"worktrees": {"cleanBuildCaches": true}}')
+        verdict, reasons = self.verdicts()["proj-abc"]
+        self.assertEqual(verdict, "kept")
+        self.assertIn(gd.CMUX_OWNED_REASON, reasons)
+        with mock.patch.object(gd, "ROLE", "fleet-mini"):  # a fleet host is glaeda's whatever the setting
+            self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")
+
+    def test_the_setting_reads_as_cmux_reads_it(self) -> None:
+        self.assertFalse(gd.cmux_build_caches_on())
+        self.settings('// c\n{"worktrees.cleanBuildCaches": true, /* flat key */ "x": "a//b,}",}', "cmux.json")
+        self.assertTrue(gd.cmux_build_caches_on())  # classic file before the app's first launch copies it
+        self.settings('﻿{"worktrees": {"cleanBuildCaches": false,},}')
+        self.assertFalse(gd.cmux_build_caches_on())  # cmux-next.json wins over classic
+        self.settings('{"worktrees": {"cleanBuildCaches": tru')
+        self.assertFalse(gd.cmux_build_caches_on())  # unreadable: off, as cmux keeps its caches then
+        self.settings('{"worktrees": {"cleanBuildCaches": "true"}}')
+        self.assertFalse(gd.cmux_build_caches_on())
+        other = self.home / "elsewhere.json"
+        other.write_text('{"worktrees": {"cleanBuildCaches": true}}')
+        with mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": "~/elsewhere.json"}):
+            self.assertTrue(gd.cmux_build_caches_on())  # the override alone
+        with mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": os.fspath(self.home / "none.json")}):
+            self.assertFalse(gd.cmux_build_caches_on())
+
+    def test_only_cmux_cache_roots_and_what_is_inside_them(self) -> None:
+        for rel in gd.CMUX_OWNED_CACHE_ROOTS:
+            self.assertTrue(gd.cmux_owned_cache(self.home / rel), rel)
+            self.assertTrue(gd.cmux_owned_cache(self.home / rel / "child"), rel)
+        for rel in (".npm", ".bun", "Library/Caches", "Library/Caches/org.swift.swiftpm-other", ".cache/go-build",
+                    "Library/Developer/Xcode"):
+            self.assertFalse(gd.cmux_owned_cache(self.home / rel), rel)
+
+    def test_the_report_says_cmux_acts(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report([], [], 0, 24)
+        self.assertNotIn("cmux acts here", out.getvalue())
+        self.settings('{"worktrees": {"cleanBuildCaches": true}}')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report([], [], 0, 24)
+        self.assertIn("cmux acts here (worktrees.cleanBuildCaches on)", out.getvalue())
+        self.assertIn("~/Library/Developer/Xcode/DerivedData", out.getvalue())
 
 
 if __name__ == "__main__":

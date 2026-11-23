@@ -967,11 +967,17 @@ and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
 cmux-next.yml's fast tier waits at most `FAST_TIER_CAPACITY_WAIT_S` (60 s) for units or
-tokens, on any runner, then is refused (FAST_TIER_WAIT). Its 20-minute timeout counts the
+tokens, on any runner (FAST_TIER_WAIT), then is admitted busy with no unit beside the mini's
+other jobs (FAST_TIER_BUSY, hq#17742) instead of refused. Its 20-minute timeout counts the
 wait in "Set up runner", and a run after admission takes 866 s p50: of 191 fast tiers that
 waited 60 s or more (2026-11-16 to 11-19), 3 passed, and 141 timeouts had spent 68202 s of
-their caps waiting. cmux's owned-pool rescue re-runs a refusal; it never re-runs a PR job
-GitHub timed out.
+their caps waiting. A refusal's re-run went back to the same label and was refused again,
+and nothing re-runs a PR job GitHub timed out.
+
+Its generated files job waits at most `GENERATED_FILES_CAPACITY_WAIT_S` (240 s) the same way
+(GENERATED_FILES_WAIT): its 70-minute timeout counts the wait too, and on 2026-11-22 03-05Z
+eight ran it out mostly waiting (up to 69.9 of 70 minutes). Past the bound it is admitted
+busy like the fast tier (FAST_TIER_BUSY), not refused.
 
 Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
 pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label

@@ -210,6 +210,9 @@ DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of ma
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
 FLEET_SERVICES_SOURCE = REPO / "config/fleet-services.json"  # the owned non-glaeda launchd services (unmanaged_service)
 GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
+# The shared intent layer every glaeda CLI loads (leo-workspace tools/intent.py, vendored by scripts/intent-sync): the
+# copies in ~/.local/bin have no scripts/ beside them, so they read it from ~/.local/share/glaeda/intent/ (every profile)
+INTENT_SOURCES = (REPO / "scripts/intent.py", REPO / "scripts/intent_aliases.json")
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -1270,6 +1273,11 @@ def gh_policy_path(ctx: Context) -> Path:
     return ctx.home / ".local/share/glaeda/gh-daemon.json"
 
 
+def intent_dir(ctx: Context) -> Path:
+    """Where the glaeda CLIs in ~/.local/bin load the shared intent layer from (their INTENT_DIRS)."""
+    return ctx.home / ".local/share/glaeda/intent"
+
+
 def is_update_agent(label: str) -> bool:
     return label == LABEL_PREFIX + "update" or label.startswith("glaeda-update.")
 
@@ -1561,7 +1569,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE)):
+    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
+                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)

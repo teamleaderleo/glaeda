@@ -4293,6 +4293,36 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("admitted busy", other.stdout)
         self.finish("s3")
 
+    def test_a_fast_tier_job_behind_an_older_units_waiter_runs_busy_not_refused(self) -> None:
+        """FAST_TIER_BUSY (hq#17742): the fast tier behind an older job waiting here for units (fair_turn's "has
+        waited longer here for units", run 45042885544 on ultra2, 16:22Z) is admitted busy past FAST_TIER_WAIT, not
+        refused; the waiter keeps its turn for the units. Only a waiting nightly job still refuses it."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"],
+                                      "who": "ultra2-glaeda fill-main-test (run 45042885544)"}) + "\n")
+        try:
+            busy = self.job("fast-tier", "s0", 14, None, env=self.FAST_TIER)
+            self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+            self.assertIn("(ultra2-glaeda fill-main-test (run 45042885544) has waited longer here for units);"
+                          " admitted busy", busy.stdout)
+            self.assertIn("holding 0/14 units for fast-tier (isolated", busy.stdout)
+            self.assertTrue(hook.probe(capacity / "unit-0"), "the waiter's units stay free for its turn")
+        finally:
+            self.finish("s0")
+        marker.write_text(json.dumps({"since": time.time() - 600, "wants": ["units"], "tier": hook.TIER_NIGHTLY,
+                                      "who": "cmux14-glaeda-2 build (run 1)"}) + "\n")
+        try:
+            nightly = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
+            self.assertEqual(nightly.returncode, 1, nightly.stdout)
+            self.assertIn("is a nightly job and goes first here for units", nightly.stdout)
+            self.assertNotIn("admitted busy", nightly.stdout)
+        finally:
+            marker.unlink()
+            self.finish("s1")
+
     def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
         """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
         caught the fast tier with 4 of 14 free while its admission asked for its own p90 (8) and was refused after 60
@@ -4329,6 +4359,55 @@ class HookTest(unittest.TestCase):
                        {"small_runner": True}):
             with self.subTest(change=change):
                 self.assertFalse(hook.plain_side_runner(argparse.Namespace(**{**base, **change})))
+
+    def held_seed_roots(self, second: bool = True) -> tuple[list[Path], contextlib.ExitStack]:
+        """Two seed roots under the test dir; the first held, the second marked and held when second is set."""
+        roots = [self.dir / "seed/cmux", self.dir / "seed/cmux-2"]
+        stack = contextlib.ExitStack()
+        for n, root in enumerate(roots):
+            root.mkdir(parents=True, exist_ok=True)
+            (root / hook.SEED_ROOT_MARKER).touch()
+            if n == 0 or second:
+                f = stack.enter_context(open(root / hook.SEED_ROOT_LOCK, "w"))
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return roots, stack
+
+    def test_a_fast_tier_on_a_plain_side_runner_with_every_seed_root_held_is_refused_not_run_cold(self) -> None:
+        """SIDE_SEED_FREE: cut logs cmux18-2 and cmux18-5 (2026-11-22 07:02-07:25Z, one mini) read "the seed root is
+        busy ... taking a shared root" and built from scratch to the 20-minute limit. With every seed root held the
+        side runner refuses it before taking anything, and FAST_TIER_BUSY does not admit it busy."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots))}
+        with stack:
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 1, side.stdout + side.stderr)
+                self.assertIn("refused: seed root: every fast-tier seed root here is held", side.stdout)
+                self.assertNotIn("admitted busy", side.stdout)
+            finally:
+                self.finish("s2")
+        try:  # the same roots free: admitted as before
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertNotIn("seed root:", side.stdout)
+        finally:
+            self.finish("s2")
+
+    def test_a_seed_root_is_free_when_the_first_is_unheld_or_a_marked_second_is(self) -> None:
+        roots, stack = self.held_seed_roots(second=False)
+        with stack:
+            self.assertIsNone(hook.seed_root_refusal(tuple(roots)), "the marked second root is free")
+            (roots[1] / hook.SEED_ROOT_MARKER).unlink()
+            self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal(tuple(roots)) or "",
+                          "an unmarked second root is no seed: the job would build cold")
+            self.assertIn("SIDE_SEED_FREE", hook.seed_root_refusal((roots[0], self.dir / "absent")) or "")
+            with mock.patch.dict(os.environ, {hook.SIDE_SEED_FREE_OFF_ENV: "1"}):
+                self.assertIsNone(hook.seed_root_refusal((roots[0],)), "the off switch admits as before")
+            (self.dir / hook.SIDE_SEED_FREE_OFF_FILE).touch()
+            self.assertIsNone(hook.seed_root_refusal((roots[0],), capacity_dir=self.dir), "the live off file too")
+        self.assertIsNone(hook.seed_root_refusal(tuple(roots)), "the first root unheld")
+        self.assertIsNone(hook.seed_root_refusal((self.dir / "never-taken",)), "no lock file: no job ever took it")
 
     def test_the_fast_runner_refuses_every_other_job(self) -> None:
         """The fast runner keeps listening on a full mini (it needs no general units), so another job that
@@ -12010,6 +12089,26 @@ class GateTest(unittest.TestCase):
         # composes like the other bounds: a shorter explicit wait is kept
         self.assertEqual(hook.bounded_wait(None, bound), bound)
         self.assertEqual(hook.bounded_wait(5.0, bound), 5.0)
+
+    def test_generated_files_waits_a_bounded_time_for_capacity(self) -> None:
+        """GENERATED_FILES_WAIT: on 2026-11-22 03-05Z eight cmux-next generated files jobs ran out their 70-minute
+        timeout, mostly waiting in "Set up runner" (69.9 and 57.7 of 70 minutes, for two), and 29% of 1185 logged
+        generated-files minutes were that wait. After GENERATED_FILES_CAPACITY_WAIT_S it is admitted busy like the
+        fast tier (FAST_TIER_BUSY), since a refusal's re-run goes back to the same label."""
+        bound = hook.GENERATED_FILES_CAPACITY_WAIT_S
+        self.assertEqual(bound, 240.0)
+        self.assertLess(bound + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S, 10 * 60,
+                        "admitted busy within minutes, not most of the 70-minute timeout")
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "generated-files"),
+                         bound)
+        self.assertEqual(hook.fast_tier_capacity_wait("manaflow-ai/cmux", home, "cmux-next.yml", "fast-tier"),
+                         hook.FAST_TIER_CAPACITY_WAIT_S, "the fast tier keeps its own bound")
+        for repo, workflow, job in (("someone/else", "cmux-next.yml", "generated-files"),
+                                    (None, "cmux-next.yml", "generated-files"),
+                                    ("manaflow-ai/cmux", "ci.yml", "generated-files")):
+            with self.subTest(repo=repo, workflow=workflow, job=job):
+                self.assertIsNone(hook.fast_tier_capacity_wait(repo, home, workflow, job))
 
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
