@@ -20308,14 +20308,16 @@ class RoleDaemonTest(unittest.TestCase):
         self.assertEqual(act["state"], "moved")
         self.assertFalse(agent.exists())
 
-    def test_the_root_script_installs_the_installers_supervisor_and_parses_on_python_3_9(self) -> None:
+    def test_the_root_script_installs_the_installers_supervisor_and_runs_the_root_python(self) -> None:
         root, body = daemon_root_module()
         self.assertEqual(root.HELPER_BYTES, cr.HEADLESS_HELPER)
         self.assertEqual(root.HELPER, "/usr/local/sbin/glaeda-headless-supervise")
         self.assertEqual(root.SUDOERS, cr.RUNNER_SUDOERS)
-        ast.parse(body, feature_version=(3, 9))
+        ast.parse(body)
         script = (ROOT / cr.DAEMON_ROOT_SCRIPT).read_text()
-        self.assertIn("/usr/bin/python3 -I", script)
+        self.assertIn(f"ROOT_PYTHON={cr.ROOT_PYTHON}\n", script)
+        self.assertIn('"$ROOT_PYTHON" -I /dev/fd/3', script)
+        self.assertNotIn("/usr/bin/python3", script)
         self.assertTrue(os.access(ROOT / cr.DAEMON_ROOT_SCRIPT, os.X_OK))
 
     def test_the_root_script_refuses_any_plist_but_this_runners_daemon(self) -> None:
