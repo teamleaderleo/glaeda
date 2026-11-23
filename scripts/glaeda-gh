@@ -34,6 +34,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
     glaeda-gh log flaky OWNER/REPO [TEST] [--since 72h] [--job RE]   failing tests by name; flaky = passed on re-run
     glaeda-gh post comment OWNER/REPO#N --body-file F|- [--wait S]    queue a comment; the daemon posts it, paced
     glaeda-gh post pr OWNER/REPO --head B --base B --title T --body-file F [--reviewer LOGIN] [--wait S]
+                                                        OWNER/REPO#N instead: a comment on that PR
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
     glaeda-gh budget [--json] [--local]                 who spent the login's quota this hour, per host
@@ -1388,7 +1389,17 @@ TOKEN_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9._-]{20,2048}|github_pat_[A-Za-z0-9
 
 
 class WatchError(RuntimeError):
-    pass
+    """Our own message, which describe() hands on as written -- so GitHub's personal identifiers come out of it
+    where it is raised, not at each print.
+
+    Every GitHub or `gh` sentence that reaches a person through an exception reaches it here, because describe()
+    reduces anything that is not ours to a type name: the stderr tail of a refused `gh api` child, a broker's or
+    an upstream's forwarded refusal, a land executor's reason, a search that was not answered. gh_sanitize names
+    the login whose bucket a quota refusal spent and is idempotent, so a message with no identifier in it is
+    raised byte for byte and the words stay GitHub's own."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*(gh_sanitize(a) if isinstance(a, str) else a for a in args))
 
 
 # ---------------------------------------------------------------- keys and files
@@ -2888,7 +2899,9 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
     open for as long as it lives. Here the child leads its own process group and the whole group is
     killed. Raises subprocess.TimeoutExpired or OSError."""
     timeout = SUBPROCESS_DEADLINE if timeout is None else timeout
-    with subprocess.Popen(argv, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
+    env = deadline_env(env, timeout)
+    with subprocess.Popen(self_bounded(argv, timeout, env),
+                          stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
         try:
             out, err = proc.communicate(input=input_text, timeout=timeout)
@@ -2904,6 +2917,132 @@ def run_bounded(argv: list[str], timeout: float | None = None, input_text: str |
                     stream.close()
             raise subprocess.TimeoutExpired(argv, timeout) from None
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+# A bound held only by its caller (communicate(timeout=) then killpg) ends with the caller: the daemon's execv (an
+# update, the stale valve) or a killed `budget` drops every thread mid-wait, and the child, in its own session, runs
+# on. cosmic-gray 2026-11-22: 55 `reach HOST sh -c '... @@budget ...'` probes (bound FLEET_HOST_TIMEOUT, 25 s) alive
+# 29 minutes, and 19 finished children of `glaeda-gh serve` defunct for up to 1.5 days, started by an image the
+# daemon had execv'd away (cmuxterm-hq handbook: mirror-read-outlives-its-bound.md). So the bound also lives in the
+# child: coreutils `timeout` leads its process group and signals the whole group at the bound, whoever the parent is.
+SELF_BOUND_SLACK = 5.0  # the child's own bound is this long past its caller's, so a live caller always acts first
+SELF_BOUND_KILL = 5  # timeout -k: SIGKILL this long after the SIGTERM
+TIMEOUT_PATHS = ("/opt/homebrew/bin/timeout", "/usr/local/bin/timeout", "/usr/bin/timeout", "/bin/timeout",
+                 "/opt/homebrew/bin/gtimeout", "/usr/local/bin/gtimeout")
+TIMEOUT_ENV = "GLAEDA_GH_TIMEOUT_CMD"  # a test's or an operator's coreutils timeout; empty turns the self-bound off
+DETACHED_BOUND = 600.0  # a fire-and-forget alert send (tell-coordinator, coord-alert) running longer is hung
+
+
+DEADLINE_ENV = "CMUX_DEADLINE"  # unix seconds past which this process tree is over its bound (agent-orphan-reaper)
+DEADLINE_OWNER_ENV = "CMUX_DEADLINE_OWNER"  # the tool that set it
+DEADLINE_OWNER = "glaeda-gh"
+
+
+def deadline_env(env: dict | None, seconds: float | None) -> dict | None:
+    """ENV (None: this process's) plus CMUX_DEADLINE, the epoch second the child's self-bound has killed it by, and
+    CMUX_DEADLINE_OWNER: the shared contract by which leo-workspace's agent-orphan-reaper prunes any tool's child
+    that outlived its bound, whatever tool started it. ENV unchanged with no finite bound."""
+    if seconds is None or not math.isfinite(seconds):
+        return env
+    base = dict(os.environ if env is None else env)
+    base[DEADLINE_ENV] = str(math.ceil(time.time() + max(0.0, seconds) + SELF_BOUND_SLACK + SELF_BOUND_KILL))
+    base[DEADLINE_OWNER_ENV] = DEADLINE_OWNER
+    return base
+
+
+def coreutils_timeout() -> str | None:
+    """The coreutils `timeout` this host has (GLAEDA_GH_TIMEOUT_CMD, else the first of TIMEOUT_PATHS), or None."""
+    if TIMEOUT_ENV in os.environ:
+        named = os.environ[TIMEOUT_ENV]
+        return named if named and os.access(named, os.X_OK) else None
+    return next((p for p in TIMEOUT_PATHS if os.access(p, os.X_OK)), None)
+
+
+def self_bounded(argv: list[str], seconds: float | None, env: dict | None = None) -> list[str]:
+    """ARGV run under `timeout -k SELF_BOUND_KILL SECONDS+SELF_BOUND_SLACK`, so it ends at its bound even when its
+    caller is gone first. ARGV unchanged with no bound, no timeout on this host, or an ARGV[0] that does not resolve
+    (Popen's OSError then names it, as the callers expect, instead of timeout's exit 127)."""
+    tool = coreutils_timeout()
+    if not argv or seconds is None or not math.isfinite(seconds) or tool is None:
+        return list(argv)
+    if shutil.which(argv[0], path=(env if env is not None else os.environ).get("PATH")) is None:
+        return list(argv)
+    return [tool, "-k", str(SELF_BOUND_KILL), f"{max(0.0, seconds) + SELF_BOUND_SLACK:g}", *argv]
+
+
+def remote_self_bounded(script: str, seconds: float) -> str:
+    """A `sh -c` SCRIPT for another host that bounds itself there: under that host's coreutils timeout (the first of
+    TIMEOUT_PATHS; ssh's PATH has no Homebrew) at SECONDS, so a remote side whose ssh or caller died ends too; run
+    as it is where the host has none."""
+    inner = shlex.quote(script)
+    found = " ".join(shlex.quote(p) for p in TIMEOUT_PATHS)
+    return (f'for t in {found}; do if [ -x "$t" ]; then exec "$t" -k {SELF_BOUND_KILL} {seconds:g} sh -c {inner}; '
+            f'fi; done; {script}')
+
+
+# Every child serve starts and does not wait for is reaped here, each tick (reap_children). An unreaped child is a
+# zombie until the daemon exits, and the daemon re-executes itself instead of exiting: the new image holds no Popen
+# for the old image's children, so serve adopts them by PID when it starts (adopt_inherited) and reaps those too.
+DETACHED: list[subprocess.Popen] = []
+INHERITED: set[int] = set()
+DETACHED_LOCK = threading.Lock()
+
+
+def spawn_detached(argv: list[str], bound: float | None = None, **kwargs: Any) -> subprocess.Popen:
+    """Popen(ARGV) in a session of its own, not waited for, kept for reap_children; with BOUND, self_bounded. Raises
+    OSError as Popen does."""
+    reap_children()
+    if bound is not None:
+        kwargs["env"] = deadline_env(kwargs.get("env"), bound)
+    proc = subprocess.Popen(self_bounded(argv, bound, kwargs.get("env")), start_new_session=True, **kwargs)
+    with DETACHED_LOCK:
+        DETACHED.append(proc)
+    return proc
+
+
+def child_pids(parent: int) -> set[int]:
+    """PARENT's child processes now (zombies included), from one ps."""
+    try:
+        done = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in done.stdout.splitlines():
+        words = line.split()
+        if len(words) == 2 and words[1] == str(parent) and words[0].isdigit():
+            pids.add(int(words[0]))
+    return pids
+
+
+def adopt_inherited() -> int:
+    """serve's first step: every child this PID has before the new image starts any is the previous image's (an
+    execv keeps the PID and its children), kept for reap_children. The count adopted."""
+    found = child_pids(os.getpid())
+    with DETACHED_LOCK:
+        INHERITED.update(found)
+    return len(found)
+
+
+def reap_children() -> int:
+    """Wait for every detached and inherited child that ended (never blocking); the count still running."""
+    with DETACHED_LOCK:
+        alive = []
+        for proc in DETACHED:
+            with contextlib.suppress(Exception):  # a test's stand-in, or a poll the OS refused: dropped
+                if proc.poll() is None:
+                    alive.append(proc)
+        DETACHED[:] = alive
+        for pid in list(INHERITED):
+            try:
+                ended, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                ended = pid  # reaped already, or not ours
+            except OSError:
+                continue
+            if ended:
+                INHERITED.discard(pid)
+        return len(DETACHED) + len(INHERITED)
 
 
 def internal_env() -> dict:
@@ -3911,7 +4050,7 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         status = answer.get("status")
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
-            return 502, {}, json.dumps({"message": f"direct: {why}"[:UPSTREAM_ERROR_MAX]}).encode()
+            return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
         return status, {}, json.dumps(answer.get("data")).encode()
     return send
 
@@ -5359,7 +5498,7 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
         part = f"{where}: {code}" if where and code else where or code
         if part:  # an error dict with none of the three says nothing; empty parens say less than no parens
             parts.append(part)
-    line = f"HTTP {status}: {doc.get('message') or ''}".rstrip().rstrip(":")  # a body with no message: no bare colon
+    line = f"HTTP {status}: {gh_said(doc.get('message'), limit=None)}".rstrip().rstrip(":")  # a body with no message: no bare colon
     if parts:
         line += f" ({'; '.join(parts)})"
     if repo:
@@ -6383,11 +6522,10 @@ class Daemon:
             log({"event": "alarm-unsent", "alarm": name, "why": f"no {ALARM_CMD}"})
             return
         try:
-            self.alarm_procs.append(subprocess.Popen(
+            self.alarm_procs.append(spawn_detached(
                 [os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level,
-                 *(["--source-key", source_key] if source_key else []), text],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True))
+                 *(["--source-key", source_key] if source_key else []), text], bound=DETACHED_BOUND,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         except OSError as error:
             log({"event": "alarm-unsent", "alarm": name, "why": describe(error)})
 
@@ -7388,7 +7526,7 @@ class Daemon:
             found, _ = self.post_find(item, actor)
             self.post_finish(path, item, url=found.get("html_url") if found else None,
                              note="a pull request for this head is already open",
-                             error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
+                             error=None if found else f"HTTP 422: {gh_said(doc.get('message'), limit=None) or 'already exists'}")
         else:
             self.post_finish(path, item, error=write_failure(item, status, doc, known=broker_repo_slugs()))
 
@@ -7403,7 +7541,8 @@ class Daemon:
             return f"reviewers not requested: {describe(error) if isinstance(error, WatchError) else 'out of time'}"
         if 200 <= status < 300:
             return None
-        return f"reviewers not requested: HTTP {status} {(answer or {}).get('message', '') if isinstance(answer, dict) else ''}".strip()
+        said = gh_said(answer.get("message"), limit=None) if isinstance(answer, dict) else ""
+        return f"reviewers not requested: HTTP {status} {said}".strip()
 
     def post_delivered(self, path: Path, item: dict, doc: dict | None = None, note: str | None = None) -> None:
         """Checkpoint delivery before follow-up effects: a failed/interrupted regrade never replays content."""
@@ -9696,6 +9835,10 @@ class Daemon:
             self.beat = self.now
 
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
+        # `error` is the one field of a cache entry GitHub's own sentence reaches (a REST refusal, an upstream's
+        # forwarded one), and every surface that prints an entry prints it; the id goes here, once, for all of them.
+        if isinstance(fields.get("error"), str):
+            fields = {**fields, "error": gh_sanitize(fields["error"])}
         cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         cache = cache_dir() / file_name(key)
         with bounded_lock(cache_dir() / ".write.lock") as held:
@@ -9724,6 +9867,14 @@ class Daemon:
                 seen = old.get("headSeenAt") if head and old.get("headRefOid") == head else None
                 if head and entry["data"].get("headSeenAt") is None:
                     entry["data"] = {**entry["data"], "headSeenAt": seen if seen is not None else self.now}
+            if key.startswith("pr:"):
+                # What this read's counts are a count over, kept beside them so the next line can say what moved
+                # (churn_log). Carried over a write that brought no data (an error, a jobs-only write), so a
+                # transient failure does not erase the comparison; absent when there is nothing to say.
+                churn = churn_log((base or {}).get("churn"), (base or {}).get("data"), entry["data"], self.now) \
+                    if "data" in fields and isinstance(entry.get("data"), dict) else (base or {}).get("churn")
+                if churn_events(churn, self.now):
+                    entry["churn"] = churn
             write_json(cache, entry)
         if key.startswith("pr:") and "data" in fields:
             if self.land_queue is not None:
@@ -10610,7 +10761,7 @@ class Daemon:
             return "same", None, etag
         if status == 200 and isinstance(doc, (dict, list)):  # .../rules/branches/B answers a list
             return "fresh", doc, h.get("etag")
-        message = (doc or {}).get("message", "") if isinstance(doc, dict) else ""
+        message = gh_said(doc.get("message"), limit=None) if isinstance(doc, dict) else ""
         return "error", f"HTTP {status} {message}".strip()[:200], None
 
     def fetch_run(self, e: dict) -> None:
@@ -13115,7 +13266,9 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
 # installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
 # never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
-# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it. Nor does it halve the
+# adaptive pool (park_quota sets no quota_refused): no pool this host reads was spent. cmux-cp-1, 17:42-21:00Z: 10 of
+# 11 host parks were this refusal, each halving the pool (157 to 78, 149 to 74, 175 to 87), ~10 min to grow back.
 LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
@@ -13740,6 +13893,17 @@ LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the wr
 LAND_HANDOFF_TOOL = "land_handoff"
 LAND_BROKER_MERGE_TOOL = "land"  # a lane VM's pinned merge: the broker judges and merges it (broker_land)
 LAND_HANDOFF_DEADLINE = 60.0
+# A "forwarded" row (handed to the broker host's queue, or to this host's executor) used to be terminal here: nothing
+# read its PR again, so it never learned that the far host merged it, closed it or lost it. Finding hq#19725
+# (docs/findings/2026-11-23-land-handoff-orphans.md): on a lane VM 89 of 179 land rows sat "forwarded" with no outcome,
+# median 8.6 h; 9 had MERGED on GitHub while still "forwarded" here, and 61 had gone to an executor that later
+# answered not_executor and were never sent again. Now each such row is looked at from the daemon's cache (no GitHub
+# read of its own) at most once per LAND_FORWARD_LOOK_EVERY (forwards_follow): MERGED ends it merged and tells its
+# requester as a merge here does, CLOSED stops it, a moved pin stops it head_moved, and one still OPEN this long past
+# its last hand-off is handed off again, once per LAND_FORWARD_RESEND (the far host applies a repeated request once).
+LAND_FORWARD_RESEND = 1800.0
+LAND_FORWARD_RESEND_DOUBLINGS = 4  # the wait before a row's next re-send doubles this many times, then holds
+LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files, not one per daemon tick
 
 
 def land_session_lane(name: str) -> str:
@@ -13903,7 +14067,12 @@ def land_redact(text: Any) -> str:
 
 
 def land_trim(text: Any, limit: int = LAND_TEXT) -> str:
-    text = " ".join(str(text or "").split())
+    """TEXT on one line, cut to LIMIT, with GitHub's account id out of it (land_redact).
+
+    Every land string a person reads is cut here -- a judge's refusal reason, an escalation notice, a peer's
+    "why" -- and a judge quotes gh's own refusal in its reason ("quota: gh: API rate limit already exceeded for
+    user ID NNNN"), so this is where that id stops. The substitution is idempotent, so clean text is unchanged."""
+    text = land_redact(" ".join(str(text or "").split()))
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
@@ -14510,6 +14679,7 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
         self.overflow_after = float("-inf")
@@ -14797,6 +14967,7 @@ class LandQueue:
         self.reap()
         if self.refuse():
             return
+        self.forwards_follow()  # cache reads and a broker call, no read of this login's: a park holds none of it
         if self.queue_quota_parked():
             # The park holds only the steps that need the login it spent: a judgment, a read, a watch or a nudge.
             # Every step that needs none runs on: a PR the cache shows ended leaves the queue (retire_ended), a row
@@ -14972,6 +15143,7 @@ class LandQueue:
                 if e["state"] in LAND_DONE and self.now - float(e.get("updated") or 0) > LAND_KEEP:
                     (self.entries_dir() / file_name(key)).unlink(missing_ok=True)
                     del self.entries[key]
+        self.forwards_follow(executor=True)  # a row re-queued for a re-send goes in this pass's batch
         if self.forward_thread is not None and self.forward_thread.is_alive():
             return
         if self.now < self.forward_after:
@@ -15363,6 +15535,81 @@ class LandQueue:
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
+    def forwards_follow(self, executor: bool = False) -> None:
+        """At most once per LAND_FORWARD_LOOK_EVERY: every forwarded row no worker holds is looked at in the daemon's
+        cache (forward_follow, LAND_FORWARD_RESEND's comment). EXECUTOR: this host forwards its lands (forward_tick)."""
+        if self.now < self.forward_look_at:
+            return
+        self.forward_look_at = self.now + LAND_FORWARD_LOOK_EVERY
+        for key in [k for k, e in self.entries.items() if e["state"] == LAND_FORWARDED and k not in self.jobs
+                    and k not in self.sending and k not in self.overflowing]:
+            try:
+                with self.lock:
+                    self.forward_follow(self.entries[key], executor)
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+
+    def forwarded_since(self, e: dict) -> float:
+        """When E was last handed to another host's queue: its newest hand-off, forward, overflow or re-send."""
+        times = [float((e.get("handedOff") or {}).get("at") or 0), float((e.get("forwardResent") or {}).get("at") or 0)]
+        times += [float(h.get("at") or 0) for h in e.get("history") or []
+                  if h.get("event") in ("handed_off", "overflowed", "forward_resent")]
+        return max(times) or float(e.get("updated") or 0)
+
+    def forward_follow(self, e: dict, executor: bool) -> None:
+        """Under the lock. A forwarded E whose cached PR reads MERGED ends merged (its requester told, as a merge here
+        does), CLOSED (in a copy read since E was queued) stops "closed", a pin the copy shows moved stops head_moved
+        (stop_moved_pin); one still OPEN past LAND_FORWARD_RESEND since its last hand-off is handed off again: a lane
+        VM's to the broker host (hand_off_now), an executor-forwarding host's re-queued for its next forward batch.
+        A row a peer took as overflow is followed to its end, never re-sent: this host judges its own late rows."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        state = str(data.get("state") or "").upper()
+        host = str(e.get("forwardedTo") or "the host it was handed to")
+        at = c.get("dataAt")
+        read_at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+        if state == "MERGED":
+            merge = data.get("mergeCommit")
+            sha = str(merge.get("oid") or "") if isinstance(merge, dict) else ""
+            self.merged(e, sha or e.get("mergeSha") or "", f"forwarded to {host}: the cache shows it merged")
+            return
+        if state == "CLOSED":
+            if read_at >= float(e.get("created") or 0):  # an older copy may predate a reopen (retire_from_cache)
+                self.stop(e, "closed", f"closed unmerged while handed to {host}'s land queue (the cache shows it "
+                          f"closed); nothing is merged", "")
+            return
+        if state != "OPEN" or self.stop_moved_pin(e, c, data):
+            return
+        since = self.forwarded_since(e)
+        last = e.get("forwardResent") or {}
+        # each re-send waits twice as long as the one before (30, 60, 120 min, to 8 h): a far host still waiting on
+        # the PR's own checks is not asked again every bound, by every row it holds
+        if self.now - since <= LAND_FORWARD_RESEND * 2 ** min(int(last.get("n") or 0), LAND_FORWARD_RESEND_DOUBLINGS):
+            return
+        n = int(last.get("n") or 0) + 1
+        why = (f"still open {self.now - since:.0f} s after it was handed to {host}, with no outcome there: "
+               f"handed off again (LAND_FORWARD_RESEND)")
+        if executor:
+            e["forwardResent"] = {"at": self.now, "n": n, "to": host}
+            self.history(e, "forward_resent", to=host, n=n, why=why)
+            log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n})
+            e.update(state="queued", wait=None, wakeAt=None, action=None)  # forward_batch sends it on this pass
+            self.save(e)
+            return
+        done = e.get("handedOff") or {}
+        if not done or not self.broker_client():
+            return  # a peer's overflow, or a row from before this host was a broker client: followed, not re-sent
+        head = str(e.get("pinSha") or "").lower()
+        cached = str(data.get("headRefOid") or "").lower()
+        if not head:
+            head = cached if SHA40.fullmatch(cached) and read_at >= float(done.get("at") or 0) \
+                else str(done.get("head") or "").lower()
+        if not SHA40.fullmatch(head):
+            return
+        e["forwardResent"] = {"at": self.now, "n": n, "to": host}
+        log({"event": "land-forward-resent", "key": e["key"], "to": host, "n": n, "head": head[:12]})
+        self.hand_off_now(e, head, why, "forward_resent")
+
     def unpark_due(self) -> None:
         """Every row whose own quota park (park_quota) has run out is re-queued, a host-wide park holding or not: its
         wake and state are this queue's own files, read and written with no GitHub call. Before, the host park
@@ -15450,7 +15697,9 @@ class LandQueue:
         only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
-        self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
+        own = not host or bool(LAND_JOB_QUOTA.search(text or ""))  # its PR's own CI job's limit, not this host's
+        if not own:
+            self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
         said = land_quota_said(text, self.now)
         if said is not None:
             jitter = land_jitter(e["key"], said)
@@ -15459,7 +15708,9 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None and host:
+        if own:
+            w["own"] = True  # its PR's CI job's limit: this row alone waits for it
+        if said is not None and not own:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -17275,7 +17526,8 @@ class LandQueue:
 
     @staticmethod
     def _run_real(argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
-        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env = deadline_env(env, timeout)  # its bound in the child too: the queue's caller can execv mid-step
+        with subprocess.Popen(self_bounded(argv, timeout, env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True, env=env,
                               cwd=os.environ.get("HOME") or "/") as proc:
             try:
@@ -18797,9 +19049,9 @@ class LandQueue:
                 logs.mkdir(parents=True, exist_ok=True, mode=0o700)
                 try:
                     with open(logs / f"review-{repo.replace('/', '_')}-{number}-{head[:12]}.log", "ab") as sink:
-                        subprocess.Popen([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
-                                         stdout=sink, stderr=subprocess.STDOUT, env=self.env(e), start_new_session=True,
-                                         close_fds=True, cwd=os.environ.get("HOME") or "/")
+                        spawn_detached([os.fspath(rr), repo, number, "--post"], stdin=subprocess.DEVNULL,
+                                       stdout=sink, stderr=subprocess.STDOUT, env=self.env(e),
+                                       close_fds=True, cwd=os.environ.get("HOME") or "/")
                     self.finish(e, None, started=True)
                 except OSError as error:
                     e["reviewed"] = [h for h in e["reviewed"] if h != key]
@@ -20314,6 +20566,7 @@ def utc_stamp(at: float) -> str:
 def refresh_log_write(line: str) -> None:
     """One refresh-failure line on stderr and in BASE/REFRESH_LOG, cut to its newest half past REFRESH_LOG_MAX.
     Never raises: writing down a failure must not become one."""
+    line = gh_sanitize(line)  # the reasons here are GitHub's own words (refresh_note)
     with contextlib.suppress(Exception):
         print(line, file=sys.stderr, flush=True)
     path = BASE / REFRESH_LOG
@@ -20622,6 +20875,9 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 def serve(foreground_ok: bool = False) -> int:
+    inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
+    for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
+        os.environ.pop(name, None)
     lock = hold_daemon_lock()
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
@@ -20634,7 +20890,7 @@ def serve(foreground_ok: bool = False) -> int:
     seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid()})
+    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -20656,6 +20912,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.tick_failed(describe(error), site)
             except Exception as report:  # noqa: BLE001  e.g. a full disk: keep serving
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
+        with contextlib.suppress(Exception):  # noqa: BLE001  a reap that fails is tried again next tick
+            reap_children()
         time.sleep(TICK)
         watchdog.beat()
         try:
@@ -21640,9 +21898,9 @@ def incident_send(text: str, level: str, source_key: str, to: str = "", cls: str
     if ALARM_CMD.is_file() and os.access(ALARM_CMD, os.X_OK):
         route = (["--to", to] if to else []) + (["--class", cls] if cls else [])
         try:
-            subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
-                              source_key, text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", level, *route, "--source-key",
+                            source_key, text], bound=DETACHED_BOUND, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             log({"event": "alert", "via": ALARM_CMD.name, "sourceKey": source_key, "to": to or None, "text": text})
             return
         except OSError as error:
@@ -21842,9 +22100,8 @@ def coord_alert_spawn(text: str) -> None:
         coord_alert_missing(text)
         return
     try:
-        subprocess.Popen([*self_argv(), "coord-alert", text],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([*self_argv(), "coord-alert", text], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": describe(error), "text": text})
 
@@ -21861,9 +22118,8 @@ def coord_alert_missing(text: str) -> None:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT} and no {ALARM_CMD}", "text": text})
         return
     try:
-        subprocess.Popen([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        spawn_detached([os.fspath(ALARM_CMD), "--from", "glaeda-gh", "--severity", "fire", fire], bound=DETACHED_BOUND,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         log({"event": "alert-unsent", "why": f"no {COORD_ALERT}; {ALARM_CMD}: {describe(error)}", "text": text})
         return
@@ -22157,6 +22413,150 @@ def outcome(conclusion: str | None) -> str:
     return "failed" if text in {"failure", "error", ""} else text
 
 
+# ---------------------------------------------------------------- what a tally is a tally of
+
+# A count of checks is a count over a set, and the set changes while nobody is looking at it. One `wait pr` printed
+# these two lines 120 s apart, with nothing between them (teamleaderleo/leo-workspace, 2026-11-22):
+#   checks FAILURE: 16 passed, 2 failed, 0 pending (of 18, 0 required)
+#   checks PENDING: 16 passed, 0 failed, 1 pending (of 17, 0 required)
+# Both lines have the same shape, so both read as facts about one set; but the second set is not the first one with
+# newer states in it -- the two checks the FAILURE verdict was about had left it, and a check that was not there
+# before had arrived. The reader (human or agent) takes away either a red that no longer exists or a green that never
+# ruled on the thing that failed. No single read can say this: the counts are a function of one read, and `summary`
+# had no memory of the one before it. So each read's membership is remembered beside the read (`churn_log`, written
+# at the one place every cache entry is written) and the next line says what came, what went and that the counts are
+# not comparable -- naming a *failed* check that disappeared first, because that is the one that turns a red into a
+# green with no verdict in between (docs/handbook/missing-read-counted-as-a-value.md: a check with no verdict is
+# unknown, never a pass; it must not be read as a red either, which is why this says "not comparable" and invents no
+# verdict of its own).
+#
+# The memory is advisory only, in both directions: no verdict, exit code, `wait` end or land decision reads it, and
+# an entry that does not carry it (a first read, a cleared cache, an entry written by an older daemon) prints exactly
+# what it printed before. It is bounded by CHURN_* at every step: the names of a change are capped with a count of
+# the rest, a key keeps at most CHURN_EVENTS of them, and each is dropped CHURN_KEEP seconds after it happened.
+
+CHURN_KEEP = 300.0  # how long a membership change is still worth saying (two 120 s progress intervals, and slack:
+# a reader printing on that cadence must not be able to step over one)
+CHURN_NAMED = 3     # checks named per direction per change; the rest are counted
+CHURN_EVENTS = 3    # changes remembered per key
+
+
+def check_ident(c: dict) -> str:
+    """How a check is identified from one read to the next: workflow and name, as `parse_pr` keys its latest attempt
+    (so same-named jobs of different workflows stay separate, and a rerun is the same member, not a new one)."""
+    return f"{c.get('workflow') or ''}\0{c.get('name')}"
+
+
+def ident_label(ident: str) -> str:
+    workflow, _, name = str(ident).partition("\0")
+    return f"{workflow} / {name}" if workflow else name
+
+
+def members(data: Any) -> dict[str, str]:
+    """One read's check set: each member's identity -> passed, failed or pending, from its own fields only. Never
+    `classify`'s groups: `held` is this read's rendering of a failed check, not a different membership."""
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return out
+    for c in data.get("checks") or []:
+        if isinstance(c, dict):
+            done = c.get("status") == "COMPLETED"
+            failed = (c.get("conclusion") or "").upper() in FAILED
+            out[check_ident(c)] = "pending" if not done else "failed" if failed else "passed"
+    return out
+
+
+def whole_read(data: Any) -> bool:
+    """A read that holds the whole check set. A partial one (check pages held, a rollup past its first page) is
+    missing members it never read, and a read that did not happen is unknown, never a disappearance."""
+    return (isinstance(data, dict) and isinstance(data.get("checks"), list)
+            and not data.get("checksPageError") and not data.get("checksTruncated"))
+
+
+def membership_change(old: Any, new: Any, now: float) -> dict | None:
+    """What NEW's check set gained and lost against OLD's, bounded and typed, or None when there is nothing to say:
+    the same members in any order (a reorder is not a change, and saying so would be worse than today's silence), a
+    state that changed without the set changing, a first read, either read partial, a set that was empty (nothing to
+    compare against), or a different head commit -- a push is allowed to replace the basis, and the head is on the
+    headline above these counts already."""
+    if not whole_read(old) or not whole_read(new) or old.get("headRefOid") != new.get("headRefOid"):
+        return None
+    before, after = members(old), members(new)
+    gone = sorted(k for k in before if k not in after)
+    came = sorted(k for k in after if k not in before)
+    if not before or (not gone and not came):
+        return None
+    lost = [k for k in gone if before[k] == "failed"]
+
+    def few(keys: list[str]) -> list[str]:
+        return [ident_label(k) for k in keys[:CHURN_NAMED]]
+
+    return {"at": float(now), "before": len(before), "after": len(after),
+            "gone": few(gone), "goneMore": max(0, len(gone) - CHURN_NAMED), "goneTotal": len(gone),
+            "new": few(came), "newMore": max(0, len(came) - CHURN_NAMED), "newTotal": len(came),
+            "lostFailed": few(lost), "lostFailedMore": max(0, len(lost) - CHURN_NAMED),
+            "lostFailedTotal": len(lost)}
+
+
+def churn_log(prior: Any, old: Any, new: Any, now: float, keep: float = CHURN_KEEP) -> list[dict]:
+    """A key's recent membership changes: the ones still inside KEEP, plus this read's change when it has one, at
+    most CHURN_EVENTS of them. The log, rather than the previous read alone, is what a reader on a 120 s cadence
+    needs: the pair of lines that cost the time were two *prints*, and the read where the set moved was neither."""
+    log = churn_events(prior, now, keep)
+    change = membership_change(old, new, now)
+    if change is not None:
+        log.append(change)
+    return log[-CHURN_EVENTS:]
+
+
+def churn_events(log: Any, now: float | None = None, keep: float = CHURN_KEEP) -> list[dict]:
+    """The remembered changes still worth saying, oldest first; [] for anything else, so a cache without this memory
+    reads exactly as it did before there was one."""
+    now = time.time() if now is None else now
+    if not isinstance(log, list):
+        return []
+    return [e for e in log if isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+            and not isinstance(e.get("at"), bool) and now - e["at"] < keep][-CHURN_EVENTS:]
+
+
+def churn_names(event: dict, field: str) -> str:
+    names = [str(n) for n in event.get(field) or []]
+    more = int(event.get(f"{field}More") or 0)
+    return f"{', '.join(names)}{f' +{more} more' if more else ''}" if names else "?"
+
+
+def churn_clause(log: Any, now: float | None = None) -> str:
+    """The note the checks line carries when its own basis moved, or "" when nothing moved. It rides on that line
+    rather than taking one of its own because a wait's progress keeps only the first two lines (`progress_state`),
+    and the counts this is about are on the second of them."""
+    events = churn_events(log, now)
+    if not events:
+        return ""
+    lost = sum(int(e.get("lostFailedTotal") or 0) for e in events)
+    danger = f"; {lost} failed check(s) left it with no verdict" if lost else ""
+    return (f"; basis changed {age(events[0]['at'])} ({events[0].get('before')} -> {events[-1].get('after')} "
+            f"checks){danger}: these counts are not comparable with the earlier read")
+
+
+def churn_lines(log: Any, now: float | None = None) -> list[str]:
+    """One line per remembered change, what went before what came, and a vanished failure named as unknown."""
+    lines = []
+    for e in churn_events(log, now):
+        parts = []
+        gone, lost = int(e.get("goneTotal") or 0), int(e.get("lostFailedTotal") or 0)
+        if gone:
+            had = (" (all of them had failed)" if lost and lost == gone
+                   else f" ({lost} of them had failed: {churn_names(e, 'lostFailed')})" if lost else "")
+            parts.append(f"gone: {churn_names(e, 'gone')}{had}")
+        if lost:
+            parts.append("a failed check that disappeared has no verdict -- not a pass, and not a red to chase either")
+        if e.get("newTotal"):
+            parts.append(f"new: {churn_names(e, 'new')}")
+        lines.append(f"  basis moved {age(e['at'])}: {e.get('before')} -> {e.get('after')} checks; "
+                     + "; ".join(parts))
+    return lines
+
+
 # What a text summary lists by default. Agents read it, so it names the checks that need action and counts the rest:
 # a superseded attempt is not counted toward the verdict, so it is one count line, not one line each (a green
 # cmux PR printed seven of them, half its summary). --verbose or AGENT_VERBOSE=1 lists them all, as before; --json
@@ -22217,6 +22617,12 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             left = settling(data, now)
             lines.append("checks: none reported yet for this head commit"
                          + (f" (not started; settles in {int(left)}s)" if left is not None else "") + partial)
+        # The line just appended is this read's tally (either branch above appends exactly one). A tally whose
+        # basis moved says so on that same line, and then what moved; nothing here changes a verdict.
+        basis = churn_clause(entry.get("churn"), now)
+        if basis:
+            lines[-1] += basis
+            lines += churn_lines(entry.get("churn"), now)
         if data.get("state") == "OPEN" and expected_missing(data):
             lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
         if data.get("requiredMissing"):
@@ -22367,9 +22773,10 @@ def wait_command(req: dict) -> str:
 # dies ... We can listen for success outputs"). `--timeout S` was a total wall-clock bound: a run that was still
 # starting jobs and finishing steps at S ended "timeout" all the same, and its `next:` was the same wait again, so an
 # agent re-waited a run that had never stopped moving. Now --timeout is "no progress for S": the deadline is S past
-# the last time the waited thing's observed state changed (wait_progress_mark: a PR's checks, head or state; a run's
-# status, attempt, updated_at and, with --jobs, its jobs and steps; a comment thread's comments; a file's size and
-# mtime; a process's CPU time). A wait whose target does not move still ends at S, exactly as before. --max is the
+# the last time the waited thing moved toward a verdict (wait_progress_mark, wait_verdict_facts: a PR's checks
+# completing, its mergeable resolving, its rollup concluding; a run's, job's and step's conclusions; a comment
+# thread's comments; a file's size and mtime; a process's CPU time). A wait whose target does not move still ends at
+# S, exactly as before. --max is the
 # hard ceiling from the wait's start (default WAIT_MAX_TIMES x --timeout), so a target that keeps moving forever is
 # still not waited on forever. The outcome says which ended it: `ended_by` success, failure, ..., no-progress or
 # ceiling.
@@ -22437,18 +22844,120 @@ def wait_progress_print(kind: str, entry: dict | None) -> str | None:
     return hashlib.sha256(json.dumps(mark, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def wait_progress_mark(req: dict, mark: str | None, now: float, seen: str = "") -> bool:
-    """Note what the wait sees now in REQ["moved"] ({"print", "at", "seen"}); True when it changed since the last
-    look. The first thing read is where it starts, not a change: a target that never moves ends at --timeout."""
-    if mark is None:
+# A no-progress deadline that any churn resets is not a bound. One real `wait pr` on this fleet, 2026-11-22, ran
+# 3700 s and ended with no verdict, its deadline moving every time it was about to fire:
+#   deadline 01:07:04Z -> 01:23:43Z -> 01:33:33Z -> 01:37:18Z -> 01:42:45Z   (ceiling 03:53:48Z)
+# Every reset was a real difference in the fingerprint above, and not one of them was the PR getting closer to a
+# verdict: over those same 3700 s its head advanced (4ce5d07926 -> ca12962280) and its check set gained and lost
+# members, so "the rendered state differs from the last read" kept being true while nothing decided anything. With a
+# ceiling nearly three hours out, that slides almost indefinitely and the leash stops being a leash.
+#
+# So the leash does not move on difference; it moves on movement toward the verdict the wait was asked for. A wait
+# keeps the set of verdict facts it has ever observed (wait_verdict_facts) and its deadline moves only when a read
+# brings one it had never seen: a check starting, a check reaching a conclusion, a mergeable resolving, a rollup
+# concluding, the PR reaching a terminal state, a run's job or step concluding. The set only ever grows, so losing a
+# member is never progress and regaining one is never progress twice, and nothing outside it buys a window at all --
+# not a head advancing, not a check appearing or disappearing while it is still queued, not a queue position, not a
+# startedAt or an updated_at ticking.
+#
+# Two decisions this encodes, both deliberate.
+#
+# A head change neither extends the leash nor ends the wait. It does not extend it because a fact is named by the
+# check and the conclusion, never by the head it was observed under: when a new head re-runs the same contexts to the
+# same conclusions, the wait has seen all of it and buys nothing, which is what closes the slide above. A conclusion
+# it had not seen (a red that went green) is progress, because that is the part that can decide the PR. It does not
+# end the wait either: a rebase or a push is the ordinary way a PR reaches a verdict, `--sha` already exists for a
+# caller that means one exact head (another head stops that path, head_moved), and ending every unpinned wait on a
+# teammate's push would turn one agent's push into another agent's failure. The defect was the extension, not the
+# continuation; removing the extension bounds it, and --max still bounds a head that keeps advancing.
+#
+# A required check that is legitimately still running is never cut short by this. Both steps of a check's life count
+# -- it starting, and it concluding -- so a PR working through its checks is exactly as patient as it was before this
+# rule, and a lone pending check still ends its wait --timeout past the last real movement, with stuck_note naming
+# it. What is gone is only the window that used to be bought by things that were never movement.
+WAIT_FACTS_MAX = 256  # how many distinct verdict facts one wait remembers: REQ["moved"] stays bounded and typed
+
+
+def pr_verdict_facts(data: dict) -> list[str]:
+    """What of a PR read is movement toward a `wait pr` verdict: a terminal PR state, a mergeable that has resolved,
+    a rollup that has concluded, and each check that has started or concluded. Named by the check and the value, not
+    by the head: the same contexts re-running to the same conclusions on a new head is work already accounted for."""
+    facts = []
+    if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+        facts.append(f"state:{str(data.get('state')).upper()}")
+    if str(data.get("mergeable") or "").upper() in ("MERGEABLE", "CONFLICTING"):
+        facts.append(f"mergeable:{str(data.get('mergeable')).upper()}")
+    rollup = str(data.get("checkState") or "").upper()
+    if rollup and rollup not in ("PENDING", "EXPECTED"):
+        facts.append(f"rollup:{rollup}")
+    for c in data.get("checks") or []:
+        if not isinstance(c, dict):
+            continue
+        status = str(c.get("status") or "").upper()
+        if status == "COMPLETED":
+            facts.append(f"check:{label(c)}:{str(c.get('conclusion') or '').upper()}")
+        elif status and status not in ("QUEUED", "WAITING", "PENDING", "REQUESTED"):
+            facts.append(f"check:{label(c)}:started")  # a queued check that got a runner: one step, counted once
+    return facts
+
+
+def run_verdict_facts(data: dict, jobs: Any) -> list[str]:
+    """What of a run read is movement toward a `wait run` verdict: the run concluding, and (with --jobs) each job and
+    step that has started or concluded. Its updated_at is a clock, not a verdict."""
+    facts = []
+    if str(data.get("status") or "").lower() == "completed":
+        facts.append(f"run:{data.get('conclusion')}")
+    for j in jobs if isinstance(jobs, list) else []:
+        if not isinstance(j, dict):
+            continue
+        for what, number, item in [("job", "", j)] + [("step", s.get("number"), s) for s in j.get("steps") or []
+                                                      if isinstance(s, dict)]:
+            status = str(item.get("status") or "").lower()
+            where = f"{what}:{j.get('id')}:{number}"
+            if status == "completed":
+                facts.append(f"{where}:{item.get('conclusion')}")
+            elif status and status not in ("queued", "waiting", "pending", "requested"):
+                facts.append(f"{where}:started")
+    return facts
+
+
+def wait_verdict_facts(kind: str, entry: dict | None) -> list[str] | None:
+    """Every verdict fact a `wait pr|run|comment` read carries, or None before anything was read. Read times are left
+    out on purpose, and so is everything else that can change without bringing a verdict closer."""
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+    if kind == "run":
+        return run_verdict_facts(data, (entry or {}).get("jobs"))
+    if kind == "comment":
+        # a comment wait ends on a comment; one arriving, or being edited into the match, is the movement there
+        return [f"comment:{c.get('id')}:{c.get('updatedAt') or c.get('createdAt')}"
+                for c in data.get("comments") or [] if isinstance(c, dict)]
+    return pr_verdict_facts(data)
+
+
+def fact_mark(fact: str) -> str:
+    return hashlib.sha256(fact.encode()).hexdigest()[:16]
+
+
+def wait_progress_mark(req: dict, facts: list[str] | None, now: float, seen: str = "") -> bool:
+    """Note what the wait has now seen in REQ["moved"] ({"facts", "at", "seen", "changes"}); True when this read
+    brought a verdict fact the wait had not seen before. What was already true at the first read is where it starts,
+    not a change: a target that never moves ends at --timeout. Past WAIT_FACTS_MAX facts the set stops growing and
+    so does the deadline -- a bound only ever tightens."""
+    if facts is None:
         return False
+    marks = {fact_mark(f) for f in facts}
     moved = req.get("moved") if isinstance(req.get("moved"), dict) else None
     if moved is None:
-        req["moved"] = {"print": mark, "at": float(req["began"]), "seen": seen, "changes": 0}
+        req["moved"] = {"facts": sorted(marks)[:WAIT_FACTS_MAX], "at": float(req["began"]), "seen": seen,
+                        "changes": 0}
         return False
-    if moved.get("print") == mark:
+    known = set(moved.get("facts") or [])
+    if marks <= known or len(known) >= WAIT_FACTS_MAX:
         return False
-    req["moved"] = {"print": mark, "at": now, "seen": seen, "changes": int(moved.get("changes") or 0) + 1}
+    req["moved"] = {"facts": sorted(known | marks)[:WAIT_FACTS_MAX], "at": now, "seen": seen,
+                    "changes": int(moved.get("changes") or 0) + 1}
     return True
 
 
@@ -22727,7 +23236,9 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
     pending and how long each has been (the age is the load-bearing part -- "pending" alone reads the same at 20 s and
-    at 14 min), that their siblings have finished when they have, and a next step for a check that is not moving.
+    at 14 min), that their siblings have finished when they have, that a required check has already failed and so
+    decided it when one has, and a next step for whichever check the reader should look at: the one that decided it if
+    any did, else the one that is not moving.
 
     None while there is nothing to say: the state has not been still that long, the target is not a PR (a run's status
     is its own state), or nothing is pending. Never the blind read of glaeda#2316, which is the opposite case: there
@@ -22770,19 +23281,31 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
              and not groups["held"] else "")
     # The rollup can already be red while a `--until done` wait goes on (it ends on the checks, not on the rollup):
     # cmux#48834 said PENDING against a rollup FAILURE for 25 minutes and never said the two were not the same test.
+    # A required check that has already failed decided this wait, whatever its siblings are still doing.
+    # teamleaderleo/glaeda#2564 (3700 s) said "not moving: Verify / scripts pending 11m" on every progress line while
+    # `ci-status / Require every Verify job` had already failed: the words named the slowest check instead of the
+    # deciding one, so a reader kept waiting on a verdict that was already in. `required` is on every check this wait
+    # has already read, so naming it costs no extra read, and this changes no exit code and no verdict mapping.
+    decided = [c for c in groups["failed"] if c.get("required")]
+    gate = (f" {label(decided[0])} is required and has already failed"
+            + (f" (and {len(decided) - 1} more required check(s) with it)" if len(decided) > 1 else "")
+            + ": the decision is already in, and nothing still pending can change it."
+            if decided else "")
     rollup = str(data.get("checkState") or "").upper()
     disagrees = (f" GitHub's rollup already says {rollup}; this wait ends on the checks it counts, not on the rollup, "
                  "so a red there does not end it." if rollup in COUNT_BAD else "")
     stands = (f"{len(pending)} of {len(data['checks'])} checks are still pending" if pending
               else f"every one of the {len(data['checks'])} checks it can read has finished")
     lines = [f"glaeda-gh: WARNING: {key_name(key)} has not changed for {span(unchanged)}: "
-             f"{stands}{siblings}.{alone}{disagrees}"]
+             f"{stands}{siblings}.{gate}{alone}{disagrees}"]
     if pending:
         lines.append(f"  not moving: {named}{more}")
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    lines.append(f"next: {stuck_next(oldest[0], key) if pending else unseen_next(data, key)}")
+    nxt = (stuck_next(decided[0], key) if decided
+           else stuck_next(oldest[0], key) if pending else unseen_next(data, key))
+    lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
 
@@ -23397,8 +23920,9 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
                                  until, grace, bool(req.get("verbose")))
     data = (entry or {}).get("data")
     if fresh and data:
-        # a fresh read: whether the target moved since the last one stretches this wait's deadline (wait_deadline)
-        wait_progress_mark(req, wait_progress_print(kind, entry), now)
+        # a fresh read: a verdict fact it had not seen stretches this wait's deadline (wait_deadline). A difference
+        # that is not one does not; churn is not progress (wait_progress_mark).
+        wait_progress_mark(req, wait_verdict_facts(kind, entry), now)
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
@@ -25214,7 +25738,8 @@ def fetch_host(host: str, local: bool) -> dict:
     if local:
         return local_host_report()
     try:
-        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(FLEET_HOST_SCRIPT)], timeout=FLEET_HOST_TIMEOUT)
+        script = remote_self_bounded(FLEET_HOST_SCRIPT, FLEET_HOST_TIMEOUT)  # its own bound there, too
+        done = run_bounded([REACH_CMD, host, "sh", "-c", shlex.quote(script)], timeout=FLEET_HOST_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"error": f"unreachable (no answer in {FLEET_HOST_TIMEOUT:g}s)"}
     except OSError as error:
@@ -28934,7 +29459,7 @@ def read_runner_state(repo: str) -> tuple[list[dict] | None, str]:
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"{where} not read ({describe(error)})"
     if done.returncode != 0:
-        return None, f"{where} not read ({(done.stderr or '').strip()[:120]})"
+        return None, f"{where} not read ({gh_said((done.stderr or '').strip(), limit=120)})"
     try:
         doc = json.loads(gzip.decompress(base64.b64decode(done.stdout.strip(), validate=True)))
     except (ValueError, OSError, EOFError, zlib.error) as error:
@@ -30608,13 +31133,14 @@ def broker_post(item: dict) -> int:
     return 0
 
 
-def post_issue_names_an_existing_issue(target: str) -> str:
-    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+def post_target_number(target: str) -> str:
+    """The issue or pull request number a `post` target names, or "" where it names a repository.
 
-    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    Nothing is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
     that issue: the caller had the number from a wait or land line, not from this parser's help. Until
     2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
-    cost the refusal plus the same call typed again under another kind.
+    cost the refusal plus the same call typed again under another kind. `post pr OWNER/REPO#N` reads the same
+    way and was refused ("post pr takes OWNER/REPO") until 2026-11-23, measured on a comment for cmux#51063.
     """
     text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
     found = KEY_RES["comment"].fullmatch(text)
@@ -30888,7 +31414,7 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         err = done.stderr.decode(errors="replace").strip()
         if not (flags and "unknown flag" in err):
             break
-    return False, b"", (err or f"gh api exited {done.returncode}")[-300:]
+    return False, b"", (gh_said(err, limit=None) or f"gh api exited {done.returncode}")[-300:]
 
 
 def job_log_finished(text: bytes) -> bool:
@@ -32376,7 +32902,10 @@ def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) ->
     if parent != "post":
         return True
     if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
-        return False
+        # Since 2026-11-23 `post pr OWNER/REPO#N` is a comment on that pull request, which takes a body and
+        # not --head/--base/--title. Without a body it is still a call `post` could only refuse.
+        return bool(post_target_number(target)) and bool(
+            {normalized_flag("--body"), normalized_flag("--body-file")} & typed)
     needs = NESTING_WRITE_INPUT.get((parent, word))
     return not needs or bool({normalized_flag(f) for f in needs} & typed)
 
@@ -32920,7 +33449,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
             if one == "issue":
-                numbered = post_issue_names_an_existing_issue(args.target)
+                numbered = post_target_number(args.target)
                 if numbered and args.title:
                     raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
                                      f"to comment on it, or pass OWNER/REPO to file a new issue")
@@ -32928,6 +33457,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
                           f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
                     args.kind, one = "comment", "comment"
+            if args.kind == "pr":
+                numbered = post_target_number(args.target)
+                opening = [f for f, v in (("--head", args.head), ("--base", args.base), ("--title", args.title)) if v]
+                if numbered and opening:
+                    raise WatchError(f"post pr {args.target} names pull request {numbered}, which exists: drop "
+                                     f"{', '.join(opening)} to comment on it, or pass OWNER/REPO to open a new one")
+                if numbered:
+                    print(f"glaeda-gh: post pr {args.target} names pull request {numbered}, which exists: this is "
+                          f"a comment on it (a new pull request takes OWNER/REPO with --head, --base and --title)",
+                          file=sys.stderr)
+                    args.kind = "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:

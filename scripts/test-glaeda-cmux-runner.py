@@ -2646,6 +2646,11 @@ class HookTest(unittest.TestCase):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), None, log))
             with mock.patch.object(hook, "free_gib", return_value=40.0):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+            # JOB_OWN_NEED_ALONE: a peak learned only beside other jobs counts their writes too: no refusal
+            crowded = self.peak_log([(100.0, 45.0, False)] * 20)
+            self.assertIn("p90 of 20 runs here", hook.learned_job_peaks(hook.job_log_tail(crowded))[self.PEAK_KEY][1])
+            with mock.patch.object(hook, "free_gib", return_value=17.2):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, crowded))
             with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
                 self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
             with mock.patch.object(hook, "free_gib", return_value=5.0), \
@@ -12589,6 +12594,66 @@ class GateTest(unittest.TestCase):
             disk = self.runner_job_disk_file(5.3)
             ps.side_effect = subprocess.TimeoutExpired("ps", 30)
             self.assertIsNone(self.short(gate), "no process table: the one-job peak alone")
+
+    def test_a_disk_refusal_holds_the_accounts_listeners_until_its_need_fits_or_the_bound(self) -> None:
+        """OWN_NEED_HOLD (2026-11-23: cmux23's listeners took the fast tier, 54.7 GiB peak, at 18 GiB free and refused
+        it at setup again and again): a JOB_DISK_OWN_NEED refusal leaves its need, and this account's pool listeners
+        take no job while free disk is under it, at most OWN_NEED_HOLD_S; room, the bound, a small runner or the off
+        switch end it."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=self.tmp / "capacity")
+        free = {"gib": 18.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        notes: list[str] = []
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(hook, "gate_log", side_effect=notes.append), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "8"}):
+            self.assertIsNone(gate.low_disk(), "no refusal here: listening")
+            hook.own_need_record(self.state, 64.7, "manaflow-ai/cmux/cmux-next.yml/fast-tier")
+            hook.own_need_record(self.state, 30.0, "manaflow-ai/cmux/cmux-next.yml/lint")  # a smaller one keeps 64.7
+            why = gate.low_disk() or ""
+            self.assertIn("needs 64.7 GiB free", why)
+            self.assertIn("(OWN_NEED_HOLD)", why)
+            self.assertEqual(cleanup.call_args.args[1], 64.7, "reclaim aims at the refused job's need")
+            self.assertEqual(why, gate.low_disk(), "the same words every poll")
+            self.assertEqual([n for n in notes if n.startswith("OWN_NEED_HOLD start")],
+                             ["OWN_NEED_HOLD start free_gib=18.0 need_gib=64.7 "
+                              "key=manaflow-ai/cmux/cmux-next.yml/fast-tier"])
+            (self.tmp / "capacity").mkdir(exist_ok=True)
+            (self.tmp / "capacity" / hook.RUNNER_JOBS_HOLD_OFF_FILE).touch()
+            self.assertNotIn("OWN_NEED_HOLD", gate.low_disk() or "", "the off switch")
+            (self.tmp / "capacity" / hook.RUNNER_JOBS_HOLD_OFF_FILE).unlink()
+            self.assertIn("OWN_NEED_HOLD", gate.low_disk() or "", "switch gone: held again")
+            free["gib"] = 70.0
+            self.assertIsNone(gate.low_disk(), "room for the refused job: listening, the record gone")
+            self.assertFalse((self.state / hook.OWN_NEED_FILE).exists())
+            self.assertEqual(len([n for n in notes if n.startswith("OWN_NEED_HOLD end")]), 2)
+            free["gib"] = 18.0
+            hook.own_need_record(self.state, 64.7, "k", now=time.time() - hook.OWN_NEED_HOLD_S - 1)
+            self.assertIsNone(gate.low_disk(), "past the bound: listening")
+            (self.state / hook.OWN_NEED_FILE).write_text("{not json")
+            self.assertIsNone(gate.low_disk(), "an unreadable record holds nothing")
+            self.assertFalse((self.state / hook.OWN_NEED_FILE).exists())
+
+    def test_job_disk_own_refusal_leaves_its_need_for_the_listeners(self) -> None:
+        """The refusal itself writes the record the listener gate reads (OWN_NEED_HOLD); admitted, it writes none."""
+        # JOB_OWN_NEED_ALONE: a peak learned beside other jobs neither refuses nor leaves a record for the listeners
+        with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here")}), \
+                mock.patch.object(hook, "job_log_tail", return_value=""), \
+                mock.patch.object(hook, "free_gib", return_value=18.0):
+            self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
+        self.assertIsNone(hook.own_need_held(self.state, 18.0))
+        with mock.patch.object(hook, "learned_job_peaks", return_value={"k": (54.7, "p90 of 20 runs here alone")}), \
+                mock.patch.object(hook, "job_log_tail", return_value=""):
+            with mock.patch.object(hook, "free_gib", return_value=70.0):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
+            self.assertIsNone(hook.own_need_held(self.state, 10.0))
+            with mock.patch.object(hook, "free_gib", return_value=18.0):
+                self.assertIn("JOB_DISK_OWN_NEED", hook.job_disk_own_refusal(os.fspath(self.tmp), "k", None, self.state))
+            self.assertEqual(hook.own_need_held(self.state, 18.0)["need_gib"], 64.7)
 
     def test_the_runner_jobs_hold_logs_its_start_and_end_and_has_an_off_switch(self) -> None:
         """RUNNER_JOBS_HOLD: one countable line when a hold starts (free, need, reserve, jobs in flight) and one when it
