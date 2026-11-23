@@ -3473,7 +3473,7 @@ def foreign_app_forbidden(owner: str, error: Any) -> bool:
     path = error.get("path")
     if not (isinstance(path, list) and len(path) > 1 and path[-1] == APP_FIELD):
         return False
-    org = APP_POOL_IP_ALLOW_LIST.search(str(error.get("message") or ""))
+    org = APP_POOL_IP_ALLOW_LIST.search(gh_said(error, None))  # (sanitized: the org name survives)
     return bool(org) and org.group(1).lower() != str(owner or "").lower()
 
 
@@ -10256,7 +10256,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "updatedAtAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "jobsDone", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "gqlBlindAt", "fp", "fullAt", "wholeAt", "restFullAt", "stepsOwed", "updatedAtAt")
                               if k in base})
             if key == self.resume_key and fields.get("dataAt") == self.now:
                 fields = {**fields, "dataAt": self.resume_from}  # its oldest part's tick: no newer than that
@@ -11519,9 +11519,9 @@ class Daemon:
                               missing=not parts and str(error).startswith("HTTP 404"))
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
-        self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
+        owed = self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
         self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest",
-                   restFullAt=min(self.now, self.resume_from))
+                   restFullAt=min(self.now, self.resume_from), stepsOwed=owed)
 
     def rest_gate_holds(self, e: dict, prior: dict, old: dict, root: str, number: Any) -> bool:
         """The REST PR read's gate (PR_REST_FULL_EVERY): True when the issue, the head's check suites and its first
@@ -11557,8 +11557,29 @@ class Daemon:
                     return False
         except WatchError:
             return False  # the full read says what failed
-        self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest")
+        more = self.owed_steps_gated(e, prior, old, root, sha)
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest", **more)
         return True
+
+    def owed_steps_gated(self, e: dict, prior: dict, old: dict, root: str, sha: str) -> dict:
+        """The steps a held read still owes (stepsOwed: a 5xx, a refusal past STEPS_RETRY, a read left for later),
+        read now by fill_steps_rest from the kept check runs, without the full read the gate saves: {} when none is
+        due, else the store fields. The settled failed head the gate holds for PR_REST_SETTLED_FULL_EVERY is the one
+        whose steps decide a rescue, and its steps were read only on a full read: a 502 on them stood for 30 min."""
+        owed = prior.get("stepsOwed")
+        if not isinstance(owed, list) or not owed or not any(
+                self.now - self.steps_failed.get(j, self.now - STEPS_RETRY) >= STEPS_RETRY for j in owed):
+            return {}
+        path = check_runs_path(root, sha)
+        listed: list = []
+        for page in range(1, REST_CHECK_PAGES + 1):
+            kept = old.get(path if page == 1 else f"{path}&page={page}")
+            if not isinstance(kept, dict) or not isinstance(kept.get("doc"), dict):
+                break
+            listed += kept["doc"].get("check_runs") or []
+        data = json.loads(json.dumps(prior["data"]))
+        still = self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
+        return {"data": data, "stepsOwed": still}
 
     def rest_gate_due(self, e: dict, prior: dict) -> bool:
         """Whether E's REST PR read goes to its gate (rest_gate_holds) rather than straight to a full read: an open,
@@ -11608,6 +11629,11 @@ class Daemon:
                         and bool((old.get(f"{root}/issues/{number}") or {}).get("etag")))
             unlikely = f"{root}/pulls/{number}" if reusable else f"{root}/issues/{number}"
             paths = [path for path in paths if path != unlikely]
+            checks = data.get("checks") or []
+            if (checks and data.get("checkState") != "FAILURE"
+                    and all(str(c.get("status") or "").upper() == "COMPLETED" for c in checks)):
+                # a settled head: fetch_pr_rest reads no gate baseline for it, so its kept suites answer is not asked
+                paths = [path for path in paths if path != suites_path(root, str(data.get("headRefOid") or ""))]
         out = []
         for path in paths:
             kept = old.get(path) if isinstance(old.get(path), dict) else {}
@@ -11893,7 +11919,7 @@ class Daemon:
         self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=parse_comments(rest_issue_node(issue, comments)),
                    restParts=parts, via="rest")
 
-    def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> None:
+    def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> list:
         """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped). An Actions
         check run's id is its job's id, and a run's job list names every job's steps. A completed job does not
         change, so each is read once. Steps come, cheapest first, from the PR's own cache, the run watch's cached
@@ -11902,7 +11928,10 @@ class Daemon:
         names (a run past REST_JOB_PAGES pages) is read alone, GET .../actions/jobs/ID. At most REST_STEPS_MAX
         reads per PR read, and the rest on the next one. Without its steps a refused or never-started check
         cannot be held. On 2026-11-11 huge-blue's daemon sent 22 jobs/{id} reads in an hour, one per failed job
-        of a few runs."""
+        of a few runs. Returns the job ids whose steps are still owed (a 5xx, a refusal waiting STEPS_RETRY, a
+        read left for the next one): rest_gate_due sends the next read on in full while one is due, so a gated
+        settled head still asks again."""
+        owed: list = []
         known = known_steps([(e, data)])
         left = REST_STEPS_MAX
         self.steps_failed = {j: t for j, t in self.steps_failed.items() if self.now - t < STEPS_RETRY}
@@ -11919,6 +11948,7 @@ class Daemon:
             if not job_id or not c.get("runId") or self.mode("rest") == "stop":
                 continue
             if job_id in self.steps_failed:
+                owed.append(job_id)
                 continue
             got = self.run_cache_job(owner, repo, c["runId"], job_id)
             if got is None and left > 0 and self.rest_room(1):
@@ -11926,26 +11956,29 @@ class Daemon:
                     got, sent = self.run_list_job(root, c["runId"], job_id, left)
                 except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
                     self.deferred.add(e["key"])
-                    return
+                    return owed + [job_id]
                 left -= sent
             if got is not None:
                 c["failedSteps"], c["stepCount"] = got
                 continue
             if left <= 0 or not self.rest_room(1):
+                owed.append(job_id)
                 continue
             left -= 1
             try:
                 state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
             except OutOfTime:
                 self.deferred.add(e["key"])
-                return
+                return owed + [job_id]
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
                 if STEPS_GONE.match(str(doc)):
                     self.steps_failed[job_id] = self.now
+                owed.append(job_id)
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
+        return owed
 
     @staticmethod
     def run_cache_job(owner: str, repo: str, run_id: Any, job_id: Any) -> list | None:
@@ -22752,8 +22785,22 @@ def refresh_log_tail(n: int = REFRESH_LOG_SHOWN) -> list[str]:
     return lines[-n:] if n > 0 else []
 
 
+# Where log() writes. stdout is the daemon's log (serve sets this); every other process -- a CLI call, the gh
+# shim -- owns its stdout as its answer. Measured 2026-11-23 with no gh login: `budget --json` printed a
+# "login-fallback" event line in front of its document, so stdout was no longer one JSON document, and the same
+# line would land in the output of any `gh` the shim served. The module default stays stdout for the suite's
+# in-process daemon; the program's entry point turns it off and serve() back on.
+LOG_STDOUT = True
+
+
 def log(event: dict) -> None:
-    print(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event}), flush=True)
+    line = json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), **event})
+    if LOG_STDOUT:
+        print(line, flush=True)
+        return
+    if sys.stderr is not None:  # closed fd 2: print(file=None) would write to stdout, the thing kept clean here
+        with contextlib.suppress(OSError, ValueError):
+            print(line, file=sys.stderr, flush=True)
 
 
 def clear_failing() -> None:
@@ -23030,6 +23077,8 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 def serve(foreground_ok: bool = False) -> int:
+    global LOG_STDOUT
+    LOG_STDOUT = True  # the daemon's stdout is its log
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
@@ -36132,6 +36181,7 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         return raw, []
     values = bare_wait_defaults(raw)
     hungry = value_hungry_flags(raw)
+    full = len(positional_words(raw)) >= positional_capacity(parser_nodes(raw)[-1])
     fixed: list[str] = []
     said: list[str] = []
     i = 0
@@ -36142,7 +36192,13 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
             break
         value = values.get(word)
         nxt = raw[i + 1] if i + 1 < len(raw) else None
-        has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
+        # A number argparse will refuse (-5, nan, inf) or a word the command has no positional slot left for
+        # (`wait file X --timeout soon`) is the caller's value for this flag, typed wrong: `seconds` refuses it
+        # by name ("is not a number of seconds"). Read as a bare flag it became `--timeout 3600 soon` and
+        # argparse's "unrecognized arguments: soon", which names no flag and no reason.
+        has_value = nxt is not None and (bare_wait_count(nxt) and not nxt.startswith("-")
+                                         or bare_wait_number_typed(nxt)
+                                         or (full and not nxt.startswith("-")))
         if value is None or has_value or (fixed and fixed[-1] in hungry):
             fixed.append(word)
             i += 1
@@ -36154,6 +36210,15 @@ def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     if said:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
+
+
+def bare_wait_number_typed(word: str) -> bool:
+    """Whether WORD was typed as a number, however `seconds` judges it: -5, nan, inf, 1e9."""
+    try:
+        float(word)
+    except ValueError:
+        return False
+    return True
 
 
 def bare_wait_count(word: str) -> bool:
@@ -36505,4 +36570,5 @@ def exec_from_bytecode() -> None:
 if __name__ == "__main__":
     exec_from_bytecode()
     INTENT_ON = True  # the program, not a test that imports it: a refused call is the intent layer's to read first
+    LOG_STDOUT = False  # stdout is this call's answer; serve() takes it back for the daemon's log
     raise SystemExit(main())

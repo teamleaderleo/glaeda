@@ -104,6 +104,26 @@ os.environ.setdefault("GLAEDA_GH_LANE_CHAIN", os.fspath(Path(tempfile.gettempdir
 POST_ROUTE_MISSING = gg.post_route_missing
 gg.post_route_missing = lambda: None
 _NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
+# Nor may a test exec for real: an exec replaces this process, the run ends with the exec'd program's exit code and
+# no unittest summary, and every test after it never runs. From 2026-11-21 the create hand-off used os.execve
+# (glaeda#2376) while BrokerMergeGuardTest mocked only os.execv: its stand-in guard (`exit 0`) replaced the run at
+# about test 298, so CI passed this suite green without running PostTest or any class after it. A test that means
+# to see an exec patches it (mock.patch.object(os, "execv", ...)) over this.
+
+
+class RealExec(BaseException):
+    """Not an Exception: the code under test catches Exception around its execs (broker_merge_handoff) and would
+    swallow the refusal, falling through to a route the test never meant to see."""
+
+
+def _no_real_exec(name: str):
+    def refuse(path, *_args, **_kw):
+        raise RealExec(f"a test reached a real os.{name}({path!r}): patch it, or this run would end here")
+    return refuse
+
+
+for _name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
+    setattr(os, _name, _no_real_exec(_name))
 
 
 def no_head_runs(repo: str, paths: list[str], budget: float = 0) -> dict:
@@ -1171,7 +1191,7 @@ class HeadRunOrderTest(unittest.TestCase):
         self.assertEqual(failed, {10: "CR_10", 11: "CR_11"})  # only failures
         asked: list = []
 
-        def graphql(query: str, variables: dict) -> tuple:
+        def graphql(query: str, variables: dict, _route: list | None = None) -> tuple:
             asked.append(variables["ids"])
             return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
                                        {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
@@ -1186,7 +1206,7 @@ class HeadRunOrderTest(unittest.TestCase):
         gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
         self.assertEqual(asked, [["CR_10", "CR_11"]])
         down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
-                                     graphql=lambda q, v: (None, "graphql: down"))
+                                     graphql=lambda q, v, _route=None: (None, "graphql: down"))
         again = gg.head_data("a" * 40, runs, {}, {}, order)
         again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
                          for k, rs in again["runs"].items()}
@@ -3763,7 +3783,10 @@ class BalanceTest(Base):
     def test_richness_is_what_is_left_over_the_time_to_reset(self) -> None:
         self.budgets(rest=(1600, 120), graphql=(1600, 3000))  # same count, both above their floors: 2 minutes to go is rich
         self.assertGreater(self.daemon.richness("rest"), 10 * self.daemon.richness("graphql"))
-        self.assertEqual(self.daemon.route("pr"), "rest")
+        # A PR is cost-weighted and capped at the reads per second the daemon's own time affords (read_seconds: a
+        # REST PR read is ~4 s, a GraphQL one ~0.5 s), so a rich REST bucket alone does not move PRs: GraphQL
+        # still reads them faster than REST could.
+        self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "rest")
         self.assertEqual(self.daemon.route("comment"), "graphql")  # comment watches never move
         self.budgets(rest=(1600, 3000), graphql=(1600, 120))
@@ -3786,7 +3809,7 @@ class BalanceTest(Base):
 
     def test_the_cheaper_path_flips_as_buckets_drain(self) -> None:
         """Both buckets drain about evenly: reads follow whichever has more to spend per second."""
-        self.budgets(rest=(4500, 1800), graphql=(1000, 1800))
+        self.budgets(rest=(4500, 1800), graphql=(600, 1800))  # GraphQL nearly at its reserve: PRs move to REST
         self.assertEqual(self.daemon.route("pr"), "rest")
         self.budgets(rest=(900, 1800), graphql=(1000, 600))  # REST drained; GraphQL's reset is near
         self.assertEqual(self.daemon.route("pr"), "graphql")
@@ -3940,6 +3963,13 @@ class BalanceTest(Base):
         self.gh.prs[("o", "r", number)] = first
         self.gh.heads[("o", "r", "a" * 40)] = checks
 
+    def probed_until(self, at: float) -> None:
+        """Probes confirmed pr:o/r#12 every cycle until AT (dataAt moves, fullAt stays), so its reads are not behind
+        (pr_behind, #2440: data older than PR_FULL_EVERY lets a probe stand in for the full read)."""
+        entry = gg.read_cache("pr:o/r#12")
+        entry["dataAt"] = at - gg.CYCLE
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#12"), entry)
+
     def test_an_unchanged_paged_pr_keeps_its_whole_answer_without_its_pages(self) -> None:
         """cosmic-gray, 2026-11-11 15:40Z: 7 of 74 PRs sat partial ("PR check pages wait for the per-minute ceiling"),
         were never probed, and were read in full every cycle. A full read whose first page agrees with the whole
@@ -3956,6 +3986,7 @@ class BalanceTest(Base):
         calls = len(self.gh.gql_calls())
         # past PR_FULL_EVERY: the full read is due, and the pace has no room for its pages
         later = NOW + gg.PR_FULL_EVERY + gg.CYCLE
+        self.probed_until(later)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (later, later))
         self.daemon.gql_log = [(later - 1, "other", self.daemon.policy.get("graphqlPerMinute", gg.GRAPHQL_PER_MINUTE) - 2)]
         self.daemon.tick(later)
@@ -3970,6 +4001,7 @@ class BalanceTest(Base):
                                    for c in entry["data"]["checks"]]
         gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#12"), entry)
         third = later + gg.PR_FULL_EVERY + gg.CYCLE
+        self.probed_until(third)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (third, third))
         self.daemon.gql_log = []
         self.daemon.tick(third)
@@ -3978,6 +4010,7 @@ class BalanceTest(Base):
                          ["SUCCESS"])
         # kept answers are read whole again at PR_WHOLE_EVERY, however often a first page confirms them
         bound = third + gg.PR_WHOLE_EVERY
+        self.probed_until(bound)
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (bound, bound))
         self.daemon.tick(bound)
         self.assertEqual(gg.read_cache("pr:o/r#12")["via"], "graphql")
@@ -5622,8 +5655,11 @@ class ClientTest(Base):
         code, text = self.wait("pr", "o/r#1", fill=(running, {}), timeout=0.3)
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         lines = text.strip().splitlines()
-        self.assertEqual(lines[-1], "next: glaeda-gh wait pr o/r#1 --timeout 0.3")
-        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1 \(deadline \d\d:\d\d:\d\dZ\); last seen: ")
+        # Never this same wait again (timeout_next, leo-workspace#8794): the pending check has no run to open, so
+        # the step is the PR's own verbose status.
+        self.assertEqual(lines[-1], "next: glaeda-gh status pr o/r#1 --verbose")
+        self.assertRegex(lines[-2], r"^glaeda-gh: waited 0 s for o/r#1: no change for 0.3 s \(deadline "
+                                    r"\d\d:\d\d:\d\dZ; no change since the wait began\); last seen: ")
         self.assertIn("checks PENDING", lines[-2])
 
     def test_a_wait_says_how_it_stands_while_it_blocks(self) -> None:
@@ -5633,7 +5669,8 @@ class ClientTest(Base):
         self.assertEqual(code, gg.EXIT_TIMEOUT)
         progress = [line for line in text.splitlines() if line.startswith("glaeda-gh: still waiting on pr:o/r#1: ")]
         self.assertTrue(progress, text)
-        self.assertRegex(progress[0], r"\d+s of 0.5s, deadline \d\d:\d\d:\d\dZ; o/r#1 OPEN .*; checks PENDING")
+        self.assertRegex(progress[0], r"no change for \d+s of 0.5s, deadline \d\d:\d\d:\d\dZ \(moves while it "
+                                      r"progresses; ceiling \d\d:\d\d:\d\dZ\); o/r#1 OPEN .*; checks PENDING")
 
     def test_a_daemon_ruled_wait_keeps_the_state_its_blocker_prints(self) -> None:
         running = gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a", "IN_PROGRESS", None)]))
@@ -9067,8 +9104,11 @@ class TickBudgetTest(Base):
         inner, spent = self.daemon.transport, [0.0]
 
         def transport(method, url, headers, body):
-            self.daemon.tick_deadline -= request_s  # the request's share of the tick's budget
-            spent[0] += request_s
+            # the request's share of the tick's budget: a read's own, sent in turn. A prefetch (prefetch_rest, #2421)
+            # goes on its pool alongside the reads, so it takes no turn of the tick's
+            if threading.current_thread() is threading.main_thread():
+                self.daemon.tick_deadline -= request_s
+                spent[0] += request_s
             return inner(method, url, headers, body)
         self.daemon.transport = transport
         worst, stored = 0.0, {"plain": 0, "waited": 0}
@@ -12764,8 +12804,12 @@ class BrokerBase(Base):
             execed.append((path, argv))
             raise SystemExit(0)
 
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the create hand-off execs with its own environment (broker_create_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
@@ -13591,8 +13635,12 @@ class BrokerMergeGuardTest(BrokerBase):
             execed.append((path, argv))
             raise SystemExit(0)
 
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the create hand-off execs with its own environment (broker_create_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 code = gg.cmd_gh(args)
             except SystemExit:
@@ -13684,7 +13732,10 @@ class BrokerMergeGuardTest(BrokerBase):
                 self.assertIsNone(code)
                 self.assertEqual(path, str(self.guard))
                 self.assertEqual(passed, args)
-                self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                # The guard's directory leads the PATH the hand-off execs with (glaeda#2376: execve, so this
+                # process's own PATH is left as it was).
+                self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(self.guard.parent))
+                self.assertNotEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.guard.parent))
 
     def test_a_comment_in_combined_short_flags_is_a_create(self) -> None:
         # `-dc x` is --delete-branch then --comment x; `-cx` is --comment x: both close with a comment, which creates.
@@ -14854,8 +14905,12 @@ class BrokerQuotaGuardTest(BrokerBase):
         for name in (gg.BROKER_MARK, gg.BROKER_DEPTH):
             if name not in self.kept:
                 os.environ.pop(name, None)
-        with mock.patch.object(os, "execv", execv), contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
+        def execve(path: str, argv: list[str], env: dict) -> None:
+            self.exec_env = env  # the guard hand-off execs with its own environment (broker_merge_handoff)
+            execv(path, argv)
+
+        with mock.patch.object(os, "execv", execv), mock.patch.object(os, "execve", execve), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with contextlib.suppress(SystemExit):
                 gg.cmd_gh(list(args if args is not None else self.READ))
         return (seen[0][0], seen[0][1][1:]) if seen else (None, None)
@@ -14869,10 +14924,11 @@ class BrokerQuotaGuardTest(BrokerBase):
         self.assertEqual(path, str(guard), "the guard runs first, as it would for a plain `gh`")
         self.assertEqual(passed, ["pr", "edit", "2358", "-R", "o/r", "--body-file", "-"],
                          "the line it is handed is the line that was typed")
-        self.assertEqual(os.environ.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
+        self.assertEqual(self.exec_env.get("GLAEDA_GH_QUOTA_HOP"), str(os.getpid()),
                          "the pass back here knows it has been round")
-        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(guard.parent),
+        self.assertEqual(self.exec_env["PATH"].split(os.pathsep)[0], str(guard.parent),
                          "led by the guard's own directory, so it finds the gh after it as usual")
+        self.assertIsNone(os.environ.get("GLAEDA_GH_QUOTA_HOP"), "and this process keeps its own environment")
 
     def test_a_read_the_guard_has_already_judged_is_not_sent_round_again(self) -> None:
         """One hop, not a loop: the guard exports GH_QUOTA_CHECKED, and this hand-off's own mark carries the pid in
@@ -19220,12 +19276,12 @@ class SpendAlarmTest(AlarmBase):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
         on = {"stale": True, "staleRestart": True}
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5,
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5, "landWait": True,
                                                         "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000,
                                                            "paceShare": 0.25}}))
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25,
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25, "landWait": True,
                                                         "consumerShare": {"fraction": 0.2, "minCalls": 100},
                                                         **on})
         # the stale alarm and its valve each turn off (alarms.stale was dropped by the parser, so it never could)
@@ -20236,7 +20292,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
     def test_a_queued_post_stamps_its_repository(self) -> None:
         no_guard(self)
         args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+                         head=None, base=None, title=None, reviewer=None, label=None, remove_label=None, event="comment")
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
@@ -20248,7 +20304,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
         nothing was wrong. The broker writes it with a token minted for the call."""
         no_guard(self)
         args = mock.Mock(kind="pr", target="O/R", body="why", body_file=None, wait=0, json=False,
-                         head="lane/x", base="main", title="a title", reviewer=None, event="comment")
+                         head="lane/x", base="main", title="a title", reviewer=None, label=None, remove_label=None, event="comment")
         ran: list[list[str]] = []
 
         def answer(argv, **_kw):
@@ -20269,7 +20325,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
     def test_a_write_the_broker_cannot_make_is_refused_with_its_body_and_the_command_for_it(self) -> None:
         no_guard(self)
         args = mock.Mock(kind="review", target="O/R#7", body="the review body", body_file=None, wait=0, json=False,
-                         head=None, base=None, title=None, reviewer=None, event="comment")
+                         head=None, base=None, title=None, reviewer=None, label=None, remove_label=None, event="comment")
         err = io.StringIO()
         with mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
                 mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no call for a review")), \
@@ -20299,7 +20355,7 @@ class BrokerAnswerCacheTest(CountingGhBase):
                 made = {"head": "lane/x", "base": "main", "title": "t"} if kind == "pr" else {
                     "head": None, "base": None, "title": None}
                 args = mock.Mock(kind=kind, target=target, body="hi", body_file=None, wait=0, json=False,
-                                 reviewer=None, event="comment", **made)
+                                 reviewer=None, label=None, remove_label=None, event="comment", **made)
                 err = io.StringIO()
                 with mock.patch.object(gg, "UPSTREAM_CONFIG", config), mock.patch("os.access", return_value=False), \
                         contextlib.redirect_stderr(err):
@@ -20843,7 +20899,8 @@ class RunnersTest(BrokerBase):
             self.assertEqual(gg.cmd_runners("o", None, True), 0)
         argv = ran.call_args[0][0]
         self.assertIn("orgs/o/actions/runners?per_page=100", argv)
-        self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        self.assertEqual(argv[:len(gg.self_argv())], gg.self_argv(), "this file, run again through its loader")
+        self.assertEqual(argv[len(gg.self_argv()):][:2], ["gh", "api"], "read through this broker, so the cache shares it")
         # The daemon's own reads carry the internal mark, so they keep this route instead of being handed to the
         # host's quota guard; a fake answer that does not take env= is no longer this caller.
         self.assertEqual(ran.call_args.kwargs["env"][gg.GLAEDA_INTERNAL], "1")
@@ -21509,7 +21566,7 @@ class LandSnapshotTest(Base):
                 {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
         self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None, *, dirty=None: None,
-                                          reap=lambda: None,
+                                          reap=lambda: None, refill=lambda now=None: None,
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
 
@@ -36738,7 +36795,10 @@ class QueuedNeverDoneTest(unittest.TestCase):
         whole, _ = self.head(13438, ["size"], ["tests"], 60)
         gg.write_json(gg.cache_dir() / gg.file_name(key),
                       {"key": key, "fetchedAt": self.now, "dataAt": self.now, "data": whole, "error": None})
-        self.assertEqual(gg.wait_step(req, self.now, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
+        # The whole read is a change, and --timeout is "no change for S": this step moves the deadline on and
+        # keeps waiting; once the read has stood still for the whole --timeout, it times out.
+        self.assertIsNone(gg.wait_step(req, self.now, lambda repo, paths: {}))
+        self.assertEqual(gg.wait_step(req, self.now + 61, lambda repo, paths: {})[0], gg.EXIT_TIMEOUT)
 
     def test_hq13397_runs_queued_with_no_check_runs_hold_the_wait(self) -> None:
         """claude-sr2-coord-old: `wait pr manaflow-ai/cmuxterm-hq#13397 --until done --sha a6534f4d` said success twice
@@ -38379,7 +38439,7 @@ class SearchTest(Base):
 
     def test_search_reads_graphql_through_this_broker_and_no_rest(self) -> None:
         text, argv = self.search("prs", ["flaky"], ["o/r"], "all", None, 20, False)
-        self.assertEqual(argv[2:5], ["gh", "api", "graphql"],
+        self.assertEqual(argv[len(gg.self_argv()):][:3], ["gh", "api", "graphql"],
                          "read through this broker, so the cache shares it with every session on the host")
         self.assertNotIn("search/issues", " ".join(argv), "never GitHub's REST search")
         query = next(a[len("query="):] for a in argv if a.startswith("query="))
@@ -39865,11 +39925,13 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
         read that blocks) and of `post` (a write on a public thread). Guessing for the caller would guess
         between reading and writing, so it refuses and names all three, each as a line that runs.
 
-        The vectors carry evidence for a read *and* for the write (`--body` is `post`'s, `--timeout` is
-        `wait`'s), which is what leaves the write in the running: with neither kind of evidence the write
-        could only refuse and the word routes to the read instead (the two tests below)."""
-        for argv in (["comment", "o/r#1", "--body", "hi", "--timeout", "60"],
-                     ["pr", "o/r", "--title", "T", "--timeout", "60"]):
+        The vectors carry evidence for a read *and* for the write (`--body` and `--title` are `post`'s,
+        `--contains` is `wait`'s), which is what leaves the write in the running: with neither kind of evidence
+        the write could only refuse and the word routes to the read instead (the two tests below). Not
+        `--timeout`: `post` takes it too (its write deadline), so `--body hi --timeout 60` fits `post` alone
+        and routes there."""
+        for argv in (["comment", "o/r#1", "--body", "hi", "--contains", "x"],
+                     ["pr", "o/r", "--title", "T", "--contains", "x"]):
             word = argv[0]
             fixed, refusal = gg.nesting_synonym(list(argv))
             self.assertEqual(fixed, argv, "argv is never half-rewritten when it refuses")
@@ -39908,7 +39970,7 @@ class ACommandWordAtTheWrongNestingLevelTest(unittest.TestCase):
     def test_the_refusal_is_the_whole_call_and_nothing_runs(self) -> None:
         """The exit code a usage error already has, and no request queued: an ambiguous write must not post."""
         with mock.patch.object(gg, "post_item", side_effect=AssertionError("must not post")):
-            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1", "--body", "hi", "--timeout", "60"]), 64)
+            self.assertEqual(gg.main(["comment", "manaflow-ai/cmux#1", "--body", "hi", "--contains", "x"]), 64)
         self.assertIn("not a command of its own", self.err.getvalue())
 
     def test_the_callers_own_flags_narrow_an_ambiguous_word_to_one_command(self) -> None:
@@ -40359,7 +40421,11 @@ class AWaitDeadlineUnderBothSpellingsTest(unittest.TestCase):
     def test_every_command_that_waits_answers_to_both_spellings(self) -> None:
         """The structural claim, so a command added later cannot take only one of them: the set of commands
         owning `--wait` is the set owning `--timeout`."""
-        self.assertEqual(gg.flag_commands("--wait"), gg.flag_commands("--timeout"))
+        # `log errors --timeout` is that command's whole-command budget (`--budget`, glaeda#2680): it bounds an
+        # answer, it waits for nothing to end, so it takes no `--wait`.
+        budgets = ["log errors"]
+        self.assertEqual(gg.flag_commands("--wait"), [c for c in gg.flag_commands("--timeout") if c not in budgets])
+        self.assertTrue(set(budgets) <= set(gg.flag_commands("--budget")), "each one is a budget, by its other name")
         self.assertIn("post", gg.flag_commands("--timeout"))  # the fixture: the command that was refused
 
     def test_a_timeout_on_a_command_that_spelled_it_wait_is_that_wait(self) -> None:
