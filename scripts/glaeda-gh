@@ -68,7 +68,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
                                                         (~/.config/glaeda/on-event.json), and what each one did
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
-    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
+    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA|HEAD] [--wait|--timeout S]
                    [--max S] [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
                                                         pinned merge) and tells the requester on a merge or a stop;
@@ -22212,6 +22212,35 @@ def land_pin_local_head(repo: str, git: Callable[[list[str]], str | None] | None
     return head if SHA40.fullmatch(head) else ""
 
 
+LAND_HEAD_WORD_AGE = 600.0
+
+
+def land_resolve_head_word(repo: str, number: int, key: str, pin: str | None,
+                           read: Callable[[list[str]], str | None] | None = None) -> str | None:
+    """`--sha HEAD` (any case) is the PR's current head, the pin glaeda-land's own stop notice tells agents to add
+    (forward_no_outcome: "--sha HEAD to pin it"); every other pin comes back as given. The head is the cache's when
+    it is a few minutes old and the PR is open (land_cached_head), else one read of the PR (`gh api`, the step
+    check_land_pin names). Prints one line saying what it pinned to. A head that cannot be read refuses the request
+    rather than queuing an unpinned land the caller asked to pin."""
+    if not pin or pin.strip().lower() != "head":
+        return pin
+    head = land_cached_head(key, LAND_HEAD_WORD_AGE)
+    if not SHA40.fullmatch(head):
+        def real(argv: list[str]) -> str | None:
+            try:
+                got = run_bounded(argv, 20)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return got.stdout.strip() if got.returncode == 0 else None
+        head = str((read or real)(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"]) or "").lower()
+    if not SHA40.fullmatch(head):
+        raise WatchError(f"--sha HEAD: cannot read the head of {repo}#{number}\n"
+                         f"next: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+                         f"then glaeda-gh land {repo}#{number} --sha THAT")
+    print(f"--sha HEAD: pinned to {head}", file=sys.stderr)
+    return head
+
+
 def check_land_pin_shape(pin: str | None) -> None:
     """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
     request this host can answer from its cache (land_draft_refusal) is answered after this and before
@@ -22402,6 +22431,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     try."""
     key, repo, number = land_key(target)
     after = land_after_in(repo, after)
+    pin = land_resolve_head_word(repo, number, key, pin)
     check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
