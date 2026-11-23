@@ -33514,6 +33514,7 @@ JOB_LOG_TMP_KEEP = 3600.0  # a writer's temporary file this old was left by a cr
 JOB_LOG_DONE = b"Cleaning up orphan processes"
 LOG_CONTROLLER_TIMEOUT = 8  # the controller's job-log read (it may read GitHub itself first)
 LOG_REST_TIMEOUT = 18  # one `gh api .../logs` read (a redirect to blob storage, which gh follows)
+LOG_ERRORS_BUDGET = 120  # `log errors`'s whole wall clock, run id or job (log_read_seconds)
 
 
 def job_log_path(repo: str, job: int) -> Path:
@@ -33589,15 +33590,34 @@ def kept_evict(root: Path, suffix: str, max_bytes: int, now: float | None = None
     return {"removed": removed, "bytes": total}
 
 
-def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, bytes]:
+def log_read_seconds(deadline: float | None, cap: float) -> float:
+    """How long one log read may take: CAP, or what is left of DEADLINE when that is less. 0.0 when the budget is
+    spent, which every caller reads as "do not make this call".
+
+    `log errors` had no whole-command bound, only a timeout per step, and a run id makes many steps: one doomed
+    job-log read for the number itself (8 s controller + 18 s REST, because a run id and a job id are the same
+    bare integer) and then one per failed job the run has, up to `--reads`. Measured 2026-11-23 on
+    manaflow-ai/cmux/44919951254: `timeout 180 glaeda-gh log errors` was killed with nothing printed (rc 124).
+    This command is the designated "why did this run fail" front door, so its never answering is why a red
+    triage falls back to `gh run view --log-failed | grep -i error` -- which on a Rust job returns passing
+    lines, acpmux's own test names holding the word "error"."""
+    if deadline is None:
+        return cap
+    return max(0.0, min(cap, deadline - time.monotonic()))
+
+
+def controller_job_log(ctl: "Controller", repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
     """(HTTP status, body) of the controller's GET /v1/github/job-log: 200 is a finished job's log; 0 when it did not
     answer. 404 (unknown job, or an older controller), 409 (still running), 410 (GitHub expired it) and 429 (its log
     reads are spent) carry no log."""
     headers = {"Authorization": f"Bearer {ctl.token}"} if ctl.token else {}
     url = f"{ctl.base}/v1/github/job-log?repo={urllib.parse.quote(repo, safe='/')}&id={int(job)}"
+    left = log_read_seconds(deadline, LOG_CONTROLLER_TIMEOUT)
+    if not left:  # the caller's budget is spent: a read that cannot finish is not started
+        return 0, b""
     try:
-        with hard_deadline(LOG_CONTROLLER_TIMEOUT + 1), \
-                OPENER.open(urllib.request.Request(url, headers=headers), timeout=LOG_CONTROLLER_TIMEOUT) as response:
+        with hard_deadline(left + 1), \
+                OPENER.open(urllib.request.Request(url, headers=headers), timeout=left) as response:
             return response.status, response.read(JOB_LOG_RAW_MAX + 1)
     except urllib.error.HTTPError as error:
         return error.code, b""
@@ -33605,7 +33625,7 @@ def controller_job_log(ctl: "Controller", repo: str, job: int) -> tuple[int, byt
         return 0, b""
 
 
-def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
+def rest_job_log(repo: str, job: int, deadline: float | None = None) -> tuple[bool, bytes, str]:
     """One `gh api repos/REPO/actions/jobs/JOB/logs` through the PATH gh (so the quota guard and a lane's broker see
     it; gh follows the redirect to blob storage, which no quota counts): (ok, log bytes, why not)."""
     gh = find_gh()
@@ -33613,9 +33633,12 @@ def rest_job_log(repo: str, job: int) -> tuple[bool, bytes, str]:
         return False, b"", "gh not found"
     route = f"repos/{repo}/actions/jobs/{int(job)}/logs"
     for flags in (["--allow-escape-sequences"], []):  # newer gh strips a log's colour codes without it; older lacks it
+        left = log_read_seconds(deadline, LOG_REST_TIMEOUT)
+        if not left:
+            return False, b"", "the command's time budget was spent"
         try:
             done = subprocess.run([gh, "api", *flags, route], stdin=subprocess.DEVNULL, capture_output=True,
-                                  timeout=LOG_REST_TIMEOUT, check=False)
+                                  timeout=left, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             return False, b"", f"gh api: {type(error).__name__}"
         if done.returncode == 0:
@@ -33630,10 +33653,12 @@ def job_log_finished(text: bytes) -> bool:
     return JOB_LOG_DONE in text[-4096:]
 
 
-def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log
-                 ) -> tuple[bytes | None, str, str]:
+def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | None = rest_job_log,
+                 deadline: float | None = None) -> tuple[bytes | None, str, str]:
     """(log, source, why not) for JOB: kept here, else from the build controller, else one REST read. rest=None
-    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota."""
+    reads no REST: the commands that scan many jobs (log search, log flaky) never spend the user quota.
+    DEADLINE is the caller's whole budget (monotonic): each read takes the smaller of its own timeout and what is
+    left of it, so a command that makes several reads cannot outlive the bound it published."""
     repo = repo.lower()
     text = job_log_get(repo, job)
     if text is not None:
@@ -33641,7 +33666,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     ctl = Controller.from_env() if controller == "env" else controller
     status = 0
     if ctl is not None:
-        status, body = controller_job_log(ctl, repo, job)
+        status, body = controller_job_log(ctl, repo, job, deadline)
         if status == 200 and len(body) <= JOB_LOG_RAW_MAX:
             with contextlib.suppress(OSError):
                 job_log_put(repo, job, body)  # the controller serves only a finished job's log
@@ -33653,7 +33678,7 @@ def job_log_read(repo: str, job: int, controller: Any = "env", rest: Callable | 
     if rest is None:
         return None, "", {0: "controller down", 409: "still running", 429: "controller log reads spent"}.get(
             status, "not kept by the controller")
-    ok, body, why = rest(repo, job)
+    ok, body, why = rest(repo, job, deadline)
     if not ok:
         return None, "", why
     if job_log_finished(body):
@@ -34131,14 +34156,21 @@ def run_id_hint(repo: str, number: int, jobs: list[dict] | None, cut: bool | str
 
 
 def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, controller: Any = "env",
-                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS) -> int:
+                   rest: Callable = rest_job_log, reads: int = LOG_ERRORS_RUN_READS,
+                   budget: float = LOG_ERRORS_BUDGET) -> int:
     """One job's error-level lines by step, not its whole log. A run id here reads the newest READS failed jobs of
     that run, because the two kinds of id are indistinguishable (run_jobs_typed_as_a_job). Exit 0 with a log read
-    (a log with no error line prints a count of 0), 1 with none."""
+    (a log with no error line prints a count of 0), 1 with none.
+
+    BUDGET is the whole command's wall clock (`--timeout`): every read inside it takes the smaller of its own
+    timeout and what is left (log_read_seconds), and a job the budget cannot reach is named unread with its own
+    command, like one past `--reads`. Without it the per-step timeouts added up unannounced and the command could
+    answer nothing at all."""
     if not re.fullmatch(rf"{NAME}/{NAME}", repo) or job <= 0:
         raise WatchError("log errors takes OWNER/REPO and a job id (the number after /job/ in the job's URL)")
     repo = repo.lower()
-    text, source, why = job_log_read(repo, job, controller, rest)
+    deadline = time.monotonic() + budget if budget > 0 else None
+    text, source, why = job_log_read(repo, job, controller, rest, deadline)
     if text is not None:
         return log_errors_emit(repo, [(job, text, source)], limit, as_json, None)
     try:
@@ -34162,11 +34194,22 @@ def cmd_log_errors(repo: str, job: int, limit: int = 40, as_json: bool = False, 
                 f"{'its' if not over else f'the newest {len(take)} of its'} {len(failed)} failed job(s)")
     read, unread = [], []
     for r in take:
-        one, src, reason = job_log_read(repo, int(r["id"]), controller, rest)
+        jid = int(r["id"])
+        if not log_read_seconds(deadline, 1):
+            # The budget is spent. A kept copy costs nothing, so it is still served; anything that would need a
+            # read is named unread, with its own command, rather than making a call that cannot finish.
+            kept = job_log_get(repo, jid)
+            if kept is None:
+                unread.append({"job": jid, "why": f"unread: the command's {budget:g} s budget was spent "
+                                                  f"(`glaeda-gh log errors {repo} {jid}` reads this one)"})
+                continue
+            read.append((jid, kept, "cache"))
+            continue
+        one, src, reason = job_log_read(repo, jid, controller, rest, deadline)
         if one is None:
-            unread.append({"job": int(r["id"]), "why": reason})
+            unread.append({"job": jid, "why": reason})
         else:
-            read.append((int(r["id"]), one, src))
+            read.append((jid, one, src))
     if over:
         # Bounded like `run_id_hint`'s own offer: a next step has to be readable to be a next step (95
         # commands, 3001 characters measured on a 100-failed-job run).
@@ -34832,6 +34875,9 @@ def parser() -> argparse.ArgumentParser:
     le.add_argument("--reads", type=reads_cap, default=LOG_ERRORS_RUN_READS, metavar="N",
                     help="given a run id, how many of its failed jobs to read, newest first (default "
                          "%(default)s; the rest are named with their own commands)")
+    le.add_argument("--timeout", "--budget", dest="budget", type=seconds, default=LOG_ERRORS_BUDGET, metavar="S",
+                    help="the whole command's wall clock (default %(default)s); a failed job it cannot reach in "
+                         "time is named with its own command, never waited for silently")
     le.add_argument("--json", action="store_true")
     for kind, text in (("search", "which recent jobs printed PATTERN (controller job history; logs kept here or "
                                   "on the controller, never REST)"),
@@ -35935,7 +35981,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             if args.kind == "errors":
-                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads)
+                return cmd_log_errors(args.repo, args.job, args.max, args.json, reads=args.reads,
+                                      budget=args.budget)
             if args.kind == "search":
                 return cmd_log_search(args.repo, args.pattern, args.since, args.job, args.workflow, args.seg,
                                       args.conclusion, args.reads, args.limit, args.json)
