@@ -603,6 +603,10 @@ RESTART_COOLDOWN = 180  # `glaeda-gh restart` within this long of the last one w
 RESTART_SETTLE = 45  # how long `restart` waits for a new daemon's heartbeat
 BOOTSTRAP_RETRY = 10  # launchctl bootstrap is retried this long after bootout
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
+# What this daemon runs, in every heartbeat: the sha256 of the script's bytes when serve started (the bytes
+# script_changed compares) and when. leo-workspace tools/fast-patch reads it to know a swapped-in release is the one
+# running, instead of inferring it from a start after the swap; `glaeda-gh status` readers can name the build too.
+RUNNING_SCRIPT: dict = {}
 # A request's socket timeout bounds each read, not the request: a server that trickles bytes, or a tick
 # of many slow reads, kept one 10-20 daemon silent for 20 minutes. So every request also has a hard
 # wall-clock deadline, a tick stops starting requests after TICK_BUDGET (the rest go first next tick),
@@ -1245,6 +1249,11 @@ PULL_REUSE_MAX = 300
 # required check passing before its workflow ends) shows within PR_REST_FULL_EVERY rather than the next cycle. Only
 # the REST route: GraphQL's rollup is one read already.
 PR_REST_FULL_EVERY = 300
+# A full REST read whose head's check suites are unchanged (a 304, or the same slimmed answer: the gate's test) takes
+# the check-run pages its last read kept, with no request, while those were read within PR_REST_FULL_EVERY: the gate's
+# own bound. Never for `--jobs`, which the gate never takes either. gcp-agent-lane-11's direct ledger, 2026-11-22 14:36-19:52Z: glaeda-upstream asked check-suites 325 and
+# check-runs 291 times in 4 h, mostly the full read that follows a gate broken by the issue (a comment) on an
+# unchanged head. The check-runs part keeps "at", when it was last read or confirmed.
 # A failed head with every check finished (settled) passes the same gate for this long after its last full read: its
 # check runs can change only through a suite (a rerun queues the suite again, a new push is a new head the pull and
 # issue show), so the gate's three reads see every change a full read would. Under a backlog no read came within
@@ -1329,6 +1338,15 @@ SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cos
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
 checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
   detailsUrl databaseId startedAt completedAt } } } } }"""
+# Whether each suite ran anything in any attempt, asked of an App before SUITE_RUNS. Most suites whose newest attempt
+# ran nothing never ran anything (another App's suite that is requested and never run), and SUITE_RUNS's `app { slug }`
+# on a suite whose App another organization owns is that organization's IP allow list's FORBIDDEN: the suite was
+# node-benched (bench_nodes) and read on the login. The broker host, 2026-11-22 23:39Z-00:46Z: 165 login-fallback
+# lines, every one a last-real-attempt read, 89 "refused" and 55 more of those benched suites (then misnamed
+# "pool-resting"). This query asks no App node, so it stays on the App; a suite with no check run in any attempt is
+# answered here, empty, and only a suite that ran something is read with SUITE_RUNS (it needs the slug).
+SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
+... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
@@ -1622,7 +1640,25 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
             "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
                               "counted": r["counted"], "waiters": r["waiters"]} for r in by_caller(rest, "counted")],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
-                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")]}
+                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")],
+            "graphqlLoginWhy": login_why_rows(gql, top)}
+
+
+def login_why_rows(gql: list[dict], top: int = SPEND_TOP) -> list[dict]:
+    """The login's GraphQL points by why no App took them (note_login_fallback's cause) and query, most first: the
+    detector for a daemon whose GraphQL stays on the login while its Apps have their hour. Every point graphql()
+    books is the login's (an App's answer is never in spend), so these rows sum to graphql.points less rows an older
+    build wrote without a cause. Before, spendBy said which query spent the login (graphqlByQuery) but not why: the
+    login carried 26% of an hour's GraphQL with the Apps at 11.4k-12.5k of 12.5k left, the daemons on three hosts
+    spending 173-274 points/h of it, and nothing on the census could tell an owner no App serves from a resting pool."""
+    merged: dict[tuple, dict] = {}
+    for r in gql:
+        if not r.get("why"):
+            continue
+        row = merged.setdefault((r["why"], r["name"]), {"why": r["why"], "query": r["name"], "queries": 0, "points": 0})
+        row["queries"] += r["requests"]
+        row["points"] += r["points"]
+    return sorted(merged.values(), key=lambda r: (-r["points"], -r["queries"], r["why"], r["query"]))[:top]
 
 
 def waiters_text(r: dict, field: str) -> str:
@@ -2897,10 +2933,24 @@ def gh_graphql_read(args: list[str]) -> bool:
         return False
 
 
+# A lane VM holds no GitHub login (lane_vm_gh: its gh is the lane-gh broker's credential chain), so its `gh` GraphQL
+# reads spend no login hour of this host's: the broker asks them on its read Apps first, behind its own per-VM read
+# admission and per-identity connection caps. The two slots of the login "default" (no hosts.yml here) were a queue
+# with nothing behind it: gcp-agent-lane-1, 2026-11-22 16:19:42Z, `gh pr view 49882 --json ...` waited exactly
+# GRAPHQL_SLOT_WAIT (120 s) for a slot before it reached lane-gh at 16:21:42Z, and overflow.log held 3,331 such
+# 120 s waits (56 in the hour to 16:25Z), every lane's land-judge read among them; with broker reads taking 15-25 s
+# each under load, two slots carried about one read every 10 s for the whole VM. land-judge's explain then ran 9.5
+# min against glaeda land's 300 s kill and every judgment read "unreadable". So on a lane VM a CLI read takes no slot;
+# the daemon's own reads keep theirs (Daemon.request).
+
+
 def gh_graphql_slot_for(args: list[str]) -> Any:
     """For the broker: a held slot's open file when `gh ARGS` is a GraphQL read that needs one, else None (not a
-    GraphQL read, a gh call nested under a slot its parent holds, or GRAPHQL_SLOT_WAIT passed: logged)."""
+    GraphQL read, a lane VM's read (no login here: the lane-gh broker paces it), a gh call nested under a slot its
+    parent holds, or GRAPHQL_SLOT_WAIT passed: logged)."""
     if not gh_graphql_read(args):
+        return None
+    if lane_vm_gh() is not None:
         return None
     holder = os.environ.get(GRAPHQL_SLOT_ENV, "")
     if holder.isdigit() and int(holder) > 1:
@@ -3355,7 +3405,7 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
         return None
     found: list[tuple[str, str]] = []
     for e in errors:
-        if not isinstance(e, dict) or protection_forbidden(e):
+        if not isinstance(e, dict) or protection_forbidden(e) or foreign_app_forbidden(owner, e):
             continue
         text = gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""), limit=None)
         if not app_graphql_refused(text):
@@ -3366,6 +3416,61 @@ def foreign_ip_refusal(owner: str, body: dict | None, errors: Any) -> list[tuple
             return None
         found.append((node, ".".join(str(p) for p in e["path"])))
     return found or None
+
+
+# One field of an answer is not the answer. The broker host, 2026-11-22 18Z to 2026-11-23 02Z: 1,300
+# app-pool-node-refused lines, every one at suiteRuns.N.app, every one the `cursor` organization's IP allow list: an
+# App token may not read the Cursor App's own node from this address, while the suite itself (its conclusion, its
+# workflow run, its check runs) came back whole beside that error. Each one benched the suite node in every pool, so
+# that read and every read of that suite for the next hour went on the login (867 `refused` and 898 `pool-resting`
+# login-fallback lines in those 9 hours; Leo: "we have ten App pools for exactly this"). Such an error is now part of
+# the answer: the App's 200 is kept, no node or scope is benched, and the field reads as unread (unread_foreign_apps),
+# never as GitHub's documented null app.
+APP_FIELD = "app"
+
+
+def foreign_app_forbidden(owner: str, error: Any) -> bool:
+    """Whether one GraphQL error of a 200 App answer is another organization's IP allow list refusing an `app` field
+    only (a check suite's App node): the rest of the answer stands."""
+    if not isinstance(error, dict) or str(error.get("type") or "") != "FORBIDDEN":
+        return False
+    path = error.get("path")
+    if not (isinstance(path, list) and len(path) > 1 and path[-1] == APP_FIELD):
+        return False
+    org = APP_POOL_IP_ALLOW_LIST.search(str(error.get("message") or ""))
+    return bool(org) and org.group(1).lower() != str(owner or "").lower()
+
+
+def unread_foreign_apps(owner: str, doc: Any) -> list[str]:
+    """Take DOC's foreign_app_forbidden errors out of it, in place, and return their paths ("suiteRuns.3.app"). Each
+    path's `app` key is removed from its object, which is marked appUnread: a reader sees an App it could not read,
+    not a null one (run_identity's appNull) and not an unread suite (suite_runs reads a suite by its errors)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("errors"), list):
+        return []
+    kept, paths = [], []
+    for e in doc["errors"]:
+        if not foreign_app_forbidden(owner, e):
+            kept.append(e)
+            continue
+        paths.append(".".join(str(p) for p in e["path"]))
+        node: Any = doc.get("data")
+        for step in e["path"][:-1]:
+            if isinstance(node, dict) and isinstance(step, str):
+                node = node.get(step)
+            elif isinstance(node, list) and type(step) is int and 0 <= step < len(node):
+                node = node[step]
+            else:
+                node = None
+                break
+        if isinstance(node, dict) and node.get(APP_FIELD) is None:
+            node.pop(APP_FIELD, None)
+            node["appUnread"] = True
+    if paths:
+        if kept:
+            doc["errors"] = kept
+        else:
+            doc.pop("errors", None)
+    return paths
 
 
 def entry_nodes(key: str) -> list[str]:
@@ -3593,24 +3698,30 @@ class AppPool:
         owner = next(iter(owners))
         return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
 
-    def passed_over(self, owner: str, scope: str) -> tuple[str, dict[str, str]]:
+    def passed_over(self, owner: str, scope: str, body: dict | None = None) -> tuple[str, dict[str, str]]:
         """Why no pool of the chain answers OWNER's SCOPE after pick() found none, without a mint or a request:
         (cause, {role: its own}). A role is "no-token" (this host holds none of it), "route-benched" (it refused
-        SCOPE lately, covers) or "pool-resting" (rate limited, under its floor, or a failed mint). The cause is
-        "no-token" when no role holds one, else "pool-resting" when any holder rests, else "route-benched"."""
+        SCOPE lately, covers), "node-benched" (it refused a node the GraphQL BODY asks, bench_nodes) or
+        "pool-resting" (rate limited, under its floor, or a failed mint). The cause is "no-token" when no role holds
+        one, else "pool-resting" when any holder rests, else "node-benched" when any holder benched a node, else
+        "route-benched". A node bench used to read as "pool-resting": the broker host, 2026-11-22 23:39Z-00:46Z, 55
+        last-real-attempt reads "pool-resting" on the login while every App of the chain had its points."""
         now = self.clock()
         each: dict[str, str] = {}
+        nodes = list(graphql_body_nodes(body).values()) if body is not None else []
         for pool in [self, *self.spares]:
             if not pool.covers(scope):
                 each[pool.role] = "route-benched"
             elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_cached():
                 each[pool.role] = "no-token"
+            elif nodes and pool.nodes_benched(nodes):
+                each[pool.role] = "node-benched"
             else:
                 each[pool.role] = "pool-resting"
         held = [c for c in each.values() if c != "no-token"]
         if not held:
             return "no-token", each
-        return ("pool-resting" if "pool-resting" in held else "route-benched"), each
+        return next(c for c in ("pool-resting", "node-benched", "route-benched") if c in held), each
 
     def ready_cached(self) -> bool:
         """ready_fn() (held_here: directory scans and token file reads) once per APP_POOL_TTL, for passed_over,
@@ -4599,6 +4710,12 @@ def suites_path(root: str, sha: str) -> str:
     return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
 
 
+def check_runs_path(root: str, sha: str) -> str:
+    """A head's first check-run page (filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes
+    both alike); page N is this with &page=N."""
+    return f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
+
+
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
     """A head with a check run not completed, or a status pending, by its REST reads (rest_head)."""
     return (any(str(c.get("status") or "").lower() != "completed" for c in checks.get("check_runs") or [])
@@ -4936,6 +5053,21 @@ def parse_pr(node: dict) -> dict:
         else:
             superseded.append(check)
     checks = [check for _, check in latest.values()]
+    # A concurrency group shared across workflows cancels one workflow's job for another's: manaflow-ai/cmux#50693 at
+    # f4620c79 (2026-11-22), "pr-red-checks / comment" ran in three workflow runs on the head; the "CI" one (run
+    # 45046534087) was cancelled at 16:56:14Z and another workflow's started 16:56:32Z and passed, yet status counted
+    # the cancel as failed and `wait pr --sha` exited 1. A cancelled check run is superseded by a same-named one of
+    # another workflow that started at or after it and passed; a real failure, or a cancel with no such twin, counts.
+    passed_at: dict[str, list[str]] = {}
+    for c in checks:
+        if c.get("workflow") and c.get("startedAt") and (c.get("conclusion") or "").upper() in {"SUCCESS", "NEUTRAL"}:
+            passed_at.setdefault(str(c.get("name")), []).append(str(c["startedAt"]))
+    def cancelled_by_twin(c: dict) -> bool:
+        started = c.get("startedAt")
+        return (bool(c.get("workflow") and started) and (c.get("conclusion") or "").upper() == "CANCELLED"
+                and any(at >= str(started) for at in passed_at.get(str(c.get("name")), [])))
+    superseded.extend(c for c in checks if cancelled_by_twin(c))
+    checks = [c for c in checks if not cancelled_by_twin(c)]
     # only the ones that would have counted against the PR are worth keeping. One that ran nothing (GitHub
     # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
@@ -5541,6 +5673,28 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
 
 
 class Daemon:
+    # Which credential this thread's last request() used, and its App pool: per thread, never one field on the daemon.
+    # graphql() reads them right after its request() returns, while the outbox, the content-pause ask and the land
+    # threads send their own requests on the same daemon (request's in_call comment: huge-blue 2026-11-22). A shared
+    # field let another thread's login request flip "app" to "login" in between, so an App's GraphQL answer was booked
+    # as login spend (gql_log, note_spend "graphql", spend.json's daemon:glaeda-gh) and its rateLimit as the login's
+    # budget. Leo, 2026-11-22: "this is clearly not measured properly".
+    @property
+    def last_request_source(self) -> str:
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "source", "login")
+
+    @last_request_source.setter
+    def last_request_source(self, value: str) -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).source = value
+
+    @property
+    def last_app_pool(self) -> "AppPool | None":
+        return getattr(self.__dict__.setdefault("_request_local", threading.local()), "pool", None)
+
+    @last_app_pool.setter
+    def last_app_pool(self, value: "AppPool | None") -> None:
+        self.__dict__.setdefault("_request_local", threading.local()).pool = value
+
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
         # The clock comes first: the pool built below reads it (restore_bench), and a clock set afterwards
@@ -5549,6 +5703,7 @@ class Daemon:
         self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
+        self.login_cause = ""  # why the most recent request went on the login (note_login_fallback's cause), or ""
         # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
         # every read on the login.
         chain = app_pool_chain(APP_POOL_SPARES)
@@ -5978,11 +6133,14 @@ class Daemon:
              **{k: cause[k] for k in ("verdict", "reads", "top", "slotS", "githubS", "inCall", "lastCall", "deferral",
                                       "text")}})
 
-    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0) -> None:
+    def note_spend(self, bucket: str, name: str, counted: int, points: int = 0, why: str = "") -> None:
         """One request in the spend log: NAME is a REST route template or a GraphQL query name; COUNTED is 1 when
-        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged."""
+        it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged. WHY is a
+        login GraphQL query's note_login_fallback cause: the key's sixth field, so spendBy.graphqlLoginWhy can say
+        why the login's points went there and not to an App."""
         kind, repo, waiter = (tuple(self.caller) + ("", "", ""))[:3]
-        key = "\t".join((bucket, name, kind, repo) + ((waiter.replace("\t", " "),) if waiter else ()))
+        tail = (waiter.replace("\t", " "),) if waiter or why else ()
+        key = "\t".join((bucket, name, kind, repo) + tail + ((why,) if why else ()))
         row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
         row[0] += 1
         row[1] += counted
@@ -6002,9 +6160,9 @@ class Daemon:
                     mine[2] += points
         out = []
         for key, (requests, counted, points) in total.items():
-            bucket, name, kind, repo, waiter = (key.split("\t") + ["", "", "", "", ""])[:5]
+            bucket, name, kind, repo, waiter, why = (key.split("\t") + ["", "", "", "", "", ""])[:6]
             out.append({"bucket": bucket, "name": name, "kind": kind, "repo": repo, "waiter": waiter, "requests": requests,
-                        "counted": counted, "points": points})
+                        "counted": counted, "points": points, **({"why": why} if why else {})})
         return out
 
     def spend_by(self, seconds: float = 3600.0) -> dict:
@@ -6895,6 +7053,7 @@ class Daemon:
         logged: a write is the login's by design) and AppPool.passed_over's. A write logs nothing."""
         query = str(body.get("query") or "") if isinstance(body, dict) else ""
         if not (method == "GET" or (method == "POST" and path == "/graphql" and not re.match(r"\s*mutation\b", query))):
+            self.login_cause = "write"  # the login's by design: logged nothing, booked as such
             return
         pool, pools = self.app_pool, None
         if free:
@@ -6908,9 +7067,10 @@ class Daemon:
         elif owner is None:
             cause = pool.owner_why(method, path, body)[1] or "other"
         else:
-            cause, pools = pool.passed_over(owner, scope)
+            cause, pools = pool.passed_over(owner, scope, body if path == "/graphql" else None)
         if cause == "write":
             return
+        self.login_cause = cause  # graphql() books the login's points under it (spendBy.graphqlLoginWhy)
         kind = (tuple(self.caller) + ("",))[0]
         log({"event": "login-fallback", "kind": kind, "cause": cause, "route": route_of(method, path),
              **({"query": self.gql_reason} if path == "/graphql" and self.gql_reason else {}),
@@ -6926,6 +7086,7 @@ class Daemon:
         free: /rate_limit, which counts against no primary limit. Counting it as a REST request
         would overstate the spend of the very call that reads the spend."""
         self.last_request_source = "login"
+        self.login_cause = ""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
         self.land_refill()  # between two of the read phase's requests: a freed land worker takes its next row
@@ -6973,6 +7134,12 @@ class Daemon:
                 doc = json.loads(raw) if raw else None
             except ValueError:
                 doc = None
+            # another organization's IP allow list on a check suite's `app` field only: the rest of the answer is
+            # the App's, and those fields read as unread (unread_foreign_apps), never the login's to read again
+            unread_apps = unread_foreign_apps(owner, doc) if status == 200 and graphql_body else []
+            if unread_apps:
+                log({"event": "app-pool-app-unread", "role": pool.role, "owner": owner, "route": route,
+                     "scope": scope, "paths": unread_apps[:5], "count": len(unread_apps)})
             if isinstance(doc, dict):
                 errors = doc.get("errors")
                 error_text = " ".join(gh_said(str(e.get("type") or "") + " " + str(e.get("message") or ""),
@@ -8975,7 +9142,7 @@ class Daemon:
         self.fed_repos = {r: t for r, t in self.fed_repos.items() if self.now - t < FED_REPO_KEEP}
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
-        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
+        status = {**RUNNING_SCRIPT, "pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
                   "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   # `fedRepos` and `okAt` are Daemon.fed's own two inputs, published so a client can tell whether a
@@ -9075,6 +9242,10 @@ class Daemon:
         daemon stored over the last READ_PROGRESS_WINDOW, so a slower GitHub narrows the window instead of leaving
         every waited PR older than STALE_DATA_AFTER; at least LAND_WATCH_FLOOR."""
         reads = sum(1 for t in self.read_done.get("pr", []) if self.now - t < READ_PROGRESS_WINDOW)
+        started = getattr(self, "started_tick", None)
+        up = None if started is None else self.now - started
+        if up is not None and 0 < up < READ_PROGRESS_WINDOW:  # a daemon just started has read for up s, not the window
+            reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
     def land_tick(self) -> None:
@@ -10024,7 +10195,7 @@ class Daemon:
                 self.last_app_pool.graphql_answered(rate if isinstance(rate, dict) else {}, points)
         else:
             self.gql_log.append((self.clock(), self.gql_reason, points))  # (gql_minute_points: one clock)
-            self.note_spend("graphql", self.gql_reason, 1, points)
+            self.note_spend("graphql", self.gql_reason, 1, points, why=self.login_cause or "unlogged")
         if status != 200 or not isinstance(doc, dict):
             return None, f"graphql: HTTP {status}"
         if rate and self.last_request_source != "app":
@@ -10618,11 +10789,11 @@ class Daemon:
         pool = self.app_pool
         benched = [s for s in suites if pool is not None and pool.chain_benched([f"id:{s}"])]
         held = frozenset(benched)
-        suites = [s for s in suites if s not in held] + benched
+        out: dict[str, list[dict] | str] = self.suites_never_ran([s for s in suites if s not in held], route)
+        suites = [s for s in suites if s not in held and s not in out] + benched
         starts = (list(range(0, len(suites) - len(benched), SUITE_RUNS_BATCH))
                   + list(range(len(suites) - len(benched), len(suites), SUITE_RUNS_BATCH)))
         ends = starts[1:] + [len(suites)]
-        out: dict[str, list[dict] | str] = {}
         # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
         # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
         for start, end in zip(starts, ends):
@@ -10663,11 +10834,47 @@ class Daemon:
                 if (runs.get("pageInfo") or {}).get("hasNextPage"):
                     out[suite_id] = "graphql: last real attempt: more than 100 check runs in one suite"
                     continue
-                context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
+                # an App another organization's IP allow list kept from the App token (unread_foreign_apps) is unread,
+                # not GitHub's null app: the context has no `app` (run_identity names no app and no appNull)
+                context = {"conclusion": suite.get("conclusion"),
+                           **({} if suite.get("appUnread") else {"app": suite.get("app")}),
                            "workflowRun": suite.get("workflowRun")}
                 out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
                                  for run in nodes]
         return out, None
+
+    def suites_never_ran(self, suites: list[str], route: "list[str] | None") -> dict[str, list]:
+        """{suite id: []} for each of SUITES an App says ran no check run in any attempt (SUITE_COUNTS), so
+        suite_runs reads only the rest with SUITE_RUNS. Asked only when an App answers it: on the login it would be
+        one more query, not one fewer. A suite it could not read (an error at its path, a null node, another id, no
+        count) is left out, and SUITE_RUNS reads it as before: never greener."""
+        found: dict[str, list] = {}
+        for start in range(0, len(suites), SUITE_RUNS_BATCH):
+            chunk = suites[start:start + SUITE_RUNS_BATCH]
+            if not route or not self.app_answers(SUITE_COUNTS, {"suites": chunk}, route):
+                break
+            reason, self.gql_reason = self.gql_reason, "last-real-attempt-count"
+            try:
+                doc, _ = self.graphql(SUITE_COUNTS, {"suites": chunk}, route)
+            finally:
+                self.gql_reason = reason
+            nodes = ((doc or {}).get("data") or {}).get("suiteRuns")
+            if not isinstance(nodes, list) or len(nodes) != len(chunk):
+                continue
+            hit: set[int] = set()
+            for e in (doc or {}).get("errors") or []:
+                path = e.get("path") if isinstance(e, dict) else None
+                if isinstance(path, list) and len(path) > 1 and path[0] == "suiteRuns" and type(path[1]) is int:
+                    hit.add(path[1])
+                else:
+                    hit.update(range(len(chunk)))
+            for n, (suite_id, node) in enumerate(zip(chunk, nodes)):
+                runs = node.get("checkRuns") if isinstance(node, dict) else None
+                total = runs.get("totalCount") if isinstance(runs, dict) else None
+                if n not in hit and isinstance(node, dict) and node.get("id") == suite_id and total == 0 \
+                        and type(total) is int:
+                    found[suite_id] = []
+        return found
 
     def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
                    extra: list[tuple[str, list[dict]]] = ()) -> dict | str:
@@ -11008,6 +11215,11 @@ class Daemon:
             return new[path]["doc"]
         if state == "error":
             raise WatchError(doc)
+        if state == "fresh" and not etag and kept.get("etag") and "doc" in kept and slim(doc) == kept["doc"]:
+            # An answer with no ETag (broker_transport: the lane-gh broker answers none) that says what the kept one
+            # says keeps the kept ETag: a 304 on it vouches for that same slimmed answer. Storing None instead made
+            # the next read-token read of the path a counted 200 after every broker fallback.
+            state = "same"
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
         return new[path]["doc"]
 
@@ -11078,7 +11290,9 @@ class Daemon:
                 # (a settled failed head's too: PR_REST_SETTLED_FULL_EVERY gates it on its suites)
                 with contextlib.suppress(WatchError):
                     self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
-            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha,
+                                                               not e.get("jobs")
+                                                               and self.runs_unchanged(old, parts, root, sha))
             if reused and not head_pending(checks, statuses) and head_moved(old, parts, f"{root}/commits/{sha}/"):
                 # every check finished, and something changed since the kept pull: the merge state is final now
                 pull, _ = self.rest_pull(old, parts, root, number, reuse=False)
@@ -11360,15 +11574,45 @@ class Daemon:
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
 
-    def rest_head(self, old: dict, parts: dict, root: str, sha: str) -> tuple[dict, list, list, dict]:
+    def runs_unchanged(self, old: dict, parts: dict, root: str, sha: str) -> bool:
+        """Whether this read's check-suites answer for SHA (in PARTS) is the kept one (a 304, or the same slimmed
+        answer) and every check-run page the last read kept for SHA was read within PR_REST_FULL_EVERY: then rest_head
+        takes those pages and asks nothing. No request."""
+        suites = suites_path(root, sha)
+        now, was = parts.get(suites), old.get(suites)
+        if not isinstance(now, dict) or not isinstance(was, dict) or "doc" not in now or "doc" not in was:
+            return False
+        if now.get("unavailable") or now.get("gone") or now["doc"] != was["doc"]:
+            return False
+        path = check_runs_path(root, sha)
+        first = old.get(path)
+        at = first.get("at") if isinstance(first, dict) else None
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= self.now - at < PR_REST_FULL_EVERY \
+                or not isinstance(first.get("doc"), dict):
+            return False
+        pages = min(REST_CHECK_PAGES, -(-(first["doc"].get("total_count") or 0) // 100))
+        return all(isinstance(old.get(f"{path}&page={p}"), dict) and "doc" in old[f"{path}&page={p}"]
+                   for p in range(2, pages + 1))
+
+    def rest_head(self, old: dict, parts: dict, root: str, sha: str,
+                  runs_kept: bool = False) -> tuple[dict, list, list, dict]:
         """A commit's check runs (every attempt, up to REST_CHECK_PAGES pages), statuses, workflow runs and the
-        repository's workflow names, each a conditional read kept in `parts`. Raises WatchError."""
-        # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
-        path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
-        checks = self.head_part(old, parts, path, slim_check_runs)
+        repository's workflow names, each a conditional read kept in `parts`. RUNS_KEPT (runs_unchanged): the check
+        runs are the pages OLD keeps, not asked. Raises WatchError."""
+        path = check_runs_path(root, sha)
+        if runs_kept:
+            def run_page(page_path: str) -> dict:
+                parts[page_path] = old[page_path]
+                return old[page_path]["doc"]
+        else:
+            def run_page(page_path: str) -> dict:
+                return self.head_part(old, parts, page_path, slim_check_runs)
+        checks = run_page(path)
+        if not runs_kept:  # read (or confirmed by a 304) now: runs_unchanged's bound counts from here
+            parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}
         listed = list(checks.get("check_runs") or [])
         for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-            listed += self.head_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+            listed += run_page(f"{path}&page={page}").get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
         statuses: list[dict] = []
         total = 0
@@ -12542,9 +12786,63 @@ def land_overflow_readable(owners: Any, queue: Any = None) -> dict[str, str]:
     return out
 
 
-def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
-                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
-    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError."""
+# The redirect: an executor that forwards its own lands names where. 2026-11-22 17:16-17:32Z: the executor's land.json
+# named an executor of its own (a cutover to a new host), so its `land serve` answered not_executor to every host
+# forwarding to it; one forwarder's outbox grew 4 -> 12 requests over 18 min, each retry backing off, with one warn
+# notice that named the next host as "-o" (land_forward_name read ssh's first option as the host). Now `land serve`'s
+# not_executor answer carries "executor": the host it forwards to, and a forwarder whose command is `reach HOST ...`
+# or `ssh ... HOST ...` sends the same request there, once (LAND_REDIRECT_HOPS: the far host's answer is final, so
+# two hosts never pass a request back and forth, and a host never redirects to itself). Every redirect says so (a
+# land-forward-redirected notice naming both hosts and the land.json to fix); a refusal with no usable redirect is a
+# "fire" notice at once, since a config that points at a non-executor never heals by retrying.
+LAND_REDIRECT_HOPS = 1
+LAND_HOST_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+# ssh's options that take a value (ssh(1)): their value is never the host
+SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+class LandNotExecutor(WatchError):
+    """The far host's `land serve` refused: it forwards its own lands (to REDIRECT, a host name, when it said one)."""
+
+    def __init__(self, text: str, redirect: str = "") -> None:
+        super().__init__(text)
+        self.redirect = redirect
+
+
+def land_command_host(command: list[str]) -> int | None:
+    """The index of the host word in COMMAND (`reach HOST ...`, `ssh [OPTIONS] HOST ...`), or None for another
+    program."""
+    if not command or Path(command[0]).name not in ("reach", "ssh"):
+        return None
+    i = 1
+    while i < len(command):
+        word = command[i]
+        if word == "--":
+            return i + 1 if i + 1 < len(command) else None
+        if word.startswith("-") and len(word) > 1:
+            # -o VALUE, or -oVALUE / a cluster of flags with no value
+            if word[-1] in SSH_VALUE_FLAGS and len(word) == 2:
+                i += 2
+            else:
+                i += 1
+            continue
+        return i
+    return None
+
+
+def land_redirected(command: list[str], host: Any) -> list[str] | None:
+    """COMMAND aimed at HOST instead (the host word replaced), or None: no host word, HOST not a host name, the same
+    host, or this host itself."""
+    i = land_command_host(command)
+    if i is None or not isinstance(host, str) or not LAND_HOST_SHAPE.fullmatch(host):
+        return None
+    if host in (command[i], policy_host()):
+        return None
+    return [*command[:i], host, *command[i + 1:]]
+
+
+def land_forward_once(command: list[str], request: dict, deadline: float,
+                      run: Callable[..., subprocess.CompletedProcess] | None) -> dict:
     exe = program_path(command[0])
     argv = [exe, *command[1:]]
     try:
@@ -12562,9 +12860,36 @@ def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWA
     if not isinstance(answer, dict):
         tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
         raise WatchError(f"land executor: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
-    if not answer.get("ok") and answer.get("code") in ("not_executor", "bad_request"):
+    if not answer.get("ok") and answer.get("code") == "not_executor":
+        to = answer.get("executor") if isinstance(answer.get("executor"), str) else ""
+        raise LandNotExecutor(f"land executor: not_executor: {land_trim(answer.get('reason'), 200)}", to)
+    if not answer.get("ok") and answer.get("code") == "bad_request":
         raise WatchError(f"land executor: {answer.get('code')}: {land_trim(answer.get('reason'), 200)}")
     return answer
+
+
+def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
+                 run: Callable[..., subprocess.CompletedProcess] | None = None) -> dict:
+    """REQUEST sent to the executor (land_executor) as one JSON line; its answer, a dict with "ok", or WatchError.
+    An executor that forwards its own lands (not_executor) and names where gets the request sent there, at most
+    LAND_REDIRECT_HOPS times (LAND_REDIRECT_HOPS's comment); the answer then carries "redirectedTo", that host."""
+    hops: list[str] = []
+    while True:
+        try:
+            answer = land_forward_once(command, request, deadline, run)
+        except LandNotExecutor as error:
+            target = land_redirected(command, error.redirect) if len(hops) < LAND_REDIRECT_HOPS else None
+            if target is None or error.redirect in hops:
+                via = f" (redirected from {land_forward_name(command)} via {', '.join(hops)})" if hops else ""
+                raise LandNotExecutor(f"{error}{via}", error.redirect) from None
+            log({"event": "land-forward-redirect", "from": land_forward_name(command), "to": error.redirect,
+                 "op": request.get("op")})
+            hops.append(error.redirect)
+            command = target
+            continue
+        if hops:
+            answer["redirectedTo"] = hops[-1]
+        return answer
 
 
 # A forward is one small control-plane request, never a background client: the host's fan-out admission (the reach
@@ -12596,9 +12921,11 @@ def land_forward_pending(name: str, now: float) -> str:
 
 
 def land_forward_name(command: list[str]) -> str:
-    """The executor as said in messages: `reach HOST ...`'s HOST, else the program's words."""
-    if Path(command[0]).name in ("reach", "ssh") and len(command) > 1:
-        return command[1]
+    """The executor as said in messages: `reach HOST ...`'s or `ssh [OPTIONS] HOST ...`'s HOST, else the program's
+    words."""
+    i = land_command_host(command)
+    if i is not None:
+        return command[i]
     return " ".join(command)[:120]
 
 
@@ -12983,6 +13310,14 @@ LAND_NOTIFY_DEADLINE = 30.0
 # a later acpmux; huge-blue logged 1,893 against 976 land-pool lines.
 LAND_NOTIFY_TRIES = 3
 LAND_NOTIFY_RETRY_S = 5.0
+# What acpmux answered decides the resend. The broker host cmux-cp-1, 2026-11-22 18Z-2026-11-23 02Z: of 307
+# land-notify-failed, ~190 were "no_session: no session matches HOST/SESSION" (a lane that has ended: no resend
+# finds it, so it is told once and logged land-notify-no-session), and 78 were the mesh hub's "429
+# mesh.rate_limited" or "503 mesh.unavailable", resent 5 s apart into the same limit. A busy hub is now resent
+# LAND_NOTIFY_BUSY_RETRY_S, then twice that, apart.
+LAND_NOTIFY_GONE = re.compile(r"\bno_session:")
+LAND_NOTIFY_BUSY = re.compile(r"\b(?:429|503)\b|mesh\.rate_limited|mesh\.unavailable")
+LAND_NOTIFY_BUSY_RETRY_S = 30.0
 # A requester word that names nobody: `--notify none` (or a $ACPMUX_SESSION of "none") was kept as a session named
 # "none" and sent to HOST/none, which timed out (glaeda#2480, 2026-11-22 09:15Z).
 LAND_NO_REQUESTER = frozenset({"none", "null", "nobody", "-"})
@@ -13085,8 +13420,8 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
-                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", ""})
-LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke"})
+                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", ""})
+LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
 # (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
@@ -14803,6 +15138,8 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
+        self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
         self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
         self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
         self.overflow_thread: threading.Thread | None = None
@@ -15062,6 +15399,8 @@ class LandQueue:
             e.pop("laneHost", None)
         if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
             e["override"] = land_request_override(req)
+            # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
+            e["overrideAt"] = self.now if e["override"] else None
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -15294,6 +15633,18 @@ class LandQueue:
                                                    daemon=True)
             self.forward_thread.start()
 
+    def forward_redirected(self, name: str, to: str) -> None:
+        """A forward EXECUTOR NAME refused went on to TO (land_forward): said once per pair, so the land.json that
+        names NAME gets fixed."""
+        if (name, to) in self.forward_redirects:
+            return
+        self.forward_redirects.add((name, to))
+        with contextlib.suppress(Exception):
+            self.notice("land-forward-redirected", "warn", f"glaeda land on {policy_host()}: its executor {name} "
+                        f"forwards its lands to {to}, so this host's requests go to {to}; point "
+                        f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at {to}",
+                        {"executor": name, "to": to})
+
     def forward_batch(self) -> tuple[list[dict], list[tuple[str, Path]], list[tuple[str, int]]]:
         """(the requests to send, (id, file) of each from requests/, (key, gen) of each entry handed off): the entries
         open here first (none whose step still runs), then requests/ in order, at most LAND_FORWARD_BATCH."""
@@ -15448,6 +15799,9 @@ class LandQueue:
                                   LAND_FORWARD_DEADLINE)
             if not answer.get("ok"):
                 raise WatchError(f"land executor {name}: {land_trim(answer.get('reason') or answer.get('code'), 200)}")
+            if isinstance(answer.get("redirectedTo"), str):
+                self.forward_redirected(name, answer["redirectedTo"])
+                name = answer["redirectedTo"]
             accepted = {str(a) for a in answer.get("accepted") or []}
             refused = {str(r.get("id")): str(r.get("why") or "refused") for r in answer.get("refused") or []
                        if isinstance(r, dict) and r.get("id")}
@@ -15462,6 +15816,14 @@ class LandQueue:
                                                             "at": self.now, "pending": len(batch),
                                                             "retryAt": self.forward_after})
             log({"event": "land-forward-failed", "executor": name, "error": why, "pending": len(batch)})
+            if isinstance(error, LandNotExecutor) and not self.forward_misrouted:
+                # never heals by retrying: land.json names a host that executes nothing (LAND_REDIRECT_HOPS)
+                self.forward_misrouted = True
+                with contextlib.suppress(Exception):
+                    self.notice("land-forward-misrouted", "fire", f"glaeda land on {policy_host()}: its executor "
+                                f"{name} executes no lands ({why}); {len(batch)} request(s) wait here. Point "
+                                f"~/.config/glaeda/land.json \"executor\" on {policy_host()} at the live executor",
+                                {"executor": name, "error": why, "pending": len(batch)})
             if self.forward_fails == 1:
                 with contextlib.suppress(Exception):
                     self.notice("land-forward-failed", "warn", f"glaeda land could not hand {len(batch)} request(s) "
@@ -15471,6 +15833,7 @@ class LandQueue:
         with self.lock:
             self.sending = set()
             self.forward_fails = 0
+            self.forward_misrouted = False
             self.forward_after = float("-inf")
             for rid, path in files:
                 if rid in accepted:
@@ -16227,8 +16590,16 @@ class LandQueue:
             self.pool_size = float(self.workers())
             return
         size, ceiling = self.pool_size, float(land_pool_max())
+        # Every worker's judgment holds its PR waited, so the pool is demand on the read loop too: no more workers
+        # than the reads it keeps fresh (read_room, LAND_WATCH_SHARE). cmux-cp-1, 2026-11-22: 175 workers, 262 waited
+        # PRs, 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old.
+        room = self.read_room()
+        if room is not None:
+            ceiling = max(1.0, min(ceiling, float(room)))
         if self.quota_refused > last:
             size, why = max(1.0, size / 2), "a quota refusal"
+        elif size > ceiling and room is not None and int(ceiling) == int(room):
+            size, why = ceiling, "more workers than the read loop keeps fresh"
         elif len(self.jobs) >= int(size) and self.pass_gated:
             size, why = min(ceiling, size + max(1.0, size * LAND_POOL_GROW)), "full, with due rows waiting"
         else:
@@ -16329,7 +16700,7 @@ class LandQueue:
                             "busy": len(self.jobs), "loadPerCore": None if load is None else round(load, 2)}
             self.history(e, "due_late", waited=round(self.now - self.due_since(e)), why=why,
                          workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
-                         holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
+                         holders=",".join(self.holder(k) for k in list(self.jobs)[:8]))
             self.save(e)
         elif (dl := e.get("dueLate")) and dl.get("why") != why \
                 and self.now - float(dl.get("whyAt") or dl.get("at") or 0) >= LAND_LATE_WHY_EVERY:
@@ -16339,6 +16710,18 @@ class LandQueue:
             load = land_load_per_core()
             dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
+
+    def holder(self, key: str) -> str:
+        """One job holding a worker, for a due_late row: its PR, what it runs (judging, or acting and the step's kind)
+        and for how many seconds. The executor of forwarded lands, 2026-11-23 00:20Z: a row due 30 min named 8 of 24
+        holders by PR only, so whether they were judgments or merge steps, and how long each had held, had to be
+        read off the host while it was still happening."""
+        e = self.entries.get(key) or {}
+        what = str(e.get("state") or "?")
+        if what == "acting":
+            what += " " + str((e.get("action") or {}).get("kind") or "?")
+        at = (self.job_started.get(key) or (None,))[0]
+        return f"{key_name(key)} {what}" + ("" if at is None else f" {round(self.now - at)}s")
 
     def log_pool(self) -> None:
         """Once per LAND_POOL_LOG_EVERY, the pool as the last pass left it: workers busy and on what, snapshot waits,
@@ -16807,6 +17190,13 @@ class LandQueue:
                 return
         running = land_checks_running(data, head)
         kind = w.get("kind")
+        if running and kind not in ("head_change", "repin") and self.stuck_carry_due(e, head, data):
+            # an override given after this head's checks_stuck verdict: judged now, not after another wait on the same
+            # pending check (land_override_carries); take() merges it if the judgment is still only that wait
+            if self.judge(e, head, fp, why="stuck_carry"):
+                e["stuckCarryJudged"] = f"{e.get('requestId') or ''}|{head}"
+                self.history(e, "stuck_carry", head=head[:12])
+            return
         if e["state"] == "queued":
             if running:
                 self.wait_running(e, head, fp)
@@ -17253,6 +17643,14 @@ class LandQueue:
             if at >= since and pattern.search(str(cm.get("body") or "")):
                 return True
         return False
+
+    def stuck_carry_due(self, e: dict, head: str, data: dict) -> bool:
+        """Whether E at HEAD, its checks still running, is owed one judgment now because its override carries an
+        earlier checks_stuck verdict (land_override_carries). Once per request and head (stuckCarryJudged, marked when
+        the judgment starts): a judgment that does not merge it waits as before."""
+        if land_override_carry_verdict(e, head, data) is None:
+            return False
+        return e.get("stuckCarryJudged") != f"{e.get('requestId') or ''}|{head}"
 
     def wait_running(self, e: dict, head: str, fp: str) -> None:
         """Checks still run at the head: land_judge is not asked until they finish (the cache says when)."""
@@ -18155,7 +18553,12 @@ class LandQueue:
         recent = [bad for at, bad in self.live_reads if self.now - at <= LAND_EARLY_HANDOFF_WINDOW]
         if sum(recent) < LAND_EARLY_HANDOFF_BAD:
             return False
-        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")).lower()
+        # A PR this host has no read of yet (consider's no_data) is handed off at its full pin: it is the head the
+        # caller's merge is pinned to, so the broker host judges exactly what was asked. Without it every no_data
+        # entry was judged here first, and on a host whose reads time out that is a 300 s explain_failed: 140 of 355
+        # lane-VM judgments, 2026-11-22 14:11-17:42Z, 10 GCP and Freestyle lane VMs, were no_data, the median 300.1 s.
+        head = (sha or str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "")
+                or str(e.get("pinSha") or "")).lower()
         if not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head):
             return False
         why = f"handed off early: {sum(recent)} of the last {len(recent)} judgments here could not read GitHub"
@@ -18313,6 +18716,9 @@ class LandQueue:
         if idle < LAND_WAIT_STUCK:
             return False
         left = land_unfinished(data, self.now) if fp else ""
+        # Kept past the stop, a requeue and a rearm (keyed by head): an override given after it answers it at once
+        # (land_override_carries)
+        e["stuckVerdict"] = {"head": head, "at": self.now, "checks": land_unfinished_names(data, head), "code": code}
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
                   f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
                   f"{land_reason(reason, 200)}", land_trim(nxt))
@@ -18386,6 +18792,26 @@ class LandQueue:
                           land_trim(answer.get("next")))
             return
         if kind == "stop" and act.get("stop") == "own_red" and self.rerun_unrelated(e, act, answer, head):
+            return
+        carried = land_override_carries(e, act, head, (self.cache_of(e["key"]) or {}).get("data") or {})
+        if carried is not None:
+            # land_override_carries' comment: a wait on a check this head was already judged stuck on, and an override
+            # given since: the pinned merge carrying it, at once
+            with self.lock:
+                self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
+                             carried="checks_stuck", stuckAt=round(float(carried.get("at") or 0), 3),
+                             **land_override_history(e))
+            log({"event": "land-override-carried", "key": e["key"], "head": head[:12],
+                 "code": str(answer.get("code") or kind), "override": (e.get("override") or {}).get("reason")})
+            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            return
+        if land_override_waited(e, act, answer, head, self.now):
+            # LAND_OVERRIDE_WAIT_CODES' comment: the check never posted within its wait, and the override answers it
+            with self.lock:
+                self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
+                             waited=round(self.now - float(e["overrideWait"]["since"])), **land_override_history(e))
+                e.pop("overrideWait", None)
+            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
             why = act.get("why") or answer.get("reason")
@@ -19692,8 +20118,14 @@ class LandQueue:
                         log({"event": "land-notify-retried", "key": e["key"], "to": to, "tries": tried, "why": whys[0]})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if LAND_NOTIFY_GONE.search(whys[-1]):
+                    # the session has ended: no resend reaches it (LAND_NOTIFY_GONE's comment)
+                    log({"event": "land-notify-no-session", "key": e["key"], "to": to, "why": whys[-1],
+                         "tries": tried})
+                    return
                 if tried < LAND_NOTIFY_TRIES:
-                    time.sleep(LAND_NOTIFY_RETRY_S)
+                    busy = LAND_NOTIFY_BUSY.search(whys[-1])
+                    time.sleep(LAND_NOTIFY_BUSY_RETRY_S * tried if busy else LAND_NOTIFY_RETRY_S)
             why = whys[-1]
             log({"event": "land-notify-failed", "key": e["key"], "to": to, "why": why, "tries": len(whys)})
             with contextlib.suppress(Exception):
@@ -19839,6 +20271,93 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
     if act.get("kind") == "command":
         return True
     return act.get("kind") == "stop" and str(act.get("stop") or "") not in set(LAND_STOP_CLASSES.values())
+
+
+# An override given after the queue already judged a check stuck covers that check at once. The queue stops an entry
+# checks_stuck once nothing at its head moved in LAND_WAIT_STUCK of waits; a re-request with --override-reason (the
+# rulebook's [never-without-ci]: "a stuck check or his say-so: merge pinned with LAND_JUDGE_OVERRIDE") started the
+# wait over, because an override answered only a stop or a command step, never a wait. 2026-11-23 ~03:30Z on
+# cmux-cp-1: lw#8104 (3289e083) and lw#8246 (2bceb3eb), stopped checks_stuck on a ws-check that never posted
+# (4.0 h and 4.2 h), were re-requested with an override and sat waiting on the same pending ws-check, up to another
+# 4 h. Now, at the same head, a request carrying an override given at or after that verdict, judged to a wait on the
+# checks (wait_pr, wait_run) whose unfinished checks are all ones the verdict named, is the pinned merge carrying the
+# override (override_merge, carried=checks_stuck, logged with its reason; land_judge logs it again). A check merely
+# running, never judged stuck at that head, still waits; a new head, a check that started since, a hold, a BLOCK or
+# any other stop is judged as before.
+def land_unfinished_names(data: dict, head: str) -> list[str]:
+    """The names (not workflows: land_wait_shape's comment) of the checks DATA shows unfinished at HEAD, sorted."""
+    if not head or str(data.get("headRefOid") or "").lower() != head:
+        return []
+    return sorted({str(c.get("name") or "") for c in data.get("checks") or []
+                   if str(c.get("status") or "").upper() not in ("COMPLETED", "") and c.get("name")})
+
+
+def land_stuck_verdict(e: dict, head: str) -> dict | None:
+    """E's checks_stuck verdict at HEAD ({"head", "at", "checks": names or None}), or None. An entry stopped before
+    stuckVerdict was kept has only its stop or its history's "stopped" line, whose reason names the head and the
+    checks still unfinished ("no check at <head12> moved ... still unfinished: NAME (status), ...")."""
+    v = e.get("stuckVerdict")
+    if isinstance(v, dict) and v.get("head") == head:
+        return v
+    said = f"no check at {head[:12]} moved"
+    lines = [e.get("stop") or {}, e.get("lastStop") or {}]
+    lines += [h for h in reversed(e.get("history") or []) if h.get("event") == "stopped"]
+    for h in lines:
+        if isinstance(h, dict) and h.get("code") == "checks_stuck" and said in str(h.get("reason") or ""):
+            return {"head": head, "at": float(h.get("at") or 0), "checks": None, "reason": str(h.get("reason") or "")}
+    return None
+
+
+def land_override_carry_verdict(e: dict, head: str, data: dict) -> dict | None:
+    """The checks_stuck verdict at HEAD E's override carries (the comment above), or None: E has an override given at
+    or after that verdict, and every check DATA shows unfinished at HEAD (at least one) is one it named."""
+    if not land_override_env(e) or not SHA40.fullmatch(head or ""):
+        return None
+    v = land_stuck_verdict(e, head)
+    if v is None or float(e.get("overrideAt") or 0) < float(v.get("at") or 0):
+        return None
+    pending = land_unfinished_names(data, head)
+    if not pending:
+        return None
+    named = v.get("checks")
+    if isinstance(named, list):
+        return v if set(pending) <= set(named) else None
+    said = str(v.get("reason") or "").split("still unfinished:", 1)[-1]
+    return v if all(f"{n} (" in said for n in pending) else None
+
+
+def land_override_carries(e: dict, act: dict, head: str, data: dict) -> dict | None:
+    """The verdict E's override carries when ACT, judged at HEAD, is a wait on the checks (the comment above)."""
+    if act.get("kind") not in LAND_WAIT_KINDS:
+        return None
+    return land_override_carry_verdict(e, head, data)
+
+
+# A wait an override answers too: land_judge's ws_check_missing ("has no ws-check yet" / "has ws-check still pending") at
+# the same head past LAND_OVERRIDE_WAIT_S, one ws_check_timer pass plus its run (land_judge's WS_CHECK_WAIT_S). On
+# leo-workspace a tools/ PR waits for its ws-check even on the lagging sync (lw#8271 takes no head-age exemption there),
+# and the rulebook names the override as the escape for a stuck check; but the queue took an override only on a stop or
+# a command step, so a wait it answered never came. 2026-11-22 21:55-23:20Z: lw#8689 and lw#8708, queued with an
+# override and a receipt, and a dozen tools/ PRs were judged ws_check_missing/wait_pr for 1.5 h while the ws-check
+# verdicts, posted through the lane-gh broker, never came (its host's broker serve wedged, 2,093 calls in flight). A
+# check still inside its wait keeps it: the override never skips a run that may still post.
+LAND_OVERRIDE_WAIT_CODES = frozenset({"ws_check_missing"})
+LAND_OVERRIDE_WAIT_S = 2700.0
+
+
+def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float) -> bool:
+    """True when E's override answers ACT, a wait_pr step for one of LAND_OVERRIDE_WAIT_CODES at HEAD that has held
+    E at that head LAND_OVERRIDE_WAIT_S (the comment above). Marks when the wait began (overrideWait)."""
+    if act.get("kind") != "wait_pr" or str(answer.get("code") or "") not in LAND_OVERRIDE_WAIT_CODES:
+        e.pop("overrideWait", None)
+        return False
+    if not land_override_env(e) or not SHA40.fullmatch(head or ""):
+        return False
+    w = e.get("overrideWait") or {}
+    if w.get("head") != head:
+        e["overrideWait"] = {"head": head, "since": now}
+        return False
+    return now - float(w.get("since") or now) >= LAND_OVERRIDE_WAIT_S
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
@@ -20933,7 +21452,7 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
 def cmd_land_serve(text: str) -> int:
     """`land serve`: the executor's end of land.json's "executor" on a forwarding host. One JSON request line on stdin
     ({"op": "land" | "withdraw" | "status" | "batch", ...}), one JSON answer line on stdout. A host that forwards its
-    own lands is no executor: it refuses, so two hosts never hand a PR back and forth."""
+    own lands relays the request to its executor once (LAND_SERVE_RELAYED), so two hosts never hand a PR back and forth."""
     try:
         req = json.loads(text)
     except ValueError:
@@ -20949,13 +21468,16 @@ def cmd_land_serve(text: str) -> int:
             answer = land_forward(executor, {**req, LAND_SERVE_RELAY_KEY: policy_host()})
         except WatchError as error:
             print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands "
-                              f"to {land_forward_name(executor)}, which did not take this one: {error}"}))
+                              f"to {land_forward_name(executor)}, which did not take this one: {error}",
+                              "executor": land_forward_name(executor)}))
             return EXIT_FAIL
         print(json.dumps(answer, sort_keys=True))
         return EXIT_OK if answer.get("ok") else EXIT_FAIL
     if executor is not None:
+        # "executor" names where: glaeda-gh's own forwarders follow it once (LAND_REDIRECT_HOPS)
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
-                          f"{land_forward_name(executor)} (land.json executor); it serves none"}))
+                          f"{land_forward_name(executor)} (land.json executor); it serves none",
+                          "executor": land_forward_name(executor)}))
         return EXIT_FAIL
     op = req["op"]
     if op == "room":
@@ -21138,7 +21660,7 @@ def first_heartbeat(now: float | None = None) -> None:
     if isinstance(before, dict):
         last = before if before.get("state") in ("held", "stale") else before.get("last")
         status["stale"] = {"state": "starting", **({"last": last} if isinstance(last, dict) else {})}
-    write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
+    write_json(BASE / "daemon.json", {**status, **RUNNING_SCRIPT, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
 
@@ -21371,6 +21893,9 @@ def serve(foreground_ok: bool = False) -> int:
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
     lock = hold_daemon_lock()
+    me = Path(__file__).resolve()
+    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
+    RUNNING_SCRIPT.update(scriptSha256=seen["sha"], scriptSince=time.time())
     first_heartbeat()
     # A daemon started by a gh call holding a GraphQL slot outlives it: its own gh calls (the land pool's) take slots.
     os.environ.pop(GRAPHQL_SLOT_ENV, None)
@@ -21378,11 +21903,9 @@ def serve(foreground_ok: bool = False) -> int:
         swept = sweep_temp_files()
         if swept:
             log({"event": "swept", "tempFiles": swept})
-    me = Path(__file__).resolve()
-    seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid(), **({"inheritedChildren": inherited} if inherited else {})})
+    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
@@ -21910,6 +22433,40 @@ def pr_repo(data: dict) -> str:
 def expected_missing(data: dict) -> list[str]:
     reported = {c.get("name") for c in data.get("checks") or []}
     return [name for name in expected_contexts(pr_repo(data)) if name not in reported]
+
+
+# An expected context that nothing requires and nobody posts. EXPECTED_CONTEXTS exists because a green head is not
+# green until the status its merges wait on reports (leo-workspace#3538: ws-check went pending at push+26.5 min).
+# But that status has one publisher, a timer, and whenever that publisher falls behind it posts for no head at all --
+# a recurring state, not a transient one -- so "expected, not posted yet" held waits that could never end.
+# teamleaderleo/leo-workspace#8794 at 31a84d01, 2026-11-23: a `wait pr` spent 2401 s and ended `ended_by:
+# no-progress`, `progress_changes: 0`, on a PR that was MERGEABLE (CLEAN) with a SUCCESS rollup, 1 of 1 checks
+# passed, 0 required, and ws-check the only thing absent; its `next:` was the same wait again, with the same
+# `--timeout 2400 --max 9600`.
+# docs/handbook/done-wait-held-by-stragglers.md: a done wait ends once every check that decides has ended, and names
+# what it ended without. A context GitHub's base does not require decides nothing -- it cannot move mergeable, the
+# rollup or any required name -- so past EXPECTED_UNPOSTED_AFTER it no longer holds the wait. It is never read as a
+# pass: the verdict is EXIT_INCONCLUSIVE, the same value a straggler gets, because the absence of a verdict is its
+# own answer and must not be folded into pass or fail. A context the base requires (requiredNames, requiredMissing,
+# requiredUnread) holds the wait exactly as before, named at the same bound.
+EXPECTED_UNPOSTED_AFTER = 30 * 60  # past #3538's 26.5 min tail, and STRAGGLER_AFTER's bound for the same shape
+
+
+def expected_unposted(data: dict, now: float | None = None,
+                      bound: float = EXPECTED_UNPOSTED_AFTER) -> list[str]:
+    """The expected contexts of DATA's open head that nothing requires and that were still not posted BOUND seconds
+    after the head was pushed: the ones a wait ends without, in the order expected_contexts names them. Empty while
+    any of them may still arrive -- the head is younger than BOUND, or its push time cannot be placed (pushed_by),
+    when they hold the wait as they always did."""
+    now = time.time() if now is None else now
+    if data.get("state") != "OPEN":
+        return []
+    required = set(data.get("requiredNames") or []) | set(data.get("requiredMissing") or []) \
+        | set(data.get("requiredUnread") or [])
+    pushed = pushed_by(data)
+    if pushed is None or now - pushed < bound:
+        return []
+    return [name for name in expected_missing(data) if name not in required]
 
 
 def pushed_by(data: dict) -> float | None:
@@ -22726,8 +23283,11 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         return EXIT_FAIL  # merge conflicts: the required checks will not run until the next push
     if bad:
         return EXIT_FAIL
-    if data.get("state") == "OPEN" and expected_missing(data):
-        return None  # a status every head of this repo gets has not been posted yet: unfinished, like a required one
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if missing:
+        # a status every head of this repo gets has not been posted yet: unfinished, like a required one, until it is
+        # plainly not coming and nothing requires it (expected_unposted) -- then the wait ends without it, and says so
+        return None if set(missing) - set(expected_unposted(data, now)) else EXIT_INCONCLUSIVE
     return EXIT_OK
 
 
@@ -23116,7 +23676,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
             lines[-1] += basis
             lines += churn_lines(entry.get("churn"), now)
         if data.get("state") == "OPEN" and expected_missing(data):
-            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}")
+            unposted = expected_unposted(data, now)
+            why = (f" (nothing requires them; not posted {int(EXPECTED_UNPOSTED_AFTER // 60)} min after the push, so a "
+                   "wait ends without them, and land-judge still counts them)" if unposted else "")
+            lines.append(f"  expected, not posted yet: {', '.join(expected_missing(data))}{why}")
         if data.get("requiredMissing"):
             why = " (merge conflicts: they run after the next push)" if data.get("mergeStateStatus") == "DIRTY" else ""
             lines.append(f"  required, not reported yet: {', '.join(data['requiredMissing'])}{why}")
@@ -23666,16 +24229,38 @@ def blocked_start_line(key: str, kind: str) -> str | None:
     return f"glaeda-gh: {key_name(key)} cannot be read right now: {blocked['text']}.{resumes}"
 
 
-def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE) -> str:
-    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line). When nothing
-    is being read for its kind (read_blocked) and the data is not fresh, the line names the bucket and the reset
-    as well: "no data yet" alone reads as "its CI has not started", which is the one thing it does not mean."""
+def pin_mismatch(pin: str | None, data: object) -> str | None:
+    """What a wait says when the caller pinned a full commit and that commit is not the head GitHub shows: both shas,
+    named, every time the state is said. None when there is no pin, the pin is not a full id, or it is the head.
+
+    A pin is an assertion about which commit the caller cares about. teamleaderleo/glaeda#2564 (3700 s, 2026-11-23)
+    was pinned to 41092a54, which was never the head in those 3700 s: every line it printed was about 4ce5d079 and
+    later ca129622, and it never said the head it reported was not the head it was asked about. A wait may legitimately
+    wait for a pinned push GitHub has not seen yet -- it may not do that silently, because the words it prints then
+    describe work the caller never asked about."""
+    if not isinstance(data, dict) or not pin or not re.fullmatch(r"[0-9a-f]{40}", str(pin)):
+        return None
+    head = str(data.get("headRefOid") or "")
+    if not head or head == str(pin):
+        return None
+    return (f"pinned --sha {str(pin)[:10]} is not the head GitHub shows ({head[:10]}), so this state is "
+            f"{head[:10]}'s, and this wait cannot end on {str(pin)[:10]} until that commit becomes the head")
+
+
+def progress_state(key: str, entry: dict | None, until: str = "done", grace: float = RESCUE_GRACE,
+                   pin: str | None = None) -> str:
+    """How a waited PR or run stands, on one line: the summary's headline (and a PR's checks line), and the pin it was
+    asked about whenever that is not the head this state is about (pin_mismatch). When nothing is being read for its
+    kind (read_blocked) and the data is not fresh, the line names the bucket and the reset as well: "no data yet" alone
+    reads as "its CI has not started", which is the one thing it does not mean."""
     lines = [line.strip() for line in summary(key, entry, until, grace, False).splitlines()]
     keep = lines[:2] if split_key(key)[0] == "pr" else lines[:1]
     state = "; ".join(line for line in keep if line and not line.startswith("http"))
     at = (entry or {}).get("dataAt")
     fresh = (entry or {}).get("data") and isinstance(at, (int, float)) and not isinstance(at, bool) \
         and time.time() - at < WAIT_PROGRESS_EVERY
+    mismatch = pin_mismatch(pin, (entry or {}).get("data"))
+    state = f"{state}; {mismatch}" if mismatch else state
     blocked = None if fresh else blocked_now(split_key(key)[0])
     return f"{state}; {blocked['text']}" if blocked is not None else state
 
@@ -23724,6 +24309,42 @@ def unseen_next(data: dict, key: str) -> str:
             else f"glaeda-gh status pr {key_name(key)} --verbose")
 
 
+def expected_unposted_next(key: str, data: dict) -> str:
+    """The step for a wait that ended without an expected context nothing requires: the land queue, pinned to the head
+    this wait read, which judges that head itself and holds the row until the context posts. Never another wait on a
+    state only that one publisher can change (docs/handbook/wait-that-cannot-end.md). Pinned because the step must act
+    on the head that was green and on no other; a head this tool cannot read as 40 hex is not pinned, and then the
+    step is to look."""
+    sha = str(data.get("headRefOid") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return f"glaeda-gh status pr {key_name(key)} --verbose"
+    return f"glaeda-gh land {key_name(key)} --match-head-commit {sha}"
+
+
+def timeout_next(req: dict, entry: dict | None, now: float | None = None) -> str:
+    """The `next:` of a wait that ended with nothing moving for its whole --timeout: a step that can change the state
+    it waited on. Never this same wait again -- that is the one step guaranteed not to help, and an agent takes it
+    (teamleaderleo/leo-workspace#8794, 2026-11-23: 2401 s, `progress_changes: 0`, `next:` itself with the same
+    `--timeout 2400 --max 9600`). A wait that was still moving at its --max keeps naming itself, on purpose: that
+    one can end. docs/handbook/wait-that-cannot-end.md."""
+    now = time.time() if now is None else now
+    kind = split_key(req["key"])[0]
+    key = req["key"]
+    data = (entry or {}).get("data")
+    if not isinstance(data, dict) or kind != "pr":
+        return f"glaeda-gh status {kind} {key_name(key)}" + (" --jobs" if kind == "run" else "")
+    if expected_unposted(data, now):
+        return expected_unposted_next(key, data)
+    groups = classify(data, now, float(req.get("grace", RESCUE_GRACE)))
+    pending = groups["pending"]
+    if pending:
+        oldest = sorted(pending, key=lambda c: iso_epoch(c.get("startedAt")) or now)
+        return stuck_next(oldest[0], key)  # its own run: whether its job ever got a runner
+    if max(0, pending_on_every_page(data) - len(pending) - len(groups["held"])):
+        return unseen_next(data, key)  # the page past the rollup's first 100
+    return f"glaeda-gh status pr {key_name(key)} --verbose"
+
+
 def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RESCUE_GRACE,
                now: float | None = None) -> str | None:
     """What a wait says once its own rendered state has not changed for WAIT_STUCK_AFTER: which checks are still
@@ -23751,7 +24372,13 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     # it can see and the count it cannot are in the same breath. A read that did not happen is unknown
     # (docs/handbook/missing-read-counted-as-a-value.md): the wait names that part as unseen instead of absorbing it.
     unseen = max(0, pending_on_every_page(data) - len(pending) - len(groups["held"]))
-    if not pending and not unseen:
+    # The third absence, enumerated here with the other two instead of in a detector of its own: a context every head
+    # of this repo gets (expected_contexts) that was never posted holds the wait exactly as a pending check does, but
+    # it is in no group classify() returns, so this branch returned None and teamleaderleo/leo-workspace#8794 spent
+    # 2401 s with nothing said at all -- while a check merely *pending* beside finished siblings got a named warning
+    # and a run to look at. One kind of absence cannot get a name while the other gets silence.
+    missing = expected_missing(data) if data.get("state") == "OPEN" else []
+    if not pending and not unseen and not missing:
         return None
 
     def since(c: dict) -> float | None:
@@ -23795,8 +24422,31 @@ def stuck_note(key: str, entry: dict | None, unchanged: float, grace: float = RE
     if unseen:
         lines.append(f"  cannot see: {unseen} unfinished context(s) past the first {len(data['checks'])} this "
                      "rollup returned; pagination, not this PR, decided that this wait cannot name them")
-    nxt = (stuck_next(decided[0], key) if decided
-           else stuck_next(oldest[0], key) if pending else unseen_next(data, key))
+    if missing:
+        unposted = expected_unposted(data, now)
+        pushed = pushed_by(data)
+        age = f" {span(now - pushed)} after the push" if pushed is not None else ""
+        verdictless = ("; nothing requires it, so this wait ends without it and says so" if unposted
+                       else "; it may still arrive, and until then it holds this wait as a required check would")
+        lines.append(f"  never posted: {', '.join(missing)}{age}; nothing has reported it on head "
+                     f"{str(data.get('headRefOid') or '')[:10]}, so it is in no pending check this wait can "
+                     f"name{verdictless}")
+    # A required check that has already failed outranks every absence below it (#2601): the decision is in, so the
+    # run to look at is the one that decided, not the oldest pending check nor a context nobody requires.
+    if decided:
+        nxt = stuck_next(decided[0], key)
+    elif pending:
+        nxt = stuck_next(oldest[0], key)
+    elif unseen:
+        nxt = unseen_next(data, key)
+    elif expected_unposted(data, now):
+        nxt = expected_unposted_next(key, data)
+    else:
+        # the bound after which this tool answers differently about the same state: a wait past it ends without the
+        # context instead of holding. Never this same wait (docs/handbook/wait-that-cannot-end.md)
+        pushed = pushed_by(data) or now
+        nxt = (f"glaeda-gh wait until {utc_clock(pushed + EXPECTED_UNPOSTED_AFTER)} && "
+               f"glaeda-gh status pr {key_name(key)} --verbose")
     lines.append(f"next: {nxt}")
     return "\n".join(lines)
 
@@ -23809,7 +24459,8 @@ def progress_update(seen: dict, req: dict, entry: dict | None, now: float | None
     request, and its blocker drops a line it already printed the same way."""
     now = time.time() if now is None else now
     grace = float(req.get("grace", RESCUE_GRACE))
-    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace)
+    state = progress_state(req["key"], entry, str(req.get("until") or "done"), grace,
+                           str(req.get("sha") or "") if req.get("exact", True) else None)
     if state != seen.get("state"):
         seen.update(state=state, at=now, stuck=False)
         return state
@@ -23836,7 +24487,8 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
                            f"waited {waited} s for {name}, which is {data.get('state')}",
                            f"gh pr view {number} -R {owner}/{repo}")
     if result == EXIT_TIMEOUT:
-        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)))
+        state = progress_state(key, entry, req.get("until", "done"), float(req.get("grace", RESCUE_GRACE)),
+                               str(req.get("sha") or "") if req.get("exact", True) else None)
         deadline = utc_clock(wait_deadline(req))
         blocked = blocked_now(kind)
         now = time.time()
@@ -23849,9 +24501,10 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             return fail_fields("timeout", f"waited {waited} s for {name}, its ceiling (--max {wait_max(req):g}), while "
                                f"it was still changing ({last}); last seen: {state}",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        # nothing moved for the whole --timeout: the step is something that can move it, never this wait again
         return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
                            f"(deadline {deadline}; {last}); last seen: {state}",
-                           blocked_next(req, blocked) if blocked else wait_command(req))
+                           blocked_next(req, blocked) if blocked else timeout_next(req, entry, now))
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
@@ -23861,6 +24514,17 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
             blocked = blocked_now(kind)
             return fail_fields("inconclusive", f"{name}: the last read was partial ({why})",
                                blocked_next(req, blocked) if blocked else wait_command(req))
+        unposted = expected_unposted(data, time.time())
+        if unposted:
+            pushed = pushed_by(data)
+            since = f" {span(time.time() - pushed)} after its push" if pushed is not None else ""
+            ended = len(classify(data, time.time(), float(req.get("grace", RESCUE_GRACE)))["passed"])
+            return fail_fields("expected-unposted",
+                               f"{name}: {', '.join(unposted)} is still not posted on head "
+                               f"{str(data.get('headRefOid') or '')[:10]}{since}, and nothing requires it: every "
+                               f"check that decides has ended ({ended} passed, 0 failed) and this wait ends without "
+                               f"it (not a pass; land-judge still counts it)",
+                               expected_unposted_next(key, data))
         return fail_fields("inconclusive", f"{name}: {inconclusive_note(data, time.time())}",
                            f"glaeda-gh status pr {name} (the queued checks' runner label; land_judge counts them "
                            "running)")
@@ -24610,7 +25274,13 @@ def head_runs_unfinished(key: str, data: dict, now: float,
 
 
 def inconclusive_note(data: dict, now: float) -> str:
-    """What an inconclusive done wait says: how many checks are still queued with no runner, and any red already in."""
+    """What an inconclusive done wait says: the expected contexts nothing requires that were never posted, else how
+    many checks are still queued with no runner, and any red already in. Both are the same answer -- no verdict, not
+    a pass -- and each says which one it was, by name."""
+    unposted = expected_unposted(data, now)
+    if unposted:
+        return (f"not done: {', '.join(unposted)} was never posted on this head, nothing requires it, and the one "
+                f"publisher of it may post it later; every check that decides has ended (not a pass)")
     cut = straggler_cut(data, now)
     queued = len((cut or {}).get("stragglers") or [])
     failed = len(classify(data, now)["failed"])
@@ -25861,6 +26531,9 @@ def spend_lines(spend: Any) -> list[str]:
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
                    f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "points"))
+    for r in spend.get("graphqlLoginWhy") or []:
+        out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
+                   f"on the login: {r.get('why')}")
     return out
 
 
