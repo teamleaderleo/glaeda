@@ -855,6 +855,21 @@ class ExpectedUnpostedTest(Base):
         self.assertIn("expected, not posted yet: ws-check", gg.summary(self.KEY, {"data": data}))
         self.assertIn("a wait ends without them", gg.summary(self.KEY, {"data": data}))
 
+    def test_this_state_takes_the_exit_code_that_already_means_no_verdict(self) -> None:
+        """The value is not new and is not a red: EXIT_INCONCLUSIVE is the code the stragglers incident created
+        (docs/handbook/done-wait-held-by-stragglers.md) and the one `glaeda-gh wait`'s callers already bucket as
+        neither pass nor fail. A thing with no verdict read as a red is the failure this lane has fixed four times;
+        this pins that nobody quietly turns this state into one."""
+        self.assertEqual(gg.EXIT_INCONCLUSIVE, 7)
+        data = self.head(NOW - gg.EXPECTED_UNPOSTED_AFTER - 1)
+        self.assertEqual(gg.verdict("pr", data, "done", self.SHA, now=NOW), gg.EXIT_INCONCLUSIVE)
+        # the same state the stragglers case takes, rendered the same way: PENDING, never FAILURE
+        self.assertNotIn("FAILURE", gg.summary(self.KEY, {"data": data}))
+        self.assertIn("PENDING", gg.summary(self.KEY, {"data": data}))
+        out = gg.wait_outcome(self.request(), gg.EXIT_INCONCLUSIVE, {"data": data}, 2401)
+        self.assertFalse(out["ok"])
+        self.assertNotIn(out["code"], ("fail", "timeout", "ok"))
+
     def test_it_still_holds_the_wait_while_the_publisher_may_still_post_it(self) -> None:
         # leo-workspace#3538: the head was pushed at 14:02 and ws-check went pending at 14:28:31 (26.5 min)
         data = self.head(NOW - 1590)
