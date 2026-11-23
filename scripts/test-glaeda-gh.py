@@ -2215,6 +2215,26 @@ class GraphqlDietTest(Base):
         self.daemon.tick(NOW + 6 * gg.TICK + gg.CONTROLLER_ABSENT + 1)
         self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
 
+    def test_a_pending_commit_status_is_never_quiet_for_the_land_queue(self) -> None:
+        """The feed carries no commit-status delivery: a PR whose cached head shows a status pending is not quiet
+        (nothing says when it ends), whatever the feed delivered, and is quiet again once the status is done."""
+        sha, key = "b" * 40, "pr:o/r#1"
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        since = NOW + gg.TICK
+        pending = {"state": "OPEN", "headRefOid": sha, "checks": [
+            {"name": "ci", "workflow": "w", "id": "n1", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "deploy", "workflow": None, "status": "PENDING", "conclusion": None}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": pending, "dataAt": since})
+        self.assertFalse(self.daemon.land_feed_quiet(key, sha, since))
+        done = {**pending, "checks": [{**pending["checks"][0]}, {**pending["checks"][1], "status": "COMPLETED"}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": done, "dataAt": since})
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since))
+        run_pending = {**pending, "checks": [{**pending["checks"][0], "status": "IN_PROGRESS"}]}
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": run_pending, "dataAt": since})
+        self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "a check run's events reach the feed")
+
     def test_the_feed_view_a_downstream_rules_with_is_kept_for_read(self) -> None:
         """save_feed_view / feed_view (UPSTREAM_FEED_FILE): the view `read` gives a downstream host says what
         land_feed_quiet says here, and says nothing once the feed is out."""
@@ -30822,6 +30842,48 @@ class LandTest(Base):
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick(121)  # not a checks_running wait: its timeout judges
         self.assertEqual(len(self.w.judgments()), 4)
+
+    def seconds_to_judged(self, limit: float = 2 * gg.LAND_FEED_QUIET_MAX, step: float = 10.0) -> float:
+        """Seconds from now until a judgment is asked for (one more than there are), ticking every STEP."""
+        judged, began = len(self.w.judgments()), self.t
+        while self.t - began < limit:
+            self.tick(step)
+            if len(self.w.judgments()) > judged:
+                return self.t - began
+        return float("inf")
+
+    def test_a_checks_running_wait_ends_when_the_cache_shows_the_checks_done_with_no_feed_event(self):
+        """A commit status going green reaches the feed as no event (it carries runs, suites and comments), so with
+        the feed quiet the green copy was held and the row slept until LAND_FEED_QUIET_MAX after its checks_running
+        verdict. Before: 1800 s from green to judged here; after: the next tick."""
+        self.feed()  # quiet throughout: no event arrives
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.tick(30)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("status / ci", "COMPLETED", "SUCCESS")])  # the status went green
+        self.w.answers.append(ok_answer(LA))
+        seconds = self.seconds_to_judged()
+        print(f"\nfeed-quiet green-to-judged: {seconds:.0f} s")
+        self.assertLessEqual(seconds, 30)
+        self.assert_merged_at(LA)
+
+    def test_a_checks_running_timer_still_waits_while_the_cache_shows_the_checks_running(self):
+        """The wake above is the cache's own read of finished checks: a copy that still shows a check running (or
+        was read before the verdict) keeps the timer held."""
+        events = self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 120}
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        for _ in range(5):
+            self.tick(121)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertEqual(events, [])
 
     def test_a_feed_held_wait_is_judged_past_the_bound(self):
         self.feed()

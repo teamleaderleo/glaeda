@@ -12101,6 +12101,8 @@ class Daemon:
         run, suite or comment for the PR, for SHA or for the branch the cached PR names since then. Anything else
         (no feed, a gap, an event) is False: the land queue reads as it would with no feed (LAND_FEED_QUIET_MAX).
         On an upstream host, which follows no feed, the upstream's view of the key rules (upstream_feed_quiet)."""
+        if land_pending_status((read_cache(key) or {}).get("data") or {}):
+            return False  # a commit status ending its wait reaches the feed as no event (land_pending_status)
         view = self.upstream_feed.get(key)
         if view is not None:
             return upstream_feed_quiet(view, sha, since, self.now)
@@ -14587,6 +14589,21 @@ def land_checks_running(data: dict, head: str) -> bool:
         return False
     return (any(str(c.get("status") or "").upper() not in ("COMPLETED", "") for c in data.get("checks") or [])
             or pending_on_every_page(data) > 0)
+
+
+def land_pending_status(data: dict) -> bool:
+    """Whether the cache shows a commit status (not a check run) still pending at its head. The controller's feed
+    carries workflow runs, check suites and comments, and no `status` delivery: a status going green moves no feed
+    mark and nudges no read, so "the feed is quiet" says nothing about a wait that rests on one (land_feed_quiet).
+    A status context is a check with no workflow and no check-run id; a truncated rollup's counts say it too."""
+    if not data or data.get("state") != "OPEN":
+        return False
+    if any(not c.get("workflow") and "id" not in c and str(c.get("status") or "").upper() not in ("COMPLETED", "")
+           for c in data.get("checks") or []):
+        return True
+    counts = data.get("checkCounts")
+    return bool(data.get("checksTruncated") and isinstance(counts, dict)
+                and sum(n for state, n in (counts.get("statuses") or {}).items() if state in COUNT_PENDING) > 0)
 
 
 def land_unfinished(data: dict, now: float, limit: int = 6) -> str:
@@ -17521,6 +17538,16 @@ class LandQueue:
         if not head or v.get("head") != head or not isinstance(at, (int, float)) or isinstance(at, bool) \
                 or self.now - at >= LAND_FEED_QUIET_MAX:
             return False
+        if v.get("code") in LAND_TIMER_HELD:
+            # A checks_running verdict whose checks the cache shows finished, in a read made since it (a commit status
+            # going green: the feed carries no event for it): the wait is over, whatever the feed did not say.
+            c = self.cache_of(e["key"]) or {}
+            read = c.get("dataAt")
+            data = c.get("data") or {}
+            if isinstance(read, (int, float)) and not isinstance(read, bool) and read >= at \
+                    and data.get("state") == "OPEN" and data.get("headRefOid") == head \
+                    and not land_checks_running(data, head):
+                return False
         if not self.feed_quiet(e["key"], head, at):
             return False
         if not v.get("noted"):  # counted once per verdict held, not per pass
