@@ -68,7 +68,7 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
                                                         (~/.config/glaeda/on-event.json), and what each one did
     glaeda-gh on-event replay --run-file F [--jobs-file F] [--wait S] [--json]
                                                         one run record through the same path, deduped the same way
-    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA] [--wait|--timeout S]
+    glaeda-gh land OWNER/REPO#N [--after OWNER/REPO#M]... [--notify HOST/SESSION] [--sha SHA|HEAD] [--wait|--timeout S]
                    [--max S] [--json]                             land a PR: the daemon asks land_judge, takes each step it
                                                         names (update-branch, rerun, retarget, review, waits, the
                                                         pinned merge) and tells the requester on a merge or a stop;
@@ -9534,7 +9534,14 @@ class Daemon:
         """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
         self.upstream_status = self.upstream_status or {"state": "starting"}
         self.controller_status = {"state": "off", "why": "reads through upstream"}
-        self.upstream_refuse_posts()
+        if lane_vm_poster():
+            try:
+                with self.phase("outbox"):
+                    self.post_tick()  # a lane VM reading through lane-gh writes through it too (lane_vm_poster)
+            except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
+                self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        else:
+            self.upstream_refuse_posts()
         with self.phase("watches"):
             entries = self.watches()
         due = []
@@ -22205,6 +22212,35 @@ def land_pin_local_head(repo: str, git: Callable[[list[str]], str | None] | None
     return head if SHA40.fullmatch(head) else ""
 
 
+LAND_HEAD_WORD_AGE = 600.0
+
+
+def land_resolve_head_word(repo: str, number: int, key: str, pin: str | None,
+                           read: Callable[[list[str]], str | None] | None = None) -> str | None:
+    """`--sha HEAD` (any case) is the PR's current head, the pin glaeda-land's own stop notice tells agents to add
+    (forward_no_outcome: "--sha HEAD to pin it"); every other pin comes back as given. The head is the cache's when
+    it is a few minutes old and the PR is open (land_cached_head), else one read of the PR (`gh api`, the step
+    check_land_pin names). Prints one line saying what it pinned to. A head that cannot be read refuses the request
+    rather than queuing an unpinned land the caller asked to pin."""
+    if not pin or pin.strip().lower() != "head":
+        return pin
+    head = land_cached_head(key, LAND_HEAD_WORD_AGE)
+    if not SHA40.fullmatch(head):
+        def real(argv: list[str]) -> str | None:
+            try:
+                got = run_bounded(argv, 20)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return got.stdout.strip() if got.returncode == 0 else None
+        head = str((read or real)(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"]) or "").lower()
+    if not SHA40.fullmatch(head):
+        raise WatchError(f"--sha HEAD: cannot read the head of {repo}#{number}\n"
+                         f"next: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+                         f"then glaeda-gh land {repo}#{number} --sha THAT")
+    print(f"--sha HEAD: pinned to {head}", file=sys.stderr)
+    return head
+
+
 def check_land_pin_shape(pin: str | None) -> None:
     """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
     request this host can answer from its cache (land_draft_refusal) is answered after this and before
@@ -22395,6 +22431,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     try."""
     key, repo, number = land_key(target)
     after = land_after_in(repo, after)
+    pin = land_resolve_head_word(repo, number, key, pin)
     check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
@@ -33223,6 +33260,9 @@ def post_item(args: argparse.Namespace) -> dict:
     item: dict[str, Any] = {"kind": args.kind, "body": read_body(args.body, args.body_file), "queuedAt": time.time(),
                             "attempts": 0, "by": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("ACPMUX_SESSION")
                             or os.getcwd()}
+    lane = post_queue_lane()
+    if lane:
+        item["lane"] = lane  # the lane a lane VM's daemon writes it as (post_lane_env): the caller's, not its own
     if args.kind == "pr":
         if not re.fullmatch(rf"{NAME}/{NAME}", args.target):
             raise WatchError("post pr takes OWNER/REPO")
@@ -33476,12 +33516,50 @@ BROKER_OUTBOX_DEADLINE = 120.0  # one queued write the daemon makes through the 
 BROKER_RATE_LIMITED_EXIT = 75  # lane-gh's exit for a write GitHub's or the broker's limit refused (nothing was made)
 
 
+def upstream_is_lane_gh() -> bool:
+    """Whether UPSTREAM_CONFIG reads through lane-gh's `glaeda-read`: the lane-gh broker, which also makes writes."""
+    command = upstream_command()
+    return command is not None and len(command) == 2 and Path(command[0]).name == "lane-gh" and \
+        command[1] == "glaeda-read"
+
+
 def lane_vm_poster() -> bool:
-    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream
-    and a runnable lane-gh. Such a host holds no login, so the daemon's own `gh auth token` post can never succeed:
-    fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued; 0 ahead; last attempt: gh auth token exited 1; is gh
-    signed in?" while the caller had been told the daemon posts it."""
-    return upstream_command() is None and lane_vm_gh() is not None and os.access(LANE_GH_CMD, os.X_OK)
+    """Whether this host's queued writes are made through the lane-gh broker: a lane VM (lane_vm_gh) with no upstream,
+    or with lane-gh's own `glaeda-read` as its upstream, and a runnable lane-gh. Such a host holds no login, so the
+    daemon's own `gh auth token` post can never succeed: fs-agent-lane-10 2026-11-23 07:38Z, a `post pr` sat "queued;
+    0 ahead; last attempt: gh auth token exited 1; is gh signed in?" while the caller had been told the daemon posts
+    it. A lane VM reading through lane-gh counts too: until 2026-11-23 its `post` made one synchronous broker call and
+    a limit answered "rate limited, retry after 633s", exit 1, nothing kept, so the caller retried by hand or a loop
+    (gcp-codex-swarm-10, a leo-workspace `post pr` refused 4 times in 40 minutes). Queued, the daemon makes it once
+    the limit lets it (post_through_broker's notBefore)."""
+    return (upstream_command() is None or upstream_is_lane_gh()) and lane_vm_gh() is not None and \
+        os.access(LANE_GH_CMD, os.X_OK)
+
+
+# The lane a queued write is made as. lane-gh fences every broker write (pr_create, comment: BROKER_POST_TOOLS) with a
+# lease taken in the calling lane's name (leo-workspace tools/lane-gh lease_for_write, from LANE_GH_LANE or the acpmux
+# session: tools/lease_client.py owner()) and refuses with none: "lease acquisition requires a lane session", before
+# the broker. The daemon that replays a queued write runs as no session, so until 2026-11-23 every write gh-quota
+# queued on the login's create pause (queue_paced_write) and this daemon later sent through the broker failed that
+# way: on gcp-agent-lane-11 3 of 3 queued creates of lane/quiet-connect-cloud-carry in manaflow-ai/cmux, from two
+# sessions, while the same create sent directly was made. So `post` records the caller's lane in the entry ("lane",
+# post_queue_lane, read as lane-gh reads its own: LANE_GH_LANE, the acpmux session's name, else ACPMUX_FROM, a timer's
+# sending name) and the replay names it (post_lane_env). The land queue does the same for its steps (LAND_LANE_ENV).
+# An entry with no lane (queued before this, or by a process with no session) is sent as before, and lane-gh says so.
+POST_LANE_KEYS = (*LAND_LANE_KEYS, "ACPMUX_FROM")  # lease_client.owner()'s order
+
+
+def post_queue_lane(env: dict | None = None) -> str:
+    """The lane of the process queuing a write, as lane-gh would name it for its own write, or "" with none."""
+    env = os.environ if env is None else env
+    return land_session_lane(next((env[k] for k in POST_LANE_KEYS if str(env.get(k) or "").strip()), ""))
+
+
+def post_lane_env(item: dict) -> dict[str, str] | None:
+    """The environment a queued ITEM's `lane-gh call` runs with: this process's, with ITEM's recorded lane as
+    LANE_GH_LANE (lane-gh's first key), or None (this process's as is) when it recorded none."""
+    lane = land_session_lane(str(item.get("lane") or ""))
+    return {**os.environ, LAND_LANE_ENV: lane} if lane else None
 
 
 def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
@@ -33490,7 +33568,7 @@ def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[
     tool, call_args = chosen
     argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
     try:
-        done = run_bounded(argv, timeout=timeout)
+        done = run_bounded(argv, timeout=timeout, env=post_lane_env(item))
     except subprocess.TimeoutExpired:
         return "lost", f"the lane-gh broker gave no answer in {timeout:g}s"
     except (OSError, subprocess.SubprocessError) as error:
@@ -33674,10 +33752,11 @@ def cmd_post(args: argparse.Namespace) -> int:
     if why:
         print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
         return 3
-    if upstream_command() is not None:
+    if lane_vm_poster():
+        if broker_post_args(item) is None:
+            return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for it
+    elif upstream_command() is not None:
         return broker_post(item)  # this host has no login: the broker writes, or says what does (broker_post)
-    if lane_vm_poster() and broker_post_args(item) is None:
-        return broker_post_unsent(item, None)  # the daemon here posts through the broker, which has no form for this
     missing = post_route_missing()
     if missing:
         return post_unrouted(item, missing)

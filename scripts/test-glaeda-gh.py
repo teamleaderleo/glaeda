@@ -5866,6 +5866,30 @@ class ClientTest(Base):
             with self.assertRaises(gg.WatchError):
                 gg.check_land_pin("o/r", 1, "not-a-sha")
 
+    def test_land_sha_head_pins_the_prs_current_head(self) -> None:
+        """Leo: "You guys should now as standing rules start noticing and fixing tool calls ... Mistakes should also
+        be auto fixed and ran properly". The forward_no_outcome stop says "--sha HEAD to pin it"; the tool refused it."""
+        head = "c" * 40
+        calls = []
+        def read(argv):
+            calls.append(argv)
+            return head
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_cached_head", return_value=""), mock.patch("sys.stderr", out):
+            for word in ("HEAD", "head"):
+                self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", word, read), head)
+        self.assertIn(f"--sha HEAD: pinned to {head}", out.getvalue())
+        self.assertEqual(calls[0][:3], ["gh", "api", "repos/o/r/pulls/1"])
+        with mock.patch.object(gg, "land_cached_head", return_value="d" * 40), mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", "HEAD", read), "d" * 40)
+            self.assertEqual(gg.land_resolve_head_word("o/r", 1, "k", "abc1234", read), "abc1234")
+            self.assertIsNone(gg.land_resolve_head_word("o/r", 1, "k", None, read))
+        with mock.patch.object(gg, "land_cached_head", return_value=""):
+            with self.assertRaises(gg.WatchError):
+                gg.land_resolve_head_word("o/r", 1, "k", "HEAD", lambda a: None)
+        with self.assertRaises(gg.WatchError):
+            gg.check_land_pin_shape("not-a-sha")
+
     def test_the_word_for_a_pin_is_the_flag_for_a_pin(self) -> None:
         """gcp-agent-lane-2, 2026-11-22: `glaeda-gh land o/r#8293 --pin SHA` came back "unrecognized arguments:
         --pin" with the land unqueued, though `--pin` is what the rulebook ("land pinned <sha>") and every agent
@@ -16003,6 +16027,54 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
+        """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
+        login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
+        acquisition requires a lane session". lane-gh takes the lease in the lane its environment names (LANE_GH_LANE,
+        ACPMUX_SESSION_NAME, ACPMUX_SESSION, ACPMUX_FROM) and the daemon runs as no session. A fake lane-gh with the
+        real one's rule replays each write kind the broker carries (BROKER_POST_TOOLS) in an environment that names no
+        lane: each is made, in the queuing session's lane."""
+        lane_gh = Path(self.tmp.name) / "lane-gh"
+        lane_gh.write_text(
+            "#!/bin/sh\n"
+            "lane=${LANE_GH_LANE:-${ACPMUX_SESSION_NAME:-${ACPMUX_SESSION:-$ACPMUX_FROM}}}\n"
+            "lane=${lane##*/}\n"
+            "if [ -z \"$lane\" ]; then echo \"lane-gh: $2: lease acquisition requires a lane session\" >&2; exit 1; fi\n"
+            "printf '{\"ok\": true, \"data\": {\"url\": \"https://github.com/o/r/pull/9\", \"number\": 9, "
+            "\"lane\": \"%s\"}}\\n' \"$lane\" > \"$0.$2\"\n"
+            "cat \"$0.$2\"\n")
+        lane_gh.chmod(0o755)
+        argvs = {"pr": ("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why"),
+                 "comment": ("comment", "o/r#7", "--body", "x")}
+        self.assertEqual(set(argvs), set(gg.BROKER_POST_TOOLS))  # every kind the broker makes
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        bare = {k: v for k, v in os.environ.items() if k not in lanes}
+        for kind, argv in argvs.items():
+            with self.subTest(kind=kind):
+                d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)  # no spacing between kinds
+                with mock.patch.dict(os.environ, {**bare, "ACPMUX_SESSION_NAME": "gcp-agent-lane-11/quiet-lane"},
+                                     clear=True):
+                    item = self.queue(*argv)
+                with mock.patch.dict(os.environ, bare, clear=True), \
+                        mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                        mock.patch.object(gg, "LANE_GH_CMD", str(lane_gh)):
+                    self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual(state["state"], "posted", state)
+                made = json.loads(Path(f"{lane_gh}.{gg.BROKER_POST_TOOLS[kind]}").read_text())
+                self.assertEqual(made["data"]["lane"], "quiet-lane")
+                self.assertEqual(d.transport.calls, [])
+
+    def test_a_queued_write_with_no_lane_runs_lane_gh_as_before(self) -> None:
+        """No session at queue time: nothing is recorded and the replay's environment is the daemon's own."""
+        lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in lanes}, clear=True):
+            item = self.queue("comment", "o/r#7", "--body", "x")
+        self.assertNotIn("lane", item)
+        self.assertIsNone(gg.post_lane_env(item))
+        self.assertEqual(gg.post_queue_lane({"ACPMUX_FROM": "ws-sync"}), "ws-sync")  # a timer's sending name
+        self.assertEqual(gg.post_queue_lane({"LANE_GH_LANE": "a", "ACPMUX_SESSION_NAME": "h/b"}), "a")
+
     def test_a_lane_vm_write_the_broker_rate_limits_waits_its_retry_after_and_then_goes(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "x")
         d, ran = self.lane_vm((75, {"ok": False, "status": 403, "retry_after": 90, "error": "secondary"}),
@@ -16013,6 +16085,48 @@ class PostTest(unittest.TestCase):
         self.assertEqual(len(ran), 1)  # held: nothing sent inside the pause
         self.step(d, NOW + 91)
         self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (2, "posted"))
+
+    def test_a_lane_vm_reading_through_lane_gh_is_a_broker_poster_and_another_upstream_is_not(self) -> None:
+        """gcp-codex-swarm-10, 2026-11-23: a lane VM whose upstream is `lane-gh glaeda-read` was no lane_vm_poster,
+        so `post pr` made one synchronous broker call, a limit answered "rate limited, retry after 633s", exit 1, and
+        nothing was kept: four refusals in 40 minutes, each retried by hand."""
+        chain = Path(self.tmp.name) / "chain" / "gh"
+        chain.parent.mkdir(parents=True)
+        chain.write_text("#!/bin/sh\nexec \"$HOME/.local/bin/lane-gh-credential\" gh \"$@\"\n")
+        chain.chmod(0o755)
+        lane_gh = Path(self.tmp.name) / "lane-gh"
+        lane_gh.write_text("#!/bin/sh\nexit 0\n")
+        lane_gh.chmod(0o755)
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_LANE_CHAIN": str(chain)}), \
+                mock.patch.object(gg, "LANE_GH_CMD", str(lane_gh)):
+            for upstream, poster in ((None, True), (["/home/u/.local/bin/lane-gh", "glaeda-read"], True),
+                                     (["ssh", "huge-blue", "glaeda-gh", "upstream"], False)):
+                with self.subTest(upstream=upstream), mock.patch.object(gg, "upstream_command", return_value=upstream):
+                    self.assertEqual(gg.lane_vm_poster(), poster)
+
+    def test_a_lane_vm_post_through_a_lane_gh_upstream_is_queued_not_sent_where_the_caller_is(self) -> None:
+        args = gg.parser().parse_args(["post", "pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t",
+                                       "--body", "why"])
+        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
+                mock.patch.object(gg, "upstream_command", return_value=["lane-gh", "glaeda-read"]), \
+                mock.patch.object(gg, "run_bounded", side_effect=AssertionError("no broker call where the caller is")), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gg.cmd_post(args), 0)
+        queued = list(gg.outbox_dir().glob("*.json"))
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(gg.post_state(queued[0].stem)["state"], "queued")
+
+    def test_an_upstream_tick_on_a_lane_vm_sends_the_queue_through_the_broker_instead_of_failing_it(self) -> None:
+        """Until 2026-11-23 upstream_tick failed every queued write ("has no login to post with") before reading, so
+        a lane VM reading through lane-gh could not queue one at all."""
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"url": "https://github.com/o/r/pull/7#issuecomment-1"}}))
+        d.now = NOW
+        with mock.patch.object(d, "watches", return_value=[]):
+            d.upstream_tick(lambda _request: {})
+        self.assertEqual(ran[0][1:4], ["call", "comment", "o/r"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
     def test_a_lane_vm_write_left_uncertain_by_a_token_less_attempt_is_sent(self) -> None:
         """The queue's earlier attempts on a lane VM marked it uncertain and then failed for want of a token, before
