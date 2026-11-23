@@ -14336,6 +14336,7 @@ LAND_FORWARD_LOOK_EVERY = 60.0  # one pass over the forwarded rows' cache files,
 # place: 30 + 60 min, then 120) it is stopped forward_no_outcome, naming why it could not be ended another way and
 # what to do, and its requester is told as any stop tells it.
 LAND_FORWARD_GIVE_UP = 7200.0
+LAND_FORWARD_GIVE_UP_READ = 900.0  # the one read a row past LAND_FORWARD_GIVE_UP asks for, before it stops
 
 
 def land_session_lane(name: str) -> str:
@@ -16095,6 +16096,18 @@ class LandQueue:
             e["forwardFirst"] = first
             self.save(e)
         if self.now - first > LAND_FORWARD_GIVE_UP:
+            # one read of the PR first: a row whose copy is missing or old (a PR that merged on the far host while
+            # nothing here read it) ends merged or closed on the next look instead of stopping forward_no_outcome
+            asked = e.get("forwardGiveUpRead")
+            if not isinstance(asked, (int, float)) or isinstance(asked, bool) or read_at < asked:
+                if not isinstance(asked, (int, float)) or isinstance(asked, bool):
+                    e["forwardGiveUpRead"] = self.now
+                    self.save(e)
+                    with contextlib.suppress(OSError, WatchError):
+                        self.peek(e["key"])
+                    return
+                if self.now - asked <= LAND_FORWARD_GIVE_UP_READ:
+                    return
             self.forward_give_up(e, state, host, first, int(last.get("n") or 0), executor)
             return
         if state != "OPEN":

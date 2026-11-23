@@ -28714,9 +28714,28 @@ class LandTest(Base):
         self.tick(gg.LAND_FORWARD_GIVE_UP / 2)
         self.assertEqual(self.q.entries[self.KEY]["state"], "forwarded")
         e = self.tick(gg.LAND_FORWARD_GIVE_UP / 2 + 1)
+        self.assertEqual(e["state"], "forwarded")  # past the bound: one read of the PR is asked for first
+        self.assertIn(self.KEY, self.w.watched)
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP_READ + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("holds no read of the PR", e["stop"]["reason"])
         self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_forwarded_land_the_cache_never_read_reads_it_once_at_the_give_up_and_ends_merged(self):
+        # glaeda#2599 and #2570, 2026-11-23: merged on the far host, stopped forward_no_outcome here ("this host's
+        # cache holds no read of the PR"); the read asked for at the bound shows MERGED, so the row ends merged
+        self.forwarded_row()
+        self.w.cache.pop(self.KEY, None)
+        self.w.watched.clear()
+        e = self.tick(gg.LAND_FORWARD_GIVE_UP + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertEqual(self.w.watched.count(self.KEY), 1)
+        self.pr(LA, state="MERGED")
+        self.w.cache[self.KEY]["dataAt"] = self.t
+        self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
+        e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
+        self.assertFalse([c for c in self.w.sent() if "forward_no_outcome" in c[-1]])
 
     def test_a_forwarded_pinned_land_whose_cached_head_moved_stops_head_moved(self):
         self.forwarded_row(sha=LA)
