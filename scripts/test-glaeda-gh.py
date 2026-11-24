@@ -22755,7 +22755,7 @@ class ReexecDrainTest(Base):
         fast-patch swapped the bytes. ScriptWake ends the tick and the TICK sleep once per new content."""
         path = Path(self.tmp.name) / "glaeda-gh"
         path.write_bytes(b"one")
-        daemon = types.SimpleNamespace(tick_deadline=float("inf"))
+        daemon = types.SimpleNamespace(tick_deadline=float("inf"), script_cut=False)
         wake = gg.ScriptWake(path, gg.hashlib.sha256(b"one").hexdigest(), daemon)
         self.assertFalse(wake.check())
         self.assertEqual(daemon.tick_deadline, float("inf"))
@@ -22770,7 +22770,8 @@ class ReexecDrainTest(Base):
         self.assertTrue(wake.check())
         self.assertLessEqual(daemon.tick_deadline, time.monotonic())
         self.assertGreaterEqual(daemon.tick_deadline, before)
-        daemon.tick_deadline = float("inf")  # the next tick
+        self.assertTrue(daemon.script_cut, "a tick that starts before serve sees the change gets no budget")
+        daemon.tick_deadline, daemon.script_cut = float("inf"), False  # serve saw it; the next tick
         self.assertFalse(wake.check(), "one wake per new content")
         self.assertEqual(daemon.tick_deadline, float("inf"))
         started = time.monotonic()

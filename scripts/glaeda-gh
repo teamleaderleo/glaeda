@@ -6075,6 +6075,7 @@ class Daemon:
         self.plain_at: dict[str, float] = {}  # kind, or "rest" -> last read of a watch nothing is blocked on
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
+        self.script_cut = False  # ScriptWake saw a new glaeda-gh: a tick starting now gets no budget (serve clears it)
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
@@ -7255,7 +7256,7 @@ class Daemon:
             try:
                 self.read_rate_limit()
             finally:
-                self.tick_deadline = deadline
+                self.tick_deadline = min(deadline, self.tick_deadline)  # a ScriptWake cut in the window stands
         seen = self.budget.get(pool)
         return dict(seen) if isinstance(seen, dict) else None
 
@@ -9234,7 +9235,7 @@ class Daemon:
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
-        self.tick_deadline = time.monotonic() + TICK_BUDGET
+        self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -23538,7 +23539,8 @@ class ScriptWake:
         if key == self.woken:
             return False
         self.woken = key
-        self.daemon.tick_deadline = time.monotonic()  # between ticks: the next tick resets it, nothing lost
+        self.daemon.script_cut = True  # a tick that starts before serve sees the change: no budget (Daemon.tick)
+        self.daemon.tick_deadline = time.monotonic()  # the tick running now: its next deadline check stops it
         self.event.set()
         log({"event": "script-wake"})
         return True
@@ -23777,6 +23779,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = script_changed(me, seen)
+            if changed:
+                daemon.script_cut = False  # serve has seen it: the ticks a held or deferred re-exec runs are whole
             if not changed and daemon.reexec_waiting:
                 # the script is back to the bytes this daemon runs (a reverted install): nothing to re-exec for, so the
                 # drain ends and land steps start again (land_tick)
