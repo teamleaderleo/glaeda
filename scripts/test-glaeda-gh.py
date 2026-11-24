@@ -18541,7 +18541,7 @@ class SpendAlarmTest(AlarmBase):
         self.assertIn("200 left", told[0])
 
     def test_a_pool_on_track_to_its_reset_is_no_alarm(self) -> None:
-        """Leo, 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool on cosmic-gray: 587 left, draining
+        """Leo, 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool: 587 left, draining
         112.6/min ..., dry at 12:28Z, resets 12:29Z.": "ok... if it's right on track, why is it even firing? dont fire
         for bullshit". Dry less than 5 minutes before the reset lasts to it; 5 or more before is the alarm."""
         self.policy(pool=True)

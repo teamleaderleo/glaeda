@@ -476,7 +476,7 @@ ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection 
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
 ALARM_FIRE_WITHIN = 600.0  # a pool projected empty within this, or under the REST reserve, is a FIRE
 # On track: a pool projected dry less than this before its reset lasts to it, so it is no alarm at all (Leo,
-# 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool on cosmic-gray: 587 left, draining 112.6/min ..., dry at
+# 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool: 587 left, draining 112.6/min ..., dry at
 # 12:28Z, resets 12:29Z.": "ok... if it's right on track, why is it even firing? dont fire for bullshit"). The same
 # 5 minutes as cmuxterm-hq quota_outage.py's LOW rule. A low count (restLeft) or a fast pace (paceShare) alone is no
 # alarm either: reads ask the Apps first (land-judge, glaeda, ci-watch, quota-goblin), so the login's count is not the
