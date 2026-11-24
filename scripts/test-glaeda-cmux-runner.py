@@ -4450,6 +4450,116 @@ class HookTest(unittest.TestCase):
                                                  bound=30, poll=0.05), (None, "cancelled"))
             self.assertIn("SIDE_SEED_WAIT end: abandoned", out.getvalue())
 
+    @staticmethod
+    def fast_tier_message(fleet_result: str = "skipped", verdict: str = "", ffi: str = "false",
+                          job: str = "fast-tier", run_id: str = "42") -> dict:
+        """A cmux-next fast tier's job message, its needs context serialized as the runner logs it."""
+        def d(**pairs: object) -> dict:
+            return {"t": 2, "d": [{"k": k.replace("_", "-") if k == "fast_tier_fleet" else k, "v": v}
+                                  for k, v in pairs.items()]}
+        return {"messageType": "PipelineAgentJobRequest", "contextData": {
+            "github": d(job=job, run_id=run_id),
+            "needs": d(fast_tier_fleet=d(result=fleet_result, outputs=d(verdict=verdict)),
+                       path_route=d(result="success", outputs=d(ffi_repin=ffi)))}}
+
+    def worker_log(self, message: dict, started: datetime.datetime) -> Path:
+        diag = self.dir / "_diag"
+        diag.mkdir(exist_ok=True)
+        (diag / "Worker_20261123-180000-utc.log").write_text(
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO Worker] Version: 2.330.0\n"
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO Worker] Job message:\n {json.dumps(message, indent=2)}\n"
+            f"[{started:%Y-%m-%d %H:%M:%S}Z INFO JobRunner] Job ID 1\n")
+        return diag
+
+    def test_the_fast_tier_limit_follows_cmux_next_timeout_rule(self) -> None:
+        """SIDE_SEED_LIMIT: cmux-next.yml's fast-tier timeout-minutes is 5 when the build fleet gave a verdict, 35
+        when that verdict is queued, 50 for an ffi_repin route, else 120 (feat-cmux-next, 2026-11-24)."""
+        m = self.fast_tier_message
+        with mock.patch.dict(os.environ, {"GITHUB_JOB": "fast-tier", "GITHUB_RUN_ID": "42"}):
+            self.assertEqual(hook.fast_tier_limit(m("success", "pass")), (5, False))
+            self.assertEqual(hook.fast_tier_limit(m("failure", "fail")), (5, False))
+            self.assertEqual(hook.fast_tier_limit(m("success", "queued")), (35, True))
+            self.assertEqual(hook.fast_tier_limit(m("skipped", "", "true")), (50, True))
+            self.assertEqual(hook.fast_tier_limit(m("skipped")), (120, True))
+            self.assertIsNone(hook.fast_tier_limit(m(job="swift-canary")), "another job's log")
+            self.assertIsNone(hook.fast_tier_limit(m(run_id="7")), "another run's log")
+            self.assertIsNone(hook.fast_tier_limit({"contextData": {"needs": {"t": 2, "d": []}}}), "no needs read")
+            self.assertIsNone(hook.fast_tier_limit({}))
+
+    def test_a_cold_build_waits_only_within_its_limit_room(self) -> None:
+        """SIDE_SEED_LIMIT: cold fast tiers built in 37-53 min and ran 41-57 min (18:14-22:06Z 11-23), inside 120.
+        Room is the limit, less the time the job has run, less SIDE_SEED_COLD_S; none at 35 min; inf for report-only."""
+        start = datetime.datetime(2026, 11, 23, 18, 0, 0, tzinfo=datetime.timezone.utc)
+        now = start.timestamp() + 600
+        job = ("cmux-next.yml", "fast-tier")
+        env = {"GITHUB_JOB": "fast-tier", "GITHUB_RUN_ID": "42", hook.JOB_DIAG_ENV: os.fspath(self.dir / "_diag")}
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "no log: refused as before")
+            self.worker_log(self.fast_tier_message(), start)
+            room, note = hook.side_seed_cold_room(*job, None, self.dir, now)
+            self.assertEqual(room, 120 * 60 - 600 - hook.SIDE_SEED_COLD_S)
+            self.assertIn("fits its 120 min limit after 10 min", note)
+            self.assertIsNone(hook.side_seed_cold_room("cmux-next.yml", "swift-canary", None, self.dir, now)[0])
+            late = start.timestamp() + 61 * 60
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, late)[0], "no room left: refused")
+            self.worker_log(self.fast_tier_message("success", "queued"), start)
+            room, note = hook.side_seed_cold_room(*job, None, self.dir, now)
+            self.assertIsNone(room)
+            self.assertIn("does not fit its 35 min limit", note)
+            self.worker_log(self.fast_tier_message("success", "pass"), start)
+            self.assertEqual(hook.side_seed_cold_room(*job, None, self.dir, now)[0], float("inf"))
+            self.worker_log(self.fast_tier_message(), start)
+            with mock.patch.dict(os.environ, {hook.SIDE_SEED_LIMIT_OFF_ENV: "1"}):
+                self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "off: refused as before")
+            (self.dir / hook.SIDE_SEED_LIMIT_OFF_FILE).touch()
+            self.assertIsNone(hook.side_seed_cold_room(*job, None, self.dir, now)[0], "the live off file too")
+
+    def test_a_seed_wait_with_cold_room_builds_cold_past_it_instead_of_refusing(self) -> None:
+        roots, stack = self.held_seed_roots()
+        with stack, contextlib.redirect_stdout(io.StringIO()) as out:
+            start = time.monotonic()
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30,
+                                                 poll=0.05, cold_room=0.2), (None, None))
+            self.assertLess(time.monotonic() - start, 5, "the room bounds the wait, not SIDE_SEED_WAIT's bound")
+            self.assertIn("SIDE_SEED_WAIT end: cold", out.getvalue())
+            self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots), bound=30,
+                                                 cold_room=0), (None, None), "no room to wait: admitted cold at once")
+            live = [subprocess.Popen(["sleep", "30"]) for _ in roots]
+            try:
+                for proc in live:
+                    (self.dir / f"{hook.SIDE_SEED_WAITER}{proc.pid}").touch()
+                self.assertEqual(hook.side_seed_wait("SIDE_SEED_FREE x", self.dir, lambda: None, tuple(roots),
+                                                     bound=30, cold_room=600), (None, None),
+                                 "every waiter slot taken: admitted cold, not refused")
+            finally:
+                for proc in live:
+                    proc.kill()
+                    proc.wait()
+
+    def test_a_fast_tier_whose_cold_build_fits_its_limit_runs_cold_with_every_seed_root_held(self) -> None:
+        """SIDE_SEED_LIMIT end to end: the 120 min fast tier is admitted cold; the 35 min one is refused as before."""
+        self.fleet()
+        roots, stack = self.held_seed_roots()
+        diag = self.worker_log(self.fast_tier_message(), datetime.datetime.now(datetime.timezone.utc))
+        env = {**self.FAST_TIER, hook.SEED_ROOTS_ENV: os.pathsep.join(map(os.fspath, roots)),
+               hook.SIDE_SEED_WAIT_ENV: "0", hook.JOB_DIAG_ENV: os.fspath(diag), "GITHUB_RUN_ID": "42"}
+        with stack:
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+                self.assertIn("SIDE_SEED_LIMIT: a cold build (60 min) fits its 120 min limit", side.stdout)
+                self.assertIn("admitted cold", side.stdout)
+            finally:
+                self.finish("s2")
+            self.worker_log(self.fast_tier_message("success", "queued"),
+                            datetime.datetime.now(datetime.timezone.utc))
+            try:
+                side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+                self.assertEqual(side.returncode, 1, side.stdout + side.stderr)
+                self.assertIn("refused: seed root: every fast-tier seed root here is held", side.stdout)
+            finally:
+                self.finish("s2")
+
     def test_a_seed_root_is_free_when_the_first_is_unheld_or_a_marked_second_is(self) -> None:
         roots, stack = self.held_seed_roots(second=False)
         with stack:
