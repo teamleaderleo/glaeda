@@ -22770,6 +22770,7 @@ class ReexecDrainTest(Base):
         self.assertTrue(wake.check())
         self.assertLessEqual(daemon.tick_deadline, time.monotonic())
         self.assertGreaterEqual(daemon.tick_deadline, before)
+        self.assertGreaterEqual(wake.woken_at, before, "the re-exec logs its sinceWakeS from here")
         self.assertTrue(daemon.script_cut, "a tick that starts before serve sees the change gets no budget")
         daemon.tick_deadline, daemon.script_cut = float("inf"), False  # serve saw it; the next tick
         self.assertFalse(wake.check(), "one wake per new content")

@@ -23559,6 +23559,7 @@ class ScriptWake:
         self.seen = {"stat": script_stat(path), "sha": sha}  # its own copy: serve's is not shared across threads
         self.event = threading.Event()
         self.woken: tuple | None = None  # the stat it last woke serve for
+        self.woken_at: float | None = None  # time.monotonic() of that wake: the re-exec logs how long it waited
 
     def check(self) -> bool:
         """One stat; True when it woke serve."""
@@ -23567,7 +23568,7 @@ class ScriptWake:
         key = self.seen.get("changedStat")
         if key == self.woken:
             return False
-        self.woken = key
+        self.woken, self.woken_at = key, time.monotonic()
         self.daemon.script_cut = True  # a tick that starts before serve sees the change: no budget (Daemon.tick)
         self.daemon.tick_deadline = time.monotonic()  # the tick running now: its next deadline check stops it
         self.event.set()
@@ -23837,8 +23838,10 @@ def serve(foreground_ok: bool = False) -> int:
             elif due is not None:
                 q = daemon.land_queue
                 handed = len(q.judging) if q is not None and q.handover else 0  # judge_handed: the next daemon's
+                woke = wake.woken_at  # seconds from the new bytes to this re-exec: what land work held it for
                 log({"event": "reexec", **({"why": due} if due != "reexec" else {}),
-                     **({"handedJudgments": handed} if handed else {})})
+                     **({"handedJudgments": handed} if handed else {}),
+                     **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
