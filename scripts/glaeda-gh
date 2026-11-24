@@ -8022,7 +8022,7 @@ class Daemon:
             return
         if not actor and lane_vm_poster():
             return self.post_through_broker(path, item)
-        if item.get("uncertain"):
+        if item.get("uncertain") and item["kind"] != "update-branch":  # a merge of the base is safe to ask twice
             # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
             # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
             found, looked = self.post_find(item, actor)
@@ -8081,6 +8081,12 @@ class Daemon:
             write_json(path, item)  # only the App is out; other outbox items keep their turn
         elif not actor and self.rest_out(status, h, text):
             write_json(path, item)  # nothing was written: GraphQL posts it if it can, else it waits for REST's reset
+        elif item["kind"] == "update-branch" and status in (404, 422) and not THROTTLED.search(text) \
+                and (retired := update_branch_retired(status, text)):
+            if retired[0] == "done":
+                self.post_finish(path, item, note=retired[1])  # the branch needs nothing: done, never retried
+            else:
+                self.post_finish(path, item, superseded=retired[1])  # it can no longer mean anything: retired, recorded
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):
             self.post_hold_for(h, path, item)
@@ -8127,7 +8133,13 @@ class Daemon:
             self.post_finish(path, item, error=f"{value}; it may have been made: read {item['repo']} before sending "
                                                "it again")
         else:
-            self.post_finish(path, item, error=f"the lane-gh broker did not make it: {value}")
+            ended = update_branch_retired(422, str(value)) if item["kind"] == "update-branch" else None
+            if ended and ended[0] == "done":
+                self.post_finish(path, item, note=ended[1])
+            elif ended:
+                self.post_finish(path, item, superseded=ended[1])
+            else:
+                self.post_finish(path, item, error=f"the lane-gh broker did not make it: {value}")
 
     def post_after(self, item: dict, doc: dict) -> str | None:
         """A new PR's requested reviewers (not content creation, so no spacing); a failure is a note."""
@@ -31852,7 +31864,7 @@ def gh_cache_post_scopes(item: dict) -> list[str]:
     comment or review its PR or issue, the lists and the run lists (it can start a workflow); a new PR
     the lists and the run lists. Anything else stamps the whole repository."""
     number = item.get("number")
-    if item.get("kind") in ("comment", "review") and isinstance(number, int) and not isinstance(number, bool):
+    if item.get("kind") in ("comment", "review", "update-branch") and isinstance(number, int) and not isinstance(number, bool):
         return [f"pr {number}", "runlists", "heads", "other"]
     if item.get("kind") == "pr":
         return ["runlists", "heads", "other"]
@@ -33989,10 +34001,30 @@ def post_request(item: dict) -> tuple[str, str, dict]:
     if item["kind"] == "pr":
         return "POST", f"/repos/{repo}/pulls", {"title": item["title"], "head": item["head"], "base": item["base"],
                                                 "body": item["body"], "draft": False}
+    if item["kind"] == "update-branch":
+        return "PUT", f"/repos/{repo}/pulls/{item['number']}/update-branch", \
+            ({"expected_head_sha": item["expectedHead"]} if item.get("expectedHead") else {})
     if item["kind"] == "issue":
         return "POST", f"/repos/{repo}/issues", {"title": item["title"], "body": item["body"],
                                                  **({"labels": item["labels"]} if item.get("labels") else {})}
     raise WatchError(f"unknown write kind {item['kind']!r}")
+
+
+def update_branch_retired(status: int, text: str) -> tuple[str, str] | None:
+    """How a queued update-branch ends on a 404/422 that is no limit: ("done", why) when the branch needs nothing,
+    ("retired", why) when the write can no longer mean anything (the PR is gone or closed, or its head moved past the
+    pinned sha), None for a refusal worth reading (a merge conflict): that one fails with GitHub's own words. Never
+    retried (cmuxterm-hq docs/handbook/outbox-drains-slower-than-it-fills.md)."""
+    low = text.lower()
+    if status == 404:
+        return "retired", "the pull request or repository was not found (HTTP 404)"
+    if re.search(r"up[ -]to[ -]date|no new commits|nothing to merge|already contains", low):
+        return "done", "the branch was already up to date with its base"
+    if re.search(r"expected head sha|head sha didn.?t match|head branch was modified", low):
+        return "retired", "the pull request head moved past the pinned sha; the pin no longer describes it"
+    if re.search(r"\b(closed|merged)\b", low):
+        return "retired", "the pull request is closed or merged"
+    return None
 
 
 def read_body(body: str | None, body_file: str | None) -> str:
@@ -34009,7 +34041,10 @@ def read_body(body: str | None, body_file: str | None) -> str:
 
 
 def post_item(args: argparse.Namespace) -> dict:
-    item: dict[str, Any] = {"kind": args.kind, "body": read_body(args.body, args.body_file), "queuedAt": time.time(),
+    if args.kind == "update-branch" and (args.body is not None or args.body_file is not None):
+        raise WatchError("post update-branch takes no body (OWNER/REPO#N, and --sha HEAD to pin it)")
+    body = "" if args.kind == "update-branch" else read_body(args.body, args.body_file)
+    item: dict[str, Any] = {"kind": args.kind, "body": body, "queuedAt": time.time(),
                             "attempts": 0, "by": os.environ.get("CMUX_SURFACE_ID") or os.environ.get("ACPMUX_SESSION")
                             or os.getcwd()}
     lane = post_queue_lane()
@@ -34039,7 +34074,7 @@ def post_item(args: argparse.Namespace) -> dict:
         # all read, and one this tool prints -- refused here. The kind is named one word to the left, so the
         # separator before the number is whichever the caller typed (see PR_KEY_RE). `post review` keeps the
         # pr form: PR_KEY_RE has no `/issues/`, and an issue has no reviews.
-        kind = "pr" if args.kind == "review" else "comment"
+        kind = "pr" if args.kind in ("review", "update-branch") else "comment"
         m = KEY_RES[kind].fullmatch(target)
         if not m and not BARE_NUMBER.fullmatch(target):
             raise WatchError(f"post {args.kind} takes {KIND_FORMS[kind]}, not {args.target!r}")
@@ -34050,6 +34085,13 @@ def post_item(args: argparse.Namespace) -> dict:
                              f"(`glaeda-gh post label {args.target} --label L`)")
         if args.kind == "comment" and args.event != "comment":
             raise WatchError("--event is for post review")
+        sha = getattr(args, "sha", None)
+        if sha is not None and not isinstance(sha, str):
+            sha = None
+        if sha and (args.kind != "update-branch" or not SHA40.fullmatch(sha.lower())):
+            raise WatchError("--sha is for post update-branch: the full 40-hex head it pins")
+        if sha:
+            item["expectedHead"] = sha.lower()
         key = getattr(args, "status_key", None)
         if key is not None and not isinstance(key, str):
             key = None  # a caller's own namespace without the flag (an older argv, a test's Mock)
@@ -34205,7 +34247,7 @@ def body_guard_refusal(item: dict) -> str | None:
 # that twice in one session and opened both PRs by hand with `gh pr create`. A write the broker has a tool for is
 # made here instead, and one it has no tool for is refused at accept, with its body written out and the command that
 # posts it named (cmuxterm-hq docs/handbook/printed-step-not-a-command.md).
-BROKER_POST_TOOLS = {"pr": "pr_create", "comment": "comment"}
+BROKER_POST_TOOLS = {"pr": "pr_create", "comment": "comment", "update-branch": "update_branch"}
 BROKER_POST_DEADLINE = 600.0  # a busy broker queues a write behind other lanes' (hq broker-caller-admission)
 
 
@@ -34222,6 +34264,9 @@ def broker_post_args(item: dict) -> tuple[str, dict] | None:
     if tool == "pr_create":
         return tool, {"repo": item["repo"], "base": item["base"], "head": item["head"],
                       "title": item["title"], "body": item["body"]}
+    if tool == "update_branch":
+        return tool, {"repo": item["repo"], "number": item["number"],
+                      **({"expected_head_sha": item["expectedHead"]} if item.get("expectedHead") else {})}
     return tool, {"repo": item["repo"], "number": item["number"], "body": item["body"]}
 
 
@@ -34235,6 +34280,8 @@ def broker_post_next(item: dict, body: Path | None = None) -> str:
         return ("post it from the broker host, which has a login for this queue: "
                 f"glaeda-gh post review {repo}#{number} "
                 f"--event {str(item.get('event') or 'comment').lower()} --body-file {body_file}")
+    if item["kind"] == "update-branch":
+        return f"write it with gh, which routes through this host's broker: gh pr update-branch {number} --repo {repo}"
     if item["kind"] == "pr":
         return (f"write it with gh, which routes through this host's broker: gh pr create --repo {repo} "
                 f"--base {item.get('base')} --head {item.get('head')} "
@@ -34499,7 +34546,7 @@ def post_unrouted(item: dict, missing: str) -> int:
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
     try:
-        why = body_guard_refusal(item)
+        why = None if item["kind"] == "update-branch" else body_guard_refusal(item)  # it carries no text
     except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
         why = f"the body guard failed ({type(error).__name__}: {error})"
     if why:
@@ -35571,7 +35618,7 @@ POST_ELSEWHERE = {
 # CHOICE_SYNONYMS carries the looser spellings (`bug`, `tag`, `closed`).
 POST_ONE_CALL = {"issue": "issue", "label": "label", "close": "close",
                  "issue-comment": "comment", "pr-comment": "comment"}
-POST_QUEUED_KINDS = ("comment", "pr", "review", "status")
+POST_QUEUED_KINDS = ("comment", "pr", "review", "status", "update-branch")
 POST_KIND_CHOICES = POST_QUEUED_KINDS + tuple(POST_ONE_CALL)
 
 
@@ -35896,7 +35943,7 @@ def parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true")
     po = sub.add_parser("post", help="queue a comment, PR or review; the daemon posts it, paced for every session")
     po.add_argument("kind", choices=POST_KIND_CHOICES, metavar="KIND",
-                    help="comment, pr, review (queued and paced), status, or issue, label, close, issue-comment "
+                    help="comment, pr, review, update-branch (queued and paced), status, or issue, label, close, issue-comment "
                          "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
     po.add_argument("--body", help="the text (prefer --body-file: backticks and dollar signs stay data)")
@@ -35919,6 +35966,8 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--gate", action="store_true",
                     help="comment or review: a receipt a merge waits on (a verdict, a check, a land receipt); it goes "
                          "out ahead of every other queued write (review receipts are recognized without it)")
+    po.add_argument("--sha", metavar="HEAD",
+                    help="update-branch: the full 40-hex head to pin (a PR whose head moved is retired, not updated)")
     po.add_argument("--json", action="store_true")
     lg = sub.add_parser("log", help="a finished job's log, read once per host (cache, build controller, then REST)")
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
