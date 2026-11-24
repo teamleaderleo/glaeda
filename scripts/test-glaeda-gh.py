@@ -65,6 +65,7 @@ HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
 # Base shortens it for every test; the grace test checks the value that ships
 SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
+os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -27680,6 +27681,94 @@ class LandTest(Base):
         self.land()
         self.assertNotEqual(self.tick()["state"], "cancelled")  # landing it again starts it over
 
+    def test_a_red_stop_is_rearmed_because_its_answer_is_a_comparison_not_the_head(self):
+        # 2026-11-24, one land queue: 55 of 130 stopped entries were own_red/red_not_excused, and a re-ask
+        # at the unchanged head excused 21 of them (cmux#41558 merged after 80 h, #47993 after 90 h on a hand
+        # requeue). "Is this red the PR's?" is read against the base and the rollup, which move with no push.
+        self.assertTrue(gg.LAND_REARM_CODES.match("own_red"))
+        self.assertTrue(gg.LAND_REARM_CODES.match("red_not_excused"))
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.w.answers.append(self.own_red())  # the rerun's red is the same: stopped
+        for _ in range(6):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"), e.get("stop"))
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        # the base went green under it, so the same head is excused now and lands
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["stop"], e["rearms"]["n"]), ("queued", None, 1))
+        self.assertEqual(e["lastStop"]["code"], "own_red")
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_red_that_is_the_prs_own_stops_again_at_once_and_quietly(self):
+        # The cost of re-asking a red that has not cleared: one judgment, no new notice for the requester.
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.w.answers.append(self.own_red())
+        for _ in range(6):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual(e["stop"]["code"], "own_red")
+        sent = len(self.w.sent())
+        judged = len(self.w.explains())
+        for n in range(1, gg.LAND_REARM_CAP + 1):
+            self.w.answers.append(self.own_red())
+            e = self.tick(gg.LAND_REARM_AFTER)
+            self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", n))
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"), e.get("stop"))
+            self.assertEqual(len(self.w.explains()), judged + n)  # one probe per re-arm, not a fresh wait
+        self.assertEqual(len(self.w.sent()), sent)  # the requester was told at the first stop and not again
+        self.assertEqual([h.get("quiet") for h in e["history"] if h["event"] == "stopped"][-gg.LAND_REARM_CAP:],
+                         ["repeat"] * gg.LAND_REARM_CAP)
+        e = self.tick(gg.LAND_REARM_AFTER * 3)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
+
+    def test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts(self):
+        # 2026-11-24, one lane's queue after 10.5 h idle: 5 of its 5 open PRs stopped, none on a red of its own; one
+        # stopped checks_stuck on a status that never posted, and a stopped row reads nothing, so a status posting
+        # after the stop was never seen. Still unmoved at the same head: one probe, stopped again at once, quietly.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms stay inside one UTC day
+        self.assertTrue(gg.LAND_REARM_CODES.match("checks_stuck"))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        sent, judged = len(self.w.sent()), len(self.w.explains())
+        self.w.answers.clear()
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        self.w.answers.append(wait())
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"], e["lastStop"]["code"]), ("queued", 1, "checks_stuck"))
+        # a check still pending is watched through the cache (no judgment while it runs); the first judgment after
+        # that wait reads the same unmoved head and stops it again at once
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"), e.get("stop"))
+        self.assertEqual(len(self.w.explains()), judged + 1)  # one probe, not another 4 h of waits
+        self.w.answers.clear()
+        self.assertEqual(len(self.w.sent()), sent)  # the requester was told at the first stop and not again
+        # the status posts green: the next re-arm reads it and the same head lands, with nobody requeueing it
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 2))
+        self.tick()
+        self.assert_merged_at(LA)
+
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)
         self.land()
@@ -34018,7 +34107,7 @@ class LandTest(Base):
     def test_a_reviewer_that_cannot_start_is_re_armed_while_a_review_verdict_is_not(self):
         # "could not run the reviewer here" can clear by itself (a link, a deploy); a BLOCK verdict is a judgment.
         self.assertTrue(gg.LAND_REARM_CODES.match("review_cannot_start"))
-        for verdict in ("block", "review_failed", "chat_hold", "own_red"):
+        for verdict in ("block", "review_failed", "chat_hold"):
             self.assertIsNone(gg.LAND_REARM_CODES.match(verdict), verdict)
         self.pr(LA)
         self.land()
@@ -34757,6 +34846,58 @@ class LandTest(Base):
         q.jobs["pr:o/r#1"] = fut
         q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "judging"}
         self.assertTrue(self.daemon.land_busy())
+
+    def test_an_update_is_not_held_by_a_judgment_it_hands_over(self):
+        # lane-9, 2026-11-24: a fast-patch waited 145 s for "5 land step(s) running", all judgments (judge_handed)
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        self.assertTrue(q.handover)
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs["pr:o/r#1"] = fut
+        q.judging["pr:o/r#1"] = (time.monotonic(), 300.0)
+        self.assertFalse(self.daemon.land_busy())
+        q.jobs["pr:o/r#2"] = fut  # a step outside a judgment (a merge): still drained
+        self.assertTrue(self.daemon.land_busy())
+
+    def test_a_judgment_outlives_a_reexec_and_the_next_daemon_reads_its_answer(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        argv = [sys.executable, "-c", "print('fresh')"]
+        got = q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ))
+        self.assertEqual((got.returncode, got.stdout.strip()), (0, "fresh"))
+        self.assertEqual(list((gg.land_dir() / gg.LAND_JUDGING_DIR).iterdir()), [])  # its files go with its answer
+        # the previous image's child, still running: same argv, so its answer is read, not judged again
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name("pr:o/r#1")
+        stem = meta.parent / f"{meta.stem}.old"
+        old = subprocess.Popen(["/bin/sh", "-c", f'sleep 1; echo handed > "{stem}.out"; echo 3 > "{stem}.rc"'])
+        gg.write_json(meta, {"argv": argv, "run": "old", "pid": old.pid, "at": time.time(), "deadline": time.time() + 30})
+        try:
+            got = q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ))
+        finally:
+            old.wait(timeout=10)
+        self.assertEqual((got.returncode, got.stdout.strip()), (3, "handed"))
+        self.assertEqual(list(meta.parent.iterdir()), [])
+        # one whose child is gone with no answer (killed, a zombie until reaped), or with another argv, is judged afresh
+        dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        time.sleep(0.3)  # ended, not reaped: kill(pid, 0) still answers
+        gg.write_json(meta, {"argv": argv, "run": "dead", "pid": dead.pid, "at": time.time(), "deadline": time.time() + 30})
+        started = time.monotonic()
+        self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertLess(time.monotonic() - started, 10)
+        gg.write_json(meta, {"argv": argv + ["x"], "run": "other", "pid": os.getpid(), "at": time.time(),
+                             "deadline": time.time() + 30})
+        self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertEqual(list(meta.parent.iterdir()), [])
+
+    def test_a_handed_judgment_past_its_bound_times_out(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        with self.assertRaises(subprocess.TimeoutExpired):
+            q.judge_handed("pr:o/r#1", [sys.executable, "-c", "import time; time.sleep(30)"], 1.0, dict(os.environ))
 
     def test_the_latch_holds_only_lands_with_no_unlatched_source(self):
         # huge-blue, 2026-11-18 15:24Z: the login's GraphQL latched, 382 open lands, workers busy=0, nothing judged,
@@ -41982,6 +42123,71 @@ class StableTempNameTests(unittest.TestCase):
         if not source:
             self.skipTest("glaeda-gh source not found")
         self.assertNotRegex(source, r"with_name\(f\"\.\{path\.name\}\.\{os\.getpid\(\)\}")
+
+
+class MainWatchTriggersFastPatch(unittest.TestCase):
+    """The main watch: an anonymous ls-remote of glaeda main, and `fast-patch glaeda TIP` when main moved."""
+
+    TIP = "a" * 40
+    LIVE = "b" * 40
+
+    def ls_remote(self, out: str, code: int = 0):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, code, out, "")
+        return runner, calls
+
+    def test_tip_from_an_anonymous_ls_remote(self):
+        runner, calls = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+        self.assertEqual(gg.main_tip(runner), self.TIP)
+        self.assertIn("credential.helper=", calls[0])  # no login asked for: the repo is public
+        self.assertEqual(gg.main_tip(self.ls_remote("", 128)[0]), None)
+        self.assertEqual(gg.main_tip(self.ls_remote("junk\n")[0]), None)
+
+    def test_due_only_when_main_moved_and_not_after_a_rollback(self):
+        due = gg.main_watch_due
+        self.assertIsNone(due(self.TIP, self.TIP, {}, [], 100.0))
+        self.assertEqual(due(self.TIP, self.LIVE, {}, [], 100.0), "first try")
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 90.0}, [], 100.0))  # in flight
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "rolled-back"}], 9e9))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "live"}], 9e9))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 50.0}, [{"outcome": "refused"}], 100.0))
+        self.assertTrue(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "refused"}], 500.0))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 3, "at": 0.0}, [{"outcome": "refused"}] * 3, 9e9))
+
+    def test_a_step_starts_one_run_and_remembers_it_across_a_reexec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            runner, _ = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+            spawned = []
+            clock = [1000.0]
+            watch = gg.MainWatch("/bin/fast-patch", state, runner,
+                                 lambda argv, **kw: spawned.append((argv, kw)), lambda: clock[0])
+            self.assertEqual(watch.step(), "first try")
+            self.assertEqual(spawned[0][0], ["/bin/fast-patch", "glaeda", self.TIP, "--json"])
+            self.assertEqual(spawned[0][1]["env"]["FAST_PATCH_TRIGGER"], "main-watch")
+            clock[0] += 3
+            again = gg.MainWatch("/bin/fast-patch", state, runner, lambda argv, **kw: spawned.append(argv),
+                                 lambda: clock[0])  # the image after the patch's re-exec
+            self.assertIsNone(again.step())  # in flight: its line is not written yet
+            self.assertEqual(len(spawned), 1)
+            gg.write_json(state / "glaeda" / "live.json", {"commit": self.TIP, "tools": {"glaeda-gh": "sha-new"}})
+            with mock.patch.dict(gg.RUNNING_SCRIPT, {"scriptSha256": "sha-new"}):
+                self.assertIsNone(again.step())  # live: nothing to do
+            self.assertEqual(len(spawned), 1)
+
+    def test_a_failing_read_backs_off(self):
+        watch = gg.MainWatch("/bin/fast-patch", Path(tempfile.gettempdir()), self.ls_remote("", 128)[0],
+                             lambda *a, **k: None)
+        watch.step()
+        watch.step()
+        self.assertEqual(watch.every, gg.MAIN_WATCH_EVERY * 4)
+
+    def test_off_by_env(self):
+        with mock.patch.dict(os.environ, {"GLAEDA_FAST_PATCH_WATCH": "0"}):
+            self.assertIsNone(gg.start_main_watch())
 
 
 if __name__ == "__main__":

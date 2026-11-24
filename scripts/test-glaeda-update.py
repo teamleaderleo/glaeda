@@ -1113,6 +1113,47 @@ class UpdateTest(unittest.TestCase):
         with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
             self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
 
+    def test_the_minute_probe_starts_a_full_run_when_a_canary_soak_ends(self) -> None:
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
+        with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
+            gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": now + 300}, self.state)
+            self.assertEqual(gu.probe_gate(self.config, now + 299, self.state)[0::2], (False, "unchanged"))
+            self.assertEqual(gu.probe_gate(self.config, now + 300, self.state)[0::2], (True, "soak ended"))
+            gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": True}, self.state)  # malformed: ignored
+            self.assertEqual(gu.probe_gate(self.config, now + 300, self.state)[0::2], (False, "unchanged"))
+
+    def test_a_reporting_canary_records_when_its_post_soak_nudge_falls_due(self) -> None:
+        entry = {"tag": "r-20260925-" + "a" * 12, "published": "2026-09-25T00:00:00Z", "policy": {"soakHours": 0.25}}
+        soaked = gu.parse_utc("2026-09-25T00:15:00Z")
+        canary = {"ring": "canary", "reportStatus": True}
+        self.assertEqual(gu.nudge_pending_at(canary, {"result": "updated"}, entry, None, soaked - 600), soaked)
+        self.assertEqual(gu.nudge_pending_at(canary, {"result": "current"}, entry, None, soaked - 1), soaked)
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, entry, None, soaked))  # nudged this run
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, entry, entry["tag"], soaked - 1))
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "backoff"}, entry, None, soaked - 1))
+        self.assertIsNone(gu.nudge_pending_at({**canary, "reportStatus": False}, {"result": "current"}, entry, None, 0))
+        self.assertIsNone(gu.nudge_pending_at({**canary, "ring": "stable"}, {"result": "current"}, entry, None, 0))
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, {**entry, "published": "x"}, None, 0))
+
+    def test_main_keeps_the_soak_end_in_the_probe_after_a_full_run(self) -> None:
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value=seen), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "updated", "soakEndsAt": 123.0}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gu.main(["--apply"]), 0)
+        self.assertEqual(gu.load_probe(self.state)["soakEndsAt"], 123.0)
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value=seen), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "current"}), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(gu.main(["--apply"]), 0)  # soak ended: a full run, which clears it
+        self.assertEqual(json.loads(printed.getvalue())["trigger"], "soak ended")
+        self.assertNotIn("soakEndsAt", gu.load_probe(self.state))
+
     def test_main_probes_silently_and_records_the_probe_after_a_full_run_even_one_that_fails(self) -> None:
         seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
         now = time.time()
@@ -1411,9 +1452,14 @@ class UpdateTest(unittest.TestCase):
         soak = float(entry["policy"]["soakHours"]) * 3600
         self.assertGreater(soak, 120)
         with mock.patch.object(gu, "nudge_promotion", return_value="dispatched") as nudge:
-            self.assertEqual(self.apply(published + 60)["promotion"], "dispatched")  # the install's nudge
+            installed = self.apply(published + 60)
+            self.assertEqual(installed["promotion"], "dispatched")  # the install's nudge
             self.assertNotIn("nudged", self.converge())
-            self.assertNotIn("promotion", self.apply(published + 120))  # current, still soaking
+            current = self.apply(published + 120)
+            self.assertNotIn("promotion", current)  # current, still soaking
+            # a canary that posts no status holds no quorum, so its probe waits for nothing
+            self.assertFalse(self.config["reportStatus"])
+            self.assertNotIn("soakEndsAt", current)
             self.assertEqual(self.apply(published + soak + 3600)["promotion"], "dispatched")  # after the soak
             self.assertEqual(self.converge()["nudged"], entry["tag"])
             self.assertNotIn("promotion", self.apply(published + soak + 7200))  # once per release
