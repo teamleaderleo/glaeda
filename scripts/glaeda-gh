@@ -12955,7 +12955,8 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # seen (pin_wait), so nothing asked for a read. So an entry whose copy was older than LAND_OWN_REFRESH_AFTER at its last land request
 # (requestedAt, a re-request's too), and is not read since, is read directly here too (direct_read, as on an upstream host), at most every LAND_OWN_REFRESH_AFTER per entry and
 # LAND_OWN_REFRESH_MAX per LAND_WINDOW_S per host: a PR read is a handful of requests, so the cap costs well under one
-# percent of an hour's login quota however many entries the queue holds.
+# percent of an hour's login quota however many entries the queue holds. The same budget recovers an active checks
+# wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
 
@@ -18722,8 +18723,8 @@ class LandQueue:
 
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
-        LAND_REFRESH_AFTER (see there); on a host with its own login, a direct read of a due entry's PR whose copy is
-        that was older than LAND_OWN_REFRESH_AFTER at its last land request. Started on a worker: True when one was started (or waits for one)."""
+        LAND_REFRESH_AFTER. On a host with its own login, read a stale copy seen at enqueue or a stale exact-head
+        check wait. The recovery sweep revisits quiet PR waits and the same per-entry and host budgets cover both."""
         at = (c or {}).get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
@@ -18733,17 +18734,24 @@ class LandQueue:
         every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
         if isinstance(last, (int, float)) and self.now - last < every:
             return False
+        checks_wait = False
         if own:
-            # A host with its own login: the nudge reads it in the daemon's waited pass, unless the copy was already
-            # older than LAND_OWN_REFRESH_AFTER when the entry's last land request came (see there) and no read has
-            # answered since, within the host's hourly cap
+            wait = e.get("wait") or {}
+            head = str(wait.get("sha") or "")
+            checks_wait = (e["state"] == "waiting" and not self.due(e) and wait.get("kind") == "pr"
+                           and not wait.get("rerun") and self.now - at >= LAND_OWN_REFRESH_AFTER
+                           and (wait.get("why") == "checks running"
+                                or (e.get("explain") or {}).get("code") == "checks_running")
+                           and land_checks_running(c.get("data") or {}, head))
+            # A PR read after enqueue can still be the last copy we have of a running head. A quiet webhook
+            # feed does not establish that it is still running. The recovery sweep shares the usual read budget.
             self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]
             asked = e.get("requestedAt")
-            if not isinstance(asked, (int, float)) or isinstance(asked, bool) \
-                    or asked - at < LAND_OWN_REFRESH_AFTER \
-                    or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
+            stale_request = (isinstance(asked, (int, float)) and not isinstance(asked, bool)
+                             and asked - at >= LAND_OWN_REFRESH_AFTER)
+            if (not stale_request and not checks_wait) or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
                 return False
-        if self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
+        if not checks_wait and self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
             if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
                 e["feedNoRefresh"] = at
                 self.count("feed_norefresh")
