@@ -4256,6 +4256,52 @@ DIRECT_GET_SHARE = 25.0
 DIRECT_GET_RETRY_MIN = 5.0
 
 
+# The broker's refusal of a read for the read Apps' reserve ("read Apps busy ... at its reserve", lane-gh's floor and
+# lane share, "busy: N GitHub reads already in flight") holds every direct read on this host, a waiter's, a land
+# worker's or `status`'s (one file, so every process sees it), for the wait it names (or DIRECT_BUSY_HOLD), doubling per
+# refusal in a row up to DIRECT_BUSY_HOLD_MAX; any answer ends it. Before, each of a VM's waits and land entries asked
+# again every few seconds through a refused window (:20-:52 of every hour; a lane VM's ledger 2026-11-23 23:50Z-00:30Z:
+# 540 refused asks against 22 sent), each ask a lane-gh process and each full read's first GETs (the pull, the issue)
+# paid before a later one was refused, then read again whole when the window opened: every VM at the same minute, the
+# reserve drained by the backlog (rest_breakdown of manaflow-ai/cmux, 2026-11-23 23:00Z-01:00Z: glaeda-upstream 4,963
+# App requests an hour, the fleet's largest caller).
+DIRECT_BUSY_FILE = "direct-busy.json"  # under BASE: {"until": t, "n": refusals in a row}
+DIRECT_BUSY_HOLD = 60.0
+DIRECT_BUSY_HOLD_MAX = 300.0
+DIRECT_BUSY_RE = re.compile(r"read Apps busy|at its reserve|reads already in flight|lane share|read floor|\bfloor\b",
+                            re.IGNORECASE)
+DIRECT_BUSY_WAIT_RE = re.compile(r"retry after (\d+)\s*s", re.IGNORECASE)
+
+
+def direct_busy_until(now: float) -> float | None:
+    """When the hold on this host's direct reads ends (DIRECT_BUSY_FILE), or None: none, or past."""
+    doc = read_json(BASE / DIRECT_BUSY_FILE)
+    until = doc.get("until") if isinstance(doc, dict) else None
+    return float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now else None
+
+
+def direct_busy_note(text: str | None, now: float) -> None:
+    """Record one direct GET's outcome: a refusal (TEXT names the reserve) starts or doubles the hold, an answer
+    (TEXT None) ends it. Best effort: a lost write costs a read."""
+    try:
+        doc = read_json(BASE / DIRECT_BUSY_FILE)
+        doc = doc if isinstance(doc, dict) else {}
+        if text is None:
+            if doc:
+                write_json(BASE / DIRECT_BUSY_FILE, {})
+            return
+        if not DIRECT_BUSY_RE.search(text):
+            return
+        if float(doc.get("until") or 0) > now:
+            return  # one outage, counted once: reads started before the hold was set
+        n = int(doc.get("n") or 0) + 1 if now - float(doc.get("until") or 0) < DIRECT_BUSY_HOLD_MAX else 1
+        said = DIRECT_BUSY_WAIT_RE.search(text)
+        hold = min(DIRECT_BUSY_HOLD_MAX, max(float(said.group(1)) if said else 0.0, DIRECT_BUSY_HOLD * 2 ** (n - 1)))
+        write_json(BASE / DIRECT_BUSY_FILE, {"until": now + hold, "n": n, "why": text[:160]})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
     """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
     (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
@@ -4272,6 +4318,10 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
                                                    f"not {method} {parts.path}"}).encode()
         args = {"path": urllib.parse.unquote(m.group(2)),
                 "query": dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))}
+        held = direct_busy_until(time.time())
+        if held is not None:
+            # a refusal for the reserve holds every direct read here (DIRECT_BUSY_FILE): nothing is run or sent
+            raise WatchError(f"direct: busy: the read Apps are at their reserve; held {int(held - time.time())}s more")
         for attempt in range(2):
             left = min(UPSTREAM_DEADLINE, deadline() - time.monotonic())
             if left <= 0:
@@ -4299,8 +4349,14 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         status = answer.get("status")
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
+            direct_busy_note(why, time.time())
             return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
-        return status, {}, json.dumps(answer.get("data")).encode()
+        data = answer.get("data")
+        if status == 403 and isinstance(data, dict) and isinstance(data.get("message"), str):
+            direct_busy_note(data["message"], time.time())
+        elif status < 400:
+            direct_busy_note(None, time.time())
+        return status, {}, json.dumps(data).encode()
     return send
 
 
@@ -5836,6 +5892,7 @@ class Daemon:
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
+        self.rules_ttl = REST_REPO_PART_TTL  # a direct read through the broker keeps a base's rulesets longer
         # False for that read too: the broker answers no ETag (broker_transport), so an issues/N read can never vouch
         # for a kept pull (rest_pull's 304 probe) and is not sent (DIRECT_PARTS says what that read cost).
         self.etags = True
@@ -11721,7 +11778,7 @@ class Daemon:
             listed = checks["check_runs"]
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
-            required = set(self.repo_part(old, parts, rules, slim_rules, []))
+            required = set(self.repo_part(old, parts, rules, slim_rules, [], ttl=self.rules_ttl))
             if not self.reads_protection:
                 # The base's classic protection is not read here (reads_protection): the checks GraphQL last
                 # called required stay required, beside the rulesets' read now.
@@ -26798,6 +26855,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
                 transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                 controller=None, upstream=None)
             daemon.reads_protection = False
+            daemon.rules_ttl = DIRECT_RULES_TTL
             daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
         else:
             daemon = Daemon(controller=None, upstream=None)
@@ -26877,6 +26935,16 @@ def direct_read(req: dict) -> str | None:
 DIRECT_PARTS = "direct-parts.json"  # under BASE (read when used: tests move BASE)
 DIRECT_PARTS_RE = re.compile(r"^/repos/[^/]+/[^/]+/(?:rules/branches/[^?]+|actions/workflows)\?")
 DIRECT_PARTS_MAX = 200
+# ... and the base's rulesets (rules/branches/B) that long: a required check added or dropped on a base is rare, the
+# broker host's own daemon still reads them every REST_REPO_PART_TTL, and a land judges on the host that merges. The
+# fleet's lane VMs each re-read manaflow-ai/cmux's rules/branches/main every 10 minutes: rest_breakdown, 2026-11-23
+# 23:00Z-01:00Z, 380 App requests (190 an hour, about one an hour per VM that reads cmux and every one the same answer).
+DIRECT_RULES_TTL = 3600
+DIRECT_RULES_RE = re.compile(r"^/repos/[^/]+/[^/]+/rules/branches/")
+
+
+def direct_part_ttl(path: str) -> float:
+    return DIRECT_RULES_TTL if DIRECT_RULES_RE.match(path) else REST_REPO_PART_TTL
 
 
 def direct_parts_load(now: float) -> dict[str, dict]:
@@ -26888,7 +26956,7 @@ def direct_parts_load(now: float) -> dict[str, dict]:
     return {path: v for path, v in parts.items()
             if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("part"), dict)
             and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)
-            and 0 <= now - v["at"] < REST_REPO_PART_TTL}
+            and 0 <= now - v["at"] < direct_part_ttl(path)}
 
 
 def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
