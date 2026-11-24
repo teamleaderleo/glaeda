@@ -18524,8 +18524,12 @@ class SpendAlarmTest(AlarmBase):
         again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
         self.assertEqual(again.alarms, {})
 
-    def test_the_pool_alarm_fires_under_rest_left_and_only_where_the_policy_asks(self) -> None:
-        self.seen(800, NOW, NOW + 1200)
+    def test_the_pool_alarm_fires_under_the_reserve_and_only_where_the_policy_asks(self) -> None:
+        self.seen(800, NOW, NOW + 1200)  # under restLeft, no drain measured: no alarm on a count alone
+        self.policy(pool=True)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.seen(200, NOW + 30, NOW + 1200)  # under the 300 reserve
         self.policy(pool=False)
         self.daemon.check_alarms()
         self.assertEqual(self.told_lines(), [])
@@ -18533,12 +18537,34 @@ class SpendAlarmTest(AlarmBase):
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
-        self.assertIn("--severity warn", told[0])
-        self.assertIn("800 left", told[0])
+        self.assertIn("--severity fire", told[0])
+        self.assertIn("200 left", told[0])
+
+    def test_a_pool_on_track_to_its_reset_is_no_alarm(self) -> None:
+        """Leo, 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool on cosmic-gray: 587 left, draining
+        112.6/min ..., dry at 12:28Z, resets 12:29Z.": "ok... if it's right on track, why is it even firing? dont fire
+        for bullshit". Dry less than 5 minutes before the reset lasts to it; 5 or more before is the alarm."""
+        self.policy(pool=True)
+        reset = NOW + 300 + 360  # the reset 6 minutes after the second reading
+        self.seen(1150, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(587, NOW + 300, reset)  # 112.6 a minute: dry 5.2 min later, 0.8 min before the reset
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual(self.notice_lines(), [])
+        late = NOW + 1000 + 312 + 20 * 60  # the next window's same drain, its reset 20 minutes after it runs dry
+        self.seen(1150, NOW + 700, late)
+        self.daemon.check_alarms()
+        self.seen(587, NOW + 1000, late)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity fire", told[0])
+        self.assertIn("587 left, draining 112.6/min", told[0])
 
     def test_a_cleared_alarm_says_so_once_and_a_restart_does_not_resend(self) -> None:
         self.policy(pool=True)
-        self.seen(800, NOW, NOW + 1200)
+        self.seen(250, NOW, NOW + 1200)
         self.daemon.check_alarms()
         self.seen(1500, NOW + 30, NOW + 1200)
         self.daemon.check_alarms()
@@ -18546,7 +18572,7 @@ class SpendAlarmTest(AlarmBase):
         again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
         again.clock_real = False
         again.policy = self.daemon.policy
-        again.now, again.budget = NOW + 60, {"rest": {"limit": 5000, "remaining": 700, "reset": NOW + 1200,
+        again.now, again.budget = NOW + 60, {"rest": {"limit": 5000, "remaining": 250, "reset": NOW + 1200,
                                                       "seenAt": NOW + 60}}
         again.check_alarms()
         self.assertEqual(len(self.told_lines()), 1)  # within the hour of the first
@@ -18688,7 +18714,9 @@ class SpendAlarmTest(AlarmBase):
 
     def test_the_pool_alarm_fires_at_half_the_hourly_limit_and_names_who_spent_it(self) -> None:
         """2026-11-10 11:23Z: the pool drained 158 a minute and the alarm came 25 minutes before dry, naming only this
-        daemon's routes. Past half the limit's pace it fires, and names the host's top callers and each route's waiter."""
+        daemon's routes. A drain that runs it dry before the reset is named with its pace (past half the limit's), the
+        host's top callers and each route's waiter; the same pace that lasts to the reset is no alarm (Leo,
+        2026-11-22: "if it's right on track, why is it even firing? dont fire for bullshit")."""
         self.policy(pool=True)
         self.spenders([{"caller": "tool:pr_owner.py", "rest": 900, "graphql": 3, "source": "gh shim"},
                        {"caller": "gcp-agent-lane-2", "rest": 1200, "graphql": 0, "source": "lane-gh-broker"},
@@ -18699,21 +18727,24 @@ class SpendAlarmTest(AlarmBase):
         self.seen(4700, NOW + 300, reset)  # 40 a minute: under half of 5000 an hour (41.7)
         self.daemon.check_alarms()
         self.assertEqual(self.told_lines(), [])
+        self.seen(4300, NOW + 600, reset)  # 60 a minute over the 10: past half the limit, dry in 72 min, after the reset
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])  # on track to the reset: no alarm
         self.daemon.transport = lambda *a: (200, {}, b"{}")
         with self.daemon.calling("pr", "o/r", "session:lane-7"):
             for n in range(5):
                 self.daemon.request("GET", f"/repos/o/r/pulls/{n}")
-        self.seen(4300, NOW + 600, reset)  # 60 a minute over the 10: dry in 72 minutes, after the reset
+        self.seen(3100, NOW + 900, reset)  # 120 a minute over the 15: dry 26 minutes out, 9 before the reset
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
         self.assertIn("--severity warn", told[0])
-        self.assertIn("draining 60.0/min (past 50% of its 5000 an hour, 42/min)", told[0])
+        self.assertIn("draining 120.0/min (past 50% of its 5000 an hour, 42/min)", told[0])
         self.assertIn("GET /repos/{owner}/{repo}/pulls/{id} 5 (pr o/r; waiter session:lane-7)", told[0])
         self.assertIn("last hour: gcp-agent-lane-2 1200 (lane-gh-broker); tool:pr_owner.py 900 (gh shim).", told[0])
         self.assertNotIn("session:quiet", told[0])
         self.assertEqual(self.notice_lines()[-1]["data"]["spenders"][0]["caller"], "gcp-agent-lane-2")
-        # the pool spent 5000 - 4300 = 700 since its window opened; this host's callers logged 2100 in the hour: no gap
+        # the pool spent 5000 - 3100 = 1900 since its window opened; this host's callers logged 2100 in the hour: no gap
         self.assertNotIn("in no log on", told[0])
         self.assertEqual((self.notice_lines()[-1]["data"]["hostRest"], self.notice_lines()[-1]["data"]["unlogged"]),
                          (2100, None))
@@ -18723,7 +18754,7 @@ class SpendAlarmTest(AlarmBase):
         self.policy(pool=True)
         self.spenders([{"caller": "gcp-agent-lane-2", "rest": 900, "graphql": 0, "source": "lane-gh-broker"}])
         reset = NOW + 1200  # the window opened 40 min ago
-        self.seen(2000, NOW, reset)
+        self.seen(3000, NOW, reset)  # 200 a minute: dry 5 minutes before the reset
         self.daemon.check_alarms()
         self.seen(1000, NOW + 600, reset)
         self.daemon.check_alarms()
@@ -18741,7 +18772,7 @@ class SpendAlarmTest(AlarmBase):
                        {"caller": "host-a/tool:x", "rest": 900, "graphql": 0, "source": "gh shim",
                         "host": "host-a"}])
         reset = NOW + 1200
-        self.seen(2000, NOW, reset)
+        self.seen(3000, NOW, reset)  # 200 a minute: dry 5 minutes before the reset
         self.daemon.check_alarms()
         self.seen(1000, NOW + 600, reset)
         self.daemon.check_alarms()
@@ -19430,7 +19461,7 @@ class SpendAlarmTest(AlarmBase):
 
     def test_an_unreadable_spenders_list_still_sends_the_alarm(self) -> None:
         self.policy(pool=True)
-        self.seen(800, NOW, NOW + 1200)
+        self.seen(200, NOW, NOW + 1200)
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
@@ -19440,7 +19471,9 @@ class SpendAlarmTest(AlarmBase):
     def test_an_alarm_with_no_inbox_still_writes_its_notice(self) -> None:
         gg.ALARM_CMD = Path(self.tmp.name) / "missing"
         self.policy(pool=True)
-        self.seen(500, NOW, NOW + 1200)
+        self.seen(4000, NOW, NOW + 3000)
+        self.daemon.check_alarms()
+        self.seen(3400, NOW + 300, NOW + 3000)  # 120 a minute: dry 28 minutes out, 17 before the reset
         self.daemon.check_alarms()
         self.assertEqual(self.notice_lines()[0]["data"]["severity"], "warn")
 
