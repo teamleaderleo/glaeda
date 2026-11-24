@@ -22807,6 +22807,38 @@ class ReexecDrainTest(Base):
         os.utime(path, ns=(seen["stat"][0] + 3 * 10**9, seen["stat"][0] + 3 * 10**9))
         self.assertFalse(gg.script_changed(path, seen))
 
+    def test_a_swapped_script_ends_the_tick_and_wakes_serve(self) -> None:
+        """A lane VM, 2026-11-24: merge a8f8c140 went live 15 s after it merged, 7 s of them a tick finishing after
+        fast-patch swapped the bytes. ScriptWake ends the tick and the TICK sleep once per new content."""
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        daemon = types.SimpleNamespace(tick_deadline=float("inf"), script_cut=False)
+        wake = gg.ScriptWake(path, gg.hashlib.sha256(b"one").hexdigest(), daemon)
+        self.assertFalse(wake.check())
+        self.assertEqual(daemon.tick_deadline, float("inf"))
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"one")
+        later.replace(path)  # same bytes reinstalled: no wake
+        self.assertFalse(wake.check())
+        self.assertFalse(wake.event.is_set())
+        later.write_bytes(b"two")
+        later.replace(path)  # fast-patch's swap
+        before = time.monotonic()
+        self.assertTrue(wake.check())
+        self.assertLessEqual(daemon.tick_deadline, time.monotonic())
+        self.assertGreaterEqual(daemon.tick_deadline, before)
+        self.assertTrue(daemon.script_cut, "a tick that starts before serve sees the change gets no budget")
+        daemon.tick_deadline, daemon.script_cut = float("inf"), False  # serve saw it; the next tick
+        self.assertFalse(wake.check(), "one wake per new content")
+        self.assertEqual(daemon.tick_deadline, float("inf"))
+        started = time.monotonic()
+        wake.sleep(5.0)
+        self.assertLess(time.monotonic() - started, 1.0, "the woken sleep returns at once")
+        self.assertFalse(wake.event.is_set(), "and only once: a held re-exec sleeps TICK again")
+        later.write_bytes(b"three")
+        later.replace(path)
+        self.assertTrue(wake.check(), "a later swap wakes again")
+
     def serve_over(self, rewrite: bytes) -> list:
         """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
         script = Path(self.tmp.name) / "bin" / "glaeda-gh"
@@ -22817,7 +22849,7 @@ class ReexecDrainTest(Base):
             pass
 
         class Idle:
-            valve_due, reexec_waiting, reexec_finish_until, ticks = None, False, None, 0
+            valve_due, reexec_waiting, reexec_finish_until, ticks, land_queue = None, False, None, 0, None
 
             def tick(self) -> dict:
                 self.ticks += 1
@@ -27750,6 +27782,40 @@ class LandTest(Base):
                          ["repeat"] * gg.LAND_REARM_CAP)
         e = self.tick(gg.LAND_REARM_AFTER * 3)
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
+
+    def test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts(self):
+        # 2026-11-24, one lane's queue after 10.5 h idle: 5 of its 5 open PRs stopped, none on a red of its own; one
+        # stopped checks_stuck on a status that never posted, and a stopped row reads nothing, so a status posting
+        # after the stop was never seen. Still unmoved at the same head: one probe, stopped again at once, quietly.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms stay inside one UTC day
+        self.assertTrue(gg.LAND_REARM_CODES.match("checks_stuck"))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        sent, judged = len(self.w.sent()), len(self.w.explains())
+        self.w.answers.clear()
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        self.w.answers.append(wait())
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"], e["lastStop"]["code"]), ("queued", 1, "checks_stuck"))
+        # a check still pending is watched through the cache (no judgment while it runs); the first judgment after
+        # that wait reads the same unmoved head and stops it again at once
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"), e.get("stop"))
+        self.assertEqual(len(self.w.explains()), judged + 1)  # one probe, not another 4 h of waits
+        self.w.answers.clear()
+        self.assertEqual(len(self.w.sent()), sent)  # the requester was told at the first stop and not again
+        # the status posts green: the next re-arm reads it and the same head lands, with nobody requeueing it
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 2))
+        self.tick()
+        self.assert_merged_at(LA)
 
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)

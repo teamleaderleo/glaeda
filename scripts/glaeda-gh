@@ -298,7 +298,7 @@ when this file changes, so an update takes effect without a restart.
   (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land_judge names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, 3 identical
   refusals in a row of a step that is not a wait (a named update-branch never counts: it is sent once per head), or a
-  wait past its bound (checks: 4 h with none moving, checks_stuck; a review, a retry or a cancelled job's
+  wait past its bound (checks: 4 h with none moving, checks_stuck, re-armed hourly as a red is; a review, a retry or a cancelled job's
   rerun: 2 h, `<kind>_deadline`; an unreadable retry, a read that could not complete: 6 h). A land --after one that stopped keeps waiting for it (24 h): landing or merging
   the stopped one resumes the chain. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
@@ -6075,6 +6075,7 @@ class Daemon:
         self.plain_at: dict[str, float] = {}  # kind, or "rest" -> last read of a watch nothing is blocked on
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
+        self.script_cut = False  # ScriptWake saw a new glaeda-gh: a tick starting now gets no budget (serve clears it)
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
@@ -7255,7 +7256,7 @@ class Daemon:
             try:
                 self.read_rate_limit()
             finally:
-                self.tick_deadline = deadline
+                self.tick_deadline = min(deadline, self.tick_deadline)  # a ScriptWake cut in the window stands
         seen = self.budget.get(pool)
         return dict(seen) if isinstance(seen, dict) else None
 
@@ -9234,7 +9235,7 @@ class Daemon:
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
-        self.tick_deadline = time.monotonic() + TICK_BUDGET
+        self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -14202,7 +14203,16 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
 # A red that is the PR's own stays stopped, and costs one probe to say so: the re-arm keeps the wait budget, the
 # second judgment reads the same red and stops at once, LAND_STOP_REPEAT keeps that quiet for the requester, and
 # LAND_REARM_CAP bounds it at 3 re-asks per entry per UTC day.
-LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|[a-z_]+_transient)$")
+# checks_stuck is re-armed on the same reading: "no check at HEAD moved in 4 h" is a fact about the checks, not the
+# head, and a check that posts after the stop (a status poster that came back, a runner that took the job, a base that
+# moved and turned the verdict into a base merge) was never seen, because a stopped row reads nothing. One lane's
+# queue, 2026-11-24, after it sat idle 10.5 h: 5 of its 5 open PRs were stopped, none on a red in its own change, one
+# of them checks_stuck on a status that never posted; every one waited for its session to requeue it by hand. The
+# re-arm keeps waitRefused (keyed by head), so a check still unmoved at the same head stops it again at the first wait
+# refusal: one probe, quiet (LAND_STOP_REPEAT), at most LAND_REARM_CAP a day. Detector: test-glaeda-gh.py
+# test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|checks_stuck"
+                              r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
 # LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
@@ -23577,6 +23587,48 @@ def script_changed(path: Path, seen: dict) -> bool:
     return True
 
 
+SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
+
+
+class ScriptWake:
+    """The thread that ends a tick when a new glaeda-gh lands. serve noticed a swapped script only after the tick it was
+    in (up to TICK_BUDGET) and its TICK sleep: a lane VM, 2026-11-24, merge a8f8c140 went live 15 s after it merged, 7 s
+    of them a tick finishing after fast-patch had swapped the bytes. This stats the script every SCRIPT_WAKE_EVERY and,
+    on new content, ends the tick (its requests stop at the next tick_deadline check, the rest go first next tick)
+    and wakes serve's sleep, so the re-exec decision (reexec_due) runs within a second. One wake per new content."""
+
+    def __init__(self, path: Path, sha: str, daemon: Any, every: float = SCRIPT_WAKE_EVERY):
+        self.path, self.daemon, self.every = path, daemon, every
+        self.seen = {"stat": script_stat(path), "sha": sha}  # its own copy: serve's is not shared across threads
+        self.event = threading.Event()
+        self.woken: tuple | None = None  # the stat it last woke serve for
+
+    def check(self) -> bool:
+        """One stat; True when it woke serve."""
+        if not script_changed(self.path, self.seen):
+            return False
+        key = self.seen.get("changedStat")
+        if key == self.woken:
+            return False
+        self.woken = key
+        self.daemon.script_cut = True  # a tick that starts before serve sees the change: no budget (Daemon.tick)
+        self.daemon.tick_deadline = time.monotonic()  # the tick running now: its next deadline check stops it
+        self.event.set()
+        log({"event": "script-wake"})
+        return True
+
+    def run(self) -> None:
+        while True:
+            time.sleep(self.every)
+            with contextlib.suppress(OSError):  # a swap's rename: the next stat sees the new file
+                self.check()
+
+    def sleep(self, seconds: float) -> None:
+        """serve's TICK sleep, cut short by a wake."""
+        if self.event.wait(seconds):
+            self.event.clear()
+
+
 # ---------------------------------------------------------------- main watch: a glaeda merge live in seconds
 # Leo, 2026-11-23: "hm. i feel like there should be ways for you guys to incrementally fast-patch controllers and etc
 # etc stuff that goes over network intra network etc". The release ring put a glaeda merge live in p50 1,034 s, p95
@@ -23774,6 +23826,8 @@ def serve(foreground_ok: bool = False) -> int:
     watchdog.start()
     with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
         start_main_watch()
+    wake = ScriptWake(me, seen["sha"], daemon)
+    threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
     last = None
     while True:
         try:
@@ -23791,7 +23845,7 @@ def serve(foreground_ok: bool = False) -> int:
                 log({"event": "error", "error": describe(report), "site": "tick_failed"})
         with contextlib.suppress(Exception):  # noqa: BLE001  a reap that fails is tried again next tick
             reap_children()
-        time.sleep(TICK)
+        wake.sleep(TICK)
         watchdog.beat()
         try:
             if daemon.valve_due is not None:
@@ -23799,6 +23853,8 @@ def serve(foreground_ok: bool = False) -> int:
                 daemon.restart_self()
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = script_changed(me, seen)
+            if changed:
+                daemon.script_cut = False  # serve has seen it: the ticks a held or deferred re-exec runs are whole
             if not changed and daemon.reexec_waiting:
                 # the script is back to the bytes this daemon runs (a reverted install): nothing to re-exec for, so the
                 # drain ends and land steps start again (land_tick)
