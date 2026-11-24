@@ -916,6 +916,17 @@ CONSUMER_WINDOW = 3600
 # also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
 # REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
 HEAD_DIRECT_MAX = 60
+# A head asked after a tick's due phase (`glaeda-gh checks` on a new SHA: a merge gate's bounded wait) is read between
+# that tick's read batches, not at the next tick's due phase. cosmic-gray, 2026-11-23 23:17-23:49Z: ticks ran 1.5-5 min
+# (PR reads took 483 of 614 s), the lane-gh broker's land waits 20 s for an unread head (next_autoland
+# CACHED_WEBVIEW_WAIT_S) after its 45 s live read, and fs-agent-lane-18's lands of cmux#52295, #52646, #52773 and
+# #52296 were refused six times "glaeda-gh holds no checks for SHA (not read yet)": 93e83cd2 was asked at 23:37:35Z
+# and read at 23:41:22Z, at the next tick. Looked for every HEADS_BETWEEN_EVERY s, at most one GraphQL batch or
+# HEADS_BETWEEN_REST REST heads a look and HEADS_BETWEEN_TICK_MAX a tick, newest ask first, so a flood of asks (the
+# land queue's, glaeda#2489) keeps its turn at the tick's due phase and never takes the tick from the waited PRs.
+HEADS_BETWEEN_EVERY = 5.0
+HEADS_BETWEEN_REST = 2
+HEADS_BETWEEN_TICK_MAX = 21
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
@@ -2198,6 +2209,21 @@ def register(key: str, jobs: bool = False, consumer: str | None = None, waited: 
     # losing a concurrent registration costs one watch, and waiting costs the gh call.
     with bounded_lock(watch_dir() / ".register.lock"):
         _register_locked(path, key, jobs, consumer, waited, began, reader, at or {}, once)
+
+
+def watch_entry(key: str, doc: dict, cached: dict | None, touched: float) -> dict:
+    """The daemon's entry for one watch file's DOC (Daemon.watches, Daemon.heads_between): its key, cached answer,
+    last interest (TOUCHED), wait, readers and consumers."""
+    asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
+    waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
+    began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
+    since = doc.get("since")
+    since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+    return {"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": touched,
+            "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
+            "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
+            "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))},
+            "since": since}
 
 
 def stamp_at(now: float, given: Any, prior: Any = None) -> float:
@@ -5991,6 +6017,10 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.heads_between_since = float("inf")  # wall time of this tick's watch read: later asks are read between
+        self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
+        self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
+        self.heads_between_read = 0  # heads a look sent this tick (HEADS_BETWEEN_TICK_MAX)
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
@@ -7586,6 +7616,7 @@ class Daemon:
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
         finally:
             self.now = tick_now
+        self.heads_between()
 
     def content_pause_until(self) -> float:
         """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. The ask runs on its
@@ -8387,16 +8418,7 @@ class Daemon:
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
-            asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
-            waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
-            began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
-            since = doc.get("since")
-            since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
-            entry = {"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
-                     "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
-                     "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
-                     "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))},
-                     "since": since}
+            entry = watch_entry(key, doc, cached, self.now - age)
             if self.once_answered(entry) and self.make_dormant(path, doc, self.now - age):
                 continue
             out.append(entry)
@@ -8592,6 +8614,81 @@ class Daemon:
         if not e["key"].startswith("head:") or (e.get("cache") or {}).get("data"):
             return False
         return any(self.now - t < HEAD_INTEREST for t in (e.get("consumers") or {}).values())
+
+    def heads_between(self) -> None:
+        """Read the heads asked since this tick read its watches that hold no answer, between the tick's read batches
+        (batched, the REST loop and post_between call it), at most every HEADS_BETWEEN_EVERY s: one GraphQL batch, or
+        HEADS_BETWEEN_REST heads over REST, newest ask first. A long tick (minutes, behind a PR backlog) otherwise left
+        a `glaeda-gh checks --wait` on a new head unread until the next tick, past any merge gate's bounded wait. Each
+        is charged as at the due phase (due_heads: the consumer's cap, the mode; a head the due phase already tried
+        this tick waits its retry), and what GraphQL spills is deferred, first next tick. Never raises."""
+        if (self.heads_between_busy or threading.get_ident() != self.tick_thread
+                or self.heads_between_read >= HEADS_BETWEEN_TICK_MAX):
+            return
+        if time.monotonic() - self.heads_between_at < HEADS_BETWEEN_EVERY:
+            return
+        self.heads_between_at = time.monotonic()
+        self.heads_between_busy = True
+        try:
+            self.read_heads_between()
+        except OutOfTime:
+            pass  # the tick's own budget ran out: the tick's next read stops it too
+        except Exception as error:  # noqa: BLE001  a look must never fail the read it sits between
+            self.errors.append(f"heads between reads: {describe(error)} at {error_site(error)}")
+        finally:
+            self.heads_between_busy = False
+
+    def read_heads_between(self) -> None:
+        since = self.heads_between_since
+        asked = []
+        for path in watch_dir().glob("*.json") if watch_dir().is_dir() else []:
+            try:
+                touched = path.stat().st_mtime
+            except OSError:
+                continue
+            if touched < since:
+                continue
+            doc = read_json(path)
+            key = doc.get("key") if isinstance(doc, dict) else None
+            if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
+                continue
+            e = watch_entry(key, doc, read_cache(key), touched)
+            if self.head_unanswered(e):
+                asked.append(e)
+        if not asked:
+            return
+        asked.sort(key=self.head_rank)
+        path = self.paths.get("head") or "graphql"
+        mode = self.mode(path)
+        if self.app_entries_eligible("head", asked, path):
+            mode = "normal"
+        if mode == "stop":
+            due, path = self.due_heads_direct(asked), "rest"
+        else:
+            due = self.due_heads(asked, mode, rest=path == "rest")
+        if not due:
+            return
+        size = max(1, self.batch.get("head") or 1) if path == "graphql" else HEADS_BETWEEN_REST
+        size = min(size, HEADS_BETWEEN_TICK_MAX - self.heads_between_read)
+        due, later = due[:size], due[size:]
+        self.heads_between_read += len(due)
+        for e in later:  # not read now: not charged, and the next look or the next tick's due phase takes it
+            self.refund(e["key"])
+            self.attempted.pop(e["key"], None)
+        # (no phase of its own: the time goes to the read phase it sits in, never counted twice)
+        if path == "graphql":
+            self.defer(self.batched("head", due, self.graphql_fetch["head"]))
+            return
+        for i, e in enumerate(due):
+            try:
+                with self.calling(*caller_of(e["key"]), waiter_of(e)):
+                    self.fetch_head_rest(e)
+            except OutOfTime:
+                self.defer(due[i:])
+                raise
+            except Exception as error:  # noqa: BLE001
+                self.refund(e["key"])
+                self.errors.append(f"{e['key']}: {describe(error)}")
 
     def fed(self, key: str) -> bool:
         """Whether the controller's webhooks cover this key's repository now: its feed answered within
@@ -8953,6 +9050,8 @@ class Daemon:
                 self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        self.heads_between_since = time.time()  # (wall time: a watch file's mtime is when it was asked)
+        self.heads_between_read = 0
         with self.phase("watches"):
             entries = self.watches()
         self.adopt_pace_hold()
@@ -9055,6 +9154,8 @@ class Daemon:
         asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
+                if not e["key"].startswith("head:"):
+                    self.heads_between()  # a head asked meanwhile is read before this one, not next tick
                 if e["key"].startswith("head:") and time.monotonic() >= head_until and i < last_waited \
                         and (asked_read or not self.head_unanswered(e)):
                     self.defer([e], "the heads' share of the tick, waited PRs still to read")
@@ -10034,6 +10135,8 @@ class Daemon:
         to_rest: list[dict] = list(backing_off)
         asked = False  # a query was sent: UNTIL may cut the rest
         while queue:
+            if kind != "head":
+                self.heads_between()  # a head asked meanwhile is read before the next chunk, not next tick
             chunk = queue.pop(0)
             if until is not None and asked and time.monotonic() >= until:
                 self.defer(chunk + [e for c in queue for e in c], f"the {kind}s' share of the tick, waited reads due")
