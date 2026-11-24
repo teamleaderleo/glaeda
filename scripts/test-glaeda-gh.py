@@ -16083,6 +16083,67 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_a_queued_update_branch_is_one_put_with_its_pinned_head_and_needs_no_body(self) -> None:
+        """Leo, 2026-11-23: "never pause. if you have to pause, it means we have to fix things". 16 of 28 paced
+        refusals on one lane VM (2026-11-24) were a bare `gh pr update-branch N`: it is queued instead."""
+        sha = "a" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        self.assertEqual((item["kind"], item["repo"], item["number"], item["expectedHead"], item["body"]),
+                         ("update-branch", "o/r", 7, sha, ""))
+        d, t = self.daemon((202, {}, {"message": "Updating pull request branch.", "url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("PUT", "/repos/o/r/pulls/7/update-branch", {"expected_head_sha": sha})])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        bare = self.queue("update-branch", "o/r#8", stdin="")
+        self.assertNotIn("expectedHead", bare)
+        d, t = self.daemon((202, {}, {"message": "ok"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(t.calls, [("PUT", "/repos/o/r/pulls/8/update-branch", {})])
+
+    def test_a_queued_update_branch_that_can_mean_nothing_more_is_finished_with_a_reason_and_never_retried(self) -> None:
+        cases = [
+            (422, {"message": "There are no new commits on the base branch."}, "posted", "up to date"),
+            (422, {"message": "Validation Failed", "errors": ["expected head sha didn't match current head ref."]},
+             "superseded", "head moved"),
+            (422, {"message": "Cannot update a closed pull request"}, "superseded", "closed or merged"),
+            (404, {"message": "Not Found"}, "superseded", "not found"),
+            (422, {"message": "merge conflict between base and head"}, "failed", None),
+        ]
+        for status, doc, state, word in cases:
+            with self.subTest(doc=doc):
+                item = self.queue("update-branch", "o/r#7", stdin="")
+                d, t = self.daemon((status, {}, doc))
+                self.step(d, NOW)
+                done = gg.post_state(item["id"])
+                self.assertEqual(done["state"], state, done)
+                if word:
+                    self.assertIn(word, done["note"])
+                self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])  # finished, not waiting for a retry
+                self.assertEqual(len(t.calls), 1)
+
+    def test_post_update_branch_takes_no_body_and_only_a_full_sha(self) -> None:
+        with self.assertRaises(gg.WatchError):
+            self.queue("update-branch", "o/r#7", "--body", "x")
+        with self.assertRaises(gg.WatchError):
+            self.queue("update-branch", "o/r#7", "--sha", "abc", stdin="")
+        with self.assertRaises(gg.WatchError):
+            self.queue("comment", "o/r#7", "--sha", "a" * 40, "--body", "x")
+
+    def test_a_lane_vm_queued_update_branch_is_the_brokers_update_branch_tool(self) -> None:
+        sha = "b" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(ran[0][1:4], ["call", "update_branch", "o/r"])
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "expected_head_sha": sha})
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(d.transport.calls, [])
+        item = self.queue("update-branch", "o/r#9", stdin="")
+        d, ran = self.lane_vm((1, {"ok": False, "error": "pull request 9 is closed"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9})
+        self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
+
     def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
         """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
         login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
@@ -16101,7 +16162,8 @@ class PostTest(unittest.TestCase):
             "cat \"$0.$2\"\n")
         lane_gh.chmod(0o755)
         argvs = {"pr": ("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why"),
-                 "comment": ("comment", "o/r#7", "--body", "x")}
+                 "comment": ("comment", "o/r#7", "--body", "x"),
+                 "update-branch": ("update-branch", "o/r#7")}
         self.assertEqual(set(argvs), set(gg.BROKER_POST_TOOLS))  # every kind the broker makes
         lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
         bare = {k: v for k, v in os.environ.items() if k not in lanes}
