@@ -13137,6 +13137,11 @@ def land_direct_read(key: str) -> str | None:
 #   handed off when that step ends; a request for it in the meantime is applied here first, so the handoff carries it.
 LAND_EXECUTOR_KEY = "executor"
 LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's --wait)
+# `reach` ends a far command after 1800 s (REMOTE_TIMEOUT_S in leo-workspace tools/reach). A forwarded land's --wait/--max
+# past it rode that bound and the forward died with "no answer" though the land was queued (#53013, 2026-11-24): the
+# executor's wait is clamped so the answer comes, with the land's state, before reach ends the command.
+LAND_FORWARD_REACH_BOUND = 1800.0
+LAND_FORWARD_MAX_WAIT = LAND_FORWARD_REACH_BOUND - 120.0 - LAND_FORWARD_DEADLINE
 LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
 LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
@@ -22332,9 +22337,9 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
-           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
+           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": min(wait, LAND_FORWARD_MAX_WAIT), "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
-        | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
+        | ({"max": min(Leash(wait, ceiling).ceiling, LAND_FORWARD_MAX_WAIT)} if wait > 0 else {}) \
         | ({"override": override} if override else {}) \
         | ({"nominated": nominated} if nominated is not None else {})
     why = land_forward_pending(name, time.time()) if land_outbox_busy(key) else ""
