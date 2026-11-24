@@ -1261,7 +1261,10 @@ scripts size swift build and test `--jobs`, Swift Testing suites and webview tes
 `CARGO_BUILD_JOBS`, `CMAKE_BUILD_PARALLEL_LEVEL`, `MAKEFLAGS=-jN` and git's `pack.threads` (through
 `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`, only when the runner sets no `GIT_CONFIG_COUNT`). A variable the runner's
 environment already sets is left alone, and a step's own `env:` or inline value wins over `$GITHUB_ENV`. A job
-holding the whole mini (exclusive) or no shared unit (fast, gateway) gets no cap. The job log's admitted line says
+holding the whole mini (exclusive) gets no cap. A job holding no shared unit (the fast tier on the fast runner, a
+fast tier admitted busy, a gateway's thin client) gets the share of its own cores (its `JOB_CORES` row or its class's
+need; JOB_SHARE_UNCOUNTED): uncapped, the fast tier's `swift build --build-tests` ran at every core of ultra2 beside
+jobs capped at 4 to 12 (load 343 on 30 cores, 2026-11-22). The job log's admitted line says
 `compiles with N cores`. `GLAEDA_JOB_SHARE=0` in the runner LaunchAgent environment turns it off without a
 redeploy. A ci-step `admit` reports the same share as `cpu`, the build worker's grant for the step.
 
@@ -1814,8 +1817,8 @@ in at the producer's root. So one root job per root per mini:
   `--test-keychain`. It runs only cmux's thin `cmux-ci` client jobs, which submit to the cmux-ci controller and
   wait with about no CPU on the mini (the hook's `GATEWAY_JOBS`, by workflow file and job id: `cmux-next.yml`'s
   `app-compile-fleet`, `swift-canary-fleet`, `release-compile-fast`, `fast-tier-fleet`, `swift-test-fleet` and
-  `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
-  `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
+  `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile`,
+  `cmux-next-tip-test-compile.yml`'s `compile` and `cmux-next-head-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which

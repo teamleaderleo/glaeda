@@ -3955,7 +3955,6 @@ class HookTest(unittest.TestCase):
         github_env.unlink()
         for env, units in (({"GITHUB_ENV": os.fspath(github_env), "GLAEDA_JOB_SHARE": "0"}, 5),  # kill switch
                            ({"GITHUB_ENV": os.fspath(github_env)}, 14),  # exclusive: the whole mini
-                           ({"GITHUB_ENV": os.fspath(github_env)}, 0),  # fast or gateway: no shared unit
                            ({}, 5)):  # no $GITHUB_ENV
             with self.subTest(env=env, units=units), mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(hook.export_job_share({"units": units, "units_total": 14}, cores=14), "")
@@ -4058,6 +4057,56 @@ class HookTest(unittest.TestCase):
             with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(hook.export_share_tools(hook_dir), "")
         self.assertFalse(github_path.exists())
+
+    def test_a_job_with_no_shared_unit_still_gets_a_cpu_share(self) -> None:
+        """JOB_SHARE_UNCOUNTED: ultra2, 2026-11-22: the fast tier on the fast runner and fast tiers admitted busy held no
+        unit, so they got no CMUX_CI_CPU_BUDGET and ran `swift build --build-tests` at all 30 cores (SwiftPM hands each
+        swiftc -j30) beside jobs capped at 4 to 12: load 343 on 30 cores. No unit is no reason for no cap: the share is
+        the job's own cores, and a thin client's is JOB_SHARE_MIN."""
+        github_env = self.dir / "share-env"
+        cases = (({"units": 0, "units_total": 30, "share_cores": 5}, 30, 5),  # the fast tier (JOB_CORES 5)
+                 ({"units": 0, "units_total": 14, "share_cores": 5}, 28, 10),  # cores other than units
+                 ({"units": 0, "units_total": 30}, 30, hook.JOB_SHARE_MIN),  # a gateway's thin client
+                 ({"units": 0, "units_total": 30, "share_cores": 0}, 30, hook.JOB_SHARE_MIN))
+        for taken, cores, share in cases:
+            with self.subTest(taken=taken), mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)},
+                                                            clear=True):
+                self.assertEqual(hook.export_job_share(taken, cores=cores),
+                                 f"compiles with {share} cores (CMUX_CI_CPU_BUDGET, 7 variables)")
+                self.assertIn(f"CMUX_CI_CPU_BUDGET={share}\n", github_env.read_text())
+                github_env.unlink()
+
+    def test_the_fast_tier_gets_a_cpu_share_on_the_fast_runner_and_when_admitted_busy(self) -> None:
+        """JOB_SHARE_UNCOUNTED end to end: job-started on the fast runner (fast tokens, no unit) and on a full side
+        runner (FAST_TIER_BUSY, no unit) writes the fast tier's share of its own cores (JOB_CORES: 5)."""
+        self.fleet()
+        env_file = self.dir / "github_env"
+        fast_env = {**self.FAST_TIER, "GITHUB_ENV": os.fspath(env_file)}
+
+        def assert_share(out: str) -> None:
+            total = int(re.search(r"holding 0/(\d+) units", out).group(1))
+            share = hook.job_cpu_share(5, total, os.cpu_count())
+            if share is None:  # a host too small for any cap
+                return
+            self.assertIn(f"compiles with {share} cores", out)
+            self.assertIn(f"CMUX_CI_CPU_BUDGET={share}\n", env_file.read_text())
+
+        try:
+            fast = self.job("fast-tier", "f0", 14, None, "--fast-runner", env=fast_env)
+            self.assertEqual(fast.returncode, 0, fast.stdout + fast.stderr)
+            self.assertIn("units+fast-0+fast-1 for fast-tier (fast", fast.stdout)
+            assert_share(fast.stdout)
+        finally:
+            self.finish("f0")
+        env_file.unlink(missing_ok=True)
+        self.take_units(int(re.search(r"holding 0/(\d+) units", fast.stdout).group(1)) - 4)  # 4 free: it needs 5
+        try:
+            busy = self.job("fast-tier", "s1", 14, None, env=fast_env)
+            self.assertEqual(busy.returncode, 0, busy.stdout + busy.stderr)
+            self.assertIn("admitted busy", busy.stdout)
+            assert_share(busy.stdout)
+        finally:
+            self.finish("s1")
 
     def test_an_admitted_job_gets_its_cpu_share(self) -> None:
         """job-started writes the share (JOB_SHARE) to $GITHUB_ENV and logs it."""
@@ -4705,7 +4754,8 @@ class HookTest(unittest.TestCase):
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                               ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
-                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")):
+                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              ("cmux-next-head-compile.yml", "compile")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",

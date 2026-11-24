@@ -797,7 +797,8 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                           ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
-                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")})
+                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                          ("cmux-next-head-compile.yml", "compile")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
@@ -4484,13 +4485,20 @@ def export_developer_dir(xcode_app: str) -> str:
 # job's swift-frontend, rustc, make and git used to start one thread per core, so on 2026-11-05 the 14-core CI minis
 # ran at load 40 to 208 with three to five jobs each compiling at full width. So an admitted job is told its share
 # of the cores through $GITHUB_ENV: cores x its units / the mini's units (units are cores, so on a std mini that is
-# its units), at least JOB_SHARE_MIN. A job that holds every unit (the exclusive class) or none (fast, gateway: they
-# sit outside the shared units) gets no cap. CMUX_CI_CPU_BUDGET is the knob cmux's own scripts read (swift build
+# its units), at least JOB_SHARE_MIN. A job that holds every unit (the exclusive class) gets no cap; one that holds
+# none (fast, gateway, FAST_TIER_BUSY) gets the share of its own cores (JOB_SHARE_UNCOUNTED). CMUX_CI_CPU_BUDGET is the knob cmux's own scripts read (swift build
 # and test --jobs, Swift Testing suites, webview test files); the rest are the toolchains' own. A variable the
 # runner's environment already sets is left alone. $GITHUB_ENV ranks below a step's env: and an inline assignment,
 # so a step that sizes itself (cmux-tui's cargo test sets CARGO_BUILD_JOBS) keeps its own value; a job-level env:
 # ranks below it (no cmux workflow sets these there, 2026-11-05). Kill switch without a redeploy: GLAEDA_JOB_SHARE=0
 # in the runner LaunchAgent environment.
+# JOB_SHARE_UNCOUNTED: a job that holds no shared unit still compiles beside the mini's other jobs, so it gets a share
+# too, at the cores it takes when it does hold units (its JOB_CORES row or its class's need; at least JOB_SHARE_MIN).
+# Uncapped, it started one task per core and SwiftPM gave each swiftc -j<cores>: on ultra2 on 2026-11-22 (30 cores)
+# the fast tier on the fast runner, and fast tiers admitted busy (FAST_TIER_BUSY), ran `swift build --build-tests`
+# with no --jobs beside the units' jobs, which had shares of 4 to 12. 555 swift-frontends under 12 runner jobs held a
+# 1-minute load of 343 (11 per core), and the fast tier's median went from 1.2 to 17.4 minutes. A gateway's thin
+# client gets JOB_SHARE_MIN. Only the exclusive class (the whole mini) runs with no cap.
 JOB_SHARE_MIN = 2
 JOB_SHARE_ENV = "CMUX_CI_CPU_BUDGET"
 
@@ -4520,8 +4528,10 @@ def export_job_share(taken: dict[str, Any], cores: int | None = None) -> str:
     """Write the job's share (JOB_SHARE) to $GITHUB_ENV. Returns a note, or '' (no cap, or no $GITHUB_ENV)."""
     if os.environ.get("GLAEDA_JOB_SHARE", "1") == "0":
         return ""
-    share = job_cpu_share(int(taken.get("units") or 0), int(taken.get("units_total") or 0),
-                          os.cpu_count() if cores is None else cores)
+    units = int(taken.get("units") or 0)
+    if units <= 0:  # JOB_SHARE_UNCOUNTED: no shared unit (fast, gateway, FAST_TIER_BUSY) is no reason for no cap
+        units = max(1, int(taken.get("share_cores") or 0))
+    share = job_cpu_share(units, int(taken.get("units_total") or 0), os.cpu_count() if cores is None else cores)
     target = os.environ.get("GITHUB_ENV")
     if share is None or not target:
         return ""
@@ -7279,6 +7289,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if klass == EXCLUSIVE_CLASS and gui_token != "gui":
             tokens = (*tokens, "gui")  # the idle fuzzer looks at gui.token itself: hold it whatever this runner's is
     units = min(units, total)
+    # JOB_SHARE_UNCOUNTED: the cores the job compiles with, even when it takes no shared unit below
+    share_cores = units or JOB_CORES.get((workflow, job), 0)
     if busy and klass != EXCLUSIVE_CLASS:  # FAST_TIER_BUSY: nothing shared is taken; a signing job never runs busy
         if signing := exclusive_claim(capacity_dir):  # and nothing runs busy beside one (SIGNING_DRAIN)
             return False, f"capacity: {signing}"
@@ -7572,7 +7584,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             note += (f"; admitted though a fleet build waits for the host (pid {handed_past}): GitHub handed this job "
                      "here, so it runs, and the build gets the host when it ends")
         if held and taken_out is not None:
-            taken_out.update(units=units, units_total=total, tokens=list(taken), **{"class": klass})
+            taken_out.update(units=units, units_total=total, tokens=list(taken), share_cores=share_cores,
+                             **{"class": klass})
             if mem_total:
                 taken_out.update(mem_gib=chunks, mem_total_gib=mem_total, need_source=need.source)
         if held and gui_token in taken:
