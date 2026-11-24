@@ -22856,6 +22856,72 @@ class ReexecDrainTest(Base):
         self.assertEqual(status["modes"], {})
         self.assertEqual(self.daemon.tick_deadline, 0.0, "the cut deadline stays expired until serve re-execs")
 
+    def test_a_script_wake_reexecs_from_its_thread_only_inside_a_read(self) -> None:
+        """A lane VM, 2026-11-24: merge 9b616468 went live 62 s after its swap, a cut tick still in a read. ScriptWake
+        re-execs inside a read phase with no claimed land step; never inside a write, never past a claim."""
+        ran: list = []
+        self.daemon.land_queue = None
+        self.assertIsNone(self.daemon.phase_now)
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(1)), "between phases: serve decides")
+        with self.daemon.phase("outbox"):
+            self.assertFalse(self.daemon.reexec_now(lambda: ran.append(1)), "a write is never cut")
+        with self.daemon.phase("controller"):
+            self.assertEqual(self.daemon.phase_now, "controller")
+            self.assertTrue(self.daemon.reexec_now(lambda: ran.append(1)))
+        self.assertIsNone(self.daemon.phase_now, "the phase ends with its block")
+        self.assertEqual(ran, [1])
+        queue = types.SimpleNamespace(lock=threading.RLock(), claimed=True)
+        queue.claimed_running = lambda: queue.claimed
+        self.daemon.land_queue = queue
+        self.daemon.phase_now = "reads"
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(2)), "a claimed land step runs")
+        queue.claimed = False
+        self.assertTrue(self.daemon.reexec_now(lambda: ran.append(2)))
+        self.assertEqual(ran, [1, 2])
+        held = threading.Event()
+        threading.Thread(target=lambda: (queue.lock.acquire(), held.set(), time.sleep(0.5), queue.lock.release()),
+                         daemon=True).start()
+        held.wait(2)
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(3)), "a claim in progress holds the lock")
+        seen: list = []
+        with mock.patch.object(self.daemon, "post_tick", side_effect=lambda: seen.append(self.daemon.phase_now)), \
+                mock.patch.object(self.daemon, "heads_between"):
+            self.daemon.phase_now = "reads"
+            self.daemon.post_between()
+        self.assertEqual((seen, self.daemon.phase_now), (["outbox"], "reads"), "the outbox between reads is a write")
+        self.daemon.land_queue, self.daemon.script_cut, self.daemon.phase_now = None, True, "reads"
+        self.daemon.finish_tick([], [], [], [], [])
+        self.assertIsNone(self.daemon.phase_now, "the end of the tick writes: no leap there")
+
+    def test_claimed_running_asks_without_reaping(self) -> None:
+        done, running = mock.Mock(), mock.Mock()
+        done.done.return_value, running.done.return_value = True, False
+        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, jobs={"j": running, "d": done, "r": running},
+                                  entries={"j": {"action": {"kind": "fetch"}}, "d": {"action": {"kind": "merge"}},
+                                           "r": {"action": None}})
+        self.assertFalse(gg.LandQueue.claimed_running(q), "a handed judgment, a done job, a job with no claim")
+        q.entries["r"]["action"] = {"kind": "merge"}
+        self.assertTrue(gg.LandQueue.claimed_running(q))
+        self.assertEqual(set(q.jobs), {"j", "d", "r"}, "nothing reaped off the tick's thread")
+        q.handover, q.entries["r"]["action"] = False, None
+        self.assertTrue(gg.LandQueue.claimed_running(q), "no handover: any running job")
+
+    def test_a_script_wake_leaps_once_while_new_content_waits(self) -> None:
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        jumps: list = []
+        daemon = types.SimpleNamespace(tick_deadline=float("inf"), script_cut=False,
+                                       reexec_now=lambda run: (run(), True)[1])
+        wake = gg.ScriptWake(path, gg.hashlib.sha256(b"one").hexdigest(), daemon, jump=lambda: jumps.append(1))
+        self.assertFalse(wake.leap(), "no new content")
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"two")
+        later.replace(path)
+        wake.check()
+        self.assertTrue(wake.leap())
+        self.assertFalse(wake.leap(), "once")
+        self.assertEqual(jumps, [1])
+
     def serve_over(self, rewrite: bytes) -> list:
         """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
         script = Path(self.tmp.name) / "bin" / "glaeda-gh"

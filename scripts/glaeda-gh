@@ -6076,6 +6076,7 @@ class Daemon:
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.script_cut = False  # ScriptWake saw a new glaeda-gh: a tick starting now gets no budget (serve clears it)
+        self.phase_now: str | None = None  # the tick phase running now (phase; "reads"): ScriptWake jumps only in a read
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
@@ -6202,11 +6203,34 @@ class Daemon:
     @contextlib.contextmanager
     def phase(self, name: str):
         """The wall time inside is one tick phase's (READ_PROGRESS_WINDOW): where the ticks went, for stall_cause."""
-        start = time.monotonic()
+        start, prior, self.phase_now = time.monotonic(), self.phase_now, name
         try:
             yield
         finally:
+            self.phase_now = prior
             self.note_spent(name, time.monotonic() - start)
+
+    def reexec_now(self, run: Callable[[], Any]) -> bool:
+        """Run RUN (serve's re-exec) now, from ScriptWake's thread, when the tick is in a read phase (JUMP_PHASES) and
+        no claimed land step runs, holding the land queue's lock so no step is claimed in between: False otherwise.
+        A cut tick still ended only at its next deadline check, and a read already sent ran to HTTP_DEADLINE: a lane VM,
+        2026-11-24, merge 9b616468 went live 62 s after fast-patch swapped the bytes, with no land step held. A read
+        cut off is read again by the next daemon; a write (the outbox, the land and wait phases) is never cut."""
+        if self.phase_now not in JUMP_PHASES:
+            return False
+        q = self.land_queue
+        if q is None:
+            run()
+            return True
+        if not q.lock.acquire(timeout=0.2):
+            return False
+        try:
+            if self.phase_now not in JUMP_PHASES or q.claimed_running():
+                return False
+            run()
+            return True
+        finally:
+            q.lock.release()
 
     def note_spent(self, name: str, seconds: float) -> None:
         self.spent.append((self.now, name, max(0.0, seconds)))
@@ -7814,14 +7838,15 @@ class Daemon:
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""
-        tick_now = self.now
+        tick_now, reading = self.now, self.phase_now
         self.now = time.time() if self.clock_real else self.now  # the outbox's own clock; the reads keep theirs
+        self.phase_now = "outbox"  # writes: never cut (reexec_now)
         try:
             self.post_tick()
         except Exception as error:  # noqa: BLE001
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
         finally:
-            self.now = tick_now
+            self.now, self.phase_now = tick_now, reading
         self.heads_between()
 
     def content_pause_until(self) -> float:
@@ -9248,6 +9273,7 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + (0.0 if self.script_cut else TICK_BUDGET)  # (ScriptWake)
+        self.phase_now = None
         self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
@@ -9292,6 +9318,7 @@ class Daemon:
         with self.phase("due"):
             prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
             heads = self.due("head", entries)
+        self.phase_now = "reads"  # until finish_tick: GitHub reads into the cache (ScriptWake may re-exec here)
         due = {"pr": prs, "run": runs, "comment": comments, "head": heads}
         over = {kind: self.paths[kind] for kind in due}  # due() routed each kind
         spilled: list[dict] = []
@@ -9569,6 +9596,7 @@ class Daemon:
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
         """Rule on the waits, prune, and write the heartbeat: the end of every tick, whatever read it."""
+        self.phase_now = None  # (reexec_now: the phases from here write)
         # ScriptWake cuts the read phase when fast-patch swaps this file.  If no claimed land step is running,
         # the next image can safely take over the in-memory queue and all deferred bookkeeping.  Do not restore the
         # deadline or walk the end-of-tick phases here: on an upstream host those phases were the wake-to-reexec gap.
@@ -17626,6 +17654,14 @@ class LandQueue:
                     if now - start >= bound / 2 and now < start + bound]
         return max(ends, default=0.0)
 
+    def claimed_running(self) -> bool:
+        """land_busy's answer without reap's bookkeeping, so another thread may ask (Daemon.reexec_now): a job still
+        running that the next daemon cannot take over, a claimed step outside a handed judgment (or any, no handover)."""
+        jobs = [(k, f) for k, f in list(self.jobs.items()) if f is not None and not f.done()]
+        if not self.handover:
+            return bool(jobs)
+        return any(k not in self.judging and isinstance((self.entries.get(k) or {}).get("action"), dict) for k, _ in jobs)
+
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
             if fut is None or fut.done():
@@ -23563,6 +23599,7 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
+JUMP_PHASES = frozenset({"watches", "controller", "due", "reads"})  # tick phases that only read (Daemon.reexec_now)
 
 
 class ScriptWake:
@@ -23572,8 +23609,9 @@ class ScriptWake:
     on new content, ends the tick (its requests stop at the next tick_deadline check, the rest go first next tick)
     and wakes serve's sleep, so the re-exec decision (reexec_due) runs within a second. One wake per new content."""
 
-    def __init__(self, path: Path, sha: str, daemon: Any, every: float = SCRIPT_WAKE_EVERY):
-        self.path, self.daemon, self.every = path, daemon, every
+    def __init__(self, path: Path, sha: str, daemon: Any, every: float = SCRIPT_WAKE_EVERY,
+                 jump: Callable[[], Any] | None = None):
+        self.path, self.daemon, self.every, self.jump = path, daemon, every, jump  # JUMP: serve's re-exec (reexec_now)
         self.seen = {"stat": script_stat(path), "sha": sha}  # its own copy: serve's is not shared across threads
         self.event = threading.Event()
         self.woken: tuple | None = None  # the stat it last woke serve for
@@ -23598,6 +23636,18 @@ class ScriptWake:
             time.sleep(self.every)
             with contextlib.suppress(OSError):  # a swap's rename: the next stat sees the new file
                 self.check()
+            with contextlib.suppress(Exception):  # noqa: BLE001  a fault here leaves the re-exec to serve, as before
+                self.leap()
+
+    def leap(self) -> bool:
+        """While new content waits (seen, not reverted), re-exec from this thread once the tick is in a read and no
+        claimed land step runs (Daemon.reexec_now): serve's own decision waits for the tick to return."""
+        if self.jump is None or "changedStat" not in self.seen:
+            return False
+        if not self.daemon.reexec_now(self.jump):
+            return False
+        self.jump = None  # once (an execv does not return; a test's does)
+        return True
 
     def sleep(self, seconds: float) -> None:
         """serve's TICK sleep, cut short by a wake."""
@@ -23858,7 +23908,17 @@ def serve(foreground_ok: bool = False) -> int:
     watchdog.start()
     with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
         start_main_watch()
-    wake = ScriptWake(me, seen["sha"], daemon)
+    def reexec(due: str = "reexec", where: str = "") -> None:
+        q = daemon.land_queue
+        handed = len(q.judging) if q is not None and q.handover else 0  # judge_handed: the next daemon's
+        woke = wake.woken_at  # seconds from the new bytes to this re-exec: what land work held it for
+        log({"event": "reexec", **({"why": due} if due != "reexec" else {}),
+             **({"from": where} if where else {}),
+             **({"handedJudgments": handed} if handed else {}),
+             **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
+        os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+
+    wake = ScriptWake(me, seen["sha"], daemon, jump=lambda: reexec(where=f"script-wake in {daemon.phase_now}"))
     threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
     last = None
     while True:
@@ -23912,13 +23972,7 @@ def serve(foreground_ok: bool = False) -> int:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
                     daemon.reexec_waiting = time.monotonic()
             elif due is not None:
-                q = daemon.land_queue
-                handed = len(q.judging) if q is not None and q.handover else 0  # judge_handed: the next daemon's
-                woke = wake.woken_at  # seconds from the new bytes to this re-exec: what land work held it for
-                log({"event": "reexec", **({"why": due} if due != "reexec" else {}),
-                     **({"handedJudgments": handed} if handed else {}),
-                     **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
-                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+                reexec(due)
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
                 # this daemon still polls, but its lock is on a file nobody can see, so every client reads
