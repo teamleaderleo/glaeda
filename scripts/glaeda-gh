@@ -298,7 +298,7 @@ when this file changes, so an update takes effect without a restart.
   (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land_judge names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, 3 identical
   refusals in a row of a step that is not a wait (a named update-branch never counts: it is sent once per head), or a
-  wait past its bound (checks: 4 h with none moving, checks_stuck; a review, a retry or a cancelled job's
+  wait past its bound (checks: 4 h with none moving, checks_stuck, re-armed hourly as a red is; a review, a retry or a cancelled job's
   rerun: 2 h, `<kind>_deadline`; an unreadable retry, a read that could not complete: 6 h). A land --after one that stopped keeps waiting for it (24 h): landing or merging
   the stopped one resumes the chain. Its calls carry CMUX_AGENT_SESSION=glaeda-land and MAY_MERGE_PATH=glaeda-land, so the gh-quota
   call log and the landing record tell them from a person's. State in land/ (entries/, requests/, counts.json: the
@@ -14169,7 +14169,16 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
 # A red that is the PR's own stays stopped, and costs one probe to say so: the re-arm keeps the wait budget, the
 # second judgment reads the same red and stops at once, LAND_STOP_REPEAT keeps that quiet for the requester, and
 # LAND_REARM_CAP bounds it at 3 re-asks per entry per UTC day.
-LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|[a-z_]+_transient)$")
+# checks_stuck is re-armed on the same reading: "no check at HEAD moved in 4 h" is a fact about the checks, not the
+# head, and a check that posts after the stop (a status poster that came back, a runner that took the job, a base that
+# moved and turned the verdict into a base merge) was never seen, because a stopped row reads nothing. One lane's
+# queue, 2026-11-24, after it sat idle 10.5 h: 5 of its 5 open PRs were stopped, none on a red in its own change, one
+# of them checks_stuck on a status that never posted; every one waited for its session to requeue it by hand. The
+# re-arm keeps waitRefused (keyed by head), so a check still unmoved at the same head stops it again at the first wait
+# refusal: one probe, quiet (LAND_STOP_REPEAT), at most LAND_REARM_CAP a day. Detector: test-glaeda-gh.py
+# test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|checks_stuck"
+                              r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
 # LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
