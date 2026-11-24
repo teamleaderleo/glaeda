@@ -16500,7 +16500,8 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual([c[:2] for c in t.calls], [("POST", "/repos/teamleaderleo/glaeda/pulls")])
         self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
-        self.assertEqual(asked, [["broker-actor", "create", "teamleaderleo/glaeda"]])
+        self.assertEqual(asked, [["broker-actor", "post", "teamleaderleo/glaeda"],  # lander is no poster: no pool App
+                                 ["broker-actor", "create", "teamleaderleo/glaeda"]])
         self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
         self.assertEqual(gg.post_state(comment["id"])["state"], "queued")  # the login's comment waits the pause out
 
@@ -16528,6 +16529,180 @@ class PostTest(unittest.TestCase):
             self.step(d, NOW)
         self.assertEqual((t.calls, asked), ([], []))  # it waits the login's pause out, as before
         self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
+
+    # -- comments on the poster App pool (poster_actor): the first free poster by broker-actor post, a throttle rests
+    # that App alone, the login only when none is free.
+
+    POSTERS = ("quota-goblin", "yap-goblin-9000", "yap-goblin-9001")
+
+    def poster_pool(self, roles: Any = POSTERS) -> tuple[list, dict]:
+        """gh_app_token.py broker-actor post, faked: the first of ROLES not in --skip answers. Returns (argvs, role -> token)."""
+        asked: list = []
+        tokens = {r: "ghs_" + chr(97 + i) * 40 for i, r in enumerate(roles)}
+        tool = Path(self.tmp.name) / "gh_app_token.py"
+        tool.write_text("")
+        state = Path(self.tmp.name) / "latch"
+        state.mkdir(exist_ok=True)
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "broker-actor" not in argv:
+                return real(argv, timeout, **kw)
+            asked.append(list(argv[argv.index("broker-actor"):]))
+            skip = argv[argv.index("--skip") + 1].split(",") if "--skip" in argv else []
+            free = [r for r in roles if r not in skip]
+            if argv[argv.index("broker-actor") + 1] != "post" or not free:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"role": free[0], "token": tokens[free[0]], "note": "",
+                                                                    "bot_login": free[0] + "[bot]"}), "")
+        for patch in (mock.patch.object(gg, "app_pool_tool", return_value=tool),
+                      mock.patch.object(gg, "run_bounded", side_effect=run),
+                      mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(state)})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return asked, tokens
+
+    def test_a_burst_of_comments_goes_out_on_the_other_posters_when_the_first_is_throttled(self) -> None:
+        self.no_env_token()
+        os.environ.pop(gg.APP_POSTS_ENV, None)
+        asked, tokens = self.poster_pool()
+        calls = self.pause_cmd(NOW + 900)  # the login's create pause holds for 15 minutes
+        items = [self.queue("comment", f"teamleaderleo/glaeda#{n}", "--body", f"progress {n}") for n in range(20)]
+        by_token = {v: k for k, v in tokens.items()}
+        seen: list = []
+        def send(method, url, headers, body):
+            role = by_token[headers["Authorization"][len("Bearer "):]]
+            seen.append(role)
+            if role == "quota-goblin":
+                return 403, {"retry-after": "600"}, json.dumps({"message": "You have exceeded a secondary rate limit"}).encode()
+            return 201, {}, json.dumps({"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-1"}).encode()
+        d, t = self.daemon()
+        d.transport = send
+        d.clock_real = False
+        for i in range(24):
+            self.step(d, NOW + i * gg.POST_SPACING)
+            for item in items:  # no write sits on any pause or hold, and none is told to wait
+                queued = gg.read_json(gg.outbox_dir() / (item["id"] + ".json"))
+                if queued:
+                    self.assertFalse(queued.get("notBefore"), queued)
+                    self.assertFalse(queued.get("holdUntil"), queued)
+        states = [gg.post_state(i["id"]) for i in items]
+        self.assertEqual({s["state"] for s in states}, {"posted"})
+        self.assertEqual({s["appWriter"] for s in states}, {"yap-goblin-9000"})  # the first free poster after the throttle
+        self.assertEqual(seen.count("quota-goblin"), 1)  # skipped until its retry-after, not tried again
+        self.assertEqual(d.app_create_hold["quota-goblin"], NOW + 600)
+        self.assertLessEqual(d.post_hold, NOW)  # the login's hold is not set
+        self.assertNotIn("--hold", calls.read_text() if calls.exists() else "")  # nor its pause reported for an App's throttle
+        self.assertEqual(asked[0], ["broker-actor", "post", "teamleaderleo/glaeda"])
+        self.assertTrue(all(a[-2:] == ["--skip", "quota-goblin"] for a in asked[1:]))
+        # past the retry-after the throttled App is asked for again
+        d.app_actors.clear()
+        later = self.queue("comment", "teamleaderleo/glaeda#99", "--body", "later")
+        self.step(d, NOW + 601)
+        self.assertEqual(seen[-1], "quota-goblin")  # its hold ended: it is the first poster again
+        self.assertNotIn("--skip", asked[-1])
+
+    def test_a_login_secondary_hold_from_a_read_does_not_hold_a_poster_comment(self) -> None:
+        self.no_env_token()
+        os.environ.pop(gg.APP_POSTS_ENV, None)
+        self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "hi")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        d.secondary_until = NOW + 900
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(gg.post_state(item["id"])["appWriter"], "quota-goblin")
+        self.assertNotIn("Bearer " + TOKEN, seen)
+
+    def test_with_every_poster_held_the_login_makes_the_comment(self) -> None:
+        self.no_env_token()
+        os.environ.pop(gg.APP_POSTS_ENV, None)
+        self.poster_pool(("quota-goblin",))
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "hi")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        d.app_create_hold["quota-goblin"] = NOW + 600
+        self.step(d, NOW)
+        self.assertEqual(seen, ["Bearer " + TOKEN])
+        self.assertNotIn("appWriter", gg.post_state(item["id"]))
+
+    def test_app_posts_off_keeps_comments_on_the_login(self) -> None:
+        self.no_env_token()
+        asked, _ = self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "hi")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        with mock.patch.dict(os.environ, {gg.APP_POSTS_ENV: "0"}):
+            self.step(d, NOW)
+        self.assertEqual((seen, asked), (["Bearer " + TOKEN], []))
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_receipts_markers_status_keys_and_reviews_stay_on_the_login_unless_flagged(self) -> None:
+        self.no_env_token()
+        asked, _ = self.poster_pool()
+        d, t = self.daemon()
+        for body in ("Review (codex): ship abc", "<!-- marker -->\nhi", "/land", "owner: me"):
+            item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", body)
+            self.assertIsNone(d.poster_actor(item), body)
+        status = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "plain", "--status-key", "k")
+        self.assertIsNone(d.poster_actor(status))
+        self.assertEqual(asked, [])
+        with mock.patch.dict(os.environ, {gg.APP_POST_RECEIPTS_ENV: "1"}):
+            receipt = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "/land")
+            self.assertEqual(d.poster_actor(receipt)["role"], "quota-goblin")
+            self.assertIsNone(d.poster_actor(status))  # a status edit keeps the identity that posted it: the login
+
+    def test_an_uncertain_poster_comment_is_looked_up_not_sent_again_on_another_identity(self) -> None:
+        self.no_env_token()
+        asked, tokens = self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "once")
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        gg.write_json(path, {**item, "uncertain": True, "appWriter": "quota-goblin"})
+        found = {"html_url": "https://github.com/teamleaderleo/glaeda/pull/1#issuecomment-5", "body": "once"}
+        d, t = self.daemon((200, {}, [found]))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        d.app_create_hold["quota-goblin"] = NOW + 600  # the first poster rests: another identity is asked
+        self.step(d, NOW)
+        self.assertEqual([c[0] for c in t.calls], ["GET"])  # looked up, never POSTed
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertNotIn("Bearer " + TOKEN, seen)
+
+    def test_an_uncertain_poster_comment_with_no_free_poster_waits_and_never_goes_on_the_login(self) -> None:
+        self.no_env_token()
+        self.poster_pool(("quota-goblin",))
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "once")
+        path = gg.outbox_dir() / (item["id"] + ".json")
+        gg.write_json(path, {**item, "uncertain": True, "appWriter": "quota-goblin"})
+        d, t = self.daemon()
+        d.clock_real = False
+        d.app_create_hold["quota-goblin"] = NOW + 600
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [])
+        self.assertTrue(gg.read_json(path)["uncertain"])
+
+    def test_an_older_gh_app_token_without_post_leaves_comments_on_the_login(self) -> None:
+        self.no_env_token()
+        self.poster_pool(())  # every `broker-actor post` exits 1
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "hi")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(seen, ["Bearer " + TOKEN])
+
+    def test_a_locked_thread_fails_the_comment_instead_of_resting_a_poster(self) -> None:
+        self.no_env_token()
+        self.poster_pool()
+        item = self.queue("comment", "teamleaderleo/glaeda#1", "--body", "hi")
+        d, t = self.daemon((403, {}, {"message": "Unable to create comment because issue is locked."}))
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "failed")
+        self.assertEqual(d.app_create_hold, {})
 
     def test_the_logins_create_pause_holds_queued_writes_in_order(self) -> None:
         first = self.queue("comment", "o/r#1", "--body", "one")
