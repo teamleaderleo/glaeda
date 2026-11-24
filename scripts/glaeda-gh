@@ -24508,14 +24508,23 @@ def counts_print(data: dict) -> str:
 
 def straggler_of(c: dict, data: dict, now: float, bound: float = STRAGGLER_AFTER) -> dict | None:
     """The queued check run C as a straggler {name, workflow, label, minutes, required}, or None while it may still
-    start: queued less than BOUND, or its job is unread, has a runner, is not queued, or is a rerun (attempt past 1,
-    which has no startedAt in the rollup either)."""
+    start: queued less than BOUND, or its job is unread, has a runner or is not queued. A rerun (attempt past 1) is
+    aged from its own job's created_at, never the rollup's startedAt (an earlier attempt's), and is None while that
+    is unread. 2026-11-24: cmux#50490 and cmux#53519's optional 'cmux-next fast tier' sat queued with no runner on
+    glaeda-side-std-xcode-26.6 from 09:48Z past 16:00Z while it was re-run every hour (attempts 2 and 3), so it
+    never counted and land-judge refused both checks_running all day (Leo, 2026-11-24 06:34Z: "we need to not
+    hold")."""
     started = iso_epoch(c.get("startedAt"))
     if started is None or now - started < bound:
         return None
     job = (data.get("queuedJobs") or {}).get(str(c.get("jobId")))
-    if not isinstance(job, dict) or job.get("status") != "queued" or job.get("runner") or job.get("attempt") != 1:
+    if not isinstance(job, dict) or job.get("status") != "queued" or job.get("runner"):
         return None
+    if job.get("attempt") != 1:
+        created = iso_epoch(job.get("created"))
+        if not isinstance(job.get("attempt"), int) or created is None or now - created < bound:
+            return None
+        started = created
     # a job's workflow_name is its run's name: a run-name such as "v1;sha=...;ref=..." names no workflow
     named = str(job.get("workflow") or "")
     return {"name": c.get("name"), "workflow": c.get("workflow") or ("" if ";" in named else named),
@@ -24684,7 +24693,7 @@ def straggler_pass(key: str, data: dict, now: float, get: Callable[[str, list[st
         if isinstance(doc, dict) and doc.get("id"):
             jobs[str(j)] = {"status": doc.get("status"), "runner": doc.get("runner_name") or doc.get("runner_id") or "",
                             "attempt": doc.get("run_attempt"), "workflow": doc.get("workflow_name"),
-                            "labels": [str(x) for x in doc.get("labels") or []]}
+                            "created": doc.get("created_at"), "labels": [str(x) for x in doc.get("labels") or []]}
     merged = {**data, "queuedJobs": jobs}
     if isinstance(store.get("runs"), list):
         merged.update(queuedRuns=store["runs"], queuedRunsCount=store.get("count", -1), queuedRunsAt=store.get("at"))

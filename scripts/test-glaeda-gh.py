@@ -36844,7 +36844,7 @@ class StragglerTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def head(self, number: int = 45147, queued_ago: float = 41 * 60, attempt: int = 1,
-             counts: dict | None = None) -> tuple[dict, Any]:
+             counts: dict | None = None, created_ago: float | None = None) -> tuple[dict, Any]:
         """A truncated 229-check rollup in cmux#45147's shape: the first 100 all passed (the required one among them),
         three queued past page 1 (the rollup's counts say so); and a fake GitHub for the queued list and job reads."""
         shown = [{**check_run("build"), "isRequired": True}] + [check_run(f"c{i}") for i in range(99)]
@@ -36853,6 +36853,7 @@ class StragglerTest(unittest.TestCase):
                     checkCounts=counts or {"runs": {"SUCCESS": 220, "SKIPPED": 5, "QUEUED": 3},
                                            "statuses": {"SUCCESS": 1}})
         started = iso(self.now - queued_ago)
+        created = iso(self.now - (queued_ago if created_ago is None else created_ago))
 
         def get(repo: str, paths: list[str]) -> dict:
             self.assertEqual(repo, "o/r")
@@ -36867,7 +36868,8 @@ class StragglerTest(unittest.TestCase):
                     jid = int(path.rsplit("/", 1)[1])
                     name, _, workflow, label = next(s for s in self.STRAGGLERS if s[1] == jid)
                     out[path] = {"id": jid, "name": name, "status": "queued", "runner_id": 0, "runner_name": "",
-                                 "steps": [], "run_attempt": attempt, "workflow_name": workflow, "labels": [label]}
+                                 "steps": [], "run_attempt": attempt, "workflow_name": workflow, "labels": [label],
+                                 "created_at": created}
             return out
         return data, get
 
@@ -36906,14 +36908,23 @@ class StragglerTest(unittest.TestCase):
                 data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
             self.assertEqual(self.calls, [], counts)
 
-    def test_young_queue_and_reruns_keep_waiting(self) -> None:
-        for kwargs in ({"queued_ago": 25 * 60}, {"attempt": 2}):
+    def test_young_queue_and_young_reruns_keep_waiting(self) -> None:
+        # a rerun is aged from its own job's created_at, not the rollup's startedAt of an earlier attempt
+        for kwargs in ({"queued_ago": 25 * 60}, {"attempt": 2, "created_ago": 10 * 60}):
             data, get = self.head(**kwargs)
             for _ in range(3):
                 data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
             self.assertIsNone(gg.verdict("pr", data, "done", now=self.now), kwargs)
             self.calls.clear()
             gg.straggler_path("pr:o/r#45147").unlink()
+
+    def test_a_rerun_queued_past_the_bound_is_a_straggler(self) -> None:
+        """cmux#50490, 2026-11-24: optional 'cmux-next fast tier' re-run hourly (attempts 2, 3) on a label with no free
+        runner never counted as a straggler, so the wait and land-judge held all day. Aged by its own job, it ends."""
+        data, get = self.head(attempt=3, created_ago=35 * 60)
+        for _ in range(3):
+            data = gg.straggler_pass("pr:o/r#45147", data, self.now, get)
+        self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE)
 
     def test_a_stale_list_is_read_again_before_the_wait_ends(self) -> None:
         data, get = self.head()
@@ -36990,8 +37001,8 @@ class StragglerTest(unittest.TestCase):
 
     def test_property_every_mix_of_stragglers(self) -> None:
         """For every mix of required/optional, queued/in progress, young/past the bound and first attempt/rerun over
-        one to three unfinished checks (shown, under 100 checks), the wait ends only when each is optional, queued,
-        past the bound and a first attempt; and then inconclusive, never success."""
+        one to three unfinished checks (shown, under 100 checks), the wait ends only when each is optional, queued
+        and past the bound (a rerun by its own job's created_at); and then inconclusive, never success."""
         import itertools
         kinds = list(itertools.product((False, True), ("QUEUED", "IN_PROGRESS"), (10 * 60, 31 * 60), (1, 2)))
         for n in (1, 2, 3):
@@ -37002,12 +37013,13 @@ class StragglerTest(unittest.TestCase):
                     checks.append({**check_run(f"j{i}", status=status, conclusion=None), "databaseId": 1000 + i,
                                    "startedAt": iso(self.now - ago), "isRequired": required})
                     jobs[str(1000 + i)] = {"status": status.lower(), "runner": "" if status == "QUEUED" else "r1",
-                                           "attempt": attempt, "workflow": "w", "labels": ["l"]}
+                                           "attempt": attempt, "workflow": "w", "labels": ["l"],
+                                           "created": iso(self.now - ago)}
                 data = {**gg.parse_pr(pr_node(1, checks=checks)), "queuedJobs": jobs}
-                ends = all(not r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER and a == 1 for r, s, ago, a in mix)
+                ends = all(not r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER for r, s, ago, a in mix)
                 self.assertEqual(gg.verdict("pr", data, "done", now=self.now), gg.EXIT_INCONCLUSIVE if ends else None, mix)
                 said = gg.summary("pr:o/r#1", {"data": data}, "done")
-                needed = any(r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER and a == 1 for r, s, ago, a in mix)
+                needed = any(r and s == "QUEUED" and ago > gg.STRAGGLER_AFTER for r, s, ago, a in mix)
                 self.assertEqual("required, queued with no runner past 30 min (the wait goes on)" in said,
                                  needed and all(s == "QUEUED" for _, s, _, _ in mix), (mix, said))
 
