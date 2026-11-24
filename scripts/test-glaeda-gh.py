@@ -16083,6 +16083,67 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "body": "hello `x` $HOME"})
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_a_queued_update_branch_is_one_put_with_its_pinned_head_and_needs_no_body(self) -> None:
+        """Leo, 2026-11-23: "never pause. if you have to pause, it means we have to fix things". 16 of 28 paced
+        refusals on one lane VM (2026-11-24) were a bare `gh pr update-branch N`: it is queued instead."""
+        sha = "a" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        self.assertEqual((item["kind"], item["repo"], item["number"], item["expectedHead"], item["body"]),
+                         ("update-branch", "o/r", 7, sha, ""))
+        d, t = self.daemon((202, {}, {"message": "Updating pull request branch.", "url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("PUT", "/repos/o/r/pulls/7/update-branch", {"expected_head_sha": sha})])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        bare = self.queue("update-branch", "o/r#8", stdin="")
+        self.assertNotIn("expectedHead", bare)
+        d, t = self.daemon((202, {}, {"message": "ok"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(t.calls, [("PUT", "/repos/o/r/pulls/8/update-branch", {})])
+
+    def test_a_queued_update_branch_that_can_mean_nothing_more_is_finished_with_a_reason_and_never_retried(self) -> None:
+        cases = [
+            (422, {"message": "There are no new commits on the base branch."}, "posted", "up to date"),
+            (422, {"message": "Validation Failed", "errors": ["expected head sha didn't match current head ref."]},
+             "superseded", "head moved"),
+            (422, {"message": "Cannot update a closed pull request"}, "superseded", "closed or merged"),
+            (404, {"message": "Not Found"}, "superseded", "not found"),
+            (422, {"message": "merge conflict between base and head"}, "failed", None),
+        ]
+        for status, doc, state, word in cases:
+            with self.subTest(doc=doc):
+                item = self.queue("update-branch", "o/r#7", stdin="")
+                d, t = self.daemon((status, {}, doc))
+                self.step(d, NOW)
+                done = gg.post_state(item["id"])
+                self.assertEqual(done["state"], state, done)
+                if word:
+                    self.assertIn(word, done["note"])
+                self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])  # finished, not waiting for a retry
+                self.assertEqual(len(t.calls), 1)
+
+    def test_post_update_branch_takes_no_body_and_only_a_full_sha(self) -> None:
+        with self.assertRaises(gg.WatchError):
+            self.queue("update-branch", "o/r#7", "--body", "x")
+        with self.assertRaises(gg.WatchError):
+            self.queue("update-branch", "o/r#7", "--sha", "abc", stdin="")
+        with self.assertRaises(gg.WatchError):
+            self.queue("comment", "o/r#7", "--sha", "a" * 40, "--body", "x")
+
+    def test_a_lane_vm_queued_update_branch_is_the_brokers_update_branch_tool(self) -> None:
+        sha = "b" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(ran[0][1:4], ["call", "update_branch", "o/r"])
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "expected_head_sha": sha})
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertEqual(d.transport.calls, [])
+        item = self.queue("update-branch", "o/r#9", stdin="")
+        d, ran = self.lane_vm((1, {"ok": False, "error": "pull request 9 is closed"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9})
+        self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
+
     def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
         """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
         login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
@@ -16101,7 +16162,8 @@ class PostTest(unittest.TestCase):
             "cat \"$0.$2\"\n")
         lane_gh.chmod(0o755)
         argvs = {"pr": ("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why"),
-                 "comment": ("comment", "o/r#7", "--body", "x")}
+                 "comment": ("comment", "o/r#7", "--body", "x"),
+                 "update-branch": ("update-branch", "o/r#7")}
         self.assertEqual(set(argvs), set(gg.BROKER_POST_TOOLS))  # every kind the broker makes
         lanes = ("LANE_GH_LANE", "ACPMUX_SESSION_NAME", "ACPMUX_SESSION", "ACPMUX_FROM")
         bare = {k: v for k, v in os.environ.items() if k not in lanes}
@@ -22782,6 +22844,83 @@ class ReexecDrainTest(Base):
         later.write_bytes(b"three")
         later.replace(path)
         self.assertTrue(wake.check(), "a later swap wakes again")
+
+    def test_a_script_wake_skips_end_of_tick_when_no_land_step_is_claimed(self) -> None:
+        """A script wake must not wait on finish_tick's housekeeping when the land queue has no claimed step."""
+        self.daemon.script_cut = True
+        self.daemon.tick_deadline = 0.0
+        with mock.patch.object(self.daemon, "land_busy", return_value=False), \
+                mock.patch.object(self.daemon, "land_tick", side_effect=AssertionError("land phase ran")), \
+                mock.patch.object(self.daemon, "serve_waits", side_effect=AssertionError("wait phase ran")):
+            status = self.daemon.finish_tick([], [], [], [], [])
+        self.assertEqual(status["modes"], {})
+        self.assertEqual(self.daemon.tick_deadline, 0.0, "the cut deadline stays expired until serve re-execs")
+
+    def test_a_script_wake_reexecs_from_its_thread_only_inside_a_read(self) -> None:
+        """A lane VM, 2026-11-24: merge 9b616468 went live 62 s after its swap, a cut tick still in a read. ScriptWake
+        re-execs inside a read phase with no claimed land step; never inside a write, never past a claim."""
+        ran: list = []
+        self.daemon.land_queue = None
+        self.assertIsNone(self.daemon.phase_now)
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(1)), "between phases: serve decides")
+        with self.daemon.phase("outbox"):
+            self.assertFalse(self.daemon.reexec_now(lambda: ran.append(1)), "a write is never cut")
+        with self.daemon.phase("controller"):
+            self.assertEqual(self.daemon.phase_now, "controller")
+            self.assertTrue(self.daemon.reexec_now(lambda: ran.append(1)))
+        self.assertIsNone(self.daemon.phase_now, "the phase ends with its block")
+        self.assertEqual(ran, [1])
+        queue = types.SimpleNamespace(lock=threading.RLock(), claimed=True)
+        queue.claimed_running = lambda: queue.claimed
+        self.daemon.land_queue = queue
+        self.daemon.phase_now = "reads"
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(2)), "a claimed land step runs")
+        queue.claimed = False
+        self.assertTrue(self.daemon.reexec_now(lambda: ran.append(2)))
+        self.assertEqual(ran, [1, 2])
+        held = threading.Event()
+        threading.Thread(target=lambda: (queue.lock.acquire(), held.set(), time.sleep(0.5), queue.lock.release()),
+                         daemon=True).start()
+        held.wait(2)
+        self.assertFalse(self.daemon.reexec_now(lambda: ran.append(3)), "a claim in progress holds the lock")
+        seen: list = []
+        with mock.patch.object(self.daemon, "post_tick", side_effect=lambda: seen.append(self.daemon.phase_now)), \
+                mock.patch.object(self.daemon, "heads_between"):
+            self.daemon.phase_now = "reads"
+            self.daemon.post_between()
+        self.assertEqual((seen, self.daemon.phase_now), (["outbox"], "reads"), "the outbox between reads is a write")
+        self.daemon.land_queue, self.daemon.script_cut, self.daemon.phase_now = None, True, "reads"
+        self.daemon.finish_tick([], [], [], [], [])
+        self.assertIsNone(self.daemon.phase_now, "the end of the tick writes: no leap there")
+
+    def test_claimed_running_asks_without_reaping(self) -> None:
+        done, running = mock.Mock(), mock.Mock()
+        done.done.return_value, running.done.return_value = True, False
+        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, jobs={"j": running, "d": done, "r": running},
+                                  entries={"j": {"action": {"kind": "fetch"}}, "d": {"action": {"kind": "merge"}},
+                                           "r": {"action": None}})
+        self.assertFalse(gg.LandQueue.claimed_running(q), "a handed judgment, a done job, a job with no claim")
+        q.entries["r"]["action"] = {"kind": "merge"}
+        self.assertTrue(gg.LandQueue.claimed_running(q))
+        self.assertEqual(set(q.jobs), {"j", "d", "r"}, "nothing reaped off the tick's thread")
+        q.handover, q.entries["r"]["action"] = False, None
+        self.assertTrue(gg.LandQueue.claimed_running(q), "no handover: any running job")
+
+    def test_a_script_wake_leaps_once_while_new_content_waits(self) -> None:
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        jumps: list = []
+        daemon = types.SimpleNamespace(tick_deadline=float("inf"), script_cut=False,
+                                       reexec_now=lambda run: (run(), True)[1])
+        wake = gg.ScriptWake(path, gg.hashlib.sha256(b"one").hexdigest(), daemon, jump=lambda: jumps.append(1))
+        self.assertFalse(wake.leap(), "no new content")
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"two")
+        later.replace(path)
+        wake.check()
+        self.assertTrue(wake.leap())
+        self.assertFalse(wake.leap(), "once")
+        self.assertEqual(jumps, [1])
 
     def serve_over(self, rewrite: bytes) -> list:
         """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
@@ -42170,6 +42309,41 @@ class MainWatchTriggersFastPatch(unittest.TestCase):
     def test_off_by_env(self):
         with mock.patch.dict(os.environ, {"GLAEDA_FAST_PATCH_WATCH": "0"}):
             self.assertIsNone(gg.start_main_watch())
+
+    def test_the_shared_checkout_off_main_runs_mains_fast_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, cache = Path(tmp) / "ws", Path(tmp) / "cache"
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t"}
+            git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                                            text=True, env=env).stdout.strip()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "tools").mkdir()
+            (repo / "tools/fast-patch").write_text("import os\nimport helper\n# main\n", encoding="utf-8")
+            (repo / "tools/helper.py").write_text("import json\n", encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "main")
+            main = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/main", main)
+            git("checkout", "-q", "-b", "lane/x")
+            (repo / "tools/fast-patch").write_text("# a lane's stale copy\n", encoding="utf-8")
+            git("commit", "-qam", "lane")
+            got = Path(gg.main_fast_patch(repo, cache))
+            self.assertEqual(got, cache / main / "tools/fast-patch")
+            self.assertIn("# main", got.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(p.name for p in got.parent.iterdir()), [".complete", "fast-patch", "helper.py"])
+            self.assertTrue(os.access(got, os.X_OK))
+            self.assertEqual(gg.main_fast_patch(repo, cache), os.fspath(got))  # cached
+            self.assertIsNone(gg.main_fast_patch(Path(tmp) / "nowhere", cache))
+
+    def test_a_step_runs_what_resolve_names(self):
+        runner, _ = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+        spawned = []
+        with tempfile.TemporaryDirectory() as tmp:
+            watch = gg.MainWatch("/bin/fast-patch", Path(tmp), runner, lambda argv, **kw: spawned.append(argv),
+                                 resolve=lambda: "/main/tools/fast-patch")
+            watch.step()
+        self.assertEqual(spawned[0][0], "/main/tools/fast-patch")
 
 
 if __name__ == "__main__":
