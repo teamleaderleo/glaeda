@@ -16085,7 +16085,7 @@ class PostTest(unittest.TestCase):
 
     def test_a_queued_update_branch_is_one_put_with_its_pinned_head_and_needs_no_body(self) -> None:
         """Leo, 2026-11-23: "never pause. if you have to pause, it means we have to fix things". 16 of 28 paced
-        refusals on gcp-agent-lane-4 (2026-11-24) were a bare `gh pr update-branch N`: it is queued instead."""
+        refusals on one lane VM (2026-11-24) were a bare `gh pr update-branch N`: it is queued instead."""
         sha = "a" * 40
         item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
         self.assertEqual((item["kind"], item["repo"], item["number"], item["expectedHead"], item["body"]),
