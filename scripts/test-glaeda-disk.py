@@ -5448,7 +5448,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "default_families", return_value=over.pop("families", [])), \
                 mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
                 mock.patch.object(gd, "filesystems", return_value=fss), \
-                mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total)), \
+                mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total),
+                                  side_effect=over.pop("free_effect", None)), \
                 mock.patch.object(gd, "ci_jobs", return_value=[]), \
                 mock.patch.object(gd, "survey", return_value=items,
                                   side_effect=over.pop("survey_effect", None)) as survey, \
@@ -5457,11 +5458,62 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                 mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
-                mock.patch.object(gd, "notify_disk"), contextlib.redirect_stdout(out := io.StringIO()):
+                mock.patch.object(gd, "notify_disk", side_effect=over.pop("notify", None)), \
+                contextlib.redirect_stdout(out := io.StringIO()):
             status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
         self.said = out.getvalue()  # what the run printed, for a test that checks its wording
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
         return status, rows, survey, apply
+
+    def test_pressure_page_waits_for_maintenance_and_a_complete_unscoped_pass(self) -> None:
+        compacted = []
+        free_after = 130
+        def free(_):
+            return (free_after if compacted else 20) * gd.GIB, 460 * gd.GIB
+        def spent(*args, **kwargs):
+            gd._MEASURE_BUDGET_REACHED = True
+            return []
+        notify = mock.Mock()
+        argv = ["--pressure", "--apply", "--role", "devbox"]
+        with mock.patch.object(gd, "compact_shared_mirrors", side_effect=lambda *a, **k: compacted.append(True)):
+            self._main_run(argv, free_effect=free, notify=notify)
+            self.assertTrue(compacted)
+            notify.assert_not_called()  # recovered during the last post-lock operation
+            free_after = 20
+            self._main_run(argv, free_effect=free, notify=notify)
+            self.assertEqual(notify.call_args.args[0], "glaeda disk pressure")
+            notify.reset_mock()
+            self._main_run(argv + ["--family", gd.SHARED_MIRROR_COMPACT_FAMILY],
+                           families=[gd.Family(gd.SHARED_MIRROR_COMPACT_FAMILY, self.root, False, "")],
+                           free_effect=free, notify=notify)
+            self._main_run(argv, survey_effect=spent, free_effect=free, notify=notify)
+            notify.assert_not_called()
+
+    def test_pressure_page_names_only_surviving_holders_of_an_observed_low_volume(self) -> None:
+        dev = self.root.stat().st_dev
+        volumes = [gd.Fs(dev + n, f"/v{n}", gd.GIB, 100 * gd.GIB, 20 * gd.GIB, 30 * gd.GIB)
+                   for n in range(3)]
+        held = []
+        for name, size in (("small", 1), ("large", 8), ("large/nested", 7), ("middle", 4), ("tiny", 0.5)):
+            path = self.root / name
+            path.mkdir()
+            held.append(gd.Item("ci", str(path), int(size * gd.GIB), 1, "in-use", hold={"by": "open by job 42"}))
+        # Accounting saw this path before the post-lock maintenance removed it.
+        held.append(gd.Item("ci", str(self.root / "gone"), 9 * gd.GIB, 1, "kept", hold={"by": "reserved"}))
+        family = gd.Family("ci", self.root, False, "", owner="runner")
+        with mock.patch.object(gd, "free_bytes", side_effect=[(gd.GIB, 100 * gd.GIB), OSError("df"),
+                                                              (30 * gd.GIB, 100 * gd.GIB)]), \
+                mock.patch.object(gd, "notify_disk") as notify:
+            gd.notify_remaining_pressure(volumes, {dev: held}, [family], [{"dev": dev, "accounting_gap": gd.GIB}])
+        notify.assert_called_once()
+        body = notify.call_args.args[1]
+        self.assertIn("free on /v0", body)
+        self.assertLess(body.index("/large:"), body.index("/middle:"))
+        self.assertLess(body.index("/middle:"), body.index("/small:"))
+        for absent in ("/v1", "/v2", "/nested", "/gone", "/tiny"):
+            self.assertNotIn(absent, body)
+        self.assertIn("open by job 42 (owner: runner)", body)
+        self.assertIn("last accounting gap", body)
 
     def test_the_release_is_the_ota_generation_holding_these_exact_bytes(self) -> None:
         state = self.root / "update"
@@ -7412,6 +7464,93 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
             last.assert_called_once()
             self.assertEqual(last.call_args.args[1], 30.0)
+
+    def _web_archive(self, number: int, member: str | None = None, age: float = 48) -> Path:
+        path = self.root / f"cmux-web-update-AAAAAAAA-1111-2222-3333-{number:012X}.tar.gz"
+        with gd.tarfile.open(path, "w:gz") as bundle:
+            header = gd.tarfile.TarInfo(member or gd.WEB_UPDATE_FIRST_MEMBER)
+            payload = b"<html/>"
+            header.size = len(payload)
+            bundle.addfile(header, io.BytesIO(payload))
+        os.utime(path, (time.time() - age * 3600,) * 2)
+        return path
+
+    def test_web_update_pressure_removes_only_proven_downloads(self) -> None:
+        old = self._web_archive(1)
+        keep = [self._web_archive(2, "index.html"), self._web_archive(3, age=2), self._web_archive(4)]
+        os.link(keep[-1], self.root / "linked")
+        wrong_case = self._web_archive(5)
+        wrong_case = wrong_case.rename(wrong_case.with_name(wrong_case.name.lower()))
+        link = self.root / "cmux-web-update-AAAAAAAA-1111-2222-3333-000000000006.tar.gz"
+        link.symlink_to(old)
+        junk = self._web_archive(7)
+        junk.write_bytes(b"not a gzip archive")
+        os.utime(junk, (time.time() - 48 * 3600,) * 2)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "darwin_user_tmp", return_value=self.root):
+            fam = next(f for f in gd.default_families("devbox") if f.id == gd.WEB_UPDATE_ARCHIVES)
+            items = gd.survey([fam], 1, 50 * 1024**2)
+            self.assertEqual([(i.path, i.verdict) for i in items], [(str(old), "reclaimable")])
+            dev = self.root.stat().st_dev
+            fss = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+            witness = f"p{os.getpid()}\n"
+            other_query = gd._owned_query_split
+
+            def query(argv, timeout, apart=True):
+                if argv == ["ps", "-axww", "-o", "command="] and apart:
+                    return 0, "idle\n", ""
+                if argv[-2:] == ["--", str(old)]:
+                    return 0, witness, ""
+                return other_query(argv, timeout, apart)
+
+            with mock.patch.object(gd, "default_families", return_value=[fam]), \
+                    mock.patch.object(gd, "filesystems", return_value=fss), \
+                    mock.patch.object(gd, "free_bytes", return_value=(10 * gd.GIB, 460 * gd.GIB)), \
+                    mock.patch.object(gd, "runner_floor_gib", return_value=0), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "EVICT_OWNER", self.root / "owner.json"), \
+                    mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                    mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
+                    mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                    mock.patch.object(gd, "notify_disk"), \
+                    mock.patch.object(gd, "_owned_query_split", side_effect=query), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                gd.main(["--pressure", "--apply", "--role", "devbox", "--family", fam.id,
+                         "--no-snapshot", "--receipt", str(self.receipt())])
+        self.assertFalse(old.exists())
+        self.assertTrue(all(p.exists() for p in [*keep, wrong_case, junk]))
+        self.assertTrue(link.is_symlink())
+        rows = [json.loads(s) for s in self.receipt().read_text().splitlines()]
+        self.assertEqual([r["outcome"] for r in rows if r.get("family") == fam.id], ["reclaimed"])
+
+    def test_web_update_checks_each_holder_inode_and_protected_path_at_unlink(self) -> None:
+        path = self._web_archive(1)
+        item = gd.WebUpdateArchiveItem(gd.WEB_UPDATE_ARCHIVES, str(path), 1, 48, "reclaimable",
+                                       identity=gd.web_update_identity(path.stat()))
+        witness = f"p{os.getpid()}\n"
+        idle = (0, "idle\n", "")
+        cases = [([(0, str(path), "")], "changed:in-use"),
+                 ([idle, (0, witness + "p99999999\n", "")], "changed:in-use"),
+                 ([idle, (0, "p99999999\n", "")], "blocked:lsof-incomplete"),
+                 ([idle, (0, witness, "warning")], "blocked:lsof-incomplete"),
+                 ([(1, "", "")], "blocked:ps-incomplete")]
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "darwin_user_tmp", return_value=self.root):
+            for replies, outcome in cases:
+                with self.subTest(outcome=outcome, replies=replies), \
+                        mock.patch.object(gd, "_owned_query_split", side_effect=replies):
+                    self.assertEqual(gd.remove_web_update_archive(self.root, item), outcome)
+                    self.assertTrue(path.is_file())
+            with mock.patch.object(gd, "never_delete", return_value=True):
+                self.assertIsNone(gd.web_update_archive(self.root, path))
+            def replace_during_lsof(argv, timeout):
+                if argv[0] == "ps":
+                    return idle
+                self._web_archive(10).replace(path)
+                return 0, witness, ""
+            with mock.patch.object(gd, "_owned_query_split", side_effect=replace_during_lsof):
+                self.assertEqual(gd.remove_web_update_archive(self.root, item), "changed:identity")
+                self.assertTrue(path.is_file())
 
     def _tmp_residue(self) -> tuple[Path, dict[str, Path]]:
         """A fake $TMPDIR: named test scratch, old and new, beside entries the reaper must never take."""
@@ -10758,6 +10897,12 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.RUN.pop("bundle_failed", None)
         fam = next(f for f in gd.default_families() if f.id == "cmux-job-cache")
         items = [i for i in gd.survey([fam], 24, 0) if i.path == os.fspath(unit)]
+        self.assertEqual(items[0].verdict, "bundle-failed")
+        self.assertIn("Retry at", items[0].hold["by"])
+        self.assertIn(memo["why"], items[0].hold["by"])
+        cached = {os.fspath(unit): memo["size"]}
+        sized = next(i for i in gd.survey([fam], 24, 0, cached) if i.path == os.fspath(unit))
+        self.assertEqual(sized.verdict, "bundle-failed")
         mtime = gd.item_mtime(fam, unit)
         self.assertEqual(memo["mtime"], mtime)
         # unchanged: neither bundled again nor walked with du, and still listed as failed
@@ -10767,6 +10912,12 @@ class LinuxLayoutTest(unittest.TestCase):
             self.assertEqual([i.path for i in gd.survey([fam], 24, 0, {}) if i.path == os.fspath(unit)],
                              [os.fspath(unit)])
         self.assertNotIn(unit, walked)
+        # If the hold expires after the survey, these held items still have no authority to remove the tree.
+        with mock.patch.object(gd, "recent_bundle_failure", return_value=None), \
+                mock.patch.object(gd, "archive_mirror", side_effect=AssertionError("bundled a held item")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply([sized], {fam.id: fam}, self.home / "expired-hold.jsonl", None, 24)
+        self.assertTrue(unit.is_dir())
         receipt, err = self.home / "receipt2.jsonl", io.StringIO()
         with mock.patch.object(gd, "archive_mirror", side_effect=AssertionError("bundled again")), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
@@ -10783,7 +10934,7 @@ class LinuxLayoutTest(unittest.TestCase):
         (clone / "touched").write_text("x")
         os.utime(clone, (mtime + 10, mtime + 10))
         self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), gd.item_mtime(fam, unit)))
-        self.assertEqual(gd.remembered_failure_sizes([(fam, unit)]), {})
+        self.assertEqual(gd.remembered_bundle_failures([(fam, unit)]), {})
 
     def test_a_bundle_that_failed_on_a_silent_remote_is_retried_after_an_hour(self) -> None:
         """cmux11s, 2026-11-05: a SwiftPM repository's ls-remote timed out once on the loaded uplink; that is not

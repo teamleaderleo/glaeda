@@ -283,8 +283,10 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -4560,6 +4562,83 @@ def own_runner_checkout_main(args: list[str]) -> int:
 # user-tmp. Measured on the minis: cmux-cli-socket-<uuid> (a ~48 MiB copy of the DEV app per CLI socket
 # test), cnd-bin-<n>, git-{pr,pr-merge,stage,hunk}-<uuid>, Foundation's TemporaryDirectory.<rand>.
 TMP_TEST_RESIDUE_FAMILY = "user-tmp-test-residue"
+WEB_UPDATE_ARCHIVES = "cmux-web-update-archives"
+WEB_UPDATE_NAME = re.compile(r"cmux-web-update-[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\.tar\.gz")
+WEB_UPDATE_FIRST_MEMBER = "Native/OptChat/optchat-chief/inspector/index.html"
+
+
+def web_update_archive(root: Path, path: Path) -> os.stat_result | None:
+    """Identify WebUpdater's old download by its writer name and the first sorted web-bundle-archive.py member."""
+    if (path.parent != root or not WEB_UPDATE_NAME.fullmatch(path.name) or never_delete(path)
+            or root != Path(os.path.realpath(root))):
+        return None
+    try:
+        if root.stat().st_uid != os.getuid():
+            return None
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid()
+                or time.time() - before.st_mtime <= 24 * 3600):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if web_update_identity(before) != web_update_identity(st):
+                return None
+            # One gzip input block, one tar header of output. Never extract or traverse the download.
+            header = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(os.read(fd, 16 * 1024), tarfile.BLOCKSIZE)
+            member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
+            if member.isreg() and member.name == WEB_UPDATE_FIRST_MEMBER:
+                return st
+        finally:
+            os.close(fd)
+    except (OSError, zlib.error, tarfile.HeaderError, UnicodeError):
+        pass
+    return None
+
+
+def web_update_identity(st: os.stat_result) -> tuple[int, ...]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_blocks
+
+
+def remove_web_update_archive(root: Path, item: "Item") -> str:
+    """Query this very file at unlink time. Our own open descriptor is a positive control for lsof."""
+    path = Path(item.path)
+    if not DARWIN or root != darwin_user_tmp():
+        return "changed:root-boundary"
+    st = web_update_archive(root, path)
+    if not isinstance(item, WebUpdateArchiveItem) or st is None or web_update_identity(st) != item.identity:
+        return "changed:identity"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if web_update_identity(os.fstat(fd)) != item.identity:
+                return "changed:identity"
+            # ps first: lsof itself names this file. Bounded queries; any warning holds the download.
+            code, ps, err = _owned_query_split(["ps", "-axww", "-o", "command="], 10)
+            if code or err.strip() or not ps.strip():
+                return "blocked:ps-incomplete"
+            if any(name in command_text(ps) for name in spellings(str(path))):
+                return "changed:in-use"
+            code, out, err = _owned_query_split([shutil.which("lsof") or "/usr/sbin/lsof",
+                                                 "-nP", "-Fp", "--", str(path)], 10)
+            pids = {line for line in out.splitlines() if line.startswith("p")}
+            witness = f"p{os.getpid()}"
+            if code or err.strip() or witness not in pids:
+                return "blocked:lsof-incomplete"
+            if pids != {witness}:
+                return "changed:in-use"
+            if never_delete(path):
+                return "changed:protected"
+            if web_update_identity(path.lstat()) != item.identity:
+                return "changed:identity"
+            path.unlink()
+            return "reclaimed"
+        finally:
+            os.close(fd)
+    except subprocess.TimeoutExpired:
+        return "blocked:query-timeout"
+
+
 TMP_TEST_RESIDUE = re.compile(
     r"(?:cmux-cli-socket|cnd-bin|git-pr-merge|git-pr|git-stage|git-hunk|cmux-home-attach-tests|cmux-file-pages"
     r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
@@ -4656,7 +4735,7 @@ def tmp_test_residue_prefix(name: str, runner_host: bool) -> str | None:
     stays: an idle, unopened entry is not proven disposable by its age alone."""
     if m := TMP_TEST_RESIDUE.match(name):
         return m.group(0)[:-2]
-    if not runner_host or TMP_TEST_RESIDUE_KEEP.match(name):
+    if not runner_host or TMP_TEST_RESIDUE_KEEP.match(name) or name.startswith("cmux-web-update-"):
         return None
     m = TMP_TEST_UUID_NAME.fullmatch(name)
     if m is None or (m.group("ext") or "").lower() in TMP_CREDENTIAL_EXT:
@@ -6080,8 +6159,11 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # the full timeout in one kernel filesystem call. The per-child walks remain killable and
         # fail closed, so one wedged tree cannot make the whole temp root look like one stuck item.
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
-                           skip_prefixes=("com.apple.",), git_disposable=True,
+                           skip_prefixes=("com.apple.", "cmux-web-update-"), git_disposable=True,
                            owner="agents and tools", rebuild_minutes=0.5, platform="shared"))
+        fams.append(Family(WEB_UPDATE_ARCHIVES, user_tmp, True, "downloaded again by cmux WebUpdater",
+                           owner="cmux WebUpdater", min_bytes=0, min_idle_hours=24, max_idle_hours=24,
+                           rebuild_minutes=0.1, platform="macos", files=True))
     clones = darwin_code_sign_clones() if DARWIN else None
     if clones is not None:
         # One copy per launch, below a directory per bundle id. keep_live_app_clones keeps each bundle's
@@ -6325,6 +6407,11 @@ class Item:
     # Every item that stays says why (hold_record): what holds it, its last use, its family's window and whether it is
     # stale (idle past that window), so a dry run's "blocked" total is a list of reasons, never a bare verdict
     hold: dict[str, Any] | None = None
+
+
+@dataclass
+class WebUpdateArchiveItem(Item):
+    identity: tuple[int, ...] = ()
 
 
 # What a verdict with no reason of its own means, for hold_record. A mini measured after glaeda#2060 (2026-11-18) held
@@ -10840,6 +10927,13 @@ def recent_bundle_failure(path: str, mtime: float, now: float | None = None) -> 
     return None
 
 
+def bundle_failure_reason(failed: dict) -> str:
+    why = str(failed.get("why", ""))
+    retry = float(failed["at"]) + bundle_failure_retry_s(why)
+    retry_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(retry))
+    return f"glaeda-disk could not archive this checkout ({why}). The tree has not changed since. Retry at {retry_at}."
+
+
 def remember_bundle_failure(path: str, mtime: float, why: str, size: int | None = None) -> None:
     """Record a tree's bundle failure, so the next passes neither bundle it nor walk it with du again while it
     is unchanged. Entries past their retry age are dropped as the file is written."""
@@ -10862,23 +10956,23 @@ def remember_bundle_failure(path: str, mtime: float, why: str, size: int | None 
         pass  # only a cache: the next pass bundles it again
 
 
-def remembered_failure_sizes(work: list[tuple[Family, Path]]) -> dict[str, int]:
-    """Sizes of trees whose bundle failure is still remembered and that have not changed since (their newest
-    mtime near the top, as item_mtime reads it, is the one recorded): not walked with du again, since no pass
-    deletes them before the failure expires or the tree changes."""
+def remembered_bundle_failures(work: list[tuple[Family, Path]]) -> dict[str, dict]:
+    """Read active archive holds once per survey, including holds on trees already sized in the snapshot."""
     memo = load_bundle_failures()
-    out: dict[str, int] = {}
+    if not memo:
+        return {}
+    out: dict[str, dict] = {}
     now = time.time()
     for fam, p in work:
-        got = memo.get(os.fspath(p)) if memo else None
-        if not got or not isinstance(got.get("size"), int):
+        got = memo.get(os.fspath(p))
+        if not got:
             continue
         try:
             if not bundle_failure_stands(os.fspath(p), got, now) or item_mtime(fam, p) != float(got["mtime"]):
                 continue
         except (KeyError, TypeError, ValueError, OSError):
             continue
-        out[os.fspath(p)] = got["size"]
+        out[os.fspath(p)] = got
     return out
 
 
@@ -11853,6 +11947,8 @@ def candidates(fam: Family) -> list[Path]:
     if fam.id == TART_IMAGES:
         level = tart_image_dirs(fam.root)
         tart_seen(fam, level)
+    elif fam.id == WEB_UPDATE_ARCHIVES:
+        level = [Path(e.path) for e in _entries(fam.root) if WEB_UPDATE_NAME.fullmatch(e.name)]
     elif fam.transcripts or fam.transcript_archives:
         level = transcript_candidates(fam.root, fam.transcript_archives)
     elif fam.discover:
@@ -11949,9 +12045,16 @@ def run_deadline_halt() -> str:
 
 def with_run_deadline(halt):
     """HALT (a callable naming why to stop, or None), also stopping at the caller's deadline when one is set."""
-    if run_deadline_left() is None:
-        return halt
-    return lambda: run_deadline_halt() or (halt() if halt is not None else "")
+    deadline = run_deadline_left() is not None
+    if not deadline and halt is None:
+        return None
+
+    def checked():
+        why = (run_deadline_halt() if deadline else "") or (halt() if halt is not None else "")
+        if why:
+            RUN["apply_stopped"] = why
+        return why
+    return checked
 
 
 def pressure_survey_deadlines(now: float | None = None) -> tuple[float | None, float | None]:
@@ -12263,6 +12366,12 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     items: list[Item] = []
     known = known if known is not None else {}
     work = round_robin_work(families)
+    web_archives = {}
+    for fam, path in work:
+        if fam.id == WEB_UPDATE_ARCHIVES and (st := web_update_archive(fam.root, path)) is not None:
+            web_archives[path] = web_update_identity(st)
+            known[str(path)] = st.st_blocks * 512
+    work = [(fam, path) for fam, path in work if fam.id != WEB_UPDATE_ARCHIVES or path in web_archives]
     if defer_bulk:
         work = [(fam, path) for fam, path in work if not fam.bulk_sizes or str(path) in known]
     for fam in families:
@@ -12276,7 +12385,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 known.update({k: v for k, v in walked.items() if k not in known})
     # a tree whose bundle failed and that has not changed since keeps its remembered size: no pass deletes it
     # before the failure expires, so walking it again (150-900 s for a 40 GiB scratch tree) buys nothing
-    known.update(remembered_failure_sizes([(fam, path) for fam, path in work if str(path) not in known]))
+    failed_bundles = remembered_bundle_failures(work)
+    for path, failure in failed_bundles.items():
+        if isinstance(failure.get("size"), int):
+            known.setdefault(path, failure["size"])
     missing = [path for _, path in work if str(path) not in known]
     if deadline is not None and time.monotonic() >= deadline:
         _MEASURE_BUDGET_REACHED = True
@@ -12288,6 +12400,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     # A failed walk is unsized, never zero bytes.  Do not put it in the snapshot or judge it for
     # reclaim; the next report will retry it without allowing a stale zero to hide the tree.
     known.update({path: size for path, size in measured.items() if size is not None})
+    if len(measured) < len(missing) and any(str(p) not in known and os.path.lexists(p) for p in missing):
+        RUN["survey_incomplete"] = True
     global _REFRESH_PROGRESS_KNOWN
     if _REFRESH_PROGRESS_KNOWN is not None:
         _REFRESH_PROGRESS_KNOWN = dict(known)
@@ -12310,6 +12424,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             blind = ""
         except NoEvidence as e:
             cwds, cmds, blind = [], "", f"no process evidence ({e})"
+    if blind:
+        RUN["survey_incomplete"] = True
     opened = open_index(cwds)
     references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
@@ -12438,6 +12554,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "recent"
             if media_tour_warm_slot(fam, path):
                 reasons.append("a warm media tour slot on a media host: kept by role, only under the runner floor")
+        elif sp in failed_bundles and mirror_due(fam, path, idle):
+            verdict = "bundle-failed"
+            reasons.append(bundle_failure_reason(failed_bundles[sp]))
         else:
             verdict = "reclaimable"
             if media_tour_stray(fam, path):
@@ -12478,8 +12597,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(f"a checkout of build-worker step {steps}, which ended (its step directory is gone)")
         if policy_note:
             reasons.append(policy_note)
-        items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
-                          platform_label(fam), hold_record(fam, verdict, reasons, idle, window, due)))
+        fields = (fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
+                  platform_label(fam), hold_record(fam, verdict, reasons, idle, window, due))
+        items.append(WebUpdateArchiveItem(*fields, identity=web_archives[path])
+                     if fam.id == WEB_UPDATE_ARCHIVES else Item(*fields))
     items.sort(key=lambda i: i.bytes, reverse=True)
     return items
 
@@ -14068,7 +14189,8 @@ def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[
 
 
 def filesystem_accounting(fss: list[Fs], items: list[Item],
-                          sizes: dict[str, int] | None = None) -> list[dict[str, Any]]:
+                          sizes: dict[str, int] | None = None, *,
+                          held_by_dev: dict[int, list[Item]] | None = None) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
 
     ``measured`` is every sized byte on the volume, counting the outermost path of each overlapping set
@@ -14137,6 +14259,8 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             try:
                 if Path(i.path).stat().st_dev == fs.dev:
                     catalogued.append((Path(i.path), i.bytes, i.verdict))
+                    if held_by_dev is not None and i.hold and i.bytes > 0:
+                        held_by_dev.setdefault(fs.dev, []).append(i)
             except OSError:
                 continue
         # A parent catalog item already includes every nested item. Count only the highest-level path
@@ -15104,6 +15228,47 @@ def notify_disk(title: str, body: str) -> None:
     except (OSError, subprocess.SubprocessError):
         pass
 
+
+def notify_remaining_pressure(volumes: list[Fs], held_by_dev: dict[int, list[Item]], families: list[Family],
+                              accounting: list[dict[str, Any]]) -> None:
+    """Page only for volumes observed below their floor after all cleanup; a survey hold explains its own path."""
+    _, observed = reobserve_filesystems(volumes)
+    for row in observed:
+        if not row["observed"] or not row["under"]:
+            continue
+        dev = row["dev"]
+        parts = [f"{gib(row['free']).strip()} free on {row['mount']} (floor {gib(row['low']).strip()})"]
+        held = {i.path: i for i in held_by_dev.get(dev, [])}
+        for path in sorted(_outermost(list(held)), key=lambda p: -held[p].bytes):
+            item = held[path]
+            try:
+                if Path(path).lstat().st_dev != dev:
+                    continue
+            except OSError:
+                continue  # maintenance may have removed it since accounting grouped the paths
+            reason = item.hold["by"]
+            matches = [f for f in families if f.id == item.family and Path(path).is_relative_to(f.root)]
+            family = max(matches, key=lambda f: len(f.root.parts), default=None)
+            owner = (family.owner if family else "") or census_owner(census_canon(path))
+            if owner and f"(owner: {owner})" not in reason:
+                reason += f" (owner: {owner})"
+            parts.append(f"{item.family} {path}: {gib(item.bytes).strip()} ({reason})")
+            if len(parts) == 4:  # three distinct, still-present holders
+                break
+        account = next((a for a in accounting if a.get("dev") == dev), {})
+        if len(parts) == 1:
+            # The census can name who owns a measured tree. Its size alone cannot establish a hold.
+            trees = [child for scope in account.get("coverage", []) if scope.get("scope") in (ROOT_CENSUS_SCOPE, CENSUS_SCOPE)
+                     for child in scope.get("children", []) if child.get("owner") and not child.get("private")
+                     and child.get("bytes", 0) > 0]
+            for tree in sorted(trees, key=lambda t: -t["bytes"])[:3]:
+                parts.append(f"last census measured {tree['category']}: {gib(tree['bytes']).strip()} ({tree['owner']})")
+        gap = account.get("accounting_gap", 0)
+        if gap:
+            parts.append(f"last accounting gap {gib(gap).strip()}")
+        notify_disk("glaeda disk pressure", "; ".join(parts))
+
+
 def gap_named(accounting: list[dict[str, Any]]) -> str:
     """" (...)" naming where the used space outside the walked directories is: the container's other APFS
     volumes (attributed, so outside the gap) and what the gap sits under; "" when there is nothing to name."""
@@ -15315,6 +15480,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     try:
         cwds, cmds = process_evidence()
     except NoEvidence as e:
+        RUN["apply_stopped"] = str(e)
         print(f"refusing to delete anything: {e}", file=sys.stderr)
         return 0
     cwds = open_index(cwds)
@@ -15371,7 +15537,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             return (-0.25, i.idle_hours, i.bytes, 0)
         return (0, value(i, families[i.family]), 0, 0)
     for i in sorted(items, key=order, reverse=True):
-        if i.verdict != "reclaimable":
+        if i.verdict not in ("reclaimable", "bundle-failed"):
             continue
         p = Path(i.path)
         fam = family_of(i)
@@ -15431,6 +15597,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             try:
                 opened, cmds = process_evidence()
             except NoEvidence as e:
+                RUN["apply_stopped"] = str(e)
                 print(f"refusing to delete the rest: {e}", file=sys.stderr)
                 break
             cwds = open_index(opened)
@@ -15441,6 +15608,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             # app may have started from a clone: a running app names only its installed path, so ps it is
             cmds = command_lines()
             if not cmds:
+                RUN["apply_stopped"] = "ps failed"
                 print("refusing to delete the rest: ps failed", file=sys.stderr)
                 break
         fresh_layout = ""
@@ -15460,6 +15628,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 try:
                     opened, cmds = process_evidence()
                 except NoEvidence as e:
+                    RUN["apply_stopped"] = str(e)
                     print(f"refusing to delete the rest: {e}", file=sys.stderr)
                     break
                 cwds = open_index(opened)
@@ -15467,6 +15636,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             else:
                 cmds = command_lines()
                 if not cmds:
+                    RUN["apply_stopped"] = "ps failed"
                     print("refusing to delete the rest: ps failed", file=sys.stderr)
                     break
         if (fam.boundary_root is not None or fam.id in ROOT_SAFE_FAMILIES) and not tart_root_safe(fam.boundary_root or fam.root):
@@ -15527,11 +15697,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif mirror_due(fam, p, idle_now) and (failed := recent_bundle_failure(i.path, item_mtime(fam, p))):
             # bundling this unchanged tree failed within BUNDLE_FAILURE_RETRY_S: kept without trying again
             outcome = "blocked:bundle-failed"
-            i.reasons.append(f"bundling failed at {time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(failed['at']))}"
-                             f" and the tree has not changed since; retried after "
-                             f"{bundle_failure_retry_s(str(failed.get('why', ''))) // 3600} h: {failed.get('why', '')}")
+            if i.verdict != "bundle-failed":
+                i.reasons.append(bundle_failure_reason(failed))
             RUN.setdefault("bundle_failed", []).append(i.path)
             RUN.setdefault("bundle_failed_remembered", []).append(i.path)
+        elif i.verdict == "bundle-failed":
+            continue  # its hold expired since the survey; only a fresh survey can authorize removal
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
             drop_unused_archives(bundled[1])  # the tree stays whole: what was bundled for it so far is not needed
@@ -15561,6 +15732,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     destination = archive_transcript(p)
                     outcome = "archived"
                     released += max(0, original_bytes - destination.stat().st_size)
+                elif i.family == WEB_UPDATE_ARCHIVES:
+                    web_outcome = remove_web_update_archive(fam.root, i)
+                    gone = web_outcome == "reclaimed"
                 elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
                 elif i.family in SEED_ROOT_FAMILIES:
@@ -15597,7 +15771,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                             with contextlib.suppress(OSError):
                                 empty.rmdir()
                 if not fam.transcripts:
-                    outcome = "reclaimed" if gone else "changed:in-use"
+                    outcome = web_outcome if i.family == WEB_UPDATE_ARCHIVES else "reclaimed" if gone else "changed:in-use"
                     took = i.bytes
                     if gone and fam.id == CMUX_NEXT_CI_FAMILY:
                         if whole_state or cmux_next_ci_host_root(fam, p):
@@ -17453,6 +17627,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     global CACHE_BUDGET, BUDGET_WARM_DEVS
     CACHE_BUDGET, BUDGET_WARM_DEVS = {}, frozenset()
     budget_base: dict[int, tuple[int, int]] = {}  # dev -> the volume's (low, target) before the budget raised them
+    pressure_floors = {dev: fs.low for dev, fs in fss.items()}
     if (a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not reserved and not a.family
             and a.need is None and not a.cmux_next_drain and not a.root_override):
         # an expired fleet-cas record is measured again here (a plan-only prune), on every budgeted path: the hourly
@@ -17478,6 +17653,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 if fs.tmpfs:
                     continue
                 cap = fs.total - GIB  # a want above the volume is met by nothing; aim at all of it
+                pressure_floors[dev] = max(pressure_floors[dev], min(low_want, cap))
                 fss[dev] = replace(fs, low=max(fs.low, min(low_want, cap)), target=max(fs.target, min(target_want, cap)))
             print(f"queued job wants {gib(want).strip()} free: target raised to it plus "
                   f"{POLICY['target_margin_gib']:g} GiB")
@@ -17976,14 +18152,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if PRESSURE_SIM_RUNTIMES and sim_job_host() is False:
             logical_released += apply_runtimes(simulator_runtimes(unrouted=True), a.receipt, halt, unrouted=True,
                                                below_target=short_of_target)
-        remaining = []
-        for fs in shown:
-            try:
-                free, _ = free_bytes(Path(fs.mount))
-            except OSError:
-                free = fs.free
-            if free < fs.low:
-                remaining.append(f"{gib(free).strip()} free on {fs.mount}")
         RUN["released"] = logical_released
         blocked: dict[str, int] = {}
         for i in items:
@@ -17992,11 +18160,6 @@ def _main_impl(argv: list[str] | None = None) -> int:
         RUN["blocked"] = {f: round(b / GIB, 1) for f, b in sorted(blocked.items(), key=lambda x: -x[1])[:3]}
         if logical_released:
             notify_disk("glaeda disk keepup", f"{gib(logical_released).strip()} reclaimed on {platform.node()}")
-        if remaining:
-            kept = [i for i in items if i.verdict != "reclaimable"][:3]
-            blocked = ", ".join(f"{gib(i.bytes).strip()} {Path(i.path).name} ({i.verdict})" for i in kept)
-            notify_disk("glaeda disk pressure", "still below floor: " + "; ".join(remaining)
-                        + (f"; biggest guarded items: {blocked}" if blocked else ""))
         if sweep:
             if not RUNNER_CACHE_PROFILE:
                 # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
@@ -18007,7 +18170,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # deliberately separate: logical catalogue bytes can differ from physical free
         # blocks because of APFS clones, snapshots, concurrent jobs, or failed measurements.
         after_fss, after_fs_receipt = reobserve_filesystems(fss)
-        after_accounting = filesystem_accounting(after_fss, items, known)
+        held_by_dev: dict[int, list[Item]] = {}
+        after_accounting = filesystem_accounting(after_fss, items, known, held_by_dev=held_by_dev)
         write_health_summary(after_fss, items, after_accounting, a.receipt)
         if not DEAD_MODE and not a.family and not a.cmux_next_drain:
             outlived = outlived_build_caches(items, by_id) if BUILD_CACHES_UNWINDOWED else None
@@ -18037,6 +18201,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
             repack_runner_checkouts(a.receipt, halt=halt)
         if mirror_compact_due:
             compact_shared_mirrors(a.receipt, halt=halt)
+        if ((a.pressure or sweep) and not (a.family or a.root_override or a.cmux_next_drain or RUNNER_CACHE_PROFILE
+                or DEAD_MODE or reserved or out_of_band or a.need is not None or _MEASURE_BUDGET_REACHED
+                or RUN.get("survey_incomplete") or RUN.get("evict_yielded") or RUN.get("run_deadline_reached")
+                or "apply_stopped" in RUN)):
+            # Budget pressure may have raised a volume's low to free + 1 just to collect warm caches.
+            notify_remaining_pressure([replace(fs, low=pressure_floors[fs.dev]) for fs in shown],
+                                      held_by_dev, fams, after_accounting)
     return 0
 
 

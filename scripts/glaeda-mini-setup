@@ -942,14 +942,15 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         # records a durable queued receipt; the next minute retries automatically.
         LABEL_PREFIX + "idle-repair": {
             "Label": LABEL_PREFIX + "idle-repair",
-            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply"],
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply", "--scheduled-log"],
             "StartInterval": 60,
             "RunAtLoad": True,
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
             "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
-            "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-repair.jsonl"),
+            # idle-repair opens its log under run.lock. A descriptor launchd opens first would race rotation.
+            "StandardOutPath": "/dev/null",
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
         },
         LABEL_PREFIX + "disk-dedupe": {
@@ -1867,10 +1868,54 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
     os.replace(stage, path)
 
 
+def ota_rollback_generation(ctx: Context) -> Path | None:
+    """The complete generation that glaeda-update restores on failure and keeps on success."""
+    if ctx.platform != "macos" or not os.environ.get(UPDATE_ENV):
+        return None
+    update = ctx.state.parent / "update"
+    try:
+        state = json.loads((update / "state.json").read_text())
+        tag = state.get("current") if isinstance(state, dict) else None
+        if not isinstance(tag, str) or not re.fullmatch(r"r-\d{8}-[0-9a-f]{12}", tag):
+            return None
+        gen = update / "generations" / tag
+        marker = gen / ".complete"
+        if marker_root_is_owned(ctx, marker) and marker.read_bytes() == (tag + "\n").encode():
+            return gen
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def rollback_tool(ctx: Context, gen: Path | None, act: dict[str, Any], dest: Path) -> Path | None:
+    """A receipt-owned tool whose exact prior bytes are already in OTA's rollback generation."""
+    if gen is None or act["kind"] != "tool" or not act.get("owned"):
+        return None
+    if dest == ctx.bin / "glaeda-worktree-reclaim":
+        source = gen / "bin" / dest.name
+    else:
+        try:
+            source = gen / "glaeda" / Path(act["source"]).relative_to(REPO)
+        except ValueError:
+            return None
+    digest = act.get("ownedSha256")
+    if (digest and marker_root_is_owned(ctx, source) and sha256_file(source) == digest
+            and sha256_file(dest) == digest and stat.S_IMODE(dest.stat().st_mode) == int(act["mode"], 8)):
+        return source
+    return None
+
+
 def backup(ctx: Context, path: Path) -> str:
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = ctx.state / "backup" / f"{path.name}.{stamp}"
-    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = ctx.state / "backup"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Two installs within a second must keep both originals, including a local edit between them.
+    dest = root / f"{path.name}.{stamp}"
+    try:
+        dest.touch(mode=0o600, exist_ok=False)
+    except FileExistsError:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=dest.name + ".", delete=False) as created:
+            dest = Path(created.name)
     shutil.copy2(path, dest)
     return os.fspath(dest)
 
@@ -1926,6 +1971,7 @@ def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> No
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
     reclaim_failed = False
+    rollback = ota_rollback_generation(ctx)
     for act in actions:
         kind, state = act["kind"], act["state"]
         act["applied"] = False
@@ -1971,7 +2017,11 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             else:
                 data = b""
             if state == "update":
-                act["backup"] = backup(ctx, dest)
+                saved = rollback_tool(ctx, rollback, act, dest)
+                if saved is None:
+                    act["backup"] = backup(ctx, dest)
+                else:
+                    act["rollbackSource"] = os.fspath(saved)
             if not dest.parent.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":

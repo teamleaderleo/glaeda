@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -125,6 +126,74 @@ class IdleRepairTest(unittest.TestCase):
         with mock.patch.object(idle, "load_disk_module") as load:
             self.assertEqual(idle.main(["--status"]), 0)
         load.assert_not_called()
+
+    def test_scheduled_log_keeps_the_newest_whole_records_and_receipts_the_released_bytes(self) -> None:
+        path = idle.HOME / "Library/Logs/glaeda-idle-repair.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [json.dumps({"schema": idle.SCHEMA, "state": "idle", "actions": [], "lastAttemptAt": n,
+                            "nextAttemptAt": n + 900}).encode() + b"\n" for n in range(200)]
+        path.write_bytes(b"".join(rows))
+        prior = path.stat()
+        disk = mock.Mock()
+        disk.host_busy.return_value = "test build running"
+        disk.process_evidence.return_value = ([], "")
+        disk.in_cwd.return_value = False
+        disk.free_bytes.side_effect = [(1024, 8192), (5120, 8192)]
+        with mock.patch.object(idle, "LOG_MAX_BYTES", 4096), mock.patch.object(idle, "LOG_KEEP_BYTES", 1024), \
+                mock.patch.object(idle, "load_disk_module", return_value=disk):
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), idle.QUEUED_EXIT)
+            kept = path.read_bytes()
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), 0)
+            self.assertEqual(path.read_bytes(), kept, "a not-due tick must not replay the last state")
+        lines = kept.splitlines(keepends=True)
+        self.assertLess(len(kept), 4096)
+        self.assertEqual(lines[:-1], rows[-len(lines) + 1:])
+        self.assertEqual(json.loads(lines[-1])["state"], "queued")
+        record = json.loads(idle.RECEIPT.read_bytes().splitlines()[-1])
+        after = path.stat()
+        self.assertEqual(record["outcome"], "log-compacted")
+        self.assertEqual(record["logicalReleasedBytes"], prior.st_size - after.st_size)
+        self.assertEqual(record["allocatedReleasedBytes"], (prior.st_blocks - after.st_blocks) * 512)
+        self.assertEqual(record["physicalFreeDeltaBytes"], 4096)
+
+    def test_scheduled_log_keeps_foreign_mixed_linked_open_and_changing_legacy_files(self) -> None:
+        path = idle.HOME / "Library/Logs/glaeda-idle-repair.jsonl"
+        path.parent.mkdir(parents=True)
+        value = {"state": "idle", "actions": [], "lastAttemptAt": 1, "nextAttemptAt": 901}
+        row = (json.dumps({"schema": idle.SCHEMA, **value}) + "\n").encode()
+        disk = mock.Mock()
+        disk.process_evidence.return_value = ([], "")
+        with mock.patch.object(idle, "LOG_MAX_BYTES", 1), mock.patch.object(idle, "LOG_KEEP_BYTES", 1):
+            for raw in (b"someone else's log\n", row + b"someone else's log\n" + row, row.rstrip()):
+                path.write_bytes(raw)
+                idle.write_scheduled_log(value, disk)
+                self.assertEqual(path.read_bytes(), raw)
+            path.write_bytes(row)
+            other = path.parent / "existing-log"
+            os.link(path, other)
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row)
+            path.unlink()
+            path.symlink_to(other)
+            with self.assertRaises(OSError):
+                idle.write_scheduled_log(value, disk)
+            self.assertEqual(other.read_bytes(), row)
+            path.unlink()
+            path.write_bytes(row)
+            disk.in_cwd.return_value = True
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row)
+
+            def late_write(_path):
+                with path.open("ab") as appender:
+                    appender.write(row)
+                return (8192, 8192)
+
+            disk.in_cwd.return_value = False
+            disk.free_bytes.side_effect = late_write
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row * 2)
+        self.assertFalse(idle.RECEIPT.exists())
 
 
 class RunTest(unittest.TestCase):
