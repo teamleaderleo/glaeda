@@ -9909,6 +9909,7 @@ class Daemon:
             self.upstream_refuse_posts()
         with self.phase("watches"):
             entries = self.watches()
+        self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
         for e in entries:
@@ -23599,7 +23600,10 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
-JUMP_PHASES = frozenset({"watches", "controller", "due", "reads"})  # tick phases that only read (Daemon.reexec_now)
+# Tick phases that only read (Daemon.reexec_now). "read upstream" and "read direct" are a lane VM's: its tick reads
+# through the broker (upstream_tick), and a lane VM, 2026-11-24, merge 855cbf92, re-exec'd 22.85 s after the wake
+# from serve, the jump never offered: its tick was in a phase this set did not name.
+JUMP_PHASES = frozenset({"watches", "controller", "due", "reads", "read upstream", "read direct"})
 
 
 class ScriptWake:

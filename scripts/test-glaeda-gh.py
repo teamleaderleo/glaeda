@@ -22893,6 +22893,20 @@ class ReexecDrainTest(Base):
         self.daemon.finish_tick([], [], [], [], [])
         self.assertIsNone(self.daemon.phase_now, "the end of the tick writes: no leap there")
 
+    def test_a_lane_vms_upstream_tick_offers_the_jump_in_its_reads(self) -> None:
+        """A lane VM, 2026-11-24, merge 855cbf92: the tick read through the broker (upstream_tick), in phases the jump
+        did not name, and serve re-exec'd 22.85 s after the wake."""
+        self.assertLessEqual({"read upstream", "read direct", "reads"}, gg.JUMP_PHASES)
+        self.assertNotIn("outbox", gg.JUMP_PHASES)
+        seen: list = []
+        with mock.patch.object(self.daemon, "watches", return_value=[]), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(self.daemon, "upstream_refuse_posts"), \
+                mock.patch.object(self.daemon, "finish_tick",
+                                  side_effect=lambda *a: seen.append(self.daemon.phase_now) or {}):
+            self.daemon.upstream_tick(lambda req: {})
+        self.assertEqual(seen, ["reads"], "the upstream tick's reads offer the jump until finish_tick")
+
     def test_claimed_running_asks_without_reaping(self) -> None:
         done, running = mock.Mock(), mock.Mock()
         done.done.return_value, running.done.return_value = True, False
