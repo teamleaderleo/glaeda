@@ -56,7 +56,9 @@ def run_suites(body: str, *, bound: str = "1") -> subprocess.CompletedProcess[st
 
 class SuiteBound(unittest.TestCase):
     def test_a_hanging_suite_is_killed_and_the_suites_behind_it_still_run(self) -> None:
-        done = run_suites('suite sleep 600\nsuite true\necho "REACHED_END=1"')
+        # A healthy fixture prints a verdict: the same helper also fails a suite that exits 0 without one
+        # (scripts/test-ci-suite-verdict.py), so a bare `true` here would be red for the other reason.
+        done = run_suites('suite sleep 600\nsuite sh -c \'echo OK\'\necho "REACHED_END=1"')
         self.assertIn("REACHED_END=1", done.stdout, done.stderr)
         self.assertIn("FAILED=1", done.stdout, done.stdout)
         self.assertIn("ROW=sleep 600 (hit its 1s bound)", done.stdout, done.stdout)
@@ -75,8 +77,8 @@ class SuiteBound(unittest.TestCase):
         self.assertIn("FAILED=1", done.stdout, done.stdout)
 
     def test_a_passing_suite_is_timed_and_not_counted_failed(self) -> None:
-        done = run_suites("suite true", bound="60")
-        self.assertIn("suite took 0s of its 60s bound: true", done.stdout, done.stdout)
+        done = run_suites("""suite sh -c 'echo OK'""", bound="60")
+        self.assertIn("suite took 0s of its 60s bound: sh -c echo OK", done.stdout, done.stdout)
         self.assertIn("FAILED=0", done.stdout, done.stdout)
 
     def test_the_workflow_still_bounds_every_suite_through_one_helper(self) -> None:
