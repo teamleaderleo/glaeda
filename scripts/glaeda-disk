@@ -4567,7 +4567,7 @@ WEB_UPDATE_NAME = re.compile(r"cmux-web-update-[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0
 WEB_UPDATE_FIRST_MEMBER = "Native/OptChat/optchat-chief/inspector/index.html"
 
 
-def web_update_archive(root: Path, path: Path) -> os.stat_result | None:
+def web_update_archive(root: Path, path: Path, *, applying: bool = False) -> os.stat_result | None:
     """Identify WebUpdater's old download by its writer name and the first sorted web-bundle-archive.py member."""
     if (path.parent != root or not WEB_UPDATE_NAME.fullmatch(path.name) or never_delete(path)
             or root != Path(os.path.realpath(root))):
@@ -4591,7 +4591,13 @@ def web_update_archive(root: Path, path: Path) -> os.stat_result | None:
                 return st
         finally:
             os.close(fd)
-    except (OSError, zlib.error, tarfile.HeaderError, UnicodeError):
+    except FileNotFoundError:
+        pass  # the candidate disappeared between enumeration and inspection
+    except OSError:
+        if applying:
+            raise  # apply records the failed observation and retains the candidate
+        RUN["survey_incomplete"] = True
+    except (zlib.error, tarfile.HeaderError, UnicodeError):
         pass
     return None
 
@@ -4600,12 +4606,49 @@ def web_update_identity(st: os.stat_result) -> tuple[int, ...]:
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_blocks
 
 
+def descriptor_holder_status(fd: int) -> str:
+    """Check the held device/inode against a fresh mount-safe listing. Require our exact descriptor as witness."""
+    st = os.fstat(fd)
+    try:
+        code, out, err = _owned_query_split([shutil.which("lsof") or "/usr/sbin/lsof",
+                                             *LSOF_NO_MOUNT_STAT, "-nP", "-FpfDi"], 10)
+    except subprocess.TimeoutExpired:
+        return "blocked:query-timeout"
+    except OSError:
+        return "blocked:lsof-incomplete"
+    if code or err.strip():
+        return "blocked:lsof-incomplete"
+    wanted = (f"D{st.st_dev:#x}", f"i{st.st_ino}")
+    witness = (f"p{os.getpid()}", f"f{fd}")
+    pid = descriptor = device = inode = ""
+    holders = set()
+    for line in itertools.chain(out.splitlines(), ("p",)):
+        if line.startswith(("p", "f")):
+            if (device, inode) == wanted:
+                holders.add((pid, descriptor))
+            device = inode = ""
+            if line.startswith("p"):
+                pid, descriptor = line, ""
+            else:
+                descriptor = line
+        elif line.startswith("D"):
+            device = line
+        elif line.startswith("i"):
+            inode = line
+    if witness not in holders:
+        return "blocked:lsof-incomplete"
+    return "clear" if holders == {witness} else "changed:in-use"
+
+
 def remove_web_update_archive(root: Path, item: "Item") -> str:
     """Query this very file at unlink time. Our own open descriptor is a positive control for lsof."""
     path = Path(item.path)
-    if not DARWIN or root != darwin_user_tmp():
+    observed_root = darwin_user_tmp() if DARWIN else None
+    if DARWIN and observed_root is None:
+        return "incomplete:temp-root-unavailable"
+    if not DARWIN or root != observed_root:
         return "changed:root-boundary"
-    st = web_update_archive(root, path)
+    st = web_update_archive(root, path, applying=True)
     if not isinstance(item, WebUpdateArchiveItem) or st is None or web_update_identity(st) != item.identity:
         return "changed:identity"
     try:
@@ -4613,20 +4656,17 @@ def remove_web_update_archive(root: Path, item: "Item") -> str:
         try:
             if web_update_identity(os.fstat(fd)) != item.identity:
                 return "changed:identity"
-            # ps first: lsof itself names this file. Bounded queries; any warning holds the download.
             code, ps, err = _owned_query_split(["ps", "-axww", "-o", "command="], 10)
             if code or err.strip() or not ps.strip():
                 return "blocked:ps-incomplete"
             if any(name in command_text(ps) for name in spellings(str(path))):
+                item.reasons.append("a running command names this archive")
                 return "changed:in-use"
-            code, out, err = _owned_query_split([shutil.which("lsof") or "/usr/sbin/lsof",
-                                                 "-nP", "-Fp", "--", str(path)], 10)
-            pids = {line for line in out.splitlines() if line.startswith("p")}
-            witness = f"p{os.getpid()}"
-            if code or err.strip() or witness not in pids:
-                return "blocked:lsof-incomplete"
-            if pids != {witness}:
-                return "changed:in-use"
+            holder = descriptor_holder_status(fd)
+            if holder != "clear":
+                if holder == "changed:in-use":
+                    item.reasons.append("another process has this archive open")
+                return holder
             if never_delete(path):
                 return "changed:protected"
             if web_update_identity(path.lstat()) != item.identity:
@@ -6152,6 +6192,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                 mirror_idle_hours=LANE_SESSION_IDLE_HOURS, deep_mtime=True)
         fams += lane_vm_families(tmp, uid)
     user_tmp = darwin_user_tmp() if DARWIN else None
+    if DARWIN and user_tmp is None:
+        RUN["survey_incomplete"] = True
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
         # Do not use the bulk root walk here. A user's temp directory can contain hundreds of
@@ -8823,10 +8865,13 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
     deadline = time.monotonic() + seconds
     try:
         dev = root.stat().st_dev
+    except FileNotFoundError:
+        return []
     except OSError:
+        RUN["survey_incomplete"] = True
         return []
     found: list[Path] = []
-    for top in _entries(root):
+    for top in _entries(root, catalogue=True):
         if not top.is_dir(follow_symlinks=False):
             continue
         left = budget
@@ -8835,11 +8880,15 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
             nxt: list[str] = []
             for d in level:
                 if time.monotonic() > deadline:
+                    RUN["survey_incomplete"] = True
                     return found
                 name = os.path.basename(d)
                 try:
                     other_fs = os.lstat(d).st_dev != dev
+                except FileNotFoundError:
+                    continue
                 except OSError:
+                    RUN["survey_incomplete"] = True
                     continue
                 if (other_fs or os.path.realpath(d) in never or SECRET_NAME.search(name)
                         or name in DISCOVER_SKIP or never_delete(Path(d), walk=True) or vcs_at(d)
@@ -8857,9 +8906,13 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
                             if left < 0:
                                 break
                             entries.append(e)
+                except FileNotFoundError:
+                    continue
                 except OSError:
+                    RUN["survey_incomplete"] = True
                     continue
                 if left < 0:
+                    RUN["survey_incomplete"] = True
                     break  # a partial listing can hide a layout, never invent one: stop here
                 if listing_layout(d, entries):
                     if discoverable(d) and not toolchain_held(Path(d)):
@@ -11137,16 +11190,17 @@ def git_common_dir(path: Path) -> str:
 UNREADABLE: set[str] = set()
 
 
-def _entries(path: Path) -> list[os.DirEntry]:
+def _entries(path: Path, *, catalogue: bool = False) -> list[os.DirEntry]:
     """Like _children, but entries carry their type, so filtering tens of thousands (a macOS
     $TMPDIR) costs no stat per entry."""
     try:
         with os.scandir(path) as it:
             return list(it)
-    except PermissionError:
-        UNREADABLE.add(str(path))
-        return []
-    except OSError:
+    except OSError as error:
+        if isinstance(error, PermissionError):
+            UNREADABLE.add(str(path))
+        if catalogue and not isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            RUN["survey_incomplete"] = True
         return []
 
 
@@ -11382,9 +11436,11 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
     for _ in range(fam.depth):
         nxt: list[Path] = []
         for p in level:
-            for c in _children(p):
+            for entry in _entries(p, catalogue=True):
+                c = Path(entry.path)
                 budget -= 1
                 if budget < 0:
+                    RUN["survey_incomplete"] = True
                     return found
                 if c.name in fam.skip or c.is_symlink() or not c.is_dir() or DELETING_RE.fullmatch(c.name):
                     continue
@@ -11948,7 +12004,7 @@ def candidates(fam: Family) -> list[Path]:
         level = tart_image_dirs(fam.root)
         tart_seen(fam, level)
     elif fam.id == WEB_UPDATE_ARCHIVES:
-        level = [Path(e.path) for e in _entries(fam.root) if WEB_UPDATE_NAME.fullmatch(e.name)]
+        level = [Path(e.path) for e in _entries(fam.root, catalogue=True) if WEB_UPDATE_NAME.fullmatch(e.name)]
     elif fam.transcripts or fam.transcript_archives:
         level = transcript_candidates(fam.root, fam.transcript_archives)
     elif fam.discover:
@@ -11973,7 +12029,7 @@ def candidates(fam: Family) -> list[Path]:
     else:
         level = [fam.root]
         for _ in range(fam.depth):
-            level = [Path(e.path) for p in level for e in _entries(p)
+            level = [Path(e.path) for p in level for e in _entries(p, catalogue=True)
                      if e.name not in fam.skip
                      and not (fam.skip_prefixes and e.name.startswith(fam.skip_prefixes))
                      and not (p != fam.root and DELETING_RE.fullmatch(p.name))  # never list inside an aside tree
@@ -12003,8 +12059,10 @@ def candidates(fam: Family) -> list[Path]:
         try:
             if p.lstat().st_uid == uid:
                 owned.append(p)
-        except OSError:
+        except FileNotFoundError:
             pass  # vanished mid-scan
+        except OSError:
+            RUN["survey_incomplete"] = True
     return owned
 
 
@@ -15477,6 +15535,20 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         p = Path(item.path)
         own = [f for f in every if f.id == item.family and p.parent.is_relative_to(f.root)]
         return max(own, key=lambda f: len(f.root.parts)) if own else families[item.family]
+
+    def record_hold(item: Item, family: Family, outcome: str, before: int) -> None:
+        # The survey may have judged this item reclaimable. Keep what the final check actually observed.
+        detail = outcome
+        if (outcome == "changed:in-use" or outcome.startswith("blocked:")) and len(item.reasons) > before:
+            detail = f"{outcome}: {item.reasons[-1]}"
+        if outcome != "blocked:bundle-failed" or not item.hold:
+            item.hold = hold_record(family, "blocked", [detail], item.idle_hours, math.inf, False)
+        item.verdict = "blocked"
+        item.reasons.append(outcome)
+        if outcome.startswith("incomplete:") or outcome in ("blocked:ps-incomplete", "blocked:lsof-incomplete",
+                                                            "blocked:query-timeout"):
+            RUN["apply_incomplete"] = outcome
+
     try:
         cwds, cmds = process_evidence()
     except NoEvidence as e:
@@ -15488,7 +15560,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         def archive_in_use(q: Path) -> bool:
             try:
                 o, c = process_evidence()  # fresh: the pass's own evidence is minutes old by now
-            except NoEvidence:
+            except NoEvidence as error:
+                RUN["apply_incomplete"] = f"archive pruning: {error}"
                 return True
             return in_cwd(os.fspath(q), open_index(o)) or named_by(os.fspath(q), c)  # sockets: _newest_change
         if not archive_root_why():
@@ -15541,11 +15614,11 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             continue
         p = Path(i.path)
         fam = family_of(i)
+        before_reasons = len(i.reasons)
         if RUNNER_CACHE_PROFILE and (not runner_profile_roots_safe(every)
                                      or not runner_profile_path_safe(fam, p)):
             outcome = "changed:profile-boundary"
-            i.verdict = "blocked"
-            i.reasons.append(outcome)
+            record_hold(i, fam, outcome, before_reasons)
             rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                    "outcome": outcome, "rebuild": fam.rebuild, **asdict(i)}
             with receipt.open("a") as f:
@@ -15554,7 +15627,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if targets is not None and not build_cache_unwindowed(fam, p):  # a build cache goes past the target too
             try:
                 dev = p.parent.stat().st_dev
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                RUN["apply_incomplete"] = f"candidate volume: {error.__class__.__name__}"
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
@@ -15806,8 +15882,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if outcome != "reclaimed" and outcome.startswith(("changed:", "incomplete:", "blocked:")):
             # Keep the post-apply health/accounting view honest when a candidate became
             # busy or otherwise failed the final recheck after the survey.
-            i.verdict = "blocked"
-            i.reasons.append(outcome)
+            record_hold(i, fam, outcome, before_reasons)
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                "outcome": outcome, "rebuild": fam.rebuild, **asdict(i),
                **({"sweep": "idle"} if is_sweep else {})}
@@ -18204,7 +18279,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if ((a.pressure or sweep) and not (a.family or a.root_override or a.cmux_next_drain or RUNNER_CACHE_PROFILE
                 or DEAD_MODE or reserved or out_of_band or a.need is not None or _MEASURE_BUDGET_REACHED
                 or RUN.get("survey_incomplete") or RUN.get("evict_yielded") or RUN.get("run_deadline_reached")
-                or "apply_stopped" in RUN)):
+                or RUN.get("apply_incomplete") or "apply_stopped" in RUN)):
             # Budget pressure may have raised a volume's low to free + 1 just to collect warm caches.
             notify_remaining_pressure([replace(fs, low=pressure_floors[fs.dev]) for fs in shown],
                                       held_by_dev, fams, after_accounting)

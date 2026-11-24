@@ -477,8 +477,9 @@ class MiniSetupTest(unittest.TestCase):
     def test_two_backups_in_one_second_preserve_both_files(self) -> None:
         ctx = mock.Mock(state=self.home / "state")
         file = self.home / "glaeda-gh"
-        with mock.patch.object(ms.datetime, "datetime", wraps=ms.datetime.datetime) as clock:
-            clock.now.return_value.strftime.return_value = "20261123T100000"
+        fixed = ms.datetime.datetime(2026, 11, 23, 10, 0, 0)
+        with mock.patch.object(ms.datetime, "datetime") as clock:
+            clock.now.return_value = fixed
             file.write_bytes(b"original")
             first = ms.backup(ctx, file)
             file.write_bytes(b"edit")

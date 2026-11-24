@@ -138,30 +138,28 @@ def write_scheduled_log(value: dict[str, Any], disk: Any) -> None:
                 return
         if offset != original.st_size:
             return
-    # The prior plist could have opened the old log before the writer took run.lock. Leave
-    # it for the next tick while any process still has it open or observation is incomplete.
-    opened, _ = disk.process_evidence()
-    if disk.in_cwd(os.fspath(path), opened):
-        return
-    free_before = disk.free_bytes(path.parent)[0]
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".glaeda-idle-repair-", delete=False) as new:
-        temporary = Path(new.name)
-        try:
-            new.write(tail)
-            new.write(line)
-            new.flush()
-            os.fchmod(new.fileno(), stat.S_IMODE(original.st_mode) & 0o777)
-            os.fsync(new.fileno())
-            if log_identity(path.lstat()) != log_identity(original):
-                return
-            os.replace(temporary, path)
-            after = os.fstat(new.fileno())
-            append_receipt({"at": int(time.time()), "outcome": "log-compacted", "path": os.fspath(path),
-                            "logicalReleasedBytes": original.st_size - after.st_size,
-                            "allocatedReleasedBytes": (original.st_blocks - after.st_blocks) * 512,
-                            "physicalFreeDeltaBytes": disk.free_bytes(path.parent)[0] - free_before})
-        finally:
-            temporary.unlink(missing_ok=True)
+        free_before = disk.free_bytes(path.parent)[0]
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".glaeda-idle-repair-", delete=False) as new:
+            temporary = Path(new.name)
+            try:
+                new.write(tail)
+                new.write(line)
+                new.flush()
+                os.fchmod(new.fileno(), stat.S_IMODE(original.st_mode) & 0o777)
+                os.fsync(new.fileno())
+                # The previous plist may already have opened the log before this job took run.lock.
+                if (disk.descriptor_holder_status(source.fileno()) != "clear"
+                        or log_identity(path.lstat()) != log_identity(original)):
+                    return
+                os.replace(temporary, path)
+                after = os.fstat(new.fileno())
+            finally:
+                temporary.unlink(missing_ok=True)
+    # Closing the unlinked source lets the filesystem release its blocks before observing free space.
+    append_receipt({"at": int(time.time()), "outcome": "log-compacted", "path": os.fspath(path),
+                    "logicalReleasedBytes": original.st_size - after.st_size,
+                    "allocatedReleasedBytes": (original.st_blocks - after.st_blocks) * 512,
+                    "physicalFreeDeltaBytes": disk.free_bytes(path.parent)[0] - free_before})
 
 
 def emit_state(value: dict[str, Any], scheduled: bool, disk: Any) -> None:

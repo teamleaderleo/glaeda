@@ -944,8 +944,9 @@ class GlaedaDiskTest(unittest.TestCase):
         for i in range(50):
             (wide / f"d{i}").mkdir(parents=True)
         (wide / "d0/CACHEDIR.TAG").write_bytes(cargo_tag)
-        with mock.patch.object(gd, "HOME", home):
+        with mock.patch.object(gd, "HOME", home), mock.patch.dict(gd.RUN, clear=True):
             found = {os.path.relpath(p, home) for p in gd.discover_caches(home, budget=20)}
+            self.assertTrue(gd.RUN["survey_incomplete"])
         self.assertNotIn("wide/d0", found)
         self.assertIn(".cargo/registry", found)
 
@@ -5453,7 +5454,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "ci_jobs", return_value=[]), \
                 mock.patch.object(gd, "survey", return_value=items,
                                   side_effect=over.pop("survey_effect", None)) as survey, \
-                mock.patch.object(gd, "apply", return_value=over.pop("released", 0)) as apply, \
+                mock.patch.object(gd, "apply", return_value=over.pop("released", 0),
+                                  side_effect=over.pop("apply_effect", None)) as apply, \
                 mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
                 mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
                 mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
@@ -5487,6 +5489,11 @@ class GlaedaDiskTest(unittest.TestCase):
                            families=[gd.Family(gd.SHARED_MIRROR_COMPACT_FAMILY, self.root, False, "")],
                            free_effect=free, notify=notify)
             self._main_run(argv, survey_effect=spent, free_effect=free, notify=notify)
+            notify.assert_not_called()
+            (self.root / "cache-input").mkdir()
+            def truncated(*args, **kwargs):
+                return gd.discover_caches(self.root, seconds=-1)
+            self._main_run(argv, survey_effect=truncated, free_effect=free, notify=notify)
             notify.assert_not_called()
 
     def test_pressure_page_names_only_surviving_holders_of_an_observed_low_volume(self) -> None:
@@ -5698,8 +5705,15 @@ class GlaedaDiskTest(unittest.TestCase):
             budget = gd.PRESSURE_MEASURE_BUDGET_S
             self.assertGreaterEqual(kw["deadline"], start + budget)
             self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
-            self.assertIs(apply.call_args[0][5], gd.host_saturated,
-                          "no deadline, no busy hold: only a saturated CPU halts the sweep's deletions")
+            halt = apply.call_args[0][5]
+            self.assertEqual(halt(), "")
+            self.assertNotIn("apply_stopped", gd.RUN)
+            with mock.patch.object(os, "getloadavg", return_value=(8.0, 0.0, 0.0)), \
+                    mock.patch.object(os, "cpu_count", return_value=4):
+                reason = gd.host_saturated()
+                self.assertTrue(reason)
+                self.assertEqual(halt(), reason)
+                self.assertEqual(gd.RUN["apply_stopped"], reason)
             self.assertFalse(rows[-1]["run_deadline_reached"])
             # the caller's deadline 5 min away: walks get a third of the 240 s before its margin, verdicts two thirds
             stamp.unlink()
@@ -5712,6 +5726,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertLessEqual(kw["judge_deadline"], time.monotonic() + 161)
                 halt = apply.call_args[0][5]
                 self.assertEqual(halt(), "")
+                self.assertNotIn("apply_stopped", gd.RUN, "a previous pass's saturation must not mark this one stopped")
             # past it: nothing more is started, and the run line says why
             with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 10:.0f}"}):
                 self.assertIn(gd.RUN_DEADLINE_ENV, halt())
@@ -7476,6 +7491,9 @@ class GlaedaDiskTest(unittest.TestCase):
         return path
 
     def test_web_update_pressure_removes_only_proven_downloads(self) -> None:
+        for name in ("ACTIVITY_MODE", "ROLE", "EMERGENCY_DEVS", "FLOOR_HOLD", "CMUX_NEXT_HOST_FLOOR",
+                     "OUT_OF_BAND_RUN", "RUNNER_CACHE_PROFILE", "BUILD_CACHES_UNWINDOWED", "FLEET_CLAIMS_EXPIRE"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
         old = self._web_archive(1)
         keep = [self._web_archive(2, "index.html"), self._web_archive(3, age=2), self._web_archive(4)]
         os.link(keep[-1], self.root / "linked")
@@ -7492,14 +7510,11 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertEqual([(i.path, i.verdict) for i in items], [(str(old), "reclaimable")])
             dev = self.root.stat().st_dev
             fss = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
-            witness = f"p{os.getpid()}\n"
             other_query = gd._owned_query_split
 
             def query(argv, timeout, apart=True):
                 if argv == ["ps", "-axww", "-o", "command="] and apart:
                     return 0, "idle\n", ""
-                if argv[-2:] == ["--", str(old)]:
-                    return 0, witness, ""
                 return other_query(argv, timeout, apart)
 
             with mock.patch.object(gd, "default_families", return_value=[fam]), \
@@ -7514,6 +7529,7 @@ class GlaedaDiskTest(unittest.TestCase):
                     mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
                     mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
                     mock.patch.object(gd, "notify_disk"), \
+                    mock.patch.object(gd, "descriptor_holder_status", return_value="clear"), \
                     mock.patch.object(gd, "_owned_query_split", side_effect=query), \
                     contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--pressure", "--apply", "--role", "devbox", "--family", fam.id,
@@ -7528,29 +7544,67 @@ class GlaedaDiskTest(unittest.TestCase):
         path = self._web_archive(1)
         item = gd.WebUpdateArchiveItem(gd.WEB_UPDATE_ARCHIVES, str(path), 1, 48, "reclaimable",
                                        identity=gd.web_update_identity(path.stat()))
-        witness = f"p{os.getpid()}\n"
         idle = (0, "idle\n", "")
-        cases = [([(0, str(path), "")], "changed:in-use"),
-                 ([idle, (0, witness + "p99999999\n", "")], "changed:in-use"),
-                 ([idle, (0, "p99999999\n", "")], "blocked:lsof-incomplete"),
-                 ([idle, (0, witness, "warning")], "blocked:lsof-incomplete"),
-                 ([(1, "", "")], "blocked:ps-incomplete")]
+        cases = [((0, str(path), ""), "clear", "changed:in-use"),
+                 (idle, "changed:in-use", "changed:in-use"),
+                 (idle, "blocked:lsof-incomplete", "blocked:lsof-incomplete"),
+                 ((1, "", ""), "clear", "blocked:ps-incomplete")]
         with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "darwin_user_tmp", return_value=self.root):
-            for replies, outcome in cases:
-                with self.subTest(outcome=outcome, replies=replies), \
-                        mock.patch.object(gd, "_owned_query_split", side_effect=replies):
+            for ps, holder, outcome in cases:
+                with self.subTest(outcome=outcome, ps=ps), mock.patch.object(gd, "_owned_query_split", return_value=ps), \
+                        mock.patch.object(gd, "descriptor_holder_status", return_value=holder):
                     self.assertEqual(gd.remove_web_update_archive(self.root, item), outcome)
                     self.assertTrue(path.is_file())
             with mock.patch.object(gd, "never_delete", return_value=True):
                 self.assertIsNone(gd.web_update_archive(self.root, path))
-            def replace_during_lsof(argv, timeout):
-                if argv[0] == "ps":
-                    return idle
+            def replace_during_lsof(fd):
                 self._web_archive(10).replace(path)
-                return 0, witness, ""
-            with mock.patch.object(gd, "_owned_query_split", side_effect=replace_during_lsof):
+                return "clear"
+            with mock.patch.object(gd, "_owned_query_split", return_value=idle), \
+                    mock.patch.object(gd, "descriptor_holder_status", side_effect=replace_during_lsof):
                 self.assertEqual(gd.remove_web_update_archive(self.root, item), "changed:identity")
                 self.assertTrue(path.is_file())
+
+    def test_archive_pressure_page_requires_a_complete_scan_and_holder_queries(self) -> None:
+        tmp = self.root / "downloads"
+        tmp.mkdir()
+        source = self._web_archive(1)
+        path = source.rename(tmp / source.name)
+        argv = ["--pressure", "--apply", "--role", "devbox"]
+        notify = mock.Mock()
+        survey, apply, original_query = gd.survey, gd.apply, gd._owned_query_split
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "darwin_user_tmp", return_value=tmp):
+            family = next(f for f in gd.default_families("devbox") if f.id == gd.WEB_UPDATE_ARCHIVES)
+            run = dict(families=[family], survey_effect=survey, apply_effect=apply, notify=notify)
+            for outcome in ("blocked:ps-incomplete", "blocked:lsof-incomplete", "blocked:query-timeout", "changed:in-use"):
+                def query(args, timeout, apart=True):
+                    if args == ["ps", "-axww", "-o", "command="] and apart:
+                        return (1, "", "") if outcome == "blocked:ps-incomplete" else (0, "idle", "")
+                    return original_query(args, timeout, apart)
+                with self.subTest(outcome=outcome), mock.patch.object(gd, "_owned_query_split", side_effect=query), \
+                        mock.patch.object(gd, "descriptor_holder_status", return_value=outcome):
+                    self._main_run(argv, **run)
+                    rows = [json.loads(line) for line in self.receipt().read_text().splitlines()]
+                    row = next(r for r in reversed(rows) if r.get("family") == family.id)
+                    self.assertEqual(row["outcome"], outcome)
+                    self.assertIn(outcome, row["hold"]["by"])
+                    self.assertTrue(path.exists())
+                    if outcome == "changed:in-use":
+                        notify.assert_called_once()
+                        self.assertIn("another process has this archive open", notify.call_args.args[1])
+                    else:
+                        notify.assert_not_called()
+            notify.reset_mock()
+            scandir = os.scandir
+            def denied(directory):
+                if directory == tmp:
+                    raise PermissionError(directory)
+                return scandir(directory)
+            with mock.patch.object(os, "scandir", side_effect=denied):
+                self._main_run(argv, **run)
+            self.assertTrue(gd.RUN.get("survey_incomplete"))
+            notify.assert_not_called()
 
     def _tmp_residue(self) -> tuple[Path, dict[str, Path]]:
         """A fake $TMPDIR: named test scratch, old and new, beside entries the reaper must never take."""
@@ -11943,6 +11997,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertNotIn(name(1, "2026-10-01"), (archive / "manifest.jsonl").read_text())
         self.assertTrue((self.home / "archive/other.bundle").exists())
 
+    @mock.patch.object(gd, "ACTIVITY_MODE", None)
+    @mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False)
     def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
         """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
         in the fleet CI store, where cmux-kept-build lists only its own names."""

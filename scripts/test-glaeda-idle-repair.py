@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -136,10 +137,23 @@ class IdleRepairTest(unittest.TestCase):
         prior = path.stat()
         disk = mock.Mock()
         disk.host_busy.return_value = "test build running"
-        disk.process_evidence.return_value = ([], "")
-        disk.in_cwd.return_value = False
-        disk.free_bytes.side_effect = [(1024, 8192), (5120, 8192)]
+        source_descriptors = []
+
+        def witness(fd):
+            self.assertEqual(idle.log_identity(os.fstat(fd)), idle.log_identity(prior))
+            source_descriptors.append(fd)
+            return "clear"
+
+        def free_bytes(_parent):
+            if not source_descriptors:
+                return (1024, 8192)
+            with self.assertRaises(OSError):
+                os.fstat(source_descriptors[0])
+            return (5120, 8192)
+
+        disk.free_bytes.side_effect = free_bytes
         with mock.patch.object(idle, "LOG_MAX_BYTES", 4096), mock.patch.object(idle, "LOG_KEEP_BYTES", 1024), \
+                mock.patch.object(disk, "descriptor_holder_status", side_effect=witness), \
                 mock.patch.object(idle, "load_disk_module", return_value=disk):
             self.assertEqual(idle.main(["--apply", "--scheduled-log"]), idle.QUEUED_EXIT)
             kept = path.read_bytes()
@@ -156,14 +170,41 @@ class IdleRepairTest(unittest.TestCase):
         self.assertEqual(record["allocatedReleasedBytes"], (prior.st_blocks - after.st_blocks) * 512)
         self.assertEqual(record["physicalFreeDeltaBytes"], 4096)
 
+    def test_only_log_reader_requires_complete_own_descriptor_witness(self) -> None:
+        path = idle.HOME / "log"
+        with mock.patch.dict(os.environ, {"GLAEDA_DISK": str(ROOT / "scripts/glaeda-disk")}):
+            disk = idle.load_disk_module()
+        with path.open("wb") as source, mock.patch.object(disk, "_owned_query_split") as probe:
+            fd = source.fileno()
+            st = os.fstat(fd)
+            node = f"D{st.st_dev:#x}\ni{st.st_ino}\n"
+            own = f"p{os.getpid()}\nf{fd}\n{node}"
+            probe.return_value = 0, own + "p999999\nf1\nD0x0\ni1\n", ""
+            self.assertEqual(disk.descriptor_holder_status(fd), "clear")
+            self.assertEqual(probe.call_args.args[0][1:], ["-b", "-w", "-nP", "-FpfDi"])
+            for code, output, error, outcome in [(0, "", "", "blocked:lsof-incomplete"),
+                    (0, f"p{os.getpid()}\nf{fd}\n", "", "blocked:lsof-incomplete"),
+                    (0, own + f"f{fd + 1}\n{node}", "", "changed:in-use"),
+                    (0, own + f"p999999\nf1\n{node}", "", "changed:in-use"),
+                    (0, own, "lsof: partial listing\n", "blocked:lsof-incomplete"),
+                    (1, own, "", "blocked:lsof-incomplete")]:
+                with self.subTest(code=code, output=output, error=error):
+                    probe.return_value = code, output, error
+                    self.assertEqual(disk.descriptor_holder_status(fd), outcome)
+            for failure, outcome in [(OSError(), "blocked:lsof-incomplete"),
+                                     (subprocess.TimeoutExpired("lsof", 10), "blocked:query-timeout")]:
+                probe.side_effect = failure
+                self.assertEqual(disk.descriptor_holder_status(fd), outcome)
+
     def test_scheduled_log_keeps_foreign_mixed_linked_open_and_changing_legacy_files(self) -> None:
         path = idle.HOME / "Library/Logs/glaeda-idle-repair.jsonl"
         path.parent.mkdir(parents=True)
         value = {"state": "idle", "actions": [], "lastAttemptAt": 1, "nextAttemptAt": 901}
         row = (json.dumps({"schema": idle.SCHEMA, **value}) + "\n").encode()
         disk = mock.Mock()
-        disk.process_evidence.return_value = ([], "")
-        with mock.patch.object(idle, "LOG_MAX_BYTES", 1), mock.patch.object(idle, "LOG_KEEP_BYTES", 1):
+        disk.free_bytes.return_value = (8192, 8192)
+        with mock.patch.object(idle, "LOG_MAX_BYTES", 1), mock.patch.object(idle, "LOG_KEEP_BYTES", 1), \
+                mock.patch.object(disk, "descriptor_holder_status", return_value="changed:in-use") as witness:
             for raw in (b"someone else's log\n", row + b"someone else's log\n" + row, row.rstrip()):
                 path.write_bytes(raw)
                 idle.write_scheduled_log(value, disk)
@@ -180,7 +221,6 @@ class IdleRepairTest(unittest.TestCase):
             self.assertEqual(other.read_bytes(), row)
             path.unlink()
             path.write_bytes(row)
-            disk.in_cwd.return_value = True
             idle.write_scheduled_log(value, disk)
             self.assertEqual(path.read_bytes(), row)
 
@@ -189,7 +229,7 @@ class IdleRepairTest(unittest.TestCase):
                     appender.write(row)
                 return (8192, 8192)
 
-            disk.in_cwd.return_value = False
+            witness.return_value = "clear"
             disk.free_bytes.side_effect = late_write
             idle.write_scheduled_log(value, disk)
             self.assertEqual(path.read_bytes(), row * 2)
