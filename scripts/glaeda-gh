@@ -9557,6 +9557,12 @@ class Daemon:
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
         """Rule on the waits, prune, and write the heartbeat: the end of every tick, whatever read it."""
+        # ScriptWake cuts the read phase when fast-patch swaps this file.  If no claimed land step is running,
+        # the next image can safely take over the in-memory queue and all deferred bookkeeping.  Do not restore the
+        # deadline or walk the end-of-tick phases here: on an upstream host those phases were the wake-to-reexec gap.
+        # A claimed step keeps the normal finish and the reexec drain's hold (glaeda#2713).
+        if self.script_cut and not self.land_busy():
+            return self.status or {"modes": {}, "paths": dict(self.paths), "errors": self.errors[:10]}
         self.tick_deadline = float("inf")
         try:
             with self.phase("land"):

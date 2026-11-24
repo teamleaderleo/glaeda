@@ -22783,6 +22783,17 @@ class ReexecDrainTest(Base):
         later.replace(path)
         self.assertTrue(wake.check(), "a later swap wakes again")
 
+    def test_a_script_wake_skips_end_of_tick_when_no_land_step_is_claimed(self) -> None:
+        """A script wake must not wait on finish_tick's housekeeping when the land queue has no claimed step."""
+        self.daemon.script_cut = True
+        self.daemon.tick_deadline = 0.0
+        with mock.patch.object(self.daemon, "land_busy", return_value=False), \
+                mock.patch.object(self.daemon, "land_tick", side_effect=AssertionError("land phase ran")), \
+                mock.patch.object(self.daemon, "serve_waits", side_effect=AssertionError("wait phase ran")):
+            status = self.daemon.finish_tick([], [], [], [], [])
+        self.assertEqual(status["modes"], {})
+        self.assertEqual(self.daemon.tick_deadline, 0.0, "the cut deadline stays expired until serve re-execs")
+
     def serve_over(self, rewrite: bytes) -> list:
         """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
         script = Path(self.tmp.name) / "bin" / "glaeda-gh"
