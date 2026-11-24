@@ -771,6 +771,11 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-ios-try-ahead.yml's build-ahead (advisory) submits the cmux Dev device-app step try.sh asks for
 # (cmux-ci run --class simulator, lowest priority, the try.sh key) for each same-repository iPhone pull request head,
 # so a later try.sh N only downloads; it waits at most 300 min. Its first run, 45124160918 on cmux#51721, was refused here.
+# cmux-next-ios-gestures.yml's gestures (the gesture-conflict UI suite, cmux#52373; Leo, 2026-11-23: "there are no doubt
+# dozens of ... interactions like this which should've just very easily been caught") and
+# cmux-next-ios-keyboard-motion.yml's bench each submit one simulator step (cmux-ci run --class simulator
+# scripts/ci/cmux-next-ios-sim.sh) and wait for it. The gestures job's first run, 45314398918 on cmux#52373, was refused
+# here; keyboard-motion, on the same runner label and continue-on-error, was missing from this list as well.
 # GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
 # while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
 # cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
@@ -791,7 +796,8 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                          ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead")})
+                          ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
+                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
