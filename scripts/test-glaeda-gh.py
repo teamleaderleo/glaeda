@@ -22750,6 +22750,37 @@ class ReexecDrainTest(Base):
         os.utime(path, ns=(seen["stat"][0] + 3 * 10**9, seen["stat"][0] + 3 * 10**9))
         self.assertFalse(gg.script_changed(path, seen))
 
+    def test_a_swapped_script_ends_the_tick_and_wakes_serve(self) -> None:
+        """A lane VM, 2026-11-24: merge a8f8c140 went live 15 s after it merged, 7 s of them a tick finishing after
+        fast-patch swapped the bytes. ScriptWake ends the tick and the TICK sleep once per new content."""
+        path = Path(self.tmp.name) / "glaeda-gh"
+        path.write_bytes(b"one")
+        daemon = types.SimpleNamespace(tick_deadline=float("inf"))
+        wake = gg.ScriptWake(path, gg.hashlib.sha256(b"one").hexdigest(), daemon)
+        self.assertFalse(wake.check())
+        self.assertEqual(daemon.tick_deadline, float("inf"))
+        later = path.with_name("glaeda-gh.new")
+        later.write_bytes(b"one")
+        later.replace(path)  # same bytes reinstalled: no wake
+        self.assertFalse(wake.check())
+        self.assertFalse(wake.event.is_set())
+        later.write_bytes(b"two")
+        later.replace(path)  # fast-patch's swap
+        before = time.monotonic()
+        self.assertTrue(wake.check())
+        self.assertLessEqual(daemon.tick_deadline, time.monotonic())
+        self.assertGreaterEqual(daemon.tick_deadline, before)
+        daemon.tick_deadline = float("inf")  # the next tick
+        self.assertFalse(wake.check(), "one wake per new content")
+        self.assertEqual(daemon.tick_deadline, float("inf"))
+        started = time.monotonic()
+        wake.sleep(5.0)
+        self.assertLess(time.monotonic() - started, 1.0, "the woken sleep returns at once")
+        self.assertFalse(wake.event.is_set(), "and only once: a held re-exec sleeps TICK again")
+        later.write_bytes(b"three")
+        later.replace(path)
+        self.assertTrue(wake.check(), "a later swap wakes again")
+
     def serve_over(self, rewrite: bytes) -> list:
         """serve() on a copy of the script an install rewrites with REWRITE after the first tick: its execv calls."""
         script = Path(self.tmp.name) / "bin" / "glaeda-gh"
@@ -22760,7 +22791,7 @@ class ReexecDrainTest(Base):
             pass
 
         class Idle:
-            valve_due, reexec_waiting, reexec_finish_until, ticks = None, False, None, 0
+            valve_due, reexec_waiting, reexec_finish_until, ticks, land_queue = None, False, None, 0, None
 
             def tick(self) -> dict:
                 self.ticks += 1
