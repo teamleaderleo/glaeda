@@ -14150,7 +14150,23 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
 # "review_failed" for 89 h because the reviewer could not start here and that reads the same as a review that refused:
 # a review verdict (a BLOCK, land_judge's stop class "block") is a judgment and is never re-armed, while
 # review_cannot_start is this host missing a tool and is.
-LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|[a-z_]+_transient)$")
+#
+# own_red and red_not_excused are re-armed on the same reading. A red stop sounds like a judgment on the PR, and for
+# a red the PR's own diff broke it is one -- but the classifier's answer to "is this red the PR's?" is not a property
+# of the head. It is a comparison against state outside the head: whether the base is red the same way, whether the
+# rollup lists the failed run yet, whether the run's log can be read at all. Every one of those can change with no
+# push, so the same head legitimately answers differently an hour later, and the stop that cached the first answer is
+# the "verdict for code that changed under the run" class with the sides swapped -- a verdict kept while what it was
+# compared against moved. efficiency-standing-lane, 2026-11-24: of 130 entries sitting `stopped`, 55 were
+# own_red/red_not_excused; re-running base_red_excuse.py on all 55 at their unchanged heads answered "no failure to
+# excuse" for 21 of them, aged 1.8 h to 136.6 h. A requeue by hand of those 21 merged cmux#41558 (stuck 80 h) and
+# cmux#47993 (stuck 90 h) within minutes and turned four more into a `conflict` verdict their requester could act on;
+# the stale red had been hiding the real state. 18 of the 21 were own_red, so re-arming only red_not_excused would
+# have recovered 3.
+# A red that is the PR's own stays stopped, and costs one probe to say so: the re-arm keeps the wait budget, the
+# second judgment reads the same red and stops at once, LAND_STOP_REPEAT keeps that quiet for the requester, and
+# LAND_REARM_CAP bounds it at 3 re-asks per entry per UTC day.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
 # LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
