@@ -8,7 +8,8 @@
 A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
 runs `--apply` every minute (PROBE_EVERY_S); glaeda-mini-setup installs it. A run does the full
 update every ten minutes (APPLY_EVERY_S) and, between those, only when a probe finds the channel
-files changed since the last full run: two anonymous HEADs of github.com/<repo>/releases/download,
+files changed since the last full run (or, on a reporting canary, when the release's soak ends, to ask
+promote.yml at once): two anonymous HEADs of github.com/<repo>/releases/download,
 whose redirect names the uploaded asset (a new upload, a new asset). An unchanged probe prints
 nothing. A full run whose host already holds its ring's release costs two anonymous downloads of
 small channel files, never the GitHub API, so neither spends the shared quota. Configuration is ~/.config/glaeda/update.json,
@@ -429,6 +430,9 @@ def probe_gate(config: dict, now: float, state_dir: Path = STATE_DIR) -> tuple[b
         return True, seen, "due"
     if seen is not None and seen != doc.get("channel"):
         return True, seen, "channel changed"
+    soak = doc.get("soakEndsAt")
+    if isinstance(soak, (int, float)) and not isinstance(soak, bool) and now >= soak:
+        return True, seen, "soak ended"  # this canary's post-soak promote nudge (nudge_pending_at)
     return False, seen, "unchanged"
 
 
@@ -825,11 +829,32 @@ def nudge_due(result: dict, entry: dict | None, nudged: str | None, now: float) 
         return True
     if result.get("result") != "current" or entry is None or nudged == entry.get("tag"):
         return False
+    end = soak_ends_at(entry)
+    return end is not None and now >= end
+
+
+def soak_ends_at(entry: dict) -> float | None:
+    """When the release's signed soak floor passes (its publication plus policy soakHours), or None if unreadable."""
     try:
         soak = float((entry.get("policy") or {}).get("soakHours") or 0)
-        return now >= parse_utc(str(entry.get("published"))) + soak * 3600
+        return parse_utc(str(entry.get("published"))) + soak * 3600
     except (TypeError, ValueError):
-        return False
+        return None
+
+
+def nudge_pending_at(config: dict, result: dict, entry: dict | None, nudged: str | None, now: float) -> float | None:
+    """When this reporting canary's post-soak nudge falls due, if that is still ahead. main keeps it in probe.json and
+    the minute probe starts a full run then (probe_gate "soak ended"), so promote.yml is asked within a minute of the
+    soak's end. Waiting for the next APPLY_EVERY_S run instead held stable up to ten more minutes on every release
+    the second canary reported late on. air-blue and cosmic-gray are the only canaries, so the quorum of two needs
+    both; cosmic-gray reported 16-34 min after publication or stayed pending on 5 of 8 releases (2026-11-24), and
+    each of those waited the 900 s soak plus up to 600 s for a canary's next full run (docs/GLAEDA_OTA.md step 5)."""
+    if config.get("ring") != "canary" or not config.get("reportStatus"):
+        return None
+    if result.get("result") not in ("updated", "current") or entry is None or nudged == entry.get("tag"):
+        return None
+    end = soak_ends_at(entry)
+    return end if end is not None and end > now else None
 
 
 def nudge_promotion(config: dict) -> str:
@@ -1704,6 +1729,9 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
             result["promotion"] = nudge_promotion(config)
             if entry is not None and result.get("result") == "current":
                 previous["nudged"] = entry["tag"]  # the post-soak nudge; the install's own does not count
+        pending = nudge_pending_at(config, result, entry, previous.get("nudged"), now)
+        if pending is not None:
+            result["soakEndsAt"] = pending
         if result["result"] in ("updated", "current"):
             result.update(runner_steps(state_dir, staged, home, hook_states, bin_dir))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
@@ -1770,11 +1798,15 @@ def main(argv: list[str] | None = None) -> int:
                 except BlockingIOError:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
+                result = None
                 try:
                     result = apply_once(config)
                 finally:
                     # recorded whatever the run did: a failing run waits for the next change or APPLY_EVERY_S
-                    save_probe({"channel": seen, "fullRunAt": now}, STATE_DIR)
+                    probe = {"channel": seen, "fullRunAt": now}
+                    if isinstance(result, dict) and isinstance(result.get("soakEndsAt"), (int, float)):
+                        probe["soakEndsAt"] = result["soakEndsAt"]
+                    save_probe(probe, STATE_DIR)
                 result["trigger"] = why
                 schedule = schedule_reload(config)
                 if schedule:
