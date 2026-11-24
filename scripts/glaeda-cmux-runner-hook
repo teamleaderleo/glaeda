@@ -1491,18 +1491,58 @@ def full_disk_gib() -> float:
 
 
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
-                        written_gib: float = 0.0) -> str | None:
+                        written_gib: float = 0.0, extra_gib: float = 0.0) -> str | None:
     """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None.
-    written_gib is what the running jobs have already written of their p95 (RUNNER_JOB_WRITTEN): it is gone from free
-    disk already, so it is not reserved a second time."""
-    need = round(runner_jobs_need_gib(in_flight, per_job_gib) - written_gib, 1)
+    written_gib is what the running jobs have already written of their charge (RUNNER_JOB_WRITTEN): it is gone from
+    free disk already, so it is not reserved a second time. extra_gib is what the running jobs' own learned peaks add
+    over per_job_gib (RUNNER_JOBS_OWN_PEAK)."""
+    need = round(runner_jobs_need_gib(in_flight, per_job_gib) + extra_gib - written_gib, 1)
     if free >= need:
         return None
+    more = (f", plus {extra_gib:g} GiB more the running jobs' own learned peaks here want (RUNNER_JOBS_OWN_PEAK)"
+            if extra_gib > 0 else "")
     less = (f", less {written_gib:g} GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)"
             if written_gib > 0 else "")
     return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
             f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one"
-            f"{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+            f"{more}{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+
+
+# RUNNER_JOBS_OWN_PEAK (ci-min-per-pr-140, 2026-11-24; Leo, 2026-11-21: "de facto, im asking for 99% fewer minutes of
+# ci time, period."). RUNNER_JOBS_HOLD charged every running job the fleet's flat p95 (5.3 GiB, every job of
+# 11-02..11-15, mostly light ones) and nothing once it had written that much, while cmux-next's fast tier, daemon tests
+# and Release compile each build a cold CmuxNext .build of tens of GiB. So a 228 GiB M6 mini kept listening with ten
+# such jobs in flight: cmux17 at 17:19Z 11-24 had 50.9 GiB free under 10 running jobs whose learned peaks summed to
+# ~300 GiB, took two more, and both failed "No space left on device" 46 minutes later (jobs 138467343240 and
+# 138473064477); cmux22, cmux17 and aws-m4pro-7 lost 9 of 1,635 sampled mini failures the same way in the 24 h
+# before. A running job is now charged the larger of that p95 and its own peak on this host (learned_job_peaks with
+# own_writes: runs alone, else what its runs wrote themselves, JOB_OWN_WRITTEN; never a free-disk drop beside other
+# jobs, which counts their writes too), still less what it already wrote. The hold stays what it was: the listener
+# takes no job until the disk fits, so the job goes to a runner with room; nothing is refused, and its off switch
+# (RUNNER_JOBS_HOLD_OFF_ENV, RUNNER_JOBS_HOLD_OFF_FILE) turns this off with it.
+def running_job_charges(home: Path, running: list[tuple[str, int]], per_job_gib: float,
+                        log: Path | None = None) -> dict[int, float]:
+    """{Runner.Worker pid: the disk that running job is charged}: the larger of per_job_gib and its job's own learned
+    peak here (RUNNER_JOBS_OWN_PEAK), its job being its runner's newest started line in the job log; per_job_gib for
+    a job with no such peak or on any error (the hold as before)."""
+    try:
+        records = job_log_tail(log)
+        peaks = learned_job_peaks(records, own_writes=True)
+        if not peaks:
+            return {}
+        latest: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if record.get("event") == "started" and isinstance(runner := record.get("runner"), str) and runner:
+                latest[runner] = record
+        out: dict[int, float] = {}
+        for install, pid in running:
+            record = latest.get(runner_config(home / install)[0] or install)
+            key = _job_key(record) if record else None
+            if key is not None and key in peaks:
+                out[pid] = max(per_job_gib, peaks[key][0])
+        return out
+    except Exception:  # noqa: BLE001  a reading that fails charges the flat p95, as before
+        return {}
 
 
 # RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse"). RUNNER_JOBS_DISK
@@ -10465,33 +10505,52 @@ def drain_backfill(state_dir: Path, runner: str | None, since: float | None, now
 # while it runs, only within job-started's one disk budget (DISK_RECLAIM_WAIT_S, disk_deadline); then the job starts
 # whatever was freed. It never refuses and never fails a job (DISK_RECLAIM_NOW, 2026-11-18: disk floors never refuse
 # or pause work), and a nightly job, which goes first on disk (NIGHTLY_DISK_RESERVE), is not held.
+# JOB_OWN_WRITTEN (ci-min-per-pr-140, 2026-11-24): a completed line also carries disk_written_gib, the most its sampler
+# measured the job itself write (RUNNER_JOB_WRITTEN: its runner's _work and owned SwiftPM scratch, capped by its own
+# free-disk drop). Unlike start minus min free disk it counts no neighbour's bytes, so on a busy mini, where a job
+# never runs alone, it is still that job's own need. learned_job_peaks(own_writes=True) takes it (kind "own") where a
+# job has too few solo runs; job-started's warning and JOB_DISK_OWN_NEED's refusal read peaks as before.
+JOB_OWN_WRITTEN_FIELD = "disk_written_gib"
 JOB_PEAK_MIN_SAMPLES = 3
 JOB_PEAK_RECENT = 20
 JOB_PEAK_MAX_GIB = RUNNER_JOB_DISK_MAX_GIB
 
 
-def learned_job_peaks(records: list[dict[str, Any]], alone_only: bool = False) -> dict[str, tuple[float, str]]:
+def learned_job_peaks(records: list[dict[str, Any]], alone_only: bool = False,
+                      own_writes: bool = False) -> dict[str, tuple[float, str]]:
     """{job key: (its learned peak in GiB, where it came from)} from job-log records (job_log_tail), for each job with
     at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest. alone_only keeps only
     the peaks learned from runs with no other runner job beside them (JOB_OWN_NEED_ALONE), never the fallback over
-    every run, whose free-disk drop counts the neighbours' writes too."""
+    every run, whose free-disk drop counts the neighbours' writes too. own_writes (JOB_OWN_WRITTEN, the listener's
+    RUNNER_JOBS_HOLD) keeps those and, for a job with too few solo runs, the p90 of what its runs wrote themselves."""
     runs: dict[str, list[tuple[float, bool]]] = {}
+    own: dict[str, list[float]] = {}  # JOB_OWN_WRITTEN: what each run wrote itself, beside other jobs or not
     for record in records:
         if record.get("event") != "completed" or not (key := _job_key(record)):
             continue
+        wrote = record.get(JOB_OWN_WRITTEN_FIELD)
+        if isinstance(wrote, (int, float)) and not isinstance(wrote, bool) and math.isfinite(wrote) and wrote >= 0:
+            own.setdefault(key, []).append(float(wrote))
         start, low = record.get("disk_free_start_gib"), record.get("disk_free_min_gib")
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (start, low)):
             continue
         runs.setdefault(key, []).append((max(0.0, float(start) - float(low)), record.get("other_runner_jobs") == []))
     peaks: dict[str, tuple[float, str]] = {}
-    for key, rows in runs.items():
-        rows = rows[-JOB_PEAK_RECENT:]
+    for key in {*runs, *own}:
+        rows = runs.get(key, [])[-JOB_PEAK_RECENT:]
+        written = own.get(key, [])[-JOB_PEAK_RECENT:]
         alone = [growth for growth, solo in rows if solo]
-        values, kind = (alone, "alone") if len(alone) >= JOB_PEAK_MIN_SAMPLES else ([g for g, _ in rows], "any")
-        if len(values) < JOB_PEAK_MIN_SAMPLES or (alone_only and kind != "alone"):
+        if len(alone) >= JOB_PEAK_MIN_SAMPLES:
+            values, kind = alone, "alone"
+        elif own_writes and len(written) >= JOB_PEAK_MIN_SAMPLES:
+            values, kind = written, "own"  # its own writes: no neighbour's bytes in it, so a need like a solo run's
+        else:
+            values, kind = [g for g, _ in rows], "any"
+        if len(values) < JOB_PEAK_MIN_SAMPLES or ((alone_only or own_writes) and kind == "any"):
             continue
         peak = min(JOB_PEAK_MAX_GIB, math.ceil(round(_p90(values) * 10, 6)) / 10)
-        peaks[key] = (peak, f"p90 of {len(values)} runs here{' alone' if kind == 'alone' else ''}")
+        peaks[key] = (peak, f"p90 of {len(values)} runs here"
+                            + {"alone": " alone", "own": ", its own writes", "any": ""}[kind])
     return peaks
 
 
@@ -12204,20 +12263,26 @@ class Gate:
         if per is None or free is None:
             return None
         home = self.runner_dir.parent
-        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
+        bound = per  # RUNNER_JOBS_OWN_PEAK: no install's job is charged more than the largest own peak here
+        with contextlib.suppress(Exception):
+            bound = max([per, *(gib for gib, _source in learned_job_peaks(job_log_tail(), own_writes=True).values())])
+        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), bound):
             return None
         try:
             running, listening = runner_jobs_in_flight_detail(home, self.runner_dir, processes())
         except Exception:  # noqa: BLE001
             return None
-        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its p95
+        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its charge
+        # RUNNER_JOBS_OWN_PEAK: a running job's charge is the larger of the fleet p95 and its own learned peak here
         now = time.time()
-        written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
+        charges = running_job_charges(home, running, per)
+        written = round(sum(min(charges.get(pid, per), job_written_gib(self.state_dir, name, pid, now) or 0.0)
                             for name, pid in running), 1)
+        extra = round(sum(max(0.0, charges.get(pid, per) - per) for _name, pid in running), 1)
         in_flight = len(running) + listening
         self.disk_jobs_in_flight = in_flight
-        why = runner_jobs_refusal(free, in_flight, per, source, written)
-        return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
+        why = runner_jobs_refusal(free, in_flight, per, source, written, extra)
+        return (why, round(runner_jobs_need_gib(in_flight, per) + extra - written, 1)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
@@ -14250,6 +14315,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             if nonce is not None and ws is not None:
                 written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws), nonce)
         written_at = time.monotonic()
+        written_max: float | None = None  # JOB_OWN_WRITTEN
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         dynamic_units = admitted_units = int(meta.get("units") or 0)
@@ -14304,8 +14370,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                         samples.thermal = bool(samples.thermal) or limited
                 if written is not None and time.monotonic() - written_at >= JOB_WRITTEN_EVERY_S:
                     written_at = time.monotonic()
-                    report_job_written(written[1], state_dir, written[0], watch_pid, written[2], disk_path,
-                                       samples.disk_free_start)
+                    wrote = report_job_written(written[1], state_dir, written[0], watch_pid, written[2], disk_path,
+                                               samples.disk_free_start)
+                    if wrote is not None:  # JOB_OWN_WRITTEN: the most this job wrote itself
+                        written_max = wrote if written_max is None else max(written_max, wrote)
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
             tick += 1
@@ -14342,6 +14410,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
+        if written_max is not None:
+            record[JOB_OWN_WRITTEN_FIELD] = round(written_max, 1)
         final, gui = holdings
         if final != record.get("roots", []):
             record["roots_admitted"] = record.get("roots", [])
