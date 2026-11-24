@@ -177,20 +177,46 @@ class IdleRepairTest(unittest.TestCase):
         with path.open("wb") as source, mock.patch.object(disk, "_owned_query_split") as probe:
             fd = source.fileno()
             st = os.fstat(fd)
-            node = f"D{st.st_dev:#x}\ni{st.st_ino}\n"
+            node = f"tREG\nD{st.st_dev:#x}\ni{st.st_ino}\n"
             own = f"p{os.getpid()}\nf{fd}\n{node}"
             probe.return_value = 0, own + "p999999\nf1\nD0x0\ni1\n", ""
             self.assertEqual(disk.descriptor_holder_status(fd), "clear")
-            self.assertEqual(probe.call_args.args[0][1:], ["-b", "-w", "-nP", "-FpfDi"])
+            self.assertEqual(probe.call_args.args[0][1:], ["-b", "-w", "-nP", "-FpfDit"])
             for code, output, error, outcome in [(0, "", "", "blocked:lsof-incomplete"),
                     (0, f"p{os.getpid()}\nf{fd}\n", "", "blocked:lsof-incomplete"),
                     (0, own + f"f{fd + 1}\n{node}", "", "changed:in-use"),
+                    (0, own + f"f{fd + 1}\ntREG\nD{st.st_dev:#x}\n", "", "blocked:lsof-incomplete"),
                     (0, own + f"p999999\nf1\n{node}", "", "changed:in-use"),
                     (0, own, "lsof: partial listing\n", "blocked:lsof-incomplete"),
                     (1, own, "", "blocked:lsof-incomplete")]:
                 with self.subTest(code=code, output=output, error=error):
                     probe.return_value = code, output, error
                     self.assertEqual(disk.descriptor_holder_status(fd), outcome)
+            for partial in [f"tREG\nD{st.st_dev:#x}\n", f"tREG\ni{st.st_ino}\n", "tREG\n", "",
+                            f"D{st.st_dev:#x}\n", f"i{st.st_ino}\n", f"D{st.st_dev:#x}\ni{st.st_ino}\n"]:
+                probe.return_value = 0, own + "p999999\nf1\n" + partial, ""
+                for native in ["blocked:lsof-incomplete", "changed:in-use", "clear"]:
+                    with self.subTest(partial=partial, native=native), \
+                            mock.patch.object(disk, "corroborate_descriptor_holders", return_value=native) as check:
+                        self.assertEqual(disk.descriptor_holder_status(fd), native)
+                        check.assert_called_once_with(fd)
+            # A different known inode or device rules out a match even when another field is missing.
+            probe.return_value = 0, own + f"p999999\nf1\ntREG\ni{st.st_ino + 1}\nf2\nD{st.st_dev + 1:#x}\n", ""
+            with mock.patch.object(disk, "corroborate_descriptor_holders") as check:
+                self.assertEqual(disk.descriptor_holder_status(fd), "clear")
+                check.assert_not_called()
+            own_pid = str(os.getpid())
+            with mock.patch.object(disk, "DARWIN", True), \
+                    mock.patch.object(disk.fcntl, "fcntl", return_value=os.fsencode(path) + b"\0"):
+                for result, outcome in [((0, own_pid, ""), "clear"),
+                        ((0, own_pid + " 999999", ""), "changed:in-use"),
+                        ((1, own_pid, ""), "blocked:lsof-incomplete"),
+                        ((0, "999999", ""), "blocked:lsof-incomplete"),
+                        ((0, "", ""), "blocked:lsof-incomplete"),
+                        ((0, own_pid, "warning"), "blocked:lsof-incomplete")]:
+                    with self.subTest(native_result=result):
+                        probe.return_value = result
+                        self.assertEqual(disk.corroborate_descriptor_holders(fd), outcome)
             for failure, outcome in [(OSError(), "blocked:lsof-incomplete"),
                                      (subprocess.TimeoutExpired("lsof", 10), "blocked:query-timeout")]:
                 probe.side_effect = failure

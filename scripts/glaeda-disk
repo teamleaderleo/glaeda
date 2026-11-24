@@ -4606,12 +4606,49 @@ def web_update_identity(st: os.stat_result) -> tuple[int, ...]:
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_blocks
 
 
+_PROC_LISTPIDSPATH = """
+import ctypes
+import os
+import sys
+
+lookup = ctypes.CDLL("/usr/lib/libproc.dylib").proc_listpidspath
+lookup.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+pids = (ctypes.c_int * 65536)()
+capacity = ctypes.sizeof(pids)
+count = lookup(1, 0, os.fsencode(sys.argv[1]), 0, pids, capacity)  # PROC_ALL_PIDS, all kinds of reference
+if not 0 < count < capacity or count % ctypes.sizeof(ctypes.c_int):
+    sys.exit(1)
+print(*pids[:count // ctypes.sizeof(ctypes.c_int)])
+"""
+
+
+def corroborate_descriptor_holders(fd: int) -> str:
+    """Ask Darwin for all PIDs referencing the exact local file when lsof omitted identifying fields."""
+    if not DARWIN:
+        return "blocked:lsof-incomplete"
+    try:
+        path = os.fsdecode(fcntl.fcntl(fd, 50, bytes(1024)).split(b"\0", 1)[0])  # F_GETPATH
+        st = os.fstat(fd)
+        if not os.path.samestat(st, os.stat(path)):
+            return "blocked:lsof-incomplete"
+        code, out, err = _owned_query_split([sys.executable, "-I", "-S", "-c", _PROC_LISTPIDSPATH, path], 10)
+        pids = {int(word) for word in out.split()}
+        if (code or err.strip() or os.getpid() not in pids or min(pids) <= 0
+                or not os.path.samestat(st, os.stat(path))):
+            return "blocked:lsof-incomplete"
+        return "clear" if pids == {os.getpid()} else "changed:in-use"
+    except subprocess.TimeoutExpired:
+        return "blocked:query-timeout"
+    except (OSError, ValueError):
+        return "blocked:lsof-incomplete"
+
+
 def descriptor_holder_status(fd: int) -> str:
     """Check the held device/inode against a fresh mount-safe listing. Require our exact descriptor as witness."""
     st = os.fstat(fd)
     try:
         code, out, err = _owned_query_split([shutil.which("lsof") or "/usr/sbin/lsof",
-                                             *LSOF_NO_MOUNT_STAT, "-nP", "-FpfDi"], 10)
+                                             *LSOF_NO_MOUNT_STAT, "-nP", "-FpfDit"], 10)
     except subprocess.TimeoutExpired:
         return "blocked:query-timeout"
     except OSError:
@@ -4620,13 +4657,21 @@ def descriptor_holder_status(fd: int) -> str:
         return "blocked:lsof-incomplete"
     wanted = (f"D{st.st_dev:#x}", f"i{st.st_ino}")
     witness = (f"p{os.getpid()}", f"f{fd}")
-    pid = descriptor = device = inode = ""
+    pid = descriptor = device = inode = kind = ""
+    ambiguous = False
     holders = set()
     for line in itertools.chain(out.splitlines(), ("p",)):
         if line.startswith(("p", "f")):
-            if (device, inode) == wanted:
+            if descriptor and (device, inode) == wanted and kind == "tREG":
                 holders.add((pid, descriptor))
-            device = inode = ""
+            elif (descriptor and kind in ("tREG", "", "tunknown") and device in ("", wanted[0])
+                  and inode in ("", wanted[1])):
+                # libproc identifies PIDs, not individual descriptors. An ambiguous extra fd in our own
+                # process cannot be distinguished from the known witness by that query.
+                if not pid or pid == witness[0]:
+                    return "blocked:lsof-incomplete"
+                ambiguous = True
+            device = inode = kind = ""
             if line.startswith("p"):
                 pid, descriptor = line, ""
             else:
@@ -4635,9 +4680,13 @@ def descriptor_holder_status(fd: int) -> str:
             device = line
         elif line.startswith("i"):
             inode = line
+        elif line.startswith("t"):
+            kind = line
     if witness not in holders:
         return "blocked:lsof-incomplete"
-    return "clear" if holders == {witness} else "changed:in-use"
+    if holders != {witness}:
+        return "changed:in-use"
+    return corroborate_descriptor_holders(fd) if ambiguous else "clear"
 
 
 def remove_web_update_archive(root: Path, item: "Item") -> str:
