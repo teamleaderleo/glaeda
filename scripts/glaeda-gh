@@ -9689,17 +9689,21 @@ class Daemon:
         return status
 
     def land_busy(self) -> bool:
-        """A land job (a judgment or the step it took) is running. An update waits for it (reexec_due): under
-        REEXEC_UPDATE_GAP of uptime it holds and the queue works on; past it, it drains (no new job starts) for at most
-        REEXEC_DRAIN_MAX, and a step's claim is judged again by the next daemon (LandQueue.claim)."""
+        """A land step (a claimed action: a merge, an update_branch, a rerun...) is running. An update waits for it
+        (reexec_due): under REEXEC_UPDATE_GAP of uptime it holds and the queue works on; past it, it drains (no new job
+        starts) for at most REEXEC_DRAIN_MAX, and a step's claim is judged again by the next daemon (LandQueue.claim).
+        A job with no claimed step is not waited for: a judgment is handed to the next daemon (judge_handed), and one
+        still reading (state judging, or a refresh or ancestry read) is judged again by it (LandQueue.load). A lane VM,
+        2026-11-24: merge 4c6ee1d4 went live 98 s after its swap, held for "21 land step(s) running", most of them
+        reads."""
         q = self.land_queue
         if q is None:
             return False
         q.reap()
         if not q.handover:
             return bool(q.jobs)
-        with q.lock:  # a judgment is handed to the next daemon (judge_handed): only a job outside one is waited for
-            return any(k not in q.judging for k in q.jobs)
+        with q.lock:  # only a claimed step outside a handed judgment is waited for
+            return any(k not in q.judging and isinstance((q.entries.get(k) or {}).get("action"), dict) for k in q.jobs)
 
     def land_finishing(self) -> float:
         """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for

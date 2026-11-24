@@ -34822,13 +34822,15 @@ class LandTest(Base):
         fut.done.return_value = False
         q = self.daemon.land_queue
         q.jobs["pr:o/r#1"] = fut
-        q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "acting"}
+        q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "acting", "action": {"kind": "merge"}}
         self.assertTrue(self.daemon.land_busy())
         fut.done.return_value = True
         fut.exception.return_value = None
         self.assertFalse(self.daemon.land_busy())
 
-    def test_a_running_judgment_holds_an_update(self):
+    def test_a_job_with_no_claimed_step_does_not_hold_an_update(self):
+        # a lane VM, 2026-11-24: 4c6ee1d4 held 98 s for "21 land step(s) running", most of them reads; the next
+        # daemon judges an unclaimed entry again (LandQueue.load)
         gg.land_dir().mkdir(parents=True)
         self.daemon.land_tick()
         q = self.daemon.land_queue
@@ -34836,6 +34838,10 @@ class LandTest(Base):
         fut.done.return_value = False
         q.jobs["pr:o/r#1"] = fut
         q.entries["pr:o/r#1"] = {"key": "pr:o/r#1", "state": "judging"}
+        self.assertFalse(self.daemon.land_busy())
+        q.jobs["pr:o/r#3"] = fut  # a refresh read of an entry the queue no longer holds
+        self.assertFalse(self.daemon.land_busy())
+        q.entries["pr:o/r#1"]["action"] = {"kind": "update_branch"}  # its step is claimed: it is waited for
         self.assertTrue(self.daemon.land_busy())
 
     def test_an_update_is_not_held_by_a_judgment_it_hands_over(self):
@@ -34850,6 +34856,7 @@ class LandTest(Base):
         q.judging["pr:o/r#1"] = (time.monotonic(), 300.0)
         self.assertFalse(self.daemon.land_busy())
         q.jobs["pr:o/r#2"] = fut  # a step outside a judgment (a merge): still drained
+        q.entries["pr:o/r#2"] = {"key": "pr:o/r#2", "state": "acting", "action": {"kind": "merge"}}
         self.assertTrue(self.daemon.land_busy())
 
     def test_a_judgment_outlives_a_reexec_and_the_next_daemon_reads_its_answer(self):
