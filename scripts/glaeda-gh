@@ -9695,7 +9695,10 @@ class Daemon:
         if q is None:
             return False
         q.reap()
-        return bool(q.jobs)
+        if not q.handover:
+            return bool(q.jobs)
+        with q.lock:  # a judgment is handed to the next daemon (judge_handed): only a job outside one is waited for
+            return any(k not in q.judging for k in q.jobs)
 
     def land_finishing(self) -> float:
         """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for
@@ -15771,6 +15774,16 @@ def gh_cache_gens(repo: str | None) -> list[int]:
             for k in ("host", str(repo or "").lower(), "*")]
 
 
+# A land judgment (land_judge explain: a read, p50 265 s, p90 300 s) is handed across a re-exec instead of drained or cut.
+# Its child writes its answer to files under land/judging/ (not pipes that die with this image), and the next daemon's
+# judgment of the same entry with the same argv waits for that child's answer instead of starting over
+# (LandQueue.judge_handed). So an update re-execs at once while every running land job is inside a judgment (land_busy),
+# and a fast-patch of glaeda-gh on the land executor goes live in seconds, not after a drain of up to REEXEC_DRAIN_MAX:
+# lane-9, 2026-11-24, `fast-patch glaeda f5e82403` waited 145 s on "5 land step(s) running" (merge to live 156 s).
+LAND_JUDGING_DIR = "judging"
+LAND_HANDOVER_WAIT = 0.5  # how often an adopted judgment's answer file is looked for (a local file, no GitHub read)
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -15802,6 +15815,7 @@ class LandQueue:
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
+        self.handover = run is None  # judgments outlive a re-exec (LAND_JUDGING_DIR); a test's run stays in process
         self.forward = forward
         self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
         self.forward_thread: threading.Thread | None = None
@@ -19545,12 +19559,81 @@ class LandQueue:
                 raise subprocess.TimeoutExpired(argv, timeout) from None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def call(self, argv: list[str], timeout: float, e: dict | None = None,
-             extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-        """One child (land_judge, the gh-quota shim, lane-gh) and its output, with GitHub's numeric user id dropped
-        from both streams (land_redact): every stored reason, cause and park text is captured here."""
+    def judge_handed(self, key: str, argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
+        """ARGV (a judgment: a read) run with its streams and exit code in files under land/judging/, so it outlives a
+        re-exec of this daemon; or, when the previous image left the same ARGV for KEY running or answered within its
+        bound, that child's answer (LAND_JUDGING_DIR). Raises subprocess.TimeoutExpired past TIMEOUT, as run does."""
+        d = land_dir() / LAND_JUDGING_DIR
+        stem = d / file_name(key)[:-len(".json")]
+        meta, out, err, rc = (stem.with_suffix(x) for x in (".json", ".out", ".err", ".rc"))
+        doc = read_json(meta)
+        now = time.time()
+        adopted = isinstance(doc, dict) and doc.get("argv") == argv and isinstance(doc.get("pid"), int) \
+            and isinstance(doc.get("deadline"), (int, float)) and now < float(doc["deadline"])
+        if adopted and not rc.exists():
+            try:
+                os.kill(int(doc["pid"]), 0)
+            except OSError:
+                adopted = False  # gone with no answer: judged again
+        proc = None
+        if adopted:
+            deadline = float(doc["deadline"])
+            log({"event": "land-judgment-adopted", "key": key, "pid": doc["pid"], "ageS": round(now - float(doc.get("at") or now), 1)})
+        else:
+            for f in (rc, out, err):
+                with contextlib.suppress(OSError):
+                    f.unlink()
+            d.mkdir(parents=True, exist_ok=True)
+            env = deadline_env(env, timeout)  # its bound in the child too
+            wrapped = ["/bin/sh", "-c", 'r=$1; shift; "$@"; c=$?; echo "$c" > "$r.tmp" && mv "$r.tmp" "$r"', "sh",
+                       os.fspath(rc), *self_bounded(argv, timeout, env)]
+            with open(out, "wb") as fo, open(err, "wb") as fe:
+                proc = subprocess.Popen(wrapped, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, start_new_session=True,
+                                        env=env, cwd=os.environ.get("HOME") or "/")
+            deadline = now + timeout
+            write_json(meta, {"argv": argv, "pid": proc.pid, "at": now, "deadline": deadline})
         try:
-            got = self.run(argv, timeout, {**self.env(e), **(extra or {})})
+            while not rc.exists():
+                if proc is not None:
+                    try:
+                        proc.wait(timeout=max(0.0, min(LAND_HANDOVER_WAIT * 20, deadline - time.time())))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    else:
+                        if not rc.exists():  # killed before its shell could write the code
+                            break
+                elif time.time() < deadline:
+                    try:
+                        os.kill(int(doc["pid"]), 0)
+                    except OSError:
+                        break
+                    time.sleep(LAND_HANDOVER_WAIT)
+                if time.time() >= deadline and not rc.exists():
+                    if proc is not None:
+                        with contextlib.suppress(OSError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                            proc.wait(timeout=2)
+                    raise subprocess.TimeoutExpired(argv, timeout)
+            try:
+                code = int(rc.read_text().strip())
+            except (OSError, ValueError):
+                code = 125  # no code: ended by a signal before its shell wrote one
+            return subprocess.CompletedProcess(argv, code, out.read_text(errors="replace") if out.exists() else "",
+                                               err.read_text(errors="replace") if err.exists() else "")
+        finally:
+            for f in (meta, rc, out, err):
+                with contextlib.suppress(OSError):
+                    f.unlink()
+
+    def call(self, argv: list[str], timeout: float, e: dict | None = None,
+             extra: dict[str, str] | None = None, handed: str | None = None) -> subprocess.CompletedProcess:
+        """One child (land_judge, the gh-quota shim, lane-gh) and its output, with GitHub's numeric user id dropped
+        from both streams (land_redact): every stored reason, cause and park text is captured here. HANDED: the key of a
+        judgment that outlives a re-exec (judge_handed)."""
+        try:
+            env = {**self.env(e), **(extra or {})}
+            got = self.judge_handed(handed, argv, timeout, env) if handed and self.handover else self.run(argv, timeout, env)
             return subprocess.CompletedProcess(got.args, got.returncode, land_redact(got.stdout) if got.stdout else
                                                got.stdout, land_redact(got.stderr) if got.stderr else got.stderr)
         except subprocess.TimeoutExpired:
@@ -19613,7 +19696,7 @@ class LandQueue:
             with self.lock:
                 self.judging[e["key"]] = (time.monotonic(), bound)
             try:
-                got = self.call(run_argv, bound, extra=extra)
+                got = self.call(run_argv, bound, extra=extra, handed=e["key"])
             finally:
                 with self.lock:
                     self.judging.pop(e["key"], None)
@@ -23660,7 +23743,10 @@ def serve(foreground_ok: bool = False) -> int:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
                     daemon.reexec_waiting = time.monotonic()
             elif due is not None:
-                log({"event": "reexec", **({"why": due} if due != "reexec" else {})})
+                q = daemon.land_queue
+                handed = len(q.judging) if q is not None and q.handover else 0  # judge_handed: the next daemon's
+                log({"event": "reexec", **({"why": due} if due != "reexec" else {}),
+                     **({"handedJudgments": handed} if handed else {})})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
