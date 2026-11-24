@@ -28887,6 +28887,107 @@ class LandTest(Base):
                          (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
         self.assertEqual(e["state"], "merged")
 
+    def test_land_override_merges_capped_base_red_at_followed_pin(self):
+        self.lane_vm()
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        force = "land-judge: the head's checks are older than its base, so the land merges the base in (lw#8029)"
+        self.w.answers.append(refusal("base_update", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                                          "force": force}))
+        e = self.tick()
+        self.assertEqual(e["wait"]["kind"], "head_change")
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--force", force,
+                           "--match-head-commit", LA]])
+        self.pr(LB, parent=LA, checks=[("Skills", "IN_PROGRESS", None)])
+        e = self.tick()
+        self.assertEqual((e["pinSha"], e["wait"]["kind"], self.merge_envs()), (LB, "pr", []))
+        self.pr(LB, parent=LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        self.w.answers.append(refusal("unreadable", LB, {"kind": "retry", "override_if_checks_finished": True}))
+        e = self.tick()
+        [call] = self.broker_lands()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LB, "override": self.OVERRIDE})
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        [env] = self.merge_envs()
+        self.assertEqual(env["LAND_JUDGE_OVERRIDE_RECEIPT"], self.OVERRIDE["receipt"])
+        self.assertEqual(e["explain"]["code"], "unreadable")
+        self.assertEqual([(h["code"], h["head"]) for h in e["history"] if h["event"] == "override_merge"],
+                         [("unreadable", LB[:12])])
+
+    def test_land_override_wakes_capped_retry_only_for_a_changed_receipt(self):
+        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        capped = refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True})
+        self.w.answers.append(capped)
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], self.merge_envs()), ("retry", []))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.tick()
+        self.assertEqual(len(self.w.explains()), 1)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.answers.append(capped)
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_land_override_capped_retry_requires_finished_checks_and_a_real_receipt(self):
+        def eligible(data, pin=LA, receipt=self.OVERRIDE["receipt"], seen=None):
+            cache = {"data": data}
+            e = {"override": {**self.OVERRIDE, "receipt": receipt}, "pinSha": pin,
+                 "seenChecks": gg.land_check_fingerprint(cache) if seen is None else seen}
+            return gg.land_receipted_base_red(e, LA, cache)
+
+        reds = land_pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        paged = {**reds, "checksTruncated": True, "checksTotal": 101,
+                 "checkCounts": {"runs": {"SUCCESS": 100, "FAILURE": 1}, "statuses": {}}}
+        for data in ({}, land_pr(LA), {**reds, "headRefOid": LB}, {**reds, "checksPageError": "jobs unread"},
+                     {**reds, "requiredMissing": ["coverage"]}, {**reds, "checksTruncated": True}, {**reds, "checks": []},
+                     {**paged, "checkCounts": {"runs": {"SUCCESS": 98, "IN_PROGRESS": 2, "FAILURE": 1}}},
+                     land_pr(LA, checks=[("Skills", "COMPLETED", "FAILURE"), ("CI", "IN_PROGRESS", None)])):
+            with self.subTest(data=data):
+                self.assertFalse(eligible(data))
+        self.assertFalse(eligible(reds, receipt=gg.LAND_OVERRIDE_ENV_RECEIPT))
+        self.assertFalse(eligible(reds, pin=LB))
+        self.assertFalse(eligible(reds, seen=gg.land_check_fingerprint({"data": land_pr(LA)})))
+        self.assertTrue(eligible(reds))
+        self.assertTrue(eligible(paged))
+
+    def test_land_override_never_takes_an_untyped_retry_or_quota(self):
+        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry"}, reason="some reds could not be read"))
+        e = self.tick()
+        self.assertEqual((e["wait"]["kind"], self.merge_envs()), ("retry", []))
+        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True},
+                                      reason="gh-quota: refused: GitHub's REST rate limit is spent"))
+        e = self.tick(e["wakeAt"] - self.t + 1)
+        self.assertEqual((e["wait"]["kind"], self.merge_envs()), ("quota", []))
+
+    def test_land_override_rejudges_on_terminal_pr_checks_ahead_of_run_cache(self):
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, {"kind": "wait_run", "run": 77, "timeout_s": 3600}))
+        e = self.tick()
+        self.assertEqual(e["wait"]["kind"], "run")
+        self.w.cache["run:o/r/77"] = {"data": {"status": "in_progress"}}
+        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        self.w.cache[self.KEY]["data"]["checks"][0]["runId"] = 77
+        self.w.answers.append(refusal("checks_running", LA, {"kind": "wait_run", "run": 77, "timeout_s": 3600}))
+        self.tick()
+        self.tick()
+        self.assertEqual((len(self.w.explains()), self.merge_envs()), (2, []))
+
+    def test_land_override_rejudges_when_last_off_page_check_finishes(self):
+        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+        data = self.w.cache[self.KEY]["data"]
+        data.update(checksTruncated=True, checkCounts={"runs": {"IN_PROGRESS": 1, "COMPLETED": 100}})
+        self.land()
+        e = self.tick()
+        self.assertEqual((e["wait"]["why"], len(self.w.explains())), ("checks running", 0))
+        data["checkCounts"]["runs"] = {"COMPLETED": 101}
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
     def test_land_override_survives_the_queues_own_update_branch_and_merges_past_ci_never_ran(self):
         # cmux#47821 lost its override when the queue updated the branch itself; hq#17374 (docs alone) was refused
         # ci_never_ran three times with --override-reason given. The override answers the refusal at the new head.

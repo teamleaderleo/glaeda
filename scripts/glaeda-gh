@@ -13162,11 +13162,12 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
-def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool) -> list[str]:
+def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
+                            force: str = "") -> list[str]:
     """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
     --land and one --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
     if broker:
-        return (["pr", "update-branch", number, "-R", repo, "--land"]
+        return (["pr", "update-branch", number, "-R", repo, "--land"] + (["--force", force] if force else [])
                 + [arg for name in needs for arg in ("--needs-newer-base", name)] + ["--match-head-commit", head])
     return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
 
@@ -15276,6 +15277,8 @@ def land_fingerprint(cache: dict | None, conflict_only: bool = False) -> str:
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
     mergeable = data.get("mergeable") == "CONFLICTING" if conflict_only else data.get("mergeable")
     doc = [data.get("headRefOid"), data.get("state"), mergeable, checks]
+    if data.get("checksTruncated"):
+        doc.extend((data.get("checkCounts"), pending_on_every_page(data)))
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -16094,7 +16097,8 @@ class LandQueue:
         sent = req.get("at")
         e["requestedAt"] = min(float(sent), self.now) \
             if isinstance(sent, (int, float)) and not isinstance(sent, bool) else self.now
-        if pin and pin != str(e.get("pinSha") or "").lower() and not fresh:
+        pin_changed = bool(pin and pin != str(e.get("pinSha") or "").lower())
+        if pin_changed and not fresh:
             self.drop_older_heads(e, pin)
         if pin:
             e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
@@ -16112,10 +16116,20 @@ class LandQueue:
         elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
             e.pop("lane", None)
             e.pop("laneHost", None)
+        previous_override = e.get("override")
         if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
             e["override"] = land_request_override(req)
             # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
-            e["overrideAt"] = self.now if e["override"] else None
+            if fresh or previous_override != e["override"]:
+                e["overrideAt"] = self.now if e["override"] else None
+        if e.get("state") == "waiting" and (pin_changed or e.get("override") != previous_override):
+            verdict = e.get("explain") or {}
+            wait = e.get("wait") or {}
+            checks_wait = (wait.get("kind") in ("pr", "run") and not wait.get("rerun")
+                           and (wait.get("why") == "checks running" or verdict.get("code") == "checks_running"))
+            if (checks_wait or wait.get("kind") == "retry" and verdict.get("code") == "unreadable"
+                    and (verdict.get("action") or {}).get("override_if_checks_finished") is True):
+                e.update(state="queued", wait=None, wakeAt=None, dueAt=self.now)
         if fresh or "nominated" in req:  # the same: a plain re-request of an open nominated entry keeps its gates
             e["nominated"] = land_nominated(req.get("nominated"))
         if fresh:
@@ -18342,8 +18356,18 @@ class LandQueue:
         # Against the head the cache showed when it was last judged: land_judge's own head can differ from a stale cache.
         moved = bool(head and e.get("seenHead") and head != e.get("seenHead"))
         if kind == "run":
-            rd = (self.cache_of(w.get("key", "")) or {}).get("data") or {}
-            done = (rd.get("status") == "completed" or moved) and not running
+            run_cache = self.cache_of(w.get("key", "")) or {}
+            rd = run_cache.get("data") or {}
+            # A PR read can finish a job before the run cache learns of it. Rejudge once on that
+            # transition, only for a run on this head; a wait on a base run still needs its own result.
+            pr_finished = (not running and fp != e.get("seen") and whole_read(data)
+                           and (c.get("dataAt") or 0) > (run_cache.get("dataAt") or 0)
+                           and e.get("seenChecks") != land_check_fingerprint(c))
+            run_id = w.get("key", "").rpartition("/")[2]
+            run_on_head = pr_finished and (e.get("explain") or {}).get("code") == "checks_running" and any(
+                str(check.get("runId") or "") == run_id and check.get("status") == "COMPLETED"
+                for check in data.get("checks") or [])
+            done = (rd.get("status") == "completed" or moved or run_on_head) and not running
             if done or woke:
                 self.judge(e, head, fp, why=("head_moved" if moved else "run_done") if done else "woke")
             return
@@ -19739,6 +19763,14 @@ class LandQueue:
                                 host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            if (answer.get("code") == "unreadable" and act.get("kind") == "retry"
+                    and act.get("override_if_checks_finished") is True and sha == head == act.get("head")
+                    and land_receipted_base_red(e, head, self.cache_of(e["key"]) or {})):
+                # Keep the judge's original refusal in explain. The operator's receipt answers this one
+                # incomplete base-red search; take() checks the target and uses the ordinary pinned merge.
+                self.history(e, "override_merge", code=answer["code"], head=head[:12], **land_override_history(e))
+                act = {**act, "kind": "merge", "sha": head}
+                answer = {**answer, "ok": True, "code": "ok", "action": act}
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
                 bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
                     and bool(LAND_UNREAD_TRANSIENT.search(reason))
@@ -20126,7 +20158,9 @@ class LandQueue:
                               f"{head[:12] or '?'}", land_trim(answer.get("next")))
                 return
             needs = act.get("needs_newer_base")
-            self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [])
+            force = act.get("force") if answer.get("code") == "base_update" else ""
+            self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [],
+                               force if isinstance(force, str) else "")
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -20784,7 +20818,7 @@ class LandQueue:
             return LAND_FETCH_ONCE.as_posix()
         return shutil.which("git-fetch-once") or ""
 
-    def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
+    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -20828,7 +20862,7 @@ class LandQueue:
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
         self.push_step(e, "update_branch", head,
-                       land_update_branch_args(repo, number, head, list(needs or []), self.broker_client()))
+                       land_update_branch_args(repo, number, head, list(needs or []), self.broker_client(), force))
 
     def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
@@ -21573,6 +21607,28 @@ def land_request_override(req: dict) -> dict | None:
         return land_override(o["reason"], o["receipt"])
     except WatchError:
         return None
+
+
+def land_receipted_base_red(e: dict, head: str, cache: dict) -> bool:
+    """The operator supplied a receipt and all checks at the judged head have finished, including later pages."""
+    override = land_override_env(e)
+    if not override or override["LAND_JUDGE_OVERRIDE_RECEIPT"] == LAND_OVERRIDE_ENV_RECEIPT:
+        return False
+    data = cache.get("data") or {}
+    if (not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head)
+            or data.get("state") != "OPEN" or data.get("headRefOid") != head or data.get("checksPageError")
+            or data.get("requiredMissing") or data.get("requiredUnread")
+            or e.get("seenChecks") != land_check_fingerprint(cache)):
+        return False
+    checks = data.get("checks") or []
+    if not checks or any(c.get("status") != "COMPLETED" or not c.get("conclusion") for c in checks):
+        return False
+    if data.get("checksTruncated"):
+        counts = data.get("checkCounts") or {}
+        rows = [*counts.get("runs", {}).items(), *counts.get("statuses", {}).items()]
+        return (bool(rows) and sum(n for state, n in rows if state in PASSED or state in FAILED) == data.get("checksTotal")
+                and any(n for state, n in rows if state in FAILED))
+    return any(c.get("conclusion") in FAILED for c in checks)
 
 
 def land_override_env(e: dict) -> dict[str, str]:
