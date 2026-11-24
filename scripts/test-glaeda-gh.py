@@ -24697,7 +24697,7 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual(self.w.gh_calls("api"), [])
         self.assertEqual(self.w.gh_calls("pr", "update-branch"),
-                         [["pr", "update-branch", "1", "-R", "o/r", "--needs-newer-base", "ws-check",
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--needs-newer-base", "ws-check",
                            "--needs-newer-base", "build (macos, arm64)", "--match-head-commit", LA]])
         self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", LA))
 
@@ -24816,8 +24816,18 @@ class LandTest(Base):
         self.assertTrue(gg.land_broker_client(client))
         self.assertEqual(gg.land_update_branch_args("o/r", "1", LA, ["ws-check"], False),
                          ["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f", f"expected_head_sha={LA}"])
+        # The broker form says it is a land's (--land), so the broker's not-landing check (own commit over 24 h)
+        # lets it through instead of refusing it until the land stops update_branch_refused.
         self.assertEqual(gg.land_update_branch_args("o/r", "1", LA, [], True),
-                         ["pr", "update-branch", "1", "-R", "o/r", "--match-head-commit", LA])
+                         ["pr", "update-branch", "1", "-R", "o/r", "--land", "--match-head-commit", LA])
+        self.assertEqual(gg.land_update_branch_args("o/r", "1", LA, ["ws-check"], True),
+                         ["pr", "update-branch", "1", "-R", "o/r", "--land", "--needs-newer-base", "ws-check",
+                          "--match-head-commit", LA])
+        # Every flag the land's broker form sends is one the write cache knows, so the write is stamped as this one
+        # PR's head move (GH_CACHE_HEAD_WRITES), not a wide write that drops every PR answer of the repository.
+        for needs in ([], ["ws-check", "build (macos, arm64)"]):
+            argv = gg.land_update_branch_args("o/r", "1", LA, needs, True)
+            self.assertEqual(gg.gh_cache_write_positionals(argv[2:]), ["1"], argv)
 
     NODES = [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS",
               "databaseId": 7, "isRequired": True, "checkSuite": {"databaseId": 3, "app": {"slug": "github-actions"},

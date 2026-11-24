@@ -12832,6 +12832,12 @@ def land_reads_upstream() -> bool:
 # `gh pr update-branch N -R O/R --match-head-commit SHA [--needs-newer-base CHECK]...` (its update_branch tool, pinned
 # to SHA); gh's own `pr update-branch` takes no head, so a host with its own login keeps the pinned REST call.
 # gh_quota.lane_gh_client reads the same file: the bootstrap's wrapper that runs lane-gh-credential.
+# The broker form carries --land: the broker refuses a base merge of a cmux PR that is "not landing" (its own newest
+# commit over 24 h old, cmuxterm-hq#16488) unless land asks for it, and a land's update-branch is exactly that ask.
+# Without it gcp-agent-lane-3's land queue stopped 6 cmux PRs update_branch_refused on 2026-11-23 (#46506 twice,
+# #45670, #50302, #52141, #51137), each after 6-8 identical refusals; 3 were still open and unqueued 7 h later
+# (hq docs/findings/2026-11-23-land-update-branch-no-land-flag.md).
+# Detector: test-glaeda-gh.py test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch.
 LAND_LANE_GH_CLIENT = Path.home() / ".local/lib/lane-gh/bin/gh"
 
 
@@ -12844,10 +12850,10 @@ def land_broker_client(client: Path | None = None) -> bool:
 
 
 def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool) -> list[str]:
-    """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM), one
-    --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
+    """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
+    --land and one --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
     if broker:
-        return (["pr", "update-branch", number, "-R", repo]
+        return (["pr", "update-branch", number, "-R", repo, "--land"]
                 + [arg for name in needs for arg in ("--needs-newer-base", name)] + ["--match-head-commit", head])
     return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
 
@@ -30283,12 +30289,14 @@ GH_CACHE_HEAD_WRITES = {"update-branch"}
 GH_CACHE_WRITE_VALUE_FLAGS = BROKER_VALUE_FLAGS | {
     "--match-head-commit", "--subject", "--author-email", "--add-label", "--remove-label", "--milestone",
     "--add-reviewer", "--remove-reviewer", "--add-assignee", "--remove-assignee", "--add-project",
-    "--remove-project", "-r", "-a", "-m", "-T", "--template", "-e", "--comment", "-c", "--reason"}
+    "--remove-project", "-r", "-a", "-m", "-T", "--template", "-e", "--comment", "-c", "--reason",
+    "--needs-newer-base"}
 GH_CACHE_WRITE_BOOL_FLAGS = {
     "--squash", "-s", "--merge", "--rebase", "--auto", "--disable-auto", "--delete-branch", "-d", "--admin",
     "--approve", "--request-changes", "--undo", "--yes", "--edit-last", "--create-if-none", "--delete-last",
     "--draft", "--failed", "--debug", "--force", "--remove-milestone", "--fill", "--fill-first",
-    "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w"}
+    "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w",
+    "--land"}  # the land queue's broker update-branch (land_update_branch_args)
 
 
 # -- vouched `pr view` answers: kept while the PR's head and updatedAt stay what they were
