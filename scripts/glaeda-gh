@@ -23631,6 +23631,60 @@ def fast_patch_program() -> str | None:
     return shutil.which("fast-patch")
 
 
+FAST_PATCH_CHECKOUT = Path.home() / "Projects/leo-workspace"
+FAST_PATCH_KEEP = 3  # exported main copies kept under ~/.cache/glaeda/fast-patch
+
+
+def main_fast_patch(checkout: Path = FAST_PATCH_CHECKOUT, cache: Path | None = None,
+                    runner: Callable = subprocess.run) -> str | None:
+    """origin/main's tools/fast-patch from CHECKOUT's own objects, exported with the tools/ modules it imports into
+    CACHE/<sha>/tools, or None (no origin/main there, or no fast-patch on it): the copy the watch runs.
+
+    The shared checkout is a lane's: gcp-agent-lane-9, 2026-11-24, sat on lane/ui-merge-hold, so the watch ran that
+    branch's fast-patch and leo-workspace#10098's fetch cut (10.4 s to 0.5 s), merged to main, never reached it. ws-sync
+    keeps origin/main fresh there whatever branch is checked out; reading the blobs costs no network."""
+    cache = cache or Path.home() / ".cache/glaeda/fast-patch"
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return runner(["git", "-C", os.fspath(checkout), *args], capture_output=True, timeout=20,
+                      stdin=subprocess.DEVNULL)
+
+    try:
+        tip = git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}")
+        sha = tip.stdout.decode().strip() if tip.returncode == 0 else ""
+        if len(sha) != 40:
+            return None
+        root = cache / sha / "tools"
+        if (root / ".complete").is_file():
+            return os.fspath(root / "fast-patch")
+        files: dict[str, bytes] = {}
+        todo = ["fast-patch"]
+        while todo:
+            name = todo.pop()
+            shown = git("cat-file", "blob", f"{sha}:tools/{name}")
+            if shown.returncode != 0:
+                if name == "fast-patch":
+                    return None
+                continue  # a stdlib or third-party module, not a tools/ sibling
+            files[name] = shown.stdout
+            for mod in re.findall(rb"^(?:import|from)\s+([A-Za-z_]\w*)", shown.stdout, re.M):
+                sibling = mod.decode() + ".py"
+                if sibling not in files and sibling not in todo:
+                    todo.append(sibling)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, raw in files.items():
+            (root / name).write_bytes(raw)
+        (root / "fast-patch").chmod(0o755)
+        (root / ".complete").write_text(sha + "\n", encoding="utf-8")
+        olds = sorted((d for d in cache.iterdir() if d.is_dir() and d.name != sha),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+        for old in olds[FAST_PATCH_KEEP - 1:]:
+            shutil.rmtree(old, ignore_errors=True)  # only directories this function made
+        return os.fspath(root / "fast-patch")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
+
+
 def main_tip(runner: Callable = subprocess.run) -> str | None:
     """MAIN_WATCH_REPO's main commit from one anonymous ls-remote, or None (unreachable, or no answer)."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
@@ -23693,8 +23747,10 @@ class MainWatch:
     past what this host runs. Its memory (STATE/glaeda/watch.json) outlives the re-exec a patch causes."""
 
     def __init__(self, program: str, state: Path | None = None, runner: Callable = subprocess.run,
-                 spawn: Callable = spawn_detached, clock: Callable[[], float] = time.time):
+                 spawn: Callable = spawn_detached, clock: Callable[[], float] = time.time,
+                 resolve: Callable[[], str | None] | None = None):
         self.program, self.state = program, state or fast_patch_state()
+        self.resolve = resolve  # main's copy of the program, read again at each run (None: PROGRAM as given)
         self.runner, self.spawn, self.clock = runner, spawn, clock
         self.every = MAIN_WATCH_EVERY
         self.seen: dict[str, float] = {}  # tip -> when this image first saw it
@@ -23733,7 +23789,8 @@ class MainWatch:
         out = self.state / "glaeda" / "watch-run.log"
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("ab") as sink:
-            self.spawn([self.program, "glaeda", tip, "--json"], bound=MAIN_WATCH_RUN_BOUND, env=env,
+            program = (self.resolve() if self.resolve else None) or self.program
+            self.spawn([program, "glaeda", tip, "--json"], bound=MAIN_WATCH_RUN_BOUND, env=env,
                        stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
         entry = {"tries": int(tried.get("tries") or 0) + 1, "at": now, "first": tried.get("first") or now}
         keep = {k: v for k, v in memory.items() if isinstance(v, dict) and now - float(v.get("at") or 0) < 86400}
@@ -23757,7 +23814,8 @@ def start_main_watch() -> MainWatch | None:
     program = fast_patch_program()
     if program is None:
         return None
-    watch = MainWatch(program)
+    shared = os.fspath(FAST_PATCH_CHECKOUT / "tools/fast-patch")
+    watch = MainWatch(program, resolve=main_fast_patch if program == shared else None)
     threading.Thread(target=watch.run, name="glaeda-gh-main-watch", daemon=True).start()
     return watch
 

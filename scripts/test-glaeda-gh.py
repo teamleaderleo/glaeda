@@ -42170,6 +42170,41 @@ class MainWatchTriggersFastPatch(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GLAEDA_FAST_PATCH_WATCH": "0"}):
             self.assertIsNone(gg.start_main_watch())
 
+    def test_the_shared_checkout_off_main_runs_mains_fast_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, cache = Path(tmp) / "ws", Path(tmp) / "cache"
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t"}
+            git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                                            text=True, env=env).stdout.strip()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "tools").mkdir()
+            (repo / "tools/fast-patch").write_text("import os\nimport helper\n# main\n", encoding="utf-8")
+            (repo / "tools/helper.py").write_text("import json\n", encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "main")
+            main = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/main", main)
+            git("checkout", "-q", "-b", "lane/x")
+            (repo / "tools/fast-patch").write_text("# a lane's stale copy\n", encoding="utf-8")
+            git("commit", "-qam", "lane")
+            got = Path(gg.main_fast_patch(repo, cache))
+            self.assertEqual(got, cache / main / "tools/fast-patch")
+            self.assertIn("# main", got.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(p.name for p in got.parent.iterdir()), [".complete", "fast-patch", "helper.py"])
+            self.assertTrue(os.access(got, os.X_OK))
+            self.assertEqual(gg.main_fast_patch(repo, cache), os.fspath(got))  # cached
+            self.assertIsNone(gg.main_fast_patch(Path(tmp) / "nowhere", cache))
+
+    def test_a_step_runs_what_resolve_names(self):
+        runner, _ = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+        spawned = []
+        with tempfile.TemporaryDirectory() as tmp:
+            watch = gg.MainWatch("/bin/fast-patch", Path(tmp), runner, lambda argv, **kw: spawned.append(argv),
+                                 resolve=lambda: "/main/tools/fast-patch")
+            watch.step()
+        self.assertEqual(spawned[0][0], "/main/tools/fast-patch")
+
 
 if __name__ == "__main__":
     unittest.main()
