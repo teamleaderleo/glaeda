@@ -2053,6 +2053,59 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.ARTIFACT_CUTOFF = None
 
+    def test_a_shared_rustup_home_in_the_fleet_cache_is_never_evicted_whole(self) -> None:
+        """2026-11-23: fleet-artifacts took /Users/Shared/cmux-build-fleet/cache/rustup (the RUSTUP_HOME every hq fleet
+        job gets) as one idle item on ~16 iOS simulator minis, and the next job failed "missing manifest in toolchain
+        '1.95.0-aarch64-apple-darwin'". A rustup home stays whole in any family, found by its layout or by
+        FLEET_RUSTUP_HOMES; the cargo download cache and other artifacts beside it still go."""
+        fleet = self.root / "fleet"
+        cache = fleet / "cache"
+        rh = cache / "rustup"
+        lib = rh / "toolchains/1.95.0-aarch64-apple-darwin/lib/rustlib"
+        lib.mkdir(parents=True)
+        (lib / "multirust-channel-manifest.toml").write_text("x")
+        (rh / "update-hashes").mkdir()
+        (rh / "settings.toml").write_text('version = "12"\n\n[overrides]\n')
+        registry = cache / "cargo/registry"
+        registry.mkdir(parents=True)
+        (registry / "blob").write_bytes(b"\0" * 1024 * 1024)
+        (cache / "old-artifact").mkdir()
+        (cache / "old-artifact/blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(cache, hours=48)
+        gd.ARTIFACT_CUTOFF = time.time() - 12 * 3600
+        fam = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True, stale_before=gd.ARTIFACT_CUTOFF,
+                        allow_stale_protected=True, reference_root=fleet)
+        receipt = self.root.parent / f"{self.root.name}-r.jsonl"
+        try:
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                    mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RUSTUP_HOME", None)
+                self.assertTrue(gd.rustup_home_at(rh))
+                self.assertTrue(gd.toolchain_held(rh, fresh=True), "found by its layout, no RUSTUP_HOME needed")
+                self.assertFalse(gd.toolchain_held(registry.parent, fresh=True))
+                items = gd.survey([fam], 24, 0)
+                self.assertNotIn(str(rh), [i.path for i in items])
+                self.assertIn(str(cache / "old-artifact"), [i.path for i in items if i.verdict == "reclaimable"])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {fam.id: fam}, receipt, None, 24)
+                with self.assertRaisesRegex(OSError, "job toolchain"):
+                    gd.remove(rh)
+                # a home set aside before this fix is not a rustup home any more: its deletion finishes
+                aside = cache / f"{gd.DELETING_PREFIX}rustup-1"
+                (aside / "toolchains").mkdir(parents=True)
+                (aside / "settings.toml").write_text("")
+                self.assertFalse(gd.rustup_home_at(aside))
+            # the fleet workers' homes are held at, inside and above even before rustup writes its settings
+            for home in gd.FLEET_RUSTUP_HOMES:
+                self.assertIn(home, gd.toolchain_keep(fresh=True))
+                self.assertTrue(gd.toolchain_held(Path(home) / "toolchains/1.95.0-aarch64-apple-darwin"))
+                self.assertTrue(gd.toolchain_held(Path(home).parent))
+        finally:
+            gd.ARTIFACT_CUTOFF = None
+            receipt.unlink(missing_ok=True)
+        self.assertTrue((lib / "multirust-channel-manifest.toml").exists())
+        self.assertFalse((cache / "old-artifact").exists(), "other fleet artifacts still go by age")
+
     def test_default_families_cover_fleet_and_browser_artifacts(self) -> None:
         saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
         gd.HOME = self.root

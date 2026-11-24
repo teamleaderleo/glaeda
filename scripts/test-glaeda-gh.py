@@ -8690,6 +8690,61 @@ class TickBudgetTest(Base):
         self.assertIn(("pr", 1), queries)
         self.assertEqual(len({f"head:o/r@{sha}" for sha in shas} & self.daemon.deferred), len(shas) - 2)
 
+    def test_a_head_asked_during_a_graphql_tick_is_read_between_its_pr_batches(self) -> None:
+        """cosmic-gray, 2026-11-23: ticks ran minutes behind PR reads, and a head a merge gate asked for after the due
+        phase (`glaeda-gh checks --wait 20`) was read only at the next tick, so the broker refused cmux#52295 and three
+        more "glaeda-gh holds no checks (not read yet)". It is read before the tick's next PR batch."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "pr": 1}
+        for n in (1, 2, 3):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        head = f"head:o/r@{'a' * 40}"
+        queries: list[tuple[str, list[str]]] = []
+
+        def fetch(kind):
+            def read(chunk):
+                if kind == "pr" and not queries:
+                    gg.register(head, consumer="owner-merge")  # asked while the tick reads its first PR
+                queries.append((kind, [e["key"] for e in chunk]))
+            return read
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        self.assertEqual(queries[1], ("head", [head]), queries)
+        self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
+
+    def test_a_head_asked_during_a_rest_tick_is_read_before_the_next_pr_and_a_flood_is_bounded(self) -> None:
+        """The same over REST (GraphQL stopped, as on cosmic-gray 23:17-23:42Z that night): a head asked while the tick
+        reads its PRs is read before the next PR, at most HEADS_BETWEEN_REST a look; the rest are not charged and
+        wait for the next look or tick."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for n in (1, 2):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        heads = [f"head:o/r@{n:040x}" for n in range(1, 6)]
+        read: list[str] = []
+
+        def pr(e):
+            if not read:
+                for key in heads:
+                    gg.register(key, consumer="land-judge")  # asked while the tick reads its first PR
+            read.append(e["key"])
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), \
+                mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=pr), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        between = [k for k in read if k.startswith("head:")]
+        self.assertEqual(len(between), gg.HEADS_BETWEEN_REST, read)
+        self.assertEqual(read.index(between[0]), 1, f"read before the second PR: {read}")
+        self.assertTrue(read[-1].startswith("pr:"), read)
+        for key in set(heads) - set(between):
+            self.assertNotIn(key, self.daemon.attempted, "not read, so free to read at the next look or tick")
+
     def test_the_plain_watches_share_of_a_rest_tick_is_bounded_and_an_asked_head_is_still_read(self) -> None:
         """A tick's REST phase gives the plain watches REST_PLAIN_BUDGET seconds; past it they are deferred in order,
         and an asked head with no answer, or a wait's key, is still read."""
