@@ -1001,6 +1001,19 @@ issueComment { id databaseId url authorAssociation author { __typename login } }
 # Match cmux's base-owned risk classifier. This only wakes that classifier; it never grants SHIP authority.
 RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*(ship|block|fix|not ship|hold)(?![\w-])",
                           re.I)
+# GitHub Event Streams (cmuxterm-hq#24703, Leo 2026-11-24: "4. event streams. let's all go look into these and
+# gogog"). The controller holds one stream per pull request somebody waits on (GET /v1/github/streams?v=1&want=...),
+# shared by every host. Every STREAMS_EVERY seconds the daemon names its waited, open PRs; one whose stream is live
+# since before its last read, settled (every check finished, mergeable known) and quiet since, is read every
+# EVENT_BACKSTOP seconds instead of every cycle: a stream event on it nudges a read at once. A controller without the
+# route (404) or of another version (400) or with streams off answers nothing and polling is unchanged; it is asked
+# again after STREAMS_RETRY. GLAEDA_GH_STREAMS=off or {"streams": false} in gh-daemon.json turns it off.
+EVENT_STREAMS = True
+EVENT_BACKSTOP = 300
+STREAMS_EVERY = 20
+STREAMS_RETRY = 600
+STREAMS_WANT = 90  # (the controller holds at most 90 streams; it answers the rest not live)
+STREAMS_VERSION = 1
 
 
 def outbox_gate(item: Any) -> bool:
@@ -2349,6 +2362,24 @@ def iso_epoch(text: str | None) -> float | None:
         return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def stream_time(text: Any) -> str | None:
+    """A Go RFC 3339 time (nanoseconds) cut to the microseconds fromisoformat reads."""
+    if not isinstance(text, str):
+        return None
+    return re.sub(r"(\.\d{6})\d+", r"\1", text)
+
+
+def events_settled(data: Any) -> bool:
+    """A PR read whose state only people or a stream event change: read whole, mergeable known and every check
+    finished (a running check's commit statuses send no stream event, so it keeps its cycle)."""
+    if not isinstance(data, dict) or data.get("checksTruncated") or data.get("checksPageError") \
+            or data.get("requiredMissing") or data.get("requiredUnread"):
+        return False
+    if data.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
+        return False
+    return all(str(c.get("status") or "").upper() == "COMPLETED" for c in data.get("checks") or [] if isinstance(c, dict))
 
 
 def quick(started: str | None, completed: str | None) -> bool:
@@ -5745,6 +5776,7 @@ def daemon_policy() -> dict:
     consumer_setting = alarms.get("consumerShare")
     consumer = consumer_setting if isinstance(consumer_setting, dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
+            "streams": doc.get("streams") is not False,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
                        "consumerShare": False if consumer_setting is False else {
                            "fraction": float(_bounded(consumer.get("fraction"), CONSUMER_SHARE_FRACTION, 0.01, 1.0)),
@@ -5963,6 +5995,13 @@ class Daemon:
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
+        # Event streams (EVENT_STREAMS): the controller's last answer per PR key, when a PR's event count last moved,
+        # and what the backstop saved
+        self.streams_prs: dict[str, dict] = {}
+        self.streams_event_at: dict[str, float] = {}
+        self.streams_at, self.streams_ok_at, self.streams_retry_at = float("-inf"), float("-inf"), 0.0
+        self.streams_status: dict[str, Any] = {"state": "starting"}
+        self.streams_saved, self.streams_nudges = 0, 0
         self.land_dirty: set[str] = set()  # event/cache keys retained for LandQueue after due() consumes nudged
         self.controller_ok_at = float("-inf")  # the last time the change feed answered
         self.fed_repos: dict[str, float] = {}  # owner/repo (lowercase) -> the last event the feed delivered for it
@@ -9070,6 +9109,11 @@ class Daemon:
                 if (kind == "pr" and path == "rest" and self.waited(e) and not terminal(kind, c.get("data"))
                         and self.now - self.wait_start(e) >= LONG_WAIT_AFTER):
                     want = max(want, interval * LONG_WAIT_FACTOR)  # a long wait over REST (a nudge still reads it)
+                if kind == "pr" and self.stream_quiet(e) and events_settled(c.get("data")):
+                    # settled and its stream live and quiet since the read: a stream event nudges it (streams_tick)
+                    if interval / 2 <= since < EVENT_BACKSTOP - interval / 2:
+                        self.streams_saved += 1  # a read the cycle would have made
+                    want = max(want, EVENT_BACKSTOP)
                 if want > interval and since < want - interval / 2:
                     continue  # unread and unwaited: polled about as often as it was last read
                 out.append(e)
@@ -9311,6 +9355,11 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+        try:
+            with self.phase("streams"):
+                self.streams_tick(entries)
+        except Exception as error:  # noqa: BLE001  streams are an optional nudge: polling serves without them
+            self.streams_off(f"{describe(error)} at {error_site(error)}", "error")
         self.feed_after_controller = True  # from here a long tick reads the feed between its reads (feed_due)
         # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
         self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
@@ -9698,6 +9747,7 @@ class Daemon:
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
+                  "streams": self.streams_view(),
                   "newestData": dict(self.newest_data),
                   "graphqlDown": {"until": round(self.gql_down_until, 3), "strikes": self.gql_down_strikes}
                   if self.gql_down() else None,
@@ -12409,6 +12459,89 @@ class Daemon:
             doc["since"] = self.now  # the window the counts cover: when this host first counted one
         if what == "deadline":
             doc["lastAt"] = self.now
+
+    def streams_enabled(self) -> bool:
+        return (EVENT_STREAMS and self.policy.get("streams", True) is not False
+                and os.environ.get("GLAEDA_GH_STREAMS", "").strip().lower() != "off")
+
+    def streams_off(self, why: str, state: str = "off") -> None:
+        """No stream answers until STREAMS_RETRY: every PR keeps its polling cycle."""
+        self.streams_prs, self.streams_retry_at = {}, self.now + STREAMS_RETRY
+        self.streams_status = {"state": state, "why": why, "retryAt": self.streams_retry_at}
+
+    def streams_tick(self, entries: list[dict]) -> None:
+        """Name the waited, open PRs to the controller's streams (STREAMS_EVERY), and nudge each whose stream
+        delivered an event since the last answer. One free tailnet request; GitHub is never asked here."""
+        if not self.streams_enabled():
+            self.streams_prs, self.streams_status = {}, {"state": "disabled"}
+            return
+        if (self.controller is None or self.now < self.streams_retry_at or self.now - self.streams_at < STREAMS_EVERY
+                or not self.controller_room()):
+            return
+        waited = sorted((e for e in entries if e["key"].startswith("pr:") and self.waited(e)
+                         and not terminal("pr", (e.get("cache") or {}).get("data"))), key=self.wait_start)
+        self.streams_at = self.now
+        if not waited:
+            self.streams_prs = {}
+            return
+        keys: dict[str, dict] = {}
+        for e in waited[:STREAMS_WANT]:
+            _, owner, repo, number = split_key(e["key"])
+            keys[f"{owner}/{repo}#{number}".lower()] = e
+        want = ",".join(k.replace("#", ":") for k in keys)
+        try:
+            doc = self.controller.get(f"/v1/github/streams?v={STREAMS_VERSION}&want=" + urllib.parse.quote(want, safe="/:,"))
+        except NoReceiver as error:  # an older controller: no such route
+            self.streams_off(f"{describe(error)}: this controller keeps no event streams", "absent")
+            return
+        except WatchError as error:  # 400: a controller of another streams version; or it is unreachable
+            self.streams_off(describe(error), "down")
+            return
+        if doc.get("v") != STREAMS_VERSION:
+            self.streams_off(f"controller streams version {doc.get('v')!r}, want {STREAMS_VERSION}", "absent")
+            return
+        if not doc.get("enabled"):
+            self.streams_off(str(doc.get("why") or "streams off on the controller"))
+            return
+        prs = doc.get("prs") if isinstance(doc.get("prs"), dict) else {}
+        fresh: dict[str, dict] = {}
+        for name, e in keys.items():
+            st = prs.get(name)
+            if not isinstance(st, dict):
+                continue
+            was = self.streams_prs.get(e["key"])
+            if was is not None and int(st.get("events") or 0) > int(was.get("events") or 0):
+                self.streams_event_at[e["key"]] = self.now
+                self.nudged.add(e["key"])  # read it now (due(): NUDGE_MIN), not at the backstop
+                self.streams_nudges += 1
+            fresh[e["key"]] = st
+        self.streams_prs, self.streams_ok_at = fresh, self.now
+        self.streams_event_at = {k: t for k, t in self.streams_event_at.items() if k in fresh}
+        stats = doc.get("stats") if isinstance(doc.get("stats"), dict) else {}
+        self.streams_status = {"state": "ok", "live": sum(1 for s in fresh.values() if s.get("live")),
+                               "named": len(fresh), "controllerLive": stats.get("live")}
+
+    def stream_quiet(self, e: dict) -> bool:
+        """Whether e's stream has been live since before its last read, the last answer is recent and no event came
+        after that read: what happens on the PR now arrives as a nudge, so the cycle's read can wait."""
+        st = self.streams_prs.get(e["key"])
+        c = e.get("cache") or {}
+        fetched = c.get("fetchedAt")
+        if not st or not st.get("live") or not isinstance(fetched, (int, float)):
+            return False
+        if self.now - self.streams_ok_at > 3 * STREAMS_EVERY:
+            return False  # the controller stopped answering: its view is no longer current
+        since = iso_epoch(stream_time(st.get("live_since")))
+        if since is None or since > fetched:
+            return False  # attached after the read: what came between is not known (no replay)
+        if self.streams_event_at.get(e["key"], float("-inf")) > fetched:
+            return False  # an event after the last read: its nudge has not been read yet (NUDGE_MIN)
+        began = e.get("waitBegan")
+        return not (isinstance(began, (int, float)) and began > fetched)  # a new wait is read once
+
+    def streams_view(self) -> dict:
+        return {**self.streams_status, "saved": self.streams_saved, "nudges": self.streams_nudges,
+                "backstop": EVENT_BACKSTOP}
 
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the
@@ -28608,6 +28741,19 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
         time.sleep(min(WAIT_POLL, max(0.1, leash.left())))
 
 
+def streams_line(st: dict) -> str:
+    """`budget`'s line for the event streams (EVENT_STREAMS)."""
+    state = st.get("state")
+    if state == "ok":
+        return (f"event streams: {st.get('live', 0)}/{st.get('named', 0)} waited PRs live, {st.get('saved', 0)} reads "
+                f"saved (backstop {st.get('backstop')}s), {st.get('nudges', 0)} event nudges")
+    if state == "disabled":
+        return "event streams: off here (GLAEDA_GH_STREAMS=off or streams false); polling"
+    if state in {"off", "absent", "down", "error"}:
+        return f"event streams: {state} ({st.get('why')}); polling"
+    return "event streams: starting"
+
+
 def controller_line(ctl: dict) -> str:
     state = ctl.get("state")
     scope = "" if ctl.get("token") else ", public repos only (no token)"
@@ -29621,6 +29767,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
+        streams = status.get("streams")
+        if isinstance(streams, dict):
+            print(streams_line(streams))
         fell_back = controller_fallback_line(read_json(BASE / CONTROLLER_FALLBACK_FILE))
         if fell_back:
             print(fell_back)

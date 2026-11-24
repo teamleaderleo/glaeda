@@ -54,6 +54,7 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+gg.EVENT_STREAMS = False  # a test's FakeController keeps no streams; StreamsTest turns them on
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
 LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
 LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
@@ -1936,6 +1937,103 @@ class ControllerTest(Base):
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+class StreamsTest(Base):
+    """GitHub Event Streams through the controller (cmuxterm-hq#24703; Leo, 2026-11-24: "4. event streams. let's all
+    go look into these and gogog"). A settled, waited PR whose stream is live drops from the cycle to EVENT_BACKSTOP, a
+    stream event reads it at once, and an old controller (404, 400, another version) changes nothing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = FakeController()
+        self.asked: list[str] = []
+        self.answer = lambda path: {"v": 1, "enabled": True, "prs": {"o/r#1": self.status}, "stats": {"live": 1}}
+        self.status = {"live": True, "live_since": "2000-01-01T00:00:00.123456789Z", "events": 0}
+
+        def get(path: str, timeout: float | None = None) -> dict:
+            self.asked.append(path)
+            self.ctl.fail()
+            return self.answer(path)
+
+        self.ctl.get = get
+        streams, gg.EVENT_STREAMS = gg.EVENT_STREAMS, True
+        self.addCleanup(setattr, gg, "EVENT_STREAMS", streams)
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("ci")])
+
+    def pr_reads(self) -> int:
+        return sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])
+
+    def wait_ticks(self, n: int, start: float = NOW, every: float = gg.CYCLE, between=None) -> None:
+        for i in range(n):
+            at = start + i * every
+            gg.register("pr:o/r#1", waited=True)
+            path = gg.watch_dir() / gg.file_name("pr:o/r#1")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": at, "waitBegan": NOW - 5})
+            if between:
+                between(i)
+            self.daemon.tick(at)
+
+    def test_old_controllers_and_streams_off_keep_polling(self) -> None:
+        def old(code: int):
+            def answer(path: str) -> dict:
+                raise gg.NoReceiver(f"controller HTTP {code}") if code == 404 else gg.WatchError(f"controller HTTP {code}")
+            return answer
+        for answer in (old(404), old(400), lambda p: {"v": 2, "enabled": True}, lambda p: {"v": 1, "enabled": False,
+                                                                                            "why": "403 not enabled"}):
+            with self.subTest(answer=answer):
+                self.answer, before = answer, self.pr_reads()
+                self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+                self.wait_ticks(6)
+                self.assertEqual(self.pr_reads() - before, 6)  # every cycle, as without streams
+                self.assertNotEqual(self.daemon.streams_status["state"], "ok")
+                asked = len(self.asked)
+                self.wait_ticks(3, start=NOW + 6 * gg.CYCLE)
+                self.assertEqual(len(self.asked), asked, "asked again only after STREAMS_RETRY")
+
+    def test_a_live_stream_lets_a_settled_pr_wait_for_the_backstop(self) -> None:
+        self.wait_ticks(10)  # 10 cycles
+        self.assertLessEqual(self.pr_reads(), 3)  # the first read, then about every EVENT_BACKSTOP
+        self.assertGreaterEqual(self.daemon.streams_saved, 5)
+        self.assertIn("v=1&want=o/r:1", self.asked[0])
+        self.assertIn("live", gg.streams_line(self.daemon.streams_view()))
+
+    def test_a_stream_event_reads_the_pr_at_once(self) -> None:
+        self.wait_ticks(2)
+        reads = self.pr_reads()
+
+        def event(i: int) -> None:
+            if i == 1:
+                self.status = {**self.status, "events": 1}
+        self.wait_ticks(3, start=NOW + 2 * gg.CYCLE, between=event)
+        self.assertEqual(self.pr_reads(), reads + 1)  # the event's nudge, not the backstop
+        self.assertEqual(self.daemon.streams_nudges, 1)
+
+    def test_a_running_check_or_a_stream_opened_after_the_read_keeps_the_cycle(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("ci", "IN_PROGRESS", None)])
+        self.wait_ticks(5)
+        self.assertEqual(self.pr_reads(), 5)  # commit statuses and running check runs send no stream event
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[check_run("ci")])
+        self.status = {**self.status, "live_since": gg.dt.datetime.fromtimestamp(NOW + 10 * gg.CYCLE, gg.dt.timezone.utc)
+                       .isoformat().replace("+00:00", "Z")}
+        self.wait_ticks(4, start=NOW + 5 * gg.CYCLE)
+        self.assertEqual(self.pr_reads(), 9)  # no replay: what came before the stream opened is not known
+
+    def test_off_by_env_asks_nothing(self) -> None:
+        os.environ["GLAEDA_GH_STREAMS"] = "off"
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_STREAMS", None)
+        self.wait_ticks(4)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.pr_reads(), 4)
+        self.assertIn("off here", gg.streams_line(self.daemon.streams_view()))
+
+    def test_events_settled(self) -> None:
+        self.assertTrue(gg.events_settled({"mergeable": "MERGEABLE", "checks": [{"status": "COMPLETED"}]}))
+        self.assertFalse(gg.events_settled({"mergeable": "UNKNOWN", "checks": []}))
+        self.assertFalse(gg.events_settled({"mergeable": "MERGEABLE", "checks": [{"status": "QUEUED"}]}))
+        self.assertFalse(gg.events_settled({"mergeable": "MERGEABLE", "checks": [], "checksTruncated": True}))
+        self.assertFalse(gg.events_settled({"mergeable": "MERGEABLE", "checks": [], "requiredMissing": ["ci"]}))
 
 
 class GraphqlDietTest(Base):
@@ -9203,6 +9301,7 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+gg.EVENT_STREAMS = False
 gg.BASE = Path(sys.argv[3])
 gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
 gg.LANE_VM_NAME_FILE = Path(sys.argv[3]) / "no-lane-vm-name"
