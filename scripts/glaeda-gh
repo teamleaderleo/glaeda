@@ -168,9 +168,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   of waits on it: a REST read of a commit, a pull or a run's job list serves every watch on it (repo_parts). daemon.json's spendBy holds the hour's top routes and callers,
   which `budget` prints and the fleet's quota readers (gh_quota.py spenders, ci-dash) can read with no API call.
 - Alarms, before the pool is empty rather than after. The pool alarm (policy "alarms": {"pool": true}, on one
-  host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000), its
-  drain over the last minutes runs it dry before its reset, or that drain is past alarms.paceShare (0.5) of the
-  hourly limit (42 a minute of 5000); it names the host's top REST callers (gh-quota usage) as well as this
+  host: the pool is the account's) fires when the poorest REST counter is under the REST reserve, or its drain
+  over the last minutes runs it dry at least 5 minutes before its reset (ALARM_DRY_MARGIN); a pool on track to its
+  reset is no alarm, however low its count (alarms.restLeft) or fast its drain (past alarms.paceShare, 0.5, of the
+  hourly limit, which the alarm names); it names the host's top REST callers (gh-quota usage) as well as this
   daemon's routes and their waiters. The share alarm (every host) when this daemon's own counted REST over
   the measured last hour is past its cap while the login's REST pool is under its floor (floors.rest), naming
   the one caller to slow (the host's top gh caller, or the daemon's top waiter); past the cap with the pool
@@ -470,10 +471,18 @@ NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
 ALARM_EVERY = 3600.0
 SHARE_ALARM_FLOOR = 50  # counted REST an hour under which the share alarm stays quiet, whatever the cap (a cap of 0: its exempt reads)
-ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the poorest core counter
+ALARM_REST_LEFT = 1000  # policy alarms.restLeft, kept readable; no alarm on a count alone (ALARM_DRY_MARGIN)
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
 ALARM_FIRE_WITHIN = 600.0  # a pool projected empty within this, or under the REST reserve, is a FIRE
+# On track: a pool projected dry less than this before its reset lasts to it, so it is no alarm at all (Leo,
+# 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool: 587 left, draining 112.6/min ..., dry at
+# 12:28Z, resets 12:29Z.": "ok... if it's right on track, why is it even firing? dont fire for bullshit"). The same
+# 5 minutes as cmuxterm-hq quota_outage.py's LOW rule. A low count (restLeft) or a fast pace (paceShare) alone is no
+# alarm either: reads ask the Apps first (land-judge, glaeda, ci-watch, quota-goblin), so the login's count is not the
+# fleet's (12:26Z: "you guys can simply have that stuff route to quota-goblin-9000 or quota-goblin-9001, so it's not
+# actually 12.5k. it's crying wolf for obsolete views."). The pace is still named in an alarm the projection sends.
+ALARM_DRY_MARGIN = 300.0
 # The pace alarm: the pool draining faster than this share of its hourly limit (policy alarms.paceShare). Half of
 # 5000 is 42 a minute. On 2026-11-10 (11:23Z) the pool drained at 158 a minute and the alarm said so only once it
 # projected dry 25 minutes out; at half the limit there is still an hour's room to find the caller.
@@ -916,6 +925,17 @@ CONSUMER_WINDOW = 3600
 # also charged to its consumer's cap. huge-blue 2026-11-20 14:2xZ: share 137 of 150, GraphQL 0 left, the account 2129
 # REST left, and a merge-hold head stayed "unread (not read yet)" until the hour turned.
 HEAD_DIRECT_MAX = 60
+# A head asked after a tick's due phase (`glaeda-gh checks` on a new SHA: a merge gate's bounded wait) is read between
+# that tick's read batches, not at the next tick's due phase. cosmic-gray, 2026-11-23 23:17-23:49Z: ticks ran 1.5-5 min
+# (PR reads took 483 of 614 s), the lane-gh broker's land waits 20 s for an unread head (next_autoland
+# CACHED_WEBVIEW_WAIT_S) after its 45 s live read, and fs-agent-lane-18's lands of cmux#52295, #52646, #52773 and
+# #52296 were refused six times "glaeda-gh holds no checks for SHA (not read yet)": 93e83cd2 was asked at 23:37:35Z
+# and read at 23:41:22Z, at the next tick. Looked for every HEADS_BETWEEN_EVERY s, at most one GraphQL batch or
+# HEADS_BETWEEN_REST REST heads a look and HEADS_BETWEEN_TICK_MAX a tick, newest ask first, so a flood of asks (the
+# land queue's, glaeda#2489) keeps its turn at the tick's due phase and never takes the tick from the waited PRs.
+HEADS_BETWEEN_EVERY = 5.0
+HEADS_BETWEEN_REST = 2
+HEADS_BETWEEN_TICK_MAX = 21
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
 CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
 CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
@@ -2082,23 +2102,54 @@ def touch_interest(key: str) -> None:
         pass
 
 
+def stable_replace(path: Path, data: bytes, keep_mode: bool = False) -> None:
+    """Replace PATH with DATA through one temp name per target, `.NAME.tmp` beside it, never a PID, time or random
+    suffix. macOS fseventsd keeps a record of every distinct path it has seen until reboot: a new temp name per write
+    (`.NAME.PID.NS.tmp`) made each cache, watch and answer write a new path, and on cosmic-gray (2026-11-24) the cache
+    was among the top makers of new paths while fseventsd held a 31 GB footprint. Writers in one folder take turns on a
+    flock of the folder itself (no lock file, so no extra path) from opening the temp to renaming it, so two never
+    share it. The temp is opened O_NOFOLLOW and must be a plain file with one link (a planted link is removed, never
+    written through). Created 0600; with KEEP_MODE it takes the target's own mode (a replace with the umask's mode
+    turned a 0600 file into 0644: leo-workspace#5398's BLOCK). A write cut off (a full disk, a deadline's exception)
+    removes its temp: huge-blue's cache held dozens of zero-byte temps, some days old (2026-11-11)."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    folder = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fcntl.flock(folder, fcntl.LOCK_EX)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                os.close(fd)
+                os.unlink(tmp)
+                fd = os.open(tmp, flags | os.O_EXCL, 0o600)
+            try:
+                os.ftruncate(fd, 0)
+                mode = 0o600
+                if keep_mode:
+                    with contextlib.suppress(FileNotFoundError):
+                        mode = stat.S_IMODE(os.stat(path).st_mode)
+                os.fchmod(fd, mode)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(folder, fcntl.LOCK_UN)
+        os.close(folder)
+
+
 def write_json(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    try:
-        # Created 0600, then given the target's own mode: a replace with the umask's mode turned a 0600 file into
-        # 0644 (leo-workspace#5398's BLOCK). A new file stays 0600.
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
-            with contextlib.suppress(FileNotFoundError):
-                os.fchmod(handle.fileno(), stat.S_IMODE(os.stat(path).st_mode))
-            handle.write(json.dumps(doc, sort_keys=True) + "\n")
-        os.replace(tmp, path)
-    except BaseException:
-        # A write cut off (a full disk, or a deadline's exception raised into it) left its empty temporary file behind
-        # for good: huge-blue's cache held dozens of zero-byte .budget.json.*.tmp files, some days old (2026-11-11).
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    stable_replace(path, (json.dumps(doc, sort_keys=True) + "\n").encode(), keep_mode=True)
 
 
 def read_json(path: Path) -> Any:
@@ -2198,6 +2249,21 @@ def register(key: str, jobs: bool = False, consumer: str | None = None, waited: 
     # losing a concurrent registration costs one watch, and waiting costs the gh call.
     with bounded_lock(watch_dir() / ".register.lock"):
         _register_locked(path, key, jobs, consumer, waited, began, reader, at or {}, once)
+
+
+def watch_entry(key: str, doc: dict, cached: dict | None, touched: float) -> dict:
+    """The daemon's entry for one watch file's DOC (Daemon.watches, Daemon.heads_between): its key, cached answer,
+    last interest (TOUCHED), wait, readers and consumers."""
+    asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
+    waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
+    began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
+    since = doc.get("since")
+    since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+    return {"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": touched,
+            "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
+            "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
+            "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))},
+            "since": since}
 
 
 def stamp_at(now: float, given: Any, prior: Any = None) -> float:
@@ -3559,6 +3625,38 @@ APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App
 APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
 APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
 
+# Comments on a POOL of poster Apps (Leo, 2026-11-24: "but i already have github apps made. quota-goblin... etc. well,
+# maybe we can make one specifically for posting as 'me' or whatever."; 2026-11-23: "you cannot wait. this is not a
+# solution. simply make more apps."). Almost every write left as the one shared login, so GitHub's secondary
+# content-creation limit paced them for minutes (cosmic-gray, 24 h: 113 comments p50 423 s, p90 1727 s, max 2523 s from
+# queue to delivery). Each outbox turn asks `gh_app_token.py broker-actor post REPO --skip ROLES` for the first poster
+# App (gh-app-roles.json "posters") that is installed, has a token here and is not resting; ROLES are the posters this
+# daemon holds for their own throttle (app_create_hold). A throttle holds THAT App alone, for its Retry-After, and the
+# next turn picks the next one; the login makes the comment only when no poster is free. Stays on the login: reviews,
+# status-key comments, anything with GH_TOKEN set, and the comments a reader interprets by author (a risk receipt, a
+# `<!--` marker, a `/command`, an `owner:` claim) until GLAEDA_APP_POST_RECEIPTS=1 (set once every reader accepts the
+# App bots). GLAEDA_APP_POSTS=0 turns the pool off. A post that left an App and lost its answer is looked up (post_find),
+# never sent again on another identity before the look.
+APP_POSTS_ENV = "GLAEDA_APP_POSTS"
+APP_POST_RECEIPTS_ENV = "GLAEDA_APP_POST_RECEIPTS"
+APP_POST_REFUSED_HOLD = 600.0  # a poster App's refusal that is no throttle (its credential, its install) rests it this long
+APP_POST_NONE_TTL = 10.0  # seconds "no poster is free" is reused: a poster that rests ends it sooner than APP_ACTOR_TTL
+APP_POST_ROLE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+APP_AUTHOR_INTERPRETED = re.compile(r"<!--|^\s*(?:/|owner:)", re.M | re.I)
+
+
+APP_NON_POSTER_ROLES = frozenset(APP_CREATE_ROLE.values()) | {"review"}  # Apps of another purpose, never the pool's
+
+
+def app_posts_on(env: Any = None) -> bool:
+    """Whether comments may go on the poster App pool here (APP_POSTS_ENV, on unless it is "0")."""
+    return str((os.environ if env is None else env).get(APP_POSTS_ENV, "1")).strip() != "0"
+
+
+def app_post_receipts_on(env: Any = None) -> bool:
+    """Whether author-interpreted comments (receipts, markers, commands, claims) may go on the pool too."""
+    return str((os.environ if env is None else env).get(APP_POST_RECEIPTS_ENV, "0")).strip() == "1"
+
 
 def app_creates_on(env: Any = None) -> bool:
     """Whether creates may go on the App of their purpose here (APP_CREATES_ENV, on unless it is "0")."""
@@ -4198,6 +4296,52 @@ DIRECT_GET_SHARE = 25.0
 DIRECT_GET_RETRY_MIN = 5.0
 
 
+# The broker's refusal of a read for the read Apps' reserve ("read Apps busy ... at its reserve", lane-gh's floor and
+# lane share, "busy: N GitHub reads already in flight") holds every direct read on this host, a waiter's, a land
+# worker's or `status`'s (one file, so every process sees it), for the wait it names (or DIRECT_BUSY_HOLD), doubling per
+# refusal in a row up to DIRECT_BUSY_HOLD_MAX; any answer ends it. Before, each of a VM's waits and land entries asked
+# again every few seconds through a refused window (:20-:52 of every hour; a lane VM's ledger 2026-11-23 23:50Z-00:30Z:
+# 540 refused asks against 22 sent), each ask a lane-gh process and each full read's first GETs (the pull, the issue)
+# paid before a later one was refused, then read again whole when the window opened: every VM at the same minute, the
+# reserve drained by the backlog (rest_breakdown of manaflow-ai/cmux, 2026-11-23 23:00Z-01:00Z: glaeda-upstream 4,963
+# App requests an hour, the fleet's largest caller).
+DIRECT_BUSY_FILE = "direct-busy.json"  # under BASE: {"until": t, "n": refusals in a row}
+DIRECT_BUSY_HOLD = 60.0
+DIRECT_BUSY_HOLD_MAX = 300.0
+DIRECT_BUSY_RE = re.compile(r"read Apps busy|at its reserve|reads already in flight|lane share|read floor|\bfloor\b",
+                            re.IGNORECASE)
+DIRECT_BUSY_WAIT_RE = re.compile(r"retry after (\d+)\s*s", re.IGNORECASE)
+
+
+def direct_busy_until(now: float) -> float | None:
+    """When the hold on this host's direct reads ends (DIRECT_BUSY_FILE), or None: none, or past."""
+    doc = read_json(BASE / DIRECT_BUSY_FILE)
+    until = doc.get("until") if isinstance(doc, dict) else None
+    return float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now else None
+
+
+def direct_busy_note(text: str | None, now: float) -> None:
+    """Record one direct GET's outcome: a refusal (TEXT names the reserve) starts or doubles the hold, an answer
+    (TEXT None) ends it. Best effort: a lost write costs a read."""
+    try:
+        doc = read_json(BASE / DIRECT_BUSY_FILE)
+        doc = doc if isinstance(doc, dict) else {}
+        if text is None:
+            if doc:
+                write_json(BASE / DIRECT_BUSY_FILE, {})
+            return
+        if not DIRECT_BUSY_RE.search(text):
+            return
+        if float(doc.get("until") or 0) > now:
+            return  # one outage, counted once: reads started before the hold was set
+        n = int(doc.get("n") or 0) + 1 if now - float(doc.get("until") or 0) < DIRECT_BUSY_HOLD_MAX else 1
+        said = DIRECT_BUSY_WAIT_RE.search(text)
+        hold = min(DIRECT_BUSY_HOLD_MAX, max(float(said.group(1)) if said else 0.0, DIRECT_BUSY_HOLD * 2 ** (n - 1)))
+        write_json(BASE / DIRECT_BUSY_FILE, {"until": now + hold, "n": n, "why": text[:160]})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def broker_transport(command: list[str], deadline: Callable[[], float]) -> Callable:
     """A Daemon transport for an upstream host's direct read: each GET of /repos/OWNER/REPO/PATH goes to COMMAND
     (direct_command) as `OWNER/REPO -` with {"path", "query"} on stdin, within what is left of DEADLINE (a
@@ -4214,6 +4358,10 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
                                                    f"not {method} {parts.path}"}).encode()
         args = {"path": urllib.parse.unquote(m.group(2)),
                 "query": dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))}
+        held = direct_busy_until(time.time())
+        if held is not None:
+            # a refusal for the reserve holds every direct read here (DIRECT_BUSY_FILE): nothing is run or sent
+            raise WatchError(f"direct: busy: the read Apps are at their reserve; held {int(held - time.time())}s more")
         for attempt in range(2):
             left = min(UPSTREAM_DEADLINE, deadline() - time.monotonic())
             if left <= 0:
@@ -4241,8 +4389,14 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
         status = answer.get("status")
         if not isinstance(status, int) or isinstance(status, bool):
             why = answer.get("error") if isinstance(answer.get("error"), str) else "no GitHub status"
+            direct_busy_note(why, time.time())
             return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
-        return status, {}, json.dumps(answer.get("data")).encode()
+        data = answer.get("data")
+        if status == 403 and isinstance(data, dict) and isinstance(data.get("message"), str):
+            direct_busy_note(data["message"], time.time())
+        elif status < 400:
+            direct_busy_note(None, time.time())
+        return status, {}, json.dumps(data).encode()
     return send
 
 
@@ -5313,16 +5467,11 @@ def attempt_jobs_put(repo: str, run_id: int, attempt: int, jobs: list[dict]) -> 
     """Keep that completed attempt's job list, replaced whole, then evict past the cap. Never raises: a full disk
     only means the next read asks GitHub."""
     path = attempt_jobs_path(repo, run_id, attempt)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
-                                              "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
-        os.replace(tmp, path)
+        stable_replace(path, gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
+                                                       "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
     except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
         return
     kept_evict(BASE / ATTEMPT_JOBS_DIR, ".json.gz", ATTEMPT_JOBS_MAX_BYTES)
 
@@ -5778,6 +5927,7 @@ class Daemon:
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
         self.reads_protection = True
+        self.rules_ttl = REST_REPO_PART_TTL  # a direct read through the broker keeps a base's rulesets longer
         # False for that read too: the broker answers no ETag (broker_transport), so an issues/N read can never vouch
         # for a kept pull (rest_pull's 304 probe) and is not sent (DIRECT_PARTS says what that read cost).
         self.etags = True
@@ -5991,6 +6141,10 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.heads_between_since = float("inf")  # wall time of this tick's watch read: later asks are read between
+        self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
+        self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
+        self.heads_between_read = 0  # heads a look sent this tick (HEADS_BETWEEN_TICK_MAX)
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
         self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
@@ -6268,7 +6422,7 @@ class Daemon:
             rate = (first[1] - remaining) / (at - first[0])  # per second
             out["perMinute"] = round(rate * 60, 1)
             dry = at + remaining / rate
-            if dry < reset:
+            if dry <= reset - ALARM_DRY_MARGIN:  # dry later than that lasts to the reset: on track (ALARM_DRY_MARGIN)
                 out["dryAt"] = dry
         return out
 
@@ -6583,14 +6737,13 @@ class Daemon:
             held.add("pool")  # its window is about to reset: no news either way
         if policy.get("pool") and pool is not None and pool["reset"] - self.now > 60:
             left, reset = pool["remaining"], pool["reset"]
-            low = left < policy.get("restLeft", ALARM_REST_LEFT)
             limit = (self.budget.get("rest") or {}).get("limit") or 5000
             share = policy.get("paceShare", ALARM_PACE_SHARE)
             fast = isinstance(share, (int, float)) and share > 0 and pool["perMinute"] is not None \
                 and pool["perMinute"] * 60 >= share * limit
-            if low or fast or pool["dryAt"] is not None:
-                fire = left < self.policy["floors"]["rest"][1] or (
-                    pool["dryAt"] is not None and pool["dryAt"] - self.now < ALARM_FIRE_WITHIN)
+            reserve = left < self.policy["floors"]["rest"][1]
+            if reserve or pool["dryAt"] is not None:  # on track to its reset is no alarm (ALARM_DRY_MARGIN)
+                fire = reserve or (pool["dryAt"] is not None and pool["dryAt"] - self.now < ALARM_FIRE_WITHIN)
                 pace = f", draining {pool['perMinute']}/min" if pool["perMinute"] else ""
                 if fast:
                     pace += f" (past {share:.0%} of its {limit} an hour, {share * limit / 60:.0f}/min)"
@@ -7426,6 +7579,78 @@ class Daemon:
             return False
         return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
 
+    def poster_due(self, item: dict) -> bool:
+        """Whether ITEM is a comment that may go on the poster App pool (APP_POSTS_ENV): not a status-key edit, not
+        under a GH_TOKEN or an upstream, not a comment a reader interprets by its author (APP_POST_RECEIPTS_ENV)."""
+        if (item.get("kind") != "comment" or not app_posts_on() or item.get("appPosts") is False or item.get("status")
+                or item.get("delivered") or item.get("reviewers") or self.upstream() is not None
+                or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+            return False
+        body = str(item.get("body") or "")
+        if not app_post_receipts_on() and (RISK_RECEIPT.search(body) or APP_AUTHOR_INTERPRETED.search(body)):
+            return False
+        saved = item.get("appWriter")
+        if saved is None:
+            return not (item.get("uncertain") or item.get("attempts"))  # a first send the login attempted stays its own
+        return saved not in APP_NON_POSTER_ROLES
+
+    def poster_actor(self, item: dict) -> dict | None:
+        """The poster App for ITEM's next send: the first one broker-actor answers that this daemon does not hold
+        (app_create_hold). A comment that already left an App and lost its answer asks the pool again (post_one looks
+        it up before any send). None: no poster is free (or none installed: an older gh_app_token.py), the login's
+        turn. No token goes in the outbox."""
+        if not self.poster_due(item):
+            return None
+        tool = app_pool_tool()
+        if not tool:
+            return None
+        skip = tuple(sorted(r for r, t in self.app_create_hold.items() if t > self.clock()))
+        key = ("post", str(item["repo"]).lower(), skip)
+        cached = self.app_actors.get(key)
+        if cached is not None and self.clock() - cached[0] < (APP_ACTOR_TTL if cached[1] else APP_POST_NONE_TTL):
+            return cached[1]
+        argv = [sys.executable, "-I", str(tool), "broker-actor", "post", item["repo"]]
+        if skip:
+            argv += ["--skip", ",".join(skip)]
+        actor = None
+        try:
+            result = run_bounded(argv, timeout=12)
+            found = json.loads(result.stdout) if not result.returncode else None
+            if isinstance(found, dict) and isinstance(found.get("role"), str) and found["role"] not in skip and \
+                    found["role"] not in APP_NON_POSTER_ROLES and APP_POST_ROLE.fullmatch(found["role"]) and \
+                    isinstance(found.get("note", ""), str) and \
+                    re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
+                actor = {**found, "note": found.get("note") or ""}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        self.app_actors[key] = (self.clock(), actor)
+        return actor
+
+    def app_hold_wait(self, h: dict, default: float) -> float:
+        """Seconds a refusal's headers say to wait (Retry-After, or the reset of a spent counter), else DEFAULT."""
+        try:
+            wait = (retry_after_seconds(h["retry-after"]) or 0.0) if h.get("retry-after") else (
+                float(h.get("x-ratelimit-reset", 0)) - self.now if h.get("x-ratelimit-remaining") == "0" else 0.0)
+        except ValueError:
+            wait = 0.0
+        return default if math.isnan(wait) or wait <= 0 else min(wait, PACE_HOLD_MAX)
+
+    def poster_refused(self, path: Path, item: dict, role: str, status: int, h: dict, text: str) -> None:
+        """A poster App's comment GitHub refused before making anything: that App alone rests (its Retry-After for a
+        throttle, APP_POST_REFUSED_HOLD for a credential or an install it lacks) and the comment keeps its turn: the
+        next outbox turn asks for the next poster, the login only when none is free. Neither the item's notBefore nor
+        the login's hold or pause is set."""
+        throttled = status == 429 or bool(h.get("retry-after")) or h.get("x-ratelimit-remaining") == "0" \
+            or bool(THROTTLED.search(text))
+        wait = self.app_hold_wait(h, POST_BACKOFF) if throttled else APP_POST_REFUSED_HOLD
+        self.app_create_hold[role] = max(self.app_create_hold.get(role, 0.0), self.clock() + wait)
+        item.pop("appWriter", None)  # nothing was made: the next identity may make it
+        item["posterRefused"] = sorted({*item.get("posterRefused", ()), role})
+        self.app_actors.clear()
+        write_json(path, item)
+        log({"event": "post-app-refused", "id": item["id"], "role": role, "status": status, "throttled": throttled,
+             "wait": round(self.app_create_hold[role] - self.clock()), "pool": True})
+
     def outbox_actor(self, item: dict) -> dict | None:
         """Pick the installed writer on the same host as the login. No token goes in the outbox."""
         op = {"pr": "create", "comment": "comment", "issue": "issue"}.get(item.get("kind"))
@@ -7506,10 +7731,9 @@ class Daemon:
         out its own retry is skipped."""
         self.post_tried = self.now
         self.adopt_pace_hold()
-        if self.clock() < self.secondary_until:
-            return  # a read met the secondary limit: writes wait it out too, as one account's
-        if self.now < self.post_at + POST_SPACING:
-            return
+        # A read's secondary limit on the LOGIN, or its spacing, holds the login's writes alone: a write on an App is
+        # another identity's and goes on (the pool exists so that no write waits on one identity's cooldown).
+        login_held = self.clock() < self.secondary_until or self.now < self.post_at + POST_SPACING
         paused = None  # the login's create pause, asked once and only when a write is due (login_create_paused)
         for path, item in self.retire_superseded(outbox_queue()):
             if not isinstance(item, dict) or item.get("id") != path.stem:
@@ -7521,14 +7745,22 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
-            paused = self.login_create_paused() if paused is None else paused
-            if paused:
+            actor = self.poster_actor(item)
+            if actor:
+                pass  # a poster App: no pause, hold or spacing of the login's applies
+            elif login_held:
+                actor = self.outbox_actor(item)  # another App's write (a create on its purpose's App) goes on, too
+                if not actor:
+                    continue
+            elif self.login_create_paused() if paused is None else paused:
+                paused = True
                 # The login's create pause holds the login's writes and the review App's comments. A create goes on the
                 # App of its purpose meanwhile (app_create_due), so it never waits on the login's pause.
                 actor = self.outbox_actor(item) if self.app_create_due(item) else None
                 if not actor:
                     continue  # the login's write waits out its pause; a create behind it may still go on its App
             else:
+                paused = False
                 actor = self.outbox_actor(item)
             if item.get("appWriter") and not actor and not item.get("delivered"):
                 continue  # never replay an App-authored POST with the login
@@ -7536,6 +7768,7 @@ class Daemon:
             if not actor and not broker and self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
                 continue
             self.writing = True
+            logged_at = self.post_at
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
                     self.post_one(path, item, actor)
@@ -7545,6 +7778,8 @@ class Daemon:
                 self.post_finish(path, item, error=f"bad queue entry: {describe(error)} at {error_site(error)}")
             finally:
                 self.writing = False
+                if actor and actor.get("role") not in APP_NON_POSTER_ROLES:
+                    self.post_at = logged_at  # a poster's write spaces nothing of the login's
             return
 
     def post_due(self) -> None:
@@ -7586,6 +7821,7 @@ class Daemon:
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
         finally:
             self.now = tick_now
+        self.heads_between()
 
     def content_pause_until(self) -> float:
         """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. The ask runs on its
@@ -7830,6 +8066,11 @@ class Daemon:
             if item["kind"] == "comment":
                 self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
+        elif actor and item["kind"] == "comment" and actor.get("role") not in APP_NON_POSTER_ROLES and (
+                status in (401, 403, 429) or (status == 422 and THROTTLED.search(text))) \
+                and not (status == 403 and not (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0"
+                                                or THROTTLED.search(text)) and "locked" in text.lower()):
+            self.poster_refused(path, item, actor["role"], status, h, text)
         elif actor and item["kind"] in APP_CREATE_OP and (status in (401, 403, 404, 429) or (
                 status == 422 and THROTTLED.search(text))):
             self.app_create_refused(path, item, actor["role"], status, h, text)
@@ -7987,8 +8228,8 @@ class Daemon:
     def outbox_request(self, method: str, api: str, body: dict | None, actor: dict | None):
         if not actor:
             return self.request(method, api, body, content=method != "GET")
-        if time.monotonic() >= self.tick_deadline or not self.secondary_admit("rest", 1):
-            raise OutOfTime
+        if time.monotonic() >= self.tick_deadline:
+            raise OutOfTime  # the login's secondary hold (secondary_admit) is not an App's: it never stops its request
         headers = {"Authorization": "Bearer " + actor["token"], "Accept": "application/vnd.github+json",
                    "Content-Type": "application/json", "User-Agent": "glaeda-gh", "X-GitHub-Api-Version": "2022-11-28"}
         status, h, raw = self.transport(method, API + api, headers, json.dumps(body).encode() if body is not None else None)
@@ -8387,16 +8628,7 @@ class Daemon:
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
-            asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
-            waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
-            began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
-            since = doc.get("since")
-            since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
-            entry = {"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
-                     "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
-                     "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
-                     "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))},
-                     "since": since}
+            entry = watch_entry(key, doc, cached, self.now - age)
             if self.once_answered(entry) and self.make_dormant(path, doc, self.now - age):
                 continue
             out.append(entry)
@@ -8592,6 +8824,81 @@ class Daemon:
         if not e["key"].startswith("head:") or (e.get("cache") or {}).get("data"):
             return False
         return any(self.now - t < HEAD_INTEREST for t in (e.get("consumers") or {}).values())
+
+    def heads_between(self) -> None:
+        """Read the heads asked since this tick read its watches that hold no answer, between the tick's read batches
+        (batched, the REST loop and post_between call it), at most every HEADS_BETWEEN_EVERY s: one GraphQL batch, or
+        HEADS_BETWEEN_REST heads over REST, newest ask first. A long tick (minutes, behind a PR backlog) otherwise left
+        a `glaeda-gh checks --wait` on a new head unread until the next tick, past any merge gate's bounded wait. Each
+        is charged as at the due phase (due_heads: the consumer's cap, the mode; a head the due phase already tried
+        this tick waits its retry), and what GraphQL spills is deferred, first next tick. Never raises."""
+        if (self.heads_between_busy or threading.get_ident() != self.tick_thread
+                or self.heads_between_read >= HEADS_BETWEEN_TICK_MAX):
+            return
+        if time.monotonic() - self.heads_between_at < HEADS_BETWEEN_EVERY:
+            return
+        self.heads_between_at = time.monotonic()
+        self.heads_between_busy = True
+        try:
+            self.read_heads_between()
+        except OutOfTime:
+            pass  # the tick's own budget ran out: the tick's next read stops it too
+        except Exception as error:  # noqa: BLE001  a look must never fail the read it sits between
+            self.errors.append(f"heads between reads: {describe(error)} at {error_site(error)}")
+        finally:
+            self.heads_between_busy = False
+
+    def read_heads_between(self) -> None:
+        since = self.heads_between_since
+        asked = []
+        for path in watch_dir().glob("*.json") if watch_dir().is_dir() else []:
+            try:
+                touched = path.stat().st_mtime
+            except OSError:
+                continue
+            if touched < since:
+                continue
+            doc = read_json(path)
+            key = doc.get("key") if isinstance(doc, dict) else None
+            if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
+                continue
+            e = watch_entry(key, doc, read_cache(key), touched)
+            if self.head_unanswered(e):
+                asked.append(e)
+        if not asked:
+            return
+        asked.sort(key=self.head_rank)
+        path = self.paths.get("head") or "graphql"
+        mode = self.mode(path)
+        if self.app_entries_eligible("head", asked, path):
+            mode = "normal"
+        if mode == "stop":
+            due, path = self.due_heads_direct(asked), "rest"
+        else:
+            due = self.due_heads(asked, mode, rest=path == "rest")
+        if not due:
+            return
+        size = max(1, self.batch.get("head") or 1) if path == "graphql" else HEADS_BETWEEN_REST
+        size = min(size, HEADS_BETWEEN_TICK_MAX - self.heads_between_read)
+        due, later = due[:size], due[size:]
+        self.heads_between_read += len(due)
+        for e in later:  # not read now: not charged, and the next look or the next tick's due phase takes it
+            self.refund(e["key"])
+            self.attempted.pop(e["key"], None)
+        # (no phase of its own: the time goes to the read phase it sits in, never counted twice)
+        if path == "graphql":
+            self.defer(self.batched("head", due, self.graphql_fetch["head"]))
+            return
+        for i, e in enumerate(due):
+            try:
+                with self.calling(*caller_of(e["key"]), waiter_of(e)):
+                    self.fetch_head_rest(e)
+            except OutOfTime:
+                self.defer(due[i:])
+                raise
+            except Exception as error:  # noqa: BLE001
+                self.refund(e["key"])
+                self.errors.append(f"{e['key']}: {describe(error)}")
 
     def fed(self, key: str) -> bool:
         """Whether the controller's webhooks cover this key's repository now: its feed answered within
@@ -8953,6 +9260,8 @@ class Daemon:
                 self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
+        self.heads_between_since = time.time()  # (wall time: a watch file's mtime is when it was asked)
+        self.heads_between_read = 0
         with self.phase("watches"):
             entries = self.watches()
         self.adopt_pace_hold()
@@ -9055,6 +9364,8 @@ class Daemon:
         asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
+                if not e["key"].startswith("head:"):
+                    self.heads_between()  # a head asked meanwhile is read before this one, not next tick
                 if e["key"].startswith("head:") and time.monotonic() >= head_until and i < last_waited \
                         and (asked_read or not self.head_unanswered(e)):
                     self.defer([e], "the heads' share of the tick, waited PRs still to read")
@@ -9384,7 +9695,10 @@ class Daemon:
         if q is None:
             return False
         q.reap()
-        return bool(q.jobs)
+        if not q.handover:
+            return bool(q.jobs)
+        with q.lock:  # a judgment is handed to the next daemon (judge_handed): only a job outside one is waited for
+            return any(k not in q.judging for k in q.jobs)
 
     def land_finishing(self) -> float:
         """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for
@@ -10034,6 +10348,8 @@ class Daemon:
         to_rest: list[dict] = list(backing_off)
         asked = False  # a query was sent: UNTIL may cut the rest
         while queue:
+            if kind != "head":
+                self.heads_between()  # a head asked meanwhile is read before the next chunk, not next tick
             chunk = queue.pop(0)
             if until is not None and asked and time.monotonic() >= until:
                 self.defer(chunk + [e for c in queue for e in c], f"the {kind}s' share of the tick, waited reads due")
@@ -11499,7 +11815,7 @@ class Daemon:
             listed = checks["check_runs"]
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
-            required = set(self.repo_part(old, parts, rules, slim_rules, []))
+            required = set(self.repo_part(old, parts, rules, slim_rules, [], ttl=self.rules_ttl))
             if not self.reads_protection:
                 # The base's classic protection is not read here (reads_protection): the checks GraphQL last
                 # called required stay required, beside the rulesets' read now.
@@ -12642,7 +12958,8 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # seen (pin_wait), so nothing asked for a read. So an entry whose copy was older than LAND_OWN_REFRESH_AFTER at its last land request
 # (requestedAt, a re-request's too), and is not read since, is read directly here too (direct_read, as on an upstream host), at most every LAND_OWN_REFRESH_AFTER per entry and
 # LAND_OWN_REFRESH_MAX per LAND_WINDOW_S per host: a PR read is a handful of requests, so the cap costs well under one
-# percent of an hour's login quota however many entries the queue holds.
+# percent of an hour's login quota however many entries the queue holds. The same budget recovers an active checks
+# wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
 
@@ -12832,6 +13149,12 @@ def land_reads_upstream() -> bool:
 # `gh pr update-branch N -R O/R --match-head-commit SHA [--needs-newer-base CHECK]...` (its update_branch tool, pinned
 # to SHA); gh's own `pr update-branch` takes no head, so a host with its own login keeps the pinned REST call.
 # gh_quota.lane_gh_client reads the same file: the bootstrap's wrapper that runs lane-gh-credential.
+# The broker form carries --land: the broker refuses a base merge of a cmux PR that is "not landing" (its own newest
+# commit over 24 h old, cmuxterm-hq#16488) unless land asks for it, and a land's update-branch is exactly that ask.
+# Without it gcp-agent-lane-3's land queue stopped 6 cmux PRs update_branch_refused on 2026-11-23 (#46506 twice,
+# #45670, #50302, #52141, #51137), each after 6-8 identical refusals; 3 were still open and unqueued 7 h later
+# (hq docs/findings/2026-11-23-land-update-branch-no-land-flag.md).
+# Detector: test-glaeda-gh.py test_a_host_with_its_own_login_keeps_the_pinned_rest_update_branch.
 LAND_LANE_GH_CLIENT = Path.home() / ".local/lib/lane-gh/bin/gh"
 
 
@@ -12843,11 +13166,12 @@ def land_broker_client(client: Path | None = None) -> bool:
         return False
 
 
-def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool) -> list[str]:
-    """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM), one
-    --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
+def land_update_branch_args(repo: str, number: str, head: str, needs: list[str], broker: bool,
+                            force: str = "") -> list[str]:
+    """The gh argv of an update-branch pinned to HEAD: the broker's `pr update-branch` form (BROKER, a lane VM) with
+    --land and one --needs-newer-base per check NEEDS names, else GitHub's REST PUT with expected_head_sha."""
     if broker:
-        return (["pr", "update-branch", number, "-R", repo]
+        return (["pr", "update-branch", number, "-R", repo, "--land"] + (["--force", force] if force else [])
                 + [arg for name in needs for arg in ("--needs-newer-base", name)] + ["--match-head-commit", head])
     return ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "-f", f"expected_head_sha={head}"]
 
@@ -12909,6 +13233,11 @@ def land_direct_read(key: str) -> str | None:
 #   handed off when that step ends; a request for it in the meantime is applied here first, so the handoff carries it.
 LAND_EXECUTOR_KEY = "executor"
 LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's --wait)
+# `reach` ends a far command after 1800 s (REMOTE_TIMEOUT_S in leo-workspace tools/reach). A forwarded land's --wait/--max
+# past it rode that bound and the forward died with "no answer" though the land was queued (#53013, 2026-11-24): the
+# executor's wait is clamped so the answer comes, with the land's state, before reach ends the command.
+LAND_FORWARD_REACH_BOUND = 1800.0
+LAND_FORWARD_MAX_WAIT = LAND_FORWARD_REACH_BOUND - 120.0 - LAND_FORWARD_DEADLINE
 LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
 LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
@@ -13824,7 +14153,23 @@ def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], com
 # "review_failed" for 89 h because the reviewer could not start here and that reads the same as a review that refused:
 # a review verdict (a BLOCK, land_judge's stop class "block") is a judgment and is never re-armed, while
 # review_cannot_start is this host missing a tool and is.
-LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|[a-z_]+_transient)$")
+#
+# own_red and red_not_excused are re-armed on the same reading. A red stop sounds like a judgment on the PR, and for
+# a red the PR's own diff broke it is one -- but the classifier's answer to "is this red the PR's?" is not a property
+# of the head. It is a comparison against state outside the head: whether the base is red the same way, whether the
+# rollup lists the failed run yet, whether the run's log can be read at all. Every one of those can change with no
+# push, so the same head legitimately answers differently an hour later, and the stop that cached the first answer is
+# the "verdict for code that changed under the run" class with the sides swapped -- a verdict kept while what it was
+# compared against moved. 2026-11-24, one land queue: of 130 entries sitting `stopped`, 55 were
+# own_red/red_not_excused; re-running base_red_excuse.py on all 55 at their unchanged heads answered "no failure to
+# excuse" for 21 of them, aged 1.8 h to 136.6 h. A requeue by hand of those 21 merged cmux#41558 (stuck 80 h) and
+# cmux#47993 (stuck 90 h) within minutes and turned four more into a `conflict` verdict their requester could act on;
+# the stale red had been hiding the real state. 18 of the 21 were own_red, so re-arming only red_not_excused would
+# have recovered 3.
+# A red that is the PR's own stays stopped, and costs one probe to say so: the re-arm keeps the wait budget, the
+# second judgment reads the same red and stops at once, LAND_STOP_REPEAT keeps that quiet for the requester, and
+# LAND_REARM_CAP bounds it at 3 re-asks per entry per UTC day.
+LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|red_not_excused|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
 # LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
@@ -14952,6 +15297,8 @@ def land_fingerprint(cache: dict | None, conflict_only: bool = False) -> str:
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
     mergeable = data.get("mergeable") == "CONFLICTING" if conflict_only else data.get("mergeable")
     doc = [data.get("headRefOid"), data.get("state"), mergeable, checks]
+    if data.get("checksTruncated"):
+        doc.extend((data.get("checkCounts"), pending_on_every_page(data)))
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -15443,6 +15790,16 @@ def gh_cache_gens(repo: str | None) -> list[int]:
             for k in ("host", str(repo or "").lower(), "*")]
 
 
+# A land judgment (land_judge explain: a read, p50 265 s, p90 300 s) is handed across a re-exec instead of drained or cut.
+# Its child writes its answer to files under land/judging/ (not pipes that die with this image), and the next daemon's
+# judgment of the same entry with the same argv waits for that child's answer instead of starting over
+# (LandQueue.judge_handed). So an update re-execs at once while every running land job is inside a judgment (land_busy),
+# and a fast-patch of glaeda-gh on the land executor goes live in seconds, not after a drain of up to REEXEC_DRAIN_MAX:
+# lane-9, 2026-11-24, `fast-patch glaeda f5e82403` waited 145 s on "5 land step(s) running" (merge to live 156 s).
+LAND_JUDGING_DIR = "judging"
+LAND_HANDOVER_WAIT = 0.5  # how often an adopted judgment's answer file is looked for (a local file, no GitHub read)
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -15474,6 +15831,7 @@ class LandQueue:
         self.overridden: set[tuple] = set()  # (pool, at, until) of marks a fresh reading voided, logged once each
         self.snapshot_of = snapshot_of
         self.run = run or (lambda argv, timeout, env: self._run_real(argv, timeout, env))
+        self.handover = run is None  # judgments outlive a re-exec (LAND_JUDGING_DIR); a test's run stays in process
         self.forward = forward
         self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
         self.forward_thread: threading.Thread | None = None
@@ -15770,7 +16128,8 @@ class LandQueue:
         sent = req.get("at")
         e["requestedAt"] = min(float(sent), self.now) \
             if isinstance(sent, (int, float)) and not isinstance(sent, bool) else self.now
-        if pin and pin != str(e.get("pinSha") or "").lower() and not fresh:
+        pin_changed = bool(pin and pin != str(e.get("pinSha") or "").lower())
+        if pin_changed and not fresh:
             self.drop_older_heads(e, pin)
         if pin:
             e.update(pinSha=pin, pinSince=self.now)  # pin_wait: judged only once a read since this request shows it
@@ -15788,10 +16147,20 @@ class LandQueue:
         elif fresh:  # an older sender's request: land_lane reads its requester, never an earlier queuer's lane
             e.pop("lane", None)
             e.pop("laneHost", None)
+        previous_override = e.get("override")
         if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
             e["override"] = land_request_override(req)
             # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
-            e["overrideAt"] = self.now if e["override"] else None
+            if fresh or previous_override != e["override"]:
+                e["overrideAt"] = self.now if e["override"] else None
+        if e.get("state") == "waiting" and (pin_changed or e.get("override") != previous_override):
+            verdict = e.get("explain") or {}
+            wait = e.get("wait") or {}
+            checks_wait = (wait.get("kind") in ("pr", "run") and not wait.get("rerun")
+                           and (wait.get("why") == "checks running" or verdict.get("code") == "checks_running"))
+            if (checks_wait or wait.get("kind") == "retry" and verdict.get("code") == "unreadable"
+                    and (verdict.get("action") or {}).get("override_if_checks_finished") is True):
+                e.update(state="queued", wait=None, wakeAt=None, dueAt=self.now)
         if fresh or "nominated" in req:  # the same: a plain re-request of an open nominated entry keeps its gates
             e["nominated"] = land_nominated(req.get("nominated"))
         if fresh:
@@ -18018,8 +18387,18 @@ class LandQueue:
         # Against the head the cache showed when it was last judged: land_judge's own head can differ from a stale cache.
         moved = bool(head and e.get("seenHead") and head != e.get("seenHead"))
         if kind == "run":
-            rd = (self.cache_of(w.get("key", "")) or {}).get("data") or {}
-            done = (rd.get("status") == "completed" or moved) and not running
+            run_cache = self.cache_of(w.get("key", "")) or {}
+            rd = run_cache.get("data") or {}
+            # A PR read can finish a job before the run cache learns of it. Rejudge once on that
+            # transition, only for a run on this head; a wait on a base run still needs its own result.
+            pr_finished = (not running and fp != e.get("seen") and whole_read(data)
+                           and (c.get("dataAt") or 0) > (run_cache.get("dataAt") or 0)
+                           and e.get("seenChecks") != land_check_fingerprint(c))
+            run_id = w.get("key", "").rpartition("/")[2]
+            run_on_head = pr_finished and (e.get("explain") or {}).get("code") == "checks_running" and any(
+                str(check.get("runId") or "") == run_id and check.get("status") == "COMPLETED"
+                for check in data.get("checks") or [])
+            done = (rd.get("status") == "completed" or moved or run_on_head) and not running
             if done or woke:
                 self.judge(e, head, fp, why=("head_moved" if moved else "run_done") if done else "woke")
             return
@@ -18374,8 +18753,8 @@ class LandQueue:
 
     def refresh_due(self, e: dict, c: dict | None) -> bool:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
-        LAND_REFRESH_AFTER (see there); on a host with its own login, a direct read of a due entry's PR whose copy is
-        that was older than LAND_OWN_REFRESH_AFTER at its last land request. Started on a worker: True when one was started (or waits for one)."""
+        LAND_REFRESH_AFTER. On a host with its own login, read a stale copy seen at enqueue or a stale exact-head
+        check wait. The recovery sweep revisits quiet PR waits and the same per-entry and host budgets cover both."""
         at = (c or {}).get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
@@ -18385,17 +18764,24 @@ class LandQueue:
         every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
         if isinstance(last, (int, float)) and self.now - last < every:
             return False
+        checks_wait = False
         if own:
-            # A host with its own login: the nudge reads it in the daemon's waited pass, unless the copy was already
-            # older than LAND_OWN_REFRESH_AFTER when the entry's last land request came (see there) and no read has
-            # answered since, within the host's hourly cap
+            wait = e.get("wait") or {}
+            head = str(wait.get("sha") or "")
+            checks_wait = (e["state"] == "waiting" and not self.due(e) and wait.get("kind") == "pr"
+                           and not wait.get("rerun") and self.now - at >= LAND_OWN_REFRESH_AFTER
+                           and (wait.get("why") == "checks running"
+                                or (e.get("explain") or {}).get("code") == "checks_running")
+                           and land_checks_running(c.get("data") or {}, head))
+            # A PR read after enqueue can still be the last copy we have of a running head. A quiet webhook
+            # feed does not establish that it is still running. The recovery sweep shares the usual read budget.
             self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]
             asked = e.get("requestedAt")
-            if not isinstance(asked, (int, float)) or isinstance(asked, bool) \
-                    or asked - at < LAND_OWN_REFRESH_AFTER \
-                    or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
+            stale_request = (isinstance(asked, (int, float)) and not isinstance(asked, bool)
+                             and asked - at >= LAND_OWN_REFRESH_AFTER)
+            if (not stale_request and not checks_wait) or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
                 return False
-        if self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
+        if not checks_wait and self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
             if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
                 e["feedNoRefresh"] = at
                 self.count("feed_norefresh")
@@ -19189,12 +19575,97 @@ class LandQueue:
                 raise subprocess.TimeoutExpired(argv, timeout) from None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def call(self, argv: list[str], timeout: float, e: dict | None = None,
-             extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-        """One child (land_judge, the gh-quota shim, lane-gh) and its output, with GitHub's numeric user id dropped
-        from both streams (land_redact): every stored reason, cause and park text is captured here."""
+    def judge_handed(self, key: str, argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
+        """ARGV (a judgment: a read) run with its streams and exit code in files under land/judging/, so it outlives a
+        re-exec of this daemon; or, when the previous image left the same ARGV for KEY running or answered within its
+        bound, that child's answer (LAND_JUDGING_DIR). A child gone with no answer is judged afresh. Each run's files
+        carry its own id, named in KEY's meta before the child starts, so a child a re-exec left with no meta never
+        writes over a later run's. Raises subprocess.TimeoutExpired past TIMEOUT, as run does."""
+        d = land_dir() / LAND_JUDGING_DIR
+        meta = d / file_name(key)
+
+        def files(run: str) -> tuple[Path, Path, Path]:
+            stem = d / f"{meta.stem}.{run}"
+            return stem.with_suffix(stem.suffix + ".out"), stem.with_suffix(stem.suffix + ".err"), \
+                stem.with_suffix(stem.suffix + ".rc")
+
+        def gone(pid: int) -> bool:
+            with contextlib.suppress(ChildProcessError, OSError):
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    return True  # the previous image's child, ended: reaped here (a zombie answers kill)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            return False
+
+        def answer(run: str) -> subprocess.CompletedProcess:
+            out, err, rc = files(run)
+            try:
+                code = int(rc.read_text().strip())
+            except (OSError, ValueError):
+                code = 125
+            return subprocess.CompletedProcess(argv, code, out.read_text(errors="replace") if out.exists() else "",
+                                               err.read_text(errors="replace") if err.exists() else "")
+
+        def drop(run: str) -> None:
+            for f in (meta, *files(run)):
+                with contextlib.suppress(OSError):
+                    f.unlink()
+
+        doc = read_json(meta)
+        prior = str(doc.get("run") or "") if isinstance(doc, dict) else ""
+        if prior and doc.get("argv") == argv and isinstance(doc.get("pid"), int) \
+                and isinstance(doc.get("deadline"), (int, float)) and time.time() < float(doc["deadline"]):
+            pid, deadline, rc = int(doc["pid"]), float(doc["deadline"]), files(prior)[2]
+            log({"event": "land-judgment-adopted", "key": key, "pid": pid,
+                 "ageS": round(time.time() - float(doc.get("at") or time.time()), 1)})
+            while not rc.exists() and time.time() < deadline and not gone(pid):
+                time.sleep(LAND_HANDOVER_WAIT)
+            if rc.exists():
+                got = answer(prior)
+                drop(prior)
+                return got
+            if time.time() >= deadline:
+                drop(prior)
+                raise subprocess.TimeoutExpired(argv, timeout)
+            log({"event": "land-judgment-lost", "key": key, "pid": pid})  # gone with no answer: judged afresh
+        if prior:
+            drop(prior)
+        run = f"{os.getpid()}-{time.time_ns()}"
+        out, err, rc = files(run)
+        d.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        deadline = now + timeout
+        write_json(meta, {"argv": argv, "run": run, "pid": None, "at": now, "deadline": deadline})
+        env = deadline_env(env, timeout)  # its bound in the child too
+        wrapped = ["/bin/sh", "-c", 'r=$1; shift; "$@"; c=$?; echo "$c" > "$r.tmp" && mv "$r.tmp" "$r"', "sh",
+                   os.fspath(rc), *self_bounded(argv, timeout, env)]
         try:
-            got = self.run(argv, timeout, {**self.env(e), **(extra or {})})
+            with open(out, "wb") as fo, open(err, "wb") as fe:
+                proc = subprocess.Popen(wrapped, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+                                        start_new_session=True, env=env, cwd=os.environ.get("HOME") or "/")
+            write_json(meta, {"argv": argv, "run": run, "pid": proc.pid, "at": now, "deadline": deadline})
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    proc.wait(timeout=2)
+                raise subprocess.TimeoutExpired(argv, timeout) from None
+            return answer(run)
+        finally:
+            drop(run)
+
+    def call(self, argv: list[str], timeout: float, e: dict | None = None,
+             extra: dict[str, str] | None = None, handed: str | None = None) -> subprocess.CompletedProcess:
+        """One child (land_judge, the gh-quota shim, lane-gh) and its output, with GitHub's numeric user id dropped
+        from both streams (land_redact): every stored reason, cause and park text is captured here. HANDED: the key of a
+        judgment that outlives a re-exec (judge_handed)."""
+        try:
+            env = {**self.env(e), **(extra or {})}
+            got = self.judge_handed(handed, argv, timeout, env) if handed and self.handover else self.run(argv, timeout, env)
             return subprocess.CompletedProcess(got.args, got.returncode, land_redact(got.stdout) if got.stdout else
                                                got.stdout, land_redact(got.stderr) if got.stderr else got.stderr)
         except subprocess.TimeoutExpired:
@@ -19257,7 +19728,7 @@ class LandQueue:
             with self.lock:
                 self.judging[e["key"]] = (time.monotonic(), bound)
             try:
-                got = self.call(run_argv, bound, extra=extra)
+                got = self.call(run_argv, bound, extra=extra, handed=e["key"])
             finally:
                 with self.lock:
                     self.judging.pop(e["key"], None)
@@ -19415,6 +19886,14 @@ class LandQueue:
                                 host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
+            if (answer.get("code") == "unreadable" and act.get("kind") == "retry"
+                    and act.get("override_if_checks_finished") is True and sha == head == act.get("head")
+                    and land_receipted_base_red(e, head, self.cache_of(e["key"]) or {})):
+                # Keep the judge's original refusal in explain. The operator's receipt answers this one
+                # incomplete base-red search; take() checks the target and uses the ordinary pinned merge.
+                self.history(e, "override_merge", code=answer["code"], head=head[:12], **land_override_history(e))
+                act = {**act, "kind": "merge", "sha": head}
+                answer = {**answer, "ok": True, "code": "ok", "action": act}
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
                 bad = str(answer.get("code") or "") in LAND_HANDOFF_UNREAD \
                     and bool(LAND_UNREAD_TRANSIENT.search(reason))
@@ -19802,7 +20281,9 @@ class LandQueue:
                               f"{head[:12] or '?'}", land_trim(answer.get("next")))
                 return
             needs = act.get("needs_newer_base")
-            self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [])
+            force = act.get("force") if answer.get("code") == "base_update" else ""
+            self.update_branch(e, sha, [str(n) for n in needs if str(n)] if isinstance(needs, list) else [],
+                               force if isinstance(force, str) else "")
             return
         if kind == "retarget":
             base = str(act.get("base") or "")
@@ -20460,7 +20941,7 @@ class LandQueue:
             return LAND_FETCH_ONCE.as_posix()
         return shutil.which("git-fetch-once") or ""
 
-    def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
+    def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -20504,7 +20985,7 @@ class LandQueue:
             with self.lock:
                 self.history(e, "update_again", head=head[:12], why="the base moved during this update's CI")
         self.push_step(e, "update_branch", head,
-                       land_update_branch_args(repo, number, head, list(needs or []), self.broker_client()))
+                       land_update_branch_args(repo, number, head, list(needs or []), self.broker_client(), force))
 
     def step_refused(self, e: dict, kind: str, head: str, got: subprocess.CompletedProcess) -> str | None:
         """KIND, the step land_judge named, failed at HEAD (LAND_STEP_BACKOFF's comment). Under the lock. Waits or
@@ -21249,6 +21730,28 @@ def land_request_override(req: dict) -> dict | None:
         return land_override(o["reason"], o["receipt"])
     except WatchError:
         return None
+
+
+def land_receipted_base_red(e: dict, head: str, cache: dict) -> bool:
+    """The operator supplied a receipt and all checks at the judged head have finished, including later pages."""
+    override = land_override_env(e)
+    if not override or override["LAND_JUDGE_OVERRIDE_RECEIPT"] == LAND_OVERRIDE_ENV_RECEIPT:
+        return False
+    data = cache.get("data") or {}
+    if (not SHA40.fullmatch(head) or land_head_moved(str(e.get("pinSha") or ""), head)
+            or data.get("state") != "OPEN" or data.get("headRefOid") != head or data.get("checksPageError")
+            or data.get("requiredMissing") or data.get("requiredUnread")
+            or e.get("seenChecks") != land_check_fingerprint(cache)):
+        return False
+    checks = data.get("checks") or []
+    if not checks or any(c.get("status") != "COMPLETED" or not c.get("conclusion") for c in checks):
+        return False
+    if data.get("checksTruncated"):
+        counts = data.get("checkCounts") or {}
+        rows = [*counts.get("runs", {}).items(), *counts.get("statuses", {}).items()]
+        return (bool(rows) and sum(n for state, n in rows if state in PASSED or state in FAILED) == data.get("checksTotal")
+                and any(n for state, n in rows if state in FAILED))
+    return any(c.get("conclusion") in FAILED for c in checks)
 
 
 def land_override_env(e: dict) -> dict[str, str]:
@@ -22104,9 +22607,9 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
-           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
+           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": min(wait, LAND_FORWARD_MAX_WAIT), "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
-        | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
+        | ({"max": min(Leash(wait, ceiling).ceiling, LAND_FORWARD_MAX_WAIT)} if wait > 0 else {}) \
         | ({"override": override} if override else {}) \
         | ({"nominated": nominated} if nominated is not None else {})
     why = land_forward_pending(name, time.time()) if land_outbox_busy(key) else ""
@@ -22733,9 +23236,7 @@ def refresh_log_write(line: str) -> None:
             data = path.read_bytes()
             keep = data[len(data) - REFRESH_LOG_MAX // 2:]
             keep = keep[keep.find(b"\n") + 1:] if b"\n" in keep else b""
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(keep)
-            tmp.replace(path)
+            stable_replace(path, keep)
     except Exception:  # noqa: BLE001
         pass
 
@@ -23029,6 +23530,175 @@ def script_changed(path: Path, seen: dict) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- main watch: a glaeda merge live in seconds
+# Leo, 2026-11-23: "hm. i feel like there should be ways for you guys to incrementally fast-patch controllers and etc
+# etc stuff that goes over network intra network etc". The release ring put a glaeda merge live in p50 1,034 s, p95
+# 1,841 s (11 releases, 2026-11-24): most of it the canary promote wait. leo-workspace tools/fast-patch puts a main
+# commit live here in seconds (main check, fetch, swap, health read, rollback); this watch is its trigger, and the ring
+# stays as the reconciler (glaeda-update leaves a patched file alone until a release includes its commit).
+#
+# The trigger is an anonymous `git ls-remote` of main (the repo is public): no token, no broker, no REST or GraphQL
+# point, one small HTTPS answer (~0.3 s). Per host it is MAIN_WATCH_EVERY apart, so ~80 hosts ask ~1,600 times a
+# minute from ~80 addresses, which GitHub's per-token REST limits (900 points a minute, secondary) never see; a polled
+# REST read through one lane broker token would have been over them. A webhook would need a public receiver and repo
+# admin; this needs neither, and at 3 s a merge is seen p50 1.5 s, worst 3 s after it lands.
+MAIN_WATCH_REPO = "teamleaderleo/glaeda"
+MAIN_WATCH_URL = f"https://github.com/{MAIN_WATCH_REPO}"
+MAIN_WATCH_EVERY = 3.0  # seconds between two reads of main
+MAIN_WATCH_MAX_EVERY = 60.0  # a failing read backs off, doubling, to this
+MAIN_WATCH_READ_BOUND = 10.0  # one ls-remote
+MAIN_WATCH_RUN_BOUND = 1000.0  # one fast-patch run: its health deadline (30 s) plus glaeda's own drain bound (900 s)
+MAIN_WATCH_RETRY = 120.0  # a commit whose run was refused (a fetch that failed) is tried again after this
+MAIN_WATCH_TRIES = 3  # and at most this often; a commit that rolled back is never tried again (the next merge is)
+MAIN_WATCH_ENV = "GLAEDA_FAST_PATCH_WATCH"  # "0": no watch on this host (the ring alone installs)
+FAST_PATCH_BIN_ENV = "FAST_PATCH_BIN"  # the fast-patch program (else leo-workspace's, else PATH's)
+
+
+def fast_patch_state() -> Path:
+    return Path(os.environ.get("FAST_PATCH_STATE") or Path.home() / ".local/state/fast-patch")
+
+
+def fast_patch_program() -> str | None:
+    """The fast-patch to run: FAST_PATCH_BIN, else ~/Projects/leo-workspace/tools/fast-patch, else `fast-patch` on
+    PATH; None when there is none (the watch stays off)."""
+    named = os.environ.get(FAST_PATCH_BIN_ENV)
+    for candidate in ([named] if named else []) + [os.fspath(Path.home() / "Projects/leo-workspace/tools/fast-patch")]:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("fast-patch")
+
+
+def main_tip(runner: Callable = subprocess.run) -> str | None:
+    """MAIN_WATCH_REPO's main commit from one anonymous ls-remote, or None (unreachable, or no answer)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
+    try:
+        done = runner(["git", "-c", "credential.helper=", "-c", "protocol.version=2", "ls-remote", MAIN_WATCH_URL,
+                       "refs/heads/main"], capture_output=True, text=True, timeout=MAIN_WATCH_READ_BOUND,
+                      stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (done.stdout or "").splitlines() if done.returncode == 0 else []:
+        words = line.split()
+        if len(words) == 2 and words[1] == "refs/heads/main" and len(words[0]) == 40:
+            return words[0]
+    return None
+
+
+def fast_patch_runs(state: Path, commit: str, since: float) -> list[dict]:
+    """fast-patch's glaeda run lines for COMMIT written at or after SINCE (epoch), oldest first."""
+    try:
+        with (state / "runs.jsonl").open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256 * 1024))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        if commit not in line:
+            continue
+        with contextlib.suppress(ValueError):
+            doc = json.loads(line)
+            at = iso_epoch(doc.get("at")) if isinstance(doc, dict) else None
+            if doc.get("service") == "glaeda" and doc.get("commit") == commit and at is not None and at >= since - 1:
+                out.append(doc)
+    return out
+
+
+def main_watch_due(tip: str, live: str | None, tried: dict, runs: list[dict], now: float) -> str | None:
+    """Why the watch starts a run for TIP now, or None. LIVE: the commit fast-patch put live here and this daemon runs;
+    TRIED: this commit's {"tries", "at"} (the last start, epoch); RUNS: its run lines since its first try."""
+    if tip == live:
+        return None
+    outcomes = [r.get("outcome") for r in runs]
+    if any(o in ("rolled-back", "rollback-unhealthy") for o in outcomes):
+        return None  # it missed its health read once: the next merge, or the ring, moves this host on
+    if "live" in outcomes:
+        return None  # live already (the daemon re-execs onto it within a tick or its own drain)
+    tries, at = int(tried.get("tries") or 0), float(tried.get("at") or 0)
+    if tries and len(runs) < tries and now - at < MAIN_WATCH_RUN_BOUND:
+        return None  # a run is in flight (its line is written when it ends)
+    if tries >= MAIN_WATCH_TRIES:
+        return None
+    if tries and now - at < MAIN_WATCH_RETRY:
+        return None
+    return "first try" if not tries else f"try {tries + 1} (last: {outcomes[-1] if outcomes else 'no line'})"
+
+
+class MainWatch:
+    """The thread serve starts: reads main every MAIN_WATCH_EVERY and starts `fast-patch glaeda TIP` when main moved
+    past what this host runs. Its memory (STATE/glaeda/watch.json) outlives the re-exec a patch causes."""
+
+    def __init__(self, program: str, state: Path | None = None, runner: Callable = subprocess.run,
+                 spawn: Callable = spawn_detached, clock: Callable[[], float] = time.time):
+        self.program, self.state = program, state or fast_patch_state()
+        self.runner, self.spawn, self.clock = runner, spawn, clock
+        self.every = MAIN_WATCH_EVERY
+        self.seen: dict[str, float] = {}  # tip -> when this image first saw it
+
+    @property
+    def memory(self) -> Path:
+        return self.state / "glaeda" / "watch.json"
+
+    def live_commit(self) -> str | None:
+        """The commit fast-patch's pin names when its bytes are the ones this daemon runs."""
+        doc = read_json(self.state / "glaeda" / "live.json")
+        if not isinstance(doc, dict):
+            return None
+        tools = doc.get("tools") if isinstance(doc.get("tools"), dict) else {}
+        running = RUNNING_SCRIPT.get("scriptSha256")
+        return doc.get("commit") if running and running in tools.values() else None
+
+    def step(self) -> str | None:
+        """One read of main and what it led to; the delay before the next is self.every."""
+        tip = main_tip(self.runner)
+        if tip is None:
+            self.every = min(MAIN_WATCH_MAX_EVERY, self.every * 2)
+            return None
+        self.every = MAIN_WATCH_EVERY
+        now = self.clock()
+        seen_at = self.seen.setdefault(tip, now)
+        memory = read_json(self.memory)
+        memory = memory if isinstance(memory, dict) else {}
+        tried = memory.get(tip) if isinstance(memory.get(tip), dict) else {}
+        runs = fast_patch_runs(self.state, tip, float(tried.get("first") or now)) if tried else []
+        why = main_watch_due(tip, self.live_commit(), tried, runs, now)
+        if why is None:
+            return None
+        env = {**os.environ, "FAST_PATCH_TRIGGER": "main-watch", "FAST_PATCH_SEEN_AT": f"{seen_at:.3f}"}
+        env.pop(GRAPHQL_SLOT_ENV, None)
+        out = self.state / "glaeda" / "watch-run.log"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("ab") as sink:
+            self.spawn([self.program, "glaeda", tip, "--json"], bound=MAIN_WATCH_RUN_BOUND, env=env,
+                       stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
+        entry = {"tries": int(tried.get("tries") or 0) + 1, "at": now, "first": tried.get("first") or now}
+        keep = {k: v for k, v in memory.items() if isinstance(v, dict) and now - float(v.get("at") or 0) < 86400}
+        write_json(self.memory, {**keep, tip: entry})
+        log({"event": "fast-patch-start", "commit": tip, "why": why, "seenS": round(now - seen_at, 2)})
+        return why
+
+    def run(self) -> None:
+        while True:
+            try:
+                self.step()
+            except Exception as error:  # noqa: BLE001  the watch keeps going; the ring still installs
+                log({"event": "error", "error": describe(error), "site": "main-watch"})
+            time.sleep(self.every)
+
+
+def start_main_watch() -> MainWatch | None:
+    """The main watch's thread, unless GLAEDA_FAST_PATCH_WATCH=0 or this host has no fast-patch."""
+    if os.environ.get(MAIN_WATCH_ENV) == "0":
+        return None
+    program = fast_patch_program()
+    if program is None:
+        return None
+    watch = MainWatch(program)
+    threading.Thread(target=watch.run, name="glaeda-gh-main-watch", daemon=True).start()
+    return watch
+
+
 def serve(foreground_ok: bool = False) -> int:
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
@@ -23053,6 +23723,8 @@ def serve(foreground_ok: bool = False) -> int:
                         where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
                         reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
     watchdog.start()
+    with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
+        start_main_watch()
     last = None
     while True:
         try:
@@ -23103,7 +23775,10 @@ def serve(foreground_ok: bool = False) -> int:
                     log({"event": "reexec-deferred", "why": "a land step is running; no new one starts until it ends"})
                     daemon.reexec_waiting = time.monotonic()
             elif due is not None:
-                log({"event": "reexec", **({"why": due} if due != "reexec" else {})})
+                q = daemon.land_queue
+                handed = len(q.judging) if q is not None and q.handover else 0  # judge_handed: the next daemon's
+                log({"event": "reexec", **({"why": due} if due != "reexec" else {}),
+                     **({"handedJudgments": handed} if handed else {})})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             if lock_replaced(lock):
                 # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
@@ -26576,6 +27251,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
                 transport=broker_transport(broker, lambda: daemon.tick_deadline), token=lambda: "",
                 controller=None, upstream=None)
             daemon.reads_protection = False
+            daemon.rules_ttl = DIRECT_RULES_TTL
             daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
         else:
             daemon = Daemon(controller=None, upstream=None)
@@ -26655,6 +27331,16 @@ def direct_read(req: dict) -> str | None:
 DIRECT_PARTS = "direct-parts.json"  # under BASE (read when used: tests move BASE)
 DIRECT_PARTS_RE = re.compile(r"^/repos/[^/]+/[^/]+/(?:rules/branches/[^?]+|actions/workflows)\?")
 DIRECT_PARTS_MAX = 200
+# ... and the base's rulesets (rules/branches/B) that long: a required check added or dropped on a base is rare, the
+# broker host's own daemon still reads them every REST_REPO_PART_TTL, and a land judges on the host that merges. The
+# fleet's lane VMs each re-read manaflow-ai/cmux's rules/branches/main every 10 minutes: rest_breakdown, 2026-11-23
+# 23:00Z-01:00Z, 380 App requests (190 an hour, about one an hour per VM that reads cmux and every one the same answer).
+DIRECT_RULES_TTL = 3600
+DIRECT_RULES_RE = re.compile(r"^/repos/[^/]+/[^/]+/rules/branches/")
+
+
+def direct_part_ttl(path: str) -> float:
+    return DIRECT_RULES_TTL if DIRECT_RULES_RE.match(path) else REST_REPO_PART_TTL
 
 
 def direct_parts_load(now: float) -> dict[str, dict]:
@@ -26666,7 +27352,7 @@ def direct_parts_load(now: float) -> dict[str, dict]:
     return {path: v for path, v in parts.items()
             if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("part"), dict)
             and isinstance(v.get("at"), (int, float)) and not isinstance(v.get("at"), bool)
-            and 0 <= now - v["at"] < REST_REPO_PART_TTL}
+            and 0 <= now - v["at"] < direct_part_ttl(path)}
 
 
 def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
@@ -30283,12 +30969,14 @@ GH_CACHE_HEAD_WRITES = {"update-branch"}
 GH_CACHE_WRITE_VALUE_FLAGS = BROKER_VALUE_FLAGS | {
     "--match-head-commit", "--subject", "--author-email", "--add-label", "--remove-label", "--milestone",
     "--add-reviewer", "--remove-reviewer", "--add-assignee", "--remove-assignee", "--add-project",
-    "--remove-project", "-r", "-a", "-m", "-T", "--template", "-e", "--comment", "-c", "--reason"}
+    "--remove-project", "-r", "-a", "-m", "-T", "--template", "-e", "--comment", "-c", "--reason",
+    "--needs-newer-base"}
 GH_CACHE_WRITE_BOOL_FLAGS = {
     "--squash", "-s", "--merge", "--rebase", "--auto", "--disable-auto", "--delete-branch", "-d", "--admin",
     "--approve", "--request-changes", "--undo", "--yes", "--edit-last", "--create-if-none", "--delete-last",
     "--draft", "--failed", "--debug", "--force", "--remove-milestone", "--fill", "--fill-first",
-    "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w"}
+    "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w",
+    "--land"}  # the land queue's broker update-branch (land_update_branch_args)
 
 
 # -- vouched `pr view` answers: kept while the PR's head and updatedAt stay what they were
@@ -31686,17 +32374,12 @@ def gh_cache_final_put(key: str, at: float, out: bytes, err: bytes, run: tuple[s
     if len(out) + len(err) > GH_CACHE_MAX_BYTES * 4:
         return
     path = gh_cache_final_path(key)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     doc = {"key": key, "at": at, "out": base64.b64encode(out).decode(), "err": base64.b64encode(err).decode(),
            **({"run": list(run)} if run else {})}
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(json.dumps(doc).encode(), mtime=0))
-        os.replace(tmp, path)
+        stable_replace(path, gzip.compress(json.dumps(doc).encode(), mtime=0))
     except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
         return
     with contextlib.suppress(Exception):
         gh_cache_final_evict()
@@ -33373,7 +34056,8 @@ def pause_line(pause: Any) -> list[str]:
 
 def post_line(state: dict) -> str:
     if state["state"] == "posted":
-        return (state.get("url") or "posted") + (f" ({state['note']})" if state.get("note") else "")
+        return (state.get("url") or "posted") + (f" ({state['note']})" if state.get("note") else "") + \
+            (f" [sent as {state['appWriter']}]" if state.get("appWriter") else "")
     if state["state"] == "failed":
         return f"failed: {state.get('error')}"
     if state["state"] == "superseded":
@@ -33858,15 +34542,7 @@ def job_log_put(repo: str, job: int, text: bytes) -> None:
         return
     path = job_log_path(repo, job)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    try:
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(text, compresslevel=6, mtime=0))
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    stable_replace(path, gzip.compress(text, compresslevel=6, mtime=0))
     job_logs_evict()
 
 

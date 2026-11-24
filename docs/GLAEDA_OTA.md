@@ -153,9 +153,10 @@ End to end, by design: the release is published about 5 minutes after the merge 
 hosts see it within a minute and report after their install and health check, the second canary's
 success starts a promote run that moves stable (about a minute for the run), and every host (an idle
 runner's hook too) installs it within another minute plus its install: about 10 minutes from merge to
-a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake,
-stable waits out the 15-minute soak and that canary's next full run (up to 10 minutes) dispatches the
-promote run.
+a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake (or
+the second late or pending), stable waits out the 15-minute soak, and that canary's minute probe starts a
+full run as the soak ends, which dispatches the promote run: about 16 minutes from publication. Until
+2026-11-24 that dispatch waited for the canary's next scheduled full run, up to 10 minutes later.
 Before 2026-11-17 the same path took 23 to 50 minutes (a 15-minute soak, then a 10-13 minute poll and
 up to 15 more for the mirror).
 
@@ -163,9 +164,9 @@ up to 15 more for the mirror).
 
 | Host | Ring | Why |
 | --- | --- | --- |
-| Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health |
-| Big Red | canary | always on; reports health when the Mac is asleep |
-| Cosmic Gray | canary | a second Mac; one more chance that some canary reports |
+| Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health, usually 3-4 minutes after publication |
+| Cosmic Gray | canary | a second Mac, the quorum's second host; busy, so it often reports after the soak or posts `pending` (a health check or `gh auth token` timing out) |
+| Big Red | stable | not a canary since 2026-10-31 (leo-workspace `machines/host-baseline.json` `glaeda_ota`); it posts no status |
 | manaflow minis | stable | build hosts: take only what a canary has run healthy for 15 minutes and none failed; download from the fleet mirror |
 
 Set a host's ring once with `glaeda-mini-setup --apply --ota-ring canary` (or `stable`). The
