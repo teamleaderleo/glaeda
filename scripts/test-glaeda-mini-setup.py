@@ -301,7 +301,9 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual((bin_dir / "glaeda-disk-registry").read_bytes(), (ROOT / "scripts/glaeda-disk-registry").read_bytes())
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
         repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
-        self.assertEqual(repair["ProgramArguments"], ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])
+        self.assertEqual(repair["ProgramArguments"],
+                         ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply", "--scheduled-log"])
+        self.assertEqual(repair["StandardOutPath"], "/dev/null")
         self.assertEqual(repair["StartInterval"], 60)
         self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
         self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
@@ -435,6 +437,55 @@ class MiniSetupTest(unittest.TestCase):
         act = next(a for a in receipt["actions"] if a.get("path") == os.fspath(old))
         self.assertEqual(act["state"], "update")
         self.assertEqual(Path(act["backup"]).read_text(), "#!/bin/sh\necho old\n")
+
+    def test_ota_uses_its_retained_rollback_copy_only_for_identical_owned_tools(self) -> None:
+        update = self.home / ".local/state/glaeda/update"
+        tag = "r-20261123-0123456789ab"
+        gen = update / "generations" / tag
+        scripts = gen / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        for name in ms.GH_ONLY_TOOLS:
+            shutil.copy2(ms.SCRIPT_DIR / name, scripts / name)
+        old = b"#!/bin/sh\necho previous release\n"
+        for name in ("glaeda-gh", "glaeda-disk", "disk-pressure.sh"):
+            (scripts / name).write_bytes(old)
+        with (scripts / "glaeda-update").open("ab") as updater:
+            updater.write(b"\n# previous release\n")
+        prior_updater = (scripts / "glaeda-update").read_bytes()
+        installed = self.home / ".local/bin"
+        installed.mkdir(parents=True)
+        shutil.copy2(scripts / "disk-pressure.sh", installed / "disk-pressure.sh")
+        (gen / ".complete").write_text(tag + "\n")
+        (update / "state.json").write_text(json.dumps({"current": tag, "previous": None}))
+        with mock.patch.object(ms, "SCRIPT_DIR", scripts), mock.patch.object(ms, "REPO", scripts.parent):
+            self.invoke("--gh-only", "--apply")
+        (installed / "glaeda-disk").write_bytes(b"local edit")
+        (scripts / "glaeda-update").write_bytes(b"different release bytes")
+        with mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
+            receipt = self.invoke("--gh-only", "--apply")
+        actions = {Path(a["path"]).name: a for a in receipt["actions"] if a["kind"] == "tool"}
+        gh = actions["glaeda-gh"]
+        self.assertNotIn("backup", gh)
+        self.assertEqual(Path(gh["rollbackSource"]).read_bytes(), old)
+        self.assertEqual((installed / "glaeda-gh").read_bytes(), (ROOT / "scripts/glaeda-gh").read_bytes())
+        self.assertEqual(Path(actions["glaeda-disk"]["backup"]).read_bytes(), b"local edit")
+        self.assertEqual(Path(actions["glaeda-update"]["backup"]).read_bytes(), prior_updater)
+        self.assertEqual(Path(actions["disk-pressure.sh"]["backup"]).read_bytes(), old)
+        backups = self.home / ".local/state/glaeda/mini-setup/backup"
+        self.assertEqual(list(backups.glob("glaeda-gh.*")), [])
+
+    def test_two_backups_in_one_second_preserve_both_files(self) -> None:
+        ctx = mock.Mock(state=self.home / "state")
+        file = self.home / "glaeda-gh"
+        fixed = ms.datetime.datetime(2026, 11, 23, 10, 0, 0)
+        with mock.patch.object(ms.datetime, "datetime") as clock:
+            clock.now.return_value = fixed
+            file.write_bytes(b"original")
+            first = ms.backup(ctx, file)
+            file.write_bytes(b"edit")
+            second = ms.backup(ctx, file)
+        self.assertEqual(Path(first).read_bytes(), b"original")
+        self.assertEqual(Path(second).read_bytes(), b"edit")
 
     def test_git_defaults_only_fill_unset_keys_and_uninstall_only_ours(self) -> None:
         (self.home / ".gitconfig").write_text("[fetch]\n\tparallel = 4\n")

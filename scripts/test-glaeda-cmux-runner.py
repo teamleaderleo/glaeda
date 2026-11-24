@@ -4704,7 +4704,8 @@ class HookTest(unittest.TestCase):
                               ("cmux-next.yml", "daemon-test-fleet"), ("cmux-next-perf-bench.yml", "bench"),
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                              ("fleet-rd-host-macos.yml", "check")):
+                              ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
+                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
