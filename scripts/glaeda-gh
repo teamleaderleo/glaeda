@@ -14103,12 +14103,15 @@ LAND_UNREAD_CODES = frozenset({"unreadable"})
 # webview_unreadable is land_judge's stop after three live webview reads timed out, the same slow read
 # (gcp-agent-lane-10, 2026-11-22: cmux#48009, #49213, #48839 stopped on it, each read "took over 40 s").
 LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unreadable"})
-# land_judge's land-tier stop (leo-workspace tools/land_judge/rules/land_tier.py): cmux's pending cmux/land-tier
+# land_judge's land-tier stops (leo-workspace tools/land_judge/rules/land_tier.py): cmux's pending cmux/land-tier
 # status asks for ready-to-land, which land_judge adds itself. The broker never adds that label for a lane ("a
 # maintainer's waiver or autoland's queue"), so on a lane VM the add always fails and the land stopped with a `gh pr
 # edit` the lane cannot run (cmux#53696, 2026-11-24). A broker client hands it to the broker host's land queue, whose
 # land_judge adds the label with its own login under the same rule and waits for the full tier.
-LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending"})
+# full_tier_label is the same stop for cmuxterm-hq (land_judge/rules/ci_tier.py: only `ci tier: cheap` passed, so the
+# land adds land-ci): its add went through the broker as pr_edit, which a glaeda job with no lane session cannot
+# lease and whose pr_labels never list land-ci (hq#23688, 2026-11-24, "lease acquisition requires a lane session").
+LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
 # live judgments within LAND_EARLY_HANDOFF_WINDOW read nothing for a transient reason (LAND_HANDOFF_UNREAD,

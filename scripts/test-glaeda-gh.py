@@ -30409,13 +30409,15 @@ class LandTest(Base):
         # cmux#53696, 2026-11-24: land_judge refused land_tier_pending (cmux/land-tier pending, needs ready-to-land) and
         # its label add went through the broker, which never sets that label for a lane: the land stopped on a `gh pr
         # edit` the lane could not run. The broker host's queue adds it with its own login.
+        # hq#23688, 2026-11-24: full_tier_label, the same stop for cmuxterm-hq's land-ci label, ended the land with
+        # "lease acquisition requires a lane session" from the broker's pr_edit.
         self.broker = True
         self.pr(LA)
+        self.assertEqual(gg.LAND_HANDOFF_BROKER_ONLY, {"land_tier_pending", "full_tier_label"})
         with mock.patch.object(gg, "policy_host", lambda: "host"):
             self.land(requester="host/lane")
-            self.w.answers.append(refusal("land_tier_pending", LA, {"kind": "stop"},
-                                          reason="land-judge: refused: cmux/land-tier is pending and the PR needs "
-                                                 "ready-to-land"))
+            self.w.answers.append(refusal("full_tier_label", LA, {"kind": "stop"},
+                                          reason="land-judge: refused: the full CI tier has not run at the head"))
             e = self.tick()
         [call] = self.handoffs()
         self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
@@ -30423,8 +30425,8 @@ class LandTest(Base):
         self.broker = False
 
     def test_a_land_tier_stop_stays_local_on_a_host_with_its_own_login(self):
-        self.assertEqual(self.q.unjudgeable_here({"state": "waiting"}, {"code": "land_tier_pending", "reason": "x"},
-                                                 {}, LA), "")
+        for code in ("land_tier_pending", "full_tier_label"):
+            self.assertEqual(self.q.unjudgeable_here({"state": "waiting"}, {"code": code, "reason": "x"}, {}, LA), "")
 
     def test_a_judgment_that_read_nothing_stays_local_off_a_lane_vm_or_without_a_full_head(self):
         # A host with its own login keeps judging (unread_repeated's run); so does a VM that has no full head to pin.
