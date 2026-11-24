@@ -65,6 +65,7 @@ HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
 # Base shortens it for every test; the grace test checks the value that ships
 SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
+os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -41743,6 +41744,71 @@ class StableTempNameTests(unittest.TestCase):
         if not source:
             self.skipTest("glaeda-gh source not found")
         self.assertNotRegex(source, r"with_name\(f\"\.\{path\.name\}\.\{os\.getpid\(\)\}")
+
+
+class MainWatchTriggersFastPatch(unittest.TestCase):
+    """The main watch: an anonymous ls-remote of glaeda main, and `fast-patch glaeda TIP` when main moved."""
+
+    TIP = "a" * 40
+    LIVE = "b" * 40
+
+    def ls_remote(self, out: str, code: int = 0):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, code, out, "")
+        return runner, calls
+
+    def test_tip_from_an_anonymous_ls_remote(self):
+        runner, calls = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+        self.assertEqual(gg.main_tip(runner), self.TIP)
+        self.assertIn("credential.helper=", calls[0])  # no login asked for: the repo is public
+        self.assertEqual(gg.main_tip(self.ls_remote("", 128)[0]), None)
+        self.assertEqual(gg.main_tip(self.ls_remote("junk\n")[0]), None)
+
+    def test_due_only_when_main_moved_and_not_after_a_rollback(self):
+        due = gg.main_watch_due
+        self.assertIsNone(due(self.TIP, self.TIP, {}, [], 100.0))
+        self.assertEqual(due(self.TIP, self.LIVE, {}, [], 100.0), "first try")
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 90.0}, [], 100.0))  # in flight
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "rolled-back"}], 9e9))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "live"}], 9e9))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 1, "at": 50.0}, [{"outcome": "refused"}], 100.0))
+        self.assertTrue(due(self.TIP, self.LIVE, {"tries": 1, "at": 0.0}, [{"outcome": "refused"}], 500.0))
+        self.assertIsNone(due(self.TIP, self.LIVE, {"tries": 3, "at": 0.0}, [{"outcome": "refused"}] * 3, 9e9))
+
+    def test_a_step_starts_one_run_and_remembers_it_across_a_reexec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            runner, _ = self.ls_remote(f"{self.TIP}\trefs/heads/main\n")
+            spawned = []
+            clock = [1000.0]
+            watch = gg.MainWatch("/bin/fast-patch", state, runner,
+                                 lambda argv, **kw: spawned.append((argv, kw)), lambda: clock[0])
+            self.assertEqual(watch.step(), "first try")
+            self.assertEqual(spawned[0][0], ["/bin/fast-patch", "glaeda", self.TIP, "--json"])
+            self.assertEqual(spawned[0][1]["env"]["FAST_PATCH_TRIGGER"], "main-watch")
+            clock[0] += 3
+            again = gg.MainWatch("/bin/fast-patch", state, runner, lambda argv, **kw: spawned.append(argv),
+                                 lambda: clock[0])  # the image after the patch's re-exec
+            self.assertIsNone(again.step())  # in flight: its line is not written yet
+            self.assertEqual(len(spawned), 1)
+            gg.write_json(state / "glaeda" / "live.json", {"commit": self.TIP, "tools": {"glaeda-gh": "sha-new"}})
+            with mock.patch.dict(gg.RUNNING_SCRIPT, {"scriptSha256": "sha-new"}):
+                self.assertIsNone(again.step())  # live: nothing to do
+            self.assertEqual(len(spawned), 1)
+
+    def test_a_failing_read_backs_off(self):
+        watch = gg.MainWatch("/bin/fast-patch", Path(tempfile.gettempdir()), self.ls_remote("", 128)[0],
+                             lambda *a, **k: None)
+        watch.step()
+        watch.step()
+        self.assertEqual(watch.every, gg.MAIN_WATCH_EVERY * 4)
+
+    def test_off_by_env(self):
+        with mock.patch.dict(os.environ, {"GLAEDA_FAST_PATCH_WATCH": "0"}):
+            self.assertIsNone(gg.start_main_watch())
 
 
 if __name__ == "__main__":

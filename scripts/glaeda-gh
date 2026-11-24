@@ -23351,6 +23351,175 @@ def script_changed(path: Path, seen: dict) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- main watch: a glaeda merge live in seconds
+# Leo, 2026-11-23: "hm. i feel like there should be ways for you guys to incrementally fast-patch controllers and etc
+# etc stuff that goes over network intra network etc". The release ring put a glaeda merge live in p50 1,034 s, p95
+# 1,841 s (11 releases, 2026-11-24): most of it the canary promote wait. leo-workspace tools/fast-patch puts a main
+# commit live here in seconds (main check, fetch, swap, health read, rollback); this watch is its trigger, and the ring
+# stays as the reconciler (glaeda-update leaves a patched file alone until a release includes its commit).
+#
+# The trigger is an anonymous `git ls-remote` of main (the repo is public): no token, no broker, no REST or GraphQL
+# point, one small HTTPS answer (~0.3 s). Per host it is MAIN_WATCH_EVERY apart, so ~80 hosts ask ~1,600 times a
+# minute from ~80 addresses, which GitHub's per-token REST limits (900 points a minute, secondary) never see; a polled
+# REST read through one lane broker token would have been over them. A webhook would need a public receiver and repo
+# admin; this needs neither, and at 3 s a merge is seen p50 1.5 s, worst 3 s after it lands.
+MAIN_WATCH_REPO = "teamleaderleo/glaeda"
+MAIN_WATCH_URL = f"https://github.com/{MAIN_WATCH_REPO}"
+MAIN_WATCH_EVERY = 3.0  # seconds between two reads of main
+MAIN_WATCH_MAX_EVERY = 60.0  # a failing read backs off, doubling, to this
+MAIN_WATCH_READ_BOUND = 10.0  # one ls-remote
+MAIN_WATCH_RUN_BOUND = 1000.0  # one fast-patch run: its health deadline (30 s) plus glaeda's own drain bound (900 s)
+MAIN_WATCH_RETRY = 120.0  # a commit whose run was refused (a fetch that failed) is tried again after this
+MAIN_WATCH_TRIES = 3  # and at most this often; a commit that rolled back is never tried again (the next merge is)
+MAIN_WATCH_ENV = "GLAEDA_FAST_PATCH_WATCH"  # "0": no watch on this host (the ring alone installs)
+FAST_PATCH_BIN_ENV = "FAST_PATCH_BIN"  # the fast-patch program (else leo-workspace's, else PATH's)
+
+
+def fast_patch_state() -> Path:
+    return Path(os.environ.get("FAST_PATCH_STATE") or Path.home() / ".local/state/fast-patch")
+
+
+def fast_patch_program() -> str | None:
+    """The fast-patch to run: FAST_PATCH_BIN, else ~/Projects/leo-workspace/tools/fast-patch, else `fast-patch` on
+    PATH; None when there is none (the watch stays off)."""
+    named = os.environ.get(FAST_PATCH_BIN_ENV)
+    for candidate in ([named] if named else []) + [os.fspath(Path.home() / "Projects/leo-workspace/tools/fast-patch")]:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("fast-patch")
+
+
+def main_tip(runner: Callable = subprocess.run) -> str | None:
+    """MAIN_WATCH_REPO's main commit from one anonymous ls-remote, or None (unreachable, or no answer)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/true"}
+    try:
+        done = runner(["git", "-c", "credential.helper=", "-c", "protocol.version=2", "ls-remote", MAIN_WATCH_URL,
+                       "refs/heads/main"], capture_output=True, text=True, timeout=MAIN_WATCH_READ_BOUND,
+                      stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (done.stdout or "").splitlines() if done.returncode == 0 else []:
+        words = line.split()
+        if len(words) == 2 and words[1] == "refs/heads/main" and len(words[0]) == 40:
+            return words[0]
+    return None
+
+
+def fast_patch_runs(state: Path, commit: str, since: float) -> list[dict]:
+    """fast-patch's glaeda run lines for COMMIT written at or after SINCE (epoch), oldest first."""
+    try:
+        with (state / "runs.jsonl").open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256 * 1024))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        if commit not in line:
+            continue
+        with contextlib.suppress(ValueError):
+            doc = json.loads(line)
+            at = iso_epoch(doc.get("at")) if isinstance(doc, dict) else None
+            if doc.get("service") == "glaeda" and doc.get("commit") == commit and at is not None and at >= since - 1:
+                out.append(doc)
+    return out
+
+
+def main_watch_due(tip: str, live: str | None, tried: dict, runs: list[dict], now: float) -> str | None:
+    """Why the watch starts a run for TIP now, or None. LIVE: the commit fast-patch put live here and this daemon runs;
+    TRIED: this commit's {"tries", "at"} (the last start, epoch); RUNS: its run lines since its first try."""
+    if tip == live:
+        return None
+    outcomes = [r.get("outcome") for r in runs]
+    if any(o in ("rolled-back", "rollback-unhealthy") for o in outcomes):
+        return None  # it missed its health read once: the next merge, or the ring, moves this host on
+    if "live" in outcomes:
+        return None  # live already (the daemon re-execs onto it within a tick or its own drain)
+    tries, at = int(tried.get("tries") or 0), float(tried.get("at") or 0)
+    if tries and len(runs) < tries and now - at < MAIN_WATCH_RUN_BOUND:
+        return None  # a run is in flight (its line is written when it ends)
+    if tries >= MAIN_WATCH_TRIES:
+        return None
+    if tries and now - at < MAIN_WATCH_RETRY:
+        return None
+    return "first try" if not tries else f"try {tries + 1} (last: {outcomes[-1] if outcomes else 'no line'})"
+
+
+class MainWatch:
+    """The thread serve starts: reads main every MAIN_WATCH_EVERY and starts `fast-patch glaeda TIP` when main moved
+    past what this host runs. Its memory (STATE/glaeda/watch.json) outlives the re-exec a patch causes."""
+
+    def __init__(self, program: str, state: Path | None = None, runner: Callable = subprocess.run,
+                 spawn: Callable = spawn_detached, clock: Callable[[], float] = time.time):
+        self.program, self.state = program, state or fast_patch_state()
+        self.runner, self.spawn, self.clock = runner, spawn, clock
+        self.every = MAIN_WATCH_EVERY
+        self.seen: dict[str, float] = {}  # tip -> when this image first saw it
+
+    @property
+    def memory(self) -> Path:
+        return self.state / "glaeda" / "watch.json"
+
+    def live_commit(self) -> str | None:
+        """The commit fast-patch's pin names when its bytes are the ones this daemon runs."""
+        doc = read_json(self.state / "glaeda" / "live.json")
+        if not isinstance(doc, dict):
+            return None
+        tools = doc.get("tools") if isinstance(doc.get("tools"), dict) else {}
+        running = RUNNING_SCRIPT.get("scriptSha256")
+        return doc.get("commit") if running and running in tools.values() else None
+
+    def step(self) -> str | None:
+        """One read of main and what it led to; the delay before the next is self.every."""
+        tip = main_tip(self.runner)
+        if tip is None:
+            self.every = min(MAIN_WATCH_MAX_EVERY, self.every * 2)
+            return None
+        self.every = MAIN_WATCH_EVERY
+        now = self.clock()
+        seen_at = self.seen.setdefault(tip, now)
+        memory = read_json(self.memory)
+        memory = memory if isinstance(memory, dict) else {}
+        tried = memory.get(tip) if isinstance(memory.get(tip), dict) else {}
+        runs = fast_patch_runs(self.state, tip, float(tried.get("first") or now)) if tried else []
+        why = main_watch_due(tip, self.live_commit(), tried, runs, now)
+        if why is None:
+            return None
+        env = {**os.environ, "FAST_PATCH_TRIGGER": "main-watch", "FAST_PATCH_SEEN_AT": f"{seen_at:.3f}"}
+        env.pop(GRAPHQL_SLOT_ENV, None)
+        out = self.state / "glaeda" / "watch-run.log"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("ab") as sink:
+            self.spawn([self.program, "glaeda", tip, "--json"], bound=MAIN_WATCH_RUN_BOUND, env=env,
+                       stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
+        entry = {"tries": int(tried.get("tries") or 0) + 1, "at": now, "first": tried.get("first") or now}
+        keep = {k: v for k, v in memory.items() if isinstance(v, dict) and now - float(v.get("at") or 0) < 86400}
+        write_json(self.memory, {**keep, tip: entry})
+        log({"event": "fast-patch-start", "commit": tip, "why": why, "seenS": round(now - seen_at, 2)})
+        return why
+
+    def run(self) -> None:
+        while True:
+            try:
+                self.step()
+            except Exception as error:  # noqa: BLE001  the watch keeps going; the ring still installs
+                log({"event": "error", "error": describe(error), "site": "main-watch"})
+            time.sleep(self.every)
+
+
+def start_main_watch() -> MainWatch | None:
+    """The main watch's thread, unless GLAEDA_FAST_PATCH_WATCH=0 or this host has no fast-patch."""
+    if os.environ.get(MAIN_WATCH_ENV) == "0":
+        return None
+    program = fast_patch_program()
+    if program is None:
+        return None
+    watch = MainWatch(program)
+    threading.Thread(target=watch.run, name="glaeda-gh-main-watch", daemon=True).start()
+    return watch
+
+
 def serve(foreground_ok: bool = False) -> int:
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
@@ -23375,6 +23544,8 @@ def serve(foreground_ok: bool = False) -> int:
                         where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
                         reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
     watchdog.start()
+    with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
+        start_main_watch()
     last = None
     while True:
         try:
