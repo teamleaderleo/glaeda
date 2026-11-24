@@ -16144,6 +16144,20 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
 
+    def test_a_queued_update_branch_carries_the_checks_that_need_the_newer_base_to_the_broker(self) -> None:
+        """gcp-agent-lane-11, 2026-11-24 18:19Z: `gh pr update-branch N --needs-newer-base C` refused "paced" twice,
+        the queue having no form for the flag. It is the broker's base_merge_gate's word, sent as needs_newer_base."""
+        sha = "c" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, "--needs-newer-base", "A (x)",
+                          "--needs-newer-base", "B", stdin="")
+        self.assertEqual(item["needsNewerBase"], ["A (x)", "B"])
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "expected_head_sha": sha,
+                                                 "needs_newer_base": ["A (x)", "B"]})
+        with self.assertRaises(gg.WatchError):
+            self.queue("comment", "o/r#7", "--needs-newer-base", "A", "--body", "x")
+
     def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
         """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
         login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
@@ -22892,6 +22906,20 @@ class ReexecDrainTest(Base):
         self.daemon.land_queue, self.daemon.script_cut, self.daemon.phase_now = None, True, "reads"
         self.daemon.finish_tick([], [], [], [], [])
         self.assertIsNone(self.daemon.phase_now, "the end of the tick writes: no leap there")
+
+    def test_a_lane_vms_upstream_tick_offers_the_jump_in_its_reads(self) -> None:
+        """A lane VM, 2026-11-24, merge 855cbf92: the tick read through the broker (upstream_tick), in phases the jump
+        did not name, and serve re-exec'd 22.85 s after the wake."""
+        self.assertLessEqual({"read upstream", "read direct", "reads"}, gg.JUMP_PHASES)
+        self.assertNotIn("outbox", gg.JUMP_PHASES)
+        seen: list = []
+        with mock.patch.object(self.daemon, "watches", return_value=[]), \
+                mock.patch.object(gg, "lane_vm_poster", return_value=False), \
+                mock.patch.object(self.daemon, "upstream_refuse_posts"), \
+                mock.patch.object(self.daemon, "finish_tick",
+                                  side_effect=lambda *a: seen.append(self.daemon.phase_now) or {}):
+            self.daemon.upstream_tick(lambda req: {})
+        self.assertEqual(seen, ["reads"], "the upstream tick's reads offer the jump until finish_tick")
 
     def test_claimed_running_asks_without_reaping(self) -> None:
         done, running = mock.Mock(), mock.Mock()

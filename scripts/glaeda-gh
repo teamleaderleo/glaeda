@@ -9909,6 +9909,7 @@ class Daemon:
             self.upstream_refuse_posts()
         with self.phase("watches"):
             entries = self.watches()
+        self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
         for e in entries:
@@ -23606,7 +23607,10 @@ def script_changed(path: Path, seen: dict) -> bool:
 
 
 SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
-JUMP_PHASES = frozenset({"watches", "controller", "due", "reads"})  # tick phases that only read (Daemon.reexec_now)
+# Tick phases that only read (Daemon.reexec_now). "read upstream" and "read direct" are a lane VM's: its tick reads
+# through the broker (upstream_tick), and a lane VM, 2026-11-24, merge 855cbf92, re-exec'd 22.85 s after the wake
+# from serve, the jump never offered: its tick was in a phase this set did not name.
+JUMP_PHASES = frozenset({"watches", "controller", "due", "reads", "read upstream", "read direct"})
 
 
 class ScriptWake:
@@ -34220,6 +34224,16 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("--sha is for post update-branch: the full 40-hex head it pins")
         if sha:
             item["expectedHead"] = sha.lower()
+        needs = getattr(args, "needs_newer_base", None)
+        needs = [str(n) for n in needs if str(n).strip()] if isinstance(needs, list) else []
+        if needs and args.kind != "update-branch":
+            raise WatchError("--needs-newer-base is for post update-branch: the check that needs the newer base")
+        if needs:
+            # The broker's update_branch refuses a SHIP'd head's base merge unless the check that needs it is named
+            # (lane-gh base_merge_gate): a lane VM's `gh pr update-branch --needs-newer-base C` the gh shim queues on
+            # the login's create pause (gcp-agent-lane-11 2026-11-24 18:19Z: 2 refused "paced", "the queue has no
+            # form for gh pr update-branch --needs-newer-base") carries it here. A login's REST PUT has no such gate.
+            item["needsNewerBase"] = needs
         key = getattr(args, "status_key", None)
         if key is not None and not isinstance(key, str):
             key = None  # a caller's own namespace without the flag (an older argv, a test's Mock)
@@ -34394,7 +34408,8 @@ def broker_post_args(item: dict) -> tuple[str, dict] | None:
                       "title": item["title"], "body": item["body"]}
     if tool == "update_branch":
         return tool, {"repo": item["repo"], "number": item["number"],
-                      **({"expected_head_sha": item["expectedHead"]} if item.get("expectedHead") else {})}
+                      **({"expected_head_sha": item["expectedHead"]} if item.get("expectedHead") else {}),
+                      **({"needs_newer_base": list(item["needsNewerBase"])} if item.get("needsNewerBase") else {})}
     return tool, {"repo": item["repo"], "number": item["number"], "body": item["body"]}
 
 
@@ -36096,6 +36111,9 @@ def parser() -> argparse.ArgumentParser:
                          "out ahead of every other queued write (review receipts are recognized without it)")
     po.add_argument("--sha", metavar="HEAD",
                     help="update-branch: the full 40-hex head to pin (a PR whose head moved is retired, not updated)")
+    po.add_argument("--needs-newer-base", action="append", metavar="CHECK",
+                    help="update-branch: a check that needs the newer base (repeatable); a lane VM's broker takes a "
+                         "SHIP'd head's base merge only with it")
     po.add_argument("--json", action="store_true")
     lg = sub.add_parser("log", help="a finished job's log, read once per host (cache, build controller, then REST)")
     lgs = lg.add_subparsers(dest="kind", required=True, parser_class=Parser)
