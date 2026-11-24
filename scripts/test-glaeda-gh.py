@@ -16144,6 +16144,20 @@ class PostTest(unittest.TestCase):
         self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
 
+    def test_a_queued_update_branch_carries_the_checks_that_need_the_newer_base_to_the_broker(self) -> None:
+        """gcp-agent-lane-11, 2026-11-24 18:19Z: `gh pr update-branch N --needs-newer-base C` refused "paced" twice,
+        the queue having no form for the flag. It is the broker's base_merge_gate's word, sent as needs_newer_base."""
+        sha = "c" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, "--needs-newer-base", "A (x)",
+                          "--needs-newer-base", "B", stdin="")
+        self.assertEqual(item["needsNewerBase"], ["A (x)", "B"])
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 7, "expected_head_sha": sha,
+                                                 "needs_newer_base": ["A (x)", "B"]})
+        with self.assertRaises(gg.WatchError):
+            self.queue("comment", "o/r#7", "--needs-newer-base", "A", "--body", "x")
+
     def test_a_lane_vm_queued_write_replayed_with_no_session_is_made_in_its_callers_lane(self) -> None:
         """gcp-agent-lane-11, 2026-11-23: 3 of 3 creates of lane/quiet-connect-cloud-carry that gh-quota queued on the
         login's create pause failed in the daemon: "the lane-gh broker did not make it: lane-gh: pr_create: lease
