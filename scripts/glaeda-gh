@@ -4392,8 +4392,8 @@ def broker_transport(command: list[str], deadline: Callable[[], float]) -> Calla
             direct_busy_note(why, time.time())
             return 502, {}, json.dumps({"message": gh_said(f"direct: {why}", limit=UPSTREAM_ERROR_MAX)}).encode()
         data = answer.get("data")
-        if status == 403 and isinstance(data, dict) and isinstance(data.get("message"), str):
-            direct_busy_note(data["message"], time.time())
+        if status == 403 and isinstance(data, dict) and gh_said(data, limit=None):
+            direct_busy_note(gh_said(data, limit=None), time.time())
         elif status < 400:
             direct_busy_note(None, time.time())
         return status, {}, json.dumps(data).encode()
