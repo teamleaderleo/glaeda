@@ -2093,23 +2093,54 @@ def touch_interest(key: str) -> None:
         pass
 
 
+def stable_replace(path: Path, data: bytes, keep_mode: bool = False) -> None:
+    """Replace PATH with DATA through one temp name per target, `.NAME.tmp` beside it, never a PID, time or random
+    suffix. macOS fseventsd keeps a record of every distinct path it has seen until reboot: a new temp name per write
+    (`.NAME.PID.NS.tmp`) made each cache, watch and answer write a new path, and on cosmic-gray (2026-11-24) the cache
+    was among the top makers of new paths while fseventsd held a 31 GB footprint. Writers in one folder take turns on a
+    flock of the folder itself (no lock file, so no extra path) from opening the temp to renaming it, so two never
+    share it. The temp is opened O_NOFOLLOW and must be a plain file with one link (a planted link is removed, never
+    written through). Created 0600; with KEEP_MODE it takes the target's own mode (a replace with the umask's mode
+    turned a 0600 file into 0644: leo-workspace#5398's BLOCK). A write cut off (a full disk, a deadline's exception)
+    removes its temp: huge-blue's cache held dozens of zero-byte temps, some days old (2026-11-11)."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    folder = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fcntl.flock(folder, fcntl.LOCK_EX)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                os.close(fd)
+                os.unlink(tmp)
+                fd = os.open(tmp, flags | os.O_EXCL, 0o600)
+            try:
+                os.ftruncate(fd, 0)
+                mode = 0o600
+                if keep_mode:
+                    with contextlib.suppress(FileNotFoundError):
+                        mode = stat.S_IMODE(os.stat(path).st_mode)
+                os.fchmod(fd, mode)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(folder, fcntl.LOCK_UN)
+        os.close(folder)
+
+
 def write_json(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    try:
-        # Created 0600, then given the target's own mode: a replace with the umask's mode turned a 0600 file into
-        # 0644 (leo-workspace#5398's BLOCK). A new file stays 0600.
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as handle:
-            with contextlib.suppress(FileNotFoundError):
-                os.fchmod(handle.fileno(), stat.S_IMODE(os.stat(path).st_mode))
-            handle.write(json.dumps(doc, sort_keys=True) + "\n")
-        os.replace(tmp, path)
-    except BaseException:
-        # A write cut off (a full disk, or a deadline's exception raised into it) left its empty temporary file behind
-        # for good: huge-blue's cache held dozens of zero-byte .budget.json.*.tmp files, some days old (2026-11-11).
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    stable_replace(path, (json.dumps(doc, sort_keys=True) + "\n").encode(), keep_mode=True)
 
 
 def read_json(path: Path) -> Any:
@@ -5427,16 +5458,11 @@ def attempt_jobs_put(repo: str, run_id: int, attempt: int, jobs: list[dict]) -> 
     """Keep that completed attempt's job list, replaced whole, then evict past the cap. Never raises: a full disk
     only means the next read asks GitHub."""
     path = attempt_jobs_path(repo, run_id, attempt)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
-                                              "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
-        os.replace(tmp, path)
+        stable_replace(path, gzip.compress(json.dumps({"repo": repo.lower(), "run": int(run_id), "attempt": int(attempt),
+                                                       "jobs": jobs}, separators=(",", ":")).encode(), mtime=0))
     except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
         return
     kept_evict(BASE / ATTEMPT_JOBS_DIR, ".json.gz", ATTEMPT_JOBS_MAX_BYTES)
 
@@ -23018,9 +23044,7 @@ def refresh_log_write(line: str) -> None:
             data = path.read_bytes()
             keep = data[len(data) - REFRESH_LOG_MAX // 2:]
             keep = keep[keep.find(b"\n") + 1:] if b"\n" in keep else b""
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(keep)
-            tmp.replace(path)
+            stable_replace(path, keep)
     except Exception:  # noqa: BLE001
         pass
 
@@ -31984,17 +32008,12 @@ def gh_cache_final_put(key: str, at: float, out: bytes, err: bytes, run: tuple[s
     if len(out) + len(err) > GH_CACHE_MAX_BYTES * 4:
         return
     path = gh_cache_final_path(key)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
     doc = {"key": key, "at": at, "out": base64.b64encode(out).decode(), "err": base64.b64encode(err).decode(),
            **({"run": list(run)} if run else {})}
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(json.dumps(doc).encode(), mtime=0))
-        os.replace(tmp, path)
+        stable_replace(path, gzip.compress(json.dumps(doc).encode(), mtime=0))
     except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
         return
     with contextlib.suppress(Exception):
         gh_cache_final_evict()
@@ -34157,15 +34176,7 @@ def job_log_put(repo: str, job: int, text: bytes) -> None:
         return
     path = job_log_path(repo, job)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    try:
-        with open(tmp, "wb") as f:
-            f.write(gzip.compress(text, compresslevel=6, mtime=0))
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    stable_replace(path, gzip.compress(text, compresslevel=6, mtime=0))
     job_logs_evict()
 
 
