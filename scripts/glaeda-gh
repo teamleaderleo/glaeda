@@ -168,9 +168,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   of waits on it: a REST read of a commit, a pull or a run's job list serves every watch on it (repo_parts). daemon.json's spendBy holds the hour's top routes and callers,
   which `budget` prints and the fleet's quota readers (gh_quota.py spenders, ci-dash) can read with no API call.
 - Alarms, before the pool is empty rather than after. The pool alarm (policy "alarms": {"pool": true}, on one
-  host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000), its
-  drain over the last minutes runs it dry before its reset, or that drain is past alarms.paceShare (0.5) of the
-  hourly limit (42 a minute of 5000); it names the host's top REST callers (gh-quota usage) as well as this
+  host: the pool is the account's) fires when the poorest REST counter is under the REST reserve, or its drain
+  over the last minutes runs it dry at least 5 minutes before its reset (ALARM_DRY_MARGIN); a pool on track to its
+  reset is no alarm, however low its count (alarms.restLeft) or fast its drain (past alarms.paceShare, 0.5, of the
+  hourly limit, which the alarm names); it names the host's top REST callers (gh-quota usage) as well as this
   daemon's routes and their waiters. The share alarm (every host) when this daemon's own counted REST over
   the measured last hour is past its cap while the login's REST pool is under its floor (floors.rest), naming
   the one caller to slow (the host's top gh caller, or the daemon's top waiter); past the cap with the pool
@@ -470,10 +471,18 @@ NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
 ALARM_EVERY = 3600.0
 SHARE_ALARM_FLOOR = 50  # counted REST an hour under which the share alarm stays quiet, whatever the cap (a cap of 0: its exempt reads)
-ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the poorest core counter
+ALARM_REST_LEFT = 1000  # policy alarms.restLeft, kept readable; no alarm on a count alone (ALARM_DRY_MARGIN)
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
 ALARM_FIRE_WITHIN = 600.0  # a pool projected empty within this, or under the REST reserve, is a FIRE
+# On track: a pool projected dry less than this before its reset lasts to it, so it is no alarm at all (Leo,
+# 2026-11-22 12:24Z, about "URGENT shared GitHub REST pool: 587 left, draining 112.6/min ..., dry at
+# 12:28Z, resets 12:29Z.": "ok... if it's right on track, why is it even firing? dont fire for bullshit"). The same
+# 5 minutes as cmuxterm-hq quota_outage.py's LOW rule. A low count (restLeft) or a fast pace (paceShare) alone is no
+# alarm either: reads ask the Apps first (land-judge, glaeda, ci-watch, quota-goblin), so the login's count is not the
+# fleet's (12:26Z: "you guys can simply have that stuff route to quota-goblin-9000 or quota-goblin-9001, so it's not
+# actually 12.5k. it's crying wolf for obsolete views."). The pace is still named in an alarm the projection sends.
+ALARM_DRY_MARGIN = 300.0
 # The pace alarm: the pool draining faster than this share of its hourly limit (policy alarms.paceShare). Half of
 # 5000 is 42 a minute. On 2026-11-10 (11:23Z) the pool drained at 158 a minute and the alarm said so only once it
 # projected dry 25 minutes out; at half the limit there is still an hour's room to find the caller.
@@ -6413,7 +6422,7 @@ class Daemon:
             rate = (first[1] - remaining) / (at - first[0])  # per second
             out["perMinute"] = round(rate * 60, 1)
             dry = at + remaining / rate
-            if dry < reset:
+            if dry <= reset - ALARM_DRY_MARGIN:  # dry later than that lasts to the reset: on track (ALARM_DRY_MARGIN)
                 out["dryAt"] = dry
         return out
 
@@ -6728,14 +6737,13 @@ class Daemon:
             held.add("pool")  # its window is about to reset: no news either way
         if policy.get("pool") and pool is not None and pool["reset"] - self.now > 60:
             left, reset = pool["remaining"], pool["reset"]
-            low = left < policy.get("restLeft", ALARM_REST_LEFT)
             limit = (self.budget.get("rest") or {}).get("limit") or 5000
             share = policy.get("paceShare", ALARM_PACE_SHARE)
             fast = isinstance(share, (int, float)) and share > 0 and pool["perMinute"] is not None \
                 and pool["perMinute"] * 60 >= share * limit
-            if low or fast or pool["dryAt"] is not None:
-                fire = left < self.policy["floors"]["rest"][1] or (
-                    pool["dryAt"] is not None and pool["dryAt"] - self.now < ALARM_FIRE_WITHIN)
+            reserve = left < self.policy["floors"]["rest"][1]
+            if reserve or pool["dryAt"] is not None:  # on track to its reset is no alarm (ALARM_DRY_MARGIN)
+                fire = reserve or (pool["dryAt"] is not None and pool["dryAt"] - self.now < ALARM_FIRE_WITHIN)
                 pace = f", draining {pool['perMinute']}/min" if pool["perMinute"] else ""
                 if fast:
                     pace += f" (past {share:.0%} of its {limit} an hour, {share * limit / 60:.0f}/min)"
@@ -13220,6 +13228,11 @@ def land_direct_read(key: str) -> str | None:
 #   handed off when that step ends; a request for it in the meantime is applied here first, so the handoff carries it.
 LAND_EXECUTOR_KEY = "executor"
 LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's --wait)
+# `reach` ends a far command after 1800 s (REMOTE_TIMEOUT_S in leo-workspace tools/reach). A forwarded land's --wait/--max
+# past it rode that bound and the forward died with "no answer" though the land was queued (#53013, 2026-11-24): the
+# executor's wait is clamped so the answer comes, with the land's state, before reach ends the command.
+LAND_FORWARD_REACH_BOUND = 1800.0
+LAND_FORWARD_MAX_WAIT = LAND_FORWARD_REACH_BOUND - 120.0 - LAND_FORWARD_DEADLINE
 LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
 LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
@@ -22415,9 +22428,9 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
     rid = f"{policy_host()}-{time.time_ns()}-{os.getpid()}"
     lane = land_queue_lane()
     req = {"op": "land", "target": f"{repo}#{number}", "after": targets, "requester": requester,
-           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
+           "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": min(wait, LAND_FORWARD_MAX_WAIT), "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
-        | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
+        | ({"max": min(Leash(wait, ceiling).ceiling, LAND_FORWARD_MAX_WAIT)} if wait > 0 else {}) \
         | ({"override": override} if override else {}) \
         | ({"nominated": nominated} if nominated is not None else {})
     why = land_forward_pending(name, time.time()) if land_outbox_busy(key) else ""
