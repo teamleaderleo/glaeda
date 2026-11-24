@@ -8111,21 +8111,30 @@ def side_seed_waiters(capacity_dir: Path) -> int:
 
 def side_seed_wait(why: str, capacity_dir: Path | None, gone: Callable[[], str | None],
                    roots: tuple[Path, ...] | None = None, bound: float | None = None,
-                   poll: float = SIDE_SEED_POLL_S) -> tuple[str | None, str | None]:
+                   poll: float = SIDE_SEED_POLL_S, cold_room: float | None = None) -> tuple[str | None, str | None]:
     """SIDE_SEED_WAIT: wait for a free seed root. Returns (refusal, None) past the bound or with every waiter slot
-    taken, (None, cause) when gone() names a cause to give up, and (None, None) once a seed root is free."""
+    taken, (None, cause) when gone() names a cause to give up, and (None, None) once a seed root is free. With
+    cold_room (SIDE_SEED_LIMIT: the seconds the job may still wait and then build cold inside its limit) it waits
+    at most that long too, and past it, or with every slot taken, is admitted to build cold, not refused."""
     bound = side_seed_wait_bound() if bound is None else bound
     slots = len(seed_roots() if roots is None else roots)
+    past = (why, None) if cold_room is None else (None, None)
+    if cold_room is not None:
+        bound = min(bound, max(0.0, cold_room))
     if bound <= 0 or capacity_dir is None:
-        return why, None
+        if cold_room is not None:
+            print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: a cold build fits this job's limit; admitted cold", flush=True)
+        return past
     if side_seed_waiters(capacity_dir) >= slots:
-        print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: {slots} waiter(s) already wait for a seed root here", flush=True)
-        return why, None
+        print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: {slots} waiter(s) already wait for a seed root here"
+              + ("; a cold build fits this job's limit, admitted cold" if cold_room is not None else ""), flush=True)
+        return past
     marker = capacity_dir / f"{SIDE_SEED_WAITER}{os.getpid()}"
     start = time.monotonic()
     print(f"{PREFIX}: {SIDE_SEED_WAIT} start: every seed root is held; waiting at most {bound:g} s for one to free "
-          "instead of refusing (a re-run waits out the Mac queue again)", flush=True)
-    outcome, result = "refused", (why, None)
+          + ("before it builds cold inside its limit" if cold_room is not None else
+             "instead of refusing (a re-run waits out the Mac queue again)"), flush=True)
+    outcome, result = ("refused", past) if cold_room is None else ("cold", past)
     try:
         with contextlib.suppress(OSError):
             capacity_dir.mkdir(parents=True, exist_ok=True)
@@ -8147,6 +8156,115 @@ def side_seed_wait(why: str, capacity_dir: Path | None, gone: Callable[[], str |
             marker.unlink()
         print(f"{PREFIX}: {SIDE_SEED_WAIT} end: {outcome} after {time.monotonic() - start:.0f} s", flush=True)
     return result
+
+
+# SIDE_SEED_LIMIT (2026-11-23): SIDE_SEED_FREE assumed the fast tier's ~20 min limit, which a cold build always ran
+# out. cmux#50862 raised it: cmux-next.yml's fast-tier timeout-minutes is 5 when the build fleet already gave a verdict
+# (the job only reports it and builds nothing), 35 when that verdict is "queued", 50 for an ffi_repin route, else 120.
+# Measured 18:14-22:06Z 11-23 (cmuxterm-hq docs/findings/2026-11-23-fast-tier-build-spread.md): 7 of the 12 PR fast
+# tiers that ran were refused at "Set up runner" by SIDE_SEED_FREE, while the 3 admitted cold (4 cores, a shared root)
+# built in 37-53 min and finished their jobs in 41-57 min, inside 120; a refusal costs a ~40 min re-queue plus up to
+# 15 min of SIDE_SEED_WAIT. So the refusal now holds only when a cold build cannot fit this job's own limit.
+# The runner gives a job's hooks no job env and no timeout (the server enforces it; the job message carries none), but
+# the Worker logs the job message, with its evaluated needs context, to _diag/Worker_*.log before any step: the hook
+# reads needs.fast-tier-fleet and needs.path_route there and applies cmux's timeout-minutes rule (FAST_TIER_LIMIT_RULE
+# names it; it must change with cmux-next.yml's). A job that builds nothing is admitted at once. With room for
+# SIDE_SEED_COLD_S after the time it has run, it waits for a seed root (SIDE_SEED_WAIT) only within that room and then
+# builds cold. Anything it cannot read (no log, another job's log, no needs) keeps SIDE_SEED_FREE's refusal as before.
+# Off switch: SIDE_SEED_LIMIT_OFF_ENV=1, or a SIDE_SEED_LIMIT_OFF_FILE in the capacity ledger, refuses as before.
+SIDE_SEED_LIMIT = "SIDE_SEED_LIMIT"
+SIDE_SEED_COLD_S = 60 * 60.0  # the slowest cold fast-tier job measured, 57.4 min, and a margin
+SIDE_SEED_LIMIT_OFF_ENV = "GLAEDA_SIDE_SEED_LIMIT_OFF"
+SIDE_SEED_LIMIT_OFF_FILE = "side-seed-limit.off"
+JOB_DIAG_ENV = "GLAEDA_JOB_DIAG_DIR"  # tests: the _diag directory instead of the job's runner's
+WORKER_JOB_MESSAGE = "Job message:"
+WORKER_LOG_HEAD = 16 * 1024 * 1024  # the job message is logged first; a large workflow's is a few MiB at most
+FAST_TIER_LIMIT_RULE = ("cmux-next.yml", "fast-tier")
+FLEET_DONE = ("success", "failure", "cancelled")
+
+
+def worker_job_message(diag: Path) -> tuple[dict[str, Any], float] | None:
+    """The job message the newest _diag/Worker_*.log starts with, and the epoch of that log's first line, or None."""
+    try:
+        names = sorted(n for n in os.listdir(diag) if n.startswith("Worker_") and n.endswith(".log"))
+        if not names:
+            return None
+        with open(diag / names[-1], "rb") as file:
+            head = file.read(WORKER_LOG_HEAD).decode("utf-8", "replace")
+    except OSError:
+        return None
+    stamp = DIAG_STAMP.match(head)
+    at = head.find(WORKER_JOB_MESSAGE)
+    start = head.find("{", at) if at >= 0 else -1
+    if stamp is None or start < 0:
+        return None
+    try:
+        message, _ = json.JSONDecoder().raw_decode(head, start)
+        started = datetime.datetime.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+    return (message, started) if isinstance(message, dict) else None
+
+
+def context_get(data: Any, key: str) -> Any:
+    """One key of a serialized PipelineContextData dictionary ({"t": 2 or 5, "d": [{"k", "v"}]}), or None."""
+    if isinstance(data, dict) and data.get("t") in (2, 5):
+        for pair in data.get("d") or ():
+            if isinstance(pair, dict) and pair.get("k") == key:
+                return pair.get("v")
+    return None
+
+
+def fast_tier_limit(message: Mapping[str, Any]) -> tuple[int, bool] | None:
+    """(timeout-minutes, whether it builds) of cmux-next.yml's fast tier from its job message's needs context, or
+    None when this is not that job or its needs do not read as expected. cmux-next.yml's rule, verbatim:
+    fleet done and verdict != queued: 5 (report only); verdict == queued: 35; ffi_repin: 50; else 120."""
+    context = next((v for k, v in message.items() if k.lower() == "contextdata"), None)
+    if not isinstance(context, dict):
+        return None
+    github = context.get("github")
+    for key, env in (("job", "GITHUB_JOB"), ("run_id", "GITHUB_RUN_ID")):
+        want = os.environ.get(env)
+        if want and context_get(github, key) != want:
+            return None  # another job's log
+    needs = context.get("needs")
+    fleet, route = context_get(needs, "fast-tier-fleet"), context_get(needs, "path_route")
+    if not isinstance(fleet, dict) or not isinstance(route, dict):
+        return None
+    verdict = context_get(context_get(fleet, "outputs"), "verdict") or ""
+    if context_get(fleet, "result") in FLEET_DONE and verdict != "queued":
+        return 5, False
+    if verdict == "queued":
+        return 35, True
+    return (50 if context_get(context_get(route, "outputs"), "ffi_repin") == "true" else 120), True
+
+
+def side_seed_cold_room(workflow: str, job: str, runner_dir: Path | None, capacity_dir: Path | None,
+                        now: float | None = None) -> tuple[float | None, str]:
+    """SIDE_SEED_LIMIT: (the seconds this fast tier may still wait for a seed root and then build cold inside its
+    limit, or None when it cannot or that is unknown; a note for the log). inf: it builds nothing."""
+    if (os.environ.get(SIDE_SEED_LIMIT_OFF_ENV) or "").strip() == "1" or (
+            capacity_dir is not None and (capacity_dir / SIDE_SEED_LIMIT_OFF_FILE).exists()):
+        return None, f"{SIDE_SEED_LIMIT} off: refused as before"
+    if (workflow, job) != FAST_TIER_LIMIT_RULE:
+        return None, f"{SIDE_SEED_LIMIT}: no limit rule for this job"
+    raw = os.environ.get(JOB_DIAG_ENV)
+    diag = Path(raw) if raw else runner_dir / "_diag" if runner_dir is not None else None
+    read = worker_job_message(diag) if diag is not None else None
+    limit = fast_tier_limit(read[0]) if read is not None else None
+    if read is None or limit is None:
+        return None, f"{SIDE_SEED_LIMIT}: this job's limit is unreadable (no job message with its needs)"
+    minutes, builds = limit
+    if not builds:
+        return math.inf, f"{SIDE_SEED_LIMIT}: its {minutes} min limit only reports the build fleet's verdict"
+    ran = max(0.0, (time.time() if now is None else now) - read[1])
+    room = minutes * 60 - ran - SIDE_SEED_COLD_S
+    if room < 0:
+        return None, (f"{SIDE_SEED_LIMIT}: a cold build ({SIDE_SEED_COLD_S / 60:g} min) does not fit its {minutes} min "
+                      f"limit after {ran / 60:.0f} min")
+    return room, (f"{SIDE_SEED_LIMIT}: a cold build ({SIDE_SEED_COLD_S / 60:g} min) fits its {minutes} min limit "
+                  f"after {ran / 60:.0f} min; {room:.0f} s to wait for a seed root first")
 
 
 def side_fit_units(scope: RunnerScope) -> int:
@@ -15826,7 +15944,11 @@ def main(argv: list[str] | None = None) -> int:
                 if owner is not None and owner.gone():
                     return OWNER_GONE
                 return JOB_CANCELLED if job_cancel_requested(job_runner_dir(JOB_CWD)) else None
-            why, cause = side_seed_wait(why, args.capacity_dir, seed_wait_gone)
+            cold_room, cold_note = side_seed_cold_room(job_workflow(), os.environ.get("GITHUB_JOB", ""),
+                                                       job_runner_dir(JOB_CWD), args.capacity_dir)
+            print(f"{PREFIX}: {cold_note}", flush=True)
+            why, cause = (None, None) if cold_room == math.inf else side_seed_wait(
+                why, args.capacity_dir, seed_wait_gone, cold_room=cold_room)
             if cause:
                 return abandoned("" if cause == OWNER_GONE else cause)
             if why:

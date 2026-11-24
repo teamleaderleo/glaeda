@@ -27672,6 +27672,94 @@ class LandTest(Base):
         self.land()
         self.assertNotEqual(self.tick()["state"], "cancelled")  # landing it again starts it over
 
+    def test_a_red_stop_is_rearmed_because_its_answer_is_a_comparison_not_the_head(self):
+        # 2026-11-24, one land queue: 55 of 130 stopped entries were own_red/red_not_excused, and a re-ask
+        # at the unchanged head excused 21 of them (cmux#41558 merged after 80 h, #47993 after 90 h on a hand
+        # requeue). "Is this red the PR's?" is read against the base and the rollup, which move with no push.
+        self.assertTrue(gg.LAND_REARM_CODES.match("own_red"))
+        self.assertTrue(gg.LAND_REARM_CODES.match("red_not_excused"))
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.w.answers.append(self.own_red())  # the rerun's red is the same: stopped
+        for _ in range(6):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"), e.get("stop"))
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        # the base went green under it, so the same head is excused now and lands
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["stop"], e["rearms"]["n"]), ("queued", None, 1))
+        self.assertEqual(e["lastStop"]["code"], "own_red")
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_a_red_that_is_the_prs_own_stops_again_at_once_and_quietly(self):
+        # The cost of re-asking a red that has not cleared: one judgment, no new notice for the requester.
+        self.unrelated_world(["webviews/src/a.ts"])
+        self.land()
+        self.w.answers.append(self.own_red())
+        self.tick()
+        self.w.answers.append(self.own_red())
+        for _ in range(6):
+            e = self.tick(gg.LAND_RETRY_MAX + 1)
+            if e["state"] == "stopped":
+                break
+        self.assertEqual(e["stop"]["code"], "own_red")
+        sent = len(self.w.sent())
+        judged = len(self.w.explains())
+        for n in range(1, gg.LAND_REARM_CAP + 1):
+            self.w.answers.append(self.own_red())
+            e = self.tick(gg.LAND_REARM_AFTER)
+            self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", n))
+            e = self.tick()
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"), e.get("stop"))
+            self.assertEqual(len(self.w.explains()), judged + n)  # one probe per re-arm, not a fresh wait
+        self.assertEqual(len(self.w.sent()), sent)  # the requester was told at the first stop and not again
+        self.assertEqual([h.get("quiet") for h in e["history"] if h["event"] == "stopped"][-gg.LAND_REARM_CAP:],
+                         ["repeat"] * gg.LAND_REARM_CAP)
+        e = self.tick(gg.LAND_REARM_AFTER * 3)
+        self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
+
+    def test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts(self):
+        # 2026-11-24, one lane's queue after 10.5 h idle: 5 of its 5 open PRs stopped, none on a red of its own; one
+        # stopped checks_stuck on a status that never posted, and a stopped row reads nothing, so a status posting
+        # after the stop was never seen. Still unmoved at the same head: one probe, stopped again at once, quietly.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms stay inside one UTC day
+        self.assertTrue(gg.LAND_REARM_CODES.match("checks_stuck"))
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("ws_check_missing", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        sent, judged = len(self.w.sent()), len(self.w.explains())
+        self.w.answers.clear()
+        e = self.tick(gg.LAND_REARM_AFTER - 10)
+        self.assertEqual(e["state"], "stopped")  # not before the hour
+        self.w.answers.append(wait())
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"], e["lastStop"]["code"]), ("queued", 1, "checks_stuck"))
+        # a check still pending is watched through the cache (no judgment while it runs); the first judgment after
+        # that wait reads the same unmoved head and stops it again at once
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"), e.get("stop"))
+        self.assertEqual(len(self.w.explains()), judged + 1)  # one probe, not another 4 h of waits
+        self.w.answers.clear()
+        self.assertEqual(len(self.w.sent()), sent)  # the requester was told at the first stop and not again
+        # the status posts green: the next re-arm reads it and the same head lands, with nobody requeueing it
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_REARM_AFTER)
+        self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 2))
+        self.tick()
+        self.assert_merged_at(LA)
+
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)
         self.land()
@@ -34010,7 +34098,7 @@ class LandTest(Base):
     def test_a_reviewer_that_cannot_start_is_re_armed_while_a_review_verdict_is_not(self):
         # "could not run the reviewer here" can clear by itself (a link, a deploy); a BLOCK verdict is a judgment.
         self.assertTrue(gg.LAND_REARM_CODES.match("review_cannot_start"))
-        for verdict in ("block", "review_failed", "chat_hold", "own_red"):
+        for verdict in ("block", "review_failed", "chat_hold"):
             self.assertIsNone(gg.LAND_REARM_CODES.match(verdict), verdict)
         self.pr(LA)
         self.land()
