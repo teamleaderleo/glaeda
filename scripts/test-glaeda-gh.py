@@ -18637,18 +18637,19 @@ class SpendAlarmTest(AlarmBase):
         self.assertEqual(gg.read_json(gg.BASE / gg.ALARMS_FILE)["pool"]["level"], "fire")
 
     def test_another_rest_window_running_low_is_sent_again(self) -> None:
+        # under the REST reserve: a low count alone (restLeft) is no alarm since ALARM_DRY_MARGIN
         self.policy(pool=True)
-        self.seen(800, NOW, NOW + 1200)
+        self.seen(200, NOW, NOW + 1200)
         self.daemon.check_alarms()
-        self.seen(900, NOW + 60, NOW + 2400)  # the other core counter, its own window
+        self.seen(250, NOW + 60, NOW + 2400)  # the other core counter, its own window
         self.daemon.check_alarms()
         self.assertEqual(len(self.told_lines()), 2)
 
     def test_no_cleared_notice_in_the_minute_before_a_reset(self) -> None:
         self.policy(pool=True)
-        self.seen(800, NOW, NOW + 100)
+        self.seen(200, NOW, NOW + 100)  # under the REST reserve: a notice (level warn, as a pool fire writes)
         self.daemon.check_alarms()
-        self.seen(700, NOW + 50, NOW + 100)
+        self.seen(400, NOW + 50, NOW + 100)  # back over it, but inside the minute before the reset: no cleared
         self.daemon.check_alarms()
         self.assertEqual([n["level"] for n in self.notice_lines()], ["warn"])
 
@@ -27926,6 +27927,7 @@ class LandTest(Base):
 
     def test_a_red_that_is_the_prs_own_stops_again_at_once_and_quietly(self):
         # The cost of re-asking a red that has not cleared: one judgment, no new notice for the requester.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the re-arms count per UTC day; keep them inside one
         self.unrelated_world(["webviews/src/a.ts"])
         self.land()
         self.w.answers.append(self.own_red())
