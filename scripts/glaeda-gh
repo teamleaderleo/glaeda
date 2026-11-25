@@ -15263,6 +15263,26 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# land_judge's own conflict verdict takes the same base merge (LAND_BASE_MERGE_FIRST). cmux-cp-1, 2026-11-25 00:00Z to
+# ~10:40Z: 352 land stops were conflicts, 322 of them land_judge's conflicts_base ("merge main into <PR>, resolve the
+# conflicts and push"), against 25 update_branch_conflict and 5 merge_conflict; the 41 base merges LAND_UNION tried
+# that day (11 pushed) came only from those refused steps. The judge reads GitHub's mergeable CONFLICTING, which ignores
+# .gitattributes and is often stale (LAND_UNION's comment), and the stop went straight to the requester: the queue
+# never ran the git merge it runs for a refused step, so hq#25695, lw#10818 (twice) and the rest each took a lane's
+# turn to merge main by hand while land queues were long and main moved under them. Now a conflicts_base verdict
+# takes the base merge, once per head, before it stops: clean (or only in merge=union paths) is pushed as above and
+# the land goes on; a true conflict stops as before (code conflict, the judge's own `next:`), and the stop now carries
+# the conflict hunks git left (LAND_HUNK_*), so the lane that resolves it reads them in the message, no checkout or
+# re-merge needed to find them.
+# The same merge answers ci_never_ran at a head this land did not make (KIND ci_start). hq#25829, 2026-11-25: stacked
+# on #25817, retargeted to main once #25817 merged; a retarget is an `edited` event no pull_request workflow runs on,
+# so land_judge refused ci_never_ran and a coordinator merged main and pushed by hand to start CI. A pushed base merge
+# is a `synchronize`, the head is then this land's own (land_own_head_at) and ci_never_ran_step waits for the run as
+# after any update. A head that already holds the base gets one commit on its own tree instead (the empty commit the
+# refusal names). Not mergeable here (a fork, another owner, a moved branch): ci_never_ran stops as before.
+LAND_HUNK_FILES = 3
+LAND_HUNK_LINES = 30  # lines of one conflict region kept
+LAND_HUNK_CHARS = 2500
 # A stacked PR whose base PR merged is retargeted by this queue onto that PR's own base (land_judge's stacked_base
 # step, `retarget`). When the base PR squash-merged, its commits are not on the new base, so the PR, still holding
 # them under its own, conflicts with the squash of those very commits the moment it is retargeted. manaflow-ai/
@@ -21779,6 +21799,12 @@ class LandQueue:
                     self.history(e, "override_merge", code=cls, head=head[:12], **land_override_history(e))
                 self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
                 return
+            if (str(answer.get("code") or "") == "conflicts_base" or cls == "conflict") and self.base_merge_first(
+                    e, head, "base", land_reason(why), land_trim(nxt or answer.get("next"))):
+                return  # LAND_BASE_MERGE_FIRST's comment: merged here and waiting, or stopped naming the hunks
+            if cls == "ci_never_ran" and land_own_head_at(e, head) is None and self.base_merge_first(
+                    e, head, "ci_start", land_reason(why), land_trim(nxt or answer.get("next"))):
+                return  # a head nothing of this land made (a retarget's): a pushed base merge starts its CI
             if cls == "ci_never_ran":
                 # Not terminal on its own at a head this land just made: ci_never_ran_step waits for the run GitHub
                 # has not created yet, and stops with the same clarity where no run is coming (LAND_CI_START).
@@ -22261,15 +22287,75 @@ class LandQueue:
         self.notify(e, e.get("requester") or "", f"glaeda land {name}: {did}", wake=False)
         return "rebased", tip
 
-    def conflict_stop(self, e: dict, kind: str, head: str, said: str, union_why: str = "") -> None:
-        """Under the lock: stop E on a merge conflict at HEAD (LAND_STEP_CONFLICT's comment), naming the one step."""
+    def conflict_stop(self, e: dict, kind: str, head: str, said: str, union_why: str = "",
+                      tried: dict | None = None) -> None:
+        """Under the lock: stop E on a merge conflict at HEAD (LAND_STEP_CONFLICT's comment), naming the one step.
+        KIND "base" is land_judge's own conflicts_base verdict and "ci_start" its ci_never_ran at a head this land did
+        not make (LAND_BASE_MERGE_FIRST's comment): each keeps its own stop code. TRIED is the base merge's record
+        (e["unionMerge"] before an infra failure dropped it): its conflict hunks go to the requester with the stop."""
         name = key_name(e["key"])
         repo, _, number = name.partition("#")
+        tried = tried if tried is not None else (e.get("unionMerge") or {})
+        hunks = str(tried.get("hunks") or "")
+        detail = f"the conflict, as git's merge of the base leaves it:\n{hunks}" if hunks else ""
+        if kind == "ci_start" and not tried.get("conflicts"):
+            # Not a conflict: the base merge that would start CI could not be made here; ci_never_ran stands as before.
+            self.stop(e, "ci_never_ran", f"{said} (and no step of this land made {head[:12]}, so nothing is going to "
+                      f"start that run on its own; no base merge pushed here to start it: {union_why})",
+                      str(tried.get("next") or ""))
+            return
+        if kind in ("base", "ci_start"):
+            self.stop(e, "conflict", f"land_judge read {head[:12]} as conflicting with its base: {said}"
+                      + (f"; not merged here: {union_why}" if union_why else ""),
+                      str(tried.get("next") or "") or f"merge the base into {name}, resolve the conflicts and push",
+                      detail=detail)
+            return
         self.stop(e, f"{kind}_conflict", f"the {kind} at {head[:12]} was refused for a merge conflict between the "
                   f"base and the head: {said}" + (f"; not merged here: {union_why}" if union_why else ""),
                   f"resolve the conflict: rebase the PR's branch onto its base (gh pr checkout {number} -R {repo}; "
                   f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
-                  f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>")
+                  f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>", detail=detail)
+
+    def base_merge_first(self, e: dict, head: str, kind: str, said: str, nxt: str) -> bool:
+        """LAND_BASE_MERGE_FIRST's comment: land_judge's conflicts_base (KIND "base") or ci_never_ran at a head this
+        land did not make (KIND "ci_start") takes the local base merge, once per head, before any stop. True when
+        union_merge ran (it waits for the new head or stops E itself); False when it was already tried at HEAD."""
+        with self.lock:
+            tried = e.get("unionMerge") or {}
+            if tried.get("head") == head and tried.get("tried"):
+                return False
+            e["unionMerge"] = {"head": head, "at": self.now, "kind": kind, "out": land_trim(said, 200),
+                               "next": land_trim(nxt)}
+            self.history(e, "base_merge_try", kind=kind, head=head[:12])
+            self.save(e)
+        self.union_merge(e, head)
+        return True
+
+    def conflict_hunks(self, gitdir: str, tree: str, files: list[str]) -> str:
+        """The conflict-marked regions git's merge left in TREE, for the first LAND_HUNK_FILES of FILES, at most
+        LAND_HUNK_CHARS in all: what the requester resolves, without a checkout to find it."""
+        out: list[str] = []
+        for path in files[:LAND_HUNK_FILES]:
+            got = self.union_git(gitdir, "cat-file", "blob", f"{tree}:{path}")
+            if got.returncode != 0:
+                continue
+            keep: list[str] = []
+            region: list[str] | None = None
+            for n, line in enumerate((got.stdout or "").splitlines(), 1):
+                if line.startswith("<<<<<<< "):
+                    region = [f"@@ {path}:{n}"]
+                if region is None:
+                    continue
+                if line.startswith(">>>>>>> "):
+                    keep.append("\n".join([*region, line]))
+                    region = None
+                elif len(region) <= LAND_HUNK_LINES:
+                    region.append(line)
+                elif region[-1] != "...":
+                    region.append("...")
+            out.extend(keep or [f"@@ {path}: (no text markers: a binary, rename or mode conflict)"])
+        text = "\n".join(out)
+        return text if len(text) <= LAND_HUNK_CHARS else text[:LAND_HUNK_CHARS] + "\n... (cut)"
 
     def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
                   e: dict | None = None, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
@@ -22338,16 +22424,30 @@ class LandQueue:
         if merged.returncode == 1:
             files = [p for p in words[1:] if p]
             e["unionMerge"].update(conflicts=files[:20])
+            if SHA40.fullmatch(tree):
+                e["unionMerge"]["hunks"] = self.conflict_hunks(gitdir, tree, files)
             return "", "", "", (f"a true conflict in {len(files)} file(s): {land_trim(', '.join(files), 200)} "
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
-        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a merge conflict; "
+        kind = str(e["unionMerge"].get("kind") or "update_branch")
+        why_here = {"base": "land_judge read the PR as conflicting with its base",
+                    "ci_start": "the repo's own CI never ran at the head (a retarget or a push no workflow saw)",
+                    "merge": "GitHub's merge refused a merge conflict"}.get(
+            kind, "GitHub's update-branch refused a merge conflict")
+        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: {why_here}; "
                + (f"git's merge conflicted only in paths {base}'s .gitattributes settles "
                   f"({land_trim(', '.join(paths), 300)}), merged here honoring them."
                   if paths else "git merges the two cleanly, so it was merged here."))
+        parents = ["-p", head, "-p", base_sha]
+        if kind == "ci_start" and self.union_git(gitdir, "merge-base", "--is-ancestor", base_sha, head).returncode == 0:
+            # The head already holds the base: a merge would be a no-op, so one commit on the head's own tree is what
+            # starts the repo's CI (the step ci_never_ran names, an empty commit, made here).
+            parents = ["-p", head]
+            msg = (f"Start CI at {branch}\n\nglaeda land: the repo's own CI never ran at {head[:12]}, which already "
+                   f"holds {base} {base_sha[:12]}; this commit keeps its tree and starts that CI.")
         commit = self.union_git(gitdir, "-c", "user.name=glaeda-land", "-c", "user.email=glaeda-land@users.noreply."
-                                "github.com", "commit-tree", tree, "-p", head, "-p", base_sha, "-m", msg)
+                                "github.com", "commit-tree", tree, *parents, "-m", msg)
         sha = (commit.stdout or "").strip()
         if commit.returncode != 0 or not SHA40.fullmatch(sha):
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
@@ -22373,10 +22473,11 @@ class LandQueue:
             sha, branch, base_sha, why = "", "", "", describe(error)
         if why:
             with self.lock:
-                if (e.get("unionMerge") or {}).get("retry") or why.startswith("git ") or "timed out" in why:
+                tried = dict(e.get("unionMerge") or {})
+                if tried.get("retry") or why.startswith("git ") or "timed out" in why:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
-                self.conflict_stop(e, kind, head, said, why)
+                self.conflict_stop(e, kind, head, said, why, tried)
             return
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
@@ -23129,15 +23230,16 @@ class LandQueue:
                           f"again in {after:.0f} s"}, after)
             return False
 
-    def stop(self, e: dict, code: str, reason: str, nxt: str, tell: str = "") -> None:
+    def stop(self, e: dict, code: str, reason: str, nxt: str, tell: str = "", detail: str = "") -> None:
         """Stop E, its requester told: as notify's class by default, TELL "fyi" as an inbox fyi that wakes nobody,
-        TELL "quiet" not at all (a line in the log and E's history only)."""
+        TELL "quiet" not at all (a line in the log and E's history only). DETAIL (a conflict's hunks) follows the
+        message's `next:` and is kept on the stop, so `land status` shows it too."""
         self.check(e)
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
             return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
-              "head": e.get("head") or ""}
+              "head": e.get("head") or "", **({"detail": detail[:LAND_HUNK_CHARS + 20]} if detail else {})}
         repeat = land_stop_repeats(e.get("lastStop"), st)
         live = LAND_MOVED_NEXT.search(nxt or "") if code == "head_moved" else None
         if live and e.get("pinSha"):
@@ -23151,6 +23253,8 @@ class LandQueue:
         msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
         if nxt:
             msg += f" next: {land_trim(nxt, 300)}"
+        if detail:
+            msg += "\n" + detail[:LAND_HUNK_CHARS + 20]
         if repeat:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})

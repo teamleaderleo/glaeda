@@ -31576,6 +31576,120 @@ class LandTest(Base):
         # once per head: the same refusal again at this head stops at once, with no second merge attempt
         self.assertEqual(len([h for h in e["history"] if h["event"] == "union_merge_skipped"]), 1)
 
+    JUDGE_CONFLICT_NEXT = "merge main into o/r#1, resolve the conflicts and push"
+
+    def judge_conflict_tick(self, head: str) -> dict:
+        """HEAD landed pinned and land_judge answered conflicts_base (GitHub's mergeable CONFLICTING), the stop it
+        answers 322 of cmux-cp-1's 352 conflict stops with on 2026-11-25 (LAND_BASE_MERGE_FIRST's comment)."""
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head, mergeable="CONFLICTING"), "headRefName": "lane/x",
+                                 "baseRefName": "main"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        return self.tick()
+
+    def test_a_judge_conflict_git_merges_cleanly_is_merged_here_and_the_land_goes_on(self):
+        """hq#25695, 2026-11-25: land_judge answered conflicts_base and the queue stopped it with "merge main into ...,
+        resolve the conflicts and push", never trying the git merge it runs when GitHub refuses a step. A merge git
+        makes cleanly is now pushed as the base merge, and the pinned land goes on at the new head."""
+        head, base = self.union_origin(main_path="goals/y.md")  # main appended elsewhere: git merges cleanly
+        e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertIn("land_judge read the PR as conflicting", self.origin_git("log", "-1", "--format=%B", merged))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("base_merge_try", "union_merged")],
+                         ["base_merge_try", "union_merged"])
+        self.assertEqual(self.w.gh_calls("api"), [])  # no update-branch: git's own merge, pushed
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_a_judge_conflict_in_merge_union_files_only_is_merged_here(self):
+        head, base = self.union_origin()  # both appended to goals/x.md, which main's .gitattributes marks merge=union
+        e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("show", f"{merged}:goals/x.md"),
+                         "- 10:00Z goal set\n- 11:00Z the lane's line\n- 11:05Z another PR's line, landed first")
+
+    def test_a_true_judge_conflict_stops_once_and_hands_the_lane_its_hunks(self):
+        """A conflict git cannot settle stops as before (code conflict, land_judge's own next step), and the stop the
+        requester gets now carries the conflicting hunk, so the lane resolves it without a checkout to find it."""
+        head, _ = self.union_origin(attrs="")
+        e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"], e["stop"]["next"]),
+                         ("stopped", "conflict", self.JUDGE_CONFLICT_NEXT))
+        self.assertIn("a true conflict in 1 file(s): goals/x.md", e["stop"]["reason"])
+        detail = e["stop"]["detail"]
+        self.assertIn("@@ goals/x.md:2", detail)
+        for line in ("- 11:00Z the lane's line", "=======", "- 11:05Z another PR's line, landed first"):
+            self.assertIn(line, detail)
+        told = [c[-1] for c in self.w.sent() if "stopped: conflict" in c[-1]]
+        self.assertEqual(len(told), 1, self.w.sent())
+        self.assertIn("- 11:05Z another PR's line, landed first", told[0])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # once per head: the same verdict at the same head stops again with no second merge
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"))
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "base_merge_try"]), 1)
+
+    def ci_never_ran_tick(self, head: str) -> dict:
+        """HEAD, which no step of this land made (a retarget's head), judged ci_never_ran (hq#25829's shape)."""
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head, checks=[]), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        nxt = f"git commit --allow-empty -m 'ci: start CI' && git push  # at {head}"
+        self.w.answers.append(refusal("ci_never_ran", head, {"kind": "command", "text": nxt}, nxt=nxt,
+                                      reason=f"land-judge: refused: the repo's own CI never ran at {head}"))
+        return self.tick()
+
+    def test_ci_never_ran_after_a_retarget_pushes_a_base_merge_and_waits_for_the_run(self):
+        """hq#25829, 2026-11-25: retargeted to main once its base PR merged; a retarget starts no pull_request run, so
+        land_judge refused ci_never_ran and a coordinator merged main and pushed by hand. The queue now pushes that
+        base merge itself, and the new head is its own, so ci_never_ran there waits for the run as after an update."""
+        head, base = self.union_origin(main_path="goals/y.md")
+        e = self.ci_never_ran_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.w.set_pr(self.KEY, {**land_pr(merged, checks=[], parent=head), "headRefName": "lane/x",
+                                 "baseRefName": "main"}, self.t)
+        self.w.answers.append(refusal("ci_never_ran", merged, {"kind": "command", "text": "x"}, nxt="x"))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["sha"]), ("waiting", "pr", merged), e.get("stop"))
+        self.assertEqual([h["event"] for h in e["history"]][-1], "ci_start_wait")
+
+    def test_ci_never_ran_at_a_head_that_already_holds_its_base_gets_one_commit_on_its_own_tree(self):
+        head, _ = self.union_origin(main_path="goals/y.md")
+        self.origin_git("update-ref", "refs/heads/main", f"{head}~1")  # main is the head's own parent
+        e = self.ci_never_ran_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        tip = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", tip).split()[1:], [head])
+        self.assertEqual(self.origin_git("rev-parse", f"{tip}^{{tree}}"), self.origin_git("rev-parse", f"{head}^{{tree}}"))
+
+    def test_ci_never_ran_a_base_merge_cannot_start_still_stops_naming_the_hand_step(self):
+        head, _ = self.union_origin(main_path="goals/y.md")
+        self.origin_git("update-ref", "refs/heads/lane/x", f"{head}~1")  # the branch moved off the judged head
+        e = self.ci_never_ran_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "ci_never_ran"))
+        self.assertIn("no step of this land made " + head[:12], e["stop"]["reason"])
+        self.assertIn("git commit --allow-empty", e["stop"]["next"])
+
     def test_a_union_merge_never_lands_on_a_branch_that_is_not_the_judged_head(self):
         """A fork's PR whose branch name also exists on the base repository, or a push since the judgment: the branch
         github.com holds is not the head, so nothing is merged or pushed onto it."""
