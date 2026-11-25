@@ -6159,6 +6159,9 @@ class Daemon:
         self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.rollup_slow: dict[str, float] = {}  # head sha -> self.now before which its rollup is not asked
         self.rollup_down_until = 0.0
+        # The controller a daemon with none (a direct read's: controller=None) asks for check rollups only
+        # (direct_rollup_controller); every other controller path stays off for it.
+        self.rollup_controller: Any = None
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
         self.status_cursor: int | None = None  # the controller's commit status feed (STATUS_FEED_OFF)
@@ -12338,8 +12341,9 @@ class Daemon:
 
     def controller_rollup_doc(self, root: str, sha: str) -> dict | None:
         """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed)."""
-        get = getattr(self.controller, "get", None)
-        if (not callable(get) or not self.controller_room() or self.now < self.rollup_down_until
+        own = self.controller is not None
+        get = getattr(self.controller if own else self.rollup_controller, "get", None)
+        if (not callable(get) or (own and not self.controller_room()) or self.now < self.rollup_down_until
                 or self.now < self.rollup_slow.get(sha, 0.0) or not re.fullmatch(r"[0-9A-Za-z]{40}", sha)):
             return None
         repo = root.removeprefix("/repos/")
@@ -26590,6 +26594,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
             controller=None, upstream=None)
         daemon.reads_protection = False
         daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
+        daemon.rollup_controller = direct_rollup_controller()
     else:
         daemon = Daemon(controller=None, upstream=None)
     if login_stopped(daemon, "rest") and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
@@ -29394,6 +29399,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             daemon.reads_protection = False
             daemon.rules_ttl = DIRECT_RULES_TTL
             daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
+            daemon.rollup_controller = direct_rollup_controller()
         else:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
@@ -29444,6 +29450,20 @@ def _land_direct_cache_fresh(key: str, now: float) -> bool:
     at = cached.get("dataAt")
     return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at < LAND_DIRECT_REUSE \
         and isinstance(cached.get("data"), dict) and not cached.get("error")
+
+
+def direct_rollup_controller() -> "Controller | None":
+    """The controller a direct read through the broker asks for its REST gate's check suites (controller_suites),
+    else None. Why (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 09:43-11:43Z): glaeda-upstream, every lane
+    VM's direct reads, asked commits/{sha}/check-suites 3,401 times in 2 h, more than the 2,136 before #2730 moved the
+    gate to the controller's rollup: a direct read's Daemon is built with controller=None, so its gate never asked the
+    rollup, and on a lane VM every read is a direct read (the daemon reads through its upstream)."""
+    if not PR_REST_SUITES_FROM_CONTROLLER:
+        return None
+    try:
+        return Controller.from_env()
+    except Exception:  # noqa: BLE001  no controller config: GitHub's suites, as before
+        return None
 
 
 def direct_read(req: dict) -> str | None:

@@ -24237,6 +24237,34 @@ class StaleDataTest(Base):
         self.assertEqual([p for p in served if p.startswith("rules/branches/")], [], served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
 
+    def test_a_direct_read_through_the_broker_gates_on_the_controllers_rollup(self) -> None:
+        """rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 09:43-11:43Z: glaeda-upstream (every lane VM's direct
+        reads) asked commits/{sha}/check-suites 3,401 times in 2 h after #2730, because a direct read's Daemon has
+        controller=None. With the controller's rollup reachable it asks no check-suites; with none, GitHub's, as before."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[workflow_check("a", 7)])
+        read = {"key": "pr:o/r#9", "kind": "pr", "jobs": False, "began": time.time() - 700}
+        ctl = RollupController(self.gh)
+        served: list[str] = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "direct_rollup_controller", return_value=ctl):
+            self.assertIsNone(gg.direct_read(dict(read)))
+        self.assertEqual([p for p in served if "/check-suites" in p], [], served)
+        self.assertEqual(ctl.rollups, [self.gh.prs[("o", "r", 9)]["headRefOid"]])
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "SUCCESS")
+        served.clear()
+        self.gh.prs[("o", "r", 9)]["headRefOid"] = "b" * 40  # a new head: its suites not yet known
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "direct_rollup_controller", return_value=None):
+            self.assertIsNone(gg.direct_read(dict(read)))
+        self.assertTrue([p for p in served if "/check-suites" in p], served)  # no controller: GitHub's, as before
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "SUCCESS")
+
     def test_a_refused_direct_read_holds_the_hosts_direct_reads(self) -> None:
         """A refusal for the read Apps' reserve holds every direct GET on the host for its wait: the next asks run
         nothing, and an answer ends the hold."""
