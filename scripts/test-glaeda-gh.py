@@ -1198,7 +1198,7 @@ class HeadRunOrderTest(unittest.TestCase):
             return {"data": {"nodes": [{"id": "CR_10", "steps": {"nodes": []}},
                                        {"id": "CR_11", "steps": {"nodes": [{"name": "x"}, {"name": "y"}]}}]}}, None
 
-        fake = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+        fake = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go", graphql_stopped_for=lambda *a: False,
                                      graphql=graphql)
         data = gg.head_data("a" * 40, runs, {}, {}, order)
         gg.Daemon.head_steps(fake, data, failed)
@@ -1207,7 +1207,7 @@ class HeadRunOrderTest(unittest.TestCase):
         self.assertNotIn("steps", rows[12][5])
         gg.Daemon.head_steps(fake, data, failed)  # a completed job never changes: not read again
         self.assertEqual(asked, [["CR_10", "CR_11"]])
-        down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go",
+        down = types.SimpleNamespace(job_steps={}, gql_reason=None, errors=[], mode=lambda bucket: "go", graphql_stopped_for=lambda *a: False,
                                      graphql=lambda q, v, _route=None: (None, "graphql: down"))
         again = gg.head_data("a" * 40, runs, {}, {}, order)
         again["runs"] = {k: [[*r[:5], {k2: v for k2, v in r[5].items() if k2 != "steps"}] for r in rs]
@@ -7260,19 +7260,23 @@ class OverloadTest(Base):
         self.assertEqual(age["pr"]["n"], 4)
         self.assertNotIn("run", age)
 
-    def test_a_backlog_never_restarts_the_daemon_however_many_keys_are_old(self) -> None:
-        # the land host, 2026-11-22 to 11-25: "backlog: 192 pr reads stored in the last 600s", 12 ticks in a row, and the valve
-        # re-executed the daemon every 30 min for 50 h to no effect
+    def test_a_valve_restart_that_did_not_help_is_not_repeated_for_hours(self) -> None:
+        # the land host, 2026-11-22 to 11-25: the valve re-executed the daemon every 30 min for 50 h, data 4,607 s old each time
         self.daemon.now = NOW
         self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
         self.daemon.stale_count = {"pr": 400}
         self.daemon.fresh_waited = {"pr": 900.0}
         self.daemon.stale_streak = 12
-        self.assertIn("backlog", gg.STALE_NO_RESTART)
-        data = {"kind": "pr", "age": 4607, "key": "pr:o/r#1", "cause": "backlog"}
-        _, _, valved = self.daemon.stale_valve(("fire", "FIRE x", data), {})
-        self.assertEqual(valved["valve"], "backlog")
+        gg.write_json(gg.BASE / "restart.json", {"at": self.daemon.clock() - gg.STALE_VALVE_COOLDOWN - 60, "valve": True,
+                                                  "ok": True, "ran": True, "age": 4607})
+        data = {"kind": "pr", "age": 4700, "key": "pr:o/r#1", "cause": "backlog"}
+        _, _, valved = self.daemon.stale_valve(("fire", f"FIRE x {gg.STALE_RESTART_ADVICE}", data), {})
+        self.assertEqual(valved["valve"], "spent")  # past the plain cooldown, but the last restart left it as old
         self.assertIsNone(self.daemon.valve_due)
+        gg.write_json(gg.BASE / "restart.json", {"at": self.daemon.clock() - gg.STALE_VALVE_COOLDOWN - 60, "valve": True,
+                                                  "ok": True, "ran": True, "age": 4607})
+        self.daemon.stale_valve(("fire", "x", {**data, "age": 300}), {})
+        self.assertIsNotNone(self.daemon.valve_due, "a restart that did help may be tried again")
 
     def test_failed_check_steps_are_read_over_an_app_while_the_login_graphql_is_stopped(self) -> None:
         # the land host, 2026-11-25: the login sat under its reserve all hour, fill_steps gave up on it, and 182 of 823 PRs kept
@@ -19722,6 +19726,10 @@ class SpendAlarmTest(AlarmBase):
             self.daemon.check_alarms()
         self.assertIsNotNone(self.daemon.valve_due, "an hours-old key is a read loop that cannot reach it")
         self.assertEqual(self.daemon.valve_due["key"], "pr:o/r#5")
+        for _ in range(50):  # the second tick's alarm process may already be reaped from alarm_procs: wait for its line
+            if "restarting itself now" in self.told_lines()[-1]:
+                break
+            time.sleep(0.1)
         self.assertIn("restarting itself now", self.told_lines()[-1])
 
     def test_the_valve_restarts_for_a_backlog_of_many_stale_keys_though_some_are_fresh(self) -> None:

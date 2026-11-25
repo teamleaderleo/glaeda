@@ -884,15 +884,13 @@ STALE_PACED_ADVICE = ("A restart would not read any sooner: the pace above is to
 STALE_HELD_MAX = 3600
 STALE_HELD_ADVICE = ("A restart would not read any sooner, but data this old is starvation, not pacing: the reads "
                      "above need a quota or a pace change (`glaeda-gh budget` names who spends the login).")
-# A "backlog" verdict is a daemon that IS reading (reads stored in the window): a fresh process reads no faster, and it
-# loses the heavy-entry table, the batch sizes and every land judgment in flight. the land host, 2026-11-22 23:49Z to
-# 11-25: the valve re-executed the daemon on "backlog: 192 pr reads stored in the last 600s" every 30 min for 50 h
-# (restart.json "valve": true, ok: true) and the oldest waited PR stayed 4,607 s to 20,000 s old; each restart wiped
-# what the last tick had learned. Only "stalled" (no read stored at all) is a hang a restart may fix.
-STALE_BACKLOG_ADVICE = ("A restart would not read any sooner: the daemon is reading (reads stored above), just not as fast as "
-                        "waits are added; `glaeda-gh budget` shows the waited data age (max, p95).")
+# A valve restart that did not help is not repeated: STALE_VALVE_FUTILE. The land host, 2026-11-22 23:49Z to 11-25: the
+# valve re-executed the daemon every STALE_VALVE_COOLDOWN (restart.json "valve": true, ok: true) for 50 h on "backlog: 192 pr
+# reads stored in the last 600s" and the oldest waited PR stayed 4,607 s to 20,000 s old; each restart also wiped the heavy
+# table and batch sizes the last ticks had learned. A restart whose own record shows data no older than now is futile.
+STALE_VALVE_FUTILE = 6 * 3600
 STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE,  # verdicts a restart cannot fix
-                "held": STALE_HELD_ADVICE, "backlog": STALE_BACKLOG_ADVICE}
+                "held": STALE_HELD_ADVICE}
 STALE_NO_RESTART = tuple(STALE_ADVICE)  # stall_cause verdicts a restart cannot fix: the alarm, the valve and `restart` agree
 # Reads a wait or a due land is blocked on go first in every window; watches nothing is blocked on still get one batch
 # (one REST read) at least this often, per kind, so a blocked set past the pace cannot starve them (review of #2199).
@@ -6807,7 +6805,10 @@ class Daemon:
             return level, text, {**data, "valve": "young", "up": int(up)}
         record = restart_record() or {}
         ago = self.clock() - record["at"] if record.get("valve") else None
-        if ago is not None and 0 <= ago < STALE_VALVE_COOLDOWN:
+        was, now_age = record.get("age"), data.get("age")
+        futile = (ago is not None and isinstance(was, (int, float)) and isinstance(now_age, (int, float))
+                  and now_age >= 0.5 * was)  # it started from this much age and the data is no fresher: it did not help
+        if ago is not None and 0 <= ago < (STALE_VALVE_FUTILE if futile else STALE_VALVE_COOLDOWN):
             said = (f"The daemon already restarted itself for this {int(ago)}s ago (stale valve) and that did not "
                     "help, so another restart will not either: tell the owner.")
             return level, text.replace(STALE_RESTART_ADVICE, said), {**data, "valve": "spent", "valveAgo": int(ago)}
