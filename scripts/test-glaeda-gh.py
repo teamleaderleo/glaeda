@@ -23806,12 +23806,16 @@ class ReexecDrainTest(Base):
     def test_claimed_running_asks_without_reaping(self) -> None:
         done, running = mock.Mock(), mock.Mock()
         done.done.return_value, running.done.return_value = True, False
-        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, jobs={"j": running, "d": done, "r": running},
+        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, stepping=set(),
+                                  jobs={"j": running, "d": done, "r": running},
                                   entries={"j": {"action": {"kind": "fetch"}}, "d": {"action": {"kind": "merge"}},
                                            "r": {"action": None}})
         self.assertFalse(gg.LandQueue.claimed_running(q), "a handed judgment, a done job, a job with no claim")
         q.entries["r"]["action"] = {"kind": "merge"}
         self.assertTrue(gg.LandQueue.claimed_running(q))
+        q.stepping.add("r")
+        self.assertFalse(gg.LandQueue.claimed_running(q), "a claimed step waiting on its handed child")
+        q.stepping.discard("r")
         self.assertEqual(set(q.jobs), {"j", "d", "r"}, "nothing reaped off the tick's thread")
         q.handover, q.entries["r"]["action"] = False, None
         self.assertTrue(gg.LandQueue.claimed_running(q), "no handover: any running job")
@@ -36652,6 +36656,67 @@ class LandTest(Base):
         gg.write_json(meta, {"argv": argv + ["x"], "run": "other", "pid": os.getpid(), "at": time.time(),
                              "deadline": time.time() + 30})
         self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertEqual(list(meta.parent.iterdir()), [])
+
+    def test_a_claimed_step_runs_in_a_handed_child_and_no_reexec_waits_for_it(self):
+        # gcp-agent-lane-9, glaeda a0271f3 (2026-11-25): live 22.56 s after its merge, 20.51 s of it reexec-deferred
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        self.assertTrue(q.handover)
+        key = "pr:o/r#7"
+        e = {"key": key, "repo": "o/r", "number": 7, "state": "acting", "action": {"kind": "merge", "sha": "a" * 40}}
+        q.entries[key] = e
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs[key] = fut
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name(gg.LAND_STEP_PREFIX + key)
+        seen: list[tuple[bool, bool, bool]] = []
+        argv = [sys.executable, "-c", "import time; time.sleep(1.0); print('merged')"]
+        done = threading.Event()
+        got: list[subprocess.CompletedProcess] = []
+        threading.Thread(target=lambda: (got.append(q.call(argv, 30.0, e)), done.set()), daemon=True).start()
+        deadline = time.monotonic() + 10
+        while key not in q.stepping and time.monotonic() < deadline:
+            time.sleep(0.02)
+        seen.append((key in q.stepping, meta.exists(), self.daemon.land_busy()))
+        self.assertEqual(seen, [(True, True, False)], "its pid on disk, so the update need not wait for the merge")
+        self.assertTrue(done.wait(10))
+        self.assertEqual((got[0].returncode, got[0].stdout.strip()), (0, "merged"))
+        self.assertNotIn(key, q.stepping)
+        self.assertTrue(self.daemon.land_busy(), "back in this image's own code: waited for again")
+        self.assertEqual(list(meta.parent.iterdir()), [], "its files go with its answer")
+
+    def test_the_next_daemon_reads_a_handed_steps_answer_before_judging_again(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        key = "pr:o/r#8"
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name(gg.LAND_STEP_PREFIX + key)
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        out, err, rc = gg.handed_files(meta, "old")
+        old = subprocess.Popen(["/bin/sh", "-c", f'sleep 1; echo "merged it" > "{out}"; echo 0 > "{rc}"'])
+        gg.write_json(meta, {"argv": ["gh", "pr", "merge"], "run": "old", "pid": old.pid, "at": time.time(),
+                             "deadline": time.time() + 30})
+        e = {"key": key, "repo": "o/r", "number": 8, "state": "queued", "action": None,
+             "interrupted": {"kind": "merge", "sha": "b" * 40}, "history": []}
+        try:
+            q.adopt_step(e)
+        finally:
+            old.wait(timeout=10)
+        self.assertEqual((e["lastAction"]["kind"], e["lastAction"]["exit"], e["lastAction"]["handed"]), ("merge", 0, True))
+        self.assertIn("merged it", e["lastAction"]["out"])
+        self.assertEqual(list(meta.parent.iterdir()), [])
+        # one gone with no answer: nothing kept, its files dropped, judged afresh as before
+        dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        dead.wait()
+        gg.write_json(meta, {"argv": ["gh"], "run": "dead", "pid": dead.pid, "at": time.time(),
+                             "deadline": time.time() + 30})
+        e2 = {"key": key, "repo": "o/r", "number": 8, "state": "queued", "history": []}
+        started = time.monotonic()
+        q.adopt_step(e2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotIn("lastAction", e2)
         self.assertEqual(list(meta.parent.iterdir()), [])
 
     def test_a_handed_judgment_past_its_bound_times_out(self):

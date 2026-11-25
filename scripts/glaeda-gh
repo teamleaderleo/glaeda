@@ -10033,8 +10033,8 @@ class Daemon:
         q.reap()
         if not q.handover:
             return bool(q.jobs)
-        with q.lock:  # only a claimed step outside a handed judgment is waited for
-            return any(k not in q.judging and isinstance((q.entries.get(k) or {}).get("action"), dict) for k in q.jobs)
+        with q.lock:  # only a claimed step outside a handed judgment or a handed child of its own is waited for
+            return q.claimed_running()
 
     def land_finishing(self) -> float:
         """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for
@@ -16756,6 +16756,47 @@ def gh_cache_gens(repo: str | None) -> list[int]:
 # and a fast-patch of glaeda-gh on the land executor goes live in seconds, not after a drain of up to REEXEC_DRAIN_MAX:
 # lane-9, 2026-11-24, `fast-patch glaeda f5e82403` waited 145 s on "5 land step(s) running" (merge to live 156 s).
 LAND_JUDGING_DIR = "judging"
+# A claimed step's command (a merge, an update_branch, a rerun...) runs the way a judgment does (judge_handed), its
+# files under LAND_JUDGING_DIR keyed by this prefix plus the land's key, so a re-exec no longer waits for it: the next
+# daemon reads its answer before it judges that land again (LandQueue.adopt_step). gcp-agent-lane-9, glaeda a0271f3
+# (2026-11-25): live 22.56 s after its merge, 20.51 s of it "reexec-deferred: a land step is running".
+LAND_STEP_PREFIX = "step:"
+
+
+def handed_files(meta: Path, run: str) -> tuple[Path, Path, Path]:
+    """The stdout, stderr and exit-code files of RUN, a handed child named in META (judge_handed)."""
+    stem = meta.parent / f"{meta.stem}.{run}"
+    return stem.with_suffix(stem.suffix + ".out"), stem.with_suffix(stem.suffix + ".err"), \
+        stem.with_suffix(stem.suffix + ".rc")
+
+
+def handed_gone(pid: int) -> bool:
+    """Whether a handed child (the previous image's, inherited across its execv) has ended."""
+    with contextlib.suppress(ChildProcessError, OSError):
+        if os.waitpid(pid, os.WNOHANG)[0]:
+            return True  # the previous image's child, ended: reaped here (a zombie answers kill)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
+
+
+def handed_answer(argv: list[str], meta: Path, run: str) -> subprocess.CompletedProcess:
+    """RUN's answer from its files: exit 125 when its exit-code file is missing or unreadable."""
+    out, err, rc = handed_files(meta, run)
+    try:
+        code = int(rc.read_text().strip())
+    except (OSError, ValueError):
+        code = 125
+    return subprocess.CompletedProcess(argv, code, out.read_text(errors="replace") if out.exists() else "",
+                                       err.read_text(errors="replace") if err.exists() else "")
+
+
+def handed_drop(meta: Path, run: str) -> None:
+    for f in (meta, *handed_files(meta, run)):
+        with contextlib.suppress(OSError):
+            f.unlink()
 LAND_HANDOVER_WAIT = 0.5  # how often an adopted judgment's answer file is looked for (a local file, no GitHub read)
 
 
@@ -16890,6 +16931,8 @@ class LandQueue:
         # key: (time.monotonic when its land_judge explain began, that call's own timeout): the judgments running now,
         # so a re-exec drain can let one about to finish end instead of judging it again (finishing, reexec_due)
         self.judging: dict[str, tuple[float, float]] = {}
+        # keys whose claimed step waits on its handed child right now (judge_handed's step): a re-exec need not wait
+        self.stepping: set[str] = set()
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
         # (pass, starts the CPU allows, starts the RAM allows, what was read): the host's headroom, read once per pass
         self.headroom: tuple[float, float, float, dict] = (-1.0, math.inf, math.inf, {})
@@ -18822,7 +18865,8 @@ class LandQueue:
         jobs = [(k, f) for k, f in list(self.jobs.items()) if f is not None and not f.done()]
         if not self.handover:
             return bool(jobs)
-        return any(k not in self.judging and isinstance((self.entries.get(k) or {}).get("action"), dict) for k, _ in jobs)
+        return any(k not in self.judging and k not in self.stepping
+                   and isinstance((self.entries.get(k) or {}).get("action"), dict) for k, _ in jobs)
 
     def reap(self) -> None:
         for key, fut in list(self.jobs.items()):
@@ -21004,52 +21048,34 @@ class LandQueue:
                 raise subprocess.TimeoutExpired(argv, timeout) from None
         return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
-    def judge_handed(self, key: str, argv: list[str], timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess:
+    def judge_handed(self, key: str, argv: list[str], timeout: float, env: dict[str, str],
+                     step: bool = False) -> subprocess.CompletedProcess:
         """ARGV (a judgment: a read) run with its streams and exit code in files under land/judging/, so it outlives a
         re-exec of this daemon; or, when the previous image left the same ARGV for KEY running or answered within its
         bound, that child's answer (LAND_JUDGING_DIR). A child gone with no answer is judged afresh. Each run's files
         carry its own id, named in KEY's meta before the child starts, so a child a re-exec left with no meta never
-        writes over a later run's. Raises subprocess.TimeoutExpired past TIMEOUT, as run does."""
+        writes over a later run's. Raises subprocess.TimeoutExpired past TIMEOUT, as run does. STEP: ARGV is a claimed
+        step's command (LAND_STEP_PREFIX): KEY is in stepping while its child runs, so a re-exec goes on without it."""
         d = land_dir() / LAND_JUDGING_DIR
-        meta = d / file_name(key)
+        meta = d / file_name(LAND_STEP_PREFIX + key if step else key)
 
         def files(run: str) -> tuple[Path, Path, Path]:
-            stem = d / f"{meta.stem}.{run}"
-            return stem.with_suffix(stem.suffix + ".out"), stem.with_suffix(stem.suffix + ".err"), \
-                stem.with_suffix(stem.suffix + ".rc")
-
-        def gone(pid: int) -> bool:
-            with contextlib.suppress(ChildProcessError, OSError):
-                if os.waitpid(pid, os.WNOHANG)[0]:
-                    return True  # the previous image's child, ended: reaped here (a zombie answers kill)
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                return True
-            return False
+            return handed_files(meta, run)
 
         def answer(run: str) -> subprocess.CompletedProcess:
-            out, err, rc = files(run)
-            try:
-                code = int(rc.read_text().strip())
-            except (OSError, ValueError):
-                code = 125
-            return subprocess.CompletedProcess(argv, code, out.read_text(errors="replace") if out.exists() else "",
-                                               err.read_text(errors="replace") if err.exists() else "")
+            return handed_answer(argv, meta, run)
 
         def drop(run: str) -> None:
-            for f in (meta, *files(run)):
-                with contextlib.suppress(OSError):
-                    f.unlink()
+            handed_drop(meta, run)
 
         doc = read_json(meta)
         prior = str(doc.get("run") or "") if isinstance(doc, dict) else ""
         if prior and doc.get("argv") == argv and isinstance(doc.get("pid"), int) \
                 and isinstance(doc.get("deadline"), (int, float)) and time.time() < float(doc["deadline"]):
             pid, deadline, rc = int(doc["pid"]), float(doc["deadline"]), files(prior)[2]
-            log({"event": "land-judgment-adopted", "key": key, "pid": pid,
+            log({"event": "land-judgment-adopted", "key": key, "pid": pid, **({"step": True} if step else {}),
                  "ageS": round(time.time() - float(doc.get("at") or time.time()), 1)})
-            while not rc.exists() and time.time() < deadline and not gone(pid):
+            while not rc.exists() and time.time() < deadline and not handed_gone(pid):
                 time.sleep(LAND_HANDOVER_WAIT)
             if rc.exists():
                 got = answer(prior)
@@ -21075,6 +21101,9 @@ class LandQueue:
                 proc = subprocess.Popen(wrapped, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
                                         start_new_session=True, env=env, cwd=os.environ.get("HOME") or "/")
             write_json(meta, {"argv": argv, "run": run, "pid": proc.pid, "at": now, "deadline": deadline})
+            if step:  # only once its pid is on disk: a re-exec before that would leave the next daemon no child
+                with self.lock:
+                    self.stepping.add(key)
             try:
                 proc.wait(timeout=max(0.0, deadline - time.time()))
             except subprocess.TimeoutExpired:
@@ -21083,9 +21112,42 @@ class LandQueue:
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     proc.wait(timeout=2)
                 raise subprocess.TimeoutExpired(argv, timeout) from None
+            finally:
+                if step:
+                    with self.lock:
+                        self.stepping.discard(key)
             return answer(run)
         finally:
             drop(run)
+
+    def adopt_step(self, e: dict) -> None:
+        """Before E is judged again: the claimed step a re-exec left running in its handed child (judge_handed's
+        step), waited for within its bound and its answer kept as E's lastAction, as finish keeps one that ended in
+        this image; then its files go. The judgment after it reads what the step did from GitHub (stepUnfinished)."""
+        meta = land_dir() / LAND_JUDGING_DIR / file_name(LAND_STEP_PREFIX + e["key"])
+        doc = read_json(meta)
+        if not isinstance(doc, dict) or not doc.get("run"):
+            return
+        run, pid = str(doc["run"]), doc.get("pid")
+        deadline = float(doc.get("deadline") or 0) if isinstance(doc.get("deadline"), (int, float)) else 0.0
+        rc = handed_files(meta, run)[2]
+        started = time.monotonic()
+        if isinstance(pid, int):
+            while not rc.exists() and time.time() < deadline and not handed_gone(pid):
+                time.sleep(LAND_HANDOVER_WAIT)
+        if rc.exists():
+            got = handed_answer(list(doc.get("argv") or []), meta, run)
+            interrupted = e.get("interrupted") if isinstance(e.get("interrupted"), dict) else {}
+            with self.lock:
+                e["lastAction"] = {**interrupted, "endedAt": self.now, "handed": True, "exit": got.returncode,
+                                   "out": land_tail(land_redact((got.stderr or "") + " " + (got.stdout or "")), 600)}
+                self.history(e, "step", kind=interrupted.get("kind"), exit=got.returncode, handed=True)
+                self.save(e)
+            log({"event": "land-step-adopted", "key": e["key"], "kind": interrupted.get("kind"), "exit": got.returncode,
+                 "waitedS": round(time.monotonic() - started, 1)})
+        else:
+            log({"event": "land-step-lost", "key": e["key"], "pid": pid})  # judged afresh, as before handing over
+        handed_drop(meta, run)
 
     def call(self, argv: list[str], timeout: float, e: dict | None = None,
              extra: dict[str, str] | None = None, handed: str | None = None) -> subprocess.CompletedProcess:
@@ -21094,7 +21156,12 @@ class LandQueue:
         judgment that outlives a re-exec (judge_handed)."""
         try:
             env = {**self.env(e), **(extra or {})}
-            got = self.judge_handed(handed, argv, timeout, env) if handed and self.handover else self.run(argv, timeout, env)
+            if handed and self.handover:
+                got = self.judge_handed(handed, argv, timeout, env)
+            elif self.handover and e is not None and isinstance(e.get("action"), dict) and isinstance(e.get("key"), str):
+                got = self.judge_handed(e["key"], argv, timeout, env, step=True)  # a claimed step's write
+            else:
+                got = self.run(argv, timeout, env)
             return subprocess.CompletedProcess(got.args, got.returncode, land_redact(got.stdout) if got.stdout else
                                                got.stdout, land_redact(got.stderr) if got.stderr else got.stderr)
         except subprocess.TimeoutExpired:
@@ -21257,6 +21324,8 @@ class LandQueue:
             parked, unfinished = e.pop("stepQuotaParked", False), e.pop("stepUnfinished", False)
             counts = counts and not parked and not unfinished
             check = e.pop("baseMergeCheck", None)
+        if unfinished and self.handover:
+            self.adopt_step(e)  # the step a re-exec cut off may still run in its handed child: its answer first
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
         # only a check made for E's pin now: one made for an earlier pin compares this head with a pin E no longer has
