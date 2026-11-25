@@ -20853,6 +20853,24 @@ class LandQueue:
         self.save(e)
         return None
 
+    def repin_foreign_base_merge(self, e: dict, act: dict, head: str, parents: list | None) -> bool:
+        """Off the lock, before a repin step ACT is taken at HEAD: False when land_judge's head is not one this queue may
+        follow and E was stopped or parked for it; True to take the step as before. When the head land_judge read is not
+        this queue's own update_branch's merge (follow_own_update) and is not the cache's, it is judged the way a cached
+        head is (base_merge_check): followed only when it is a base merge on the pin made by anyone (the lander bot, the
+        Update branch button, another host's queue), its diff the pin's own; a push stops head_moved at once, naming why.
+        lw#8928 (glaeda land on cmux-cp-1, 2026-11-25) stopped "pin: 3 identical refusals in a row: ... PR read head
+        '7b19878...' does not match pinned head fc371dd..." after somebody merged main into the branch: the cache still
+        showed the pin, so the cached head never reached base_merge_check, and the repin wait judged the same stale pin
+        three times (the same stop as cmux-platform#1771, which only the queue's own update_branch was followed over)."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha):
+            return True
+        with self.lock:  # parents None (unread) still follows an update this queue sent at the pin, as before
+            if self.follow_own_update(e, sha, parents) is None:
+                return True  # the queue's own update: the step below clears its streak
+        return self.base_merge_check(e, {"head": sha, "pin": pin, "parent": ""})
+
     def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
         """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
         (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
@@ -21126,6 +21144,11 @@ class LandQueue:
         older: Any = False
         if why and not unread and ancestor is None and gh:
             older = self.ancestry_read(e, head, pin)
+        live = ""
+        if why and (ancestor or (older is not False and older[0] is True)):
+            w = e.get("oldPinWait") or {}
+            if w.get("head") == head and self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
+                live = self.update_live_tip(e, data)[0]  # LAND_STALE_LIVE's comment: one REST read of the branch
         with self.lock:
             self.check(e)
             if older is not False:
@@ -21135,6 +21158,21 @@ class LandQueue:
             if ancestor and self.old_pin_wait(e, head):
                 # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
                 self.requeue(e)
+                return False
+            if ancestor and live == pin:
+                # LAND_STALE_LIVE: GitHub's branch is still at the pin; the copy showing HEAD is stale. The pin is kept
+                # and the wait starts again (one branch read per LAND_HEAD_TIMEOUT), never a stop naming HEAD.
+                e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
+                self.history(e, "stale_head_kept", head=head[:12], pin=pin[:12],
+                             why="an older commit of the pin; GitHub's branch is at the pin")
+                self.nudge(e["key"])
+                self.requeue(e)
+                return False
+            if ancestor and SHA40.fullmatch(live) and live != head:
+                # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
+                self.stop(e, "head_moved", land_moved_clause(live, pin)
+                          + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
+                          f"glaeda-gh land {e['repo']}#{e['number']} --sha {live}")
                 return False
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
@@ -22297,7 +22335,14 @@ class LandQueue:
         if kind == "review":
             self.do_review(e, head, answer)
             return
+        if kind == "repin" and not SHA40.fullmatch(str(act.get("sha") or "")):
+            # LAND_PIN_READ_HEAD's comment: the head land_judge read, from its words when its step named none
+            read = LAND_PIN_READ_HEAD.search(str(answer.get("reason") or ""))
+            if read:
+                act = {**act, "sha": read.group(1).lower()}
         parents = self.repin_parents(e, act, head) if kind == "repin" else None
+        if kind == "repin" and not self.repin_foreign_base_merge(e, act, head, parents):
+            return  # land_judge's head is not a base merge on the pin: base_merge_check stopped or parked E
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
@@ -24478,6 +24523,20 @@ LAND_BASE_MERGE_UNREAD_WAIT = 30.0
 # pin; an ancestor waits as a pin already followed away from does (old_pin_wait, LAND_HEAD_TIMEOUT), then stops as
 # before; a read that fails is bounded like a base merge's (base_merge_unread), then stops as before.
 LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
+# A "pin" refusal whose step names no head (land_judge's fallback repin, sha "") still says the head it read in its
+# words: "PR read head '<40 hex>' does not match pinned head <pin>". That head goes the way a named one does
+# (repin_foreign_base_merge: the queue's own update followed, a base merge followed, a push stopped head_moved at
+# once, an older commit of the pin held as a stale copy). Before, hq#25622 (2026-11-25) was judged three times at
+# its old pin after a hand merge of main and stopped "pin: 3 identical refusals in a row: ... verdict state could not
+# be read: no fresh head-matching PR answer: PR read head ..." with no new head named.
+# LAND_STALE_LIVE: a head the copy shows that is an older commit of the pin (head_ancestry) stopped head_moved once
+# old_pin_wait's LAND_HEAD_TIMEOUT ran out, naming that older head as the one to re-land at. hq#25937 and cmux#54988,
+# 2026-11-25: "the head is fe89af27b3c6, not the --sha fa0598099cf6" and "the head is 237ed7c375ea, not the --sha
+# f1da65f70f9a", each an older merge of the branch while GitHub's head was still the pin; both were re-queued by hand
+# at the pin they already had. Past that wait, one read of GitHub's branch ref decides: at the pin, the pin is kept
+# and the wait starts again; at another head, the stop names that head.
+LAND_STALE_LIVE = "stale_head_kept"
+LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
 
 def land_parents_have(pin: str, parents: Any) -> bool:

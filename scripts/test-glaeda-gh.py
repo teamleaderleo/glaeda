@@ -28244,10 +28244,10 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_pin_never_follows_a_push_land_judge_names_while_the_cache_has_no_read(self):
-        # The same, but LB's parents are not the pin: someone's push. It still stops on the pin refusal.
+        # The same, but LB's parents are not the pin: someone's push. It stops, head_moved at the first refusal now
+        # (repin_foreign_base_merge reads it is no base merge) and not "pin" after three.
         e = self.own_update_then_no_data([LC])
-        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pin", LA))
-        self.assertIn("identical refusals in a row", e["stop"]["reason"])
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertNotIn("repin_own_update", [h["event"] for h in e["history"]])
 
     def test_sha_pin_follows_an_update_that_timed_out_but_made_its_merge(self):
@@ -28402,6 +28402,50 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
         self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
         self.assert_merged_at(LB)
+
+    def foreign_merge_land_judge_names(self, parents: list, now: Any = "same") -> dict:
+        """Pinned at LA with the cache still showing LA (nothing read the new head), and land_judge, which reads the PR
+        live, names a repin to LB, a merge of the base nobody in this queue made (no update_branch was sent). LB's
+        commit read answers PARENTS. Judged until it stops or LB is judged; the entry. lw#8928, 2026-11-25."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.w.cache[self.KEY]["data"].update(baseRefName="main")
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}
+        now = {"mb": self.LD, "files": [moved]} if now == "same" else now
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps(now)
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        pin = refusal("pin", LA, {"kind": "repin", "sha": LB}, reason=f"land-judge: refused o/r 1: PR read head '{LB}' "
+                      f"does not match pinned head {LA}")
+        e = {}
+        for _ in range(gg.LAND_STREAK_STOP + 2):
+            self.w.answers.append(pin if e.get("pinSha", LA) == LA else ok_answer(LB))
+            e = self.tick(max(gg.LAND_NO_DATA_AFTER, gg.LAND_RETRY_MAX) + 1)
+            if e["state"] in ("stopped", "merged"):
+                break
+        return e
+
+    def test_a_pin_follows_a_base_merge_land_judge_names_while_the_cache_still_shows_the_pin(self):
+        # lw#8928 (cmux-cp-1) and cmux#53077: somebody merged main into the branch; land_judge read the new head, the
+        # cache still showed the pin, so the cached head never reached base_merge_check and the third identical "pin"
+        # refusal stopped the land for a person to re-request. The repin's head is read to be only a base merge.
+        e = self.foreign_merge_land_judge_names([LA, self.LD])
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.assertEqual([(h["was"], h["head"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12])])
+
+    def test_a_pin_stops_head_moved_at_once_on_a_push_land_judge_names_while_the_cache_still_shows_the_pin(self):
+        e = self.foreign_merge_land_judge_names([LC])
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertNotIn("identical refusals", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_pin_never_follows_a_merge_that_changes_the_prs_diff_land_judge_names(self):
+        evil = {**self.PIN_DIFF, "d": "@@ -14,3 +14,5 @@ def f():\n w\n+y\n+backdoor()\n z"}
+        e = self.foreign_merge_land_judge_names([LA, self.LD], now={"mb": self.LD, "files": [evil]})
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("more than a base merge", e["stop"]["reason"])
 
     def test_a_merge_that_changes_the_prs_own_diff_still_stops_head_moved(self):
         # an evil merge (a conflict resolution, or a change made in the merge commit) is not only a base merge
