@@ -17237,8 +17237,9 @@ class LandQueue:
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
                 e.pop("forwardQuietTold", None)  # a land by hand is a new ask: it may be told once again
-            self.history(e, "queued", by=e["requester"], via=e["requesterFrom"], after=",".join(e["after"]),
-                         **land_override_history(e), **land_nominated_history(e))
+            # a session-less caller (a helper subagent, a script) has no requester: the history names whoever queued it
+            self.history(e, "queued", by=e["requester"] or e.get("queuedBy") or None, via=e["requesterFrom"],
+                         after=",".join(e["after"]), **land_override_history(e), **land_nominated_history(e))
         else:
             self.history(e, "updated", by=e["requester"], after=",".join(e["after"]), **land_override_history(e),
                          **land_nominated_history(e))

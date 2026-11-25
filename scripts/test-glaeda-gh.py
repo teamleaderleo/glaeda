@@ -32485,6 +32485,16 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", 1))
 
+    def test_a_sessionless_land_is_queued_in_history_by_whoever_queued_it(self):
+        """The queued event names the requester, else queuedBy: a helper's mass land with no lane stays traceable."""
+        rid, why = gg.land_serve_one({"op": "land", "target": "o/r#1", "after": [], "requester": "",
+                                      "queuedBy": "host/session:abc:agent:helper", "id": "r-helper"})
+        self.assertEqual(why, "")
+        self.pr(LA)
+        e = self.tick()
+        queued = [h for h in e["history"] if h["event"] == "queued"]
+        self.assertEqual(queued[0]["by"], "host/session:abc:agent:helper")
+
     def test_a_forwarded_land_keeps_its_lane_and_host(self):
         req = {"op": "land", "target": "o/r#1", "requester": "host/parent/child", "id": "r1", "lane": "child",
                "laneHost": "host"}
