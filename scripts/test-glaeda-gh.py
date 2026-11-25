@@ -26765,9 +26765,12 @@ class LandTest(Base):
         self.q.tick(self.t + 2, dirty=set())
         self.assert_merged_at(LA)
 
-    def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
-        # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
-        # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.
+    def test_a_parked_wait_judges_only_on_a_change_its_verdict_answers(self):
+        # hq boneheaded-designs 4.2, one host 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
+        # head. Each base push turned the parked PR's mergeable UNKNOWN and back, the wake's fingerprint held that raw
+        # value, and each turn judged it again once LAND_VERDICT_KEEP had run out. The wake reads mergeability as the
+        # judge does now -- CONFLICTING or not -- so base churn costs no judgment at any age, and a change the verdict
+        # answers differently (its checks, a conflict, its head) still judges at once.
         wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
         self.pr(LA)
         self.land()
@@ -26778,14 +26781,18 @@ class LandTest(Base):
             self.w.cache[self.KEY]["data"]["mergeStateStatus"] = "BEHIND"
             e = self.tick(30)
         self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
-        self.assertEqual([h["event"] for h in e["history"]].count("kept"), 1)  # once per fingerprint it kept
-        self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["kept"], 1)
+        self.assertEqual([h["event"] for h in e["history"]].count("kept"), 0)  # nothing the keep has to hold
+        # Older than the keep, which used to let every one of those turns through: still no judgment.
+        self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.explains()), 1)
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        self.assertEqual(day.get("explain_unmoved_fp_moved"), None)
         # A changed snapshot (a check's conclusion) is judged at once.
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "FAILURE")])
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick()
         self.assertEqual(len(self.w.explains()), 2)
-        # A CONFLICTING turn is judged at once.
+        # A CONFLICTING turn is judged at once: the one mergeability change the verdict answers differently.
         self.w.cache[self.KEY]["data"]["mergeable"] = "CONFLICTING"
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick()
@@ -26796,12 +26803,9 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.w.explains()[-1][-2:], [LB, "--json"])
         self.assertEqual(len(self.w.explains()), 4)
-        # Past LAND_VERDICT_KEEP the change it held back is judged, though head and checks still hold.
-        self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
-        self.tick(30)
-        self.assertEqual(len(self.w.explains()), 4)
+        # What the fingerprint cannot see is bounded by the wait's own timeout, which still judges.
         self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
-        self.tick(gg.LAND_VERDICT_KEEP)
+        self.tick(wait["timeout_s"])
         self.assertEqual(len(self.w.explains()), 5)
 
     def test_a_kept_wait_verdict_still_judges_at_its_own_timeout(self):
@@ -29328,35 +29332,33 @@ class LandTest(Base):
         self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]),
                          (len(judged) - 1, 0, {}))
 
-    def test_a_mergeability_flip_alone_judges_again_and_is_counted_as_the_skippable_kind(self):
-        # The other half of the same count, and the only half worth removing: mergeable UNKNOWN <-> MERGEABLE turns on
-        # every push to the base, moves land_fingerprint (which the wake reads) and not land_check_fingerprint (which
-        # the verdict's keep reads), so once LAND_VERDICT_KEEP has run out it judges again at the same head on the
-        # same checks for an answer that cannot differ. Counted apart from the backoff's judgments (explain_unmoved_
-        # fp_moved) so "judgments that moved nothing" is not read as one waste: hq#15832 Fix 120 measured 171 of them
-        # and nearly held every retry for 600 s on the strength of the total, which would have delayed every recovery.
-        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
-                                                      "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
+    def test_a_mergeability_flip_alone_never_judges_however_long_it_waits(self):
+        # The other half of the same count, since removed: mergeable UNKNOWN <-> MERGEABLE turns on every push to the
+        # base, and while land_fingerprint (which the wake reads) held that raw value, each push moved it twice at an
+        # unchanged head on unchanged checks; past LAND_VERDICT_KEEP it judged again for an answer that cannot differ
+        # (5 judgments an hour per parked PR, measure-land-wake-redundancy.py; 69 of 669 on one host 2026-11-25).
+        # The wake now reads mergeability as the judge does -- CONFLICTING or not -- so no flip wakes it at any age,
+        # and what the fingerprint cannot see is bounded by the wait's own timeout, as it always was.
+        wait = lambda sha=LA: refusal("checks_running", sha, {"kind": "wait_pr", "sha": sha, "until": "done",
+                                                              "timeout_s": 100 * gg.LAND_VERDICT_KEEP})
         self.pr(LA)
         self.land()
         self.w.answers.append(wait())
         e = self.tick()
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
         first = len(self.w.explains())
-        # inside the keep, a flip is answered from the verdict: no judgment at all
-        self.pr(LA, mergeable="UNKNOWN")
-        self.tick(gg.LAND_VERDICT_KEEP / 2)
-        self.assertEqual(len(self.w.explains()), first, "the kept verdict answered the flip")
-        # past the keep, the same flip judges again (left flipped: flipping back would restore the fingerprint)
-        self.w.answers.append(wait())
-        e = self.tick(gg.LAND_VERDICT_KEEP)
-        judged = [h for h in e["history"] if h["event"] == "judged"]
-        self.assertEqual(len(self.w.explains()), first + 1)
-        self.assertEqual((judged[-1].get("why"), judged[-1].get("unmoved"), judged[-1].get("due")),
-                         ("fp_moved", True, None))
+        for n, mergeable in enumerate(("UNKNOWN", "MERGEABLE", "UNKNOWN", "MERGEABLE")):
+            self.pr(LA, mergeable=mergeable)  # a push to the base: same head, same checks
+            e = self.tick(gg.LAND_VERDICT_KEEP)  # each turn older than the keep that used to let it through
+            self.assertEqual(len(self.w.explains()), first, f"flip {n} judged again")
         day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
-        split = gg.land_unmoved_split(day)
-        self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]), (0, 1, {"fp_moved": 1}))
+        self.assertEqual(day.get("explain_unmoved_fp_moved"), None)
+        self.assertEqual(gg.land_unmoved_split(day)["redundantByWhy"], {})
+        # A CONFLICTING turn is the one mergeability change the verdict answers differently: judged at once.
+        self.pr(LA, mergeable="CONFLICTING")
+        self.w.answers.append(wait())
+        self.tick()
+        self.assertEqual(len(self.w.explains()), first + 1)
 
     def test_land_status_never_prints_the_unmoved_total_without_its_split(self):
         # A count whose name reads as waste has to say which half is skippable, in the line that prints it.
