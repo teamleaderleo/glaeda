@@ -9356,6 +9356,13 @@ def _feed_time(value: Any) -> float | None:
     return at.timestamp() if at.tzinfo is not None else None
 
 
+def feed_workflow(path: Any) -> str:
+    """The workflow file of a feed job's workflow_path (".github/workflows/pr-router.yml" -> "pr-router.yml"), or ""."""
+    if not isinstance(path, str):
+        return ""
+    return path.split("@", 1)[0].rsplit("/", 1)[-1].strip()
+
+
 def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
     """The controller's /v1/github/actions answer reduced to what the load cap reads: its last delivery and, for every
     open job on a glaeda label, its labels, status, creation time, the host of its runner and whether it is urgent.
@@ -9379,7 +9386,8 @@ def load_cap_summary(doc: Any, now: float) -> dict[str, Any] | None:
                      "host": runner_host(job.get("runner")),
                      "runner": job.get("runner") if isinstance(job.get("runner"), str) else None, "urgent": urgent,
                      "id": job_id if isinstance(job_id, int) and not isinstance(job_id, bool) else None,
-                     "name": job.get("name") if isinstance(job.get("name"), str) else ""})
+                     "name": job.get("name") if isinstance(job.get("name"), str) else "",
+                     "workflow": feed_workflow(job.get("workflow_path"))})
     return {"at": now, "delivery": _feed_time(doc.get("receiver_last_delivery")), "jobs": jobs}
 
 
@@ -9482,6 +9490,11 @@ HEAD_FIT_ALIASES = {  # display names that do not slug to their job id
     "cmux next dev release compile": ("cmux-next.yml", "cmux-scheme-compile"),
 }
 HEAD_FIT_WORKFLOW = re.compile(r"^cmux-next[a-z-]*\.yml$")
+# Every other workflow is read too, by its feed workflow_path and its display name's job segment ("pr pipeline / ios"
+# is pr-router.yml's ios). 2026-11-25 18:04-22:04Z (controller timing feed): "Set up runner" held 13.8% of Mac job
+# minutes, 53.6% on cmux13s, and the jobs a listener took back to back with no room were mostly ones HEAD_FIT skipped:
+# pr pipeline / ios (530 min), pr pipeline / mac (304), ios-billing (235), ci.yml's swift test (121). A need above the
+# mini's units (a whole-mini job, EXCLUSIVE) is not one a plain listener waits for, so it is skipped there.
 
 
 def _head_slug(name: str) -> str:
@@ -9494,16 +9507,25 @@ def _head_slug(name: str) -> str:
     return "-".join(words)
 
 
-def head_job_key(name: str) -> tuple[str, str] | None:
-    """(workflow file, job id) of a cmux-next job from its feed display name, or None when no table names it."""
+def head_job_key(name: str, workflow: str = "") -> tuple[str, str] | None:
+    """(workflow file, job id) of a queued job from its feed display name and workflow file, or None when no table
+    names it. A cmux-next job (or one whose workflow the feed left out) is read as before; any other workflow's job
+    by its workflow and the display name's last " / " segment (a reusable workflow's caller prefix dropped)."""
     lowered = name.strip().lower()
     if lowered in HEAD_FIT_ALIASES:
         return HEAD_FIT_ALIASES[lowered]
+    tables = [key for key in (*JOB_CORES, *WORKFLOW_JOB_CLASSES) if len(key) == 2]
+    if workflow and not HEAD_FIT_WORKFLOW.match(workflow):
+        keys = [key for key in tables if key[0] == workflow]
+        wants = [_head_slug(name.rsplit(" / ", 1)[-1]), _head_slug(name)]
+        for want in [w for slug in wants if slug for w in (slug, slug.removesuffix("s"))]:
+            if (workflow, want) in keys:
+                return (workflow, want)
+        return None
     slug = _head_slug(name)
     if not slug:
         return None
-    keys = [key for key in (*JOB_CORES, *WORKFLOW_JOB_CLASSES)
-            if len(key) == 2 and HEAD_FIT_WORKFLOW.match(key[0])]
+    keys = [key for key in tables if HEAD_FIT_WORKFLOW.match(key[0])]
     for want in (slug, slug.removesuffix("s")):
         found = sorted({key for key in keys if key[1] == want},
                        key=lambda key: (key[0] != "cmux-next.yml", key[0]))
@@ -9530,7 +9552,8 @@ def queue_jobs(summary: dict[str, Any] | None, labels: frozenset[str] | None, no
 
 
 def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
-                   need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
+                   need: Callable[[str, str], int] | None = None,
+                   ceiling: int | None = None) -> tuple[int, str] | None:
     """HEAD_FIT: (units, job name) of the largest need among the queued jobs this runner could take (GitHub may hand
     it any of them), or None when it cannot say for any. On a tie the oldest names it."""
     if need is None:
@@ -9539,10 +9562,12 @@ def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None
                             workflow=workflow).cores
     best: tuple[int, str] | None = None
     for queued in queue_jobs(summary, labels, now):
-        known = head_job_key(str(queued.get("name") or ""))
+        known = head_job_key(str(queued.get("name") or ""), str(queued.get("workflow") or ""))
         if known is None:
             continue
         units = max(1, int(need(*known)))
+        if ceiling is not None and units > ceiling:
+            continue  # a whole-mini job: its own admission handles it
         if best is None or units > best[0]:
             best = (units, str(queued["name"]))
     return best
@@ -11765,7 +11790,8 @@ class Gate:
         (no say) until the look lands, when it fails, or for a job it does not know. Never raises."""
         try:
             self.cap_look()
-            found = head_fit_units(self.cap_summary, self.cap_labels, time.time())
+            found = head_fit_units(self.cap_summary, self.cap_labels, time.time(),
+                                   ceiling=runner_scope(self.runner_dir).units)
         except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
             found = None
             gate_log(f"the queue-head look failed ({type(error).__name__}); listening at the side fit")
