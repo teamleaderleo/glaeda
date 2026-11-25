@@ -22694,6 +22694,32 @@ class WaitedUnderReserveTest(Base):
         self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (0, 1), "ten unchanged PRs cost one probe")
         self.assertEqual(self.ages(later, (11, 12)), [gg.CYCLE] * 2, "an unwaited PR is read under the reserve")
 
+    def test_a_waited_probe_names_one_repository_so_an_app_can_answer_it(self) -> None:
+        """cosmic-gray, 2026-11-25 06:3xZ: waited probes across two owners went on the login ("graphql-many-owners")
+        with its GraphQL at 0/5000 while four App pools had their hour: an App answers only a one-owner query."""
+        for n in (1, 2):
+            self.gh.prs[("p", "s", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a")])
+            gg.register(gg.parse_key("pr", f"p/s#{n}"), waited=True)
+        self.daemon.tick(NOW)
+        self.under(self.reserve - 10)
+        probed: list[set[str]] = []
+        inner = self.daemon.probe_prs
+
+        def probe(entries: list[dict]) -> Any:
+            probed.append({gg.caller_of(e["key"])[1] for e in entries})
+            return inner(entries)
+
+        later = NOW + gg.CYCLE
+        for n in (1, 2):
+            path = gg.watch_dir() / gg.file_name(f"pr:p/s#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": later})
+            os.utime(path, (later, later))
+        with mock.patch.object(self.daemon, "probe_prs", side_effect=probe):
+            self.at(later)
+        self.assertTrue(probed, "no waited probe was sent")
+        self.assertTrue(all(len(repos) == 1 for repos in probed), probed)
+        self.assertIn({"p/s"}, probed)
+
     def test_a_changed_waited_pr_is_read_in_full_under_the_reserve(self) -> None:
         node = self.gh.prs[("o", "r", 4)]
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
@@ -24035,6 +24061,76 @@ class StaleDataTest(Base):
         self.assertIsNotNone(gg.wait_starved(req, None, now), "never read since the wait began")
         req["directAt"] = now - 10
         self.assertIsNone(gg.wait_starved(req, {"dataAt": now - 3000}, now), "one direct read per STALE_DATA_AFTER")
+
+
+class DirectReadAppPoolTest(unittest.TestCase):
+    """A direct read the login's spent quota would refuse goes to an App pool that serves its owner (form 7 of hq
+    docs/handbook/login-quota-spent-while-apps-idle.md): cmux-cp-1, 2026-11-25, hq#25577's pinned land parked four
+    times on "GitHub's quota for this read is spent" while the App pools had nearly all of their hour."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = mock.patch.object(gg, "BASE", Path(self.tmp.name) / "gh")
+        base.start()
+        self.addCleanup(base.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        for name in ("upstream_command", "direct_command"):
+            pin = mock.patch.object(gg, name, return_value=None)
+            pin.start()
+            self.addCleanup(pin.stop)
+
+    def fake_daemon(self, pool, sent):
+        class Fake:
+            app_pool = pool
+            now = 0.0
+            tick_deadline = 0.0
+            gql_reason = ""
+
+            def mode(self, bucket):
+                return "stop"  # the login's GraphQL and REST are both under their reserve
+
+            def charge_rest(self, minute, n):
+                pass
+
+            def calling(self, *args):
+                return contextlib.nullcontext()
+
+            def fetch_prs(self, entries):
+                sent.extend(e["key"] for e in entries)
+                return "sent"
+        return Fake()
+
+    def pool(self, owners, token="ghs_" + "a" * 36):
+        return gg.AppPool(role="quota-goblin", mint=lambda owner: token, owners=lambda: owners, ready=lambda: True)
+
+    def read(self, pool, key="pr:manaflow-ai/cmuxterm-hq#25577"):
+        sent = []
+        fake = self.fake_daemon(pool, sent)
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            got = gg._read_one({"key": key, "kind": "pr", "began": time.time()}, None)
+        return got, sent
+
+    def test_a_pr_read_with_the_login_spent_goes_to_an_app_pool_that_serves_its_owner(self) -> None:
+        got, sent = self.read(self.pool(["manaflow-ai"]))
+        self.assertEqual(sent, ["pr:manaflow-ai/cmuxterm-hq#25577"], "the read was refused before the App was asked")
+        self.assertEqual(got, "sent")
+
+    def test_the_login_stop_still_holds_a_read_no_app_answers(self) -> None:
+        for pool in (None, self.pool(["teamleaderleo"]), self.pool(["manaflow-ai"], token=None)):
+            got, sent = self.read(pool)
+            self.assertEqual((got, sent), (gg.DIRECT_QUOTA, []), pool and pool.owners_fn())
+
+    def test_a_straggler_read_with_the_login_rest_spent_goes_to_the_app_pool(self) -> None:
+        fake = self.fake_daemon(self.pool(["manaflow-ai"]), [])
+        fake.get = lambda path, etag: ("fresh", {"path": path}, {})
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            got = gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"])
+        self.assertEqual(got, {"actions/jobs/1": {"path": "/repos/manaflow-ai/cmux/actions/jobs/1"}})
+        fake.app_pool = None
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            self.assertEqual(gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"]),
+                             {"actions/jobs/1": gg.DIRECT_QUOTA})
 
 
 class TempFileTest(unittest.TestCase):

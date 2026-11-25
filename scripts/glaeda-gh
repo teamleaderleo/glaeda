@@ -9674,10 +9674,18 @@ class Daemon:
             runs = [e for e in stale if e["key"].startswith("run:")]
             probe = [e for e in prs if self.probe_ok(e)]
             full = [e for e in prs if not self.probe_ok(e)]
-            for i in range(0, len(probe), WAITED_PROBE_BATCH):
+            # One repository per probe, as batched() chunks: an App answers only a query that names one owner, so a
+            # probe mixing owners went on the login (cosmic-gray, 2026-11-25 06:3xZ: "pr-probe ... on the login:
+            # graphql-many-owners" while the login's GraphQL read 0/5000 and four App pools had their hour).
+            groups: dict[str, list[dict]] = {}
+            for e in probe:
+                groups.setdefault(caller_of(e["key"])[1].lower(), []).append(e)
+            probes = sorted((g[i:i + WAITED_PROBE_BATCH] for g in groups.values()
+                             for i in range(0, len(g), WAITED_PROBE_BATCH)),
+                            key=lambda c: min(data_at(e) for e in c))
+            for chunk in probes:
                 if not self.waited_room():
                     return
-                chunk = probe[i:i + WAITED_PROBE_BATCH]
                 self.waited_tried.update((e["key"], self.now) for e in chunk)
                 repos = sorted({caller_of(e["key"])[1] for e in chunk})
                 with self.waited_spend(), self.calling("pr", repos[0] if len(repos) == 1 else f"{len(repos)} repos",
@@ -25581,8 +25589,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
         daemon.etags = isinstance(daemon.app_pool, ReadTokenPool)
     else:
         daemon = Daemon(controller=None, upstream=None)
-    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
-    if daemon.mode("rest") == "stop" or (isinstance(modes, dict) and modes.get("rest") == "stop"):
+    if login_stopped(daemon, "rest") and not app_reads_key(daemon, f"pr:{repo}#0", "rest"):
         return {p: DIRECT_QUOTA for p in paths}
     daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as direct_read: a session's read)
     daemon.now = time.time()
@@ -28268,6 +28275,41 @@ def _direct_read(req: dict) -> str | None:
     return why
 
 
+def login_stopped(daemon: "Daemon", bucket: str) -> bool:
+    """Whether the login's BUCKET is at stop: the daemon's own view as well as daemon.json's (a secondary hold or a
+    backoff lives only in the serving daemon's memory, and daemon.json's modes carry it; a fresh Daemon here starts
+    with no backoff)."""
+    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
+    return daemon.mode(bucket) == "stop" or (isinstance(modes, dict) and modes.get(bucket) == "stop")
+
+
+def app_reads_key(daemon: "Daemon", key: str, bucket: str) -> bool:
+    """Whether DAEMON's App chain (or a broker client's read token) answers KEY's read over BUCKET now, so the
+    login's spent quota does not hold it: Daemon.request sends such a read on the App whatever the login's mode.
+
+    cmux-cp-1, 2026-11-25 06:22-06:45Z: the pinned land of manaflow-ai/cmuxterm-hq#25577 parked four times on
+    "GitHub's quota for this read is spent" (pin_read_quota, window_capped pool graphql) while this host's App pools
+    (land-judge 12472/12500, glaeda 12014, ci-watch 12427, quota-goblin 7528) had nearly all of their hour. The
+    direct read refused itself on the login's GraphQL stop before the App was asked (docs/handbook/
+    login-quota-spent-while-apps-idle.md, form 7). Leo: "we have quota-goblin amongst other apps"."""
+    pool = daemon.app_pool
+    if pool is None:
+        return False
+    try:
+        _, owner, repo, _ = split_key(key)
+        if bucket == "graphql":
+            method, path, body = "POST", "/graphql", {"query": "query { __typename }",
+                                                       "variables": {"o0": owner, "r0": repo}}
+        else:
+            method, path, body = "GET", f"/repos/{owner}/{repo}/pulls", None
+        served = pool.owner_of(method, path, body)
+        if not served:
+            return False
+        return pool.pick(served, pool.scope(served, method, path, body), body) is not None
+    except Exception:  # noqa: BLE001  a check that cannot tell keeps the login's stop, as before
+        return False
+
+
 def _read_one(req: dict, used: list[bool] | None) -> str | None:
     """One read of the wait's target from GitHub by this process, outside the daemon's queue, stored in the cache the
     way the daemon stores it (so wait_step rules on it): a PR over GraphQL, a run over REST. The fallback for a wait
@@ -28295,10 +28337,8 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
             daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
-    # The daemon's own view as well as budget.json's: a secondary hold or a backoff lives only in its memory, and
-    # daemon.json's modes carry it (a fresh Daemon here starts with no backoff).
-    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
-    if daemon.mode(bucket) == "stop" or (isinstance(modes, dict) and modes.get(bucket) == "stop"):
+    # The login's stop holds only a read that would go on the login (app_reads_key): one an App pool answers is sent.
+    if login_stopped(daemon, bucket) and not app_reads_key(daemon, key, bucket):
         return DIRECT_QUOTA
     # A wait's own read is a session's request, not the daemon's polling: it is not charged to the daemon's REST share,
     # and above all this process must never write rest-spend.json from the copy it read at construction, which would
