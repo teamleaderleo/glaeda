@@ -15884,6 +15884,8 @@ LAND_PEER_SILENT_HOLD = 7200.0
 LAND_FORWARD_STATE_READS = 20
 LAND_FORWARD_STATE_TRIES = 3
 LAND_FORWARD_FYI_CLASS = "fyi"
+# The merged() HOWs of this queue's own merge (LAND_MERGED_ELSEWHERE_FYI): every other merge was read from a copy.
+LAND_OWN_MERGE_HOWS = frozenset({"merged pinned", "the read after its merge shows it merged"})
 
 
 # A head_moved stop of a land whose requester is a session on another host goes as an inbox fyi that wakes nobody
@@ -23086,9 +23088,15 @@ class LandQueue:
         e.update(state="merged", mergeSha=merge_sha, wait=None, wakeAt=None, action=None)
         self.history(e, "merged", sha=merge_sha, how=how)
         self.save(e)
+        # LAND_MERGED_ELSEWHERE_FYI: only this queue's own merge is news that wakes its requester. A merge read from a
+        # copy (a hand merge, another host's queue that told it already) reaches it as an inbox fyi with its next news.
+        # gcp-agent-lane-12, 2026-11-23..25: 30 of 86 "the cache shows it merged" notices woke a lane that said only
+        # "nothing to do"; 8 of 90 after "merged pinned". Leo, 2026-11-24: "are there any like process level fixes?"
+        own = how in LAND_OWN_MERGE_HOWS
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
-                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake)
+                    + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
+                    cls=None if own else LAND_FORWARD_FYI_CLASS)
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -23193,6 +23201,11 @@ class LandQueue:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
+        if not tell and str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("state") or "") == "MERGED":
+            # LAND_STOP_MERGED_QUIET: a stop of a PR that already merged asks the requester for nothing (a merge never
+            # reverts). gcp-agent-lane-12, 2026-11-23..25: 16 such stops (forward_no_outcome, head_moved, own_red) each
+            # woke a lane that answered "already merged". A line in the log and the entry's history, as a repeat is.
+            tell = "quiet"
         if code == "head_moved" and not tell and land_requester_far(e):
             tell = "fyi"  # LAND_FAR_HEAD_MOVED_FYI's comment: the requester's own queue says it, or it moved on
         # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
@@ -25329,12 +25342,55 @@ def script_changed(path: Path, seen: dict) -> bool:
         return False
     if key == seen.get("changedStat"):
         return True
-    if hashlib.sha256(path.read_bytes()).hexdigest() == seen.get("sha"):
+    new = hashlib.sha256(path.read_bytes()).hexdigest()
+    if new == seen.get("sha"):
         seen["stat"] = key
         seen.pop("changedStat", None)
         return False
+    older = older_release(new, seen.get("sha"))
+    if older is not None:
+        # Not a change to run: these bytes stay on disk for the next start, the daemon stays on its newer ones.
+        seen["stat"] = key
+        seen.pop("changedStat", None)
+        log({"event": "reexec-older-skipped", "release": older, "scriptSha256": new})
+        return False
     seen["changedStat"] = key
     return True
+
+
+UPDATE_GENERATIONS = Path.home() / ".local/state/glaeda/update/generations"  # glaeda-update's releases, by tag
+
+
+def older_release(new: str, running: str | None, generations: Path | None = None) -> str | None:
+    """The OTA release (its tag) whose glaeda-gh is NEW when it does not include the main commit fast-patch put live
+    as the RUNNING bytes (STATE/glaeda/live.json), else None. A re-exec never goes back to an older script: a lane VM,
+    2026-11-25, re-exec'd three times in 11 min onto the ring's release behind main, each time a setup rerun put
+    its glaeda-gh over fast-patch's and fast-patch put main back a second later, and every flip restarted the land
+    work and the reads the landing PRs waited on. Bytes no release holds (a hand install), fast-patch's own (a newer
+    main, or its rollback, which it names first) and a release that includes the commit all re-exec as before."""
+    doc = read_json(fast_patch_state() / "glaeda" / "live.json")
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    commit = doc.get("commit") if isinstance(doc, dict) else None
+    if (not isinstance(tools, dict) or running not in tools.values() or new in tools.values()
+            or not isinstance(commit, str) or not SHA40.fullmatch(commit)):
+        return None
+    try:
+        gens = sorted((generations or UPDATE_GENERATIONS).iterdir())
+    except OSError:
+        return None
+    for gen in gens:
+        try:
+            if hashlib.sha256((gen / "glaeda/scripts/glaeda-gh").read_bytes()).hexdigest() != new:
+                continue
+        except OSError:
+            continue
+        try:
+            ancestry = set((gen / "ancestry.txt").read_text(encoding="ascii").split())
+        except (OSError, UnicodeDecodeError):
+            ancestry = set()  # glaeda-update's reading too (release_descends_from): no ancestry, not a descendant
+        if commit not in ancestry:
+            return gen.name
+    return None
 
 
 SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake

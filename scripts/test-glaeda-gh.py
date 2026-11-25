@@ -23786,6 +23786,55 @@ class ReexecDrainTest(Base):
         os.utime(path, ns=(seen["stat"][0] + 3 * 10**9, seen["stat"][0] + 3 * 10**9))
         self.assertFalse(gg.script_changed(path, seen))
 
+    def test_never_reexec_onto_a_release_older_than_the_running_fast_patch(self) -> None:
+        """A lane VM, 2026-11-25: three re-execs in 11 min onto the ring's release behind main, each over
+        fast-patch's bytes and undone a second later. The release's older glaeda-gh is no change to run; a release that
+        includes the commit, fast-patch's next bytes and a hand install still are."""
+        root = Path(self.tmp.name)
+        path = root / "glaeda-gh"
+        path.write_bytes(b"main")
+        running = gg.hashlib.sha256(b"main").hexdigest()
+        state, gens = root / "fast-patch", root / "generations"
+        (state / "glaeda").mkdir(parents=True)
+        commit = "c" * 40
+        (state / "glaeda/live.json").write_text(json.dumps({"commit": commit, "tools": {"glaeda-gh": running}}))
+        for tag, body, ancestry in (("r-old", b"ring", "a" * 40), ("r-new", b"newer", f"{commit}\nd{'d' * 39}")):
+            (gens / tag / "glaeda/scripts").mkdir(parents=True)
+            (gens / tag / "glaeda/scripts/glaeda-gh").write_bytes(body)
+            (gens / tag / "ancestry.txt").write_text(ancestry + "\n")
+        seen = {"stat": gg.script_stat(path), "sha": running}
+        step = [0]
+
+        def put(body: bytes) -> None:
+            step[0] += 1
+            path.write_bytes(body)
+            os.utime(path, ns=(seen["stat"][0] + step[0] * 10**9,) * 2)
+
+        logged: list[dict] = []
+        with mock.patch.dict(os.environ, {"FAST_PATCH_STATE": str(state)}), \
+                mock.patch.object(gg, "UPDATE_GENERATIONS", gens), mock.patch.object(gg, "log", logged.append):
+            put(b"ring")  # setup put the older release back
+            self.assertFalse(gg.script_changed(path, seen))
+            self.assertEqual([(e["event"], e["release"]) for e in logged], [("reexec-older-skipped", "r-old")])
+            self.assertFalse(gg.script_changed(path, seen), "one log per install")
+            self.assertEqual(len(logged), 1)
+            put(b"main")  # fast-patch put main back: still the running bytes
+            self.assertFalse(gg.script_changed(path, seen))
+            put(b"newer")  # a release that includes the commit
+            self.assertTrue(gg.script_changed(path, seen))
+            put(b"hand")  # bytes no release holds
+            self.assertTrue(gg.script_changed(path, seen))
+            (gens / "r-old/ancestry.txt").unlink()
+            self.assertEqual(gg.older_release(gg.hashlib.sha256(b"ring").hexdigest(), running, gens), "r-old",
+                             "no ancestry: not a descendant, as glaeda-update reads it")
+            (state / "glaeda/live.json").write_text(json.dumps({"commit": commit,
+                                                                 "tools": {"glaeda-gh": gg.hashlib.sha256(b"ring").hexdigest()}}))
+            self.assertIsNone(gg.older_release(gg.hashlib.sha256(b"ring").hexdigest(), running, gens),
+                              "fast-patch named these bytes first (its rollback): they run")
+            (state / "glaeda/live.json").unlink()
+            self.assertIsNone(gg.older_release(gg.hashlib.sha256(b"ring").hexdigest(), running, gens),
+                              "no fast-patch here: the ring's bytes run as before")
+
     def test_a_swapped_script_ends_the_tick_and_wakes_serve(self) -> None:
         """A lane VM, 2026-11-24: merge a8f8c140 went live 15 s after it merged, 7 s of them a tick finishing after
         fast-patch swapped the bytes. ScriptWake ends the tick and the TICK sleep once per new content."""
@@ -32157,6 +32206,37 @@ class LandTest(Base):
         self.assertEqual(said[3], "host/lane")
         self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+        # LAND_MERGED_ELSEWHERE_FYI: a merge this queue did not make reaches its requester as an inbox fyi
+        self.assertEqual(said[said.index("--class") + 1], gg.LAND_FORWARD_FYI_CLASS)
+
+    def test_only_this_queues_own_merge_wakes_its_requester(self):
+        # LAND_MERGED_ELSEWHERE_FYI: gcp-agent-lane-12, 2026-11-23..25, 30 of 86 cache-read merged notices woke a lane
+        # that had nothing to do; Leo, 2026-11-24: "are there any like process level fixes?"
+        e = self.forwarded_row()
+
+        def told(how: str) -> str:
+            self.w.calls.clear()
+            self.q.merged(e, "f" * 40, how)
+            [said] = [c for c in self.w.sent() if "merged" in c[-1]]
+            return said[said.index("--class") + 1]
+
+        self.assertEqual(told("merged pinned"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
+        self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
+
+    def test_a_stop_of_a_pr_the_cache_reads_merged_wakes_nobody(self):
+        # LAND_STOP_MERGED_QUIET: forward_no_outcome, head_moved and own_red stops of PRs already merged each woke a
+        # lane that answered "already merged" (gcp-agent-lane-12, 16 in 48 h)
+        e = self.forwarded_row()
+        self.w.calls.clear()
+        self.w.cache[self.KEY]["data"]["state"] = "MERGED"
+        self.q.stop(e, "forward_no_outcome", "no outcome", "land again")
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual([c for c in self.w.sent() if "stopped" in c[-1]], [])
+        self.w.cache[self.KEY]["data"]["state"] = "OPEN"
+        self.q.stop(e, "own_red", "ci failed", "fix it")
+        self.assertEqual(len([c for c in self.w.sent() if "own_red" in c[-1]]), 1)  # an open PR's stop still tells
 
     def test_a_row_after_a_forwarded_pr_merged_outside_the_queue_stops_waiting_within_a_pass_latch_or_not(self):
         # glaeda#2540 sat waiting_after glaeda#2518 after a direct pinned merge of #2518: #2518's row here was
