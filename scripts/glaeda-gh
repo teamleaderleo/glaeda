@@ -22541,7 +22541,7 @@ class LandQueue:
                     branch, base = self.union_refs(e, branch, base)
                 said = said or str((e.get("refresh") or {}).get("error") or "it named no branch")
             if not branch or not base:
-                return "", "", f"this host has no read of {key_name(key)}'s branch or base: {said}", True
+                return "", "", f"{key_name(key)}'s branch and base could not be read from this host: {said}", True
         for which, name in (("branch", branch), ("base", base)):
             if not BRANCH_SAFE.fullmatch(name) or ".." in name:
                 return "", "", f"the PR's {which} {name!r} is not a plain branch name", False

@@ -32127,7 +32127,7 @@ class LandTest(Base):
         self.assertEqual((again[0], again[1], again[3]), ("", "", True))
         self.assertIn("the one read this step makes per head named no branch", again[2])
         self.assertEqual(reads, [self.KEY])
-        self.assertIn("this host has no read of o/r#1's branch or base", e["stop"]["reason"])
+        self.assertIn("o/r#1's branch and base could not be read from this host", e["stop"]["reason"])
         self.assertIn("a read gh refused", e["stop"]["reason"])
         self.assertNotIn("unionMerge", e)
         e = self.union_conflict_tick(head)
@@ -32150,7 +32150,7 @@ class LandTest(Base):
         self.assertEqual(self.retargets(), [])
         failed = [h for h in e["history"] if h["event"] == "stacked_rebase_failed"]
         self.assertEqual(len(failed), 1, e.get("history"))
-        self.assertIn("this host has no read of o/r#1's branch or base", failed[0]["why"])
+        self.assertIn("o/r#1's branch and base could not be read from this host", failed[0]["why"])
         self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
 
     def test_a_union_merge_a_restart_dropped_before_it_ran_is_tried_at_the_next_refusal(self):
