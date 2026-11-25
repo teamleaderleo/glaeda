@@ -4858,6 +4858,8 @@ class HookTest(unittest.TestCase):
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                               ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
                               ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                              ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab"),
                               # GATEWAY_FLEET_SUFFIX: a -fleet job id from any home-repository workflow
                               ("cmux-next-ios-kit.yml", "link-ffi-fleet"), ("other.yml", "new-client-fleet")):
             with self.subTest(workflow=workflow, job=job):
