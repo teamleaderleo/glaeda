@@ -1435,6 +1435,14 @@ PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus head
                    f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
                    f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
 PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
+# GitHub cuts a GraphQL query at about 10 s (a 502 or 504 after 10.x s). A full PR read costs what its checks cost:
+# about 0.5 s for a small repository's PR, 5 s or more for a cmux PR with 160+ checks. One batch size serves the
+# cheap probes and the full reads alike, and it restarts at GQL_BATCH_START, so on the land host (
+# 2026-11-25) full-read queries of 2 to 10 cmux PRs 502'd after 10.5 s, 335 times in 36 h, and each tick spent most of
+# its time in them while the land queue's PR data aged past 7,000 s. So fetch_prs splits its full reads into queries
+# whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
+PR_FULL_QUERY_SECONDS = 6.0
+PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -6181,6 +6189,7 @@ class Daemon:
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
         self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
+        self.full_pr_secs: dict[str, float] = {}  # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -11035,7 +11044,10 @@ class Daemon:
         """None, or the error when the whole query failed (batched() halves on a timeout)."""
         query, variables = pr_query([e["key"] for e in entries], kind)
         self.reads += [(self.now, kind, "graphql")] * len(entries)
+        began = time.monotonic()
         doc, error = self.graphql(query, variables)
+        if kind == "pr" and entries:
+            self.note_full_pr_secs(entries, time.monotonic() - began, doc is not None and bool(doc.get("data")))
         if doc is None:
             self.fail(entries, error or "graphql: no response")
             return error or "graphql: no response"
@@ -11390,7 +11402,39 @@ class Daemon:
                 self.fail(entries, error)
                 return error
             full += changed
-        return self.fetch_aliased(full, "pr") if full else None
+        # The full reads in queries sized by their measured cost (PR_FULL_QUERY_SECONDS), not the batch's size. One that
+        # fails stops the rest: batched() splits the chunk, and the PRs read here are probed then, which is cheap.
+        size = self.full_pr_size(full)
+        for i in range(0, len(full), size):
+            error = self.fetch_aliased(full[i:i + size], "pr")
+            if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
+                return error
+        return None
+
+    def full_pr_size(self, full: list[dict]) -> int:
+        """How many of FULL (one repository's PRs, as batched() groups them) one full-read query may carry: as many as
+        fit PR_FULL_QUERY_SECONDS at the seconds per PR measured for the repository, all of them while none is."""
+        if not full:
+            return 1
+        secs = self.__dict__.setdefault("full_pr_secs", {}).get("/".join(split_key(full[0]["key"])[1:3]).lower())
+        return len(full) if secs is None else max(1, min(len(full), int(PR_FULL_QUERY_SECONDS // max(0.01, secs))))
+
+    def note_full_pr_secs(self, entries: list[dict], seconds: float, answered: bool) -> None:
+        """Learn a repository's seconds per full PR read from one query of ENTRIES that took SECONDS: an answer moves
+        the measure a third of the way to it; a failure slower than PR_FULL_SLOW_AT says the PRs cost at least that
+        much between them (a query cut at ~10 s took longer than it shows), so the next query carries fewer."""
+        repo = "/".join(split_key(entries[0]["key"])[1:3]).lower()
+        per = seconds / len(entries)
+        measured = self.__dict__.setdefault("full_pr_secs", {})
+        known = measured.get(repo)
+        if answered:
+            measured[repo] = per if known is None else known + (per - known) / 3
+        elif seconds >= PR_FULL_SLOW_AT:
+            floor = seconds * 1.25 / len(entries)
+            if known is None or known < floor:
+                measured[repo] = floor
+                log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
+                     "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
