@@ -15059,7 +15059,12 @@ LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]
 # written before the send), on a host with its own GitHub login only. On a broker client, or at a head already sent,
 # it stays the command it was and stops as before. It decides nothing: the label starts the tier, and the next
 # judgment waits on the tier's own status.
-LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (\d+) -R ([\w.-]+/[\w.-]+) --add-label (ready-to-land|full-ci)\s*")
+# leo-workspace#10642 (2026-11-25) moved land_judge's label command to REST (`gh api -X POST
+# repos/OWNER/REPO/issues/N/labels -f 'labels[]=L' --silent`): gh pr edit's GraphQL read selects projectCards, which the
+# Projects (classic) deprecation now fails. Both shapes are the label step; do_label writes over REST either way.
+LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (?P<n>\d+) -R (?P<repo>[\w.-]+/[\w.-]+) --add-label (?P<label>ready-to-land|full-ci)\s*"
+                                r"|\s*gh api -X POST repos/(?P<repo2>[\w.-]+/[\w.-]+)/issues/(?P<n2>\d+)/labels -f "
+                                r"'?labels\[\]=(?P<label2>ready-to-land|full-ci)'?(?: --silent)?\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -16051,10 +16056,14 @@ def land_command_label(act: dict, answer: dict) -> dict | None:
     named = LAND_COMMAND_LABEL.fullmatch(text)
     repo = str(act.get("repo") or answer.get("repo") or "")
     number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
-    if not named or not repo or named.group(2).lower() != repo.lower() or named.group(1) != number:
+    if not named:
+        return None
+    n, named_repo, label = (named.group("n") or named.group("n2"), named.group("repo") or named.group("repo2"),
+                            named.group("label") or named.group("label2"))
+    if not repo or named_repo.lower() != repo.lower() or n != number:
         return None
     return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "label", "repo": repo,
-            "label": named.group(3), "text": text.strip(), "from": "command"}
+            "label": label, "text": text.strip(), "from": "command"}
 
 
 def land_command_rerun(act: dict, answer: dict) -> dict | None:
@@ -21580,7 +21589,9 @@ class LandQueue:
             e["labelSent"] = {"head": head, "at": self.now}
             self.history(e, "label_sent", head=head[:12], label=label)
             self.save(e)
-        got = self.call([gh, "pr", "edit", number, "-R", repo, "--add-label", label], LAND_GH_DEADLINE, e)
+        # REST, not `pr edit --add-label` (LAND_COMMAND_LABEL's comment: its GraphQL read fails on projectCards)
+        got = self.call([gh, "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={label}"],
+                        LAND_GH_DEADLINE, e)
         named = None
         with self.lock:
             if got.returncode not in (0, 124):

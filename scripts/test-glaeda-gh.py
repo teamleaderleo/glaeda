@@ -26542,7 +26542,8 @@ class LandTest(Base):
         self.land()
         self.w.answers.append(self.tier_refusal(LA))
         e = self.tick()
-        self.assertEqual(self.w.gh_calls("pr", "edit"), [["pr", "edit", "1", "-R", "o/r", "--add-label", "ready-to-land"]])
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "POST", "repos/o/r/issues/1/labels", "-f",
+                                                     "labels[]=ready-to-land"]])
         self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
                          ("waiting", "retry", "label", 0))
         self.assertEqual(e["labelSent"]["head"], LA)
@@ -26551,7 +26552,7 @@ class LandTest(Base):
             self.w.answers.append(self.tier_refusal(LA))
         for _ in range(3):
             e = self.tick(gg.NUDGE_MIN * 3 + 1)
-        self.assertEqual(len(self.w.gh_calls("pr", "edit")), 1)
+        self.assertEqual(len(self.w.gh_calls("api")), 1)
 
     def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
         self.broker = True
@@ -26559,7 +26560,7 @@ class LandTest(Base):
         self.land()
         self.w.answers.append(self.tier_refusal(LA))
         e = self.tick()
-        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        self.assertEqual(self.w.gh_calls("api"), [])
         self.assertFalse(e.get("labelSent"))
 
     def test_only_the_land_tier_codes_own_label_command_is_taken(self):
@@ -26581,6 +26582,21 @@ class LandTest(Base):
                                   "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
                                                            "number": 1}}, LA)
             self.assertEqual((act["kind"], act["label"]), ("label", label))
+        # leo-workspace#10642's REST shape, as land_tier.label_command now writes it
+        for label in ("ready-to-land", "full-ci"):
+            text = f"gh api -X POST repos/o/r/issues/1/labels -f 'labels[]={label}' --silent"
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual((act["kind"], act["label"]), ("label", label))
+        for text in ("gh api -X POST repos/o/r/issues/2/labels -f 'labels[]=ready-to-land' --silent",
+                     "gh api -X POST repos/x/y/issues/1/labels -f 'labels[]=ready-to-land' --silent",
+                     "gh api -X POST repos/o/r/issues/1/labels -f 'labels[]=hold' --silent",
+                     "gh api -X DELETE repos/o/r/issues/1/labels/ready-to-land --silent"):
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual(act["kind"], "command", text)
 
     def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
         bad = {
