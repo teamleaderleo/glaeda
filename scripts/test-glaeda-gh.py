@@ -25643,7 +25643,9 @@ def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: 
     return {"state": state, "headRefOid": head, "mergeable": mergeable, "mergeStateStatus": "CLEAN",
             "isDraft": draft,
             **({"headParent": parent} if parent else {}),
-            "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
+            # a 4-tuple is a status context, as parse_pr stores one: no workflow, and the description the read gave
+            "checks": [{"name": c[0], "workflow": None if len(c) > 3 else "w", "status": c[1], "conclusion": c[2],
+                        **({"description": c[3]} if len(c) > 3 else {})} for c in checks]}
 
 
 def refusal(code: str, head: str, action: dict | None, nxt: str = "", reason: str = "") -> tuple[int, dict]:
@@ -29319,6 +29321,53 @@ class LandTest(Base):
                 self.assertIn("w/linux (queued)", e["stop"]["reason"])
                 self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
                 self.assertIn("checks_stuck", self.w.sent()[-1][-1])
+
+    def test_a_stop_on_label_gated_checks_names_the_label_that_starts_them(self):
+        """cmux#55176 (2026-11-25): the head carried one pending status per deferred check, each saying in its
+        description that `ready-to-land` starts it. Nothing dispatches them until the label goes on, so every wait was
+        a wait on runs no runner would ever take, and the land stopped checks_stuck after 4.1 h and 9 wait refusals
+        telling its reader to wait again. The stop has to name the label."""
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"),
+                            ("React Doctor (changed React projects)", "PENDING", None, said)])
+        self.land()
+        e = self.run_hour(lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                          seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        reason = e["stop"]["reason"]
+        self.assertIn("React Doctor (changed React projects) (pending)", reason)
+        self.assertIn("the ready-to-land label starts", reason)
+        self.assertIn("ready-to-land", self.w.sent()[-1][-1])
+
+    def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
+        # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
+        # stop that invented a label would send its reader to add one no workflow reads.
+        for said in ("Queued on a Linux runner", None):
+            with self.subTest(said=said):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                checks = [("ci", "COMPLETED", "SUCCESS")]
+                checks.append(("ws-check", "PENDING", None, said) if said else ("ws-check", "PENDING", None))
+                self.pr(LA, checks=checks)
+                self.land()
+                e = self.run_hour(lambda: refusal("checks_running", LA,
+                                                  {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                                  seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+                self.assertNotIn("label starts", e["stop"]["reason"])
+
+    def test_land_gate_labels_reads_only_an_unfinished_status_that_says_a_label_starts_it(self):
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        self.assertEqual(gg.land_gate_labels({"checks": [
+            {"name": "a", "status": "PENDING", "description": said},
+            {"name": "b", "status": "PENDING", "description": "This check runs when land-ci is added"},
+            {"name": "c", "status": "COMPLETED", "conclusion": "SUCCESS", "description": said},
+            {"name": "d", "status": "PENDING", "description": "Waiting for a runner"},
+            {"name": "e", "status": "PENDING"},
+        ]}), ["land-ci", "ready-to-land"])
+        self.assertEqual(gg.land_gate_labels({}), [])
+        self.assertEqual(gg.land_gate_labels({"checks": [{"name": "a", "status": "PENDING", "description": 7}]}), [])
 
     def test_a_merge_refused_for_running_checks_never_counts_toward_the_step_stop(self):
         # The same class through a step: "ok", then the pinned merge refused [checks_running] naming a wait, again and
