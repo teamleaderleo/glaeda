@@ -26347,6 +26347,59 @@ class LandTest(Base):
         for url in ("https://gitlab.com/o/r.git", "https://github.com/o/r/x", "file:///m/o/r.git"):
             self.assertEqual(gg.land_fetch_origin(url), "", url)
 
+    TIER = "gh pr edit 1 -R o/r --add-label ready-to-land"
+
+    def tier_refusal(self, head: str, nxt: str | None = None, **action) -> tuple[int, dict]:
+        nxt = nxt or self.TIER
+        return refusal("land_tier_pending", head, {"kind": "command", "text": nxt, **action}, nxt,
+                       f"land-judge: refused: hq/land-tier is pending and the PR needs ready-to-land at {head}")
+
+    def test_the_land_tier_label_is_added_by_the_queue_once_per_head(self):
+        # cmuxterm-hq#24362 at a1d33b52ffc3, 2026-11-24: stopped land_tier_pending on a label command nobody ran.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.tier_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [["pr", "edit", "1", "-R", "o/r", "--add-label", "ready-to-land"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "label", 0))
+        self.assertEqual(e["labelSent"]["head"], LA)
+        self.assertIn("label_sent", [h["event"] for h in e["history"]])
+        for _ in range(3):  # still refused at the same head: not sent again
+            self.w.answers.append(self.tier_refusal(LA))
+        for _ in range(3):
+            e = self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "edit")), 1)
+
+    def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.tier_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        self.assertFalse(e.get("labelSent"))
+
+    def test_only_the_land_tier_codes_own_label_command_is_taken(self):
+        for text, code, repo, number in (
+            ("gh pr edit 1 -R o/r --add-label ready-to-land", "red_not_excused", "o/r", "1"),
+            ("gh pr edit 2 -R o/r --add-label ready-to-land", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R x/y --add-label ready-to-land", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --add-label hold", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --add-label ready-to-land && true", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --base main", "land_tier_pending", "o/r", "1"),
+        ):
+            act = gg.land_action({"ok": False, "code": code, "repo": repo, "number": number, "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text, "repo": repo,
+                                             "number": int(number)}}, LA)
+            self.assertEqual(act["kind"], "command", text)
+        for label in ("ready-to-land", "full-ci"):
+            text = f"gh pr edit 1 -R o/r --add-label {label}"
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual((act["kind"], act["label"]), ("label", label))
+
     def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
         bad = {
             "upload-pack": self.git_fetch()[:4] + ["--upload-pack=/tmp/x", "origin", "main"],
