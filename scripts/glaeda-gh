@@ -8278,7 +8278,9 @@ class Daemon:
         `gh` takes: the daemon here has no login, and its `gh auth token` post held every write queued for good
         (lane_vm_poster). A limit's refusal made nothing, so the write waits out its retry_after, and so does every
         write behind it (the pause is the login's). A write with no broker form fails with the command that makes it.
-        A lost answer fails rather than risk a second PR or comment: it names the repository to read first. An entry
+        A lost answer is never sent again blind: once the broker's own deadline has passed, broker_find looks for it
+        (posted with its URL when found, resent when the look answers "not there", failed naming the repository to
+        read only when no look answers within POST_ATTEMPTS). An entry
         a token-less attempt marked uncertain was never sent (its POST needed the token it could not get)."""
         chosen = broker_post_args(item)
         if chosen is None:
@@ -8286,6 +8288,19 @@ class Daemon:
                                                f"status key or reviewers); {broker_post_next(item)}")
             return
         item.pop("uncertain", None)
+        if item.get("brokerLost"):
+            # The last broker call's answer was lost: the write may have landed. Look before sending it twice;
+            # report it posted only on what the look found, resend only on a look that answered "not there".
+            found, looked = broker_find(item, BROKER_OUTBOX_DEADLINE)
+            self.post_at = self.now
+            if found:
+                self.post_delivered(path, item, found, note="found through the lane-gh broker after a lost answer")
+                return
+            if not looked:
+                self.post_retry(path, item, f"could not look for the lost attempt in {item['repo']}; it may have been "
+                                            f"made: read {item['repo']} before sending it again")
+                return
+            item.pop("brokerLost", None)
         outcome, value = broker_write(item, chosen, BROKER_OUTBOX_DEADLINE)
         self.post_at = self.now
         if outcome == "made":
@@ -8301,8 +8316,14 @@ class Daemon:
             write_json(path, item)
             log({"event": "post-throttled", "id": item["id"], "wait": round(wait), "via": "lane-gh"})
         elif outcome == "lost":
-            self.post_finish(path, item, error=f"{value}; it may have been made: read {item['repo']} before sending "
-                                               "it again")
+            # Never "failed" on a lost answer alone: the next turn looks for it first (broker_find), so the record
+            # ends posted with the write's own URL, or resent once the look says it is not there. An update-branch
+            # is a base merge, safe to ask twice: it is simply asked again.
+            item["brokerLost"] = item["kind"] != "update-branch"
+            self.post_retry(path, item, f"{value}; it may have been made: read {item['repo']} before sending it again")
+            if item["brokerLost"] and path.exists():  # the broker may still make it until its own deadline: look after
+                item["notBefore"] = max(float(item.get("notBefore") or 0), self.now + BROKER_POST_DEADLINE)
+                write_json(path, item)
         else:
             ended = update_branch_retired(422, str(value)) if item["kind"] == "update-branch" else None
             if ended and ended[0] == "done":
@@ -27051,6 +27072,64 @@ def wait_command(req: dict) -> str:
 # ceiling.
 WAIT_MAX_TIMES = 4
 
+# The cache-warm cap (Leo, 2026-11-25: "we need to always be cognizant of those cache writes"; "dont force them to
+# do more bullshit"). A Claude Code session's prompt cache lives 1 h. A wait that returns after that makes the
+# session's next request write its whole context again at 2x input price; a wait that returns inside the hour is a
+# cache read at 0.1x. Measured on cosmic-gray, 24 h to 2026-11-25 06:00Z: 17 Claude Code helper requests came back
+# from a glaeda-gh wait after 60-125 min (agents asked --timeout 3600-7500), 2.9 M cache-write tokens. So a wait
+# that a Claude Code session runs (CLAUDECODE=1) ends by CACHE_WARM_WAIT from its start, exit 2 with the same wait
+# as its `next:`; the re-run reads a warm cache. Bounded: after CACHE_WARM_HORIZON of back-to-back re-runs on one
+# target the wait runs as asked (a 0.1x read an hour stops paying against one 2x write well before then, but a wait
+# that long is rare and the cap must end). GLAEDA_WAIT_CACHE_WARM=0 turns it off. Only the wall-clock length
+# changes: what the wait reports, its exit codes and its verdicts are the same.
+WAIT_DEFAULT_TIMEOUT = 3600.0  # wait --timeout when none is given
+CACHE_WARM_WAIT = 3300.0  # 55 min: the 1 h cache lifetime less the read and the agent's own turn
+CACHE_WARM_HORIZON = 4 * 3600.0  # a chain of capped waits on one target stops being capped this long after it began
+CACHE_WARM_GAP = 900.0  # a wait started within this of the last capped one on the target continues its chain
+
+
+def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None,
+                   now: float | None = None) -> tuple[float, float | None, str]:
+    """TIMEOUT and CEILING for a wait a Claude Code session runs, held to CACHE_WARM_WAIT, and the line saying so
+    ("" when nothing changed). See CACHE_WARM_WAIT."""
+    if os.environ.get("CLAUDECODE") != "1" or os.environ.get("GLAEDA_WAIT_CACHE_WARM", "1") == "0":
+        return timeout, ceiling, ""
+    whole = max(float(timeout), default_wait_max(timeout) if ceiling is None else float(ceiling))
+    try:
+        key = parse_key(kind, target) if kind in ("pr", "run", "comment") else f"{kind}:{target}"
+    except Exception:  # noqa: BLE001 -- a bad target is the wait's own error to report, not this cap's
+        return timeout, ceiling, ""
+    now = time.time() if now is None else now
+    path = BASE / "cache-warm.json"
+    chains = read_json(path)
+    chains = chains if isinstance(chains, dict) else {}
+    chain = chains.get(key) if isinstance(chains.get(key), dict) else None
+    going = chain is not None and now - float(chain.get("last") or 0) < CACHE_WARM_WAIT + CACHE_WARM_GAP
+    first = float(chain.get("first") or now) if going and chain else now
+    if going and chain and (chain.get("done") or now - first >= CACHE_WARM_HORIZON):
+        # Past the horizon. The chain stays marked done while its waits follow one another, so the uncapped `next:`
+        # does not start a new capped chain; a gap past CACHE_WARM_GAP (the session went cold anyway) starts one.
+        words = ""
+        if not chain.get("done") and whole <= CACHE_WARM_WAIT:  # the capped `next:` again: the wait's own default
+            timeout, ceiling = WAIT_DEFAULT_TIMEOUT, None
+            words = (f"glaeda-gh: re-run on {key} for {span(now - first)}: this wait runs --timeout "
+                     f"{WAIT_DEFAULT_TIMEOUT:g} (the cache-warm cap ends at {span(CACHE_WARM_HORIZON)})")
+        chains[key] = {"first": first, "last": now, "done": True}
+    elif whole > CACHE_WARM_WAIT or going:
+        chains[key] = {"first": first, "last": now}
+        words = "" if whole <= CACHE_WARM_WAIT else (
+            f"glaeda-gh: this wait ends by {CACHE_WARM_WAIT:g}s (asked {whole:g}s), inside the prompt cache's 1 h, "
+            f"so the next request reads a warm cache: on exit 2 run its `next:` again "
+            f"(GLAEDA_WAIT_CACHE_WARM=0 waits as asked)")
+        timeout, ceiling = min(float(timeout), CACHE_WARM_WAIT), min(whole, CACHE_WARM_WAIT)
+    else:
+        return timeout, ceiling, ""
+    for k in [k for k, v in chains.items() if not isinstance(v, dict) or now - float(v.get("last") or 0) > 86400]:
+        chains.pop(k, None)
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        write_json(path, chains)
+    return timeout, ceiling, words
+
 
 def default_wait_max(timeout: float) -> float:
     return WAIT_MAX_TIMES * float(timeout)
@@ -35785,6 +35864,29 @@ def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool
     return "refused", str(said)[:300]
 
 
+def broker_find(item: dict, timeout: float) -> tuple[dict | None, bool]:
+    """(the queued write if it already landed, whether the look got an answer), read through the lane-gh broker's
+    `get` as Daemon.post_find reads with the login: the open PR for its head and base, or a comment with the same
+    body made since it was queued. A page that may not hold every match is no answer (its `get` gives no link)."""
+    repo, kind = item["repo"], item.get("kind")
+    since = dt.datetime.fromtimestamp(float(item.get("queuedAt") or 0) - 60, dt.timezone.utc)
+    if kind == "pr":
+        head = item["head"] if ":" in item["head"] else f"{repo.split('/')[0]}:{item['head']}"
+        call = {"path": "pulls", "query": {"state": "open", "head": head, "base": item["base"], "per_page": "100"}}
+    elif kind == "comment":
+        call = {"path": f"issues/{item['number']}/comments",
+                "query": {"since": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "per_page": "100"}}
+    else:
+        return None, False
+    outcome, data = broker_write(item, ("get", call), timeout, pin=False)
+    if outcome != "made" or not isinstance(data, list) or len(data) >= 100:
+        return None, False
+    for found in reversed(data):
+        if isinstance(found, dict) and found.get("html_url") and (kind == "pr" or (found.get("body") or "") == item["body"]):
+            return found, True
+    return None, True
+
+
 def broker_made_where(data: Any) -> tuple[str | None, Any]:
     """(url, number) from a broker write's data."""
     if not isinstance(data, dict):
@@ -37289,7 +37391,7 @@ def parser() -> argparse.ArgumentParser:
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
-            s.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=3600,
+            s.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=WAIT_DEFAULT_TIMEOUT,
                            help="seconds with no change in what it waits on (default 3600; --wait is the same): "
                                 "every change it sees "
                                 "(a check or job started or finished, a comment, a file growing, CPU used) moves "
@@ -38594,6 +38696,10 @@ def main(argv: list[str] | None = None) -> int:
             raise WatchError("--rescue-grace must be 0 or more seconds")
         if args.settle < 0:
             raise WatchError("--settle must be 0 or more seconds")
+        if args.kind in ("pr", "run", "comment", "file", "pid"):
+            args.timeout, args.max, capped = cache_warm_cap(args.kind, args.target, args.timeout, args.max)
+            if capped:
+                say_waiting(capped)
         if args.kind == "file":
             if args.exists and args.gone:
                 raise WatchError("wait file takes one of --exists and --gone")

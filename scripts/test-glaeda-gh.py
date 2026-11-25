@@ -67,6 +67,7 @@ HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
 SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
+os.environ.pop("CLAUDECODE", None)  # the suite run from a Claude Code shell is the CI run: CacheWarmCapTest sets it
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -8470,6 +8471,73 @@ class Trickle:
         self.server.close()
 
 
+class CacheWarmCapTest(unittest.TestCase):
+    """A wait a Claude Code session runs ends inside the prompt cache's 1 h (CACHE_WARM_WAIT), so the session's next
+    request is a 0.1x read instead of a 2x rewrite of its whole context; bounded by CACHE_WARM_HORIZON."""
+
+    KEY_TARGET = "o/r#7"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (mock.patch.object(gg, "BASE", Path(tmp.name)),
+                      mock.patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.environ.pop("GLAEDA_WAIT_CACHE_WARM", None)
+
+    def cap(self, timeout: float, ceiling: float | None, now: float) -> tuple[float, float | None, str]:
+        return gg.cache_warm_cap("pr", self.KEY_TARGET, timeout, ceiling, now=now)
+
+    def test_a_long_wait_ends_inside_the_cache_lifetime_and_says_how_to_go_on(self) -> None:
+        timeout, ceiling, words = self.cap(5400, None, NOW)
+        self.assertEqual((timeout, ceiling), (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+        self.assertLess(gg.CACHE_WARM_WAIT, 3600)
+        self.assertIn("next:", words)
+        self.assertIn("GLAEDA_WAIT_CACHE_WARM=0", words)
+
+    def test_the_default_wait_is_capped_too(self) -> None:
+        self.assertEqual(self.cap(gg.WAIT_DEFAULT_TIMEOUT, None, NOW)[:2], (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+
+    def test_a_short_wait_and_a_wait_outside_claude_code_are_untouched(self) -> None:
+        self.assertEqual(self.cap(600, None, NOW), (600, None, ""))
+        with mock.patch.dict(os.environ, {"CLAUDECODE": ""}):
+            self.assertEqual(self.cap(5400, None, NOW), (5400, None, ""))
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM": "0"}):
+            self.assertEqual(self.cap(5400, None, NOW), (5400, None, ""))
+
+    def test_re_runs_stay_capped_until_the_horizon_then_wait_as_the_tool_defaults(self) -> None:
+        t, c, _ = self.cap(5400, None, NOW)
+        at = NOW
+        while at + gg.CACHE_WARM_WAIT - NOW < gg.CACHE_WARM_HORIZON:
+            at += gg.CACHE_WARM_WAIT
+            t, c, words = self.cap(t, c, at)  # the capped `next:` run again
+            if at - NOW < gg.CACHE_WARM_HORIZON:
+                self.assertEqual((t, c, words), (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT, ""))
+        at += gg.CACHE_WARM_WAIT
+        t, c, words = self.cap(t, c, at)
+        self.assertEqual((t, c), (gg.WAIT_DEFAULT_TIMEOUT, None), "past the horizon the cap ends")
+        self.assertIn("cache-warm cap ends", words)
+        # and the uncapped `next:` that follows does not start a new capped chain
+        self.assertEqual(self.cap(gg.WAIT_DEFAULT_TIMEOUT, None, at + 3600)[:2], (gg.WAIT_DEFAULT_TIMEOUT, None))
+
+    def test_a_fresh_wait_after_a_gap_starts_a_new_chain(self) -> None:
+        self.cap(5400, None, NOW)
+        later = NOW + gg.CACHE_WARM_HORIZON + 86400
+        self.assertEqual(self.cap(5400, None, later)[:2], (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+
+    def test_the_cli_hands_the_capped_bound_to_the_wait(self) -> None:
+        seen = {}
+
+        def fake_wait_file(target, timeout, as_json, mode, contains, ceiling):
+            seen.update(timeout=timeout, ceiling=ceiling)
+            return 0
+
+        with mock.patch.object(gg, "cmd_wait_file", fake_wait_file), mock.patch.object(gg, "say_waiting"):
+            gg.main(["wait", "file", "/nonexistent/x", "--timeout", "7200"])
+        self.assertEqual(seen, {"timeout": gg.CACHE_WARM_WAIT, "ceiling": gg.CACHE_WARM_WAIT})
+
+
 class HardDeadlineTest(unittest.TestCase):
     """urllib's timeout bounds each socket read, not the request: a server that keeps sending a
     byte now and then holds a request (and the daemon's whole tick) for as long as it likes."""
@@ -16807,15 +16875,72 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (1, "posted"))
 
-    def test_a_lane_vm_lost_broker_answer_fails_naming_the_read_never_twice(self) -> None:
-        item = self.queue("comment", "o/r#7", "--body", "x")
+    def lost_then(self, item, *answers):
+        """A lane VM's first broker call loses its answer (a timeout); ANSWERS are the later (exit, stdout) calls.
+        Returns the daemon, the calls made, and the time the look is due (the broker's own deadline later)."""
+        ran: list[list[str]] = []
+        replies = list(answers)
+
+        def run(argv, timeout=None, **_kw):
+            ran.append(list(argv))
+            if len(ran) == 1:
+                raise subprocess.TimeoutExpired("lane-gh", 1)
+            code, out = replies.pop(0)
+            return subprocess.CompletedProcess(argv, code, json.dumps(out), "")
         d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)
-        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
-                mock.patch.object(gg, "run_bounded", side_effect=subprocess.TimeoutExpired("lane-gh", 1)):
-            self.step(d, NOW)
+        for patch in (mock.patch.object(gg, "lane_vm_poster", return_value=True),
+                      mock.patch.object(gg, "run_bounded", side_effect=run)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual(state["state"], "queued")  # a lost answer alone is never reported failed, nor done
+        self.assertIn("read o/r before sending it again", state.get("lastError") or "")
+        return d, ran, NOW + gg.BROKER_POST_DEADLINE + 1
+
+    def test_a_lane_vm_lost_broker_answer_is_posted_once_the_look_finds_it_never_sent_twice(self) -> None:
+        """gcp-agent-lane VM 2026-11-25: 4 of its last 10 queued writes ended "the lane-gh broker gave no answer in
+        120s; it may have been made" with no URL. The record now carries the write's own URL once the look finds it."""
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        url = "https://github.com/o/r/pull/7#issuecomment-5"
+        d, ran, due = self.lost_then(item, (0, {"ok": True, "data": [{"body": "y", "html_url": "other"},
+                                                                     {"body": "x", "html_url": url}]}))
+        self.step(d, NOW + 60)
+        self.assertEqual(len(ran), 1)  # the look waits out the broker's own deadline: it may still be making it
+        self.step(d, due)
+        self.assertEqual(ran[1][1:4], ["call", "get", "o/r"])
+        self.assertEqual(json.loads(ran[1][4])["path"], "issues/7/comments")
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"], len(ran)), ("posted", url, 2))
+
+    def test_a_lane_vm_lost_broker_answer_is_resent_only_when_the_look_says_it_is_not_there(self) -> None:
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why")
+        d, ran, due = self.lost_then(item, (0, {"ok": True, "data": []}),
+                                     (0, {"ok": True, "data": {"number": 9, "url": "https://github.com/o/r/pull/9"}}))
+        self.step(d, due)
+        self.assertEqual([r[2] for r in ran], ["pr_create", "get", "pr_create"])
+        self.assertEqual(json.loads(ran[1][4])["query"]["head"], "o:lane/x")
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_a_lane_vm_look_with_no_answer_keeps_the_write_queued_then_gives_up_naming_the_read(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, ran, due = self.lost_then(item, *[(1, {"ok": False, "error": "busy"})] * gg.POST_ATTEMPTS)
+        at = due
+        for _ in range(gg.POST_ATTEMPTS):
+            self.step(d, at)
+            at += gg.POST_RETRY * gg.POST_ATTEMPTS + 1
+        self.assertTrue(all(r[2] == "get" for r in ran[1:]))  # never a second comment while the look cannot answer
         state = gg.post_state(item["id"])
         self.assertEqual(state["state"], "failed")
         self.assertIn("read o/r before sending it again", state["error"])
+
+    def test_a_lane_vm_lost_update_branch_is_asked_again_without_a_look(self) -> None:
+        sha = "a" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        d, ran, _due = self.lost_then(item, (0, {"ok": True, "data": {"url": "https://github.com/o/r/pull/7"}}))
+        self.step(d, NOW + gg.POST_RETRY + 1)
+        self.assertEqual([r[2] for r in ran], ["update_branch", "update_branch"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
     def test_a_lane_vm_review_is_refused_at_accept_naming_what_posts_it(self) -> None:
         args = gg.parser().parse_args(["post", "review", "o/r#7", "--body", "r"])
