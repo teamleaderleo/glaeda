@@ -20826,8 +20826,8 @@ class LandQueue:
         sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
         if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha):
             return True
-        with self.lock:
-            if parents is not None and self.follow_own_update(e, sha, parents) is None:
+        with self.lock:  # parents None (unread) still follows an update this queue sent at the pin, as before
+            if self.follow_own_update(e, sha, parents) is None:
                 return True  # the queue's own update: the step below clears its streak
         return self.base_merge_check(e, {"head": sha, "pin": pin, "parent": ""})
 
