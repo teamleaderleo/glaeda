@@ -25042,6 +25042,11 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
+    null = land_pin_null_refusal(repo, number, sha) if sha else None
+    if null is not None:
+        # First of the pin answers, before the draft read and before check_land_pin's two git calls: no head, cache
+        # or checkout is needed to know this sha names no commit, so the refusal costs nothing at all.
+        return land_request_refused(key, "land_pin_null", *null, as_json=as_json)
     draft = land_draft_refusal(key, repo, number, sha)
     if draft is not None:
         # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
@@ -25050,10 +25055,6 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
-    null = land_pin_null_refusal(repo, number, sha) if sha else None
-    if null is not None:
-        # Before every head read: no head is needed to know this sha is no commit, so the answer costs nothing.
-        return land_request_refused(key, "land_pin_null", *null, as_json=as_json)
     cached = land_cached_head(key, LAND_PIN_BEHIND_AGE) if sha else ""
     # The cache first; failing that, the caller's own checkout of this repository, which is the head the guidance
     # tells them to pin and the only one a PR opened minutes ago has (land_pin_local_head).
