@@ -22504,15 +22504,58 @@ class LandQueue:
                 head = said  # the PR's branch is now the rebased head; the base change follows from it
         self.push_step(e, "retarget", head, land_retarget_args(repo, number, base, self.broker_client()), base=base)
 
+    def branch_base(self, e: dict, head: str) -> tuple[str, str, str, bool]:
+        """(the PR's branch, its base, "", False) for a step that needs both names: this host's cache, and when it has
+        never read the PR at all one read of its own (refresh_job), bounded to once per head; else ("", "", why not,
+        whether that decided nothing about HEAD). An unread PR is no answer about its branch: one land queue, 2026-11-25,
+        stopped leo-workspace#10571 update_branch_conflict in the same second its first full read landed,
+        and #10649 and #10864 3.5 and 14 min before theirs, each stop terminal with a next step naming no file (46 of
+        127 stopped rows were conflict stops, 41 of them naming no file at all). A read that carries no ref names is
+        the same nothing: union_refs asks for the two names alone (another queue's #10997, #10659, #11038, #11192)."""
+        key = e["key"]
+        data = (self.cache_of(key) or {}).get("data") or {}
+        branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+        if not branch or not base:
+            said = ""
+            with self.lock:
+                again = str((e.get("branchRead") or {}).get("head") or "") == str(head or "")
+                if not again:
+                    e["branchRead"] = {"head": str(head or ""), "at": self.now}
+                    self.save(e)
+                hold = self.refresh_hold
+            if again:
+                said = "the one read this step makes per head named no branch"
+            elif self.refresh is None:
+                said = "no read of its own to make here"
+            elif self.refresh_held():
+                said = "this host's land reads are held: " + land_trim(str((hold or {}).get("why") or
+                                                                           (hold or {}).get("kind") or "a hold"), 120)
+            else:
+                try:
+                    self.refresh_job(key)
+                except OSError as error:
+                    said = describe(error)
+                data = (self.cache_of(key) or {}).get("data") or {}
+                branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+                if not branch or not base:  # a full read that carried no ref names: ask for the two names alone
+                    branch, base = self.union_refs(e, branch, base)
+                said = said or str((e.get("refresh") or {}).get("error") or "it named no branch")
+            if not branch or not base:
+                return "", "", f"{key_name(key)}'s branch and base could not be read from this host: {said}", True
+        for which, name in (("branch", branch), ("base", base)):
+            if not BRANCH_SAFE.fullmatch(name) or ".." in name:
+                return "", "", f"the PR's {which} {name!r} is not a plain branch name", False
+        return branch, base, "", False
+
     def stacked_rebase(self, e: dict, head: str, base: str) -> tuple[str, str]:
         """(state, what): "none" (no rebase needed: why), "rebased" (pushed: the new head), "conflict" or "empty"
         (nothing pushed: why), "failed" (decided nothing: why). LAND_STACKED_REBASE_MAX's comment."""
         repo = e["repo"]
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        branch, old = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
-        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(old) and BRANCH_SAFE.fullmatch(base)) \
-                or ".." in branch + old + base:
-            return "failed", f"the PR's branch {branch!r}, base {old!r} or new base {base!r} is not a plain branch name"
+        branch, old, why, _nothing = self.branch_base(e, head)
+        if why:  # "failed" is this step's decided-nothing channel: its caller refuses the step, never a bare retarget
+            return "failed", why
+        if not BRANCH_SAFE.fullmatch(base) or ".." in base:
+            return "failed", f"the new base {base!r} is not a plain branch name"
         if old == base:
             return "none", f"its base already is {base}"
         if repo.split("/", 1)[0].lower() not in LAND_MERGE_OWNERS:
@@ -22751,19 +22794,11 @@ class LandQueue:
         if repo.partition("/")[0].lower() not in LAND_MERGE_OWNERS:
             return "", "", "", (f"{repo} is not a repository of {', '.join(sorted(LAND_MERGE_OWNERS))}: this queue "
                                 "pushes a base merge only to their own branches")
-        data = (self.cache_of(e["key"]) or {}).get("data") or {}
-        branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
-        if not (branch and base):
-            # cmux-cp-1, 2026-11-25: leo-workspace#10997, #10659, #11038 and #11192 stopped conflicts_base with the base
-            # merge skipped as "the PR's branch '' or base '' is not read": their cached rows held no ref names (a
-            # read that does not carry them). Read them once here; a read that fails decided nothing (retry).
-            branch, base = self.union_refs(e, branch, base)
-            if not (branch and base):
-                e["unionMerge"]["retry"] = True
-                return "", "", "", (f"the PR's branch {branch!r} or base {base!r} could not be read (neither the cache "
-                                    "nor a pr view held them)")
-        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
-            return "", "", "", f"the PR's branch {branch!r} or base {base!r} is not a plain branch name"
+        branch, base, why, nothing = self.branch_base(e, head)
+        if why:
+            if nothing:  # decided nothing about the head: a re-land at it tries again (unionMerge dropped)
+                e.setdefault("unionMerge", {})["retry"] = True
+            return "", "", "", why
         if not SHA40.fullmatch(head or ""):
             return "", "", "", "no 40-hex head to merge onto"
         gitdir = os.fspath(land_dir() / "union" / (repo.replace("/", "__") + ".git"))
