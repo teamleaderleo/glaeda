@@ -29861,7 +29861,7 @@ class LandTest(Base):
                     self.assertEqual(env["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
                 explain = [env for c, env in runs if c[1:3] == [self.w.mh, "explain"]]
                 self.assertTrue(explain)
-                self.assertNotIn("LANE_GH_LANE", explain[0])  # a read needs no lane
+                self.assertEqual(explain[0].get("LANE_GH_LANE"), "lane")  # it adds ready-to-land (label_send)
         # a requester on another host names no lane
         self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
         self.assertEqual(gg.land_lane({"requester": ""}), "")
