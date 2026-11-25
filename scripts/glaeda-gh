@@ -16512,7 +16512,16 @@ class LandQueue:
           or cleared, and every history row naming it too.
         - A row the first give-up stopped forward_no_outcome without reading the PR's state (LAND_FORWARD_STATE_FRESH's
           comment) is forwarded again, past its give-up, so the next look reads its state: a merged or closed PR ends
-          quietly, an open one is landed again here. Once per row (forwardRepaired)."""
+          quietly, an open one is landed again here. Once per row (forwardRepaired).
+        - A row stopped forward_no_outcome before its far host could be asked what became of it (forward_ask: the
+          give-up read only GitHub, and landed it again here at most once) is forwarded again, once (forwardAskRepair),
+          past its give-up and with its re-land cleared: the next look asks its far host, whose merge or stop ends it
+          quietly with its words, else reads the PR live: merged or closed ends it, still open at its pin lands it
+          again here pinned at that head, a moved head stops head_moved as an fyi. Nobody is woken: its requester was
+          told once already (forwardQuietTold). cosmic-gray, 2026-11-25 04:05Z: dozens of rows read "handed to
+          cmux-cp-1's land queue ~7200 s ago with no outcome: the PR is still open; it was landed again here ... and
+          that has no outcome either", cmux-cp-1 holding the answer. A give-up after the ask (forward_give_up)
+          writes forwardAskRepair, so this never reopens one."""
         changed = False
         to = e.get("forwardedTo")
         if isinstance(to, str) and to.startswith("-"):  # an option word, never a host or a program's words
@@ -16533,6 +16542,15 @@ class LandQueue:
             e.update(state=LAND_FORWARDED, stop=None, forwardRepaired=self.now,
                      forwardFirst=min(at, self.now) - LAND_FORWARD_GIVE_UP - 1)
             self.history(e, "forward_stop_reopened", why="stopped before its PR's state was read")
+            changed = True
+        elif e.get("state") == "stopped" and st.get("code") == "forward_no_outcome" and not e.get("forwardAskRepair"):
+            at = float(st.get("at") or self.now)
+            for field in ("forwardRelanded", "forwardGaveUp", "forwardStateFails", "forwardStateAt"):
+                e.pop(field, None)
+            e.update(state=LAND_FORWARDED, stop=None, forwardAskRepair=self.now,
+                     forwardFirst=min(at, self.now) - LAND_FORWARD_GIVE_UP - 1)
+            self.history(e, "forward_stop_reopened", why="stopped before its far host was asked what became of it")
+            log({"event": "land-forward-ask-repair", "key": e["key"], "to": e.get("forwardedTo") or ""})
             changed = True
         return changed
 
@@ -17993,6 +18011,7 @@ class LandQueue:
         naming why and the way on; its requester is told as an inbox fyi, never a blocker."""
         first = float(e.get("forwardFirst") or 0) or self.forwarded_since(e)
         e["forwardGaveUp"] = self.now  # read before it stopped: repair_forwarded never reopens it
+        e["forwardAskRepair"] = e.get("forwardAskRepair") or self.now  # its far host was asked first (forward_ask)
         told = bool(e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"))  # one fyi a PR (LAND_FORWARD_QUIET's comment): told once, no second
         if not told:
             e["forwardQuietTold"] = {"at": self.now, "since": first, "to": host, "by": "forward_give_up"}
