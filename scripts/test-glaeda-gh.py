@@ -1371,6 +1371,9 @@ class ControllerHoldProjectionTest(unittest.TestCase):
         receipt = {**ordinary, "body": "Review (Codex): SHIP at " + "a" * 40}
         self.assertIsNone(gg.controller_hold_projection(ctl_hold(pr={**ctl_hold()["pr"], "comments": [receipt]}),
                                                         "o/r", 7, "a" * 40, NOW))
+        deleted = {**receipt, "deleted": True}
+        self.assertIsNotNone(gg.controller_hold_projection(ctl_hold(pr={**ctl_hold()["pr"], "comments": [deleted]}),
+                                                           "o/r", 7, "a" * 40, NOW))
 
     def test_controller_holds_quotes_and_normalizes_the_repository(self) -> None:
         with mock.patch.object(gg.Controller, "get", return_value={}) as get:

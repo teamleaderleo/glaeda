@@ -4975,6 +4975,8 @@ def controller_hold_projection(doc: dict, repo: str, number: int, head: str, now
         return {"login": login, "__typename": "Bot" if bot else "User", "is_bot": bot}
     shaped_comments = []
     for item in comments:
+        if isinstance(item, dict) and item.get("deleted"):
+            continue
         if not isinstance(item, dict) or isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) \
                 or not isinstance(item.get("author"), str) or not isinstance(item.get("body"), str) \
                 or not isinstance(item.get("created_at"), str) or iso_epoch(item.get("created_at")) is None \
