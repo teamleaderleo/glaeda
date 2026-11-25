@@ -1313,6 +1313,19 @@ PR_REST_FULL_EVERY = 300
 # re-reads the pull whose merge state a land rules on.
 PR_REST_SETTLED_FULL_EVERY = 1800
 PR_REST_SUITE_PAGE = 100  # a head with more suites than one page is read in full
+# The gate's check suites come from the controller's check rollup (GET /v1/github/commits/SHA/rollup, over the
+# tailnet: no GitHub request) when it says the head's check runs are complete: rollup_suites groups them by suite, in
+# slim_check_suites' terms (status completed once every run is, its conclusions, its run count), so a suite finishing,
+# a new suite or a rerun's runs move it and a run's progress does not. A rollup answer and GitHub's never compare equal
+# ("via"), so a head whose source changes reads in full once. An incomplete, slow or unreachable rollup reads GitHub as
+# before. Why (rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-24 21:28-23:28Z): glaeda-upstream asked
+# commits/{sha}/check-suites 2,136 times in 2 h, 2% of them served by the broker, which never answers check-suites
+# from the rollup; the probe at 2026-11-25 00:15Z found all 57 of the most recently updated open cmux and cmuxterm-hq
+# heads' rollups complete.
+PR_REST_SUITES_FROM_CONTROLLER = True
+CONTROLLER_ROLLUP_TIMEOUT = 2.0  # a complete rollup answers in 0.05-1.4 s; a cold one is seeding from GitHub
+CONTROLLER_ROLLUP_SLOW_SKIP = 15.0  # a head whose rollup timed out is not asked again for this long
+CONTROLLER_ROLLUP_DOWN = 30.0  # a controller that failed otherwise is not asked for a rollup for this long
 # The REST loop reads one PR at a time, and each read's requests went out one after another: ~650 waited PRs at ~2 s a
 # read is a ~1300 s pass however few requests each costs (huge-blue 2026-11-22). So the conditional GETs the next
 # REST_PREFETCH_AHEAD reads will send (the paths and ETags their last read kept: Daemon.prefetch_rest) go out early on
@@ -4948,6 +4961,31 @@ def slim_check_suites(doc: dict) -> dict:
     return {"total": doc.get("total_count"), "suites": sorted(suites, key=lambda s: str(s[0]))}
 
 
+def rollup_suites(doc: object, sha: str) -> dict | None:
+    """The controller rollup DOC of SHA as slim_check_suites' answer (PR_REST_SUITES_FROM_CONTROLLER), else None: an
+    incomplete or other commit's rollup, a run without its suite id, none or more than PR_REST_SUITE_PAGE suites."""
+    if not isinstance(doc, dict) or doc.get("check_runs_complete") is not True or doc.get("sha", sha) != sha:
+        return None
+    runs = (doc.get("check_runs") or {}).get("check_runs") if isinstance(doc.get("check_runs"), dict) else None
+    if not isinstance(runs, list):
+        return None
+    by: dict[int, list[dict]] = {}
+    for run in runs:
+        suite = run.get("check_suite") if isinstance(run, dict) else None
+        sid = suite.get("id") if isinstance(suite, dict) else None
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            return None
+        by.setdefault(sid, []).append(run)
+    if not 0 < len(by) <= PR_REST_SUITE_PAGE:
+        return None
+    suites = []
+    for sid, listed in by.items():
+        done = all(r.get("status") == "completed" for r in listed)
+        conclusions = ",".join(sorted({str(r.get("conclusion")) for r in listed})) if done else None
+        suites.append([sid, "completed" if done else "in_progress", conclusions, len(listed)])
+    return {"total": len(suites), "suites": sorted(suites, key=lambda s: str(s[0])), "via": "controller"}
+
+
 def suites_path(root: str, sha: str) -> str:
     return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
 
@@ -5990,6 +6028,8 @@ class Daemon:
         self.tick_thread: int | None = None  # the thread running tick (feed_due reads the feed on it alone)
         self.controller_failures = 0
         self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
+        self.rollup_slow: dict[str, float] = {}  # head sha -> self.now before which its rollup is not asked
+        self.rollup_down_until = 0.0
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
@@ -11903,7 +11943,7 @@ class Daemon:
                 # the gate's baseline, read before the check runs so a suite finishing meanwhile reads as a change
                 # (a settled failed head's too: PR_REST_SETTLED_FULL_EVERY gates it on its suites)
                 with contextlib.suppress(WatchError):
-                    self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
+                    self.suites_part(old, parts, root, sha)
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha,
                                                                not e.get("jobs")
                                                                and self.runs_unchanged(old, parts, root, sha))
@@ -11970,14 +12010,49 @@ class Daemon:
                 # The issue moved (a comment, usually): the kept pull stands until PULL_REUSE_MAX, and the issue's
                 # old answer is kept so the next full read still sees the change and reads the pull.
                 probe[issue_path] = kept[issue_path]
-            for path, slim in zip(gate_paths, (slim_check_suites, slim_status_page)):
-                if self.head_part(old, probe, path, slim) != kept[path]["doc"]:
-                    return False
+            if self.suites_part(old, probe, root, sha) != kept[gate_paths[0]]["doc"]:
+                return False
+            if self.head_part(old, probe, gate_paths[1], slim_status_page) != kept[gate_paths[1]]["doc"]:
+                return False
         except WatchError:
             return False  # the full read says what failed
         more = self.owed_steps_gated(e, prior, old, root, sha)
         self.store(e["key"], e["cache"], error=None, dataAt=self.now, restParts={**old, **probe}, via="rest", **more)
         return True
+
+    def suites_part(self, old: dict, parts: dict, root: str, sha: str) -> dict:
+        """The head's check suites in slim_check_suites' terms, kept in PARTS: the controller's rollup when it can say
+        (controller_suites; an ETag of its own, so head_moved sees it move), else GitHub's (head_part). Raises
+        WatchError, OutOfTime."""
+        doc = self.controller_suites(root, sha)
+        if doc is None:
+            return self.head_part(old, parts, suites_path(root, sha), slim_check_suites)
+        digest = hashlib.sha1(json.dumps(doc, sort_keys=True).encode()).hexdigest()
+        parts[suites_path(root, sha)] = {"doc": doc, "etag": f"controller:{digest}", "via": "controller"}
+        return doc
+
+    def controller_suites(self, root: str, sha: str) -> dict | None:
+        """rollup_suites of the controller's rollup of SHA in ROOT's repository, else None (off, out, slow, failed,
+        incomplete). No GitHub request."""
+        get = getattr(self.controller, "get", None)
+        if (not PR_REST_SUITES_FROM_CONTROLLER or not callable(get) or not self.controller_room()
+                or self.now < self.rollup_down_until or self.now < self.rollup_slow.get(sha, 0.0)
+                or not re.fullmatch(r"[0-9A-Za-z]{40}", sha)):
+            return None
+        repo = root.removeprefix("/repos/")
+        try:
+            doc = get(f"/v1/github/commits/{sha}/rollup?repo=" + urllib.parse.quote(repo, safe="/"),
+                      timeout=CONTROLLER_ROLLUP_TIMEOUT)
+        except ControllerTimeout:  # seeding from GitHub: this head reads GitHub for a while, the rest still ask
+            self.rollup_slow = {k: v for k, v in self.rollup_slow.items() if v > self.now}
+            self.rollup_slow[sha] = self.now + CONTROLLER_ROLLUP_SLOW_SKIP
+            return None
+        except NoReceiver:  # no rollup route (an older controller), or none for this commit yet
+            return None
+        except WatchError:
+            self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
+            return None
+        return rollup_suites(doc, sha)
 
     def owed_steps_gated(self, e: dict, prior: dict, old: dict, root: str, sha: str) -> dict:
         """The steps a held read still owes (stepsOwed: a 5xx, a refusal past STEPS_RETRY, a read left for later),
@@ -12055,8 +12130,8 @@ class Daemon:
         out = []
         for path in paths:
             kept = old.get(path) if isinstance(old.get(path), dict) else {}
-            if kept.get("unavailable") or kept.get("gone"):
-                continue
+            if kept.get("unavailable") or kept.get("gone") or kept.get("via") == "controller":
+                continue  # (a controller part: its next answer is the controller's too, with no GitHub request)
             shared = self.repo_parts.get(path)
             repo_level = path.startswith((f"{root}/actions/workflows", f"{root}/rules/branches/", f"{root}/branches/"))
             if shared is not None and self.now - shared["at"] < (REST_REPO_PART_TTL if repo_level else REST_HEAD_PART_TTL):

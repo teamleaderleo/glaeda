@@ -22922,6 +22922,76 @@ class CmuxWaitsRestCostTest(Base):
         self.assertTrue([c for c in self.gh.calls[after:] if "/3cmux" in c[1] and "/check-runs" in c[1]])
 
 
+class RollupController(FakeController):
+    """FakeController plus GET /v1/github/commits/SHA/rollup, built from the fake GitHub's heads as the controller's
+    webhooks would keep it: every check run with its suite id, complete unless `incomplete` names the sha."""
+
+    def __init__(self, gh) -> None:
+        super().__init__()
+        self.gh, self.rollups, self.incomplete, self.slow = gh, [], set(), set()
+
+    def get(self, path: str, timeout: float | None = None) -> dict:
+        self.fail()
+        sha = path.split("/commits/", 1)[1].split("/", 1)[0]
+        self.rollups.append(sha)
+        if sha in self.slow:
+            raise gg.ControllerTimeout("controller: timed out")
+        contexts = [c for node in self.gh.prs.values() if node["headRefOid"] == sha
+                    for c in node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]]
+        runs = [{"id": c["databaseId"], "name": c["name"], "status": c["status"].lower(),
+                 "conclusion": (c.get("conclusion") or "").lower() or None,
+                 "check_suite": {"id": c["checkSuite"]["workflowRun"]["databaseId"]}}
+                for c in contexts if c.get("__typename") == "CheckRun"]
+        return {"sha": sha, "check_runs_complete": sha not in self.incomplete, "status_complete": True,
+                "check_runs": {"total_count": len(runs), "check_runs": runs}}
+
+
+class CmuxWaitsRollupGateTest(CmuxWaitsRestCostTest):
+    """The same waits with the controller's check rollup reachable (PR_REST_SUITES_FROM_CONTROLLER): every gate holds
+    and breaks as GitHub's check suites made it, with no GET commits/SHA/check-suites. Why: rest_breakdown of
+    manaflow-ai/cmuxterm-hq, 2026-11-24 21:28-23:28Z, glaeda-upstream's commits/{sha}/check-suites 2,136 in 2 h."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = RollupController(self.gh)
+        self.daemon.controller = self.ctl
+
+    def suite_reads(self) -> list:
+        return [c[1] for c in self.gh.calls if "/check-suites" in c[1]]
+
+    def test_ten_cmux_waits_over_rest_cost_a_small_constant_a_minute(self) -> None:
+        super().test_ten_cmux_waits_over_rest_cost_a_small_constant_a_minute()
+        self.assertEqual(self.suite_reads(), [])
+        self.assertTrue(self.ctl.rollups)
+
+    def test_an_incomplete_or_slow_rollup_reads_githubs_suites(self) -> None:
+        sha2 = self.gh.prs[("o", "cmux", 2)]["headRefOid"]
+        sha3 = self.gh.prs[("o", "cmux", 3)]["headRefOid"]
+        self.ctl.incomplete.add(sha2)
+        self.ctl.slow.add(sha3)
+        self.run_over_rest(minutes=2)
+        asked = self.suite_reads()
+        self.assertTrue([u for u in asked if sha2 in u] and [u for u in asked if sha3 in u], asked)
+        self.assertFalse([u for u in asked if sha2 not in u and sha3 not in u], asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["data"]["checkState"], "PENDING")
+
+    def test_a_down_controller_reads_githubs_suites_and_is_left_alone_a_while(self) -> None:
+        self.ctl.down = True
+        self.run_over_rest(minutes=1)
+        self.assertTrue(self.suite_reads())  # (the feed's failure took the controller out: no rollup asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["data"]["checkState"], "PENDING")
+        d, sha = self.daemon, self.gh.prs[("o", "cmux", 2)]["headRefOid"]
+        d.controller_down_until = 0.0
+        self.assertIsNone(d.controller_suites("/repos/o/cmux", sha))  # a rollup read failing otherwise
+        self.assertGreater(d.rollup_down_until, d.now)
+        asked = len(self.ctl.rollups)
+        self.ctl.down = False
+        self.assertIsNone(d.controller_suites("/repos/o/cmux", sha))  # left alone for CONTROLLER_ROLLUP_DOWN
+        self.assertEqual(len(self.ctl.rollups), asked)
+        d.now += gg.CONTROLLER_ROLLUP_DOWN
+        self.assertEqual(d.controller_suites("/repos/o/cmux", sha)["via"], "controller")
+
+
 class ReexecDrainTest(Base):
     """cosmic-gray, 2026-11-17: an installed update waited on land steps from 12:39Z until a forced restart, because a
     busy land queue always had one running. A waiting re-exec starts no new step and waits at most REEXEC_DRAIN_MAX."""
