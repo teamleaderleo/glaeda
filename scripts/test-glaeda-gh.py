@@ -6138,15 +6138,40 @@ class ClientTest(Base):
         self.put("pr:o/r#404", None, error="Could not resolve", missing=True)
         self.put("pr:o/r#5", None, error="graphql: HTTP 502")
         out = io.StringIO()
+        reads: list[str] = []
         with mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "daemon_failing", return_value=None), \
-                mock.patch.object(gg, "daemon_stale", return_value=None), contextlib.redirect_stdout(out):
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=lambda req: reads.append(req["key"]) or "rest: HTTP 502"), \
+                contextlib.redirect_stdout(out):
             self.assertEqual(gg.cmd_status("pr", "o/r#404", False, False, first_wait=0), gg.EXIT_FAIL)
             self.assertEqual(gg.cmd_status("pr", "o/r#5", False, True, first_wait=0), gg.EXIT_DOWN)
         plain, doc = out.getvalue().split("\n{", 1)
         self.assertEqual(plain.strip().splitlines()[-1], "next: gh pr list -R o/r --state all --limit 5")
         doc = json.loads("{" + doc)
         self.assertEqual((doc["ok"], doc["code"], doc["next"]), (False, "no-data-yet", "glaeda-gh wait pr o/r#5 --timeout 600"))
+        self.assertEqual(reads, ["pr:o/r#5"])  # missing is an answer; an error alone gets its one direct read
+
+    def test_status_reads_directly_a_key_whose_entry_holds_only_an_error(self) -> None:
+        """An entry with an error and no data (an upstream's failed read, kept for minutes) is unread: `status` makes
+        its direct read and answers with the data, rather than exiting 3 at once."""
+        self.put("pr:o/r#11", None, error="graphql: HTTP 200")
+
+        def fill(req: dict) -> None:
+            self.put(req["key"], gg.parse_pr(pr_node(11, rollup="SUCCESS", checks=[check_run("a")])))
+            return None
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "daemon_failing", return_value=None), \
+                mock.patch.object(gg, "daemon_stale", return_value=None), \
+                mock.patch.object(gg, "blocked_now", return_value=None), \
+                mock.patch.object(gg, "say_waiting", lambda line: None), \
+                mock.patch.object(gg, "direct_read", side_effect=fill) as read, contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_status("pr", "o/r#11", False, True, first_wait=0), gg.EXIT_OK)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(json.loads(out.getvalue())["ok"])
 
     def test_a_run_github_cannot_resolve_is_missing_only_when_never_read(self) -> None:
         self.daemon.now = NOW
