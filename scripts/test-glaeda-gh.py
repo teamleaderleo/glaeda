@@ -35494,8 +35494,9 @@ class LandTest(Base):
         self.assertLess(self.q.judge_order(old), self.q.judge_order(moves))
         self.w.set_pr(old, {**land_pr("c" * 40), "mergeStateStatus": "DIRTY"}, self.t)
         self.assertGreater(self.q.judge_order(old), self.q.judge_order(moves))
+        self.assertEqual(self.q.judge_order(old)[2], 1)  # behind every row that can move, as a re-read is
         self.q.entries[old]["lane"] = "gcp-agent-lane-1/x"
-        self.assertLess(self.q.judge_order(old), self.q.judge_order(moves))
+        self.assertEqual(self.q.judge_order(old)[2], 0)  # a lane keeps its place among the due rows
 
     def test_a_job_holding_its_worker_past_the_bound_is_logged_named_and_freed(self):
         """LAND_SLOT_HELD: a job holding its worker that long is logged once (land-slot-held), named in the land-pool
