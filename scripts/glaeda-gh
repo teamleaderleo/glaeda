@@ -34999,19 +34999,34 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
-def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int) -> str | None:
+RERUN_RATE_LIMITED = re.compile(r"rate limit (?:already )?exceeded|rate limit is spent|secondary rate limit"
+                                r"|abuse detection|submitted too quickly", re.I)
+
+
+def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int,
+                    err: str = "") -> str | None:
     """What to say when a brokered `gh run rerun` exits non-zero, else None.
 
     GitHub refuses a rerun outright for a run it will not retry ("run N cannot be rerun; This workflow run cannot be
     retried": the run is too old, its workflow file moved, or its attempts are used up), and gh names nothing that
     does work. 2026-11-22 an hq run was refused that way after a cancelled job, and the refusal read as "the rerun
     did nothing": the caller waited again on a red that a newer run had already replaced. Name the two steps that
-    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does."""
+    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does.
+
+    A refusal GitHub gave for the *caller* is not that. 2026-11-25 two reruns of manaflow-ai/cmuxterm-hq#26366's
+    infra-red jobs answered "HTTP 403: API rate limit exceeded for installation ...", and this line called them runs
+    GitHub will not retry and told the caller to push the head again -- a new head for a run that was never the
+    problem. The run is fine; the identity is out of calls. ERR is gh's stderr, so the two read apart."""
     if rc == 0 or not is_run_rerun(words):
         return None
     run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
     named = f"{repo}/{run_id}" if repo and run_id else (repo or "that run")
     where = f" -R {repo}" if repo else ""
+    if RERUN_RATE_LIMITED.search(err or ""):
+        return (f"glaeda-gh: that rerun was refused by a rate limit, not by the run (gh exited {rc}): "
+                f"{gh_said(err, 160)}. The run is still rerunnable; this host's gh calls are spent. "
+                f"next: glaeda-gh budget # whose bucket and its reset; wait for it "
+                f"(glaeda-gh wait until quota), then rerun {named} again. Do not push a new head for it.")
     return (f"glaeda-gh: that rerun did not take (gh exited {rc}): a run GitHub will not retry (too old, its "
             f"workflow file moved, every attempt used) needs a new run, not a rerun. "
             f"next: glaeda-gh status run {named} --jobs # a newer run may already stand in for it; else push the "
@@ -35023,9 +35038,9 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
     flight outlives it (a rerun's run entry too: note_run_rerun)."""
     try:
-        rc, _out, _err = gh_cache_child(real, args, False, None)
+        rc, _out, err = gh_cache_child(real, args, False, None)
         ran.append(rc)
-        said = rerun_next_step(repo, scopes, words or [], rc)
+        said = rerun_next_step(repo, scopes, words or [], rc, err if isinstance(err, str) else "")
         if said:
             print(said, file=sys.stderr)
     finally:
