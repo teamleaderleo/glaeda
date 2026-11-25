@@ -1820,7 +1820,9 @@ in at the producer's root. So one root job per root per mini:
   steps run on the bench mini or a measure worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a
   display worker and leaves its PNG archive in fleet storage, and `cmux-next-ios-try-ahead.yml`'s `build-ahead`, which
   submits the cmux Dev device-app build `try.sh` reuses, and `cmux-next-ios-gestures.yml`'s `gestures` and
-  `cmux-next-ios-keyboard-motion.yml`'s `bench`, which each submit one iOS simulator suite step); job-started refuses any
+  `cmux-next-ios-keyboard-motion.yml`'s `bench`, which each submit one iOS simulator suite step, and
+  any home-repository job whose id ends in `-fleet` (`GATEWAY_FLEET_SUFFIX`, the name cmux gives its thin
+  clients, so a new one such as `cmux-next-ios-kit.yml`'s `link-ffi-fleet` needs no change here)); job-started refuses any
   other job at once. Its gate is never held
   for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
   a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
