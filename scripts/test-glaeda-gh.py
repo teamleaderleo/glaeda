@@ -8563,9 +8563,31 @@ class CacheWarmCapTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         os.environ.pop("GLAEDA_WAIT_CACHE_WARM", None)
+        os.environ.pop("GLAEDA_WAIT_CACHE_WARM_S", None)
 
     def cap(self, timeout: float, ceiling: float | None, now: float) -> tuple[float, float | None, str]:
         return gg.cache_warm_cap("pr", self.KEY_TARGET, timeout, ceiling, now=now)
+
+    def test_a_5_minute_cache_session_waits_270s_and_its_chain_is_shorter(self) -> None:
+        """GLAEDA_WAIT_CACHE_WARM_S (tool_rewrites sets 270 for a 5 min cache session): a 600 s wait, under the 1 h cap,
+        ends by 270 s, says so, and the chain of re-runs stops being capped after 20 of them (90 min)."""
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": "270"}):
+            t, c, words = self.cap(600, None, NOW)
+            self.assertEqual((t, c), (270, 270))
+            self.assertIn("5 min", words)
+            self.assertEqual(gg.cache_warm_horizon(270), 5400)
+            at = NOW
+            while at - NOW < 5400 - 270:
+                at += 270
+                self.assertEqual(self.cap(t, c, at)[:2], (270, 270))
+            self.assertEqual(self.cap(t, c, at + 270)[:2], (gg.WAIT_DEFAULT_TIMEOUT, None))
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": "270", "CLAUDECODE": ""}):
+            self.assertEqual(self.cap(600, None, NOW + 86400 * 3)[:2], (270, 270), "set by name, it applies anywhere")
+
+    def test_a_bad_or_wild_5_minute_value_is_bounded(self) -> None:
+        for raw, want in (("x", gg.CACHE_WARM_WAIT), ("5", 60.0), ("99999", gg.CACHE_WARM_WAIT), ("nan", gg.CACHE_WARM_WAIT)):
+            with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM_S": raw}):
+                self.assertEqual(gg.cache_warm_wait(), want, raw)
 
     def test_a_long_wait_ends_inside_the_cache_lifetime_and_says_how_to_go_on(self) -> None:
         timeout, ceiling, words = self.cap(5400, None, NOW)

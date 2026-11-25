@@ -28143,12 +28143,36 @@ CACHE_WARM_HORIZON = 4 * 3600.0  # a chain of capped waits on one target stops b
 CACHE_WARM_GAP = 900.0  # a wait started within this of the last capped one on the target continues its chain
 
 
+def cache_warm_wait() -> float:
+    """CACHE_WARM_WAIT, or GLAEDA_WAIT_CACHE_WARM_S when set: the cap for a session whose prompt cache lives 5 min
+    (Leo, 2026-11-25: "we need to always be cognizant of those cache writes"). leo-workspace tools/tool_rewrites.py sets
+    it to 270 for every wait such a session runs (glaeda-gh wait, and the waits inside cmux-ci test and cmux-gh), as
+    the 1 h cap above never ended a wait before a 5 min cache went cold: cosmic-gray, 24 h to 2026-11-25 14:00Z, 123
+    helper requests on the 5 min cache came back cold from a glaeda-gh or cmux-ci wait, 14.4M tokens rewritten.
+    Clamped to 60..CACHE_WARM_WAIT; a bad value is the default."""
+    try:
+        got = float(os.environ.get("GLAEDA_WAIT_CACHE_WARM_S") or CACHE_WARM_WAIT)
+    except ValueError:
+        return CACHE_WARM_WAIT
+    return min(max(got, 60.0), CACHE_WARM_WAIT) if math.isfinite(got) else CACHE_WARM_WAIT
+
+
+def cache_warm_horizon(warm: float) -> float:
+    """How long a chain of capped waits stays capped: CACHE_WARM_HORIZON on the hour; on a shorter cap, 20 re-runs
+    (90 min at 270 s), as a 5 min cache's re-run reads at 0.05x and one rewrite costs 1.25x, about 25 reads."""
+    return CACHE_WARM_HORIZON if warm >= CACHE_WARM_WAIT else min(CACHE_WARM_HORIZON, 20 * warm)
+
+
 def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None,
                    now: float | None = None) -> tuple[float, float | None, str]:
     """TIMEOUT and CEILING for a wait a Claude Code session runs, held to CACHE_WARM_WAIT, and the line saying so
     ("" when nothing changed). See CACHE_WARM_WAIT."""
-    if os.environ.get("CLAUDECODE") != "1" or os.environ.get("GLAEDA_WAIT_CACHE_WARM", "1") == "0":
+    warm = cache_warm_wait()
+    if os.environ.get("GLAEDA_WAIT_CACHE_WARM", "1") == "0" or (
+            os.environ.get("CLAUDECODE") != "1" and warm == CACHE_WARM_WAIT):
         return timeout, ceiling, ""
+    horizon = cache_warm_horizon(warm)
+    life = "1 h" if warm == CACHE_WARM_WAIT else "5 min" if warm <= 300 else f"{warm:g}s-wait"
     whole = max(float(timeout), default_wait_max(timeout) if ceiling is None else float(ceiling))
     try:
         key = parse_key(kind, target) if kind in ("pr", "run", "comment") else f"{kind}:{target}"
@@ -28159,24 +28183,24 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
     chains = read_json(path)
     chains = chains if isinstance(chains, dict) else {}
     chain = chains.get(key) if isinstance(chains.get(key), dict) else None
-    going = chain is not None and now - float(chain.get("last") or 0) < CACHE_WARM_WAIT + CACHE_WARM_GAP
+    going = chain is not None and now - float(chain.get("last") or 0) < warm + CACHE_WARM_GAP
     first = float(chain.get("first") or now) if going and chain else now
-    if going and chain and (chain.get("done") or now - first >= CACHE_WARM_HORIZON):
+    if going and chain and (chain.get("done") or now - first >= horizon):
         # Past the horizon. The chain stays marked done while its waits follow one another, so the uncapped `next:`
         # does not start a new capped chain; a gap past CACHE_WARM_GAP (the session went cold anyway) starts one.
         words = ""
-        if not chain.get("done") and whole <= CACHE_WARM_WAIT:  # the capped `next:` again: the wait's own default
+        if not chain.get("done") and whole <= warm:  # the capped `next:` again: the wait's own default
             timeout, ceiling = WAIT_DEFAULT_TIMEOUT, None
             words = (f"glaeda-gh: re-run on {key} for {span(now - first)}: this wait runs --timeout "
-                     f"{WAIT_DEFAULT_TIMEOUT:g} (the cache-warm cap ends at {span(CACHE_WARM_HORIZON)})")
+                     f"{WAIT_DEFAULT_TIMEOUT:g} (the cache-warm cap ends at {span(horizon)})")
         chains[key] = {"first": first, "last": now, "done": True}
-    elif whole > CACHE_WARM_WAIT or going:
+    elif whole > warm or going:
         chains[key] = {"first": first, "last": now}
-        words = "" if whole <= CACHE_WARM_WAIT else (
-            f"glaeda-gh: this wait ends by {CACHE_WARM_WAIT:g}s (asked {whole:g}s), inside the prompt cache's 1 h, "
+        words = "" if whole <= warm else (
+            f"glaeda-gh: this wait ends by {warm:g}s (asked {whole:g}s), inside the prompt cache's {life}, "
             f"so the next request reads a warm cache: on exit 2 run its `next:` again "
             f"(GLAEDA_WAIT_CACHE_WARM=0 waits as asked)")
-        timeout, ceiling = min(float(timeout), CACHE_WARM_WAIT), min(whole, CACHE_WARM_WAIT)
+        timeout, ceiling = min(float(timeout), warm), min(whole, warm)
     else:
         return timeout, ceiling, ""
     for k in [k for k, v in chains.items() if not isinstance(v, dict) or now - float(v.get("last") or 0) > 86400]:
