@@ -15326,6 +15326,15 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# An update-branch that made no new head (update_branch_no_new_head, either bound) is no longer the stop: the queue first
+# makes the base merge itself, the way it does for a conflict GitHub refused (union_merge: git merges the base into the
+# head, honoring .gitattributes, and pushes it as a fast-forward of the head), once per head. A true conflict stops
+# "conflict" with its hunks; a merge or push it cannot make stops update_branch_no_new_head as before, naming why.
+# manaflow-ai/cmux#56724 and #56454, 2026-11-25: the gh-quota shim held the pinned PUT .../update-branch on the login's
+# create pause and answered exit 0 with {"queued": true, "queue_id": ...}; the queue read that as GitHub's answer,
+# the compare after LAND_HEAD_TIMEOUT still read the head behind, and both stopped update_branch_no_new_head (the
+# queued writes went out ~40 min later). A person merged the base by hand each time. LAND_UPDATE_LOCAL names the rule.
+LAND_UPDATE_LOCAL = "update_noop"
 # An update-branch GitHub answered (exit 0) that made no new head is not waited out to LAND_UPDATE_ONCE. Reported by
 # transcript-lessons passes 74 and 75 (classes update_branch_no_new_head, land-forward-unreadable): manaflow-ai/cmux
 # #53919 sat 3,642 s on one answered update before this stop; #53799 sat green for 23 h around one. Once the head
@@ -22697,7 +22706,13 @@ class LandQueue:
                       f"start that run on its own; no base merge pushed here to start it: {union_why})",
                       str(tried.get("next") or ""))
             return
-        if kind in ("base", "ci_start"):
+        if kind == "update_noop" and not tried.get("conflicts"):
+            # LAND_UPDATE_LOCAL's comment: the local base merge after an update-branch that made no new head could
+            # not be made or pushed here (another lane's branch, a refused push): the old stop, with that reason.
+            self.stop(e, "update_branch_no_new_head", f"{said}; the base merge was not made here either: {union_why}",
+                      str(tried.get("next") or ""))
+            return
+        if kind in ("base", "ci_start", "update_noop"):
             self.stop(e, "conflict", f"land_judge read {head[:12]} as conflicting with its base: {said}"
                       + (f"; not merged here: {union_why}" if union_why else ""),
                       str(tried.get("next") or "") or f"merge the base into {name}, resolve the conflicts and push",
@@ -22862,7 +22877,8 @@ class LandQueue:
         kind = str(e["unionMerge"].get("kind") or "update_branch")
         why_here = {"base": "land_judge read the PR as conflicting with its base",
                     "ci_start": "the repo's own CI never ran at the head (a retarget or a push no workflow saw)",
-                    "merge": "GitHub's merge refused a merge conflict"}.get(
+                    "merge": "GitHub's merge refused a merge conflict",
+                    "update_noop": "GitHub's update-branch made no new head (LAND_UPDATE_LOCAL)"}.get(
             kind, "GitHub's update-branch refused a merge conflict")
         msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: {why_here}; "
                + (f"git's merge conflicted only in paths {base}'s .gitattributes settles "
@@ -23171,11 +23187,19 @@ class LandQueue:
                           f"land-judge explain {repo} {number} --sha {head} --json (the rule that names the update), "
                           f"then glaeda-gh land {name}")
                 return True
-            self.stop(e, "update_branch_no_new_head",
-                      f"GitHub answered the update-branch sent at {head[:12]} {waited:.0f} s ago ({said}), and the head "
-                      f"is still {head[:12]}, {behind} commit(s) behind {base}: the update changed nothing",
-                      f"gh pr update-branch {number} -R {repo} --match-head-commit {head}, then glaeda-gh land {name}")
-            return True
+            reason = (f"GitHub answered the update-branch sent at {head[:12]} {waited:.0f} s ago ({said}), and the head "
+                      f"is still {head[:12]}, {behind} commit(s) behind {base}: the update changed nothing")
+            nxt = f"gh pr update-branch {number} -R {repo} --match-head-commit {head}, then glaeda-gh land {name}"
+            if not self.update_local_due(e, head):
+                self.stop(e, "update_branch_no_new_head", reason, nxt)
+                return True
+        self.base_merge_first(e, head, LAND_UPDATE_LOCAL, reason, nxt)
+        return True
+
+    def update_local_due(self, e: dict, head: str) -> bool:
+        """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
+        tried = e.get("unionMerge") or {}
+        return not (tried.get("head") == head and tried.get("tried"))
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
@@ -23217,14 +23241,18 @@ class LandQueue:
                 return
             with self.lock:
                 if waited >= LAND_UPDATE_ONCE:
-                    self.stop(e, "update_branch_no_new_head",
-                              f"the update-branch sent at {head[:12]} {waited:.0f} s ago made no new head the queue "
-                              "could read; it is sent once per head",
-                              f"glaeda-gh status pr {repo}#{number}")
+                    reason = (f"the update-branch sent at {head[:12]} {waited:.0f} s ago made no new head the queue "
+                              "could read; it is sent once per head")
+                    if not self.update_local_due(e, head):
+                        self.stop(e, "update_branch_no_new_head", reason, f"glaeda-gh status pr {repo}#{number}")
+                        return
+                else:
+                    self.history(e, "update_once", head=head[:12],
+                                 why="already sent at this head: waiting for the new one")
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_UPDATE_ONCE - waited)
                     return
-                self.history(e, "update_once", head=head[:12], why="already sent at this head: waiting for the new one")
-                self.nudge(e["key"])
-                self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_UPDATE_ONCE - waited)
+            self.base_merge_first(e, head, LAND_UPDATE_LOCAL, reason, f"glaeda-gh status pr {repo}#{number}")
             return
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         held = e.get("updateDeferred") or {}
