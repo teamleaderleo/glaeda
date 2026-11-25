@@ -43155,7 +43155,8 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         for word, kind in (("issue", "issue"), ("issues", "issue"), ("new-issue", "issue"), ("bug", "issue"),
                            ("file_issue", "issue"), ("label", "label"), ("labels", "label"),
                            ("add_label", "label"), ("tag", "label"), ("close", "close"), ("closed", "close"),
-                           ("close-issue", "close"), ("issue-comment", "comment"), ("pr-comment", "comment")):
+                           ("close-issue", "close"), ("issue-comment", "issue-comment"),
+                           ("pr-comment", "pr-comment")):
             with self.subTest(word):
                 with mock.patch.object(gg, "say_waiting", lambda *a, **k: None):
                     args = gg.parser().parse_args(["post", word, "o/r#5", "--body", "b"])
@@ -43175,6 +43176,10 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
                          ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
         self.assertEqual(self.one_call(["post", "close", "o/r#5", "--comment", "superseded by #7"]),
                          ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
+        self.assertEqual(self.one_call(["post", "issue-comment", "o/r#5", "--body", "on issue"]),
+                         ["issue", "comment", "5", "-R", "o/r", "--body", "on issue"])
+        self.assertEqual(self.one_call(["post", "pr-comment", "o/r#5", "--body", "on pr"]),
+                         ["pr", "comment", "5", "-R", "o/r", "--body", "on pr"])
 
     def test_the_write_is_made_here_and_nothing_is_queued(self) -> None:
         """The whole point: one call. It goes through cmd_gh -- this tool's own quota shim -- and leaves no
@@ -43188,6 +43193,25 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
             self.assertEqual(gg.main(["post", "label", "o/r#5", "--label", "ci"]), 0)
         self.assertEqual(ran, [["issue", "close", "5", "-R", "o/r", "--comment", "done"],
                                ["issue", "edit", "5", "-R", "o/r", "--add-label", "ci"]])
+
+    def test_explicit_issue_and_pr_comments_are_made_here_but_plain_comment_stays_queued(self) -> None:
+        ran: list[list[str]] = []
+        queued: list[dict] = []
+        with mock.patch.object(gg, "cmd_gh", lambda gh: ran.append(gh) or 0), \
+                mock.patch.object(gg, "body_guard_refusal", lambda item: None), \
+                mock.patch.object(gg, "write_json", lambda path, item: queued.append(item)), \
+                mock.patch.object(gg, "cmd_post_status", lambda *a, **k: 0), \
+                mock.patch.object(gg, "say_waiting", lambda *a, **k: None), \
+                mock.patch.object(gg, "upstream_command", lambda *a, **k: None), \
+                mock.patch.object(gg, "gh_cache_note_write", lambda *a, **k: None), \
+                mock.patch.object(gg, "daemon_running", lambda *a, **k: True):
+            self.assertEqual(gg.main(["post", "issue-comment", "o/r#5", "--body", "issue body"]), 0)
+            self.assertEqual(gg.main(["post", "pr-comment", "o/r#5", "--body", "pr body"]), 0)
+            self.assertEqual(gg.main(["post", "comment", "o/r#5", "--body", "queued body"]), 0)
+        self.assertEqual(ran, [["issue", "comment", "5", "-R", "o/r", "--body", "issue body"],
+                               ["pr", "comment", "5", "-R", "o/r", "--body", "pr body"]])
+        self.assertEqual([(item["kind"], item["repo"], item["number"]) for item in queued],
+                         [("comment", "o/r", 5)])
 
     def test_a_body_made_here_still_goes_through_the_public_text_guard(self) -> None:
         """An issue body and a closing comment are public text, so the guard a queued post passes judges them
