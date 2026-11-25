@@ -2557,6 +2557,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low": "35%:100-200",
     "target": "45%:150-350",
     "emergency": "10%:30-60",
+    # A saturated host (SATURATED_LOAD_PER_CORE) holds an apply only while every filesystem keeps at least this much free
+    # (space()'s syntax; "0": the old behaviour, hold until the emergency floor). Lane VMs run at load 2-3x their cores
+    # all day, so with only the emergency floor the pressure timer skipped every pass from 70% to 90% full
+    # (2026-11-25).
+    "saturated_delete_below_free": "20%",
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
@@ -2846,6 +2851,10 @@ def host_saturated() -> str:
 def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
     """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
     if emergency_devs(fss, emergency, floor_gib):
+        return None
+    spec = str(POLICY.get("saturated_delete_below_free", "0")).strip()
+    if spec not in ("", "0") and any(
+            not fs.tmpfs and fs.free < space(spec, fs.total) for fs in fss.values()):
         return None
     return host_saturated
 
