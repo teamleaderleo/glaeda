@@ -21148,7 +21148,11 @@ class LandQueue:
         act = land_action(answer, head)
         # A base-changing step on a stale copy: the base change can be the PR's own merge commit (hq#13226). Read
         # before the refusal counts, so a finished PR never reaches the identical-refusal stop.
-        if not self.state_first(e, act.get("kind")):
+        # A refusal (any code that is not ok) can end in a stop, and a stop on a finished PR is wrong whatever its
+        # code: cmux#51248 merged 08:31Z and stopped "conflict" 09:30Z, cmux#52236 (closed) stopped checks_stuck,
+        # cmux#55597 (merged) own_red, 2026-11-25. The cache that consider read was an OPEN copy and a host with its
+        # own login never reads state first, so the state is read here, before the verdict is acted on (refused).
+        if not self.state_first(e, act.get("kind"), refused=not answer.get("ok")):
             with self.lock:
                 self.count("explain")
             return
@@ -22895,11 +22899,12 @@ class LandQueue:
                     float(e.get("stateReadAt") or 0))
         return self.now - fresh >= LAND_REFRESH_AFTER
 
-    def state_first(self, e: dict, kind: str | None) -> bool:
+    def state_first(self, e: dict, kind: str | None, refused: bool = False) -> bool:
         """Outside the lock. When state_due, read the PR's state before KIND is taken: True to go on (it reads OPEN,
         or no read was due); False when the entry ended (ended), was parked on quota, or waits to read it again."""
         with self.lock:
-            if not self.state_due(e, kind):
+            hard = self.state_due(e, kind)
+            if not hard and not refused:
                 return True
         state, merge_sha, why = self.read_state(e)
         with self.lock:
@@ -22917,6 +22922,8 @@ class LandQueue:
                     e["stateOpen"] = seen.get("head") or e.get("head") or ""  # its next "closed" refusal counts
                 self.save(e)
                 return True
+            if not hard:
+                return True  # a refusal's look at the state that read nothing: the verdict goes on, as before the look
             if LAND_STEP_QUOTA.search(why):
                 self.park_quota(e, why)  # the login's state, not the PR's: parked, never counted
                 e["stepQuotaParked"] = True
