@@ -15513,8 +15513,10 @@ LAND_FETCH_UNSAFE = frozenset("\0\n\r\t ;|&$`<>\\'\"*?")
 # The step is the queuing session's: its lane names the step's; the calls stay charged to glaeda-land
 # (gh_quota reads CMUX_AGENT_SESSION, never LANE_GH_LANE).
 # Every step that writes passes E (self.env(e)): merge, update_branch, rerun_failed and review (router-review
-# --post writes its comment through the same client). Reads (land_judge explain, the post-merge `pr view`) and
-# acpmux notices need no lane and run with the bare env.
+# --post writes its comment through the same client), and the queue's land_judge explain, which adds ready-to-land
+# (label_send, lane-gh pr_edit) when the tier is pending: on gcp-agent-lane-8 on 2026-11-25 cmux#53413 parked
+# land_tier_pending, "Could not add ready-to-land: lane-gh: pr_edit: lease acquisition requires a lane session".
+# Reads (the post-merge `pr view`) and acpmux notices need no lane and run with the bare env.
 # The lane is the queuing process's own (land_queue_lane), recorded in the entry with the host it names a lane on
 # ("lane", "laneHost"): --notify only says who is told. gcp-agent-lane-1, 2026-11-18: the lane was read from the
 # requester, so a sub-session (acpmux names it PARENT/CHILD, which was read as HOST/SESSION), a --notify on another
@@ -20734,7 +20736,7 @@ class LandQueue:
             with self.lock:
                 self.judging[e["key"]] = (time.monotonic(), bound)
             try:
-                got = self.call(run_argv, bound, extra=extra, handed=e["key"])
+                got = self.call(run_argv, bound, e, extra=extra, handed=e["key"])  # its lane: it writes ready-to-land
             finally:
                 with self.lock:
                     self.judging.pop(e["key"], None)
