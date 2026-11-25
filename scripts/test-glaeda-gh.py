@@ -24095,6 +24095,70 @@ class StaleDataTest(Base):
         self.assertIn("quota", error)
         self.assertEqual(self.gh.calls, [])
 
+    def land_refresh_reads(self, keys: list[str], batched: bool) -> tuple[int, dict]:
+        """GraphQL queries sent to read KEYS as land refreshes, one land_direct_read each or one land_direct_read_many,
+        with the Daemon on the fake GitHub; (queries, {key: error})."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        real = gg.Daemon
+        before = len(self.gh.gql_calls())
+        with mock.patch.object(gg, "Daemon", side_effect=lambda **kw: real(
+                transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)):
+            out = gg.land_direct_read_many(keys) if batched else {k: gg.land_direct_read(k) for k in keys}
+        return len(self.gh.gql_calls()) - before, out
+
+    def test_land_refreshes_of_one_repository_are_read_in_batches(self) -> None:
+        """cmux-cp-1, 2026-11-25 06:40-07:40Z: 467 land refreshes in the hour, each its own one-PR GraphQL query. The
+        same 60 stale PRs read one at a time and then as one batched refresh (LAND_REFRESH_BATCH): the batch sends a
+        fraction of the queries and stores every PR as the single reads do."""
+        self.gh.counts = True  # the fingerprint's counts: an unchanged PR is probed
+        for n in list(range(1, 61)) + list(range(101, 161)):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        single, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(1, 61)], batched=False)
+        self.assertEqual(set(out.values()), {None})
+        batched, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+        self.assertEqual(set(out.values()), {None}, out)
+        self.assertEqual(len(out), 60)
+        for n in range(101, 161):
+            self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["data"]["number"], n)
+        self.assertLessEqual(batched * 5, single, (single, batched))
+        # read again at once: answered from the fresh copies (LAND_DIRECT_REUSE), no query
+        again, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+        self.assertEqual((again, set(out.values())), (0, {None}))
+        # past it, unchanged PRs: each single read is its own probe, the batch probes LAND_REFRESH_BATCH a query
+        real_time = time.time
+        with mock.patch.object(gg.time, "time", lambda: real_time() + gg.LAND_DIRECT_REUSE + 1):
+            probes = self.gh.probes
+            single_probe, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(1, 61)], batched=False)
+            self.assertEqual((self.gh.probes - probes, set(out.values())), (60, {None}))
+            probes = self.gh.probes
+            batched_probe, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+            self.assertEqual((self.gh.probes - probes, set(out.values())), (2, {None}))
+        print(f"\n60 land refreshes: first read {single} GraphQL queries one at a time, {batched} batched; "
+              f"unchanged PRs {single_probe} one at a time, {batched_probe} batched")
+        self.assertEqual(batched_probe, 2)
+
+    def test_a_land_refresh_keeps_the_rollup_snapshot_its_judgment_is_handed(self) -> None:
+        """A land refresh's own Daemon had no land queue, so its full read moved the cache's fingerprint and wrote no
+        rollup snapshot: the snapshot stopped matching and the judgment read the head from GitHub itself (cmux-cp-1,
+        2026-11-25: 4,197 of 4,765 judgments live). Both the single and the batched read now write it."""
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        self.land_refresh_reads(["pr:o/r#1"], batched=False)
+        self.land_refresh_reads(["pr:o/r#2", "pr:o/r#3"], batched=True)
+        for n in (1, 2, 3):
+            key = f"pr:o/r#{n}"
+            snap = gg.read_rollup(key)
+            self.assertIsNotNone(snap, key)
+            self.assertEqual((snap["head"], snap["fp"]),
+                             (gg.read_cache(key)["data"]["headRefOid"], gg.read_cache(key).get("fp")))
+
+    def test_a_batched_land_refresh_heeds_the_daemons_stop(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30,
+                                                "modes": {"graphql": "stop", "rest": "normal"}})
+        n, out = self.land_refresh_reads(["pr:o/r#1", "pr:o/r#2"], batched=True)
+        self.assertEqual((n, out), (0, {"pr:o/r#1": gg.DIRECT_QUOTA, "pr:o/r#2": gg.DIRECT_QUOTA}))
+
     def test_wait_starved_is_bounded(self) -> None:
         now = time.time()
         req = {"began": now - 30}
@@ -35462,6 +35526,63 @@ class LandTest(Base):
 
     def due(self, key: str) -> bool:
         return self.q.refresh_due(self.q.entries[key], self.w.cache[key])
+
+    def batched_refresh_queue(self, answer: str | None = None) -> tuple[list, list]:
+        """held_refresh_queue's queue reading through REFRESH_MANY: (each batch's keys, log rows)."""
+        refreshed, rows = self.held_refresh_queue([answer])
+        batches: list = []
+
+        def many(keys: list[str]) -> dict:
+            batches.append(list(keys))
+            for key in keys:
+                if answer is None:
+                    self.w.set_pr(key, land_pr(LA), self.q.now)
+            return {key: answer for key in keys}
+        self.q.refresh_many = many
+        self.addCleanup(lambda: self.assertEqual(refreshed, [], "no single read"))
+        return batches, rows
+
+    def stale_rows(self, repo: str, numbers: range) -> list[str]:
+        keys = []
+        for n in numbers:
+            key = f"pr:{repo}#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["dataAt"] = self.t - 3600
+            self.q.entries[key] = {"key": key, "repo": repo, "number": n, "state": "queued"}
+            keys.append(key)
+        return keys
+
+    def test_a_pass_reads_its_due_refreshes_in_one_batch_a_repository(self):
+        """cmux-cp-1, 2026-11-25 06:40-07:40Z: 467 land refreshes, one worker and one GraphQL query each. The rows a
+        pass finds due are read together: one job per repository and LAND_REFRESH_BATCH, each row judged after."""
+        batches, rows = self.batched_refresh_queue()
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 61)) + self.stale_rows("o/s", range(1, 4))
+        for key in keys:
+            self.assertTrue(self.due(key))
+            self.assertTrue(self.due(key), "queued: still waiting on its batch, not read twice")
+        self.assertEqual(batches, [])
+        self.q.flush_refreshes()
+        self.assertEqual([len(b) for b in batches], [gg.LAND_REFRESH_BATCH, 60 - gg.LAND_REFRESH_BATCH, 3])
+        self.assertEqual(sorted(k for b in batches for k in b), sorted(keys))
+        self.assertEqual(self.q.refresh_batched, {})
+        self.assertEqual(len([r for r in rows if r["event"] == "land-refresh"]), 63)
+        self.assertEqual([r["n"] for r in rows if r["event"] == "land-refresh-batch"], [50, 10, 3])
+        for key in keys:
+            self.assertFalse(self.due(key), "read: fresh")
+
+    def test_a_batch_refused_for_quota_holds_refreshes_once(self):
+        """A batch whose every read comes back DIRECT_QUOTA sets one hold (as one refused read does), not one a row."""
+        batches, rows = self.batched_refresh_queue(gg.DIRECT_QUOTA)
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 11))
+        for key in keys:
+            self.assertTrue(self.due(key))
+        self.q.flush_refreshes()
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(self.q.refresh_hold["kind"], "quota")
+        self.assertEqual(self.q.refresh_hold["n"], 1)
+        self.assertEqual(len([r for r in rows if r.get("hold")]), 1)
+        self.assertFalse(self.due(self.KEY), "held: no read")
+        self.assertEqual(len(batches), 1)
 
     def test_a_broker_refresh_failure_holds_every_refresh_then_one_probe_ends_it(self):
         """A lane VM, 2026-11-22: 503 refreshes "no answer within 60s" against 120 answered, failing in pairs in the

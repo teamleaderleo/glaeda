@@ -13761,6 +13761,94 @@ def land_direct_read(key: str) -> str | None:
     return direct_read({"key": key, "kind": "pr", "jobs": False, "began": time.time(), "land": True})
 
 
+# The land queue's refreshes, batched. cmux-cp-1, 2026-11-25 06:40-07:40Z: 467 land-refresh reads in the hour, of 212
+# PRs, each its own process-local Daemon sending its own one-PR GraphQL query (a probe or a full read: a point each,
+# and a worker held for each); 265 came back DIRECT_QUOTA. The same hour, 4,197 of 4,765 judgments that day (88 %)
+# were handed no rollup snapshot and read the head from GitHub themselves: a direct read's throwaway Daemon has no
+# land queue, so rollup_wanted() was empty there, its full read moved the cache's fingerprint without writing the
+# snapshot, and the snapshot no longer matched (LandQueue.snapshot answered "wait", then the judgment went live).
+# Now the pass gathers the refreshes it finds due per repository and hands each batch of up to LAND_REFRESH_BATCH to
+# one worker, which reads them with one Daemon: one PR_PROBE query for the batch (head, mergeable, rollup state and
+# counts), then full reads, aliased and size-adaptive (GQL_BATCH_START, halved on a timeout), only for the PRs whose
+# fingerprint moved. Every land read, batched or not, keeps the snapshot (land_read_keeps_rollups), so the judgment
+# that follows reads the daemon's copy instead of GitHub.
+LAND_REFRESH_BATCH = 50  # PRs per batched refresh (one probe query of ~3 requests a PR: 50 is about 2 points)
+LAND_REFRESH_BATCH_BUDGET = 180.0  # seconds one batch's reads may take (a single read's is DIRECT_READ_BUDGET)
+
+
+def land_read_keeps_rollups(daemon: "Daemon", keys: list[str]) -> None:
+    """A land refresh's Daemon (a direct read, outside the serving daemon) keeps KEYS' rollup snapshots as the serving
+    daemon does for the PRs its land queue holds: a full read writes the snapshot, and a stale snapshot makes the read a
+    full one (rollup_stale), so the judgment after it is handed the snapshot instead of reading GitHub."""
+    wanted = frozenset(keys)
+    daemon.rollup_wanted = lambda: wanted  # type: ignore[method-assign]
+
+
+def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
+    """Read KEYS (PRs of one repository) from GitHub in batches, stored in the cache as land_direct_read stores one:
+    {key: None, or why it could not}. A host with no login of its own (an upstream or broker host) reads each alone,
+    as before: its reads go through the broker's REST GETs, which take one PR each."""
+    keys = list(dict.fromkeys(keys))
+    if len(keys) <= 1 or upstream_command() is not None:
+        return {k: land_direct_read(k) for k in keys}
+    try:
+        daemon = Daemon(controller=None, upstream=None)
+    except Exception as failure:  # noqa: BLE001  a refresh never stops the queue
+        why = f"{describe(failure)} at {error_site(failure)}"
+        return {k: why for k in keys}
+    modes = (read_json(BASE / "daemon.json") or {}).get("modes")
+    if daemon.mode("graphql") == "stop" or (isinstance(modes, dict) and modes.get("graphql") == "stop"):
+        return {k: DIRECT_QUOTA for k in keys}
+    daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as _read_one: never write rest-spend)
+    daemon.now = time.time()
+    daemon.tick_deadline = time.monotonic() + LAND_REFRESH_BATCH_BUDGET
+    out: dict[str, str | None] = {}
+    todo = []
+    for k in keys:
+        if _land_direct_cache_fresh(k, daemon.now):
+            out[k] = None  # another reader answered it within LAND_DIRECT_REUSE
+        else:
+            todo.append(k)
+    land_read_keeps_rollups(daemon, todo)
+    errors: dict[str, str] = {}
+    if todo:
+        entries = [{"key": k, "jobs": False, "cache": read_cache(k), "touched": daemon.now, "waitedAt": daemon.now,
+                    "waitBegan": daemon.now, "readers": [], "reader": "", "consumers": {}} for k in todo]
+        daemon.heads_between = lambda: None  # type: ignore[method-assign]  (the serving daemon's heads, not ours)
+        try:
+            with daemon.calling(*caller_of(todo[0]), "tool:glaeda-gh land (batched refresh)"):
+                daemon.gql_reason = "pr-land-batch"
+                # the probes first, LAND_REFRESH_BATCH a query: the PRs whose fingerprint held are confirmed by it
+                probe = [e for e in entries if daemon.probe_ok(e)]
+                full = [e for e in entries if not daemon.probe_ok(e)]
+                for i in range(0, len(probe), LAND_REFRESH_BATCH):
+                    part = probe[i:i + LAND_REFRESH_BATCH]
+                    changed, error = daemon.probe_prs(part)
+                    if error and land_read_quota(error):
+                        errors.update({e["key"]: error for e in part})
+                        continue
+                    full += part if error else changed
+                # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
+                # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
+                left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
+                for e in left:
+                    errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
+                                      else "not read: GraphQL could not take it this time (batched: spilled)")
+        except OutOfTime as stop:
+            why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
+            errors.update({k: why for k in todo if k not in errors})
+        except Exception as failure:  # noqa: BLE001
+            why = f"{describe(failure)} at {error_site(failure)}"
+            errors.update({k: why for k in todo if k not in errors})
+    for k in todo:
+        cached = read_cache(k) or {}
+        if (cached.get("dataAt") or 0) >= daemon.now:
+            out[k] = None
+        else:
+            out[k] = errors.get(k) or cached.get("error") or "no data stored"
+    return out
+
+
 # The land executor: a host that only forwards its lands. cosmic-gray (Leo's Mac), 2026-11-17: load 48 on 15 cores,
 # swap 9.4 of 10.7 GB, and its land queue ran land_judge for every queued PR on it (base_red_excuse.py x5 and
 # pr_owner.py x2 at one look) and was its top REST caller (500/h). land.json's "executor" names a program, as
@@ -16477,6 +16565,7 @@ class LandQueue:
                  notice: Callable[[str, str, str, dict], None] | None = None, inline: bool = False,
                  config: dict | None = None, reads_upstream: Callable[[], bool] = land_reads_upstream,
                  refresh: Callable[[str], str | None] = land_direct_read,
+                 refresh_many: Callable[[list[str]], dict[str, str | None]] | None = None,
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
@@ -16550,6 +16639,12 @@ class LandQueue:
         self.config_given = config
         self.reads_upstream = reads_upstream
         self.refresh = refresh
+        # the batched read (land_direct_read_many) when this queue reads through the default single read; a queue
+        # given its own REFRESH (a test) reads one key a job, as before, unless it is given REFRESH_MANY too
+        self.refresh_many = refresh_many if refresh_many is not None else \
+            land_direct_read_many if refresh is land_direct_read else None
+        self.refresh_queued: dict[str, list[str]] = {}  # repository -> keys this pass found due a read (flush_refreshes)
+        self.refresh_batched: dict[str, str] = {}  # key -> the batch's first key, from refresh_due until its read ends
         self.own_refreshed: list[float] = []  # this host's own-login refreshes in the last LAND_WINDOW_S (refresh_due)
         # this host's shared refresh hold (LAND_REFRESH_BROKER_HOLD): {"kind": "broker"|"quota", "until", "n", "why"}
         self.refresh_hold: dict | None = None
@@ -16972,6 +17067,7 @@ class LandQueue:
             if self.queue_quota_parked():
                 break  # a worker parked the host while this pass was submitting judgments
             self.pass_one(key, latch, ended)
+        self.flush_refreshes()
         # what refill hands the workers that free before the next pass, in this pass's order
         # a row ready to judge first, then the rest in the pass's order: a row whose snapshot the daemon has not read
         # yet can only start a snapshot wait on a refill, which needs no worker (refill)
@@ -17048,6 +17144,7 @@ class LandQueue:
                 continue
             tried += 1
             self.pass_one(key, None, None)
+        self.flush_refreshes()
         if tried:
             self.count("refill")
         return tried
@@ -19727,6 +19824,8 @@ class LandQueue:
         """On an upstream host, a read of the entry's PR through the broker when the upstream's copy is older than
         LAND_REFRESH_AFTER. On a host with its own login, read a stale copy seen at enqueue or a stale exact-head
         check wait. The recovery sweep revisits quiet PR waits and the same per-entry and host budgets cover both."""
+        if e["key"] in self.refresh_batched:
+            return True  # its batch's read is queued or running: judged on the copy it stores
         at = (c or {}).get("dataAt")
         if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
             return False  # fresh, or never read (the no-data path judges it unpinned)
@@ -19761,15 +19860,57 @@ class LandQueue:
         if self.refresh_held():
             self.count("refresh_held")
             return False  # judged on the copy it has, as after a failed read (LAND_REFRESH_BROKER_HOLD)
-        if self.busy() >= self.workers():
+        repo = str(e.get("repo") or "").lower()
+        queued = self.refresh_queued.get(repo) or []
+        joins = self.refresh_many is not None and bool(queued) and len(queued) % LAND_REFRESH_BATCH != 0
+        if not joins and self.busy() + self.refresh_batches() >= self.workers():
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"])}
         if own:
             self.own_refreshed.append(self.now)
         self.save(e)
-        self.submit(e["key"], self.refresh_job, e["key"])
+        if self.refresh_many is None:
+            self.submit(e["key"], self.refresh_job, e["key"])
+            return True
+        self.refresh_queued.setdefault(repo, []).append(e["key"])
+        self.refresh_batched[e["key"]] = ""  # its batch's first key, once flush_refreshes hands it a worker
         return True
+
+    def refresh_batches(self) -> int:
+        """The workers the refreshes gathered this pass will take when flushed: one a LAND_REFRESH_BATCH a repository."""
+        return sum(-(-len(keys) // LAND_REFRESH_BATCH) for keys in self.refresh_queued.values())
+
+    def flush_refreshes(self) -> None:
+        """Hand the refreshes the pass gathered to the workers: one job a repository's batch of LAND_REFRESH_BATCH."""
+        with self.lock:
+            queued, self.refresh_queued = self.refresh_queued, {}
+            for keys in queued.values():
+                for i in range(0, len(keys), LAND_REFRESH_BATCH):
+                    batch = keys[i:i + LAND_REFRESH_BATCH]
+                    for k in batch:
+                        self.refresh_batched[k] = batch[0]
+                    self.submit(batch[0], self.refresh_batch_job, batch)
+
+    def refresh_batch_job(self, keys: list[str]) -> None:
+        """One batched read of KEYS (refresh_many), then each key's outcome as refresh_job records it."""
+        try:
+            try:
+                errors = self.refresh_many(keys) if self.refresh_many is not None else {}
+            except Exception as failure:  # noqa: BLE001  each key is answered: a probe that raised never holds the rest
+                why = f"{describe(failure)} at {error_site(failure)}"
+                errors = {k: why for k in keys}
+            failed = sum(1 for k in keys if errors.get(k, "no answer"))
+            log({"event": "land-refresh-batch", "repo": (self.entries.get(keys[0]) or {}).get("repo"),
+                 "n": len(keys), "failed": failed})
+            for k in keys:
+                self.refresh_done(k, errors.get(k, "no answer from the batched read"))
+        finally:
+            with self.lock:
+                for k in keys:
+                    self.refresh_batched.pop(k, None)
+                if self.refresh_probe in keys:
+                    self.refresh_probe = None
 
     def refresh_held(self) -> bool:
         """Whether this host's land refreshes are held (LAND_REFRESH_BROKER_HOLD): before the hold's end, or while the
@@ -19839,6 +19980,10 @@ class LandQueue:
                 if self.refresh_probe == key:
                     self.refresh_probe = None  # a probe that raised never holds every later refresh
             raise
+        self.refresh_done(key, error)
+
+    def refresh_done(self, key: str, error: str | None) -> None:
+        """KEY's refresh ended with ERROR (None: read): the shared hold, the row's refresh record, its log line."""
         with self.lock:
             hold = self.refresh_outcome(key, error)
             e = self.entries.get(key)
@@ -28706,6 +28851,8 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     daemon.tick_deadline = time.monotonic() + budget
     entry = {"key": key, "jobs": bool(req.get("jobs")), "cache": read_cache(key), "touched": daemon.now,
              "waitedAt": daemon.now, "waitBegan": float(req["began"]), "readers": [], "reader": "", "consumers": {}}
+    if req.get("land"):
+        land_read_keeps_rollups(daemon, [key])
     if broker is not None:
         daemon.repo_parts.update(direct_parts_load(daemon.now))
     try:
