@@ -3818,6 +3818,7 @@ class AppPool:
         self.tokens: dict[str, tuple[str, float]] = {}  # owner (lowercase) -> (token, use until)
         self.unreadable: dict[str, float] = {}  # installation/repository/resource scope -> on the login until then
         self.rest_until: dict[str, float] = {}  # owner (lowercase) -> not asked again before this
+        self.rest_why: dict[str, str] = {}  # owner (lowercase) -> why it rests, for passed_over (never a token)
         self.why = ""  # the last reason the pool was passed over, for daemon.json (never a token)
         self.served = self.fell_back = 0
         self.seen: dict | None = None  # the App's last rate headers: {"limit", "remaining", "reset"}
@@ -3946,27 +3947,50 @@ class AppPool:
         owner = next(iter(owners))
         return (owner, "") if owner in self.owners_at[0] else (None, "owner-without-app")
 
+    def rest(self, owner: str, until: float, why: str) -> None:
+        """Rest this role for OWNER until UNTIL, keeping WHY beside the deadline. Every reason a role stops answering
+        is written here, so passed_over and status() can say which of them held a read instead of the bare label
+        "pool-resting", which read the same for a rate limit, a floor and a failed mint (115 of this host's
+        login-fallback rows named "pool-resting" with no way to tell them apart, 2026-11-22..25)."""
+        self.rest_until[owner] = until
+        self.rest_why[owner] = why
+        self.why = why
+
+    def resting_why(self, owner: str, now: float | None = None) -> str:
+        """"pool-resting" for OWNER with the reason kept beside its deadline and the seconds left, when there is
+        one: "pool-resting: the glaeda App is under its floor (12 left), 237s left"."""
+        now = self.clock() if now is None else now
+        why, left = self.rest_why.get(owner, ""), self.rest_until.get(owner, 0.0) - now
+        if not why:
+            return "pool-resting"
+        return f"pool-resting: {why}" + (f", {round(left)}s left" if left > 0 else "")
+
     def passed_over(self, owner: str, scope: str, body: dict | None = None) -> tuple[str, dict[str, str]]:
         """Why no pool of the chain answers OWNER's SCOPE after pick() found none, without a mint or a request:
         (cause, {role: its own}). A role is "no-token" (this host holds none of it), "route-benched" (it refused
         SCOPE lately, covers), "node-benched" (it refused a node the GraphQL BODY asks, bench_nodes) or
-        "pool-resting" (rate limited, under its floor, or a failed mint). The cause is "no-token" when no role holds
+        "pool-resting" (rate limited, under its floor, or a failed mint), and a resting role names which of those
+        it is and how long is left (resting_why): the bare label read the same for all three, so 2,534 of this
+        host's 4,151 real login-fallback rows over 69 h said only "pool-resting" while Leo's shared login drained.
+        The cause is "no-token" when no role holds
         one, else "pool-resting" when any holder rests, else "node-benched" when any holder benched a node, else
         "route-benched". A node bench used to read as "pool-resting": the broker host, 2026-11-22 23:39Z-00:46Z, 55
         last-real-attempt reads "pool-resting" on the login while every App of the chain had its points."""
         now = self.clock()
         each: dict[str, str] = {}
+        bare: dict[str, str] = {}  # the label alone, which decides the cause; each[] may carry the role's reason
         nodes = list(graphql_body_nodes(body).values()) if body is not None else []
         for pool in [self, *self.spares]:
             if not pool.covers(scope):
-                each[pool.role] = "route-benched"
+                bare[pool.role] = each[pool.role] = "route-benched"
             elif pool.tokens.get(owner, ("", 0.0))[1] <= now and not pool.ready_cached():
-                each[pool.role] = "no-token"
+                bare[pool.role] = each[pool.role] = "no-token"
             elif nodes and pool.nodes_benched(nodes):
-                each[pool.role] = "node-benched"
+                bare[pool.role] = each[pool.role] = "node-benched"
             else:
-                each[pool.role] = "pool-resting"
-        held = [c for c in each.values() if c != "no-token"]
+                bare[pool.role] = "pool-resting"
+                each[pool.role] = pool.resting_why(owner, now)
+        held = [c for c in bare.values() if c != "no-token"]
         if not held:
             return "no-token", each
         return next(c for c in ("pool-resting", "node-benched", "route-benched") if c in held), each
@@ -3991,13 +4015,12 @@ class AppPool:
         ready = bool(self.ready_fn())
         self.ready_at = (ready, now + APP_POOL_TTL)  # what passed_over says next is this read's, not an older one
         if not ready:
-            self.why = f"no {self.role} App on this host"
-            self.rest_until[owner] = now + APP_POOL_REST
+            self.rest(owner, now + APP_POOL_REST, f"no {self.role} App on this host")
             return None
         token = self.mint_fn(owner)
         if not token:
-            self.why = f"gh_app_token.py token {self.role} --owner {owner} gave no token"
-            self.rest_until[owner] = now + APP_POOL_REST
+            self.rest(owner, now + APP_POOL_REST,
+                      f"gh_app_token.py token {self.role} --owner {owner} gave no token")
             return None
         self.tokens[owner] = (token, now + APP_POOL_TTL)
         return token
@@ -4104,8 +4127,9 @@ class AppPool:
         if status == 401 or limited:
             self.tokens.pop(owner, None)
             spent = remaining == 0 and reset is not None and reset > now
-            self.rest_until[owner] = min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST
-            self.why = f"the {self.role} App answered HTTP {status}"
+            self.rest(owner, min(reset, now + PACE_HOLD_MAX) if spent else now + APP_POOL_REST,
+                      f"the {self.role} App answered HTTP {status}"
+                      + (f" and is spent until its reset ({message[:120]})" if spent and message else ""))
             self.fell_back += 1
             return False
         if status == 200 and nodes:
@@ -4126,8 +4150,9 @@ class AppPool:
             self.fell_back += 1
             return False
         if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
-            self.rest_until[owner] = max(self.rest_until.get(owner, 0.0), reset)  # this answer still counts
-            self.why = f"the {self.role} App is under its floor ({remaining} left)"
+            # this answer still counts
+            self.rest(owner, max(self.rest_until.get(owner, 0.0), reset),
+                      f"the {self.role} App is under its floor ({remaining} left)")
         self.served += 1
         return True
 
@@ -4136,6 +4161,7 @@ class AppPool:
         resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
         return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
+                "restingWhy": {o: w for o, w in self.rest_why.items() if self.rest_until.get(o, 0.0) > now} or None,
                 # Published so a reader can tell an idle App from a benched one: with this unprinted, an App pool
                 # 97% unspent beside a login at 0 GraphQL points read as a routing bug for hours, 2026-11-22.
                 "unreadable": {scope: round(until) for scope, until in self.unreadable.items() if until > now} or None,
@@ -4284,8 +4310,7 @@ class ReadTokenPool(AppPool):
             return kept[0]
         pair = self.mint_pair(owner)
         if pair is None or pair[1] <= now:
-            self.why = f"the broker minted no read token for {owner}"
-            self.rest_until[owner] = now + READ_TOKEN_REST
+            self.rest(owner, now + READ_TOKEN_REST, f"the broker minted no read token for {owner}")
             return None
         self.tokens[owner] = pair
         if (read_token_kept(owner) or ("",))[0] != pair[0]:  # lane-gh's prime kept it already

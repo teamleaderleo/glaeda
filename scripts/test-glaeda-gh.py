@@ -40876,6 +40876,33 @@ class AppPoolTest(Base):
         self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/6"), {}))
         self.assertEqual(asked, ["land-judge", "land-judge"], "and again once the TTL has passed")
 
+    def test_a_resting_role_says_which_limit_rests_it_not_only_pool_resting(self) -> None:
+        """A read that goes on the shared login because every role rests must say which refusal rests each of them.
+        "pool-resting" alone covered a rate limit, a floor and a failed mint: 2,534 of this host's 4,151 real
+        login-fallback rows over 69 h (2026-11-22..25) carried that one label for manaflow-ai GraphQL reads, with
+        the login at 2,282/5,000 GraphQL points, and no row said which of the three to fix. The reason was already
+        on the pool (AppPool.why) and thrown away at the row; rest() now keeps it per owner beside the deadline."""
+        spare = gg.AppPool(role="land-judge", mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        self.pool.spares = [spare]
+        scope = self.pool.scope("manaflow-ai", "GET", "/repos/manaflow-ai/cmux/pulls/1")
+        spent = {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 600))}
+        self.assertFalse(self.pool.answered("manaflow-ai", scope, 403, spent, "API rate limit exceeded"))
+        floor = {"x-ratelimit-limit": "15000", "x-ratelimit-remaining": "3", "x-ratelimit-reset": str(int(NOW + 300))}
+        self.assertTrue(spare.answered("manaflow-ai", scope, 200, floor))
+        line, = self.fallbacks((("GET", "/repos/manaflow-ai/cmux/pulls/2"), {}))
+        self.assertEqual(line["cause"], "pool-resting", "the cause is the label, as before")
+        self.assertEqual(line["pools"], {
+            "ci-watch": "pool-resting: the ci-watch App answered HTTP 403 and is spent until its reset "
+                        "(API rate limit exceeded), 600s left",
+            "land-judge": "pool-resting: the land-judge App is under its floor (3 left), 300s left"},
+            "each role names its own refusal and how long is left, not the bare label")
+        self.assertEqual(self.pool.status()["restingWhy"],
+                         {"manaflow-ai": "the ci-watch App answered HTTP 403 and is spent until its reset "
+                                         "(API rate limit exceeded)"}, "daemon.json carries it per owner too")
+        self.daemon.now = NOW + 601
+        self.assertEqual(self.pool.status()["restingWhy"], None, "a rest that has passed names nothing")
+
     def test_an_expired_node_bench_is_dropped_at_the_next_bench(self) -> None:
         self.pool.bench_nodes(["manaflow-ai/cmux#3"], NOW + 600)
         self.daemon.now = NOW + 601
