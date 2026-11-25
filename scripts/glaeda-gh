@@ -5363,7 +5363,10 @@ def parse_pr(node: dict) -> dict:
             state = c.get("state")
             done = state in {"SUCCESS", "FAILURE", "ERROR"}
             check = {"name": c.get("context"), "workflow": None, "status": "COMPLETED" if done else "PENDING",
-                     "conclusion": state if done else None, "url": c.get("targetUrl")}
+                     "conclusion": state if done else None, "url": c.get("targetUrl"),
+                     # a status's own words, which GitHub caps at 140 characters: the only place a deferred check says
+                     # what starts it (land_gate_labels), and a count of check runs never shows it
+                     **({"description": c["description"]} if isinstance(c.get("description"), str) else {})}
             order = (0, c.get("createdAt") or "")
         else:
             workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
@@ -15901,6 +15904,41 @@ def land_pending_status(data: dict) -> bool:
                 and sum(n for state, n in (counts.get("statuses") or {}).items() if state in COUNT_PENDING) > 0)
 
 
+# A deferred check says in its own description which label starts it: "Cheap tier: this check runs when ready-to-land
+# (or full-ci) is added to the pull request". cmux#55176 (2026-11-25) carried no cmux/land-tier status at all, only one
+# such status per deferred check, so every judgment read ordinary running checks and the land waited 4.1 h over 9 wait
+# refusals for runs nothing but the label dispatches. land_judge's gate now reads the description too (leo-workspace
+# lw#10785); this names the label in the stop, so its reader is told what to add instead of to wait again. The
+# giveaway of the class: a refusal whose own next step is "wait longer" while nothing moves is not slow CI, it is a
+# gate that cannot fire (cmuxterm-hq docs/handbook/gate-keyed-on-one-exact-name.md).
+LAND_GATE_SAID = re.compile(r"runs? when\b.{0,120}?\b([\w.-]+)\b.{0,120}?\bis added\b", re.IGNORECASE | re.DOTALL)
+
+
+def land_gate_labels(data: dict) -> list[str]:
+    """The labels DATA's unfinished checks say start them, sorted, or []: only an unfinished one's own description
+    counts, and only when it says a label is what starts it. A finished check needs nothing added, and a queued one
+    that says it waits for a runner is an ordinary wait no label ends."""
+    found = set()
+    for c in data.get("checks") or []:
+        if str(c.get("status") or "").upper() in ("COMPLETED", ""):
+            continue
+        said = c.get("description")
+        match = LAND_GATE_SAID.search(said) if isinstance(said, str) else None
+        if match:
+            found.add(match.group(1))
+    return sorted(found)
+
+
+def land_gate_said(data: dict) -> str:
+    """What a checks_stuck stop adds about the gate: "; the LABEL label starts them, so no runner ever takes them
+    until it is added" or "" when no unfinished check named a label."""
+    labels = land_gate_labels(data)
+    if not labels:
+        return ""
+    return (f"; the {' and '.join(labels)} label{'s' if len(labels) > 1 else ''} starts them, so no runner ever takes "
+            f"them until it is added")
+
+
 def land_unfinished(data: dict, now: float, limit: int = 6) -> str:
     """The checks DATA shows unfinished, as said in a checks_stuck stop: "NAME (STATUS N min), ..." or ""."""
     out = []
@@ -21157,8 +21195,8 @@ class LandQueue:
         # (land_override_carries)
         e["stuckVerdict"] = {"head": head, "at": self.now, "checks": land_unfinished_names(data, head), "code": code}
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
-                  f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
-                  f"{land_reason(reason, 200)}", land_trim(nxt))
+                  f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}"
+                  f"{land_gate_said(data)}; {land_reason(reason, 200)}", land_trim(nxt))
         return True
 
     def ci_never_ran_step(self, e: dict, act: dict, answer: dict, head: str, why: str, nxt: str) -> None:
