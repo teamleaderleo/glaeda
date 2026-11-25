@@ -1180,6 +1180,25 @@ class HeadRunOrderTest(unittest.TestCase):
                            {"run": 920, "workflow": 77, "workflowName": "CI", "event": "pull_request", "app": "github-actions", "suite": 5}]])
         self.assertIn("completedAt", gg.HEAD_CONTEXTS)  # the GraphQL read asks for both times
 
+    def test_a_torn_record_with_a_conclusion_reads_completed_and_settles_its_head(self) -> None:
+        # manaflow-ai/cmux#52236 at dd25ad19: "cmux-next push head preflight" read IN_PROGRESS beside SUCCESS (and a
+        # completedAt); the head never read settled and glaeda land stopped it checks_stuck after 409 min.
+        torn = {**self.node("cmux-next push head preflight", 30, "2026-11-23T19:12:12Z", "2026-11-23T19:12:19Z"),
+                "status": "IN_PROGRESS"}
+        running = {**self.node("web / b", 31, "2026-11-23T19:12:12Z", ""), "status": "IN_PROGRESS",
+                   "conclusion": None}
+        self.assertEqual((gg.finished_status(torn), gg.finished_status(running)), ("COMPLETED", "IN_PROGRESS"))
+        runs: dict = {}
+        order: dict = {}
+        gg.fold_contexts([torn], runs, {}, {}, order=order)
+        data = gg.head_data("a" * 40, runs, {}, {}, order)
+        self.assertEqual(data["found"]["CI / cmux-next push head preflight"], ["completed", "success"])
+        self.assertEqual(data["runs"]["CI / cmux-next push head preflight"][0][1], "completed")
+        self.assertTrue(data["settled"])
+        runs, order = {}, {}
+        gg.fold_contexts([torn, running], runs, {}, {}, order=order)
+        self.assertFalse(gg.head_data("a" * 40, runs, {}, {}, order)["settled"])
+
     def test_a_failed_run_stores_its_job_step_count_once(self) -> None:
         """land-judge judges a stored red as a live one (runner_refused: a failed job with no step run is the runner's
         refusal): each failure row's identity gets `steps`, read once per job by node id; a read that fails leaves
@@ -28753,6 +28772,19 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
         e = self.tick(gg.LAND_REARM_AFTER * 2)
         self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "closed", None))
+
+    def test_a_stop_on_a_pr_closed_since_on_a_copy_still_open_reads_its_state_and_stops_closed(self):
+        # manaflow-ai/cmux#52236: closed 2026-11-24 10:49Z while this host's copy still read OPEN; re-armed and judged
+        # hourly on that copy until 00:03Z. A re-arm on a copy read before its stop reads the PR's state first.
+        self.stop_retry_deadline()
+        judged = len(self.w.explains())
+        self.w.view_state = "CLOSED"  # GitHub's answer; the cached copy still says OPEN
+        e = self.tick(gg.LAND_REARM_AFTER)
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "closed"))
+        self.assertEqual(len(self.w.explains()), judged)  # never judged closed
+        e = self.tick(gg.LAND_REARM_AFTER * 2)
+        self.assertEqual((e["state"], e["stop"]["code"], len(self.w.explains())), ("stopped", "closed", judged))
 
     def test_land_cancel_on_a_stopped_entry_survives_the_rearm(self):
         # hq#14618, 2026-11-21: `glaeda-gh land cancel` at ~01:00Z left the entry stopped, and it re-armed at 01:55Z.
