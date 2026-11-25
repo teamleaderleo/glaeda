@@ -15013,7 +15013,9 @@ def _take_over_stale_evict_owner() -> bool:
 
 
 def _write_evict_owner() -> None:
-    EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    """The evict lock holder's record. On a full disk (ENOSPC, EDQUOT) it is skipped, not raised: the flock already
+    makes this run the one evictor, the record only names it, and an OSError here used to end the pass before it
+    freed a byte (take_evict_lock catches only BlockingIOError)."""
     try:
         owner = pwd.getpwuid(os.getuid()).pw_name
     except (KeyError, OSError):
@@ -15021,8 +15023,17 @@ def _write_evict_owner() -> None:
     payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
                "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv)}
     tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")))
-    os.replace(tmp, EVICT_OWNER)
+    try:
+        EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, EVICT_OWNER)
+    except OSError as e:
+        if e.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        with contextlib.suppress(OSError):
+            print(f"glaeda-disk: evict owner record not written ({e}); the pass goes on", file=sys.stderr)
 
 
 def caller_floor_wait_s(now: float | None = None) -> float | None:
@@ -18492,7 +18503,39 @@ FULL_DISK_REFILL_OVER = 10 * 1024**3
 
 
 def full_disk_reserve_path() -> Path:
+    """The one reserve on a host: leo-workspace tools/full_disk.py (wt reclaim, disk_hygiene, worktree_reclaim)
+    releases and refills this same file, so a host never holds two."""
     return HOME / ".cache/glaeda-disk/full-disk-reserve"
+
+
+FULL_DISK_SCRATCH_UNDER = 64 * 1024**2  # still this tight after the reserve: scratch goes to memory
+
+
+def full_disk_scratch() -> str:
+    """Under FULL_DISK_SCRATCH_UNDER free on HOME's volume (no reserve, or not enough), point TMPDIR (this run's
+    tempfile and its children's mktemp) at a private dir in memory: /run/user/UID/full-disk/tmp-glaeda-disk, else
+    /dev/shm/full-disk-UID/tmp-glaeda-disk, 0700 and this user's only. The dir, or "" when it did nothing (fs-agent-
+    lane-22, 2026-11-25: 0 bytes free, and the cleaners' first mktemp failed with ENOSPC)."""
+    left = _home_free()
+    if left is None or left >= FULL_DISK_SCRATCH_UNDER:
+        return ""
+    uid = os.getuid()
+    for root in (Path(f"/run/user/{uid}/full-disk"), Path(f"/dev/shm/full-disk-{uid}")):
+        if not root.parent.is_dir():
+            continue
+        target = root / "tmp-glaeda-disk"
+        try:
+            root.mkdir(mode=0o700, exist_ok=True)
+            target.mkdir(mode=0o700, exist_ok=True)
+            ok = all(not stat.S_ISLNK(os.lstat(d).st_mode) and os.lstat(d).st_uid == uid
+                     and not os.lstat(d).st_mode & 0o022 for d in (root, target))
+        except OSError:
+            continue
+        if ok:
+            os.environ["TMPDIR"] = str(target)
+            tempfile.tempdir = None
+            return str(target)
+    return ""
 
 
 def release_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> int:
@@ -18924,6 +18967,9 @@ def _logged_main(args: list[str]) -> int:
     RUN["caller"] = run_caller()
     if released := release_full_disk_reserve():
         RUN["full_disk_reserve_released"] = released
+    with contextlib.suppress(Exception):  # never the reason a pass does not run
+        if scratch := full_disk_scratch():
+            RUN["full_disk_scratch"] = scratch
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)

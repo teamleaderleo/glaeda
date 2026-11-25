@@ -28553,6 +28553,15 @@ class LandTest(Base):
                                      {"mb": LC, "files": [same, {**same, "f": "b.py"}]}))
         self.assertIn("no patch", why(LA, LB, LC, "main", {"files": [{**same, "d": None}]},
                                       {"mb": LC, "files": [same]}))
+        # lw#10961 2026-11-25: a mode-only file has no patch; the same blob at the pin and at HEAD is the same file
+        mode = {"f": "t.py", "s": "modified", "p": None, "d": None, "b": "d" * 40}
+        self.assertEqual(why(LA, LB, LC, "main", {"files": [same, mode]}, {"mb": LC, "files": [moved, mode]}), "")
+        self.assertIn("in t.py", why(LA, LB, LC, "main", {"files": [same, mode]},
+                                     {"mb": LC, "files": [moved, {**mode, "b": "e" * 40}]}))
+        self.assertIn("in t.py", why(LA, LB, LC, "main", {"files": [same, mode]},
+                                     {"mb": LC, "files": [moved, {**mode, "d": "@@ -1 +1 @@\n-x\n+y"}]}))
+        self.assertIn("no blob", why(LA, LB, LC, "main", {"files": [{**mode, "b": None}]},
+                                     {"mb": LC, "files": [mode]}))
         many = [{**same, "f": f"f{i}"} for i in range(gg.LAND_COMPARE_FILES_MAX)]
         self.assertIn("or more", why(LA, LB, LC, "main", {"files": many}, {"mb": LC, "files": many}))
         self.assertEqual(gg.land_base_merge_parent(LA[:12], LB, {"headRefOid": LB, "headParents": [LA, LC]}), LC)
@@ -30016,6 +30025,28 @@ class LandTest(Base):
         self.assertIn("3 commit(s) behind main", e["stop"]["reason"])
         self.assertIn(f"gh pr update-branch 1 -R o/r --match-head-commit {LA}", e["stop"]["next"])
 
+    def test_an_update_whose_new_head_the_reads_miss_waits_for_it_instead_of_stopping(self):
+        # hq#26227, lw#11062, hq#26324, 2026-11-25: GitHub made the update's merge within seconds; the cache still read
+        # the old head past LAND_HEAD_TIMEOUT and the land stopped "the update changed nothing". The branch ref says
+        # otherwise: it waits for the reads once, and the new head is judged and merged.
+        self.noop_update_pr(json.dumps({"s": "diverged", "b": 3}))
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertIn("update_unread", [h["event"] for h in e["history"]])
+
+    def test_an_update_head_the_reads_never_show_stops_naming_it(self):
+        self.noop_update_pr(json.dumps({"s": "diverged", "b": 3}))
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_head_unread"))
+        self.assertIn(f"made {LB[:12]}", e["stop"]["reason"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
     def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
         # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
         # at once at that head, and a merge there lands it.
@@ -31386,6 +31417,134 @@ class LandTest(Base):
         self.assertIn(LB, doc["next"])
         self.assertIn("land_pin_invented", gg.LAND_REQUEST_REFUSED)
 
+    def test_an_all_zero_pin_is_refused_before_this_host_reads_any_head(self):
+        """The one invented pin no head is needed to judge. The invented-pin check above judges a pin against a head
+        this host holds, and is handed "" when it holds none: no cached read inside LAND_PIN_BEHIND_AGE and a caller
+        outside a checkout of the repository. 2026-11-25, efficiency-standing-lane, run from a directory that is a
+        checkout of neither repository: `land ...#26325 --sha` + 40 zeros was accepted at exit 0 and answered
+        "requested; the daemon takes it next tick" -- and it replaced that row's own correct pin. git's null object id
+        is a commit in no repository at all, so this costs one string test and no read of any kind."""
+        for zeros in ("0" * 40, "0" * 12, "0" * 7):
+            said = gg.land_pin_null_refusal("o/r", 1, zeros)
+            self.assertIsNotNone(said, zeros)
+            why, nxt = said
+            self.assertIn("is all zeros", why)
+            self.assertIn("names no commit in any repository", why)
+            self.assertIn("never a sha filled in or padded by hand", why)
+            self.assertIn("glaeda-gh land o/r#1 --sha HEAD", nxt)
+            self.assertIn("glaeda-gh gh api repos/o/r/pulls/1 --jq .head.sha", nxt)
+        # Nothing else: no pin, a real one, a short one, and a hand-padded one that still carries its head's prefix
+        # (land_pin_extends_head_refusal owns that, against a head, and said nothing when it had none).
+        for pin, why in (("", "no pin"), (LA, "a real head"), (LB[:12], "a short pin"),
+                         (LB[:12] + "0" * 28, "zeros after a real prefix"), ("0" * 39 + "1", "not all zeros")):
+            self.assertIsNone(gg.land_pin_null_refusal("o/r", 1, pin), why)
+        # End to end: the first pin answer of all, before the draft read and before check_land_pin's two git calls.
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "land_cached_head", side_effect=AssertionError("no cache read")), \
+                mock.patch.object(gg, "land_pin_local_head", side_effect=AssertionError("no git call")), \
+                mock.patch.object(gg, "land_request", side_effect=AssertionError("nothing is queued")), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, "0" * 40)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["code"], doc["key"]), (gg.EXIT_FAIL, False, "land_pin_null", self.KEY))
+        self.assertIn("--sha HEAD", doc["next"])
+        self.assertIn("land_pin_null", gg.LAND_REQUEST_REFUSED)  # a forwarded request carries it back unchanged
+
+    def test_a_pin_no_head_here_could_check_says_the_check_did_not_run(self):
+        """The queue still takes the pin -- it must, since the head may be newer than anything read here -- but the
+        caller is told the check did not run. Before this, the same one line answered a checked pin and an unchecked
+        one, so there was nothing to tell them apart by: 2026-11-25 a hand-padded 40-hex pin and an all-zero pin were
+        both accepted from a directory that was no checkout of the target, each costing a daemon tick, a park and a
+        re-request."""
+        note = gg.land_pin_unchecked_note("o/r", 1, LA)
+        self.assertIn(f"--match-head-commit {LA[:12]} was taken as given", note)
+        self.assertIn("no read of o/r#1 inside a day", note)
+        self.assertIn("the directory you ran in is no checkout of o/r", note)
+        self.assertIn("parks the row (pin_wait)", note)
+        self.assertIn("next: glaeda-gh land o/r#1 --sha HEAD", note)
+        self.assertEqual(gg.land_pin_unchecked_note("o/r", 1, ""), "", "an unpinned request checks nothing")
+        # End to end: no cached read of the PR and no checkout of it here, so the invented-pin check was handed ""
+        # and judged nothing. The request is queued, and says so.
+        self.pr(LA)
+        said: list[str] = []
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: ""), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(rc, gg.EXIT_OK)
+        self.assertIn("requested; the daemon takes it next tick", out.getvalue())
+        self.assertTrue(any("was taken as given" in line for line in said), said)
+        self.assertTrue(any("--sha HEAD pins whatever the head is, checked here" in line for line in said), said)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: ""), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, LA)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["state"]), (gg.EXIT_OK, True, "requested"))
+        self.assertIn("was taken as given", doc["pinUnchecked"])
+        self.assertNotIn("pinReplaced", doc)
+        # A pin this host *can* check says nothing extra: the cached read is the head it was judged against.
+        self.store_pr(land_pr(LA))
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: ""), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(out):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, True, LA)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((rc, doc["ok"]), (gg.EXIT_OK, True))
+        self.assertNotIn("pinUnchecked", doc)
+
+    def test_a_re_pin_names_the_live_pin_it_replaced(self):
+        """A re-pin is ordinary -- the head moved and the requester pinned the new one -- so it is not refused. What
+        was missing is the sha it replaced, which is the only way its requester can put the row back. The row this
+        session landed on 2026-11-25 was its own, correctly pinned, and one probe request overwrote that pin with no
+        word of it; the correct pin had to be read back from GitHub. land_pin_already_followed answers only the case
+        the queue itself moved the pin, and only for the same requester, so every other re-pin was silent."""
+        live = {"state": "waiting", "pinSha": LB, "requester": "host/lane", "history": []}
+        self.assertEqual(gg.land_pin_replaces_note(live, LA, "host/lane"), LB)
+        for entry, why in ((None, "no row at all"),
+                           ({}, "an empty row"),
+                           ({**live, "state": "merged"}, "a merged row"),
+                           ({**live, "state": "stopped"}, "a stopped row"),
+                           ({**live, "pinSha": ""}, "an unpinned row"),
+                           ({**live, "pinSha": "nope"}, "a pin that is no sha"),
+                           ({**live, "pinSha": LA}, "the same pin again"),
+                           ({**live, "requester": "other/lane"}, "another session's row")):
+            self.assertEqual(gg.land_pin_replaces_note(entry, LA, "host/lane"), "", why)
+        self.assertEqual(gg.land_pin_replaces_note(live, LB[:12], "host/lane"), "",
+                         "a short pin of the sha the row already holds")
+        self.assertEqual(gg.land_pin_replaces_note(live, "", "host/lane"), "", "an unpinned request")
+        # End to end, with a cached head so the pin is checked and only the replacement is new.
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "repo": "o/r", "number": 1, "state": "waiting", "pinSha": LB,
+                       "requester": "host/lane", "history": []})
+        self.pr(LA)
+        self.store_pr(land_pr(LA))
+        said: list[str] = []
+        with mock.patch.object(gg, "land_config", return_value={"landJudge": self.w.mh}), \
+                mock.patch.object(gg, "land_executor", return_value=None), \
+                mock.patch.object(gg, "cwd_repo", lambda *a, **k: ""), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                mock.patch.object(gg, "run_bounded", side_effect=lambda argv, *a, **k:
+                                  gg.subprocess.CompletedProcess(argv, 1, "", "")), \
+                mock.patch.object(gg, "say_waiting", side_effect=said.append):
+            rc = gg.cmd_land("o/r#1", [], "host/lane", 0, False, LA)
+        self.assertEqual(rc, gg.EXIT_OK)  # not a refusal: a re-pin after a head move is the normal case
+        self.assertTrue(any(f"which was queued pinned {LB}" in line for line in said), said)
+        self.assertTrue(any(f"next: glaeda-gh land o/r#1 --match-head-commit {LB} puts it back" in line for line in said), said)
+
+
     def test_the_moved_pin_refusal_shows_the_hex_at_which_the_two_shas_differ(self):
         """Every sha in this script is abbreviated to 12 hex, which is a name. In the one message whose whole subject
         is that the head is not the pin, a name is not enough: 2026-11-22 on this host, landing
@@ -32435,6 +32594,18 @@ class LandTest(Base):
         self.assertEqual(e["pinSha"], LB)
         self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
         self.assertEqual([json.loads(c[4])["sha"] for c in self.handoffs()], [LA, LB])
+
+    def test_a_request_between_passes_is_a_row_in_the_refills_line(self):
+        # cmux-cp-1, 2026-11-25: a forwarded land waited p50 58 s, p90 297 s in requests/ for the next pass
+        self.pr(LA)
+        self.tick()  # one pass: this host executes its lands
+        gg.land_request("land", "o/r#1", [], "host/lane")
+        self.assertEqual(self.q.ingest_between(), 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["state"], "queued")
+        self.assertIn(self.KEY, self.q.next_up)
+        self.assertEqual(self.q.ingest_between(), 0)
+        self.assertEqual(self.q.next_up.count(self.KEY), 1)
 
     def forwarded_row(self, sha: str = "") -> dict:
         """A lane VM's land of o/r#1 at LA (pinned to SHA when given), handed to the broker host by a judgment that
@@ -37333,28 +37504,46 @@ class LandTest(Base):
             self.assertEqual(q.workers(), 12)
         q.jobs.clear()
 
-    def test_the_pool_grows_no_wider_than_the_read_loop_keeps_fresh(self):
-        """cmux-cp-1, 2026-11-22 20:54Z, with the watch window capped: the pool at 175 workers, each judgment's PR
-        waited, held 262 waited PRs against 263-298 PR reads stored per 600 s; p50 waited data 2,419 s old. The pool
-        grows no wider than the daemon's read room and steps down to it when the room shrinks; a quota refusal still halves."""
+    def test_the_pool_grows_past_the_read_room_and_the_snapshot_waits_stay_inside_it(self):
+        """cmux-cp-1, 2026-11-22 20:54Z: 175 workers held 262 waited PRs, each worker keeping a snapshot wait's place.
+        Capping the workers at the read room fixed that and pinned the pool at LAND_WATCH_FLOOR: cmux-cp-1, 2026-11-25
+        06:35-12:35Z, 16 workers, 22 of ~23 busy on average with 75% of the CPU free, a due row waiting a median 5.5
+        min for each judgment. The pool grows to its memory ceiling while rows wait for a worker; the snapshot waits,
+        what puts reads first, stay inside the room; a quota refusal still halves."""
         q, room = self.q, [6]
         q.read_room = lambda: room[0]
         with mock.patch.object(gg, "land_mem_available_mb", return_value=40 * 1024):  # 80 workers' worth
             q.now, q.pass_gated = 1000.0, 7
-            for _ in range(10):
+            for _ in range(20):
                 while len(q.jobs) < q.workers():
                     q.jobs[f"pr:o/r#{len(q.jobs) + 100}"] = mock.Mock(done=lambda: False)
                 q.now += gg.LAND_POOL_ADAPT_S
                 q.adapt_pool()
-            self.assertEqual(q.workers(), 6)
-            room[0] = 3  # GitHub slowed: the pool steps down to the room
+            self.assertEqual(q.workers(), 80)  # past the room of 6: the memory ceiling
+            room[0] = 3  # GitHub slowed: the workers stay
             q.now += gg.LAND_POOL_ADAPT_S
             q.adapt_pool()
-            self.assertEqual(q.workers(), 3)
-            room[0] = None  # no room known: the memory ceiling alone
+            self.assertEqual(q.workers(), 80)
+            q.jobs.clear()
+            # the snapshot waits are what the room bounds: 3 places, whatever the workers
+            q.snapshot_waiting = set()
+            for n in range(3):
+                q.snapshot_waiting.add(f"pr:o/r#{n + 500}")
+                q.entries[f"pr:o/r#{n + 500}"] = {"snapshotWait": {"since": q.now}}
+            self.assertFalse(q.snapshot_room(True))
+            room[0] = 4
+            self.assertTrue(q.snapshot_room(True))
+            room[0] = None  # no room known: the workers' places alone
+            self.assertTrue(q.snapshot_room(True))
+            for n in range(3):
+                q.entries.pop(f"pr:o/r#{n + 500}")
+            q.snapshot_waiting = set()
+            q.pass_gated = 3
+            q.now += 1
+            q.park_quota({"key": "pr:o/r#1", "state": "judging", "history": []}, "API rate limit exceeded")
             q.now += gg.LAND_POOL_ADAPT_S
             q.adapt_pool()
-            self.assertEqual(q.workers(), 4)
+            self.assertEqual(q.workers(), 40)  # a quota refusal halves it, as before
         q.jobs.clear()
         # a daemon up for less than the window counts its reads over its uptime
         d = gg.Daemon.__new__(gg.Daemon)
@@ -37949,6 +38138,114 @@ class LandForwardTest(Base):
         self.assertIn("big-exec's land queue stopped it (checks_red): ci failed at LA", e["stop"]["reason"])
         self.assertEqual(e["stop"]["next"], "fix ci")
         self.assertEqual(len(self.w.sent()), told)
+
+    def test_a_forwarding_host_leaves_its_requests_to_forward_tick_between_passes(self):
+        self.q = self.forwarding()
+        self.tick()
+        gg.land_request("land", "o/r#1", [], "cosmic/coord")
+        self.assertEqual(self.q.ingest_between(), 0)
+        self.assertNotIn(self.KEY, self.q.entries)
+
+    def exec_do(self, x: Any, fn: Callable[[dict], None]) -> None:
+        """FN on the executor's row of o/r#1, under its lock and over its own BASE, saved there."""
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.now = self.t
+            fn(x.entries[self.KEY])
+            x.save(x.entries[self.KEY])
+
+    def test_a_far_stop_of_this_rows_own_request_is_its_outcome_after_a_re_send(self):
+        # cosmic-gray, 2026-11-25 08:16Z: 18 rows were re-sent under the id cmux-cp-1 had already stopped (conflict,
+        # block, ...); cmux-cp-1 applies an id once, so its stop stayed older than the re-send, the answer read as "no
+        # row of it" (forward_missing), and each stopped forward_no_outcome with the far host's reason never said.
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "conflict", "merge main into o/r#1", "resolve and push")
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardResent"] = {"at": self.t + 5, "n": 1, "to": "big-exec"}  # re-sent after the far stop
+            self.q.save(e)
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "forward_stopped"),
+                         e.get("history", [])[-3:])
+        self.assertIn("big-exec's land queue stopped it (conflict): merge main into o/r#1", e["stop"]["reason"])
+        self.assertFalse(any(h.get("event") == "forward_missing" for h in e["history"]))
+
+    def test_a_far_stopped_forward_follows_the_far_rearm_and_merge(self):
+        # cmux-cp-1, 2026-11-25 13:20Z: 5 of cosmic-gray's 23 forward_stopped rows were queued or waiting again there
+        # (a base red fixed, a retry): a stopped forward keeps asking its far host, and its rearm and merge reach here.
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "own_red", "base red at LA", "wait for the base")
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual(e["stop"]["code"], "forward_stopped")
+        told = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)  # asked again: nothing new there, still stopped
+        self.assertEqual(e["state"], "stopped")
+        self.exec_do(x, lambda r: r.update(state="queued", stop=None))  # the far queue rearms it
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["forwardHeld"]["state"]), ("forwarded", "queued"))
+        self.assertEqual(e["history"][-1]["event"], "forward_far_rearmed")
+        self.exec_do(x, lambda r: r.update(state="merged", mergeSha="f" * 40))
+        e = self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), told)  # the far host told the requester; nothing from here
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_row_stopped_no_outcome_takes_its_far_stop_of_the_same_request_in_its_words(self):
+        # cosmic-gray and huge-blue, 2026-11-25: 66 rows stopped forward_no_outcome in a day while cmux-cp-1 held each
+        # stopped (conflict, block, update_branch_conflict) on the very request they had sent
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "block", "a BLOCK at this head", "push a fix")
+        with self.q.lock:
+            self.q.forward_give_up(self.q.entries[self.KEY], "OPEN", "big-exec", True, "no outcome either")
+        told = len(self.w.sent())
+        e = self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertIn("big-exec's land queue stopped it (block): a BLOCK at this head", e["stop"]["reason"])
+        self.assertEqual(len(self.w.sent()), told)
+
+    def test_a_far_stop_older_than_a_day_is_not_asked_about(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            x.stop(x.entries[self.KEY], "conflict", "merge main", "resolve")
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        asked = len(self.asks)
+        self.tick(gg.LAND_FORWARD_STOPPED_FOLLOW + 1)
+        self.tick(gg.LAND_FORWARD_STOPPED_ASK_EVERY + 1)
+        self.assertEqual(len(self.asks), asked)
+
+    def test_a_re_land_after_a_repair_is_a_new_request_on_a_fresh_give_up_clock(self):
+        # cosmic-gray, 2026-11-25 08:15Z: the repair reopened 56 rows and cleared forwardRelanded; their re-land reused
+        # the 11-23 re-land's id, which apply here and on cmux-cp-1 both took as applied before, so nothing was judged
+        # and each stopped forward_no_outcome ~2 min later, "handed to cmux-cp-1's land queue 170373 s ago".
+        self.forwarded_to_executor()
+        with self.q.lock:
+            self.q.forward_reland(self.q.entries[self.KEY], LA, "big-exec", True)
+        first = self.q.entries[self.KEY]["requestId"]
+        e = self.tick()
+        self.assertEqual((e["state"], self.sent_batches[-1]["requests"][0]["id"]), ("forwarded", first))
+        with self.q.lock:  # the repair's reopen (repair_forwarded): an old clock, forwardRelanded cleared
+            e = self.q.entries[self.KEY]
+            e.pop("forwardRelanded", None)
+            e["forwardFirst"] = self.t - gg.LAND_FORWARD_GIVE_UP - 1
+            self.q.forward_reland(e, LA, "big-exec", True)
+        e = self.q.entries[self.KEY]
+        self.assertNotEqual(e["requestId"], first)
+        self.assertEqual((e["state"], e.get("forwardFirst")), ("queued", None))
+        e = self.tick()
+        self.assertEqual((e["state"], self.sent_batches[-1]["requests"][0]["id"]), ("forwarded", e["requestId"]))
+        for _ in range(5):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(e["state"], "forwarded")  # not given up on the first hand-off's clock
 
     def test_a_forward_the_executor_holds_open_is_never_given_up_and_never_re_sent(self):
         self.forwarded_to_executor()
