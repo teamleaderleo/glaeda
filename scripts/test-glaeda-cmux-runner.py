@@ -13819,6 +13819,32 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.stat(listener.pid).startswith("T"), "thawed")
         self.assertEqual(gate.frozen, ())
 
+    def test_the_listener_is_frozen_before_the_gate_looks_at_the_exited_worker(self) -> None:
+        """cmuxs-mac-mini-6, 2026-11-25 20:03:21Z: runner glaeda-7's Worker exited, its listener went Online and
+        acknowledged the next PR job at 20:03:22 while the runner carried cmux-ci's RUNNER_DRAIN marker. nap() ran
+        /bin/ps on the unreaped Worker (load 108 on 14 cores) before it froze the listener. The freeze comes first."""
+        import threading
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        worker, listener = self.sleeper(), self.sleeper()
+        gate.watching, gate.freeze_at_exit = (worker.pid,), True
+        gate.listener_pids = (listener.pid,)
+        seen: list[str] = []
+
+        def zombie(pid: int) -> bool:
+            seen.append(self.stat(listener.pid))
+            return True
+
+        killer = threading.Timer(0.3, worker.kill)  # not reaped: a zombie, as under the listener before it reaps
+        killer.start()
+        self.addCleanup(killer.cancel)
+        with mock.patch.object(hook, "GATE_POLL_S", 30.0), mock.patch.object(gate, "_zombie", side_effect=zombie):
+            gate.nap()
+        self.assertTrue(seen, "the gate looked at the exited Worker")
+        self.assertTrue(all(stat.startswith("T") for stat in seen), f"listener not frozen before the look: {seen}")
+        self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
+        gate.thaw()
+
     def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
         """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
         it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
