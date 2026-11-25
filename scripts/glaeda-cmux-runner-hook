@@ -776,6 +776,14 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-ios-keyboard-motion.yml's bench each submit one simulator step (cmux-ci run --class simulator
 # scripts/ci/cmux-next-ios-sim.sh) and wait for it. The gestures job's first run, 45314398918 on cmux#52373, was refused
 # here; keyboard-motion, on the same runner label and continue-on-error, was missing from this list as well.
+# cmux-next-ios-kit.yml's link-ffi-fleet submits the CmuxMobileLinkFFI xcframework build (cmux-ci ios-build --what ffi)
+# for kit-tests, reads the FFI key from a blobless sparse checkout of scripts/ci and moves the result into the Actions
+# cache and an artifact; it waits at most 40 min. Its first run, 45528332604 on cmux#55285, was refused here.
+# GATEWAY_FLEET_SUFFIX: that was the fourth client refused on its first run (gallery, try-ahead, gestures, this), each
+# fixed by one more pair here after a red. A home-repository job id that ends in -fleet is the client contract
+# cmux already names its thin clients by (app-compile-fleet, fast-tier-fleet, swift-test-fleet ...; the bare job that
+# builds on a Mac keeps the bare id and is refused), so such a job is admitted from any of its workflows with no
+# change here. GATEWAY_JOBS keeps the clients named before the contract.
 # GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
 # while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
 # cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
@@ -798,6 +806,16 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                           ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
                           ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")})
+GATEWAY_FLEET_SUFFIX = "-fleet"
+
+
+def gateway_job(workflow: str, job: str) -> bool:
+    """A thin cmux-ci client job: a GATEWAY_JOBS pair, or a job id ending in GATEWAY_FLEET_SUFFIX (the caller has
+    already refused a guest repository)."""
+    return (workflow, job) in GATEWAY_JOBS or (bool(workflow) and job.endswith(GATEWAY_FLEET_SUFFIX)
+                                               and len(job) > len(GATEWAY_FLEET_SUFFIX))
+
+
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
@@ -3594,7 +3612,8 @@ def stack_blocker_tier(event_name: str | None, repository: str | None, event: An
 
 def gateway_jobs_note() -> str:
     """GATEWAY_JOBS for a refusal: "workflow job" pairs, sorted."""
-    return ", ".join(f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS))
+    return ", ".join([f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS)]
+                     + [f"any job id ending in {GATEWAY_FLEET_SUFFIX}"])
 
 
 # STACK_SLOT: the nightly slot also admits a stack-blocker PR job (TIER_STACK, stack_blocker_tier). FEED_FIRST ranks
@@ -15841,7 +15860,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
             return 0
         if args.gateway_runner and (is_guest(repo, args.home_repo)
-                                    or (job_workflow(), os.environ.get("GITHUB_JOB", "")) not in GATEWAY_JOBS):
+                                    or not gateway_job(job_workflow(), os.environ.get("GITHUB_JOB", ""))):
             # GATEWAY: thin cmux-ci clients only. It listens through CPU saturation and a full mini, so any other job
             # would run its build here outside the units; refused at once, before any disk or capacity work, it is
             # rescued elsewhere.

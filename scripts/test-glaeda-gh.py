@@ -1965,7 +1965,10 @@ class StreamsTest(Base):
     def pr_reads(self) -> int:
         return sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])
 
-    def wait_ticks(self, n: int, start: float = NOW, every: float = gg.CYCLE, between=None) -> None:
+    def wait_ticks(self, n: int, start: float | None = None, every: float = gg.CYCLE, between=None) -> None:
+        # start defaults to this test's NOW (Base.setUp), not the import's: bound at import, it ran the ticks behind the
+        # watch files' real mtimes once the suite had run a while (#2691's whole suite: StreamsTest red in its shard)
+        start = NOW if start is None else start
         for i in range(n):
             at = start + i * every
             gg.register("pr:o/r#1", waited=True)
@@ -22957,6 +22960,76 @@ class CmuxWaitsRestCostTest(Base):
         self.assertTrue([c for c in self.gh.calls[after:] if "/3cmux" in c[1] and "/check-runs" in c[1]])
 
 
+class RollupController(FakeController):
+    """FakeController plus GET /v1/github/commits/SHA/rollup, built from the fake GitHub's heads as the controller's
+    webhooks would keep it: every check run with its suite id, complete unless `incomplete` names the sha."""
+
+    def __init__(self, gh) -> None:
+        super().__init__()
+        self.gh, self.rollups, self.incomplete, self.slow = gh, [], set(), set()
+
+    def get(self, path: str, timeout: float | None = None) -> dict:
+        self.fail()
+        sha = path.split("/commits/", 1)[1].split("/", 1)[0]
+        self.rollups.append(sha)
+        if sha in self.slow:
+            raise gg.ControllerTimeout("controller: timed out")
+        contexts = [c for node in self.gh.prs.values() if node["headRefOid"] == sha
+                    for c in node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]]
+        runs = [{"id": c["databaseId"], "name": c["name"], "status": c["status"].lower(),
+                 "conclusion": (c.get("conclusion") or "").lower() or None,
+                 "check_suite": {"id": c["checkSuite"]["workflowRun"]["databaseId"]}}
+                for c in contexts if c.get("__typename") == "CheckRun"]
+        return {"sha": sha, "check_runs_complete": sha not in self.incomplete, "status_complete": True,
+                "check_runs": {"total_count": len(runs), "check_runs": runs}}
+
+
+class CmuxWaitsRollupGateTest(CmuxWaitsRestCostTest):
+    """The same waits with the controller's check rollup reachable (PR_REST_SUITES_FROM_CONTROLLER): every gate holds
+    and breaks as GitHub's check suites made it, with no GET commits/SHA/check-suites. Why: rest_breakdown of
+    manaflow-ai/cmuxterm-hq, 2026-11-24 21:28-23:28Z, glaeda-upstream's commits/{sha}/check-suites 2,136 in 2 h."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctl = RollupController(self.gh)
+        self.daemon.controller = self.ctl
+
+    def suite_reads(self) -> list:
+        return [c[1] for c in self.gh.calls if "/check-suites" in c[1]]
+
+    def test_ten_cmux_waits_over_rest_cost_a_small_constant_a_minute(self) -> None:
+        super().test_ten_cmux_waits_over_rest_cost_a_small_constant_a_minute()
+        self.assertEqual(self.suite_reads(), [])
+        self.assertTrue(self.ctl.rollups)
+
+    def test_an_incomplete_or_slow_rollup_reads_githubs_suites(self) -> None:
+        sha2 = self.gh.prs[("o", "cmux", 2)]["headRefOid"]
+        sha3 = self.gh.prs[("o", "cmux", 3)]["headRefOid"]
+        self.ctl.incomplete.add(sha2)
+        self.ctl.slow.add(sha3)
+        self.run_over_rest(minutes=2)
+        asked = self.suite_reads()
+        self.assertTrue([u for u in asked if sha2 in u] and [u for u in asked if sha3 in u], asked)
+        self.assertFalse([u for u in asked if sha2 not in u and sha3 not in u], asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["data"]["checkState"], "PENDING")
+
+    def test_a_down_controller_reads_githubs_suites_and_is_left_alone_a_while(self) -> None:
+        self.ctl.down = True
+        self.run_over_rest(minutes=1)
+        self.assertTrue(self.suite_reads())  # (the feed's failure took the controller out: no rollup asked)
+        self.assertEqual(gg.read_cache("pr:o/cmux#2")["data"]["checkState"], "PENDING")
+        d, sha = self.daemon, self.gh.prs[("o", "cmux", 2)]["headRefOid"]
+        d.controller_down_until = 0.0
+        self.assertIsNone(d.controller_suites("/repos/o/cmux", sha))  # a rollup read failing otherwise
+        self.assertGreater(d.rollup_down_until, d.now)
+        asked = len(self.ctl.rollups)
+        self.ctl.down = False
+        self.assertIsNone(d.controller_suites("/repos/o/cmux", sha))  # left alone for CONTROLLER_ROLLUP_DOWN
+        self.assertEqual(len(self.ctl.rollups), asked)
+        d.now += gg.CONTROLLER_ROLLUP_DOWN
+        self.assertEqual(d.controller_suites("/repos/o/cmux", sha)["via"], "controller")
+
+
 class ReexecDrainTest(Base):
     """cosmic-gray, 2026-11-17: an installed update waited on land steps from 12:39Z until a forced restart, because a
     busy land queue always had one running. A waiting re-exec starts no new step and waits at most REEXEC_DRAIN_MAX."""
@@ -27246,11 +27319,50 @@ class LandTest(Base):
         self.assertIn("not a merge of main", e["stop"]["reason"])
         self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
 
-    def test_a_run_whose_commits_were_not_all_listed_stops_head_moved(self):
+    def cut_compare(self, mid_parents: list | None = None) -> None:
+        """The compare PIN...HEAD cut at its commit cap: 300 commits, the walk's two not among those listed (a base
+        merge over hundreds of base commits); each walk commit is read alone."""
+        self.base_chain(mid_parents=mid_parents)
+        self.w.api[f"repos/o/r/compare/{LA}...{LB}"] = json.dumps({"s": "ahead", "n": 300, "c": []})
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC, self.LF])
+        self.w.api[f"repos/o/r/commits/{LC}"] = json.dumps(mid_parents or [LA, self.LD])
+
+    def test_a_run_whose_commits_were_not_all_listed_is_read_commit_by_commit_and_followed(self):
+        # 2026-11-25: ~20 PRs stopped head_moved after base merges past #54484's E0062 red, each compare over a
+        # day of feat-cmux-next cut at 250 commits. Leo, 01:36Z: "fix the underlying problems. always"
         self.pinned_and_waiting()
-        self.base_chain(n=300)
+        self.cut_compare()
+        self.w.answers.append(ok_answer(LB))
         e = self.tick(30)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual([(h["was"], h["head"], h["merges"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12], 2)])
+        self.assert_merged_at(LB)
+
+    def test_a_cut_compare_with_a_commit_pushed_in_the_walk_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.cut_compare(mid_parents=[LA])  # LC is one commit on the pin, not a merge
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_cut_compare_whose_walk_commit_read_fails_waits_not_stops(self):
+        self.pinned_and_waiting()
+        self.cut_compare()
+        self.w.api[f"repos/o/r/commits/{LC}"] = None  # the read fails
+        e = self.tick(30)
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "base_merge_unread"], ["base_merge_unread"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_land_base_merge_chain_reads_only_the_walk_and_needs_a_reader_for_a_cut_list(self):
+        chain = gg.land_base_merge_chain
+        doc = {"s": "ahead", "n": 300, "c": []}
+        self.assertEqual(chain(LA, LB, doc)[0], [])
+        reads = []
+        parents = {LB: [LC, self.LF], LC: [LA, self.LD]}
+        self.assertEqual(chain(LA, LB, doc, lambda sha: reads.append(sha) or parents[sha]), ([self.LF, self.LD], ""))
+        self.assertEqual(reads, [LB, LC])
 
     def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
         self.pinned_and_waiting()
