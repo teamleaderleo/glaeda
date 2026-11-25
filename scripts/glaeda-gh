@@ -790,6 +790,10 @@ ON_EVENT_RUNS_MAX = 1000
 ON_EVENT_FIELDS = ("head_sha", "run_id", "attempt", "repo", "run_url", "job_url", "hook")  # {name} in a command
 ON_EVENT_PLACEHOLDER = r"\{([a-z_]+)\}"
 ON_EVENT_ENV = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL")  # all a command inherits
+LAND_NUDGE_MIN = 3  # a land-queue PR a check event nudged: its read is what the land waits on (Leo, 2026-11-25: "stop polling")
+FEED_STREAM_WAIT = 25  # seconds one FeedStream long-poll of the controller's change feed holds open (its max is 300)
+FEED_STREAM_BACKSTOP = 40  # the feed poll's gap while a FeedStream answers (under CONTROLLER_FRESH: downstream views stay fresh)
+FEED_STREAM_RETRY = 10  # seconds a FeedStream waits after a failed long-poll; the CONTROLLER_FEED_EVERY poll serves meanwhile
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
 # GraphQL diet (2026-11-01: the daemons on huge-blue and cosmic-gray spent 938 and 833 GraphQL queries an hour, the
 # account's biggest spenders, while their clients read about two dozen PRs). A watch nobody has read lately is
@@ -4748,9 +4752,14 @@ class Controller:
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
 
-    def events(self, since: int | None) -> dict:
-        """The change feed after cursor `since`, or only the current cursor when since is None."""
-        doc = self.get("/v1/github/events?since=" + ("latest" if since is None else str(int(since))))
+    def events(self, since: int | None, wait: int = 0) -> dict:
+        """The change feed after cursor `since`, or only the current cursor when since is None. WAIT > 0 long-polls:
+        the controller answers as soon as an event lands after `since`, or empty after WAIT seconds (FeedStream)."""
+        path = "/v1/github/events?since=" + ("latest" if since is None else str(int(since)))
+        if wait > 0 and since is not None:
+            doc = self.get(f"{path}&wait={int(wait)}", timeout=int(wait) + CONTROLLER_READ_TIMEOUT)
+        else:
+            doc = self.get(path)
         if not isinstance(doc.get("cursor"), int) or doc["cursor"] < 0:
             raise WatchError("controller: feed without a cursor")
         return doc
@@ -9094,7 +9103,7 @@ class Daemon:
                 out.append(e)  # a wait (or a rerun) since GitHub last showed this finish: read it once now
                 continue
             if (kind == "pr" and c is not None and e["key"] in self.nudged
-                    and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
+                    and self.now - self.attempted.get(e["key"], float("-inf")) >= self.nudge_min(e["key"])):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
                 # (an idle one keeps its slower cycle, except a PR in the land queue: its nudge is a wait. huge-blue,
                 # 2026-11-21 20:15Z: pinned lands sat 1.5-2 h in pin_wait while the idle backoff dropped each nudge)
@@ -9776,7 +9785,8 @@ class Daemon:
                   # run's finish still arrives over the feed when its read bucket has stopped (feed_covers).
                   "controller": {**self.controller_status, "runs": len(self.controller_filled),
                                  "fedRepos": {r: round(t, 3) for r, t in self.fed_repos.items()},
-                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None},
+                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None,
+                                 "stream": self.feed_stream_status()},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
@@ -9847,6 +9857,12 @@ class Daemon:
         none: a drain at REEXEC_DRAIN_MAX lets them finish instead of judging them again (reexec_due)."""
         q = self.land_queue
         return 0.0 if q is None else q.finishing(time.monotonic())
+
+    def nudge_min(self, key: str) -> float:
+        """How soon a nudged PR is read again: LAND_NUDGE_MIN for one in the land queue (its read is what the land
+        waits on: a check event must merge it in seconds, not at the next NUDGE_MIN), NUDGE_MIN for the rest."""
+        q = self.land_queue
+        return LAND_NUDGE_MIN if q is not None and key in q.entries else NUDGE_MIN
 
     def land_nudge(self, key: str) -> None:
         """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
@@ -12554,8 +12570,11 @@ class Daemon:
         if (self.controller is None or self.now < self.streams_retry_at or self.now - self.streams_at < STREAMS_EVERY
                 or not self.controller_room()):
             return
-        waited = sorted((e for e in entries if e["key"].startswith("pr:") and self.waited(e)
-                         and not terminal("pr", (e.get("cache") or {}).get("data"))), key=self.wait_start)
+        landing = set() if self.land_queue is None else {
+            k for k, x in self.land_queue.entries.items() if x.get("state") not in LAND_DONE}
+        waited = sorted((e for e in entries if e["key"].startswith("pr:") and (self.waited(e) or e["key"] in landing)
+                         and not terminal("pr", (e.get("cache") or {}).get("data"))),
+                        key=lambda e: (e["key"] not in landing, self.wait_start(e)))  # lands first in STREAMS_WANT
         self.streams_at = self.now
         if not waited:
             self.streams_prs = {}
@@ -12588,7 +12607,7 @@ class Daemon:
             was = self.streams_prs.get(e["key"])
             if was is not None and int(st.get("events") or 0) > int(was.get("events") or 0):
                 self.streams_event_at[e["key"]] = self.now
-                self.nudged.add(e["key"])  # read it now (due(): NUDGE_MIN), not at the backstop
+                self.land_nudge(e["key"])  # read it now (due(): nudge_min), not at the backstop; a land judges it
                 self.streams_nudges += 1
             fresh[e["key"]] = st
         self.streams_prs, self.streams_ok_at = fresh, self.now
@@ -12719,6 +12738,27 @@ class Daemon:
             with contextlib.suppress(AttributeError):
                 self.controller.budget_end = float("inf")
 
+    def feed_stream_status(self) -> dict | None:
+        """The FeedStream for daemon.json: whether it answers, how many events it named and the tick read at once, and
+        its last error, so a host's stream can be seen working (or not) without a debugger."""
+        stream = getattr(self, "feed_stream", None)
+        if stream is None:
+            return None
+        return {"live": stream.live(time.time()), "okAt": round(stream.ok_at, 3) if stream.ok_at > 0 else None,
+                "signals": stream.signals, "reads": getattr(self, "feed_stream_reads", 0),
+                "landEventNudges": getattr(self, "land_event_nudges", 0), "error": stream.error}
+
+    def feed_stream_due(self, now: float) -> bool:
+        """Whether the feed is read now: the FeedStream named an event after the cursor (read at once, and its flag is
+        taken), or the poll's gap passed: CONTROLLER_FEED_EVERY, or FEED_STREAM_BACKSTOP while the stream answers."""
+        stream = getattr(self, "feed_stream", None)
+        if stream is not None and stream.ready.is_set() and self.controller_cursor is not None:
+            stream.ready.clear()
+            self.feed_stream_reads = getattr(self, "feed_stream_reads", 0) + 1
+            return True
+        gap = FEED_STREAM_BACKSTOP if stream is not None and stream.live(time.time()) else CONTROLLER_FEED_EVERY
+        return now - self.controller_feed_at >= gap
+
     def controller_room(self) -> bool:
         """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
         CONTROLLER_READ_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
@@ -12733,7 +12773,7 @@ class Daemon:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
         last tick's reads (feed_held) are applied here first: their cursor is already past them."""
         pages, self.feed_held = self.feed_held, []
-        if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
+        if self.feed_stream_due(self.now):
             self.controller_feed_at = self.now
             try:
                 fresh = self.read_feed()
@@ -12824,8 +12864,7 @@ class Daemon:
                 or len(self.feed_held) >= FEED_HELD_MAX):
             return  # (no cursor: this daemon follows no feed yet, or reads through an upstream)
         now = self.clock()
-        if (now <= self.now or now - self.controller_feed_at < CONTROLLER_FEED_EVERY
-                or now < self.controller_down_until):
+        if now <= self.now or not self.feed_stream_due(now) or now < self.controller_down_until:
             return  # (now <= self.now: no time has passed since the tick's own feed read)
         tick_now, budget_end = self.now, self.controller_budget_end
         self.feed_between, self.now, self.controller_feed_at = True, now, now
@@ -13146,6 +13185,25 @@ class Daemon:
                 marks.add("branch:" + str(data["headRefName"]))  # a push: runs for a head GitHub has not shown yet
             if any((f"{owner}/{repo}", m) in touched for m in marks):
                 self.land_nudge(e["key"])
+        self.nudge_lands(touched)
+
+    def nudge_lands(self, touched: set[tuple[str, str]]) -> None:
+        """A run or suite event on the head (or branch) of an open land entry: nudge its PR and watch it now, so the
+        next tick reads it and the queue judges the fresh copy. Without this a land parked in a long wait (its PR
+        unwatched, peeked every LAND_PEEK_EVERY) heard of its last check only at the peek or a timeout (Leo,
+        2026-11-25: "merge timed out ... because we poll. stop polling")."""
+        q = self.land_queue
+        heads = getattr(q, "heads", None)
+        if not heads or not touched:
+            return
+        for key, (repo, sha, branch) in list(heads.items()):
+            e = q.entries.get(key)
+            if e is None or e.get("state") in LAND_DONE:
+                continue
+            if (repo, "sha:" + sha) in touched or (branch and (repo, "branch:" + branch) in touched):
+                self.land_nudge(key)
+                q.watch_now(key)
+                self.land_event_nudges = getattr(self, "land_event_nudges", 0) + 1
 
     def merge_comments(self, entries: list[dict], page: dict) -> None:
         """Add new, edited and deleted comments on watched issues to their cached comment list. The
@@ -16193,6 +16251,7 @@ class LandQueue:
                                                                 reader=f"tool:{LAND_TAG}"))
                                          if watch is None else (lambda key: None))
         self.head_touched: dict[str, float] = {}
+        self.heads: dict[str, tuple[str, str, str]] = {}  # PR key -> (repo, head sha, head branch): watch_head's
         self.changed_entries: set[str] = set()
         self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
@@ -18624,9 +18683,14 @@ class LandQueue:
         """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
         its head moves, then every LAND_TOUCH: HEAD_INTEREST outlasts a queued PR's wait, and a head that moved is a
         new key, registered the same pass. Land-judge's first read of a head then finds the daemon's entry."""
-        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        head = str(data.get("headRefOid") or "").lower()
         if not SHA40.fullmatch(head):
             return
+        # what the daemon's feed matches a run or suite event against (Daemon.nudge_lands), watched or not
+        self.heads[e["key"]] = (e["repo"].lower(), head, str(data.get("headRefName") or ""))
+        if len(self.heads) > 2000:
+            self.heads = {k: v for k, v in self.heads.items() if k in self.entries}
         key = f"head:{e['repo'].lower()}@{head}"
         if self.now - self.head_touched.get(key, float("-inf")) < LAND_TOUCH:
             return
@@ -23955,6 +24019,73 @@ SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
 JUMP_PHASES = frozenset({"watches", "controller", "due", "reads", "read upstream", "read direct"})
 
 
+class FeedStream:
+    """The thread that holds one long-poll open on the controller's change feed (events?since=CURSOR&wait=...), so a
+    check event wakes the daemon the moment the controller has it instead of at the next CONTROLLER_FEED_EVERY poll.
+    Leo, 2026-11-25: "merge timed out and the glaeda#2734 wait ran out because we poll. stop polling".
+    It never moves the daemon's cursor or touches its state: an answer that holds something after the daemon's cursor
+    sets READY and wakes serve's sleep (WAKE, ScriptWake's event); the tick then reads the feed at once (feed_stream_due)
+    through its own path, as every poll did. The poll stays as the backstop at FEED_STREAM_BACKSTOP while this answers.
+    GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves, as before)."""
+
+    def __init__(self, daemon: Any, wake: threading.Event | None, wait: int = FEED_STREAM_WAIT):
+        self.daemon, self.wake, self.wait = daemon, wake, wait
+        self.ready = threading.Event()
+        self.client: Controller | None = None  # its own: Controller.get reads budget_end, which the tick sets on its copy
+        self.ok_at = float("-inf")  # time.time() of its last answer
+        self.error: str | None = None
+        self.signals = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("GLAEDA_GH_FEED_STREAM", "").strip().lower() != "off"
+
+    def live(self, now: float) -> bool:
+        """Whether it answered recently enough that the poll can be the backstop only."""
+        return self.enabled() and now - self.ok_at <= self.wait + 2 * CONTROLLER_READ_TIMEOUT
+
+    def step(self) -> float:
+        """One long-poll; the seconds to pause before the next."""
+        d = self.daemon
+        ctl, cursor = getattr(d, "controller", None), getattr(d, "controller_cursor", None)
+        if (not self.enabled() or ctl is None or cursor is None
+                or time.time() < float(getattr(d, "controller_down_until", 0.0) or 0.0)):
+            return 2.0  # no feed followed yet (or it is out): the tick's own read starts it
+        if self.ready.is_set():
+            return 0.2  # the tick has not read what the last answer named yet
+        base = getattr(ctl, "base", None)
+        if self.client is None or getattr(self.client, "base", None) != base:
+            self.client = Controller(base, ctl.token)
+        self.client.token = ctl.token
+        began = time.monotonic()
+        try:
+            doc = self.client.events(cursor, wait=self.wait)
+        except Exception as error:  # noqa: BLE001  the poll serves while it is out
+            self.error = describe(error)
+            return FEED_STREAM_RETRY
+        self.ok_at, self.error = time.time(), None
+        if getattr(d, "controller_cursor", None) != cursor:
+            return 0.0  # the tick read the feed meanwhile: wait from its cursor
+        if (doc.get("reset") or doc.get("cursor") != cursor or doc.get("runs") or doc.get("suites")
+                or doc.get("comments")):
+            self.signals += 1
+            self.ready.set()
+            if self.wake is not None:
+                self.wake.set()
+            return 0.0
+        # an empty answer well before WAIT: a controller that does not hold the request open must not be asked in a loop
+        return 0.0 if time.monotonic() - began >= self.wait / 2 else FEED_STREAM_RETRY
+
+    def run(self) -> None:
+        while True:
+            try:
+                pause = self.step()
+            except Exception:  # noqa: BLE001  never ends the thread
+                pause = FEED_STREAM_RETRY
+            if pause:
+                time.sleep(pause)
+
+
 class ScriptWake:
     """The thread that ends a tick when a new glaeda-gh lands. serve noticed a swapped script only after the tick it was
     in (up to TICK_BUDGET) and its TICK sleep: a lane VM, 2026-11-24, merge a8f8c140 went live 15 s after it merged, 7 s
@@ -24275,6 +24406,8 @@ def serve(foreground_ok: bool = False) -> int:
 
     wake = ScriptWake(me, seen["sha"], daemon, jump=lambda: reexec(where=f"script-wake in {daemon.phase_now}"))
     threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
+    daemon.feed_stream = FeedStream(daemon, wake.event)
+    threading.Thread(target=daemon.feed_stream.run, name="glaeda-gh-feed-stream", daemon=True).start()
     last = None
     while True:
         try:
