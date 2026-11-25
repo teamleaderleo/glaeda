@@ -775,7 +775,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
     def test_disposable_family_searches_deep_trees_to_the_bottom(self) -> None:
-        # gcp-agent-lane-14, 2026-11-25: an extracted toolchain under /tmp (11 levels, 2190 entries) read "unchecked"
+        # a lane VM, 2026-11-25: an extracted toolchain under /tmp (11 levels, 2190 entries) read "unchecked"
         # at the default depth 5 forever; a git_disposable family is bounded by the entry budget, not the depth
         tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
         deep = self.root / "toolchain"

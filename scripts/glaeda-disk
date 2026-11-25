@@ -9243,7 +9243,7 @@ OLD_TREE_BUDGET = 400_000  # entries git_state may read in a tree untouched for 
 OLD_TREE_IDLE_S = 7 * 86400
 # Levels git_state searches in an item of a git_disposable family (tmp, scratch): the entry budget bounds the cost,
 # not the depth. At the default 5, any tree deeper than that read "unchecked" however few entries it held, the old-tree
-# retry raised only the budget, and the item stayed forever: gcp-agent-lane-14, 2026-11-25, /tmp at 30.2 GiB against
+# retry raised only the budget, and the item stayed forever: a lane VM, 2026-11-25, /tmp at 30.2 GiB against
 # its 20 GiB cap, /tmp/swtc (an agent's Swift 6.2 toolchain download and extract, 4.1 GiB, 2190 entries, 11 levels)
 # "unchecked: too deep or large to rule out a git checkout" while idle past its window.
 DISPOSABLE_GIT_DEPTH = 64
