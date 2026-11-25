@@ -202,7 +202,8 @@ GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh"
 # cmux-gh is glaeda-gh's primary name (Leo, 2026-11-25: "what if we start calling these cmux-gh?"). Installed beside
 # the tool it renames (scripts/cmux-gh, a shim that runs glaeda-gh beside it), so the old name keeps working for every caller, timer and skill. The service
 # labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded.
-TOOL_ALIASES = {"glaeda-gh": "cmux-gh"}
+TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
+                "glaeda-disk-registry": "cmux-disk-registry"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
                                  "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
