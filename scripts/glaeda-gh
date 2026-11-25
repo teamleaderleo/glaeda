@@ -748,11 +748,18 @@ CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 #   first byte                                 0.13-0.28 s, flat in body size
 #   whole answer, /v1/github/events            0.13-1.47 s (p50 0.44, p90 0.53), throughput-bound: the tunnel
 #                                              carries ~400 KB/s and the largest feed page seen was 321 KB
-# CONTROLLER_CONNECT_TIMEOUT is ~200x the worst connect seen, and fails faster than the old 3 s did.
 # CONTROLLER_READ_TIMEOUT is ~4x the worst whole answer seen, and still an order of magnitude under what losing
 # the race costs (CONTROLLER_RETRY's 60 s of REST): waiting can never cost more than falling back.
-CONTROLLER_CONNECT_TIMEOUT = 1.0  # a tick must not stall on an unreachable controller
-CONTROLLER_READ_TIMEOUT = 6.0  # an alive controller is worth waiting for: the fallback spends REST
+# CONTROLLER_CONNECT_TIMEOUT outlasts two lost SYNs. A connect over the WAN loses one now and then, and TCP sends the
+# SYN again only after 1 s (Linux, macOS), then 2 s more: a 1.0 s deadline turned every lost SYN into the controller
+# taken out for CONTROLLER_RETRY and more. The queue host (GCP) to the controller (cmux-lawrence, a home line),
+# 2026-11-25 04:53Z: 4% ping loss, 3 of 300 connects past 1 s (all others 0.03-0.09 s), and its daemon logged 55
+# connect timeouts ("URLError (TimeoutError)") in 03-04Z, each a minute or more with no feed, no rollup and every
+# run read on REST; the same ping from the controller's own LAN lost nothing. 3.5 s covers the SYN sent at 0, 1
+# and 3 s; an unreachable controller still costs one tick 3.5 s, then CONTROLLER_RETRY of quiet.
+CONTROLLER_CONNECT_TIMEOUT = 3.5  # two SYN retransmits (1 s, then 3 s); a tick stalls at most this long
+CONTROLLER_READ_TIMEOUT = 5.5  # an alive controller is worth waiting for: the fallback spends REST; 5.5 keeps
+# one whole request (CONTROLLER_DEADLINE) inside 5 ticks with the 3.5 s connect above
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
 # another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
