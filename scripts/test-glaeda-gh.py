@@ -5397,6 +5397,54 @@ class FallbackTest(Base):
         gg.write_json(gg.DAEMON_CONFIG, {"forceLow": "graphql"})  # not a list: ignored
         self.assertEqual(gg.daemon_policy()["forceLow"], ())
 
+    def test_a_pool_refusal_in_words_only_holds_rest_and_says_why(self) -> None:
+        """The primary limit with no rate headers (a broker's read pool, through broker_transport): before, no backoff
+        was set, every tick asked again and stored only the refusal, and stale PR data read "stalled" with no reason
+        (35 to 115 minutes old across hosts). Now REST holds for the wait the answer names, its reads move to GraphQL
+        in the same tick, and while GraphQL is spent too the hold is the stale data's loud reason."""
+        pool_spent = (403, {}, json.dumps({"message": "API rate limit exceeded on every read credential for o/r; "
+                                                      "the first is free again in 433s"}).encode())
+        self.register_all()
+        over_rest = self.baseline("rest")
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.force_low()
+        self.gh.throttle["rest"] = pool_spent
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+        self.assertGreaterEqual(self.daemon.backoff["rest"], NOW + 433)
+        self.assertLess(self.daemon.backoff["rest"], NOW + 433 + gg.PACE_HOLD_MAX)
+        self.assertEqual(len(self.gh.rest_calls()), 1)  # the read that found it refused, and no retry in a loop
+        for kind, key in self.keys.items():
+            entry = gg.read_cache(key)
+            self.assertEqual(entry["via"], "graphql", kind)
+            self.assertIsNone(entry["error"], kind)
+            self.same(kind, entry["data"], over_rest[kind])
+        for i in range(1, 10):  # inside the hold: REST is asked nothing more
+            self.daemon.tick(NOW + i * gg.TICK)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        self.daemon.paths["pr"] = "rest"  # a read REST would take: the hold says why it waits
+        self.assertIn("back off REST", (self.daemon.quota_hold("pr") or ("",))[0])
+        self.daemon.paths["pr"] = "graphql"
+        # GraphQL spent too: nothing can read, and the old data says the quota, never "stalled" with no reason
+        self.gh.throttle["graphql"] = self.GQL_SPENT
+        self.daemon.backoff["graphql"] = NOW + 1800
+        self.daemon.stale_waited = {"pr": gg.STALE_DATA_AFTER + 1}
+        self.assertEqual(self.daemon.stale_explained("pr"), "quota")
+        self.assertIn("back off", self.daemon.stale_why()["pr"]["why"])
+
+    def test_a_primary_refusal_in_words_without_a_wait_holds_a_cycle(self) -> None:
+        self.register_all()
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.force_low()
+        self.gh.throttle["rest"] = (403, {}, json.dumps({"message": "API rate limit exceeded"}).encode())
+        self.daemon.tick(NOW)
+        self.assertGreaterEqual(self.daemon.backoff["rest"], NOW + gg.CYCLE)
+        # a refusal that only quotes those words is not the limit
+        self.assertIsNone(gg.PRIMARY_SAID.search("merge refused: API rate limit exceeded upstream"))
+        self.assertEqual(gg.primary_said_wait({"retry_after": 90}, ""), 90.0)
+        self.assertEqual(gg.primary_said_wait(None, "API rate limit exceeded ...; retry after 600s"), 600.0)
+        self.assertIsNone(gg.primary_said_wait({"retry_after": True}, "API rate limit exceeded"))
+
     def test_a_secondary_403_holds_both_buckets_and_is_never_retried_in_a_loop(self) -> None:
         self.register_all()
         self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
@@ -24622,6 +24670,18 @@ class StaleDataTest(Base):
             send("GET", "https://api.github.com/repos/o/r/pulls/9", {}, None)
         self.assertEqual(seen[0][0][-2:], ["o/r", "-"])
         self.assertEqual(seen[0][1], "glaeda-upstream")
+
+    def test_a_broker_refusal_keeps_its_wait_for_the_daemon(self) -> None:
+        """broker_transport answers no headers: the broker's retry_after rides in the body, where request() reads it."""
+        def fake(argv, timeout=None, input_text=None, env=None):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": False, "status": 403, "retry_after": 433, "data": {
+                "message": "API rate limit exceeded on every read credential for o/r"}}), "")
+        with mock.patch.object(gg, "run_bounded", fake):
+            send = gg.broker_transport(["/home/cmux/.local/bin/lane-gh", "call", "get"], lambda: time.monotonic() + 30)
+            status, h, body = send("GET", "https://api.github.com/repos/o/r/pulls/9", {}, None)
+        doc = json.loads(body)
+        self.assertEqual((status, h, doc["retry_after"]), (403, {}, 433))
+        self.assertEqual(gg.primary_said_wait(doc, doc["message"]), 433.0)
 
     def test_one_broker_get_has_its_own_share_of_a_direct_reads_budget(self) -> None:
         """A lane VM, 2026-11-22: one GET waiting on the broker socket spent a whole 60 s land refresh. Each GET has
