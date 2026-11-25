@@ -700,6 +700,7 @@ EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": 
 EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
+UPSTREAM_LAND_EVERY = 5  # an open land entry's PR is asked this often: the broker host's stream has its last check in seconds
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 STATUS_UPSTREAM_WAIT = 8.0  # status on an upstream-fed host: a tick plus two UPSTREAM_NEW asks, then read directly
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
@@ -10019,6 +10020,8 @@ class Daemon:
         self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
+        q = self.land_queue
+        landing = set() if q is None else {k for k, x in q.entries.items() if x.get("state") not in LAND_DONE}
         for e in entries:
             kind = split_key(e["key"])[0]
             if kind == "head" and not self.head_askers(e):
@@ -10029,7 +10032,10 @@ class Daemon:
                                                      "its upstream")
                 continue
             fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
-            if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
+            since = self.now - self.attempted.get(e["key"], float("-inf"))
+            # a landing PR every UPSTREAM_LAND_EVERY, not UPSTREAM_EVERY: a lane VM's land heard of its last check up
+            # to 20 s late (teamleaderleo/glaeda#2740: judged 18 s after it; Leo, 2026-11-25: "stop polling")
+            if full or (fresh and since >= UPSTREAM_NEW) or (e["key"] in landing and since >= UPSTREAM_LAND_EVERY):
                 due.append(e)
         # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
         due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]

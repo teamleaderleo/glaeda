@@ -2719,6 +2719,23 @@ class UpstreamTest(Base):
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
 
+    def test_a_landing_pr_is_asked_of_the_upstream_every_upstream_land_every(self) -> None:
+        """teamleaderleo/glaeda#2740 was judged 18 s after its last check: a lane VM asked its upstream every 20 s."""
+        gg.register("pr:o/r#7")
+        gg.register("pr:o/r#8")
+        for k in ("pr:o/r#7", "pr:o/r#8"):
+            self.answers[k] = {"data": self.pr_data(), "dataAt": NOW, "error": None}
+        queue = types.SimpleNamespace(entries={"pr:o/r#7": {"key": "pr:o/r#7", "state": "waiting"}},
+                                      lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.daemon.tick(now=NOW)
+            self.daemon.tick(now=NOW + gg.UPSTREAM_LAND_EVERY)
+            self.daemon.land_queue = None
+        self.assertLess(gg.UPSTREAM_LAND_EVERY, gg.UPSTREAM_EVERY)
+        self.assertEqual(len(self.asked), 2)
+        self.assertEqual([k["key"] for k in self.asked[1]["keys"]], ["pr:o/r#7"])  # the landing PR only
+
     def test_an_upstream_ticks_phases_are_timed_so_the_row_says_where_they_went(self) -> None:
         """An upstream host's tick returns before every phase a login host wraps, so progress() measured only the
         three in finish_tick and "most in <phase>" named the biggest of those. gcp-agent-lane-11, 2026-11-21: six
