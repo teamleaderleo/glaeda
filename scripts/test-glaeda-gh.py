@@ -12151,6 +12151,27 @@ class RerunRefusedNextStepTest(unittest.TestCase):
         self.assertIsNotNone(said)
         self.assertIn("that run", said)
 
+    RATE_LIMIT = ("failed to get run: HTTP 403: API rate limit exceeded for installation ID 184262365. If you reach "
+                  "out to GitHub Support for help, please include the request ID C3B2:3C6127 and timestamp "
+                  "2026-11-25 16:48:38 UTC")
+
+    def test_a_rate_limit_is_not_an_unretryable_run(self) -> None:
+        """manaflow-ai/cmuxterm-hq#26366, 2026-11-25: two reruns answered HTTP 403 "API rate limit exceeded for
+        installation", and this line called them runs GitHub will not retry and said to push the head again. The
+        run is fine; the identity is out of calls. Name the wait, not a new head."""
+        said = gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 1, self.RATE_LIMIT)
+        self.assertIsNotNone(said)
+        self.assertIn("rate limit", said)
+        self.assertNotIn("push the head again", said)
+        self.assertNotIn("every attempt used", said)
+        self.assertIn("glaeda-gh status quota", said)
+
+    def test_any_other_stderr_still_reads_as_unretryable(self) -> None:
+        said = gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 1,
+                                  "run 50 cannot be rerun; This workflow run cannot be retried")
+        self.assertIsNotNone(said)
+        self.assertIn("push the head again", said)
+
 
 class WaitPrNotMergedTest(Base):
     """manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr
