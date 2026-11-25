@@ -22660,6 +22660,28 @@ class LandQueue:
                   f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
                   f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>", detail=detail)
 
+    def union_merge_backoff(self, e: dict, kind: str, head: str, said: str, why: str) -> None:
+        """Under the lock: the base merge at HEAD failed before git could say anything about a conflict (its fetch
+        timed out or failed, a git command or the broker failed): a transient step, not a conflict. cmux#50870 (three
+        times), #49337 and #49338, 2026-11-25: a ~300 s fetch timeout stopped each as "conflict" with next: none, and
+        nothing retried it. Now it backs off as LAND_STEP_TRANSIENT's steps do (e["stepTransient"], per head, doubling
+        from LAND_STEP_BACKOFF to LAND_STEP_BACKOFF_MAX), the next judgment tries the merge again (unionMerge was
+        dropped), and only LAND_RETRY_STREAK_STOP failures in a row stop it, as base_merge_transient (re-armed). The
+        judgment that named the merge is not a refusal answered: its identical-refusal streak is cleared, or the third
+        conflicts_base judgment at the head would stop it at LAND_STREAK_STOP before the merge was ever made."""
+        e["streak"] = None
+        last = e.get("stepTransient") or {}
+        n = int(last.get("count") or 0) + 1 if last.get("head") == head else 1
+        e["stepTransient"] = {"head": head, "kind": "base_merge", "count": n, "at": self.now}
+        if n >= LAND_RETRY_STREAK_STOP:
+            self.stop(e, "base_merge_transient", f"the base merge at {head[:12]} (after {kind}: {land_trim(said, 160)}) "
+                      f"could not be made {n} times in a row, never for a conflict: {land_trim(why, 200)}",
+                      f"none: it is re-armed by itself (at most {LAND_REARM_CAP} times a day)")
+            return
+        after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
+        self.wait(e, {"kind": "retry", "why": f"the base merge at {head[:12]} failed before any conflict was read "
+                      f"({land_trim(why, 160)}): backoff {after:.0f} s"}, after)
+
     def base_merge_first(self, e: dict, head: str, kind: str, said: str, nxt: str) -> bool:
         """LAND_BASE_MERGE_FIRST's comment: land_judge's conflicts_base (KIND "base") or ci_never_ran at a head this
         land did not make (KIND "ci_start") takes the local base merge, once per head, before any stop. True when
@@ -22833,15 +22855,19 @@ class LandQueue:
             # (2026-11-23 09:34Z), where git merged its base cleanly.
             e.setdefault("unionMerge", {"head": head, "at": self.now})["tried"] = True
             self.save(e)
+        infra = False
         try:
             sha, branch, base_sha, why = self.union_plan(e, head)
         except OSError as error:
-            sha, branch, base_sha, why = "", "", "", describe(error)
+            sha, branch, base_sha, why, infra = "", "", "", describe(error), True
         if why:
             with self.lock:
                 tried = dict(e.get("unionMerge") or {})
-                if tried.get("retry") or why.startswith("git ") or "timed out" in why:
+                if infra or tried.get("retry") or why.startswith("git ") or "timed out" in why:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
+                    self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200), transient=True)
+                    self.union_merge_backoff(e, kind, head, said, why)
+                    return
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, kind, head, said, why, tried)
             return
