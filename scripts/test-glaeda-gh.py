@@ -8,6 +8,7 @@ import collections
 import contextlib
 import copy
 import datetime as dt
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -3272,6 +3273,47 @@ class UpstreamTest(Base):
         self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": {**view, "head": "b" * 40}}
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "a view of another head does not cover it")
+
+    def test_a_full_disk_in_a_cache_write_still_reaches_the_land_pass(self) -> None:
+        """A lane VM, 2026-11-25: keep_feed_view's cache write hit ENOSPC in "read upstream", every tick died
+        before land_tick, and 4 land requests were not forwarded. A read phase's disk-full error is named in the tick's
+        errors and the tick goes on; any other OSError there, and a state write's, stay loud."""
+        key = "pr:o/r#7"
+        gg.register(key)
+        data = self.pr_data()
+        self.daemon.store(key, None, data=data, dataAt=NOW - 200)  # newer here: the answer goes to keep_feed_view
+        view = {"liveSince": NOW - 7200, "at": NOW - 2, "eventAt": None, "head": str(data["headRefOid"]).lower()}
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": view}
+        cache, real_open, real_write = str(gg.cache_dir()), os.open, os.write
+        landed: list[float] = []
+        full: set[int] = set()  # the fds opened in the cache folder: the disk is full there only
+
+        def opener(path: Any, *args: Any, **kw: Any) -> int:
+            fd = real_open(path, *args, **kw)
+            (full.add if str(path).startswith(cache) else full.discard)(fd)
+            return fd
+
+        def write(fd: int, data_: Any) -> int:
+            if fd in full:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return real_write(fd, data_)
+
+        with mock.patch.object(gg.os, "write", write), mock.patch.object(gg.os, "open", opener), \
+                mock.patch.object(self.daemon, "land_tick", lambda: landed.append(self.daemon.now)):
+            status = self.daemon.tick(now=NOW)
+        self.assertEqual(landed, [NOW], "the land pass (which forwards land requests) ran")
+        self.assertTrue(any(e.startswith("read upstream: ENOSPC at ") and "disk full" in e for e in status["errors"]),
+                        status["errors"])
+        self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "the skipped write left the cache as it was")
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)  # room again: the next tick writes it
+        self.assertEqual(gg.read_cache(key)["upstreamFeed"]["head"], view["head"])
+        for loud in (OSError(errno.EACCES, "denied"), OSError(errno.EIO, "io")):
+            with self.subTest(errno=loud.errno), self.assertRaises(OSError):
+                with self.daemon.phase("read upstream"):
+                    raise loud
+        with self.assertRaises(OSError):
+            with self.daemon.phase("land"):
+                raise OSError(errno.ENOSPC, "a state write stays loud")
 
     def test_read_answers_a_prs_feed_view(self) -> None:
         sha = "a" * 40
@@ -9275,7 +9317,7 @@ class TickBudgetTest(Base):
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
     def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
-        """fs-agent-lane-27, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
+        """A lane VM, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
         mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
         the tick's watch read could carry an mtime before heads_between_since and was skipped until the next tick.
         Here the head's mtime is set 3 ms behind the tick's own wall time, every run."""
@@ -18134,6 +18176,28 @@ class PostTest(unittest.TestCase):
                          ("posted", "https://github.com/o/r/pull/9", 9, 2))
         self.assertEqual(d.post_backoff, gg.POST_BACKOFF)
 
+    def test_a_throttled_write_records_which_refusal_held_it_and_what_github_said(self) -> None:
+        """A hold used to record only its wait, so a secondary content limit, a spent hour and an abuse-detection
+        refusal of this one write all read `wait: 240` and the only move left was to wait again."""
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b")
+        secondary = (403, {}, {"message": "You have exceeded a secondary rate limit. Please wait a few minutes."})
+        blocked = (403, {"retry-after": "120"}, {"message": "You have been temporarily blocked from content creation"})
+        d, t = self.daemon(secondary, blocked)
+        d.clock_real = False
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["throttleWhy"], state["throttleStatus"], state["throttleFrom"], state["throttled"]),
+                         ("secondary", 403, "rest", 1))
+        self.assertIn("secondary rate limit", state["throttleSaid"])
+        line = gg.post_line(state)  # `post status ID` says it without reading the daemon's log
+        self.assertIn("(secondary, HTTP 403, over rest)", line)
+        self.assertIn("secondary rate limit", line)
+        self.step(d, d.post_hold)  # a Retry-After refusal of this write is a different refusal, and says so
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["throttleWhy"], state["throttled"]), ("retry-after", 2))
+        self.assertIn("temporarily blocked", state["throttleSaid"])
+        self.assertEqual(len(t.calls), 2)
+
     def test_a_lost_answer_is_looked_up_before_writing_again(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "receipt")
         d, t = self.daemon(gg.WatchError("request failed: TimeoutError"),
@@ -23376,7 +23440,7 @@ class RestPrefetchTest(Base):
                   f"{early[name]['requests']} requests / {early[name]['counted']} counted", file=sys.stderr)
             self.assertEqual(early[name]["counted"], serial[name]["counted"], name)
             self.assertLessEqual(early[name]["requests"], serial[name]["requests"] + gg.REST_PREFETCH_HELD, name)
-            # Not a wall-clock ratio: on a loaded VM (load 40, fs-agent-lane-27, 2026-11-25) the threads were starved and
+            # Not a wall-clock ratio: on a loaded VM (load 40, A lane VM, 2026-11-25) the threads were starved and
             # "prefetched under 0.6x serial" failed at random. Overlap is what makes it faster, and is read exactly.
         self.assertEqual(early["data"], serial["data"])
         self.assertTrue(serial["fresh"] and early["fresh"], "a PR was left unread")
@@ -24265,6 +24329,34 @@ class StaleDataTest(Base):
                                               "began": time.time() - 700}))
         self.assertEqual([p for p in served if p.startswith("rules/branches/")], [], served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
+
+    def test_a_direct_read_through_the_broker_gates_on_the_controllers_rollup(self) -> None:
+        """rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 09:43-11:43Z: glaeda-upstream (every lane VM's direct
+        reads) asked commits/{sha}/check-suites 3,401 times in 2 h after #2730, because a direct read's Daemon has
+        controller=None. With the controller's rollup reachable it asks no check-suites; with none, GitHub's, as before."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[workflow_check("a", 7)])
+        read = {"key": "pr:o/r#9", "kind": "pr", "jobs": False, "began": time.time() - 700}
+        ctl = RollupController(self.gh)
+        served: list[str] = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "direct_rollup_controller", return_value=ctl):
+            self.assertIsNone(gg.direct_read(dict(read)))
+        self.assertEqual([p for p in served if "/check-suites" in p], [], served)
+        self.assertEqual(ctl.rollups, [self.gh.prs[("o", "r", 9)]["headRefOid"]])
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "SUCCESS")
+        served.clear()
+        self.gh.prs[("o", "r", 9)]["headRefOid"] = "b" * 40  # a new head: its suites not yet known
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "direct_rollup_controller", return_value=None):
+            self.assertIsNone(gg.direct_read(dict(read)))
+        self.assertTrue([p for p in served if "/check-suites" in p], served)  # no controller: GitHub's, as before
+        self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["checkState"], "SUCCESS")
 
     def test_a_refused_direct_read_holds_the_hosts_direct_reads(self) -> None:
         """A refusal for the read Apps' reserve holds every direct GET on the host for its wait: the next asks run
@@ -32193,6 +32285,37 @@ class LandTest(Base):
         self.assertEqual(said[3], "host/lane")
         self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
+        # LAND_MERGED_ELSEWHERE_FYI: a merge this queue did not make reaches its requester as an inbox fyi
+        self.assertEqual(said[said.index("--class") + 1], gg.LAND_FORWARD_FYI_CLASS)
+
+    def test_only_this_queues_own_merge_wakes_its_requester(self):
+        # LAND_MERGED_ELSEWHERE_FYI: gcp-agent-lane-12, 2026-11-23..25, 30 of 86 cache-read merged notices woke a lane
+        # that had nothing to do; Leo, 2026-11-24: "are there any like process level fixes?"
+        e = self.forwarded_row()
+
+        def told(how: str) -> str:
+            self.w.calls.clear()
+            self.q.merged(e, "f" * 40, how)
+            [said] = [c for c in self.w.sent() if "merged" in c[-1]]
+            return said[said.index("--class") + 1]
+
+        self.assertEqual(told("merged pinned"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_NOTICE_CLASS)
+        self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
+        self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
+
+    def test_a_stop_of_a_pr_the_cache_reads_merged_wakes_nobody(self):
+        # LAND_STOP_MERGED_QUIET: forward_no_outcome, head_moved and own_red stops of PRs already merged each woke a
+        # lane that answered "already merged" (gcp-agent-lane-12, 16 in 48 h)
+        e = self.forwarded_row()
+        self.w.calls.clear()
+        self.w.cache[self.KEY]["data"]["state"] = "MERGED"
+        self.q.stop(e, "forward_no_outcome", "no outcome", "land again")
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
+        self.assertEqual([c for c in self.w.sent() if "stopped" in c[-1]], [])
+        self.w.cache[self.KEY]["data"]["state"] = "OPEN"
+        self.q.stop(e, "own_red", "ci failed", "fix it")
+        self.assertEqual(len([c for c in self.w.sent() if "own_red" in c[-1]]), 1)  # an open PR's stop still tells
 
     def test_a_row_after_a_forwarded_pr_merged_outside_the_queue_stops_waiting_within_a_pass_latch_or_not(self):
         # glaeda#2540 sat waiting_after glaeda#2518 after a direct pinned merge of #2518: #2518's row here was
