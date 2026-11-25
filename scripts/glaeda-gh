@@ -9785,7 +9785,8 @@ class Daemon:
                   # run's finish still arrives over the feed when its read bucket has stopped (feed_covers).
                   "controller": {**self.controller_status, "runs": len(self.controller_filled),
                                  "fedRepos": {r: round(t, 3) for r, t in self.fed_repos.items()},
-                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None},
+                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None,
+                                 "stream": self.feed_stream_status()},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
@@ -12736,6 +12737,16 @@ class Daemon:
             self.controller_budget_end = float("inf")
             with contextlib.suppress(AttributeError):
                 self.controller.budget_end = float("inf")
+
+    def feed_stream_status(self) -> dict | None:
+        """The FeedStream for daemon.json: whether it answers, how many events it named and the tick read at once, and
+        its last error, so a host's stream can be seen working (or not) without a debugger."""
+        stream = getattr(self, "feed_stream", None)
+        if stream is None:
+            return None
+        return {"live": stream.live(time.time()), "okAt": round(stream.ok_at, 3) if stream.ok_at > 0 else None,
+                "signals": stream.signals, "reads": getattr(self, "feed_stream_reads", 0),
+                "landEventNudges": getattr(self, "land_event_nudges", 0), "error": stream.error}
 
     def feed_stream_due(self, now: float) -> bool:
         """Whether the feed is read now: the FeedStream named an event after the cursor (read at once, and its flag is

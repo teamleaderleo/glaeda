@@ -1931,6 +1931,8 @@ class ControllerTest(Base):
         self.assertEqual(len(self.ctl.feeds), reads + 1)
         self.daemon.tick(NOW + 2 * gg.TICK + gg.FEED_STREAM_BACKSTOP)
         self.assertEqual(len(self.ctl.feeds), reads + 2)  # the backstop poll
+        status = self.daemon.feed_stream_status()  # daemon.json's controller.stream
+        self.assertEqual((status["live"], status["signals"], status["reads"], status["error"]), (True, 1, 1, None))
         with mock.patch.dict(os.environ, {"GLAEDA_GH_FEED_STREAM": "off"}):
             self.assertFalse(stream.live(time.time()))
             self.assertEqual(stream.step(), 2.0)
