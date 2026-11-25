@@ -13812,6 +13812,15 @@ LAND_REFRESH_UNANSWERED = 3  # refreshes in a row with no answer before `land st
 # wait whose copy aged after the pin was seen: a missed completion would otherwise wait the whole checks timeout.
 LAND_OWN_REFRESH_AFTER = 600.0
 LAND_OWN_REFRESH_MAX = 120
+# LAND_BEFORE_REQUEST_READ: a land request with no --sha, sent right after a push, was judged on the copy read before
+# the push. It stopped at once on land_judge's conflict verdict for the old head, and the requester got that back as its answer: a forwarded
+# `land --wait` returned "head <old> conflict" seconds after the push (incident hq#20521's second data point). A
+# re-request pinned to the new head was accepted. So a conflict stop of an unpinned row, decided on a copy read before
+# its request (requestedAt) and not read since, waits for one read instead (stale_copy_stop): the row is judged
+# again on the fresh copy, and that judgment's stop stands. One read per request, under refresh_due's broker hold and
+# worker gate; counted in LAND_OWN_REFRESH_MAX but not refused by it (a duress run of 200 such requests left 40 pushed
+# rows stopped on their old head at the cap: the request itself bounds these reads). The feed check that spares other refreshes is skipped here, because the copy it would vouch for is the
+# one the stop came from.
 
 
 def land_judge(config: dict) -> tuple[Path | None, list[Path]]:
@@ -20298,13 +20307,19 @@ class LandQueue:
         if e["key"] in self.refresh_batched:
             return True  # its batch's read is queued or running: judged on the copy it stores
         at = (c or {}).get("dataAt")
-        if not isinstance(at, (int, float)) or isinstance(at, bool) or self.now - at < LAND_REFRESH_AFTER:
-            return False  # fresh, or never read (the no-data path judges it unpinned)
-        urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            return False  # never read (the no-data path judges it unpinned)
         last = (e.get("refresh") or {}).get("at")
+        asked = e.get("requestedAt")
+        # LAND_BEFORE_REQUEST_READ: a conflict stop held for a read of a copy older than the request
+        before = (_finite(asked) and e.get("readBeforeStop") == asked and at < asked
+                  and not (_finite(last) and last >= asked))
+        if not before and self.now - at < LAND_REFRESH_AFTER:
+            return False  # fresh
+        urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
         own = not self.reads_upstream()
         every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
-        if isinstance(last, (int, float)) and self.now - last < every:
+        if not before and isinstance(last, (int, float)) and self.now - last < every:
             return False
         checks_wait = False
         if own:
@@ -20318,12 +20333,12 @@ class LandQueue:
             # A PR read after enqueue can still be the last copy we have of a running head. A quiet webhook
             # feed does not establish that it is still running. The recovery sweep shares the usual read budget.
             self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]
-            asked = e.get("requestedAt")
-            stale_request = (isinstance(asked, (int, float)) and not isinstance(asked, bool)
-                             and asked - at >= LAND_OWN_REFRESH_AFTER)
-            if (not stale_request and not checks_wait) or len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX:
-                return False
-        if not checks_wait and self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
+            stale_request = before or (isinstance(asked, (int, float)) and not isinstance(asked, bool)
+                                       and asked - at >= LAND_OWN_REFRESH_AFTER)
+            if (not stale_request and not checks_wait) or (len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX
+                                                            and not before):
+                return False  # a held conflict stop's one read is the request's own, past the host cap
+        if not before and not checks_wait and self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
             if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
                 e["feedNoRefresh"] = at
                 self.count("feed_norefresh")
@@ -21698,6 +21713,26 @@ class LandQueue:
         self.save(e)
         self.submit(e["key"], self.job, e["key"], head, int(e.get("gen") or 0), True)
         self.changed_entries.discard(e["key"])
+
+    def stale_copy_stop(self, e: dict, code: str) -> bool:
+        """Under the lock, from stop: True when unpinned E's stop CODE is land_judge's conflict verdict (code
+        "conflict", read from the PR copy; a step's own *_conflict is GitHub's answer now) on a copy read before E's
+        request (requestedAt) and not read since. E then waits for one read (refresh_due) and is judged again, and the
+        stop is not made. Once per request: the next judgment's stop stands (LAND_BEFORE_REQUEST_READ)."""
+        if e.get("pinSha") or code != "conflict":
+            return False
+        asked = e.get("requestedAt")
+        at = (self.cache_of(e["key"]) or {}).get("dataAt")
+        last = (e.get("refresh") or {}).get("at")
+        if not (_finite(asked) and _finite(at) and at < asked) or (_finite(last) and last >= asked) \
+                or e.get("readBeforeStop") == asked:
+            return False
+        e["readBeforeStop"] = asked
+        self.history(e, "stop_read_first", code=code, head=str(e.get("head") or "")[:12], age=round(asked - at))
+        self.wait(e, {"kind": "retry", "why": f"{code} on a copy read {asked - at:.0f} s before this request: "
+                      f"read again before it stops"}, 0.0)
+        log({"event": "land-stop-read-first", "key": e["key"], "code": code, "age": round(asked - at)})
+        return True
 
     def infra_read_stop(self, e: dict, code: str, reason: str) -> bool:
         """Under the lock, from stop: when stop CODE only says GitHub could not be read (LAND_INFRA_STOPS' comment),
@@ -23470,6 +23505,8 @@ class LandQueue:
         infra = land_infra_stop(e, code)
         if infra and self.infra_read_stop(e, code, reason):
             return  # GitHub could not be read: handed off or retried, not stopped (LAND_INFRA_STOPS' comment)
+        if self.stale_copy_stop(e, code):
+            return  # judged on a copy older than the request: read first, then judged again (LAND_BEFORE_REQUEST_READ)
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or "", **({"detail": detail[:LAND_HUNK_CHARS + 20]} if detail else {})}
         repeat = land_stop_repeats(e.get("lastStop"), st)
