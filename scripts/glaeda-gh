@@ -14770,6 +14770,19 @@ LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 # (head, run), the stale_replay guard, and a 2 h budget -- and then judges again. It decides nothing itself: the
 # rerun posts a real verdict or the cap stops the entry. A check that will never post has not passed.
 LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]+/[\w.-]+)\s*")
+# The third "command" this queue runs itself: the label land_judge's land_tier rule asks for. cmuxterm-hq#24362 at
+# a1d33b52ffc3, 2026-11-24: handed to cmux-cp-1's land queue (LAND_HANDOFF_BROKER_ONLY holds land_tier_pending), which
+# stopped it "land_tier_pending: ... hq/land-tier is pending and the PR needs ready-to-land ...; next: gh pr edit 24362
+# -R manaflow-ai/cmuxterm-hq --add-label ready-to-land". The rule (land_judge/rules/land_tier.py) refuses before the
+# engine's own label write (land_tier_refusal) is reached, and names the label as a "command" step this queue stopped
+# on, so the land tier -- the cut Leo named for ci-runner-min-per-day-50k ("whatever we need to cut, we cut") -- only
+# ran when a person added the label by hand. A command that is exactly `gh pr edit N -R OWNER/REPO --add-label L`
+# (L ready-to-land or full-ci; land_tier.label_command's shape) for this entry's own PR, under the land_tier_pending
+# code, is the label step: run through the gh-quota shim (land_judge judges the write), once per head (e["labelSent"],
+# written before the send), on a host with its own GitHub login only. On a broker client, or at a head already sent,
+# it stays the command it was and stops as before. It decides nothing: the label starts the tier, and the next
+# judgment waits on the tier's own status.
+LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (\d+) -R ([\w.-]+/[\w.-]+) --add-label (ready-to-land|full-ci)\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -15723,7 +15736,25 @@ def land_action(answer: dict, head: str) -> dict:
     if act.get("kind") != "command":
         return act
     return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
-        or land_command_wait(act, answer, head)
+        or land_command_label(act, answer) or land_command_wait(act, answer, head)
+
+
+def land_command_label(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment) as that
+    label step, else None. Only a land_tier_pending refusal's own command, for the PR it judged: any other text, code,
+    repository or number stays a command. The step keeps its text, so a host that must not run it stops as before."""
+    if str(answer.get("code") or "") != "land_tier_pending":
+        return None
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_LABEL.fullmatch(text)
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
+    if not named or not repo or named.group(2).lower() != repo.lower() or named.group(1) != number:
+        return None
+    return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "label", "repo": repo,
+            "label": named.group(3), "text": text.strip(), "from": "command"}
 
 
 def land_command_rerun(act: dict, answer: dict) -> dict | None:
@@ -16402,7 +16433,7 @@ class LandQueue:
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
-                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
+                     lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
@@ -20538,6 +20569,16 @@ class LandQueue:
                 return
             self.retarget(e, head, base, answer)
             return
+        if kind == "label":
+            sent = e.get("labelSent") or {}
+            if self.broker_client() or not head or sent.get("head") == head:
+                # LAND_COMMAND_LABEL's comment: a broker client hands the label to the broker host's queue, and a head
+                # already labelled is not labelled again; either stops as the command it was
+                act = {"v": 1, "kind": "command", "text": act.get("text")}
+                kind = "command"
+            else:
+                self.do_label(e, act, answer, head)
+                return
         if kind == "fetch":
             self.do_fetch(e, act, answer, head)
             return
@@ -21116,6 +21157,38 @@ class LandQueue:
             self.history(e, "union_merged", head=head[:12], merge=sha[:12], base=base_sha[:12],
                          paths=land_trim(", ".join(e["unionMerge"].get("paths") or []), 200))
             self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+
+    def do_label(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Add the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment), once per head, then judge
+        again soon. e["labelSent"] is written before the send, so a restart mid-send counts it as sent."""
+        gh = self.gh()
+        if gh is None:
+            with self.lock:
+                self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; the label is not sent around it",
+                          "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
+            return
+        label, repo, number = str(act["label"]), e["repo"], str(e["number"])
+        with self.lock:
+            self.claim(e, "label", label=label)
+            e["labelSent"] = {"head": head, "at": self.now}
+            self.history(e, "label_sent", head=head[:12], label=label)
+            self.save(e)
+        got = self.call([gh, "pr", "edit", number, "-R", repo, "--add-label", label], LAND_GH_DEADLINE, e)
+        named = None
+        with self.lock:
+            if got.returncode not in (0, 124):
+                e.pop("labelSent", None)  # refused: not sent (a timeout may have reached GitHub: it stays sent)
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"added {label}: the tier's status is judged next"},
+                          NUDGE_MIN * 3)
+            else:
+                named = self.step_refused(e, "label", head, got)
+        if named == "update_branch":
+            self.update_branch(e, head)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
