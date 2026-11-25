@@ -708,6 +708,7 @@ EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": 
 EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
+UPSTREAM_LAND_EVERY = 5  # an open land entry's PR is asked this often: the broker host's stream has its last check in seconds
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 STATUS_UPSTREAM_WAIT = 8.0  # status on an upstream-fed host: a tick plus two UPSTREAM_NEW asks, then read directly
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
@@ -10067,6 +10068,8 @@ class Daemon:
         self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
+        q = self.land_queue
+        landing = set() if q is None else {k for k, x in q.entries.items() if x.get("state") not in LAND_DONE}
         for e in entries:
             kind = split_key(e["key"])[0]
             if kind == "head" and not self.head_askers(e):
@@ -10077,7 +10080,10 @@ class Daemon:
                                                      "its upstream")
                 continue
             fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
-            if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
+            since = self.now - self.attempted.get(e["key"], float("-inf"))
+            # a landing PR every UPSTREAM_LAND_EVERY, not UPSTREAM_EVERY: a lane VM's land heard of its last check up
+            # to 20 s late (teamleaderleo/glaeda#2740: judged 18 s after it; Leo, 2026-11-25: "stop polling")
+            if full or (fresh and since >= UPSTREAM_NEW) or (e["key"] in landing and since >= UPSTREAM_LAND_EVERY):
                 due.append(e)
         # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
         due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
@@ -15053,6 +15059,13 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# An --after PR with no copy here, or a copy older than this, after that long of unwaited reads (keep_watching) is
+# read once directly (land_direct_read, as a pinned land's head is: pin_wait), at most once per this bound, so its
+# merge or close ends the wait (after_wait). cmux-cp-1, 2026-11-25 01:40Z: 30 rows waiting_after; the p95 green wait
+# (41h49m) was manaflow-ai/cmux-extensions#15 behind manaflow-ai/cmux#46686, closed unmerged 11 min after it queued,
+# with no copy of #46686 in the daemon's cache 41 h on: the unwaited read sat below every wait while pr data ran
+# 3,000-5,000 s stale. Of the 31 predecessors, 3 were closed and 6 merged on GitHub, their rows still waiting.
+LAND_AFTER_BLIND = 1800.0
 # Of the due entries (queued, or waiting past their wake) only the first this many per worker, in judge_order, hold a
 # waited watch; the rest are read like a parked entry (LAND_PEEK_EVERY), and the tick that brings one inside the window
 # waits on it again, so its judgment is handed a fresh copy (and fresh_head/snapshot_wait nudge a read regardless).
@@ -16404,6 +16417,8 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.after_blind_since: dict[str, float] = {}  # an --after PR with no copy: since when (after_blind_read)
+        self.after_read_at: dict[str, float] = {}  # an --after PR's last direct read (LAND_AFTER_BLIND)
         self.forward_reads = 0  # forwards_unjudged's one-off reads this pass
         self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
@@ -18839,6 +18854,28 @@ class LandQueue:
                 self.peeked[k] = self.now
                 with contextlib.suppress(OSError, WatchError):
                     self.peek(k)
+        for a in peeks:
+            if a != e["key"] and (self.entries.get(a) or {}).get("state") != LAND_FORWARDED:
+                self.after_blind_read(a)  # a forwarded one is read live by forward_state_reads
+
+    def after_blind_read(self, a: str) -> None:
+        """Under the lock. --after PR A, read only unwaited (keep_watching), whose copy here is missing or older than
+        LAND_AFTER_BLIND and has stayed so that long: one direct read of it (refresh_job, land_direct_read), at most
+        once per LAND_AFTER_BLIND, when no hold, park or busy pool stops it. after_wait then ends the wait on the copy it
+        stored (merged: queued; closed: after_closed) instead of the row waiting forever on a read that never comes."""
+        c = self.cache_of(a) or {}
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if reads:
+            self.after_blind_since.pop(a, None)
+        since = max(reads) if reads else self.after_blind_since.setdefault(a, self.now)
+        if self.now - since < LAND_AFTER_BLIND or self.now - self.after_read_at.get(a, float("-inf")) < LAND_AFTER_BLIND:
+            return
+        if a in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return  # read on a later pass
+        self.after_read_at[a] = self.now
+        log({"event": "land-after-read", "key": a, "age": round(self.now - max(reads)) if reads else None})
+        self.submit(a, self.refresh_job, a)
 
     def watch_head(self, e: dict) -> None:
         """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
@@ -19440,7 +19477,9 @@ class LandQueue:
         with self.lock:
             hold = self.refresh_outcome(key, error)
             e = self.entries.get(key)
-            if e is None:
+            if e is None:  # an --after PR with no row here (after_blind_read)
+                if error:
+                    log({"event": "land-refresh", "key": key, "error": error, **({"hold": hold} if hold else {})})
                 return
             probe = bool((e.get("refresh") or {}).get("probe"))
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
