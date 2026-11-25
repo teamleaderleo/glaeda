@@ -18773,6 +18773,20 @@ class PostBodyGuardTest(unittest.TestCase):
                                    "--body", "x\n\nAgent session: [s](https://cmux.com/deeplink/agent?id=aid-1)")[0], 0)
         self.assertEqual(self.queued(), 1)
 
+    def test_a_pr_without_the_footer_gets_it_appended_and_is_queued(self) -> None:
+        line = "Agent session: [s](https://cmux.com/deeplink/agent?id=aid-1)"
+        self.guard.write_text(self.GUARD + "FOOTER = re.compile(r'^Agent session:', re.M)\n"
+                              f"def own_footer(repo, env):\n    return {line!r}\n")
+        code, err = self.post("pr", "pub/cmux", "--head", "h", "--base", "b", "--title", "t", "--body", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("appended the `agent-identity footer` line", err)
+        bodies = [json.loads(f.read_text())["body"] for f in gg.outbox_dir().glob("*.json")]
+        self.assertEqual(bodies, ["x\n\n" + line + "\n"])
+        code, err = self.post("comment", "pub/cmux#7", "--body", "y")  # a comment never gets one
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(json.loads(f.read_text())["body"] for f in gg.outbox_dir().glob("*.json"))[-1:],
+                         ["y"])
+
     def test_a_guard_that_breaks_queues_nothing(self) -> None:
         self.guard.write_text("def refusal(args, env):\n    raise RuntimeError('boom')\n")
         code, err = self.post("comment", "pub/cmux#7", "--body", "x")
@@ -25707,7 +25721,9 @@ def land_pr(head: str, state: str = "OPEN", checks: list | None = None, parent: 
     return {"state": state, "headRefOid": head, "mergeable": mergeable, "mergeStateStatus": "CLEAN",
             "isDraft": draft,
             **({"headParent": parent} if parent else {}),
-            "checks": [{"name": n, "workflow": "w", "status": s, "conclusion": c} for n, s, c in checks]}
+            # a 4-tuple is a status context, as parse_pr stores one: no workflow, and the description the read gave
+            "checks": [{"name": c[0], "workflow": None if len(c) > 3 else "w", "status": c[1], "conclusion": c[2],
+                        **({"description": c[3]} if len(c) > 3 else {})} for c in checks]}
 
 
 def refusal(code: str, head: str, action: dict | None, nxt: str = "", reason: str = "") -> tuple[int, dict]:
@@ -29386,6 +29402,53 @@ class LandTest(Base):
                 self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
                 self.assertIn("checks_stuck", self.w.sent()[-1][-1])
 
+    def test_a_stop_on_label_gated_checks_names_the_label_that_starts_them(self):
+        """cmux#55176 (2026-11-25): the head carried one pending status per deferred check, each saying in its
+        description that `ready-to-land` starts it. Nothing dispatches them until the label goes on, so every wait was
+        a wait on runs no runner would ever take, and the land stopped checks_stuck after 4.1 h and 9 wait refusals
+        telling its reader to wait again. The stop has to name the label."""
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"),
+                            ("React Doctor (changed React projects)", "PENDING", None, said)])
+        self.land()
+        e = self.run_hour(lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                          seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        reason = e["stop"]["reason"]
+        self.assertIn("React Doctor (changed React projects) (pending)", reason)
+        self.assertIn("the ready-to-land label starts", reason)
+        self.assertIn("ready-to-land", self.w.sent()[-1][-1])
+
+    def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
+        # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
+        # stop that invented a label would send its reader to add one no workflow reads.
+        for said in ("Queued on a Linux runner", None):
+            with self.subTest(said=said):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                checks = [("ci", "COMPLETED", "SUCCESS")]
+                checks.append(("ws-check", "PENDING", None, said) if said else ("ws-check", "PENDING", None))
+                self.pr(LA, checks=checks)
+                self.land()
+                e = self.run_hour(lambda: refusal("checks_running", LA,
+                                                  {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                                  seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+                self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+                self.assertNotIn("label starts", e["stop"]["reason"])
+
+    def test_land_gate_labels_reads_only_an_unfinished_status_that_says_a_label_starts_it(self):
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        self.assertEqual(gg.land_gate_labels({"checks": [
+            {"name": "a", "status": "PENDING", "description": said},
+            {"name": "b", "status": "PENDING", "description": "This check runs when land-ci is added"},
+            {"name": "c", "status": "COMPLETED", "conclusion": "SUCCESS", "description": said},
+            {"name": "d", "status": "PENDING", "description": "Waiting for a runner"},
+            {"name": "e", "status": "PENDING"},
+        ]}), ["land-ci", "ready-to-land"])
+        self.assertEqual(gg.land_gate_labels({}), [])
+        self.assertEqual(gg.land_gate_labels({"checks": [{"name": "a", "status": "PENDING", "description": 7}]}), [])
+
     def test_a_merge_refused_for_running_checks_never_counts_toward_the_step_stop(self):
         # The same class through a step: "ok", then the pinned merge refused [checks_running] naming a wait, again and
         # again at one head. Each is a wait, never one of LAND_STEP_STOP's refusals; the long bound still ends it.
@@ -30569,6 +30632,50 @@ class LandTest(Base):
                 self.assertEqual(env.get("LAND_JUDGE_OVERRIDE"), self.OVERRIDE["reason"])
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual(took[-1]["code"], "ws_check_missing")
+
+    def test_land_override_waits_one_measured_ws_check_not_a_constant(self):
+        """2700 s held every override 45 min behind a ws-check that posts in about 27 (hq fast checks run 45562131182,
+        2026-11-25). The queue keeps how long each ws-check wait lasted until the check posted at that head, and an
+        override waits their p90 (at least LAND_OVERRIDE_WAIT_MIN_S, at most LAND_OVERRIDE_WAIT_S); too few
+        measurements, or a wait a new head or a stop cut, leave it at the ceiling."""
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.addCleanup(gg._LAND_CHECK_WAIT_READ.clear)
+        wait = {"kind": "wait_pr"}
+        missing = {"code": "ws_check_missing"}
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "nothing measured: the ceiling")
+        for i, took in enumerate((900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1620, 1650)):
+            e = {}
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 0.0))
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 30.0), "still waiting: no measurement")
+            self.assertEqual(gg.land_check_wait_ended(e, {"kind": "merge"}, {}, LA, float(took)), took)
+        self.assertEqual(gg.land_override_wait_s(1000.0), 1650.0, "p90 of the ten")
+        cut = {}
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "stop", "stop": "hold"}, {}, LA, 99999.0))
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "merge"}, {}, LB, 99999.0), "a new head")
+        self.assertEqual(len(gg.land_check_waits()), 10)
+        gg.write_json(gg.land_check_waits_path(), {"waits": [5.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_MIN_S, "never under the floor")
+        gg.write_json(gg.land_check_waits_path(), {"waits": [9000.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "never over the ceiling")
+        # the queue itself: past the measured wait, not the ceiling, the override's pinned merge goes
+        gg.write_json(gg.land_check_waits_path(), {"waits": [1200.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        for _ in range(3):
+            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr"}, reason=(
+                "land-judge: refused: PR #1 head " + LA + " has ws-check still pending, and it changes tools/x.py: a "
+                "PR that changes tools/ waits for its ws-check result even on the lagging sync"),
+                nxt="glaeda-gh wait pr o/r#1 --until done"))
+        e = self.tick()
+        e = self.tick(1100.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+        e = self.tick(1300.0)
+        self.assert_merged_at(LA)
 
     def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
         never = "git commit --allow-empty -m x && git push"
@@ -34558,6 +34665,51 @@ class LandTest(Base):
         for _ in range(4):
             self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)  # that event was judged; it asks nothing again
+
+    def test_a_check_completed_event_whose_judgment_was_not_handed_is_asked_again_next_pass(self):
+        """glaeda#2744, 2026-11-25: green by 07:29Z, the done event met a refused read (judge handed nothing), the
+        event was marked seen and the row slept to its 08:23Z wake. Now an event is spent only once handed."""
+        self.feed()
+        done, _, _ = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(60)
+        real = self.q.judge
+        refused = [True]
+
+        def judge(e, sha, fp, counts=True, why=""):
+            if refused and why == "checks_done":
+                refused.pop()
+                return False
+            return real(e, sha, fp, counts=counts, why=why)
+        self.q.judge = judge
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 1)
+        e = self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_re_request_of_a_waiting_checks_row_judges_it_again(self):
+        """glaeda#2744: two same-pin re-requests left the waiting row on its hour wake."""
+        self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(30)
+        self.land()  # the same request again
+        self.w.answers.append(ok_answer(LA))
+        self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
 
     def test_an_event_from_before_the_wait_verdict_or_no_feed_keeps_the_timer(self):
         """An event older than the wait's verdict was judged already; with no feed (a lane VM) feed_done says
