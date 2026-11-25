@@ -20813,6 +20813,24 @@ class LandQueue:
         self.save(e)
         return None
 
+    def repin_foreign_base_merge(self, e: dict, act: dict, head: str, parents: list | None) -> bool:
+        """Off the lock, before a repin step ACT is taken at HEAD: False when land_judge's head is not one this queue may
+        follow and E was stopped or parked for it; True to take the step as before. When the head land_judge read is not
+        this queue's own update_branch's merge (follow_own_update) and is not the cache's, it is judged the way a cached
+        head is (base_merge_check): followed only when it is a base merge on the pin made by anyone (the lander bot, the
+        Update branch button, another host's queue), its diff the pin's own; a push stops head_moved at once, naming why.
+        lw#8928 (glaeda land on cmux-cp-1, 2026-11-25) stopped "pin: 3 identical refusals in a row: ... PR read head
+        '7b19878...' does not match pinned head fc371dd..." after somebody merged main into the branch: the cache still
+        showed the pin, so the cached head never reached base_merge_check, and the repin wait judged the same stale pin
+        three times (the same stop as cmux-platform#1771, which only the queue's own update_branch was followed over)."""
+        sha, pin = str(act.get("sha") or "").lower(), str(e.get("pinSha") or "")
+        if not SHA40.fullmatch(sha) or sha == head or not land_head_moved(pin, sha):
+            return True
+        with self.lock:
+            if parents is not None and self.follow_own_update(e, sha, parents) is None:
+                return True  # the queue's own update: the step below clears its streak
+        return self.base_merge_check(e, {"head": sha, "pin": pin, "parent": ""})
+
     def repin_parents(self, e: dict, act: dict, head: str) -> list | None:
         """Off the lock, before a repin step ACT is taken at HEAD: the parents of the head it names, read once
         (base_merge_check's read), when only they can say that head is this queue's own update_branch's base merge on
@@ -22258,6 +22276,8 @@ class LandQueue:
             self.do_review(e, head, answer)
             return
         parents = self.repin_parents(e, act, head) if kind == "repin" else None
+        if kind == "repin" and not self.repin_foreign_base_merge(e, act, head, parents):
+            return  # land_judge's head is not a base merge on the pin: base_merge_check stopped or parked E
         with self.lock:
             if kind == "wait_pr":
                 esc = act.get("escalate")
