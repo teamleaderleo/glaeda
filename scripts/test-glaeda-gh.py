@@ -26824,12 +26824,12 @@ class LandTest(Base):
         # Its timeout: judged, and handed a snapshot rather than reading live.
         self.snap_pr(LA, snap_head=LA)  # the read the prefetch asked for
         day = gg.land_day(self.t)
-        live_before = gg.land_counts()[day].get("live") or 0
+        live_before = gg.land_counts().get(day, {}).get("live") or 0  # (a day with no row yet: a run past midnight UTC)
         self.w.answers.append(ok_answer(LA))
         self.tick(gg.LAND_WAKE_PREFETCH)
         self.assertEqual(len(self.w.explains()), 2)
         self.assertIn(gg.LAND_SNAPSHOT_ENV, self.explain_env())
-        self.assertEqual(gg.land_counts()[day].get("live") or 0, live_before)
+        self.assertEqual(gg.land_counts().get(day, {}).get("live") or 0, live_before)
         self.assertNotIn("snapshot_missing", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
         self.assert_merged_at(LA)
 
