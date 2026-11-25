@@ -38054,7 +38054,9 @@ def parser() -> argparse.ArgumentParser:
                     help="comment, pr, review, update-branch (queued and paced), status, or issue, label, close, issue-comment "
                          "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
-    po.add_argument("--body", help="the text (prefer --body-file: backticks and dollar signs stay data)")
+    po.add_argument("--body", "--comment", dest="body",
+                    help="the text (prefer --body-file: backticks and dollar signs stay data); --comment is the "
+                         "same (gh's name for a close comment)")
     po.add_argument("--body-file", metavar="PATH", help="the text from a file, - for stdin")
     po.add_argument("--title", help="pr: the title")
     po.add_argument("--head", help="pr: the branch (OWNER:BRANCH from a fork)")

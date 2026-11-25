@@ -281,6 +281,10 @@ jobs:
               Path("scripts/test-glaeda-runner-hygiene.py"),
               Path("scripts/glaeda-procs"),
               Path("scripts/test-glaeda-procs.py"),
+              Path("scripts/cmux-disk"),
+              Path("scripts/cmux-procs"),
+              Path("scripts/cmux-disk-registry"),
+              Path("scripts/test-cmux-names.py"),
               Path("scripts/glaeda-local-guard"),
               Path("scripts/test-glaeda-local-guard.py"),
               Path("scripts/glaeda-update"),
@@ -429,6 +433,7 @@ jobs:
           suite python3 scripts/test-glaeda-worktree-reclaim-all.py
           suite python3 scripts/test-glaeda-runner-hygiene.py
           suite python3 scripts/test-glaeda-procs.py
+          suite python3 scripts/test-cmux-names.py
           suite python3 scripts/test-glaeda-local-guard.py
           suite python3 scripts/test-glaeda-update.py
           suite python3 scripts/test-glaeda-fleet-cas-prune.py

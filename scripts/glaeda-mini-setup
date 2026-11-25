@@ -26,18 +26,18 @@ as operator steps instead. The one exception is the explicit --runner mode, whic
 GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
-    ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-disk, cmux-disk        from scripts/glaeda-disk, scripts/cmux-disk (cmux-disk is the primary name)
     ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
     ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
-    ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-procs, cmux-procs      from scripts/glaeda-procs and its primary name cmux-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
                                                left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
-    ~/.local/bin/glaeda-disk-registry          from scripts/glaeda-disk-registry (LRU eviction to config/disk-registry.toml's
+    ~/.local/bin/glaeda-disk-registry          and cmux-disk-registry, its primary name (LRU eviction to config/disk-registry.toml's
                                                budgets; a dry run without GLAEDA_DISK_REGISTRY=1)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
@@ -201,8 +201,11 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh")
 # cmux-gh is glaeda-gh's primary name (Leo, 2026-11-25: "what if we start calling these cmux-gh?"). Installed beside
 # the tool it renames (scripts/cmux-gh, a shim that runs glaeda-gh beside it), so the old name keeps working for every caller, timer and skill. The service
-# labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded.
-TOOL_ALIASES = {"glaeda-gh": "cmux-gh"}
+# labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded. cmux-disk, cmux-procs
+# and cmux-disk-registry are the same for their glaeda-* programs (Leo, 2026-11-25: "start migrating off glaeda and
+# into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
+TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
+                "glaeda-disk-registry": "cmux-disk-registry"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
                                  "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
