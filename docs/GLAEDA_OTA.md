@@ -153,19 +153,40 @@ End to end, by design: the release is published about 5 minutes after the merge 
 hosts see it within a minute and report after their install and health check, the second canary's
 success starts a promote run that moves stable (about a minute for the run), and every host (an idle
 runner's hook too) installs it within another minute plus its install: about 10 minutes from merge to
-a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake,
-stable waits out the 15-minute soak and that canary's next full run (up to 10 minutes) dispatches the
-promote run.
+a runner's hook. A busy runner takes the hook at its next gap between jobs. With one canary awake (or
+the second late or pending), stable waits out the 15-minute soak, and that canary's minute probe starts a
+full run as the soak ends, which dispatches the promote run: about 16 minutes from publication. Until
+2026-11-24 that dispatch waited for the canary's next scheduled full run, up to 10 minutes later.
 Before 2026-11-17 the same path took 23 to 50 minutes (a 15-minute soak, then a 10-13 minute poll and
 up to 15 more for the mirror).
+
+## Fast path for glaeda-gh
+
+The rings above stay the reconciler. Before they run, a merge to `main` also reaches each host's glaeda-gh
+on a faster path:
+
+- **Trigger.** The daemon's main watch (`MainWatch` in `scripts/glaeda-gh`) reads `main` with `git ls-remote`
+  every few seconds. When `main` moves, it starts the operator's `fast-patch glaeda COMMIT` with
+  `FAST_PATCH_TRIGGER=main-watch`.
+- **Swap.** fast-patch fetches the commit, swaps the installed script, and waits for the daemon to report it.
+  The daemon reports it through daemon.json's `scriptSha256`.
+- **Wake.** `ScriptWake` stats the script every 0.5 s. On new content it ends the running tick at its next
+  request boundary and wakes serve's sleep.
+- **Re-exec.** serve then decides with `reexec_due`:
+  - Land judgments in flight are handed to the next daemon.
+  - Only a claimed land step holds or drains the re-exec (`land_busy`). A read is judged again after the
+    restart.
+- **Rollback.** fast-patch rolls back when the daemon is not on the new bytes within its bound.
+- **Record.** Every run appends a line to `~/.local/state/fast-patch/runs.jsonl`. The line carries
+  `seconds`, `fetchedS` and `swapS`, plus `deferred` when land work held the hand-over.
 
 ## Rings
 
 | Host | Ring | Why |
 | --- | --- | --- |
-| Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health |
-| Big Red | canary | always on; reports health when the Mac is asleep |
-| Cosmic Gray | canary | a second Mac; one more chance that some canary reports |
+| Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health, usually 3-4 minutes after publication |
+| Cosmic Gray | canary | a second Mac, the quorum's second host; busy, so it often reports after the soak or posts `pending` (a health check or `gh auth token` timing out) |
+| Big Red | stable | not a canary since 2026-10-31 (leo-workspace `machines/host-baseline.json` `glaeda_ota`); it posts no status |
 | manaflow minis | stable | build hosts: take only what a canary has run healthy for 15 minutes and none failed; download from the fleet mirror |
 
 Set a host's ring once with `glaeda-mini-setup --apply --ota-ring canary` (or `stable`). The

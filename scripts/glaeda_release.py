@@ -79,8 +79,10 @@ MAX_ASSET = 200 * 1024 * 1024
 # it. Longer than glaeda-update's FAILURE_WAIT_MAX plus BACKOFF_MAX_S (test-glaeda-update.py checks), so a
 # failing canary has posted its failure by then even through a spent quota.
 CANARY_SILENT_HOURS = 2.5
-# Canary hosts whose success (with no canary failure or pending) ends the soak early. Three canaries exist
-# (docs/GLAEDA_OTA.md Rings): two healthy installs are the evidence the soak window waits for.
+# Canary hosts whose success (with no canary failure or pending) ends the soak early: two healthy installs are the
+# evidence the soak window waits for. Two canaries exist (docs/GLAEDA_OTA.md Rings: air-blue and cosmic-gray; the
+# third host there has been on stable since 2026-10-31 and never posts a status), so the quorum is both of them, and a release the
+# second reports late on waits out the soak; glaeda-update's minute probe then asks promote.yml at the soak's end.
 CANARY_QUORUM = 2
 SMOKE_SCHEMA = "glaeda-release-smoke/v1"
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")

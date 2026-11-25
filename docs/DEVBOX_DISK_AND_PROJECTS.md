@@ -24,6 +24,14 @@ this policy does not remove user source or Git state. Package caches are pressur
 archives remain report-only so Codex task history is preserved. Every candidate is rechecked for open files, a live cwd, command-line use,
 socket markers, recent activity, Git state, and submodule state immediately before mutation.
 
+Where cmux acts, `devbox` stands down. When the cmux setting `worktrees.cleanBuildCaches` is on, cmux's
+worktree care removes the machine's idle build caches itself, so glaeda-disk keeps every item at or inside
+`~/Library/Developer/Xcode/DerivedData`, `~/Library/Caches/org.swift.swiftpm`, `~/.npm/_cacache` and
+`~/.bun/install/cache`. Each such item is `kept` with the reason "cmux cleans it", the report's first lines say
+`cmux acts here`, and `--json` carries `"cmux_acts": true`. glaeda-disk reads the setting from the same file
+cmux reads: `CMUX_NEXT_CONFIG_FILE`, else `~/.config/cmux/cmux-next.json`, then `~/.config/cmux/cmux.json`. A
+missing or unreadable file reads as off, and glaeda-disk then acts. A `fleet-mini` host never stands down.
+
 New checkouts go through `~/.local/bin/glaeda-worktree add`. `--no-build` creates the source
 worktree without initializing submodules. `--build` initializes Ghostty with `--reference` to
 the canonical checkout's module objects. Worktrees live under `~/Projects/worktrees/<repo>/<name>`.
