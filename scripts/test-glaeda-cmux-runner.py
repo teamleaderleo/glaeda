@@ -2960,7 +2960,7 @@ class HookTest(unittest.TestCase):
             for r in ("w0", "w1", "w2", "c0"):
                 self.finish(r)
         # Only cmux-next.yml's jobs: the same id in another workflow is still an unknown job, a compile.
-        self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="other.yml")[0], "compile")
+        self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="")[0], "compile")
         self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="cmux-next.yml")[0], "light")
         self.assertEqual(hook.job_class("tooling-tests", "manaflow-ai/cmux", workflow="cmux-next-guards.yml"),
                          ("light", False))
@@ -3394,7 +3394,7 @@ class HookTest(unittest.TestCase):
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=workflow), ("exclusive", False))
             self.assertEqual(hook.job_units("exclusive", job, "manaflow-ai/cmux", workflow=workflow),
                              hook.EXCLUSIVE_UNITS)
-        self.assertEqual(hook.job_class("sign", "manaflow-ai/cmux", workflow="other.yml")[0], "compile",
+        self.assertEqual(hook.job_class("sign", "manaflow-ai/cmux", workflow="")[0], "compile",
                          "only the named workflow's job")
         self.assertEqual(hook.reserve_for(1, 14, 14), 0, "a job of every unit leaves no reserve beside it")
         self.fleet()
@@ -5427,15 +5427,57 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 self.assertIn("holding 4/14 units for build (isolated", done.stdout)
                 self.assertNotIn("is in no job table", done.stdout)
-            # the same job id under a workflow no table names is still a compile, and its log says so once
-            unlisted = run("s2", "some-new-caller.yml")
+            # an unlisted job of a CANONICAL_ROOT_WORKFLOWS file is still a compile, and its log says so once
+            unlisted = run("s2", "ci.yml", "some-new-job")
             self.assertEqual(unlisted.returncode, 1, unlisted.stdout + unlisted.stderr)
-            self.assertIn("some-new-caller.yml build is in no job table of this hook, so it is costed as a compile: "
+            self.assertIn("ci.yml some-new-job is in no job table of this hook, so it is costed as a compile: "
                           "5 units and the persistent-dd and root tokens (canonical root 1)", unlisted.stdout)
             self.assertIn("list it in WORKFLOW_JOB_CLASSES", unlisted.stdout)
-            self.assertIn("the persistent-dd token is taken (build is compile)", unlisted.stdout)
+            self.assertIn("the persistent-dd token is taken (some-new-job is compile)", unlisted.stdout)
+            # under any other workflow it is isolated: units and no token, so it runs beside the compile
+            self.finish("s1")
+            other = run("s3", "some-new-caller.yml")
+            self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+            self.assertIn("some-new-caller.yml build is in no job table of this hook; some-new-caller.yml is not one "
+                          "of CANONICAL_ROOT_WORKFLOWS, so it is costed as isolated: 4 units and no token", other.stdout)
+            self.assertIn("holding 4/14 units for build (isolated", other.stdout)
         finally:
-            for runner in ("r0", "s0", "s1", "s2"):
+            for runner in ("r0", "s0", "s1", "s2", "s3"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
+    def test_an_unlisted_job_outside_the_canonical_root_workflows_never_waits_for_a_token(self) -> None:
+        """UNLISTED_JOB (2026-11-25): billing.yml ios-billing and the new pr-router.yml step-table jobs were in no job
+        table, so they were compiles and waited in Set up runner, with no bound, for persistent-dd and canonical root
+        1 on side and session runners whose listeners never check either token (mini_full checks them only on a root
+        runner). Every later job on the mini queued behind them (fair_turn) and the Mac PR setup-wait p95 went from
+        about 15 min to 2 h. Unlisted, a job of a workflow that builds in no canonical root is isolated: while a
+        compile holds both tokens it starts at once."""
+        self.fleet()
+        home = "manaflow-ai/cmux"
+        for workflow, job in (("billing.yml", "ios-billing"), ("pr-router.yml", "some-future-step"),
+                              ("brand-new.yml", "build")):
+            with self.subTest(workflow=workflow, job=job):
+                self.assertEqual(hook.job_class(job, home, home, workflow), ("isolated", True))
+                self.assertEqual(hook.CLASS_COST["isolated"][1], ())
+        for workflow in sorted(hook.CANONICAL_ROOT_WORKFLOWS):
+            with self.subTest(canonical=workflow):
+                self.assertEqual(hook.job_class("some-new-job", home, home, workflow), ("compile", True))
+
+        def run(runner: str, workflow: str, job: str) -> subprocess.CompletedProcess:
+            ref = f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/pull/1/merge"
+            return self.job(job, runner, 14, None, env={"GITHUB_WORKFLOW_REF": ref})
+
+        try:
+            compile_ = run("r0", "ci.yml", "macos-compile-admission")
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            billing = run("s0", "billing.yml", "ios-billing")
+            self.assertEqual(billing.returncode, 0, billing.stdout + billing.stderr)
+            self.assertIn("for ios-billing (isolated", billing.stdout)
+            self.assertNotIn("persistent-dd token is taken", billing.stdout)
+            self.assertNotIn("root token is taken", billing.stdout)
+        finally:
+            for runner in ("r0", "s0"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
@@ -7116,9 +7158,12 @@ time.sleep(60)
         home = "manaflow-ai/cmux"
         for job in ("lint", "test", "build"):
             self.assertEqual(hook.job_class(job, home, home, "cmux-tui.yml"), ("isolated", False))
-            # the same id in a workflow the table does not name keeps the unknown-job default: compile, pinned
-            self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
+            # the same id under an unknown workflow keeps the unknown-job default: compile, pinned; under a known
+            # workflow that is no CANONICAL_ROOT_WORKFLOWS file it is isolated (units, no token), still unlisted
+            self.assertEqual(hook.job_class(job, home, home, ""), ("compile", True))
             self.assertEqual(hook.job_class(job, home, home), ("compile", True))
+            self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("isolated", True))
+            self.assertEqual(hook.job_class(job, home, home, "ci.yml"), ("compile", True))
         # test-e2e runs its tests in the console session: build compiles and tests, test is the fallback
         self.assertEqual(hook.job_class("build", home, home, "test-e2e.yml"), ("compile-gui", False))
         self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui-step", False))
@@ -7140,10 +7185,10 @@ time.sleep(60)
         # a seed job holds the root its matrix names itself (take-root), so no token picks one for it
         self.assertEqual(hook.job_class("seed", home, home, "seed-derived-data.yml"), ("seed", False))
         self.assertEqual(hook.CLASS_COST["seed"], (5, ()))
-        self.assertEqual(hook.job_class("seed", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("seed", home, home, ""), ("compile", True))
         # the nightly app build compiles in its own workspace: no root a seed on the trusted mini waits for
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
-        self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("build-nightly-app", home, home, ""), ("compile", True))
         # These controls may use a picked owned Mac, but do no Xcode app compile or root work. They use the
         # light class's measured two-core p75; the remote daemon runs concurrent Go cross-builds.
         for job in ("decide", "build-nightly-remote-daemon", "await-nightly-tree-marker",
@@ -7152,7 +7197,7 @@ time.sleep(60)
             with self.subTest(job=job):
                 self.assertEqual(hook.job_class(job, home, home, "nightly.yml"), ("light", False))
                 self.assertEqual(hook.job_units("light", job, home, home, "nightly.yml"), hook.CLASS_COST["light"][0])
-                self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True))
+                self.assertEqual(hook.job_class(job, home, home, ""), ("compile", True))
         # the nightly Ghostty helper runs Zig in its workspace: light (no root), sized by its measured cores
         self.assertEqual(hook.job_class("build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), ("light", False))
         self.assertEqual(hook.job_units("light", "build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), 4)
@@ -7173,7 +7218,7 @@ time.sleep(60)
         self.assertEqual(hook.job_class("publish", home, home, "cmux-tui-artifacts.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "ios-e2e.yml"), ("isolated", False))
-        self.assertEqual(hook.job_class("build-mac", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("build-mac", home, home, ""), ("compile", True))
         # cmux-next's side-lane jobs build in their workspace or $RUNNER_TEMP: no root, no kept DerivedData
         self.assertEqual(hook.job_class("swift-test", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "cmux-next.yml"), ("isolated", False))
@@ -7188,22 +7233,22 @@ time.sleep(60)
         # the caller), builds in its workspace; `bench` takes the gui token itself (take-gui) and draws in the console
         self.assertEqual(hook.job_class("build", home, home, "cmux-next-frame-pacing.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("bench", home, home, "cmux-next-frame-pacing.yml"), ("gui-step", False))
-        self.assertEqual(hook.job_class("bench", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("bench", home, home, ""), ("compile", True))
         # cmux-next's session-only jobs on the gui runner build SwiftPM in the workspace (owned_spm_scratch keeps
         # .build per workspace path) and run swift test in the logged-in session: no root, kept DerivedData or token
         for workflow, job in (("cmux-next.yml", "daemon-test"), ("cmux-next.yml", "generated-files"),
                               ("cmux-next-pr-autofix.yml", "action-exports"),
                               ("cmux-next-base-autofix.yml", "action-exports")):
             self.assertEqual(hook.job_class(job, home, home, workflow), ("isolated", False), (workflow, job))
-            self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True), job)
+            self.assertEqual(hook.job_class(job, home, home, ""), ("compile", True), job)
         # cmux-next media's tour holds its own tag in the workflow and captures only its app's window: isolated,
         # as many per mini as units allow
         self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("isolated", False))
         self.assertNotIn("tour", hook.CLASS_COST)
-        self.assertEqual(hook.job_class("tour", home, home, "other.yml"), ("compile", True))
-        self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("tour", home, home, ""), ("compile", True))
+        self.assertEqual(hook.job_class("release-compile", home, home, ""), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
-        self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("rerun", home, home, ""), ("compile", True))
         self.assertEqual(hook.job_class("release-build", home, home, "ci.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("macos-compile-admission", home, home, "ci.yml"), ("compile", False))
         self.assertEqual(hook.job_class("lint", "someone/else", home, "cmux-tui.yml"), ("isolated", False),

@@ -2306,8 +2306,8 @@ SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
               workflow: str = "") -> tuple[str, bool]:
-    """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). A
-    SIM_SLOT_JOBS job is a simulator job where this mini's simulator ceiling is above 1 (SIM_DYNAMIC)."""
+    """The job's class and whether no job table names it (an unknown job of the home repo, unlisted_class): as a
+    compile such a job is pinned to /private/tmp/cmux-ci (canonical root 1). A SIM_SLOT_JOBS job is a simulator job where this mini's simulator ceiling is above 1 (SIM_DYNAMIC)."""
     if is_guest(repo, home_repo):
         name = job.lower()
         if name.endswith("-sim") or name.endswith("simulator"):
@@ -2322,17 +2322,44 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
         # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
         return "light", False
-    return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
+    if job in JOB_CLASSES:
+        return JOB_CLASSES[job], False
+    return unlisted_class(workflow), True
+
+
+# CANONICAL_ROOT_WORKFLOWS: the cmux workflow files whose jobs build in a canonical root (/private/tmp/cmux-ci*) or
+# the kept DerivedData (cmux .github/workflows and scripts/ci grepped for /private/tmp/cmux-ci,
+# CMUX_CI_CANONICAL_ROOT, CMUX_OWNED_STATE_ROOT and persistent-dd, 2026-11-25; ci.yml calls ci-macos.yml and is
+# the caller file the hook sees). Only an unlisted job of one of these, or of an unknown workflow, is costed as a
+# compile. Any other unlisted job is isolated: it builds in its workspace, so it needs units but no token. Costed
+# as a compile, such a job waited unbounded in "Set up runner" for the persistent-dd and root tokens on a runner
+# whose listener never looks at either (only a root runner's listener checks them, mini_full), and every later job
+# on the mini queued behind it (fair_turn): on 2026-11-25 the new pr-router.yml step-table jobs and billing.yml
+# ios-billing took the Mac PR setup-wait p95 from about 15 min to 2 h (docs/handbook
+# job-handed-to-a-runner-that-cannot-start-it.md in cmuxterm-hq).
+CANONICAL_ROOT_WORKFLOWS = frozenset({
+    "app-host-test-rerun.yml", "ci.yml", "ci-macos.yml", "main-compile-probe.yml", "nightly.yml",
+    "seed-derived-data.yml", "seed-swiftpm-manifests.yml", "test-e2e.yml"})
+
+
+def unlisted_class(workflow: str) -> str:
+    """The class of a home-repo job no job table names: a compile in a CANONICAL_ROOT_WORKFLOWS file or an unknown
+    one (the safe side for a job that uses the kept DerivedData or a root), else isolated (no token to wait for)."""
+    return "compile" if not workflow or workflow in CANONICAL_ROOT_WORKFLOWS else "isolated"
 
 
 def unlisted_job_note(workflow: str, job: str) -> str:
-    """What a home-repo job that no job table names is told once, before it waits (UNLISTED_JOB). It is costed as a
-    compile, the safe side for a job that does use the kept DerivedData or a root, and a long wait for a job that
-    uses neither (TREE_BUILD): the line names the table to list it in, so the job's own log says why it queued."""
-    units, tokens = CLASS_COST["compile"]
-    return (f"{workflow or 'an unknown workflow'} {job or 'job'} is in no job table of this hook, so it is costed as "
-            f"a compile: {units} units and the {' and '.join(tokens)} tokens (canonical root 1). If it builds only "
-            "in its workspace, list it in WORKFLOW_JOB_CLASSES")
+    """What a home-repo job that no job table names is told once, before it waits (UNLISTED_JOB): the class it was
+    given (unlisted_class) and the table to list it in, so the job's own log says why it queued."""
+    klass = unlisted_class(workflow)
+    units, tokens = CLASS_COST[klass]
+    if tokens:
+        return (f"{workflow or 'an unknown workflow'} {job or 'job'} is in no job table of this hook, so it is costed "
+                f"as a compile: {units} units and the {' and '.join(tokens)} tokens (canonical root 1). If it builds "
+                "only in its workspace, list it in WORKFLOW_JOB_CLASSES")
+    return (f"{workflow} {job or 'job'} is in no job table of this hook; {workflow} is not one of "
+            f"CANONICAL_ROOT_WORKFLOWS, so it is costed as {klass}: {units} units and no token. If it uses a "
+            "canonical root or the kept DerivedData, list it in WORKFLOW_JOB_CLASSES")
 
 
 def job_units(klass: str, job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO, workflow: str = "") -> int:
@@ -7383,7 +7410,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, note
         return False, waiter_why(host_lock, passed)
 
-    # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
+    # pinned: home-repo jobs the hook does not know, costed as a compile (unlisted_class), use /private/tmp/cmux-ci
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
         share_fleet_path(capacity_dir)
