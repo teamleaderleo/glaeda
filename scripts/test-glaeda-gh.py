@@ -1898,6 +1898,96 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + 3 * gg.TICK)  # still inside the 60 s cycle
         self.assertEqual(len(self.gh.gql_calls()), 3)  # another repository's commit
 
+    def test_a_feed_stream_event_reads_the_feed_at_once_and_the_poll_backs_off(self) -> None:
+        """Leo, 2026-11-25: "stop polling". The FeedStream's long-poll names an event after the daemon's cursor: the
+        next tick reads the feed at once instead of after CONTROLLER_FEED_EVERY, and while the stream answers the poll
+        is only the FEED_STREAM_BACKSTOP."""
+        gg.CONTROLLER_FEED_EVERY = 20
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)  # learns the cursor
+        wake = threading.Event()
+        stream = gg.FeedStream(self.daemon, wake, wait=0)  # (the fake answers at once: no long-poll to hold)
+        self.daemon.feed_stream = stream
+        pending: list[dict] = []
+        stream.client = types.SimpleNamespace(base=None, token=None, events=lambda since, wait=0: {
+            "cursor": since + len(pending), "suites": list(pending)})  # a peek: the daemon's read takes them
+        self.assertEqual(stream.step(), 0.0)  # nothing yet: the answer came back empty after the wait
+        self.assertFalse(stream.ready.is_set())
+        reads = len(self.ctl.feeds)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads)  # no event, stream live: no poll before the backstop
+        suite = {"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"}
+        self.ctl.suites.append(suite)
+        pending.append(suite)
+        self.assertEqual(stream.step(), 0.0)
+        self.assertTrue(stream.ready.is_set() and wake.is_set())  # serve's sleep ends now
+        self.assertEqual(stream.step(), 0.2)  # no second long-poll until the tick has read it
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads + 1)
+        self.assertFalse(stream.ready.is_set())
+        self.assertIn("pr:o/r#1", self.daemon.nudged)
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads + 1)
+        self.daemon.tick(NOW + 2 * gg.TICK + gg.FEED_STREAM_BACKSTOP)
+        self.assertEqual(len(self.ctl.feeds), reads + 2)  # the backstop poll
+        status = self.daemon.feed_stream_status()  # daemon.json's controller.stream
+        self.assertEqual((status["live"], status["signals"], status["reads"], status["error"]), (True, 1, 1, None))
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_FEED_STREAM": "off"}):
+            self.assertFalse(stream.live(time.time()))
+            self.assertEqual(stream.step(), 2.0)
+
+    def test_a_feed_stream_on_a_controller_that_answers_at_once_is_not_asked_in_a_loop(self) -> None:
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        stream = gg.FeedStream(self.daemon, None, wait=25)
+        stream.client = types.SimpleNamespace(base=None, token=None, events=lambda since, wait=0: {"cursor": since})
+        self.assertEqual(stream.step(), gg.FEED_STREAM_RETRY)  # (the fake answers in no time: no long-poll held)
+        stream.client.events = mock.Mock(side_effect=gg.WatchError("controller: URLError"))
+        self.assertEqual(stream.step(), gg.FEED_STREAM_RETRY)
+        self.assertIn("URLError", stream.error)
+
+    def test_a_check_event_on_a_parked_lands_head_watches_and_reads_its_pr(self) -> None:
+        """A land parked in a long wait has no watch on its PR: a run or suite event on its head must still reach the
+        land queue at once (watch it now, mark it dirty), not at the next LAND_PEEK_EVERY peek or a timeout."""
+        node = pr_node(1)
+        node["headRefName"] = "feat/x"
+        self.gh.prs[("o", "r", 1)] = node
+        queue = types.SimpleNamespace(entries={"pr:o/r#1": {"key": "pr:o/r#1", "state": "waiting"},
+                                               "pr:o/r#2": {"key": "pr:o/r#2", "state": "merged"}},
+                                      heads={"pr:o/r#1": ("o/r", "a" * 40, "feat/x"),
+                                             "pr:o/r#2": ("o/r", "a" * 40, "feat/y")},
+                                      watch_now=mock.Mock(), lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.daemon.tick(NOW)
+            self.ctl.suites.append({"id": 1, "repo": "o/other", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + gg.TICK)
+            queue.watch_now.assert_not_called()  # another repository's commit
+            self.ctl.suites.append({"id": 2, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + 2 * gg.TICK)
+            queue.watch_now.assert_called_once_with("pr:o/r#1")  # not the merged #2
+            self.assertIn("pr:o/r#1", self.daemon.land_dirty)
+            self.ctl.runs[50] = {**ctl_run(50, "queued"), "head_sha": "c" * 40, "head_branch": "feat/x"}
+            self.daemon.tick(NOW + 3 * gg.TICK)  # a push to its branch: runs for a head not read yet
+            self.assertEqual(queue.watch_now.call_count, 2)
+            self.daemon.land_queue = None
+
+    def test_a_land_prs_check_event_is_read_within_land_nudge_min(self) -> None:
+        node = pr_node(1)
+        self.gh.prs[("o", "r", 1)] = node
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        reads = len(self.gh.gql_calls())
+        queue = types.SimpleNamespace(entries={"pr:o/r#1": {"key": "pr:o/r#1", "state": "waiting"}}, lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + gg.LAND_NUDGE_MIN)  # NUDGE_MIN would hold it until NOW + 20
+            self.daemon.land_queue = None
+        self.assertLess(gg.LAND_NUDGE_MIN, gg.NUDGE_MIN)
+        self.assertEqual(len(self.gh.gql_calls()), reads + 1)
+
     def test_comments_from_the_feed_reach_a_comment_wait(self) -> None:
         self.gh.issues[("t", "s", 454)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
                                            "comments": {"totalCount": 0, "nodes": []}}
@@ -2417,6 +2507,29 @@ class GraphqlDietTest(Base):
         run_pending = {**pending, "checks": [{**pending["checks"][0], "status": "IN_PROGRESS"}]}
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "data": run_pending, "dataAt": since})
         self.assertTrue(self.daemon.land_feed_quiet(key, sha, since), "a check run's events reach the feed")
+
+    def test_the_feed_says_when_a_check_finished_at_a_head_for_the_land_queue(self) -> None:
+        """land_feed_done (LAND_EVENT_JUDGE): the time of the last completed run or suite the feed delivered for a head,
+        never an in-progress one or another head's; land_checks_done is the controller rollup's word on every run."""
+        sha, other, key = "b" * 40, "c" * 40, "pr:o/r#1"
+        self.daemon.tick(NOW)
+        self.feed_covers()
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertIsNone(self.daemon.land_feed_done(key, sha))
+        self.ctl.suites.append({"id": 4, "repo": "o/r", "head_sha": sha, "status": "in_progress"})
+        self.ctl.suites.append({"id": 5, "repo": "o/r", "head_sha": other, "status": "completed"})
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertIsNone(self.daemon.land_feed_done(key, sha))
+        self.ctl.suites.append({"id": 4, "repo": "O/R", "head_sha": sha.upper(), "status": "completed"})
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertEqual(self.daemon.land_feed_done(key, sha), NOW + 3 * gg.TICK)
+        self.assertIsNone(self.daemon.land_feed_done("pr:x/y#1", sha))
+        docs = {sha: {"total": 2, "suites": [[1, "completed", "success", 3], [2, "completed", "failure", 1]]},
+                other: {"total": 2, "suites": [[1, "completed", "success", 3], [2, "in_progress", None, 1]]}}
+        with mock.patch.object(self.daemon, "controller_suites", lambda root, s: docs.get(s)):
+            self.assertIs(self.daemon.land_checks_done(key, sha), True)
+            self.assertIs(self.daemon.land_checks_done(key, other), False)
+            self.assertIsNone(self.daemon.land_checks_done(key, "d" * 40))  # the rollup cannot say
 
     def test_the_feed_view_a_downstream_rules_with_is_kept_for_read(self) -> None:
         """save_feed_view / feed_view (UPSTREAM_FEED_FILE): the view `read` gives a downstream host says what
@@ -26240,6 +26353,59 @@ class LandTest(Base):
         for url in ("https://gitlab.com/o/r.git", "https://github.com/o/r/x", "file:///m/o/r.git"):
             self.assertEqual(gg.land_fetch_origin(url), "", url)
 
+    TIER = "gh pr edit 1 -R o/r --add-label ready-to-land"
+
+    def tier_refusal(self, head: str, nxt: str | None = None, **action) -> tuple[int, dict]:
+        nxt = nxt or self.TIER
+        return refusal("land_tier_pending", head, {"kind": "command", "text": nxt, **action}, nxt,
+                       f"land-judge: refused: hq/land-tier is pending and the PR needs ready-to-land at {head}")
+
+    def test_the_land_tier_label_is_added_by_the_queue_once_per_head(self):
+        # cmuxterm-hq#24362 at a1d33b52ffc3, 2026-11-24: stopped land_tier_pending on a label command nobody ran.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.tier_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [["pr", "edit", "1", "-R", "o/r", "--add-label", "ready-to-land"]])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
+                         ("waiting", "retry", "label", 0))
+        self.assertEqual(e["labelSent"]["head"], LA)
+        self.assertIn("label_sent", [h["event"] for h in e["history"]])
+        for _ in range(3):  # still refused at the same head: not sent again
+            self.w.answers.append(self.tier_refusal(LA))
+        for _ in range(3):
+            e = self.tick(gg.NUDGE_MIN * 3 + 1)
+        self.assertEqual(len(self.w.gh_calls("pr", "edit")), 1)
+
+    def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
+        self.broker = True
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.tier_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        self.assertFalse(e.get("labelSent"))
+
+    def test_only_the_land_tier_codes_own_label_command_is_taken(self):
+        for text, code, repo, number in (
+            ("gh pr edit 1 -R o/r --add-label ready-to-land", "red_not_excused", "o/r", "1"),
+            ("gh pr edit 2 -R o/r --add-label ready-to-land", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R x/y --add-label ready-to-land", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --add-label hold", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --add-label ready-to-land && true", "land_tier_pending", "o/r", "1"),
+            ("gh pr edit 1 -R o/r --base main", "land_tier_pending", "o/r", "1"),
+        ):
+            act = gg.land_action({"ok": False, "code": code, "repo": repo, "number": number, "next": text,
+                                  "action": {"v": 1, "kind": "command", "text": text, "repo": repo,
+                                             "number": int(number)}}, LA)
+            self.assertEqual(act["kind"], "command", text)
+        for label in ("ready-to-land", "full-ci"):
+            text = f"gh pr edit 1 -R o/r --add-label {label}"
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual((act["kind"], act["label"]), ("label", label))
+
     def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
         bad = {
             "upload-pack": self.git_fetch()[:4] + ["--upload-pack=/tmp/x", "origin", "main"],
@@ -33712,6 +33878,93 @@ class LandTest(Base):
             self.tick(121)
         self.assertEqual(len(self.w.judgments()), 1)
         self.assertEqual(events, [])
+
+    def event_feed(self) -> tuple[list[float], list[bool | None], list[str]]:
+        """A fake check-completed event feed (LAND_EVENT_JUDGE): DONE holds the event times, ROLLUP what the
+        controller's rollup says next (its last word repeats), ASKED the heads it was asked about."""
+        done: list[float] = []
+        rollup: list[bool | None] = [True]
+        asked: list[str] = []
+        self.q.feed_done = lambda key, sha: max(done) if done else None
+
+        def checks_done(key: str, sha: str) -> bool | None:
+            asked.append(sha)
+            return rollup.pop(0) if len(rollup) > 1 else rollup[0]
+        self.q.checks_done = checks_done
+        return done, rollup, asked
+
+    def test_a_check_completed_event_judges_a_checks_wait_at_once_though_the_copy_shows_it_running(self):
+        """cmux-cp-1, 2026-11-25 02:55Z: 60 of 103 rows waiting on their checks, the copy showing one running, had
+        every check done on GitHub a median 59 min before, asleep until their timers. The feed's completed event and
+        the rollup now judge at once; land_judge reads live. Before: the wait's 1800 s timer; after: the next tick."""
+        self.feed()
+        done, _, _ = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("build", "IN_PROGRESS", None)])  # the copy's next read
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)  # nothing finished yet: the wait stands
+        done.append(self.t)  # "build" finished; the copy has not caught up
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertIn("checks_done_event", [h.get("event") for h in e["history"]])
+        judged = [h for h in e["history"] if h.get("event") == "judged"]
+        self.assertEqual(judged[-1].get("why"), "checks_done")
+        self.assert_merged_at(LA)
+
+    def test_a_check_completed_event_the_rollup_does_not_vouch_for_asks_nothing_and_is_looked_at_once(self):
+        """A suite finishing while another runs (the rollup says False), or a rollup that cannot say (None), judges
+        nothing, and the same event is never put to the rollup twice; the next event that it vouches for judges."""
+        self.feed()
+        done, rollup, asked = self.event_feed()
+        rollup[:] = [False, None, True]
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None), ("build", "IN_PROGRESS", None)])
+        done.append(self.t + 1)
+        for _ in range(4):
+            self.tick(5)
+        self.assertEqual((len(self.w.judgments()), asked), (1, [LA]))
+        done.append(self.t + 1)
+        for _ in range(4):
+            self.tick(5)
+        self.assertEqual((len(self.w.judgments()), len(asked)), (1, 2))
+        done.append(self.t + 1)
+        self.w.answers.append(refusal("checks_running", LA, wait))  # a commit status still pending: land_judge waits
+        self.tick(5)
+        self.assertEqual((len(self.w.judgments()), len(asked)), (2, 3))
+        for _ in range(4):
+            self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)  # that event was judged; it asks nothing again
+
+    def test_an_event_from_before_the_wait_verdict_or_no_feed_keeps_the_timer(self):
+        """An event older than the wait's verdict was judged already; with no feed (a lane VM) feed_done says
+        nothing, and the wait runs on its timer as before."""
+        self.feed()
+        done, _, asked = self.event_feed()
+        done.append(self.t)
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual((len(self.w.judgments()), asked), (1, []))
+        self.q.feed_done = lambda key, sha: None
+        for _ in range(3):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)
 
     def test_a_feed_held_wait_is_judged_past_the_bound(self):
         self.feed()
