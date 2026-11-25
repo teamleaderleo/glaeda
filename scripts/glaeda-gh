@@ -24636,7 +24636,7 @@ def is_serve(pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     words = result.stdout.split()
-    return result.returncode == 0 and "serve" in words and any(Path(w).name == "glaeda-gh" for w in words)
+    return result.returncode == 0 and "serve" in words and any(Path(w).name in ("glaeda-gh", "cmux-gh") for w in words)
 
 
 def take_over(lock: Any, now: float | None = None) -> bool:
@@ -37110,7 +37110,7 @@ def wait_extra_targets(message: str) -> tuple[str, str]:
         return "", ""  # an unrecognized flag, or a word that is no target: the usual usage error
     kind = Parser.argv[1] if len(Parser.argv) > 1 and not Parser.argv[1].startswith("-") else "KIND"
     kept = [w for w in Parser.argv if w not in extra]  # the call the lane meant, minus the targets past the first
-    form = ["glaeda-gh"] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
+    form = [CLI] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
     first = Parser.argv[2] if len(Parser.argv) > 2 and TARGET_WORD.search(Parser.argv[2]) else ""
     both = ([first] if first else []) + extra
     hint = (f"`wait` waits for one target, so {', '.join(extra)} "
@@ -37177,15 +37177,18 @@ def post_elsewhere(kind: str) -> str:
     return ""
 
 
-def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
+def usage_next(argv: list[str], prog: str | None = None) -> str:
     """The right form of a mistyped call: `wait pr OWNER/REPO N` is `wait pr OWNER/REPO#N`; else the --help."""
+    prog = prog or CLI
+    cli = "cmux-gh" if prog.startswith("cmux-gh") else "glaeda-gh"  # the name the caller ran: a hint it can run again
+    prog_base = "glaeda-gh" + prog[len(cli):]  # one spelling for the comparisons below
     words = list(argv)
     if len(words) >= 4 and words[0] in ("wait", "status") and words[1] in ("pr", "comment") \
             and re.fullmatch(rf"{NAME}/{NAME}", words[2]) and BARE_NUMBER.fullmatch(words[3]):
         fixed = [words[0], words[1], f"{words[2]}#{words[3].lstrip('#')}"] + words[4:]
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
-        return typed_line(["glaeda-gh"] + fixed)
+        return typed_line([cli] + fixed)
     # `wait pr A B`: two targets in one call, which `status pr` takes and `wait` does not. A wait is one key
     # by construction (one request file, one FIFO, one exit code -- 0/1/2/4 is *the* target's verdict, which
     # every caller branches on), so this names the two calls that do the job rather than inventing an
@@ -37199,28 +37202,28 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
             targets.append(word)
         if len(targets) >= 2 and all(target_readable(words[1], w) for w in targets):
             rest = words[2 + len(targets):]
-            one = typed_line(["glaeda-gh", "wait", words[1], targets[0], *rest])
+            one = typed_line([cli, "wait", words[1], targets[0], *rest])
             return (f"wait takes one target, because its exit code is that target's verdict: "
-                    f"`glaeda-gh status {words[1]} {typed_line(targets)}` reads them all in one gather, "
+                    f"`{cli} status {words[1]} {typed_line(targets)}` reads them all in one gather, "
                     f"or run one wait each (`{one}`)")
     # prog is "glaeda-gh post" when the post parser itself refuses the kind, and "glaeda-gh" when the top-level
     # one does: the word typed, not the prog, says which command was meant.
-    if len(words) >= 2 and words[0] == "post" and prog in ("glaeda-gh", "glaeda-gh post"):
+    if len(words) >= 2 and words[0] == "post" and prog_base in ("glaeda-gh", "glaeda-gh post"):
         hand = post_elsewhere(words[1])
         if hand:
             return hand
     # `checks OWNER/REPO` with no commit and no --consumer (measured 2026-11-16..23): no default is safe (which commit
     # is the caller's to say), so the refusal is the form that runs in a checkout, and the read a PR's checks have.
-    if words[:1] == ["checks"] and prog in ("glaeda-gh", "glaeda-gh checks"):
+    if words[:1] == ["checks"] and prog_base in ("glaeda-gh", "glaeda-gh checks"):
         repo = next((w for w in words[1:] if re.fullmatch(rf"{NAME}/{NAME}", w)), "OWNER/REPO")
         shas = [w for w in words[1:] if SHA40.fullmatch(w)]
         consumer = os.environ.get("ACPMUX_SESSION_NAME") or "NAME"
         sha = " ".join(shas) or '"$(git rev-parse HEAD)"'
-        return (f"`glaeda-gh checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
-                f"name, so none is assumed; a pull request's checks: `glaeda-gh status pr {repo}#N`)")
-    if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
+        return (f"`{cli} checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
+                f"name, so none is assumed; a pull request's checks: `{cli} status pr {repo}#N`)")
+    if prog_base == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
-        return f"glaeda-gh {words[0]} --help"
+        return f"{cli} {words[0]} --help"
     return f"{prog} --help"
 
 
@@ -37392,7 +37395,7 @@ class ShorthandFlag(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         value = self.const if self.nargs == 0 else values
         setattr(namespace, self.dest, value)
-        say_waiting(f"glaeda-gh: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
+        say_waiting(f"{CLI}: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
 
 
 class OptionalJobId(argparse.Action):
@@ -37404,7 +37407,7 @@ class OptionalJobId(argparse.Action):
 
 
 def parser() -> argparse.ArgumentParser:
-    p = Parser(prog="glaeda-gh", description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Parser(prog=CLI, description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
     sv = sub.add_parser("serve", help="run the daemon (the only process that polls GitHub); launchd or systemd runs it")
     sv.add_argument("--foreground-ok", action="store_true",
@@ -38839,7 +38842,13 @@ def from_loader() -> bool:
     return os.access(cache if os.path.isdir(cache) else here, os.W_OK)
 
 
+# The name this program was run as. cmux-gh is the primary name (Leo, 2026-11-25); glaeda-gh is the same bytes
+# under the old name (scripts/cmux-gh runs it), so every existing caller, timer and skill keeps working and says nothing about it.
+CLI = "cmux-gh" if os.environ.get("GLAEDA_GH_AS") == "cmux-gh" or os.path.basename(__file__) == "cmux-gh" else "glaeda-gh"
 DOC = __doc__.partition('"$@"\n')[2] or __doc__  # the usage, without the /bin/sh line the docstring opens with
+if CLI == "cmux-gh":
+    DOC = DOC.replace("glaeda-gh: one shared GitHub CI watcher", "cmux-gh (formerly glaeda-gh; that name runs the same program): one shared GitHub CI watcher", 1)
+    DOC = DOC.replace("glaeda-gh ", "cmux-gh ")
 PYC_ENV = "GLAEDA_GH_FROM_PYC"
 PYC_LOADER = ('import sys, types, importlib.machinery as m; p = sys.argv[1]; sys.argv = sys.argv[1:]; '
               'g = types.ModuleType("__main__"); g.__file__ = p; sys.modules["__main__"] = g; '
