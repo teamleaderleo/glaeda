@@ -19573,6 +19573,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
         self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
         self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        # NO_RUST_GATE: the protected PATH has no Rust, so the hook's toolchain gate is off for the agent and listen.sh
+        self.assertEqual(agent["EnvironmentVariables"]["GLAEDA_RUNNER_TOOLCHAIN_GATE"], "0")
+        self.assertIn("export GLAEDA_RUNNER_TOOLCHAIN_GATE=0\n", listen)
         watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
         self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
         dot_path = (runner / ".path").read_text().strip().split(":")
