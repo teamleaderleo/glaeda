@@ -16332,10 +16332,43 @@ class PostTest(unittest.TestCase):
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
         self.assertEqual(d.transport.calls, [])
         item = self.queue("update-branch", "o/r#9", stdin="")
-        d, ran = self.lane_vm((1, {"ok": False, "error": "pull request 9 is closed"}))
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"state": "closed", "head": {"sha": "D" * 40}}}),
+                              (1, {"ok": False, "error": "pull request 9 is closed"}))
         self.step(d, NOW + 1000)
-        self.assertEqual(json.loads(ran[0][4]), {"repo": "o/r", "number": 9})
+        self.assertEqual(json.loads(ran[1][4]), {"repo": "o/r", "number": 9, "expected_head_sha": "d" * 40})
         self.assertEqual(gg.post_state(item["id"])["state"], "superseded")
+
+    def test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_broker_call(self) -> None:
+        """glaeda-lane 2026-11-25: every `gh pr update-branch N -R manaflow-ai/cmux` gh-quota queued on the login's
+        create pause (no --match-head-commit, so no --sha) failed in the daemon: "the lane-gh broker did not make it:
+        refused: expected_head_sha must be the PR's full 40-character head". The broker's update_branch tool takes no
+        unpinned call, so the daemon reads the PR's head through the broker (`get pulls/N`) and pins the call to it, as
+        an unpinned update-branch means "whatever the head is now". A read the limit refused waits like a write; a read
+        that fails otherwise fails the post with its reason."""
+        sha = "e" * 40
+        item = self.queue("update-branch", "o/r#7", stdin="")
+        d, ran = self.lane_vm((0, {"ok": True, "data": {"state": "open", "head": {"sha": sha.upper()}}}),
+                              (0, {"ok": True, "data": {"updated": True}}))
+        self.step(d, NOW)
+        self.assertEqual(ran[0][1:4], ["call", "get", "o/r"])
+        self.assertEqual(json.loads(ran[0][4]), {"path": "pulls/7"})
+        self.assertEqual(ran[1][1:4], ["call", "update_branch", "o/r"])
+        self.assertEqual(json.loads(ran[1][4]), {"repo": "o/r", "number": 7, "expected_head_sha": sha})
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        item = self.queue("update-branch", "o/r#10", stdin="")
+        d, ran = self.lane_vm((1, {"ok": False, "error": "GitHub answered HTTP 404: Not Found"}))
+        self.step(d, NOW + 1000)
+        self.assertEqual(len(ran), 1)  # nothing was sent unpinned
+        done = gg.post_state(item["id"])
+        self.assertEqual(done["state"], "failed", done)
+        self.assertIn("could not read o/r#10's head", done["error"])
+        item = self.queue("update-branch", "o/r#8", stdin="")
+        d, ran = self.lane_vm((gg.BROKER_RATE_LIMITED_EXIT, {"ok": False, "error": "rate limited",
+                                                             "data": {"retry_after": 300}}))
+        self.step(d, NOW + 5000)
+        self.assertEqual(len(ran), 1)  # the read only: the update waits out the limit
+        held = json.loads((gg.outbox_dir() / f"{item['id']}.json").read_text())
+        self.assertIn("limit", held["lastError"])
 
     def test_a_queued_update_branch_carries_the_checks_that_need_the_newer_base_to_the_broker(self) -> None:
         """gcp-agent-lane-11, 2026-11-24 18:19Z: `gh pr update-branch N --needs-newer-base C` refused "paced" twice,
@@ -16364,6 +16397,8 @@ class PostTest(unittest.TestCase):
             "lane=${LANE_GH_LANE:-${ACPMUX_SESSION_NAME:-${ACPMUX_SESSION:-$ACPMUX_FROM}}}\n"
             "lane=${lane##*/}\n"
             "if [ -z \"$lane\" ]; then echo \"lane-gh: $2: lease acquisition requires a lane session\" >&2; exit 1; fi\n"
+            "if [ \"$2\" = get ]; then echo '{\"ok\": true, \"data\": {\"head\": {\"sha\": \"%s\"}}}'; exit 0; fi\n"
+            % ("f" * 40) +
             "printf '{\"ok\": true, \"data\": {\"url\": \"https://github.com/o/r/pull/9\", \"number\": 9, "
             "\"lane\": \"%s\"}}\\n' \"$lane\" > \"$0.$2\"\n"
             "cat \"$0.$2\"\n")

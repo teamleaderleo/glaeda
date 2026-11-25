@@ -34871,9 +34871,39 @@ def post_lane_env(item: dict) -> dict[str, str] | None:
     return {**os.environ, LAND_LANE_ENV: lane} if lane else None
 
 
-def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+# The broker's update_branch tool takes only a pinned call ("expected_head_sha must be the PR's full 40-character
+# head"), and a queued update-branch with no --sha (gh-quota queues a bare `gh pr update-branch N` that the login's
+# create pause held) was sent unpinned: every one failed in the daemon, "the lane-gh broker did not make it: refused:
+# expected_head_sha must be ..." (glaeda-lane, 2026-11-25), so each update-branch made during a pause never happened.
+# An unpinned update-branch means "whatever the head is now", so the daemon reads the PR's head through the broker's
+# own get and pins the call to it. Detector: test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_
+# broker_call.
+def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+    """CHOSEN with update_branch's expected_head_sha read from the PR when it has none: ("pinned", chosen), or the
+    read's outcome as broker_write gives it ("limited", seconds; "refused", why: nothing was written either way)."""
+    tool, call_args = chosen
+    if tool != "update_branch" or call_args.get("expected_head_sha"):
+        return "pinned", chosen
+    outcome, data = broker_write(item, ("get", {"path": f"pulls/{call_args['number']}"}), timeout, pin=False)
+    if outcome == "limited":
+        return outcome, data
+    head = str(((data.get("head") if isinstance(data, dict) else None) or {}).get("sha") or "").lower() \
+        if outcome == "made" and isinstance(data, dict) else ""
+    if not SHA40.fullmatch(head):
+        why = data if outcome != "made" else "its answer named no 40-character head"
+        return "refused", f"could not read {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
+    return "pinned", (tool, {**call_args, "expected_head_sha": head})
+
+
+def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool = True) -> tuple[str, Any]:
     """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
-    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
+    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made. An unpinned
+    update_branch is pinned to the PR's head first (broker_pin_update_branch)."""
+    if pin:
+        outcome, value = broker_pin_update_branch(item, chosen, timeout)
+        if outcome != "pinned":
+            return outcome, value
+        chosen = value
     tool, call_args = chosen
     argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
     try:
