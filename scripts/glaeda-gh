@@ -25305,12 +25305,55 @@ def script_changed(path: Path, seen: dict) -> bool:
         return False
     if key == seen.get("changedStat"):
         return True
-    if hashlib.sha256(path.read_bytes()).hexdigest() == seen.get("sha"):
+    new = hashlib.sha256(path.read_bytes()).hexdigest()
+    if new == seen.get("sha"):
         seen["stat"] = key
         seen.pop("changedStat", None)
         return False
+    older = older_release(new, seen.get("sha"))
+    if older is not None:
+        # Not a change to run: these bytes stay on disk for the next start, the daemon stays on its newer ones.
+        seen["stat"] = key
+        seen.pop("changedStat", None)
+        log({"event": "reexec-older-skipped", "release": older, "scriptSha256": new})
+        return False
     seen["changedStat"] = key
     return True
+
+
+UPDATE_GENERATIONS = Path.home() / ".local/state/glaeda/update/generations"  # glaeda-update's releases, by tag
+
+
+def older_release(new: str, running: str | None, generations: Path | None = None) -> str | None:
+    """The OTA release (its tag) whose glaeda-gh is NEW when it does not include the main commit fast-patch put live
+    as the RUNNING bytes (STATE/glaeda/live.json), else None. A re-exec never goes back to an older script: a lane VM,
+    2026-11-25, re-exec'd three times in 11 min onto the ring's release behind main, each time a setup rerun put
+    its glaeda-gh over fast-patch's and fast-patch put main back a second later, and every flip restarted the land
+    work and the reads the landing PRs waited on. Bytes no release holds (a hand install), fast-patch's own (a newer
+    main, or its rollback, which it names first) and a release that includes the commit all re-exec as before."""
+    doc = read_json(fast_patch_state() / "glaeda" / "live.json")
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    commit = doc.get("commit") if isinstance(doc, dict) else None
+    if (not isinstance(tools, dict) or running not in tools.values() or new in tools.values()
+            or not isinstance(commit, str) or not SHA40.fullmatch(commit)):
+        return None
+    try:
+        gens = sorted((generations or UPDATE_GENERATIONS).iterdir())
+    except OSError:
+        return None
+    for gen in gens:
+        try:
+            if hashlib.sha256((gen / "glaeda/scripts/glaeda-gh").read_bytes()).hexdigest() != new:
+                continue
+        except OSError:
+            continue
+        try:
+            ancestry = set((gen / "ancestry.txt").read_text(encoding="ascii").split())
+        except (OSError, UnicodeDecodeError):
+            ancestry = set()  # glaeda-update's reading too (release_descends_from): no ancestry, not a descendant
+        if commit not in ancestry:
+            return gen.name
+    return None
 
 
 SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
