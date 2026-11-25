@@ -7171,7 +7171,8 @@ time.sleep(60)
         self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
         # the app FFI release build writes only in its workspace: no canonical root wait behind a compile
         self.assertEqual(hook.job_class("build", home, home, "app-ffi-release.yml"), ("isolated", False))
-        self.assertEqual(hook.job_class("publish", home, home, "app-ffi-release.yml"), ("compile", True))
+        # its unlisted jobs are isolated too: app-ffi-release.yml is no CANONICAL_ROOT_WORKFLOWS file
+        self.assertEqual(hook.job_class("publish", home, home, "app-ffi-release.yml"), ("isolated", True))
         # cmux-next's fast tier and Swift canary build SwiftPM packages (and cargo tests) in the workspace only:
         # no kept DerivedData or canonical root, so no persistent-dd wait behind a compile (hq#1915: the fast
         # tier waited 11.4 min for the token for a 52 s run, cmux run 38352638705)
@@ -7215,7 +7216,7 @@ time.sleep(60)
         self.assertEqual(hook.CLASS_COST["isolated"][1], (), "no persistent-dd, no root")
         self.assertEqual(hook.job_units("isolated", "build", home, home, "cmux-tui-artifacts.yml"), 4,
                          "the class's units until it is measured under this caller")
-        self.assertEqual(hook.job_class("publish", home, home, "cmux-tui-artifacts.yml"), ("compile", True))
+        self.assertEqual(hook.job_class("publish", home, home, "cmux-tui-artifacts.yml"), ("isolated", True))
         self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "ios-e2e.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, ""), ("compile", True))
