@@ -28512,6 +28512,32 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
     return timeout, ceiling, words
 
 
+# An agent's land wait never holds its turn (2026-11-25 Codex trial: one lane sat 137 min in a foreground
+# `cmux-gh land --wait 1800`; hq docs/findings/2026-11-25-codex-6.2-trial.md). The land is queued and the requester is
+# told on its merge or stop, so a long foreground wait only spends the session. A land an agent runs (any READER_KEYS
+# session variable, or CLAUDECODE=1) waits at most LAND_AGENT_WAIT_CAP, the helper cap leo-workspace#11193 set
+# (tools/tool_rewrites.py HELPER_WAIT_CAP_S: Claude Code backgrounds a foreground call at 180 s), and exits 2 with
+# the land still queued. A script that waits on purpose (leo-workspace tools/pinned_land.py) sets
+# GLAEDA_LAND_AGENT_WAIT_CAP=0. Only the wall-clock length changes: the queue entry, exit codes and verdicts are the same.
+LAND_AGENT_WAIT_CAP = 150.0
+
+
+def land_agent_wait_cap(target: str, wait: float, ceiling: float | None) -> tuple[float, float | None, str]:
+    """WAIT and CEILING for a land an agent runs, held to LAND_AGENT_WAIT_CAP, and the line saying so ("" when nothing
+    changed). See LAND_AGENT_WAIT_CAP."""
+    if os.environ.get("GLAEDA_LAND_AGENT_WAIT_CAP", "1") == "0":
+        return wait, ceiling, ""
+    if os.environ.get("CLAUDECODE") != "1" and not any(os.environ.get(k) for k in READER_KEYS):
+        return wait, ceiling, ""
+    whole = max(float(wait), default_wait_max(wait) if ceiling is None else float(ceiling))
+    if wait <= 0 or whole <= LAND_AGENT_WAIT_CAP:
+        return wait, ceiling, ""
+    words = (f"glaeda-gh land: an agent's foreground wait ends by {LAND_AGENT_WAIT_CAP:g}s (asked {whole:g}s); the land "
+             f"stays queued and your session is told on its merge or stop. End the turn, or run one background "
+             f"`cmux-gh wait pr {target} --until merged --timeout 1800`")
+    return min(float(wait), LAND_AGENT_WAIT_CAP), min(whole, LAND_AGENT_WAIT_CAP), words
+
+
 def default_wait_max(timeout: float) -> float:
     return WAIT_MAX_TIMES * float(timeout)
 
@@ -40189,6 +40215,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("land takes one OWNER/REPO#N (more PRs: one land each, --after to order them)")
             if args.wait < 0:
                 raise WatchError("--wait must be 0 or more seconds")
+            args.wait, args.max_wait, capped = land_agent_wait_cap(words[0], args.wait, args.max_wait)
+            if capped:
+                say_waiting(capped)
             override = land_override(*land_override_given(args.override_reason, args.override_receipt))
             nominated = land_nominated_given(args.nominated_path, args.nominated_evidence)
             return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,

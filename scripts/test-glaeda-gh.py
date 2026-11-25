@@ -69,6 +69,7 @@ SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
 os.environ.pop("CLAUDECODE", None)  # the suite run from a Claude Code shell is the CI run: CacheWarmCapTest sets it
+os.environ["GLAEDA_LAND_AGENT_WAIT_CAP"] = "0"  # likewise for an agent shell's session variables: LandAgentWaitCapTest
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -8547,6 +8548,51 @@ class Trickle:
     def close(self) -> None:
         self.stop.set()
         self.server.close()
+
+
+class LandAgentWaitCapTest(unittest.TestCase):
+    """An agent's `land --wait` never holds its turn: it waits at most LAND_AGENT_WAIT_CAP (150 s, leo-workspace#11193's
+    helper cap) and exits 2 with the land still queued (2026-11-25: a lane sat 137 min in `land --wait 1800`)."""
+
+    def setUp(self) -> None:
+        patch = mock.patch.dict(os.environ, {"GLAEDA_LAND_AGENT_WAIT_CAP": "1", "CLAUDECODE": ""}, clear=False)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for key in gg.READER_KEYS:
+            os.environ.pop(key, None)
+
+    def test_an_agent_land_wait_is_capped_and_says_how_to_go_on(self) -> None:
+        self.assertEqual(gg.LAND_AGENT_WAIT_CAP, 150)
+        for env in ({"ACPMUX_SESSION_NAME": "codex-26"}, {"CODEX_THREAD_ID": "t1"}, {"CLAUDECODE": "1"}):
+            with mock.patch.dict(os.environ, env):
+                wait, ceiling, words = gg.land_agent_wait_cap("o/r#1", 1800, None)
+            self.assertEqual((wait, ceiling), (150, 150), env)
+            self.assertIn("stays queued", words)
+            self.assertIn("cmux-gh wait pr o/r#1 --until merged --timeout 1800", words)
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "x"}):  # a short --wait with a long --max: capped
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", 60, 3000)[:2], (60, 150))
+
+    def test_no_agent_a_short_wait_no_wait_and_the_script_opt_out_are_untouched(self) -> None:
+        self.assertEqual(gg.land_agent_wait_cap("o/r#1", 1800, None), (1800, None, ""))
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "x"}):
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", 0, None), (0, None, ""))
+            short = gg.LAND_AGENT_WAIT_CAP / gg.WAIT_MAX_TIMES  # its default ceiling is the cap itself
+            self.assertEqual(gg.land_agent_wait_cap("o/r#1", short, None), (short, None, ""))
+            with mock.patch.dict(os.environ, {"GLAEDA_LAND_AGENT_WAIT_CAP": "0"}):
+                self.assertEqual(gg.land_agent_wait_cap("o/r#1", 900, 900), (900, 900, ""))
+
+    def test_main_hands_cmd_land_the_capped_wait(self) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_land(target, after, notify, wait, as_json, pin=None, override=None, ceiling=None, nominated=None):
+            seen.update(wait=wait, ceiling=ceiling)
+            return gg.EXIT_TIMEOUT
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "codex-26"}), \
+                mock.patch.object(gg, "cmd_land", fake_land), contextlib.redirect_stderr(err):
+            code = gg.main(["land", "o/r#1", "--match-head-commit", "c" * 40, "--wait", "1800"])
+        self.assertEqual((code, seen), (gg.EXIT_TIMEOUT, {"wait": 150, "ceiling": 150}))
 
 
 class CacheWarmCapTest(unittest.TestCase):
