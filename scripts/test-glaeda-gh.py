@@ -67,6 +67,7 @@ HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
 SHIPPED_UPSTREAM_DOWN_GRACE = gg.UPSTREAM_DOWN_GRACE
 # A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
 os.environ["GLAEDA_FAST_PATCH_WATCH"] = "0"  # a daemon a test starts never fast-patches this host
+os.environ.pop("CLAUDECODE", None)  # the suite run from a Claude Code shell is the CI run: CacheWarmCapTest sets it
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
@@ -8468,6 +8469,73 @@ class Trickle:
     def close(self) -> None:
         self.stop.set()
         self.server.close()
+
+
+class CacheWarmCapTest(unittest.TestCase):
+    """A wait a Claude Code session runs ends inside the prompt cache's 1 h (CACHE_WARM_WAIT), so the session's next
+    request is a 0.1x read instead of a 2x rewrite of its whole context; bounded by CACHE_WARM_HORIZON."""
+
+    KEY_TARGET = "o/r#7"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for patch in (mock.patch.object(gg, "BASE", Path(tmp.name)),
+                      mock.patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.environ.pop("GLAEDA_WAIT_CACHE_WARM", None)
+
+    def cap(self, timeout: float, ceiling: float | None, now: float) -> tuple[float, float | None, str]:
+        return gg.cache_warm_cap("pr", self.KEY_TARGET, timeout, ceiling, now=now)
+
+    def test_a_long_wait_ends_inside_the_cache_lifetime_and_says_how_to_go_on(self) -> None:
+        timeout, ceiling, words = self.cap(5400, None, NOW)
+        self.assertEqual((timeout, ceiling), (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+        self.assertLess(gg.CACHE_WARM_WAIT, 3600)
+        self.assertIn("next:", words)
+        self.assertIn("GLAEDA_WAIT_CACHE_WARM=0", words)
+
+    def test_the_default_wait_is_capped_too(self) -> None:
+        self.assertEqual(self.cap(gg.WAIT_DEFAULT_TIMEOUT, None, NOW)[:2], (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+
+    def test_a_short_wait_and_a_wait_outside_claude_code_are_untouched(self) -> None:
+        self.assertEqual(self.cap(600, None, NOW), (600, None, ""))
+        with mock.patch.dict(os.environ, {"CLAUDECODE": ""}):
+            self.assertEqual(self.cap(5400, None, NOW), (5400, None, ""))
+        with mock.patch.dict(os.environ, {"GLAEDA_WAIT_CACHE_WARM": "0"}):
+            self.assertEqual(self.cap(5400, None, NOW), (5400, None, ""))
+
+    def test_re_runs_stay_capped_until_the_horizon_then_wait_as_the_tool_defaults(self) -> None:
+        t, c, _ = self.cap(5400, None, NOW)
+        at = NOW
+        while at + gg.CACHE_WARM_WAIT - NOW < gg.CACHE_WARM_HORIZON:
+            at += gg.CACHE_WARM_WAIT
+            t, c, words = self.cap(t, c, at)  # the capped `next:` run again
+            if at - NOW < gg.CACHE_WARM_HORIZON:
+                self.assertEqual((t, c, words), (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT, ""))
+        at += gg.CACHE_WARM_WAIT
+        t, c, words = self.cap(t, c, at)
+        self.assertEqual((t, c), (gg.WAIT_DEFAULT_TIMEOUT, None), "past the horizon the cap ends")
+        self.assertIn("cache-warm cap ends", words)
+        # and the uncapped `next:` that follows does not start a new capped chain
+        self.assertEqual(self.cap(gg.WAIT_DEFAULT_TIMEOUT, None, at + 3600)[:2], (gg.WAIT_DEFAULT_TIMEOUT, None))
+
+    def test_a_fresh_wait_after_a_gap_starts_a_new_chain(self) -> None:
+        self.cap(5400, None, NOW)
+        later = NOW + gg.CACHE_WARM_HORIZON + 86400
+        self.assertEqual(self.cap(5400, None, later)[:2], (gg.CACHE_WARM_WAIT, gg.CACHE_WARM_WAIT))
+
+    def test_the_cli_hands_the_capped_bound_to_the_wait(self) -> None:
+        seen = {}
+
+        def fake_wait_file(target, timeout, as_json, mode, contains, ceiling):
+            seen.update(timeout=timeout, ceiling=ceiling)
+            return 0
+
+        with mock.patch.object(gg, "cmd_wait_file", fake_wait_file), mock.patch.object(gg, "say_waiting"):
+            gg.main(["wait", "file", "/nonexistent/x", "--timeout", "7200"])
+        self.assertEqual(seen, {"timeout": gg.CACHE_WARM_WAIT, "ceiling": gg.CACHE_WARM_WAIT})
 
 
 class HardDeadlineTest(unittest.TestCase):
@@ -22821,6 +22889,32 @@ class WaitedUnderReserveTest(Base):
         self.assertEqual((self.gh.full_reads - self.full0, self.gh.probes), (0, 1), "ten unchanged PRs cost one probe")
         self.assertEqual(self.ages(later, (11, 12)), [gg.CYCLE] * 2, "an unwaited PR is read under the reserve")
 
+    def test_a_waited_probe_names_one_repository_so_an_app_can_answer_it(self) -> None:
+        """cosmic-gray, 2026-11-25 06:3xZ: waited probes across two owners went on the login ("graphql-many-owners")
+        with its GraphQL at 0/5000 while four App pools had their hour: an App answers only a one-owner query."""
+        for n in (1, 2):
+            self.gh.prs[("p", "s", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a")])
+            gg.register(gg.parse_key("pr", f"p/s#{n}"), waited=True)
+        self.daemon.tick(NOW)
+        self.under(self.reserve - 10)
+        probed: list[set[str]] = []
+        inner = self.daemon.probe_prs
+
+        def probe(entries: list[dict]) -> Any:
+            probed.append({gg.caller_of(e["key"])[1] for e in entries})
+            return inner(entries)
+
+        later = NOW + gg.CYCLE
+        for n in (1, 2):
+            path = gg.watch_dir() / gg.file_name(f"pr:p/s#{n}")
+            gg.write_json(path, {**gg.read_json(path), "waitedAt": later})
+            os.utime(path, (later, later))
+        with mock.patch.object(self.daemon, "probe_prs", side_effect=probe):
+            self.at(later)
+        self.assertTrue(probed, "no waited probe was sent")
+        self.assertTrue(all(len(repos) == 1 for repos in probed), probed)
+        self.assertIn({"p/s"}, probed)
+
     def test_a_changed_waited_pr_is_read_in_full_under_the_reserve(self) -> None:
         node = self.gh.prs[("o", "r", 4)]
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
@@ -24152,6 +24246,70 @@ class StaleDataTest(Base):
         self.assertIn("quota", error)
         self.assertEqual(self.gh.calls, [])
 
+    def land_refresh_reads(self, keys: list[str], batched: bool) -> tuple[int, dict]:
+        """GraphQL queries sent to read KEYS as land refreshes, one land_direct_read each or one land_direct_read_many,
+        with the Daemon on the fake GitHub; (queries, {key: error})."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        real = gg.Daemon
+        before = len(self.gh.gql_calls())
+        with mock.patch.object(gg, "Daemon", side_effect=lambda **kw: real(
+                transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)):
+            out = gg.land_direct_read_many(keys) if batched else {k: gg.land_direct_read(k) for k in keys}
+        return len(self.gh.gql_calls()) - before, out
+
+    def test_land_refreshes_of_one_repository_are_read_in_batches(self) -> None:
+        """cmux-cp-1, 2026-11-25 06:40-07:40Z: 467 land refreshes in the hour, each its own one-PR GraphQL query. The
+        same 60 stale PRs read one at a time and then as one batched refresh (LAND_REFRESH_BATCH): the batch sends a
+        fraction of the queries and stores every PR as the single reads do."""
+        self.gh.counts = True  # the fingerprint's counts: an unchanged PR is probed
+        for n in list(range(1, 61)) + list(range(101, 161)):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        single, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(1, 61)], batched=False)
+        self.assertEqual(set(out.values()), {None})
+        batched, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+        self.assertEqual(set(out.values()), {None}, out)
+        self.assertEqual(len(out), 60)
+        for n in range(101, 161):
+            self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["data"]["number"], n)
+        self.assertLessEqual(batched * 5, single, (single, batched))
+        # read again at once: answered from the fresh copies (LAND_DIRECT_REUSE), no query
+        again, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+        self.assertEqual((again, set(out.values())), (0, {None}))
+        # past it, unchanged PRs: each single read is its own probe, the batch probes LAND_REFRESH_BATCH a query
+        real_time = time.time
+        with mock.patch.object(gg.time, "time", lambda: real_time() + gg.LAND_DIRECT_REUSE + 1):
+            probes = self.gh.probes
+            single_probe, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(1, 61)], batched=False)
+            self.assertEqual((self.gh.probes - probes, set(out.values())), (60, {None}))
+            probes = self.gh.probes
+            batched_probe, out = self.land_refresh_reads([f"pr:o/r#{n}" for n in range(101, 161)], batched=True)
+            self.assertEqual((self.gh.probes - probes, set(out.values())), (2, {None}))
+        print(f"\n60 land refreshes: first read {single} GraphQL queries one at a time, {batched} batched; "
+              f"unchanged PRs {single_probe} one at a time, {batched_probe} batched")
+        self.assertEqual(batched_probe, 2)
+
+    def test_a_land_refresh_keeps_the_rollup_snapshot_its_judgment_is_handed(self) -> None:
+        """A land refresh's own Daemon had no land queue, so its full read moved the cache's fingerprint and wrote no
+        rollup snapshot: the snapshot stopped matching and the judgment read the head from GitHub itself (cmux-cp-1,
+        2026-11-25: 4,197 of 4,765 judgments live). Both the single and the batched read now write it."""
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        self.land_refresh_reads(["pr:o/r#1"], batched=False)
+        self.land_refresh_reads(["pr:o/r#2", "pr:o/r#3"], batched=True)
+        for n in (1, 2, 3):
+            key = f"pr:o/r#{n}"
+            snap = gg.read_rollup(key)
+            self.assertIsNotNone(snap, key)
+            self.assertEqual((snap["head"], snap["fp"]),
+                             (gg.read_cache(key)["data"]["headRefOid"], gg.read_cache(key).get("fp")))
+
+    def test_a_batched_land_refresh_heeds_the_daemons_stop(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30,
+                                                "modes": {"graphql": "stop", "rest": "normal"}})
+        n, out = self.land_refresh_reads(["pr:o/r#1", "pr:o/r#2"], batched=True)
+        self.assertEqual((n, out), (0, {"pr:o/r#1": gg.DIRECT_QUOTA, "pr:o/r#2": gg.DIRECT_QUOTA}))
+
     def test_wait_starved_is_bounded(self) -> None:
         now = time.time()
         req = {"began": now - 30}
@@ -24162,6 +24320,76 @@ class StaleDataTest(Base):
         self.assertIsNotNone(gg.wait_starved(req, None, now), "never read since the wait began")
         req["directAt"] = now - 10
         self.assertIsNone(gg.wait_starved(req, {"dataAt": now - 3000}, now), "one direct read per STALE_DATA_AFTER")
+
+
+class DirectReadAppPoolTest(unittest.TestCase):
+    """A direct read the login's spent quota would refuse goes to an App pool that serves its owner (form 7 of hq
+    docs/handbook/login-quota-spent-while-apps-idle.md): cmux-cp-1, 2026-11-25, hq#25577's pinned land parked four
+    times on "GitHub's quota for this read is spent" while the App pools had nearly all of their hour."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = mock.patch.object(gg, "BASE", Path(self.tmp.name) / "gh")
+        base.start()
+        self.addCleanup(base.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        for name in ("upstream_command", "direct_command"):
+            pin = mock.patch.object(gg, name, return_value=None)
+            pin.start()
+            self.addCleanup(pin.stop)
+
+    def fake_daemon(self, pool, sent):
+        class Fake:
+            app_pool = pool
+            now = 0.0
+            tick_deadline = 0.0
+            gql_reason = ""
+
+            def mode(self, bucket):
+                return "stop"  # the login's GraphQL and REST are both under their reserve
+
+            def charge_rest(self, minute, n):
+                pass
+
+            def calling(self, *args):
+                return contextlib.nullcontext()
+
+            def fetch_prs(self, entries):
+                sent.extend(e["key"] for e in entries)
+                return "sent"
+        return Fake()
+
+    def pool(self, owners, token="ghs_" + "a" * 36):
+        return gg.AppPool(role="quota-goblin", mint=lambda owner: token, owners=lambda: owners, ready=lambda: True)
+
+    def read(self, pool, key="pr:manaflow-ai/cmuxterm-hq#25577"):
+        sent = []
+        fake = self.fake_daemon(pool, sent)
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            got = gg._read_one({"key": key, "kind": "pr", "began": time.time()}, None)
+        return got, sent
+
+    def test_a_pr_read_with_the_login_spent_goes_to_an_app_pool_that_serves_its_owner(self) -> None:
+        got, sent = self.read(self.pool(["manaflow-ai"]))
+        self.assertEqual(sent, ["pr:manaflow-ai/cmuxterm-hq#25577"], "the read was refused before the App was asked")
+        self.assertEqual(got, "sent")
+
+    def test_the_login_stop_still_holds_a_read_no_app_answers(self) -> None:
+        for pool in (None, self.pool(["teamleaderleo"]), self.pool(["manaflow-ai"], token=None)):
+            got, sent = self.read(pool)
+            self.assertEqual((got, sent), (gg.DIRECT_QUOTA, []), pool and pool.owners_fn())
+
+    def test_a_straggler_read_with_the_login_rest_spent_goes_to_the_app_pool(self) -> None:
+        fake = self.fake_daemon(self.pool(["manaflow-ai"]), [])
+        fake.get = lambda path, etag: ("fresh", {"path": path}, {})
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            got = gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"])
+        self.assertEqual(got, {"actions/jobs/1": {"path": "/repos/manaflow-ai/cmux/actions/jobs/1"}})
+        fake.app_pool = None
+        with mock.patch.object(gg, "Daemon", return_value=fake):
+            self.assertEqual(gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"]),
+                             {"actions/jobs/1": gg.DIRECT_QUOTA})
 
 
 class TempFileTest(unittest.TestCase):
@@ -29697,7 +29925,7 @@ class LandTest(Base):
                     self.assertEqual(env["CMUX_AGENT_SESSION"], "glaeda-land")  # still charged to the queue
                 explain = [env for c, env in runs if c[1:3] == [self.w.mh, "explain"]]
                 self.assertTrue(explain)
-                self.assertNotIn("LANE_GH_LANE", explain[0])  # a read needs no lane
+                self.assertEqual(explain[0].get("LANE_GH_LANE"), "lane")  # it adds ready-to-land (label_send)
         # a requester on another host names no lane
         self.assertEqual(gg.land_lane({"requester": "other/lane"}), "")
         self.assertEqual(gg.land_lane({"requester": ""}), "")
@@ -30100,6 +30328,31 @@ class LandTest(Base):
                 self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_that_finds_every_worker_busy_is_the_next_one_judged(self):
+        # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy. Its one at-once judgment
+        # was gated, the mark said it was spent, and the next pass put the row in wait_running with an hour-long wake on
+        # checks a spent GraphQL quota never re-read; lanes merged around the queue. Now the mark is spent only when a
+        # worker takes the row, and judge_tier puts it ahead of every waiting row for the next worker that frees.
+        pool = self.pooled(1)
+        for n in (2, 3):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            gg.land_request("land", f"o/r#{n}", [], "host/lane")
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#2"])  # the one worker is busy
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.tick()
+        e = self.q.entries["pr:o/r#1"]
+        self.assertEqual(len(pool.handed), 1)
+        self.assertNotEqual(e["state"], "waiting", "a gated override row never falls into wait_running's hour")
+        self.assertNotIn("overridePinJudged", e)
+        self.assertEqual(self.q.judge_tier(e), 0)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#2", "pr:o/r#1"])  # ahead of o/r#3, queued earlier
+        self.assertTrue(self.q.entries["pr:o/r#1"].get("overridePinJudged"))  # spent now that a worker took it
 
     def test_land_override_pinned_row_whose_merge_is_refused_stops_by_name_not_a_wait(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
@@ -31926,7 +32179,8 @@ class LandTest(Base):
              "requester": "host/lane", "history": [{"at": self.t, "event": "handed_off", "to": "-o"}],
              "stop": {"code": "forward_no_outcome", "at": self.t, "reason": "handed to -o's land queue"}}
         gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
-        other = {**e, "key": "pr:o/r#2", "number": 2, "forwardedTo": "air-blue", "forwardGaveUp": self.t}
+        other = {**e, "key": "pr:o/r#2", "number": 2, "forwardedTo": "air-blue", "forwardGaveUp": self.t,
+                 "forwardAskRepair": self.t}
         gg.write_json(gg.LandQueue.entries_dir() / gg.file_name("pr:o/r#2"), other)
         self.w.config["executor"] = ["ssh", "-o", "ConnectTimeout=5", "cmux-cp-1", "glaeda-gh", "land", "serve"]
         q = self.queue()
@@ -31934,7 +32188,7 @@ class LandTest(Base):
         self.assertEqual((got["state"], got["forwardedTo"], got["history"][0]["to"]),
                          (gg.LAND_FORWARDED, "cmux-cp-1", "cmux-cp-1"))
         self.assertLess(got["forwardFirst"], self.t - gg.LAND_FORWARD_GIVE_UP)
-        self.assertEqual(q.entries["pr:o/r#2"]["state"], "stopped")  # read before it stopped: left as it is
+        self.assertEqual(q.entries["pr:o/r#2"]["state"], "stopped")  # asked and read before it stopped: left as it is
         # once only: a second load leaves the reopened row's marks alone
         again = self.queue().entries[self.KEY]
         self.assertEqual(again["forwardRepaired"], got["forwardRepaired"])
@@ -33952,7 +34206,7 @@ class LandTest(Base):
 
     def test_a_pinned_land_refused_for_quota_with_no_reset_known_is_not_counted(self):
         """No reading or refusal names the reset: the refusals are still not counted (no pin_unread), the PR is read
-        again on the usual cadence; real read errors after them still count and stop it."""
+        again past the refresh hold they set (refresh_outcome); real read errors after them still count and stop it."""
         self.nudge_reads = False
         self.pr(LA)
         self.refuse_for_quota()
@@ -33965,7 +34219,7 @@ class LandTest(Base):
         self.assertIn("pin_read_quota", [h.get("event") for h in e["history"]])
         self.refresh = type(self).refresh.__get__(self)
         self.q.refresh = self.refresh  # real failures ("lane-gh call get: quota" names no spent quota) count
-        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+        for _ in range(int(gg.NUDGE_MIN + gg.LAND_REFRESH_BROKER_HOLD_MAX) * (gg.LAND_PIN_READ_FAILS + 2)):
             e = self.tick(1)
             if e["state"] == "stopped":
                 break
@@ -35539,6 +35793,63 @@ class LandTest(Base):
     def due(self, key: str) -> bool:
         return self.q.refresh_due(self.q.entries[key], self.w.cache[key])
 
+    def batched_refresh_queue(self, answer: str | None = None) -> tuple[list, list]:
+        """held_refresh_queue's queue reading through REFRESH_MANY: (each batch's keys, log rows)."""
+        refreshed, rows = self.held_refresh_queue([answer])
+        batches: list = []
+
+        def many(keys: list[str]) -> dict:
+            batches.append(list(keys))
+            for key in keys:
+                if answer is None:
+                    self.w.set_pr(key, land_pr(LA), self.q.now)
+            return {key: answer for key in keys}
+        self.q.refresh_many = many
+        self.addCleanup(lambda: self.assertEqual(refreshed, [], "no single read"))
+        return batches, rows
+
+    def stale_rows(self, repo: str, numbers: range) -> list[str]:
+        keys = []
+        for n in numbers:
+            key = f"pr:{repo}#{n}"
+            self.pr(LA, key=key)
+            self.w.cache[key]["dataAt"] = self.t - 3600
+            self.q.entries[key] = {"key": key, "repo": repo, "number": n, "state": "queued"}
+            keys.append(key)
+        return keys
+
+    def test_a_pass_reads_its_due_refreshes_in_one_batch_a_repository(self):
+        """cmux-cp-1, 2026-11-25 06:40-07:40Z: 467 land refreshes, one worker and one GraphQL query each. The rows a
+        pass finds due are read together: one job per repository and LAND_REFRESH_BATCH, each row judged after."""
+        batches, rows = self.batched_refresh_queue()
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 61)) + self.stale_rows("o/s", range(1, 4))
+        for key in keys:
+            self.assertTrue(self.due(key))
+            self.assertTrue(self.due(key), "queued: still waiting on its batch, not read twice")
+        self.assertEqual(batches, [])
+        self.q.flush_refreshes()
+        self.assertEqual([len(b) for b in batches], [gg.LAND_REFRESH_BATCH, 60 - gg.LAND_REFRESH_BATCH, 3])
+        self.assertEqual(sorted(k for b in batches for k in b), sorted(keys))
+        self.assertEqual(self.q.refresh_batched, {})
+        self.assertEqual(len([r for r in rows if r["event"] == "land-refresh"]), 63)
+        self.assertEqual([r["n"] for r in rows if r["event"] == "land-refresh-batch"], [50, 10, 3])
+        for key in keys:
+            self.assertFalse(self.due(key), "read: fresh")
+
+    def test_a_batch_refused_for_quota_holds_refreshes_once(self):
+        """A batch whose every read comes back DIRECT_QUOTA sets one hold (as one refused read does), not one a row."""
+        batches, rows = self.batched_refresh_queue(gg.DIRECT_QUOTA)
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 11))
+        for key in keys:
+            self.assertTrue(self.due(key))
+        self.q.flush_refreshes()
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(self.q.refresh_hold["kind"], "quota")
+        self.assertEqual(self.q.refresh_hold["n"], 1)
+        self.assertEqual(len([r for r in rows if r.get("hold")]), 1)
+        self.assertFalse(self.due(self.KEY), "held: no read")
+        self.assertEqual(len(batches), 1)
+
     def test_a_broker_refresh_failure_holds_every_refresh_then_one_probe_ends_it(self):
         """A lane VM, 2026-11-22: 503 refreshes "no answer within 60s" against 120 answered, failing in pairs in the
         same second: each worker spent its own 60 s on one broker outage. One such failure holds the host's
@@ -35593,6 +35904,22 @@ class LandTest(Base):
         error[0] = None
         self.assertTrue(self.due("pr:o/r#2"))
         self.assertIsNone(self.q.refresh_hold)
+        self.assertEqual(refreshed, [self.KEY, "pr:o/r#2"])
+
+    def test_a_quota_refusal_naming_no_reset_holds_every_refresh_then_one_probe(self):
+        """cmux-cp-1, 2026-11-25 05:30-06:30Z: 197 of 440 land refreshes answered DIRECT_QUOTA (no reset named), held
+        nothing, and were sent again on the next pass, one PR 12 times in the hour."""
+        refreshed, rows = self.held_refresh_queue([gg.DIRECT_QUOTA])
+        self.assertTrue(self.due(self.KEY))
+        hold = self.q.refresh_hold
+        self.assertEqual((hold["kind"], hold["n"], hold["until"]),
+                         ("quota", 1, self.q.now + gg.LAND_REFRESH_BROKER_HOLD))
+        self.assertEqual(rows[-1]["hold"]["kind"], "quota")
+        self.assertFalse(self.due("pr:o/r#2"))  # held: judged on its copy, no read
+        self.q.now += gg.LAND_REFRESH_BROKER_HOLD + 1
+        self.assertTrue(self.due("pr:o/r#2"))  # one probe past the hold, refused again: the hold doubles
+        self.assertEqual((self.q.refresh_hold["n"], self.q.refresh_hold["until"]),
+                         (2, self.q.now + 2 * gg.LAND_REFRESH_BROKER_HOLD))
         self.assertEqual(refreshed, [self.KEY, "pr:o/r#2"])
 
     def test_land_status_names_an_entry_whose_refreshes_never_answered(self):
@@ -36965,6 +37292,66 @@ class LandForwardTest(Base):
             e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("big-exec could not be asked", e["stop"]["reason"])
+
+    def gave_up_before_the_ask(self) -> dict:
+        """The forwarded row as the give-up before forward_ask left it: landed again here at LA, then stopped
+        forward_no_outcome, its requester told once (cosmic-gray's rows, 2026-11-25)."""
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardRelanded"] = {"at": self.t, "head": LA, "n": 1, "from": "big-exec"}
+            e["forwardQuietTold"] = {"at": self.t, "to": "big-exec", "by": "forward_give_up"}
+            e["pinSha"] = LA
+            self.q.stop(e, "forward_no_outcome", "handed to big-exec's land queue 7200 s ago with no outcome: the PR is "
+                        "still open; it was landed again here at aaaaaaaaaaaa and that has no outcome either",
+                        "land it again", tell="quiet")
+            e["forwardGaveUp"] = self.t
+            e.pop("forwardAskRepair", None)
+            self.q.save(e)
+        return e
+
+    def test_a_row_stopped_no_outcome_before_the_ask_ends_with_its_executors_merge_quietly_once(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+        self.w.cache.pop(self.KEY, None)
+        self.gave_up_before_the_ask()
+        told = len(self.w.sent())
+        self.q = self.forwarding()  # the daemon's next load repairs it
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e.get("forwardRelanded")), (gg.LAND_FORWARDED, None))
+        self.assertTrue(e["forwardAskRepair"])
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), told)
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_row_stopped_no_outcome_before_the_ask_still_open_at_its_pin_is_landed_again_pinned(self):
+        self.forwarded_to_executor()
+        serve = self.q.forward
+        self.q.forward = lambda cmd, req, deadline: (
+            {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": "big-exec"}
+            if req.get("op") == "batch" else serve(cmd, req, deadline))
+        shutil.rmtree(self.exec_base / "land" / "requests")  # big-exec holds no row of it
+        self.gave_up_before_the_ask()
+        told = len(self.w.sent())
+        self.q = self.forwarding()
+        self.w.view_head = LA
+        e = {}
+        for _ in range(6):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if e.get("forwardRelanded"):
+                break
+        self.assertEqual((e["state"], e["pinSha"], e["forwardRelanded"]["head"]), ("forwarded", LA, LA))
+        self.assertEqual(self.sent_batches[-1]["requests"][0]["sha"], LA)
+        self.assertEqual(len(self.w.sent()), told)
+        # stopped again after the ask: a later load leaves it stopped
+        with self.q.lock:
+            self.q.forward_give_up(self.q.entries[self.KEY], "OPEN", "big-exec", True, "no outcome either")
+        self.assertEqual(self.forwarding().entries[self.KEY]["state"], "stopped")
 
     def test_land_serve_outcomes_answers_rows_requests_and_nothing(self):
         self.forwarded_to_executor()
@@ -43598,6 +43985,53 @@ class MainWatchTriggersFastPatch(unittest.TestCase):
             watch.step()
         self.assertEqual(spawned[0][0], "/main/tools/fast-patch")
 
+
+class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
+    """The land host, 2026-11-25: full-read queries of 2 to 10 cmux PRs 502'd after 10.5 s every tick (the batch size
+    restarts at 10 and grows back on cheap probes), and the land queue's PR data aged past 7,000 s."""
+
+    def daemon(self, per_pr: float):
+        """A daemon whose full PR read costs PER_PR seconds a PR, cut by GitHub at 10.5 s."""
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 1000.0
+        d.reads, d.spill, d.gql_limited, d.sent = [], [], False, []
+        d.probe_ok = lambda e: False
+        d.fail = lambda entries, message: None
+        d.suite_runs = lambda *a, **k: ({}, None)
+        d.rollup_wanted = lambda: frozenset()
+        d.store = lambda *a, **k: None
+        clock = [0.0]
+
+        def graphql(query, variables):
+            n = sum(1 for k in variables if k.startswith("n"))
+            d.sent.append(n)
+            clock[0] += min(10.5, n * per_pr)
+            if n * per_pr > 10:
+                return None, "graphql: timed out (GitHub answered 502 after 10.5s)"
+            return {"data": {}}, None
+        d.graphql = graphql
+        return d, clock
+
+    def entries(self, n):
+        return [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {}} for i in range(1, n + 1)]
+
+    def test_a_slow_repos_full_reads_go_one_to_a_query_after_one_timeout(self):
+        d, clock = self.daemon(5.0)
+        lines = []
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lines.append):
+            self.assertIsNotNone(d.fetch_prs(self.entries(3)))  # nothing measured yet: the whole chunk, cut at 10.5 s
+            self.assertEqual(d.sent, [3])
+            self.assertEqual(lines[-1]["event"], "pr-full-seconds")
+            d.sent.clear()
+            self.assertIsNone(d.fetch_prs(self.entries(4)))
+            self.assertEqual(d.sent, [1, 1, 1, 1])
+
+    def test_a_fast_repo_keeps_its_batch(self):
+        d, clock = self.daemon(0.5)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_prs(self.entries(10)))
+            self.assertIsNone(d.fetch_prs(self.entries(10)))
+        self.assertEqual(d.sent, [10, 10])
 
 if __name__ == "__main__":
     unittest.main()
