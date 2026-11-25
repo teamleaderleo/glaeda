@@ -27226,11 +27226,50 @@ class LandTest(Base):
         self.assertIn("not a merge of main", e["stop"]["reason"])
         self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
 
-    def test_a_run_whose_commits_were_not_all_listed_stops_head_moved(self):
+    def cut_compare(self, mid_parents: list | None = None) -> None:
+        """The compare PIN...HEAD cut at its commit cap: 300 commits, the walk's two not among those listed (a base
+        merge over hundreds of base commits); each walk commit is read alone."""
+        self.base_chain(mid_parents=mid_parents)
+        self.w.api[f"repos/o/r/compare/{LA}...{LB}"] = json.dumps({"s": "ahead", "n": 300, "c": []})
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps([LC, self.LF])
+        self.w.api[f"repos/o/r/commits/{LC}"] = json.dumps(mid_parents or [LA, self.LD])
+
+    def test_a_run_whose_commits_were_not_all_listed_is_read_commit_by_commit_and_followed(self):
+        # 2026-11-25: ~20 PRs stopped head_moved after base merges past #54484's E0062 red, each compare over a
+        # day of feat-cmux-next cut at 250 commits. Leo, 01:36Z: "fix the underlying problems. always"
         self.pinned_and_waiting()
-        self.base_chain(n=300)
+        self.cut_compare()
+        self.w.answers.append(ok_answer(LB))
         e = self.tick(30)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual([(h["was"], h["head"], h["merges"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12], 2)])
+        self.assert_merged_at(LB)
+
+    def test_a_cut_compare_with_a_commit_pushed_in_the_walk_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.cut_compare(mid_parents=[LA])  # LC is one commit on the pin, not a merge
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_cut_compare_whose_walk_commit_read_fails_waits_not_stops(self):
+        self.pinned_and_waiting()
+        self.cut_compare()
+        self.w.api[f"repos/o/r/commits/{LC}"] = None  # the read fails
+        e = self.tick(30)
+        self.assertNotEqual(e["state"], "stopped")
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] == "base_merge_unread"], ["base_merge_unread"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_land_base_merge_chain_reads_only_the_walk_and_needs_a_reader_for_a_cut_list(self):
+        chain = gg.land_base_merge_chain
+        doc = {"s": "ahead", "n": 300, "c": []}
+        self.assertEqual(chain(LA, LB, doc)[0], [])
+        reads = []
+        parents = {LB: [LC, self.LF], LC: [LA, self.LD]}
+        self.assertEqual(chain(LA, LB, doc, lambda sha: reads.append(sha) or parents[sha]), ([self.LF, self.LD], ""))
+        self.assertEqual(reads, [LB, LC])
 
     def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
         self.pinned_and_waiting()

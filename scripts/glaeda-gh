@@ -19582,7 +19582,24 @@ class LandQueue:
         if not isinstance(doc, dict):
             return ("", f"the read of {path} failed (exit {got.returncode}), so its commits are not known", True,
                     f"{got.stdout or ''}\n{got.stderr or ''}", 0)
-        seconds, why = land_base_merge_chain(pin, head, doc)
+
+        def read(sha: str) -> list[str] | None:
+            # a walk commit the compare did not list (its commit cap): its parents alone
+            got = self.call([gh, "api", f"repos/{e['repo']}/commits/{sha}", "--jq", "[.parents[]?.sha]"],
+                            LAND_GH_DEADLINE)
+            try:
+                ps = json.loads(got.stdout or "") if got.returncode == 0 else None
+            except ValueError:
+                ps = None
+            if not isinstance(ps, list):
+                read.said = f"{got.stdout or ''}\n{got.stderr or ''}"  # type: ignore[attr-defined]
+                return None
+            return [str(p) for p in ps]
+
+        try:
+            seconds, why = land_base_merge_chain(pin, head, doc, read)
+        except LandChainUnread as unread:
+            return "", str(unread), True, getattr(read, "said", ""), 0
         for s in dict.fromkeys(seconds) if not why else ():
             path = f"repos/{e['repo']}/compare/{s}...{urllib.parse.quote(base, safe='')}"
             got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
@@ -22324,19 +22341,42 @@ LAND_CHAIN_JQ = "{s: .status, n: .total_commits, c: [.commits[]? | {s: .sha, p: 
 LAND_CHAIN_MAX = 20  # merges one pin follows in one step
 
 
-def land_base_merge_chain(pin: str, head: str, doc: dict) -> tuple[list[str], str]:
+# A compare lists at most 250 commits, and PIN...HEAD over a base merge counts every base commit the merge brought in:
+# on cmux feat-cmux-next a merge of a day's base is hundreds. So a run of base merges was "not all listed" whenever the
+# base had moved far, and stopped head_moved, which is exactly when a land most needs to follow it (2026-11-25: about
+# 20 PRs stopped for hours after their base merges past #54484's E0062 red; Leo, 01:36Z: "fix the underlying problems.
+# always"). Only the first-parent walk decides, never the base commits: a commit of the walk the compare did not list
+# is read on its own (READ: one `commits/SHA` read, parents only), at most LAND_CHAIN_MAX of them, and a read that fails
+# is unread (LandChainUnread: base_merge_unread waits and reads again), never a no.
+class LandChainUnread(Exception):
+    """A commit's parents on the walk could not be read: neither proof nor disproof (base_merge_unread)."""
+
+
+def land_base_merge_chain(pin: str, head: str, doc: dict,
+                          read: Callable[[str], list[str] | None] | None = None) -> tuple[list[str], str]:
     """(the second parents of the merges from HEAD down to PIN along first parents, top first, "") when DOC, GitHub's
     compare PIN...HEAD as LAND_CHAIN_JQ shapes it, shows every commit on that walk a two-parent merge and the walk
-    reaches PIN; else ([], why not). Whether those second parents are on the base is for the caller's reads."""
+    reaches PIN; else ([], why not). A walk commit DOC did not list (a compare cut at its commit cap) is READ (its
+    parents, or None when the read failed: LandChainUnread); with no READ, a cut list is no proof. Whether those second
+    parents are on the base is for the caller's reads."""
     head = str(head or "").lower()
     commits = (doc or {}).get("c")
-    if not isinstance(commits, list) or (doc or {}).get("s") != "ahead" or (doc or {}).get("n") != len(commits):
+    if not isinstance(commits, list) or (doc or {}).get("s") != "ahead":
+        return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
+    complete = (doc or {}).get("n") == len(commits)
+    if not complete and read is None:
         return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
     parents = {str((c or {}).get("s") or "").lower(): [str(p or "").lower() for p in (c or {}).get("p") or []]
                for c in commits if isinstance(c, dict)}
     seconds, cur = [], head
     while land_head_moved(pin, cur):
         ps = parents.get(cur)
+        if ps is None and not complete and read is not None and len(seconds) < LAND_CHAIN_MAX:
+            got = read(cur)
+            if got is None:
+                raise LandChainUnread(f"the parents of {cur[:12]} (not in the compare's {len(commits)} listed of "
+                                      f"{(doc or {}).get('n')}) could not be read")
+            ps = parents[cur] = [str(p or "").lower() for p in got]
         if ps is None or len(ps) != 2 or not all(SHA40.fullmatch(p) for p in ps) or len(seconds) >= LAND_CHAIN_MAX:
             return [], (f"{cur[:12]} between the pin and the head is not a merge of the base (parents "
                         f"{', '.join(p[:12] for p in ps or []) or 'unlisted'}): a push, not base merges on the pin")
