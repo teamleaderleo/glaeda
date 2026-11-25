@@ -14950,6 +14950,43 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
         self.assertIsNone(self.full_gate(capacity).full(fresh=True))
 
+    def test_a_signing_listener_stands_down_while_a_signing_job_holds_or_drains_its_mac(self) -> None:
+        """SIGNER_SIBLING_YIELD, replaying cmux nightly-next 2026-11-25: keep-published-dsyms was handed this Mac's
+        other signing listener while nightly-next-one held the Mac and waited 37.8 min in "Set up runner" with the
+        other signer idle. While a signing job holds the Mac or waits for its drain, the signing listener takes no
+        job, so GitHub hands it to the other signer; an ordinary runner, and an unreadable ledger, change nothing."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(0)
+        script.write_text(base + " --instance 1 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        with mock.patch.object(hook.Gate, "low_disk", return_value=None), \
+                mock.patch.object(hook, "host_waiters", return_value=set()):
+            self.assertIsNone(self.full_gate(capacity).claimed(), "no signing job: it listens")
+            marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+            gate = self.full_gate(capacity)
+            self.assertIn("waits for this mini to drain", gate.claimed() or "")
+            self.assertIn("the other signing Mac", gate.confirmed() or "")
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)  # any other waiter holds nothing
+            self.assertIsNone(self.full_gate(capacity).claimed())
+            marker.unlink()
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+                   for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
+            try:
+                self.assertIn("holds this mini", self.full_gate(capacity).claimed() or "")
+                with mock.patch.object(hook, "exclusive_claim", side_effect=RuntimeError("ledger")):
+                    self.assertIsNone(self.full_gate(capacity).claimed(), "an unreadable ledger holds nothing")
+                script.write_text(base + " --instance 1\n")
+                self.assertNotIn("other signing Mac", self.full_gate(capacity).claimed() or "",
+                                 "an ordinary runner is not held by it")
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            script.write_text(base + " --instance 1 --trusted-next-signing\n")
+            self.assertIsNone(self.full_gate(capacity).claimed(), "listens again once the signing job lets go")
+
     def test_the_signing_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
         """SIGNER_FIRST, replaying cmux15's 2026-11-22 06:12-07:18Z gate log: "stopping the idle listener: a fleet
         build holds the host lock" on both signing runners every 5 minutes, then 60 s offline. The holder was

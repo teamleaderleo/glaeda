@@ -11433,7 +11433,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def host_claim(self) -> str | None:
@@ -11462,6 +11462,21 @@ class Gate:
             return exclusive_claim(self.capacity_dir)
         except Exception:  # noqa: BLE001
             return None
+
+    def signer_yield(self) -> str | None:
+        """SIGNER_SIBLING_YIELD: why an idle trusted signing listener takes no job now, or None. While a signing job
+        (the exclusive class) holds this Mac or waits for it to drain, a job handed to this Mac's other signing
+        listener waits in job-started for the whole signing; held off, GitHub hands it to the other signing Mac's
+        idle listener instead. cmux nightly-next, 2026-11-25: keep-published-dsyms waited 37.8 min in "Set up runner"
+        behind nightly-next-one on the same Mac while the other signer sat idle from the start (run 45567575338),
+        sign-live-code-variant 16.7 min (run 45562645699). A ledger that cannot be read holds nothing."""
+        if self.capacity_dir is None or not runner_scope(self.runner_dir).trusted_signing:
+            return None
+        try:
+            why = exclusive_claim(self.capacity_dir)
+        except Exception:  # noqa: BLE001
+            return None
+        return f"{why}; the next signing job goes to the other signing Mac" if why else None
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -12034,7 +12049,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
