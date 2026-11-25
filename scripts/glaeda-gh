@@ -21680,7 +21680,11 @@ class LandQueue:
         act = land_action(answer, head)
         # A base-changing step on a stale copy: the base change can be the PR's own merge commit (hq#13226). Read
         # before the refusal counts, so a finished PR never reaches the identical-refusal stop.
-        if not self.state_first(e, act.get("kind")):
+        # A refusal (any code that is not ok) can end in a stop, and a stop on a finished PR is wrong whatever its
+        # code: cmux#51248 merged 08:31Z and stopped "conflict" 09:30Z, cmux#52236 (closed) stopped checks_stuck,
+        # cmux#55597 (merged) own_red, 2026-11-25. The cache that consider read was an OPEN copy and a host with its
+        # own login never reads state first, so the state is read here, before the verdict is acted on (refused).
+        if not self.state_first(e, act.get("kind"), refused=not answer.get("ok")):
             with self.lock:
                 self.count("explain")
             return
@@ -22506,7 +22510,8 @@ class LandQueue:
         whether that decided nothing about HEAD). An unread PR is no answer about its branch: one land queue, 2026-11-25,
         stopped leo-workspace#10571 update_branch_conflict in the same second its first full read landed,
         and #10649 and #10864 3.5 and 14 min before theirs, each stop terminal with a next step naming no file (46 of
-        127 stopped rows were conflict stops, 41 of them naming no file at all)."""
+        127 stopped rows were conflict stops, 41 of them naming no file at all). A read that carries no ref names is
+        the same nothing: union_refs asks for the two names alone (another queue's #10997, #10659, #11038, #11192)."""
         key = e["key"]
         data = (self.cache_of(key) or {}).get("data") or {}
         branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
@@ -22532,6 +22537,8 @@ class LandQueue:
                     said = describe(error)
                 data = (self.cache_of(key) or {}).get("data") or {}
                 branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+                if not branch or not base:  # a full read that carried no ref names: ask for the two names alone
+                    branch, base = self.union_refs(e, branch, base)
                 said = said or str((e.get("refresh") or {}).get("error") or "it named no branch")
             if not branch or not base:
                 return "", "", f"this host has no read of {key_name(key)}'s branch or base: {said}", True
@@ -22743,6 +22750,19 @@ class LandQueue:
         pre = [f"--attr-source={attrs}"] if attrs else []  # core.attributesFile off: only that tree's attributes
         return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e,
                          extra)
+
+    def union_refs(self, e: dict, branch: str, base: str) -> tuple[str, str]:
+        """(branch, base) of E's PR from one `pr view` through the gh shim (its cache first), keeping BRANCH and BASE
+        where the read gives nothing: what union_plan merges when the cached row lacks them."""
+        gh = self.gh()
+        if gh is None:
+            return branch, base
+        got = self.call([gh, "pr", "view", str(e["number"]), "-R", e["repo"], "--json", "headRefName,baseRefName"],
+                        LAND_GH_DEADLINE, e)
+        with contextlib.suppress(ValueError, AttributeError):
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else {}
+            return str(doc.get("headRefName") or branch), str(doc.get("baseRefName") or base)
+        return branch, base
 
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
         """(merge commit, the PR's branch, base sha, "") when git's merge of the base into HEAD, honoring the base's
@@ -23665,11 +23685,12 @@ class LandQueue:
                     float(e.get("stateReadAt") or 0))
         return self.now - fresh >= LAND_REFRESH_AFTER
 
-    def state_first(self, e: dict, kind: str | None) -> bool:
+    def state_first(self, e: dict, kind: str | None, refused: bool = False) -> bool:
         """Outside the lock. When state_due, read the PR's state before KIND is taken: True to go on (it reads OPEN,
         or no read was due); False when the entry ended (ended), was parked on quota, or waits to read it again."""
         with self.lock:
-            if not self.state_due(e, kind):
+            hard = self.state_due(e, kind)
+            if not hard and not refused:
                 return True
         state, merge_sha, why = self.read_state(e)
         with self.lock:
@@ -23687,6 +23708,8 @@ class LandQueue:
                     e["stateOpen"] = seen.get("head") or e.get("head") or ""  # its next "closed" refusal counts
                 self.save(e)
                 return True
+            if not hard:
+                return True  # a refusal's look at the state that read nothing: the verdict goes on, as before the look
             if LAND_STEP_QUOTA.search(why):
                 self.park_quota(e, why)  # the login's state, not the PR's: parked, never counted
                 e["stepQuotaParked"] = True
@@ -35090,19 +35113,34 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
-def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int) -> str | None:
+RERUN_RATE_LIMITED = re.compile(r"rate limit (?:already )?exceeded|rate limit is spent|secondary rate limit"
+                                r"|abuse detection|submitted too quickly", re.I)
+
+
+def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int,
+                    err: str = "") -> str | None:
     """What to say when a brokered `gh run rerun` exits non-zero, else None.
 
     GitHub refuses a rerun outright for a run it will not retry ("run N cannot be rerun; This workflow run cannot be
     retried": the run is too old, its workflow file moved, or its attempts are used up), and gh names nothing that
     does work. 2026-11-22 an hq run was refused that way after a cancelled job, and the refusal read as "the rerun
     did nothing": the caller waited again on a red that a newer run had already replaced. Name the two steps that
-    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does."""
+    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does.
+
+    A refusal GitHub gave for the *caller* is not that. 2026-11-25 two reruns of manaflow-ai/cmuxterm-hq#26366's
+    infra-red jobs answered "HTTP 403: API rate limit exceeded for installation ...", and this line called them runs
+    GitHub will not retry and told the caller to push the head again -- a new head for a run that was never the
+    problem. The run is fine; the identity is out of calls. ERR is gh's stderr, so the two read apart."""
     if rc == 0 or not is_run_rerun(words):
         return None
     run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
     named = f"{repo}/{run_id}" if repo and run_id else (repo or "that run")
     where = f" -R {repo}" if repo else ""
+    if RERUN_RATE_LIMITED.search(err or ""):
+        return (f"glaeda-gh: that rerun was refused by a rate limit, not by the run (gh exited {rc}): "
+                f"{gh_said(err, 160)}. The run is still rerunnable; this host's gh calls are spent. "
+                f"next: glaeda-gh budget # whose bucket and its reset; wait for it "
+                f"(glaeda-gh wait until quota), then rerun {named} again. Do not push a new head for it.")
     return (f"glaeda-gh: that rerun did not take (gh exited {rc}): a run GitHub will not retry (too old, its "
             f"workflow file moved, every attempt used) needs a new run, not a rerun. "
             f"next: glaeda-gh status run {named} --jobs # a newer run may already stand in for it; else push the "
@@ -35114,9 +35152,9 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
     flight outlives it (a rerun's run entry too: note_run_rerun)."""
     try:
-        rc, _out, _err = gh_cache_child(real, args, False, None)
+        rc, _out, err = gh_cache_child(real, args, False, None)
         ran.append(rc)
-        said = rerun_next_step(repo, scopes, words or [], rc)
+        said = rerun_next_step(repo, scopes, words or [], rc, err if isinstance(err, str) else "")
         if said:
             print(said, file=sys.stderr)
     finally:

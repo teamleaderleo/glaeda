@@ -12203,6 +12203,27 @@ class RerunRefusedNextStepTest(unittest.TestCase):
         self.assertIsNotNone(said)
         self.assertIn("that run", said)
 
+    RATE_LIMIT = ("failed to get run: HTTP 403: API rate limit exceeded for installation ID 184262365. If you reach "
+                  "out to GitHub Support for help, please include the request ID C3B2:3C6127 and timestamp "
+                  "2026-11-25 16:48:38 UTC")
+
+    def test_a_rate_limit_is_not_an_unretryable_run(self) -> None:
+        """manaflow-ai/cmuxterm-hq#26366, 2026-11-25: two reruns answered HTTP 403 "API rate limit exceeded for
+        installation", and this line called them runs GitHub will not retry and said to push the head again. The
+        run is fine; the identity is out of calls. Name the wait, not a new head."""
+        said = gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 1, self.RATE_LIMIT)
+        self.assertIsNotNone(said)
+        self.assertIn("rate limit", said)
+        self.assertNotIn("push the head again", said)
+        self.assertNotIn("every attempt used", said)
+        self.assertIn("glaeda-gh budget", said)
+
+    def test_any_other_stderr_still_reads_as_unretryable(self) -> None:
+        said = gg.rerun_next_step("o/r", ["run 50"], ["run", "rerun", "50"], 1,
+                                  "run 50 cannot be rerun; This workflow run cannot be retried")
+        self.assertIsNotNone(said)
+        self.assertIn("push the head again", said)
+
 
 class WaitPrNotMergedTest(Base):
     """manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr
@@ -26113,6 +26134,7 @@ class LandWorld:
         self.view_err: str | None = None  # a state read that fails, with these words
         self.view_head: str | None = None  # the headRefOid a `pr view --json headRefOid,...` answers (None: no field)
         self.body = ""  # the PR body a `pr view --json body --jq .body` read answers
+        self.view_refs: dict | None = None  # what a `pr view --json headRefName,baseRefName` answers (None: it fails)
         self.raise_on: str | None = None
         self.nudged: list[str] = []
         self.refreshed: list[str] = []
@@ -26206,10 +26228,15 @@ class LandWorld:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"s": "diverged", "b": 1}) + "\n", "")
             if words[:2] == ["pr", "view"] and words[-4:-2] == ["--json", "body"]:
                 return subprocess.CompletedProcess(argv, 0, self.body + "\n", "")
+            if words[:2] == ["pr", "view"] and words[-2:] == ["--json", "headRefName,baseRefName"]:
+                return subprocess.CompletedProcess(argv, 0 if self.view_refs else 1, json.dumps(self.view_refs or {}),
+                                                   "" if self.view_refs else "HTTP 502")
             if words[:2] == ["pr", "view"]:
                 merged = any((c[1:3] == ["pr", "merge"] or c[:3] == ["/fake/lane-gh", "call", "land"]
                               or (c[1:4] == ["api", "-X", "PUT"] and c[4].endswith("/merge")))
-                             and self.gh_rc.get("merge", 0) == 0 for c in self.calls)
+                             and self.gh_rc.get("merge", 0) == 0
+                             and re.search(rf"(?<![\w]){re.escape(words[2])}(?![\w])", " ".join(map(str, c)))
+                             for c in self.calls)  # this PR's merge: another PR's does not finish it
                 if self.view_err is not None:
                     return subprocess.CompletedProcess(argv, 1, "", self.view_err)
                 state = self.view_state or ("MERGED" if merged and self.merged_on_merge else "OPEN")
@@ -26508,14 +26535,11 @@ class LandTest(Base):
         self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
         self.w.view_state = "MERGED"
         e = self.tick()
-        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)
-        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stepFail")), ("waiting", "retry", None))
-        self.assertEqual(e["closedSeen"]["head"], LA)
-        for _ in range(4):
-            e = self.tick(30)
+        # the refused judgment reads the state first (refused): it ends merged with no update sent, none refused
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
-        self.assertEqual((len(self.w.gh_calls("pr", "update-branch")), len(self.w.explains())), (1, 1))
-        self.assertIsNone(e.get("streak"))  # a refusal naming update-branch never counts toward the 3-refusal stop
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertIsNone(e.get("streak"))
         self.assertEqual([m[-1] for m in self.w.sent()], ["glaeda land: https://github.com/o/r/pull/1 merged at "
                                                           + "f" * 40])
 
@@ -26559,13 +26583,32 @@ class LandTest(Base):
         self.w.answers += [self.tip_merge() for _ in range(3)]
         self.w.gh_rc["update"], self.w.gh_err["update"] = 1, self.CLOSED_REFUSAL
         self.w.view_state = "CLOSED"
-        self.tick()
-        for _ in range(3):
-            e = self.tick(30)
+        e = self.tick()
         self.assertEqual((e["state"], e["stop"]["code"], e["stop"]["next"]), ("stopped", "closed", ""))
         self.assertIn("closed unmerged", e["stop"]["reason"])
-        self.assertEqual(len(self.w.gh_calls("pr", "update-branch")), 1)
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"), [])
         self.assertNotIn("next:", self.w.sent()[-1][-1])
+
+    def test_a_refusal_of_any_code_on_a_pr_that_finished_ends_it_final_with_no_stop_notice(self):
+        # cmux#51248 (merged 08:31Z) stopped "conflict", cmux#52236 (closed) "checks_stuck", cmux#55597 (merged)
+        # "own_red", 2026-11-25: the cache said OPEN, the queue (its own login: no state read before a refusal) judged
+        # a finished PR and stopped it. A refused judgment reads the state before it is acted on.
+        for code, view, state, shas in (("conflict", "MERGED", "merged", ""), ("checks_stuck", "CLOSED", "stopped", ""),
+                                        ("own_red", "MERGED", "merged", "")):
+            with self.subTest(code=code):
+                self.q = self.queue()
+                self.pr(LA)
+                self.land()
+                self.w.answers.append(refusal(code, LA, {"kind": "retry"}, nxt="fix it"))
+                self.w.view_state = view
+                e = self.tick()
+                for _ in range(2):
+                    e = self.tick(30)
+                self.assertEqual(e["state"], state)
+                if state == "stopped":
+                    self.assertEqual(e["stop"]["code"], "closed")
+                self.assertNotIn(code, json.dumps(e.get("stop") or {}))
+                self.assertFalse([m for m in self.w.sent() if code in m[-1]])
 
     def test_the_cache_showing_merged_or_closed_ends_the_entry_with_no_step(self):
         for state, want in (("MERGED", "merged"), ("CLOSED", "stopped")):
@@ -32207,6 +32250,42 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
 
+    def test_a_judge_conflict_whose_cached_row_has_no_ref_names_reads_them_and_merges(self):
+        """leo-workspace#10997, #10659, #11038, #11192, 2026-11-25: conflicts_base, and the base merge was skipped as
+        "the PR's branch '' or base '' is not read or not a plain branch name": the cached row held no ref names. The
+        queue reads them once (pr view) and merges."""
+        head, base = self.union_origin(main_path="goals/y.md")
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head, mergeable="CONFLICTING"), self.t)  # no headRefName, no baseRefName
+        self.w.view_refs = {"headRefName": "lane/x", "baseRefName": "main"}
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        e = self.tick()
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(len(self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefName,baseRefName")), 1)
+
+    def test_a_judge_conflict_whose_ref_names_cannot_be_read_stops_saying_so_and_retries(self):
+        head, _ = self.union_origin(main_path="goals/y.md")
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head, mergeable="CONFLICTING"), self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        e = self.tick()
+        self.assertEqual(e["state"], "stopped")
+        self.assertIn("could not be read", " ".join(h.get("why", "") for h in e["history"]))
+        self.assertNotIn("unionMerge", e)  # decided nothing: a re-land at this head tries the merge again
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
+
     def test_a_judge_conflict_in_merge_union_files_only_is_merged_here(self):
         head, base = self.union_origin()  # both appended to goals/x.md, which main's .gitattributes marks merge=union
         e = self.judge_conflict_tick(head)
@@ -33922,6 +34001,7 @@ class LandTest(Base):
     def refuse_merges(self, text: str) -> list:
         """Every `gh pr merge` the queue sends is refused with TEXT (exit 1); the list of those sent."""
         real, refused = self.q.run, []
+        self.w.gh_rc["merge"] = 1  # every merge sent is refused: the fake's state read must not see a merged PR
 
         def run(argv, timeout, env):
             if argv[1:3] == ["pr", "merge"]:
