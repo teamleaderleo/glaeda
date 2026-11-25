@@ -32046,7 +32046,8 @@ class LandTest(Base):
              "requester": "host/lane", "history": [{"at": self.t, "event": "handed_off", "to": "-o"}],
              "stop": {"code": "forward_no_outcome", "at": self.t, "reason": "handed to -o's land queue"}}
         gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY), e)
-        other = {**e, "key": "pr:o/r#2", "number": 2, "forwardedTo": "air-blue", "forwardGaveUp": self.t}
+        other = {**e, "key": "pr:o/r#2", "number": 2, "forwardedTo": "air-blue", "forwardGaveUp": self.t,
+                 "forwardAskRepair": self.t}
         gg.write_json(gg.LandQueue.entries_dir() / gg.file_name("pr:o/r#2"), other)
         self.w.config["executor"] = ["ssh", "-o", "ConnectTimeout=5", "cmux-cp-1", "glaeda-gh", "land", "serve"]
         q = self.queue()
@@ -32054,7 +32055,7 @@ class LandTest(Base):
         self.assertEqual((got["state"], got["forwardedTo"], got["history"][0]["to"]),
                          (gg.LAND_FORWARDED, "cmux-cp-1", "cmux-cp-1"))
         self.assertLess(got["forwardFirst"], self.t - gg.LAND_FORWARD_GIVE_UP)
-        self.assertEqual(q.entries["pr:o/r#2"]["state"], "stopped")  # read before it stopped: left as it is
+        self.assertEqual(q.entries["pr:o/r#2"]["state"], "stopped")  # asked and read before it stopped: left as it is
         # once only: a second load leaves the reopened row's marks alone
         again = self.queue().entries[self.KEY]
         self.assertEqual(again["forwardRepaired"], got["forwardRepaired"])
@@ -37085,6 +37086,66 @@ class LandForwardTest(Base):
             e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_no_outcome"))
         self.assertIn("big-exec could not be asked", e["stop"]["reason"])
+
+    def gave_up_before_the_ask(self) -> dict:
+        """The forwarded row as the give-up before forward_ask left it: landed again here at LA, then stopped
+        forward_no_outcome, its requester told once (cosmic-gray's rows, 2026-11-25)."""
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardRelanded"] = {"at": self.t, "head": LA, "n": 1, "from": "big-exec"}
+            e["forwardQuietTold"] = {"at": self.t, "to": "big-exec", "by": "forward_give_up"}
+            e["pinSha"] = LA
+            self.q.stop(e, "forward_no_outcome", "handed to big-exec's land queue 7200 s ago with no outcome: the PR is "
+                        "still open; it was landed again here at aaaaaaaaaaaa and that has no outcome either",
+                        "land it again", tell="quiet")
+            e["forwardGaveUp"] = self.t
+            e.pop("forwardAskRepair", None)
+            self.q.save(e)
+        return e
+
+    def test_a_row_stopped_no_outcome_before_the_ask_ends_with_its_executors_merge_quietly_once(self):
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.pr(LA)
+        self.w.answers.append(ok_answer(LA))
+        self.exec_tick(x)
+        self.assertEqual(x.entries[self.KEY]["state"], "merged")
+        self.w.cache.pop(self.KEY, None)
+        self.gave_up_before_the_ask()
+        told = len(self.w.sent())
+        self.q = self.forwarding()  # the daemon's next load repairs it
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e.get("forwardRelanded")), (gg.LAND_FORWARDED, None))
+        self.assertTrue(e["forwardAskRepair"])
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(len(self.w.sent()), told)
+        self.assertEqual(len(self.sent_batches), 1)
+
+    def test_a_row_stopped_no_outcome_before_the_ask_still_open_at_its_pin_is_landed_again_pinned(self):
+        self.forwarded_to_executor()
+        serve = self.q.forward
+        self.q.forward = lambda cmd, req, deadline: (
+            {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": "big-exec"}
+            if req.get("op") == "batch" else serve(cmd, req, deadline))
+        shutil.rmtree(self.exec_base / "land" / "requests")  # big-exec holds no row of it
+        self.gave_up_before_the_ask()
+        told = len(self.w.sent())
+        self.q = self.forwarding()
+        self.w.view_head = LA
+        e = {}
+        for _ in range(6):
+            e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if e.get("forwardRelanded"):
+                break
+        self.assertEqual((e["state"], e["pinSha"], e["forwardRelanded"]["head"]), ("forwarded", LA, LA))
+        self.assertEqual(self.sent_batches[-1]["requests"][0]["sha"], LA)
+        self.assertEqual(len(self.w.sent()), told)
+        # stopped again after the ask: a later load leaves it stopped
+        with self.q.lock:
+            self.q.forward_give_up(self.q.entries[self.KEY], "OPEN", "big-exec", True, "no outcome either")
+        self.assertEqual(self.forwarding().entries[self.KEY]["state"], "stopped")
 
     def test_land_serve_outcomes_answers_rows_requests_and_nothing(self):
         self.forwarded_to_executor()
