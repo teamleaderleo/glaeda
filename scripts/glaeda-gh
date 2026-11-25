@@ -803,6 +803,13 @@ LAND_NUDGE_MIN = 3  # a land-queue PR a check event nudged: its read is what the
 FEED_STREAM_WAIT = 25  # seconds one FeedStream long-poll of the controller's change feed holds open (its max is 300)
 FEED_STREAM_BACKSTOP = 40  # the feed poll's gap while a FeedStream answers (under CONTROLLER_FRESH: downstream views stay fresh)
 FEED_STREAM_RETRY = 10  # seconds a FeedStream waits after a failed long-poll; the CONTROLLER_FEED_EVERY poll serves meanwhile
+# The controller's commit status feed (GET /v1/github/statuses, cmuxterm-hq#25486; hq#25251). A status delivery never
+# reached the change feed, so a PR whose last check was a commit status was judged on its 1800 s timer (a head's first
+# judgment after its last check finished: median 31 min, p90 190 min, 2026-11-25). Each feed read also reads the
+# statuses after the status feed's own cursor, as page items like a suite's (feed_mark, nudge: LAND_EVENT_JUDGE), and
+# a second FeedStream long-polls it. A controller without the route, or a failed read, never takes the controller out:
+# only the status feed is left alone, for STATUS_FEED_OFF (no route) or FEED_STREAM_RETRY (anything else).
+STATUS_FEED_OFF = 3600
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
 # GraphQL diet (2026-11-01: the daemons on huge-blue and cosmic-gray spent 938 and 833 GraphQL queries an hour, the
 # account's biggest spenders, while their clients read about two dozen PRs). A watch nobody has read lately is
@@ -4778,6 +4785,18 @@ class Controller:
             raise WatchError("controller: feed without a cursor")
         return doc
 
+    def statuses(self, since: int | None, wait: int = 0) -> dict:
+        """The commit status feed after cursor `since` (its own cursor, not the change feed's), or only the cursor when
+        since is None; WAIT > 0 long-polls as events does (STATUS_FEED_OFF)."""
+        path = "/v1/github/statuses?since=" + ("latest" if since is None else str(int(since)))
+        if wait > 0 and since is not None:
+            doc = self.get(f"{path}&wait={int(wait)}", timeout=int(wait) + CONTROLLER_READ_TIMEOUT)
+        else:
+            doc = self.get(path)
+        if not isinstance(doc.get("cursor"), int) or doc["cursor"] < 0:
+            raise WatchError("controller: status feed without a cursor")
+        return doc
+
     def run_jobs(self, repo: str, run_id: int, attempt: int) -> dict:
         """The jobs of one run attempt the controller holds (workflow_job deliveries): known false when none."""
         return self.get(f"/v1/github/run-jobs?repo={urllib.parse.quote(repo, safe='/')}"
@@ -6056,6 +6075,9 @@ class Daemon:
         self.rollup_down_until = 0.0
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
+        self.status_cursor: int | None = None  # the controller's commit status feed (STATUS_FEED_OFF)
+        self.status_feed_off_until = 0.0
+        self.status_feed_error: str | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
@@ -12778,6 +12800,36 @@ class Daemon:
             self.controller_cursor = doc["cursor"]
             if not doc.get("more"):
                 break
+        if self.controller_feed_error is None:
+            pages += self.read_statuses()
+        return pages
+
+    def read_statuses(self) -> list[dict]:
+        """The status feed's pages after status_cursor, each {"statuses": [...]} (STATUS_FEED_OFF). Never raises: a
+        failure leaves the status feed alone for a while and the change feed as it was. The first read and a reset
+        only learn the cursor: what came before is not known, and the timers cover it as before."""
+        if self.controller is None or self.now < self.status_feed_off_until or not self.controller_room():
+            return []
+        pages: list[dict] = []
+        try:
+            for _ in range(FEED_PAGES):
+                if self.status_cursor is None:
+                    self.status_cursor = self.controller.statuses(None)["cursor"]
+                    break
+                doc = self.controller.statuses(self.status_cursor)
+                self.status_cursor = doc["cursor"]
+                if doc.get("reset"):
+                    break
+                if doc.get("statuses"):
+                    pages.append({"statuses": [s for s in doc["statuses"] if isinstance(s, dict)]})
+                if not doc.get("more") or not self.controller_room():
+                    break
+        except Exception as error:  # noqa: BLE001  the status feed is an extra: it never fails the feed read
+            self.status_feed_error = describe(error)
+            absent = isinstance(error, (NoReceiver, AttributeError))  # (an older controller, or a stand-in without it)
+            self.status_feed_off_until = self.now + (STATUS_FEED_OFF if absent else FEED_STREAM_RETRY)
+        else:
+            self.status_feed_error = None
         return pages
 
     def follow_controller(self) -> None:
@@ -12797,6 +12849,7 @@ class Daemon:
              "to": getattr(current, "base", None)})
         self.controller = current
         self.controller_cursor, self.controller_seen, self.feed_held = None, {}, []
+        self.status_cursor, self.status_feed_off_until = None, 0.0
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.feed_marks, self.feed_live_since = {}, None
@@ -12830,16 +12883,20 @@ class Daemon:
             return None
         return {"live": stream.live(time.time()), "okAt": round(stream.ok_at, 3) if stream.ok_at > 0 else None,
                 "signals": stream.signals, "reads": getattr(self, "feed_stream_reads", 0),
-                "landEventNudges": getattr(self, "land_event_nudges", 0), "error": stream.error}
+                "landEventNudges": getattr(self, "land_event_nudges", 0), "error": stream.error,
+                "statusCursor": getattr(self, "status_cursor", None),
+                "statusError": getattr(self, "status_feed_error", None)
+                or getattr(getattr(self, "status_stream", None), "error", None)}
 
     def feed_stream_due(self, now: float) -> bool:
         """Whether the feed is read now: the FeedStream named an event after the cursor (read at once, and its flag is
         taken), or the poll's gap passed: CONTROLLER_FEED_EVERY, or FEED_STREAM_BACKSTOP while the stream answers."""
         stream = getattr(self, "feed_stream", None)
-        if stream is not None and stream.ready.is_set() and self.controller_cursor is not None:
-            stream.ready.clear()
-            self.feed_stream_reads = getattr(self, "feed_stream_reads", 0) + 1
-            return True
+        for named in (stream, getattr(self, "status_stream", None)):
+            if named is not None and named.ready.is_set() and self.controller_cursor is not None:
+                named.ready.clear()
+                self.feed_stream_reads = getattr(self, "feed_stream_reads", 0) + 1
+                return True
         gap = FEED_STREAM_BACKSTOP if stream is not None and stream.live(time.time()) else CONTROLLER_FEED_EVERY
         return now - self.controller_feed_at >= gap
 
@@ -12918,7 +12975,8 @@ class Daemon:
             self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
         self.controller_ok_at = self.now
         for page in pages:
-            for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
+            for item in ((page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or [])
+                         + (page.get("statuses") or [])):
                 repo = str(item.get("repo") or "").lower()
                 if "/" in repo:
                     self.fed_repos[repo] = self.now
@@ -13270,9 +13328,9 @@ class Daemon:
         e["cache"] = read_cache(e["key"])
 
     def nudge(self, entries: list[dict], page: dict) -> None:
-        """Mark watched PRs whose head commit or branch had a run or check suite event."""
+        """Mark watched PRs whose head commit or branch had a run, check suite or commit status event."""
         touched: set[tuple[str, str]] = set()
-        for item in (page.get("runs") or []) + (page.get("suites") or []):
+        for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("statuses") or []):
             repo = str(item.get("repo") or "").lower()
             touched.add((repo, "sha:" + str(item.get("head_sha") or "").lower()))
             if item.get("head_branch"):
@@ -24287,8 +24345,9 @@ class FeedStream:
     through its own path, as every poll did. The poll stays as the backstop at FEED_STREAM_BACKSTOP while this answers.
     GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves, as before)."""
 
-    def __init__(self, daemon: Any, wake: threading.Event | None, wait: int = FEED_STREAM_WAIT):
+    def __init__(self, daemon: Any, wake: threading.Event | None, wait: int = FEED_STREAM_WAIT, kind: str = "events"):
         self.daemon, self.wake, self.wait = daemon, wake, wait
+        self.kind = kind  # "events", or "statuses": the status feed, on its own cursor (STATUS_FEED_OFF)
         self.ready = threading.Event()
         self.client: Controller | None = None  # its own: Controller.get reads budget_end, which the tick sets on its copy
         self.ok_at = float("-inf")  # time.time() of its last answer
@@ -24306,7 +24365,12 @@ class FeedStream:
     def step(self) -> float:
         """One long-poll; the seconds to pause before the next."""
         d = self.daemon
+        attr = "status_cursor" if self.kind == "statuses" else "controller_cursor"
         ctl, cursor = getattr(d, "controller", None), getattr(d, "controller_cursor", None)
+        if self.kind == "statuses":
+            if float(getattr(d, "now", 0.0) or 0.0) < float(getattr(d, "status_feed_off_until", 0.0) or 0.0):
+                return 2.0  # the status feed is left alone for now (read_statuses)
+            cursor = getattr(d, attr, None) if cursor is not None else None
         if (not self.enabled() or ctl is None or cursor is None
                 or time.time() < float(getattr(d, "controller_down_until", 0.0) or 0.0)):
             return 2.0  # no feed followed yet (or it is out): the tick's own read starts it
@@ -24318,15 +24382,16 @@ class FeedStream:
         self.client.token = ctl.token
         began = time.monotonic()
         try:
-            doc = self.client.events(cursor, wait=self.wait)
+            read = self.client.statuses if self.kind == "statuses" else self.client.events
+            doc = read(cursor, wait=self.wait)
         except Exception as error:  # noqa: BLE001  the poll serves while it is out
             self.error = describe(error)
             return FEED_STREAM_RETRY
         self.ok_at, self.error = time.time(), None
-        if getattr(d, "controller_cursor", None) != cursor:
+        if getattr(d, attr, None) != cursor:
             return 0.0  # the tick read the feed meanwhile: wait from its cursor
         if (doc.get("reset") or doc.get("cursor") != cursor or doc.get("runs") or doc.get("suites")
-                or doc.get("comments")):
+                or doc.get("comments") or doc.get("statuses")):
             self.signals += 1
             self.ready.set()
             if self.wake is not None:
@@ -24667,6 +24732,8 @@ def serve(foreground_ok: bool = False) -> int:
     threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
     daemon.feed_stream = FeedStream(daemon, wake.event)
     threading.Thread(target=daemon.feed_stream.run, name="glaeda-gh-feed-stream", daemon=True).start()
+    daemon.status_stream = FeedStream(daemon, wake.event, kind="statuses")
+    threading.Thread(target=daemon.status_stream.run, name="glaeda-gh-status-stream", daemon=True).start()
     last = None
     while True:
         try:
