@@ -43780,5 +43780,52 @@ class MainWatchTriggersFastPatch(unittest.TestCase):
         self.assertEqual(spawned[0][0], "/main/tools/fast-patch")
 
 
+class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
+    """The land host, 2026-11-25: full-read queries of 2 to 10 cmux PRs 502'd after 10.5 s every tick (the batch size
+    restarts at 10 and grows back on cheap probes), and the land queue's PR data aged past 7,000 s."""
+
+    def daemon(self, per_pr: float):
+        """A daemon whose full PR read costs PER_PR seconds a PR, cut by GitHub at 10.5 s."""
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now = 1000.0
+        d.reads, d.spill, d.gql_limited, d.sent = [], [], False, []
+        d.probe_ok = lambda e: False
+        d.fail = lambda entries, message: None
+        d.suite_runs = lambda *a, **k: ({}, None)
+        d.rollup_wanted = lambda: frozenset()
+        d.store = lambda *a, **k: None
+        clock = [0.0]
+
+        def graphql(query, variables):
+            n = sum(1 for k in variables if k.startswith("n"))
+            d.sent.append(n)
+            clock[0] += min(10.5, n * per_pr)
+            if n * per_pr > 10:
+                return None, "graphql: timed out (GitHub answered 502 after 10.5s)"
+            return {"data": {}}, None
+        d.graphql = graphql
+        return d, clock
+
+    def entries(self, n):
+        return [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {}} for i in range(1, n + 1)]
+
+    def test_a_slow_repos_full_reads_go_one_to_a_query_after_one_timeout(self):
+        d, clock = self.daemon(5.0)
+        lines = []
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lines.append):
+            self.assertIsNotNone(d.fetch_prs(self.entries(3)))  # nothing measured yet: the whole chunk, cut at 10.5 s
+            self.assertEqual(d.sent, [3])
+            self.assertEqual(lines[-1]["event"], "pr-full-seconds")
+            d.sent.clear()
+            self.assertIsNone(d.fetch_prs(self.entries(4)))
+            self.assertEqual(d.sent, [1, 1, 1, 1])
+
+    def test_a_fast_repo_keeps_its_batch(self):
+        d, clock = self.daemon(0.5)
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_prs(self.entries(10)))
+            self.assertIsNone(d.fetch_prs(self.entries(10)))
+        self.assertEqual(d.sent, [10, 10])
+
 if __name__ == "__main__":
     unittest.main()
