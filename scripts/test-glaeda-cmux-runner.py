@@ -4816,7 +4816,8 @@ class HookTest(unittest.TestCase):
                  ("fast-tier", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("swift-test", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("daemon-test", self.FAST_TIER, "manaflow-ai/cmux"),
-                 ("app-compile-fleet", other, "manaflow-ai/cmux"),
+                 # the bare id of a -fleet client builds on a Mac
+                 ("app-compile", other, "manaflow-ai/cmux"),
                  # an eval's job id from another workflow is not its client
                  ("bench", self.FAST_TIER, "manaflow-ai/cmux"),
                  ("eval", other, "manaflow-ai/cmux"),
@@ -4825,7 +4826,10 @@ class HookTest(unittest.TestCase):
                  ("capture", other, "manaflow-ai/cmux"),
                  ("build", gallery, "manaflow-ai/cmux"),
                  ("capture", guest_gallery, "manaflow-ai/cmuxterm-hq"),
-                 ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"))
+                 ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"),
+                 # a guest's -fleet job is not a home-repository client, and a bare "-fleet" is no job id
+                 ("link-ffi-fleet", other, "manaflow-ai/cmuxterm-hq"),
+                 ("-fleet", other, "manaflow-ai/cmux"))
         for index, (job, env, repo) in enumerate(cases):
             with self.subTest(job=job, env=env, repo=repo):
                 runner = f"n{index}"
@@ -4847,7 +4851,9 @@ class HookTest(unittest.TestCase):
                               ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                               ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
-                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")):
+                              ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              # GATEWAY_FLEET_SUFFIX: a -fleet job id from any home-repository workflow
+                              ("cmux-next-ios-kit.yml", "link-ffi-fleet"), ("other.yml", "new-client-fleet")):
             with self.subTest(workflow=workflow, job=job):
                 try:
                     ok = self.job(job, "ok", 14, None, "--gateway-runner",
