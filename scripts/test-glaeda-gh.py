@@ -1898,6 +1898,94 @@ class ControllerTest(Base):
         self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + 3 * gg.TICK)  # still inside the 60 s cycle
         self.assertEqual(len(self.gh.gql_calls()), 3)  # another repository's commit
 
+    def test_a_feed_stream_event_reads_the_feed_at_once_and_the_poll_backs_off(self) -> None:
+        """Leo, 2026-11-25: "stop polling". The FeedStream's long-poll names an event after the daemon's cursor: the
+        next tick reads the feed at once instead of after CONTROLLER_FEED_EVERY, and while the stream answers the poll
+        is only the FEED_STREAM_BACKSTOP."""
+        gg.CONTROLLER_FEED_EVERY = 20
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)  # learns the cursor
+        wake = threading.Event()
+        stream = gg.FeedStream(self.daemon, wake, wait=0)  # (the fake answers at once: no long-poll to hold)
+        self.daemon.feed_stream = stream
+        pending: list[dict] = []
+        stream.client = types.SimpleNamespace(base=None, token=None, events=lambda since, wait=0: {
+            "cursor": since + len(pending), "suites": list(pending)})  # a peek: the daemon's read takes them
+        self.assertEqual(stream.step(), 0.0)  # nothing yet: the answer came back empty after the wait
+        self.assertFalse(stream.ready.is_set())
+        reads = len(self.ctl.feeds)
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads)  # no event, stream live: no poll before the backstop
+        suite = {"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"}
+        self.ctl.suites.append(suite)
+        pending.append(suite)
+        self.assertEqual(stream.step(), 0.0)
+        self.assertTrue(stream.ready.is_set() and wake.is_set())  # serve's sleep ends now
+        self.assertEqual(stream.step(), 0.2)  # no second long-poll until the tick has read it
+        self.daemon.tick(NOW + 2 * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads + 1)
+        self.assertFalse(stream.ready.is_set())
+        self.assertIn("pr:o/r#1", self.daemon.nudged)
+        self.daemon.tick(NOW + 3 * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), reads + 1)
+        self.daemon.tick(NOW + 2 * gg.TICK + gg.FEED_STREAM_BACKSTOP)
+        self.assertEqual(len(self.ctl.feeds), reads + 2)  # the backstop poll
+        with mock.patch.dict(os.environ, {"GLAEDA_GH_FEED_STREAM": "off"}):
+            self.assertFalse(stream.live(time.time()))
+            self.assertEqual(stream.step(), 2.0)
+
+    def test_a_feed_stream_on_a_controller_that_answers_at_once_is_not_asked_in_a_loop(self) -> None:
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        stream = gg.FeedStream(self.daemon, None, wait=25)
+        stream.client = types.SimpleNamespace(base=None, token=None, events=lambda since, wait=0: {"cursor": since})
+        self.assertEqual(stream.step(), gg.FEED_STREAM_RETRY)  # (the fake answers in no time: no long-poll held)
+        stream.client.events = mock.Mock(side_effect=gg.WatchError("controller: URLError"))
+        self.assertEqual(stream.step(), gg.FEED_STREAM_RETRY)
+        self.assertIn("URLError", stream.error)
+
+    def test_a_check_event_on_a_parked_lands_head_watches_and_reads_its_pr(self) -> None:
+        """A land parked in a long wait has no watch on its PR: a run or suite event on its head must still reach the
+        land queue at once (watch it now, mark it dirty), not at the next LAND_PEEK_EVERY peek or a timeout."""
+        node = pr_node(1)
+        node["headRefName"] = "feat/x"
+        self.gh.prs[("o", "r", 1)] = node
+        queue = types.SimpleNamespace(entries={"pr:o/r#1": {"key": "pr:o/r#1", "state": "waiting"},
+                                               "pr:o/r#2": {"key": "pr:o/r#2", "state": "merged"}},
+                                      heads={"pr:o/r#1": ("o/r", "a" * 40, "feat/x"),
+                                             "pr:o/r#2": ("o/r", "a" * 40, "feat/y")},
+                                      watch_now=mock.Mock(), lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.daemon.tick(NOW)
+            self.ctl.suites.append({"id": 1, "repo": "o/other", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + gg.TICK)
+            queue.watch_now.assert_not_called()  # another repository's commit
+            self.ctl.suites.append({"id": 2, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + 2 * gg.TICK)
+            queue.watch_now.assert_called_once_with("pr:o/r#1")  # not the merged #2
+            self.assertIn("pr:o/r#1", self.daemon.land_dirty)
+            self.ctl.runs[50] = {**ctl_run(50, "queued"), "head_sha": "c" * 40, "head_branch": "feat/x"}
+            self.daemon.tick(NOW + 3 * gg.TICK)  # a push to its branch: runs for a head not read yet
+            self.assertEqual(queue.watch_now.call_count, 2)
+            self.daemon.land_queue = None
+
+    def test_a_land_prs_check_event_is_read_within_land_nudge_min(self) -> None:
+        node = pr_node(1)
+        self.gh.prs[("o", "r", 1)] = node
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        reads = len(self.gh.gql_calls())
+        queue = types.SimpleNamespace(entries={"pr:o/r#1": {"key": "pr:o/r#1", "state": "waiting"}}, lock=threading.Lock())
+        with mock.patch.object(self.daemon, "land_tick"), mock.patch.object(self.daemon, "land_busy", return_value=False):
+            self.daemon.land_queue = queue
+            self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+            self.daemon.tick(NOW + gg.LAND_NUDGE_MIN)  # NUDGE_MIN would hold it until NOW + 20
+            self.daemon.land_queue = None
+        self.assertLess(gg.LAND_NUDGE_MIN, gg.NUDGE_MIN)
+        self.assertEqual(len(self.gh.gql_calls()), reads + 1)
+
     def test_comments_from_the_feed_reach_a_comment_wait(self) -> None:
         self.gh.issues[("t", "s", 454)] = {"__typename": "Issue", "url": "u", "state": "OPEN",
                                            "comments": {"totalCount": 0, "nodes": []}}

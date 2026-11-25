@@ -13182,9 +13182,10 @@ class Daemon:
         unwatched, peeked every LAND_PEEK_EVERY) heard of its last check only at the peek or a timeout (Leo,
         2026-11-25: "merge timed out ... because we poll. stop polling")."""
         q = self.land_queue
-        if q is None or not touched:
+        heads = getattr(q, "heads", None)
+        if not heads or not touched:
             return
-        for key, (repo, sha, branch) in list(q.heads.items()):
+        for key, (repo, sha, branch) in list(heads.items()):
             e = q.entries.get(key)
             if e is None or e.get("state") in LAND_DONE:
                 continue
@@ -24041,8 +24042,9 @@ class FeedStream:
             return 2.0  # no feed followed yet (or it is out): the tick's own read starts it
         if self.ready.is_set():
             return 0.2  # the tick has not read what the last answer named yet
-        if self.client is None or self.client.base != ctl.base:
-            self.client = Controller(ctl.base, ctl.token)
+        base = getattr(ctl, "base", None)
+        if self.client is None or getattr(self.client, "base", None) != base:
+            self.client = Controller(base, ctl.token)
         self.client.token = ctl.token
         began = time.monotonic()
         try:
