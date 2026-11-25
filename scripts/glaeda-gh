@@ -10364,7 +10364,13 @@ class Daemon:
                 jobs_at = entry.get("jobsAt")
                 if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
                     fields["jobsAt"] = min(self.now, float(jobs_at))
-            self.store(e["key"], e["cache"], **fields)
+            # `mine` above is the copy this tick started from; a read here while the ask was out (the land worker's
+            # refresh of a landing PR, a starved wait's direct_read) is newer still and only the write lock sees it.
+            # Without this, a lane VM on 2026-11-25 refreshed cmux#55644 every 22s with no error and every
+            # upstream answer put its upstream's older copy back: the PR read 3091s old and its land never moved.
+            if not self.store(e["key"], e["cache"], older_yields=True, **fields):
+                self.upstream_outage_over(e)
+                self.keep_feed_view(e)
 
     def keep_feed_view(self, e: dict) -> None:
         """The upstream's feed view of a PR whose copy here is newer (a wait's direct read), written on the entry as
@@ -10947,7 +10953,10 @@ class Daemon:
                                               "heartbeat": HEARTBEAT_EVERY, "failing": self.failing})
             self.beat = self.now
 
-    def store(self, key: str, prior: dict | None, **fields: Any) -> None:
+    def store(self, key: str, prior: dict | None, older_yields: bool = False, **fields: Any) -> bool:
+        """Write `fields` over key's cache entry; True when written. With `older_yields`, data older than the
+        entry's current copy (read under the write lock) is not written and the call answers False: an upstream
+        answer that left the upstream before this host's own read must not replace that read (upstream_tick)."""
         # `error` is the one field of a cache entry GitHub's own sentence reaches (a REST refusal, an upstream's
         # forwarded one), and every surface that prints an entry prints it; the id goes here, once, for all of them.
         if isinstance(fields.get("error"), str):
@@ -10957,8 +10966,12 @@ class Daemon:
         with bounded_lock(cache_dir() / ".write.lock") as held:
             if not held:
                 self.errors.append(f"{key}: cache write lock timeout")
-                return
+                return False
             current = read_json(cache)
+            if older_yields and isinstance(current, dict) and isinstance(current.get("data"), dict) \
+                    and fields.get("data") is not None and isinstance(fields.get("dataAt"), (int, float)) \
+                    and isinstance(current.get("dataAt"), (int, float)) and fields["dataAt"] < current["dataAt"]:
+                return False
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
@@ -10997,6 +11010,7 @@ class Daemon:
                 write_json(land_dir() / "changed" / file_name(key), key)
         if fields.get("dataAt") is not None and not fields.get("error"):
             self.note_read(key)
+        return True
 
     def fail(self, entries: list[dict], message: str) -> None:
         self.errors.append(message)
@@ -30436,9 +30450,22 @@ def controller_line(ctl: dict) -> str:
     if state in {"down", "absent"}:
         why = "no run-events receiver there" if state == "absent" else f"unreachable ({ctl.get('error')})"
         return f"controller: {why}; polling GitHub meanwhile, next try in {max(0, int((ctl.get('retryAt') or 0) - time.time()))}s"
+    if state == "off" and ctl.get("why") == "reads through upstream":
+        return "controller: none here; the upstream reads GitHub for this host"
     if state == "off":
         return "controller: none configured; polling GitHub"
     return "controller: starting"
+
+
+def upstream_line(up: dict) -> str:
+    """`budget`'s line for a host that reads through an upstream (a lane VM through its upstream host): its REST share,
+    GraphQL and controller read zero there by design, and without this line `budget` said nothing of what it reads."""
+    state = up.get("state")
+    if state == "ok":
+        return f"upstream: ok, {up.get('keys', 0)} keys answered {age(up.get('at'))}; PRs and runs read through it"
+    if state == "failing":
+        return f"upstream: failing {age(up.get('at'))}: {up.get('error')}"
+    return "upstream: starting"
 
 
 def controller_fallback_line(doc: Any) -> str:
@@ -31446,6 +31473,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                 f"{name} {c.get('spent', 0)}/{c.get('limit', '?')}{' reserved' if c.get('reserved') else ''}"
                 + (f", refused {age(c['deniedAt'])}" if c.get("deniedAt") else "")
                 for name, c in sorted(ledger["consumers"].items())))
+        up = status.get("upstream")
+        if isinstance(up, dict):
+            print(upstream_line(up))
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
@@ -31473,7 +31503,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         if isinstance(share, dict):
             print(f"daemon REST spend {share.get('spent', '?')}/{share.get('cap', '?')} this hour "
                   f"(restShare {share.get('share', '?')}"
-                  + ("; at the cap, so REST is lean and PRs and runs read over GraphQL)" if share.get("capped") else ")"))
+                  + ("; reads go through the upstream)" if isinstance(up, dict)
+                     else "; at the cap, so REST is lean and PRs and runs read over GraphQL)" if share.get("capped")
+                     else ")"))
         for line in spend_lines(status.get("spendBy")):
             print(line)
         for name, alarm in sorted((status.get("alarms") or {}).items()):
