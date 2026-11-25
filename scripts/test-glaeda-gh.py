@@ -29524,32 +29524,39 @@ class LandTest(Base):
                          (self.OVERRIDE["reason"], self.OVERRIDE["receipt"]))
         self.assertEqual(e["state"], "merged")
 
-    def test_land_override_merges_capped_base_red_at_followed_pin(self):
+    BASE_UPDATE_FORCE = "land-judge: the head's checks are older than its base, so the land merges the base in (lw#8029)"
+
+    def test_land_override_pinned_row_merges_at_its_pin_and_is_never_base_updated(self):
+        # manaflow-ai/cmux#54151, 2026-11-25: queued at 4c3d0ca4 with an override, the land updated its branch
+        # ("update_again ... the base moved during this update's CI"), the head moved to 0795cbb0, and the row sat in
+        # "pin_parent_wait head=0795cbb055ec pin=4c3d0ca43fef" and never merged. A pinned override row merges at its pin.
         self.lane_vm()
         self.pr(LA)
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
-        force = "land-judge: the head's checks are older than its base, so the land merges the base in (lw#8029)"
         self.w.answers.append(refusal("base_update", LA, {"kind": "update_branch", "expected_head_sha": LA,
-                                                          "force": force}))
+                                                          "force": self.BASE_UPDATE_FORCE}))
         e = self.tick()
-        self.assertEqual(e["wait"]["kind"], "head_change")
-        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
-                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--force", force,
-                           "--match-head-commit", LA]])
-        self.pr(LB, parent=LA, checks=[("Skills", "IN_PROGRESS", None)])
-        e = self.tick()
-        self.assertEqual((e["pinSha"], e["wait"]["kind"], self.merge_envs()), (LB, "pr", []))
-        self.pr(LB, parent=LA, checks=[("Skills", "COMPLETED", "FAILURE")])
-        self.w.answers.append(refusal("unreadable", LB, {"kind": "retry", "override_if_checks_finished": True}))
-        e = self.tick()
+        self.assertEqual((self.w.gh_calls("pr", "update-branch"), self.w.gh_calls("api")), ([], []))
         [call] = self.broker_lands()
-        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LB, "override": self.OVERRIDE})
-        self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "override": self.OVERRIDE})
+        self.assertEqual((e["state"], e["pinSha"]), ("merged", LA))
         [env] = self.merge_envs()
         self.assertEqual(env["LAND_JUDGE_OVERRIDE_RECEIPT"], self.OVERRIDE["receipt"])
-        self.assertEqual(e["explain"]["code"], "unreadable")
-        self.assertEqual([(h["code"], h["head"]) for h in e["history"] if h["event"] == "override_merge"],
-                         [("unreadable", LB[:12])])
+        self.assertEqual([h["head"] for h in e["history"] if h["event"] == "override_pin_merge"], [LA[:12]])
+
+    def test_land_override_pinned_row_whose_pin_merge_is_refused_stops_by_name_never_updated(self):
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = ("land-judge: refused [tip_merge]: the base's checks have not run on this PR merged "
+                                  f"with the tip; next: gh api -X PUT repos/o/r/pulls/1/update-branch -f "
+                                  f"expected_head_sha={LA} (why: guard-why)")
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual((self.w.gh_calls("pr", "update-branch"), self.w.gh_calls("api")), ([], []))
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
+        self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
 
     def test_land_override_wakes_capped_retry_only_for_a_changed_receipt(self):
         self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])

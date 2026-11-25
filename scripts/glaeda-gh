@@ -21374,6 +21374,31 @@ class LandQueue:
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
         checks finished, is the base moving during CI: counted in history as update_again."""
         repo, number = e["repo"], str(e["number"])
+        pin = str(e.get("pinSha") or "").lower()
+        if e.get("override") and pin:
+            # A pinned override row is never base-updated: the update moves the head off the pin the override was
+            # given for, and the row then waits on a pin nothing will merge. manaflow-ai/cmux#54151, 2026-11-25:
+            # queued at 4c3d0ca4 with an override, "update_again ... the base moved during this update's CI", then
+            # "pin_parent_wait head=0795cbb055ec pin=4c3d0ca43fef", never merged; a direct merge at the new head
+            # worked. It merges at its pin, once per head; a merge GitHub refuses there stops the row by name.
+            tried = e.get("overridePinMerge") or {}
+            if land_head_moved(pin, head) or tried.get("head") == head:
+                with self.lock:
+                    self.stop(e, "pinned_override_update",
+                              f"land_judge named an update-branch at {head[:12] or '?'} for a row pinned at {pin[:12]} "
+                              "with an override; an update would move the head off the pin, so it is never sent"
+                              + (" (the merge at the pin was already tried and refused)" if tried.get("head") == head
+                                 else ""),
+                              f"merge it by hand at the pin (gh pr merge {number} -R {repo} --squash "
+                              f"--match-head-commit {pin}), or update it and re-queue at the new head")
+                return
+            with self.lock:
+                e["overridePinMerge"] = {"head": head, "at": self.now}
+                self.history(e, "override_pin_merge", head=head[:12],
+                             why="a pinned override row is merged at its pin, never base-updated")
+                self.save(e)
+            self.do_merge(e, head, {"pinned": True})
+            return
         sent = e.get("updateSent") or {}
         if head and sent.get("head") == head:
             # Once per head (LAND_UPDATE_ONCE's comment): never a second update at this head. Wait for the new head
