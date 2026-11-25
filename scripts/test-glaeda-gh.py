@@ -2781,11 +2781,14 @@ class UpstreamTest(Base):
         self.asked: list[dict] = []
         self.answers: dict[str, dict | None] = {}
         self.broken: Exception | None = None
+        self.mid_ask: Callable[[], None] | None = None  # what happens here while the ask is out
 
         def ask(request: dict) -> dict:
             self.asked.append(request)
             if self.broken is not None:
                 raise self.broken
+            if self.mid_ask is not None:
+                self.mid_ask()
             return {"entries": {k["key"]: self.answers.get(k["key"]) for k in request["keys"]}}
 
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None,
@@ -2812,6 +2815,39 @@ class UpstreamTest(Base):
         self.assertEqual(pr["source"], "upstream")
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
+
+    def test_a_read_here_while_the_ask_is_out_is_not_replaced_by_the_upstreams_older_copy(self) -> None:
+        """A lane VM, 2026-11-25: the land worker refreshed cmux#55644 every 22s and every upstream answer
+        put the upstream's older copy back over it (the guard compared with the copy the tick started from), so the
+        PR read 3091s old. A copy written while the ask is out wins over an answer older than it."""
+        gg.register("pr:o/r#7")
+        fresh = {**self.pr_data(), "headRefOid": "b" * 40}
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 3000, "error": None}
+        # this host's own read lands mid-ask (land_direct_read stores through the same cache)
+        self.mid_ask = lambda: self.daemon.store("pr:o/r#7", None, data=fresh, dataAt=NOW - 1, source="direct")
+        self.daemon.tick(now=NOW)
+        pr = gg.read_cache("pr:o/r#7")
+        self.assertEqual(pr["dataAt"], NOW - 1)
+        self.assertEqual(pr["data"]["headRefOid"], "b" * 40)
+        self.assertEqual(pr["source"], "direct")
+
+    def test_an_older_answer_still_fills_a_copy_nothing_newer_was_written_over(self) -> None:
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 3000, "error": None}
+        self.daemon.tick(now=NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["dataAt"], NOW - 3000)
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 10, "error": None}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["dataAt"], NOW - 10)
+
+    def test_budget_says_a_host_reads_through_its_upstream(self) -> None:
+        """A lane VM's budget said "restShare 0.0; at the cap ... read over GraphQL" and "controller: none configured;
+        polling GitHub" while it read every PR through its upstream and never polled GitHub."""
+        self.assertIn("upstream: ok, 21 keys answered", gg.upstream_line({"state": "ok", "at": time.time(), "keys": 21}))
+        self.assertIn("upstream: failing", gg.upstream_line({"state": "failing", "at": time.time(), "error": "boom"}))
+        self.assertEqual(gg.upstream_line({"state": "starting"}), "upstream: starting")
+        self.assertIn("the upstream reads GitHub", gg.controller_line({"state": "off", "why": "reads through upstream"}))
+        self.assertIn("none configured", gg.controller_line({"state": "off"}))
 
     def test_a_landing_pr_is_asked_of_the_upstream_every_upstream_land_every(self) -> None:
         """teamleaderleo/glaeda#2740 was judged 18 s after its last check: a lane VM asked its upstream every 20 s."""
