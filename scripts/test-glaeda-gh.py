@@ -28177,6 +28177,47 @@ class LandTest(Base):
         self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
         self.assert_merged_at(LB)
 
+    def repin_named_before_the_cache(self, parents: list) -> None:
+        """land_judge's live read names HEAD LB (a repin) while the cache still shows the pin LA: the race behind
+        hq#26571's head_moved stops. LB's parents answer only the worker's commit read."""
+        self.pinned_and_waiting()
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the pin's checks done: it is judged
+        self.w.cache[self.KEY]["data"]["baseRefName"] = "main"
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}
+        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps({"mb": self.LD, "files": [moved]})
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
+        self.w.answers.append(refusal("pin", LA, {"kind": "repin", "sha": LB}))
+
+    def test_a_base_merge_land_judge_names_before_the_cache_shows_it_is_followed(self):
+        # hq#26571, cmux-cp-1 2026-11-25: 311 of 537 head_moved stops in a day said "no update_branch of this queue's
+        # was sent at the pinned head" on a base merge whose first parent was the pin (cmux#56122 665df78b ->
+        # 053f2c3e, "Merge branch 'feat-cmux-next' into ..."): land_judge named the new head (repin) before the cache
+        # read it, and base_merge_maybe answered no for a head the cache did not show instead of reading its parents.
+        self.repin_named_before_the_cache([LA, self.LD])
+        e = self.tick(30)
+        self.assertNotEqual(e["state"], "stopped", e.get("stop"))
+        self.w.answers.append(ok_answer(LB))
+        e = self.run_hour(lambda: ok_answer(LB), seconds=600, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assert_merged_at(LB)
+
+    def test_a_push_land_judge_names_before_the_cache_shows_it_still_stops_head_moved(self):
+        self.repin_named_before_the_cache([LA])  # one parent, the pin: a commit pushed on it
+        e = self.run_hour(lambda: refusal("pin", LA, {"kind": "repin", "sha": LB}), seconds=600, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_base_merge_on_a_push_land_judge_names_first_still_stops_head_moved(self):
+        # a merge whose first parent is a commit pushed after the pin: the push is not a base merge
+        self.repin_named_before_the_cache([LC, self.LD])
+        self.w.api[f"repos/o/r/commits/{LC}"] = json.dumps([LA])
+        e = self.run_hour(lambda: refusal("pin", LA, {"kind": "repin", "sha": LB}), seconds=600, step=30.0)
+        self.assertEqual((e["state"], e["pinSha"]), ("stopped", LA))  # never followed (the chain read says no)
+        self.assertNotIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
     def test_a_copy_showing_a_pin_already_followed_away_from_is_a_stale_read_not_a_moved_head(self):
         # glaeda#2540, 2026-11-22 22:08Z: followed 023cd7fc -> f745a168, then stopped on a copy still showing 023cd7fc
         self.pinned_and_waiting()

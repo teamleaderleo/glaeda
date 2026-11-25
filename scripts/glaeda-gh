@@ -20979,9 +20979,14 @@ class LandQueue:
         if land_base_merge_parent(pin, head, data):
             return True
         head = str(head or "").lower()
-        if not bool(pin) or SHA40.fullmatch(head) is None or str(data.get("headRefOid") or "").lower() != head \
-                or self.gh() is None:
+        if not bool(pin) or SHA40.fullmatch(head) is None or self.gh() is None:
             return False
+        if str(data.get("headRefOid") or "").lower() != head:
+            # The cache has not read HEAD yet: land_judge's live read named it first (a repin), so nothing here says
+            # its parents, and base_merge_check reads them (one commit read) before it repins or stops. hq#26571,
+            # cmux-cp-1 2026-11-25: 311 of 537 head_moved stops in a day were this, mostly base merges on the pin
+            # ("Merge branch 'feat-cmux-next' into ...", first parent the pin), each stopped with no read at all.
+            return True
         parents = data.get("headParents")
         # a merge whose first parent is not the pin may sit on top of other base merges (land_base_merge_chain)
         return not isinstance(parents, list) or len(parents) == 2
