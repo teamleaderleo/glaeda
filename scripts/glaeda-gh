@@ -14609,10 +14609,12 @@ LAND_REVIEW_WAIT = 3600.0
 # run of checks between. hq docs/investigations/2026-11-18-boneheaded-designs.md §4.2, huge-blue 2026-11-18:
 # glaeda-land ran 841 explains (816 live reads, 46 snapshot judgments) for 97 merges; one PR made 214 shim calls in
 # 44 min at an unchanged head, and at 14:29-14:45Z host:glaeda-land was the broker's top caller every minute (~1,400
-# REST/h). One leak: land_fingerprint holds `mergeable`, which GitHub turns UNKNOWN and back on every push to the base,
-# so each base push woke every PR parked on a wait_pr verdict twice, each a land_judge explain answering the same. A
-# head or check change, a CONFLICTING turn and a wait's own timeout (land_judge's timed step, its timeout_s) still
-# judge at once. 600 s bounds what the fingerprint cannot see (the base moving under a green head: stale_green,
+# REST/h). One leak, since closed: land_fingerprint held `mergeable`, which GitHub turns UNKNOWN and back on every push
+# to the base, so each base push moved the wake's fingerprint twice and the keep bounded -- never removed -- the cost:
+# 5 judgments an hour per parked PR from base churn alone (measure-land-wake-redundancy.py), 69 of 669 judgments on
+# big-red on 2026-11-25 (explain_unmoved_fp_moved). The wake now reads mergeability as CONFLICTING or not, as the keep
+# always did. A head or check change, a CONFLICTING turn and a wait's own timeout (land_judge's timed step, its
+# timeout_s) still judge at once. 600 s bounds what the fingerprint cannot see (the base moving under a green head: stale_green,
 # tip_merge; a webview wait): a change it held back is judged at most this late, so a PR parked on a wait costs at
 # most 6 explains an hour from base churn, not two per base push. Twice LAND_SNAPSHOT_MAX_AGE and under land_judge's
 # RUNNING_WAIT_S (1800 s), so a wait land_judge names still times out on its own clock.
@@ -16091,26 +16093,28 @@ def land_step_named(out: str) -> dict | None:
     return None
 
 
-def land_fingerprint(cache: dict | None, conflict_only: bool = False) -> str:
-    """What could change land_judge's answer, as the cache shows it: head, state, mergeability, each check. (Not
-    mergeStateStatus: it flips with every push to the base, and each flip would be a judgment.) CONFLICT_ONLY:
-    mergeability only as CONFLICTING or not (land_check_fingerprint)."""
+def land_fingerprint(cache: dict | None) -> str:
+    """What could change land_judge's answer, as the cache shows it: head, state, mergeability as CONFLICTING or not,
+    each check. (Not mergeStateStatus, and not raw `mergeable`: both flip with every push to the base -- `mergeable`
+    turns UNKNOWN and back while GitHub recomputes it -- and each flip would be a judgment at an unchanged head on
+    unchanged checks, for an answer that cannot differ. A CONFLICTING turn, either way, still judges at once: that is
+    a change land_judge answers differently. Measured by scripts/measure-land-wake-redundancy.py: 5 judgments an hour
+    per PR parked on a wait, from base churn alone, before this reading; 0 after.)"""
     data = (cache or {}).get("data") or {}
     if not data:
         return ""
     checks = sorted((str(c.get("workflow") or ""), str(c.get("name") or ""), str(c.get("status") or ""),
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
-    mergeable = data.get("mergeable") == "CONFLICTING" if conflict_only else data.get("mergeable")
-    doc = [data.get("headRefOid"), data.get("state"), mergeable, checks]
+    doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable") == "CONFLICTING", checks]
     if data.get("checksTruncated"):
         doc.extend((data.get("checkCounts"), pending_on_every_page(data)))
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def land_check_fingerprint(cache: dict | None) -> str:
-    """What a kept verdict was judged on (LAND_VERDICT_KEEP): the head, its state, each check run and status, and
-    mergeability only as CONFLICTING or not: UNKNOWN <-> MERGEABLE turns on every push to the base."""
-    return land_fingerprint(cache, conflict_only=True)
+    """What a kept verdict was judged on (LAND_VERDICT_KEEP): the one fingerprint above. The name stays where a call
+    site asks that question; the two readings are the same since the wake stopped holding raw `mergeable`."""
+    return land_fingerprint(cache)
 
 
 def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
