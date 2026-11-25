@@ -5052,6 +5052,66 @@ def rollup_suites(doc: object, sha: str) -> dict | None:
     return {"total": len(suites), "suites": sorted(suites, key=lambda s: str(s[0])), "via": "controller"}
 
 
+CONTROLLER_GREEN = {"success", "skipped", "neutral"}
+
+
+def controller_green_checks(doc: object, sha: str) -> list[dict] | None:
+    """The controller rollup DOC of SHA as its checks, when it says the head is done and green (LAND_ROLLUP_JUDGE),
+    else None: incomplete (either part), another commit's, nothing in it, a check run whose newest attempt (per app,
+    suite and name) is not finished or not success, skipped or neutral, or a commit status that is not success. Each
+    check: name, conclusion (lower case), statusContext, and for a check run its id, app, suite and times."""
+    if not isinstance(doc, dict) or doc.get("complete") is not True or str(doc.get("sha") or sha).lower() != sha:
+        return None
+    runs = (doc.get("check_runs") or {}).get("check_runs") if isinstance(doc.get("check_runs"), dict) else None
+    statuses = (doc.get("status") or {}).get("statuses") if isinstance(doc.get("status"), dict) else None
+    if not isinstance(runs, list) or not isinstance(statuses, list) or not runs + statuses:
+        return None
+    newest: dict[tuple, dict] = {}
+    for run in runs:
+        if not isinstance(run, dict) or not isinstance(run.get("id"), int) or not isinstance(run.get("name"), str):
+            return None
+        suite = run.get("check_suite") if isinstance(run.get("check_suite"), dict) else {}
+        app = run.get("app") if isinstance(run.get("app"), dict) else {}
+        key = (app.get("slug"), suite.get("id"), run["name"])
+        if key not in newest or run["id"] > newest[key]["id"]:
+            newest[key] = run
+    checks: list[dict] = []
+    for (app, suite, name), run in sorted(newest.items(), key=lambda kv: kv[1]["id"]):
+        conclusion = str(run.get("conclusion") or "").lower()
+        if run.get("status") != "completed" or conclusion not in CONTROLLER_GREEN:
+            return None
+        checks.append({"name": name, "conclusion": conclusion, "statusContext": False, "id": run["id"], "app": app,
+                       "suite": suite, "started": run.get("started_at"), "completed": run.get("completed_at"),
+                       "details": run.get("details_url")})
+    for st in statuses:
+        if not isinstance(st, dict) or not isinstance(st.get("context"), str) or st.get("state") != "success":
+            return None
+        checks.append({"name": st["context"], "conclusion": "success", "statusContext": True,
+                       "created": st.get("created_at")})
+    return checks
+
+
+def controller_green_rollup(doc: object, sha: str) -> list[dict] | None:
+    """controller_green_checks as land_judge's rollup context nodes (the land queue's snapshot, LAND_ROLLUP_JUDGE).
+    What the controller cannot carry (a check's workflow; isRequired, False here) can only make a judgment wait, never
+    pass a red: only a green head is handed on, and the merge's own judgment still reads GitHub live."""
+    checks = controller_green_checks(doc, sha)
+    if checks is None:
+        return None
+    nodes: list[dict] = []
+    for c in checks:
+        if c["statusContext"]:
+            nodes.append({"__typename": "StatusContext", "context": c["name"], "state": "SUCCESS",
+                          "createdAt": c.get("created"), "isRequired": False})
+            continue
+        nodes.append({"__typename": "CheckRun", "id": None, "name": c["name"], "status": "COMPLETED",
+                      "conclusion": c["conclusion"].upper(), "detailsUrl": c.get("details"), "databaseId": c["id"],
+                      "startedAt": c.get("started"), "completedAt": c.get("completed"), "isRequired": False,
+                      "checkSuite": {"databaseId": c["suite"], "app": {"slug": c["app"]} if c["app"] else None,
+                                     "workflowRun": None}})
+    return nodes
+
+
 def suites_path(root: str, sha: str) -> str:
     return f"{root}/commits/{sha}/check-suites?per_page={PR_REST_SUITE_PAGE}"
 
@@ -10037,7 +10097,8 @@ class Daemon:
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
                                         feed_quiet=self.land_feed_quiet, read_room=self.land_read_room,
-                                        feed_done=self.land_feed_done, checks_done=self.land_checks_done)
+                                        feed_done=self.land_feed_done, checks_done=self.land_checks_done,
+                                        rollup_nodes=self.land_rollup_nodes)
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -12256,15 +12317,21 @@ class Daemon:
     def controller_suites(self, root: str, sha: str) -> dict | None:
         """rollup_suites of the controller's rollup of SHA in ROOT's repository, else None (off, out, slow, failed,
         incomplete). No GitHub request."""
+        if not PR_REST_SUITES_FROM_CONTROLLER:
+            return None
+        doc = self.controller_rollup_doc(root, sha)
+        return None if doc is None else rollup_suites(doc, sha)
+
+    def controller_rollup_doc(self, root: str, sha: str) -> dict | None:
+        """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed)."""
         get = getattr(self.controller, "get", None)
-        if (not PR_REST_SUITES_FROM_CONTROLLER or not callable(get) or not self.controller_room()
-                or self.now < self.rollup_down_until or self.now < self.rollup_slow.get(sha, 0.0)
-                or not re.fullmatch(r"[0-9A-Za-z]{40}", sha)):
+        if (not callable(get) or not self.controller_room() or self.now < self.rollup_down_until
+                or self.now < self.rollup_slow.get(sha, 0.0) or not re.fullmatch(r"[0-9A-Za-z]{40}", sha)):
             return None
         repo = root.removeprefix("/repos/")
         try:
-            doc = get(f"/v1/github/commits/{sha}/rollup?repo=" + urllib.parse.quote(repo, safe="/"),
-                      timeout=CONTROLLER_ROLLUP_TIMEOUT)
+            return get(f"/v1/github/commits/{sha}/rollup?repo=" + urllib.parse.quote(repo, safe="/"),
+                       timeout=CONTROLLER_ROLLUP_TIMEOUT)
         except ControllerTimeout:  # seeding from GitHub: this head reads GitHub for a while, the rest still ask
             self.rollup_slow = {k: v for k, v in self.rollup_slow.items() if v > self.now}
             self.rollup_slow[sha] = self.now + CONTROLLER_ROLLUP_SLOW_SKIP
@@ -12274,7 +12341,17 @@ class Daemon:
         except WatchError:
             self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
             return None
-        return rollup_suites(doc, sha)
+
+    def land_rollup_nodes(self, key: str, sha: str) -> list[dict] | None:
+        """KEY's head SHA as land_judge's rollup nodes from the controller's rollup, when it says every check there is
+        done and green (controller_green_rollup), else None: the land queue's snapshot without a GitHub read
+        (LAND_ROLLUP_JUDGE)."""
+        try:
+            _, owner, repo, _ = split_key(key)
+        except ValueError:
+            return None
+        sha = str(sha or "").lower()
+        return controller_green_rollup(self.controller_rollup_doc(f"/repos/{owner}/{repo}", sha), sha)
 
     def owed_steps_gated(self, e: dict, prior: dict, old: dict, root: str, sha: str) -> dict:
         """The steps a held read still owes (stepsOwed: a 5xx, a refusal past STEPS_RETRY, a read left for later),
@@ -14609,15 +14686,17 @@ LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
 # A wait_pr verdict is kept, not judged again, while what it judged is unchanged (LandQueue.verdict_holds): the same
 # head and the same check runs, statuses and conclusions in the daemon's own cache (land_check_fingerprint), with no
-# run of checks between. hq docs/investigations/2026-11-18-boneheaded-designs.md §4.2, huge-blue 2026-11-18:
+# run of checks between. hq docs/investigations/2026-11-18-boneheaded-designs.md §4.2, one host 2026-11-18:
 # glaeda-land ran 841 explains (816 live reads, 46 snapshot judgments) for 97 merges; one PR made 214 shim calls in
 # 44 min at an unchanged head, and at 14:29-14:45Z host:glaeda-land was the broker's top caller every minute (~1,400
-# REST/h). One leak: land_fingerprint holds `mergeable`, which GitHub turns UNKNOWN and back on every push to the base,
-# so each base push woke every PR parked on a wait_pr verdict twice, each a land_judge explain answering the same. A
-# head or check change, a CONFLICTING turn and a wait's own timeout (land_judge's timed step, its timeout_s) still
-# judge at once. 600 s bounds what the fingerprint cannot see (the base moving under a green head: stale_green,
-# tip_merge; a webview wait): a change it held back is judged at most this late, so a PR parked on a wait costs at
-# most 6 explains an hour from base churn, not two per base push. Twice LAND_SNAPSHOT_MAX_AGE and under land_judge's
+# REST/h). One leak, since closed: land_fingerprint held `mergeable`, which GitHub turns UNKNOWN and back on every push
+# to the base, so each base push moved the wake's fingerprint twice and the keep bounded -- never removed -- the cost:
+# 5 judgments an hour per parked PR from base churn alone (measure-land-wake-redundancy.py), 73 of 696 judgments on
+# one host on 2026-11-25 (explain_unmoved_fp_moved). The wake now reads mergeability as CONFLICTING or not, as the keep
+# always did. A head or check change, a CONFLICTING turn and a wait's own timeout (land_judge's timed step, its
+# timeout_s) still judge at once. 600 s bounds what the fingerprint cannot see (the base moving under a green head:
+# stale_green, tip_merge; a webview wait): a change it held back is judged at most this late, and base churn now costs
+# a parked PR no judgment at all. Twice LAND_SNAPSHOT_MAX_AGE and under land_judge's
 # RUNNING_WAIT_S (1800 s), so a wait land_judge names still times out on its own clock.
 LAND_VERDICT_KEEP = 600.0
 # The controller's webhook feed (the deliveries the daemon already follows: workflow runs, check suites and comments,
@@ -14653,6 +14732,19 @@ LAND_TIMER_HELD = frozenset({"checks_running"})
 # check running had every check done on GitHub, a median 59 min before, each asleep until its timer (median ~20 min
 # more); over 72 h the queue's merges came a median 31 min (p90 190 min) after the head's last check finished. One
 # judgment per event (doneEventSeen); a rollup that cannot say judges nothing, and the timer and copy paths stand.
+# LAND_ROLLUP_JUDGE: when the controller's rollup of a head says every check there is done and green
+# (controller_green_checks), the land queue judges it now instead of waiting for a fresh GitHub read. Two halves:
+# the queue's judgment does not wait for the daemon's GitHub snapshot of the head (snapshot: the controller's green
+# rollup stands in, no snapshot wait), and land-judge's store read of the head (`checks --pr`) is answered from the
+# controller's rollup when the daemon's own entry is stale or missing (controller_rollup_head, in the pr-rollup shape
+# land-judge already judges as green-only), so the explain makes no GitHub read for the checks. The daemon's copy
+# names the head (the pin) and which checks are required, as before; the merge's own judgment still reads live. cmux-cp-1,
+# 2026-11-25 08:05Z: cmux#52099's last check finished 06:11Z, it was judged checks_running at 07:17Z from a stale
+# copy and then sat in snapshot_wait, the snapshot unable to refresh with the shared GraphQL quota spent; 6 merges
+# after the status feed went live came a median 12 min (p90 76 min) after green, none of them judged on an event.
+# Decision (hq#25251, the coordinator's go 2026-11-25): judge on the controller's summary. A head the rollup cannot
+# call green (running, red, incomplete, unreachable) is asked about at most every LAND_ROLLUP_SEEN_TTL.
+LAND_ROLLUP_SEEN_TTL = 30.0
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -16129,26 +16221,28 @@ def land_step_named(out: str) -> dict | None:
     return None
 
 
-def land_fingerprint(cache: dict | None, conflict_only: bool = False) -> str:
-    """What could change land_judge's answer, as the cache shows it: head, state, mergeability, each check. (Not
-    mergeStateStatus: it flips with every push to the base, and each flip would be a judgment.) CONFLICT_ONLY:
-    mergeability only as CONFLICTING or not (land_check_fingerprint)."""
+def land_fingerprint(cache: dict | None) -> str:
+    """What could change land_judge's answer, as the cache shows it: head, state, mergeability as CONFLICTING or not,
+    each check. (Not mergeStateStatus, and not raw `mergeable`: both flip with every push to the base -- `mergeable`
+    turns UNKNOWN and back while GitHub recomputes it -- and each flip would be a judgment at an unchanged head on
+    unchanged checks, for an answer that cannot differ. A CONFLICTING turn, either way, still judges at once: that is
+    a change land_judge answers differently. Measured by scripts/measure-land-wake-redundancy.py: 5 judgments an hour
+    per PR parked on a wait, from base churn alone, before this reading; 0 after.)"""
     data = (cache or {}).get("data") or {}
     if not data:
         return ""
     checks = sorted((str(c.get("workflow") or ""), str(c.get("name") or ""), str(c.get("status") or ""),
                      str(c.get("conclusion") or "")) for c in data.get("checks") or [])
-    mergeable = data.get("mergeable") == "CONFLICTING" if conflict_only else data.get("mergeable")
-    doc = [data.get("headRefOid"), data.get("state"), mergeable, checks]
+    doc = [data.get("headRefOid"), data.get("state"), data.get("mergeable") == "CONFLICTING", checks]
     if data.get("checksTruncated"):
         doc.extend((data.get("checkCounts"), pending_on_every_page(data)))
     return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def land_check_fingerprint(cache: dict | None) -> str:
-    """What a kept verdict was judged on (LAND_VERDICT_KEEP): the head, its state, each check run and status, and
-    mergeability only as CONFLICTING or not: UNKNOWN <-> MERGEABLE turns on every push to the base."""
-    return land_fingerprint(cache, conflict_only=True)
+    """What a kept verdict was judged on (LAND_VERDICT_KEEP): the one fingerprint above. The name stays where a call
+    site asks that question; the two readings are the same since the wake stopped holding raw `mergeable`."""
+    return land_fingerprint(cache)
 
 
 def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
@@ -16689,7 +16783,11 @@ class LandQueue:
                  feed_quiet: Callable[[str, str, float], bool] | None = None,
                  read_room: Callable[[], int | None] | None = None,
                  feed_done: Callable[[str, str], float | None] | None = None,
-                 checks_done: Callable[[str, str], bool | None] | None = None) -> None:
+                 checks_done: Callable[[str, str], bool | None] | None = None,
+                 rollup_nodes: Callable[[str, str], list[dict] | None] | None = None) -> None:
+        # (key, head) -> the controller's green rollup of the head as land_judge's nodes, else None (LAND_ROLLUP_JUDGE)
+        self.rollup_nodes = rollup_nodes or (lambda key, sha: None)
+        self.rollup_seen: dict[tuple[str, str], tuple[float, list[dict] | None]] = {}
         # (key, head) -> when the feed last said a check finished at the head, and whether the controller's rollup
         # shows every check run there completed (LAND_EVENT_JUDGE). None: no feed here, so no event judges.
         self.feed_done = feed_done or (lambda key, sha: None)
@@ -20188,7 +20286,35 @@ class LandQueue:
 
     def snapshot(self, key: str, sha: str) -> tuple[dict | None, str]:
         """(KEY's rollup snapshot at SHA, ready to hand land_judge, or None; why not: "" when it is ready, "wait" when
-        the daemon's next full read will write it, else the reason no snapshot will come for this judgment)."""
+        the daemon's next full read will write it, else the reason no snapshot will come for this judgment). A GitHub
+        snapshot that is not ready gives way to the controller's green rollup of SHA (LAND_ROLLUP_JUDGE)."""
+        snap, why = self.github_snapshot(key, sha)
+        if snap is not None or why in ("unpinned", "upstream"):
+            return snap, why
+        nodes = self.rollup_green(key, sha)
+        if nodes is None:
+            return snap, why
+        return {"rollup": {"nodes": nodes}, "complete": True, "head": sha, "readAt": self.now, "dataAt": self.now,
+                "via": "controller"}, ""
+
+    def rollup_green(self, key: str, sha: str) -> list[dict] | None:
+        """rollup_nodes for KEY at SHA, asked at most every LAND_ROLLUP_SEEN_TTL (a green answer is asked again too:
+        a rerun can turn it)."""
+        k = (key, str(sha).lower())
+        seen = self.rollup_seen.get(k)
+        if seen is not None and self.now - seen[0] < LAND_ROLLUP_SEEN_TTL:
+            return seen[1]
+        try:
+            nodes = self.rollup_nodes(key, k[1])
+        except Exception:  # noqa: BLE001  the controller is an extra here: the GitHub snapshot path stands
+            nodes = None
+        if len(self.rollup_seen) > 4096:
+            self.rollup_seen = {kk: v for kk, v in self.rollup_seen.items() if self.now - v[0] < LAND_ROLLUP_SEEN_TTL}
+        self.rollup_seen[k] = (self.now, nodes)
+        return nodes
+
+    def github_snapshot(self, key: str, sha: str) -> tuple[dict | None, str]:
+        """snapshot's GitHub half: the daemon's GraphQL read of the head, kept in ROLLUP_DIR."""
         if not SHA40.fullmatch(sha or ""):
             return None, "unpinned"
         if self.reads_upstream():
@@ -21023,6 +21149,10 @@ class LandQueue:
                                   "head": sha, "dataAt": snap["dataAt"], "readAt": snap.get("readAt"),
                                   "rollup": snap.get("rollup")})
                 extra[LAND_SNAPSHOT_ENV] = os.fspath(path)
+        if snap is not None and snap.get("via") == "controller":
+            with self.lock:
+                self.count("rollup_judge")
+                self.history(e, "rollup_judge", head=sha[:12])  # judged on the controller's rollup (LAND_ROLLUP_JUDGE)
         with self.lock:
             self.count("snapshot" if extra else "live")
         extra.update(land_nominated_env(e))  # judged under the nominating path, as the merge is (LAND_NOMINATED_ENV)
@@ -24981,7 +25111,7 @@ def is_serve(pid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     words = result.stdout.split()
-    return result.returncode == 0 and "serve" in words and any(Path(w).name == "glaeda-gh" for w in words)
+    return result.returncode == 0 and "serve" in words and any(Path(w).name in ("glaeda-gh", "cmux-gh") for w in words)
 
 
 def take_over(lock: Any, now: float | None = None) -> bool:
@@ -29937,6 +30067,54 @@ PR_ROLLUP_ROUTE = "pr-rollup"
 PR_ROLLUP_GREEN = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
 
 
+def controller_rollup_head(repo: str, number: int, sha: str, now: float,
+                           controller: Any = None) -> tuple[dict | None, str]:
+    """The third route for a head `checks` holds no fresh entry for (LAND_ROLLUP_JUDGE): the cmux build controller's
+    rollup of SHA (over the tailnet, no GitHub request), when it says every check there is done and green
+    (controller_green_checks), answered in pr_rollup_head's shape (route pr-rollup, marked via=controller), so
+    land-judge judges it as it judges that route: green only, anything else its live read decides. PR NUMBER's cached
+    read is used only for the check names it calls required: each one must be in the controller's green list (a
+    required check that never started is not in the rollup at all), and a copy that names none required still serves.
+    Returns (the head as `checks` serves it, "") or (None, why not)."""
+    if controller is None:
+        # only where this host's daemon reads the controller now: a host with none, or one it cannot reach, is not
+        # made to wait out a connect on every store read
+        state = ((read_json(BASE / "daemon.json") or {}).get("controller") or {}).get("state")
+        if state != "ok":
+            return None, ""  # (said nowhere: the route is not offered here, as on a host with no controller)
+    ctl = Controller.from_env() if controller is None else controller
+    if ctl is None:
+        return None, "no controller here"
+    try:
+        doc = ctl.get(f"/v1/github/commits/{sha}/rollup?repo=" + urllib.parse.quote(repo.lower(), safe="/"),
+                      timeout=CONTROLLER_ROLLUP_TIMEOUT)
+    except WatchError as error:
+        return None, f"the controller's rollup did not answer ({describe(error)})"
+    checks = controller_green_checks(doc, sha)
+    if checks is None:
+        return None, "the controller's rollup is not whole and green"
+    data = (read_cache(parse_key("pr", f"{repo}#{number}")) or {}).get("data") or {}
+    listed = data.get("checks") if isinstance(data.get("checks"), list) else []
+    required = {str(c.get("name")) for c in listed if isinstance(c, dict) and c.get("required")}
+    required |= {str(n) for n in data.get("requiredMissing") or []}
+    names = {c["name"] for c in checks}
+    missing = sorted(required - names)
+    if missing:
+        return None, f"required checks not in the controller's rollup: {', '.join(missing)[:120]}"
+    found: dict[str, list] = {}
+    states: dict[str, str] = {}
+    rollup = []
+    for c in checks:
+        key = f"status / {c['name']}" if c["statusContext"] else f"{c['app'] or 'check'} / {c['name']}"
+        found[key] = ["completed", c["conclusion"]]
+        if c["statusContext"]:
+            states[key] = c["conclusion"]
+        rollup.append({"name": c["name"], "workflow": None, "status": "COMPLETED", "conclusion": c["conclusion"].upper(),
+                       "required": c["name"] in required, "runId": None, "statusContext": c["statusContext"]})
+    return {"found": found, "ids": {}, "settled": True, "statusStates": states, "at": now, "stale": False,
+            "route": PR_ROLLUP_ROUTE, "via": "controller", "pr": number, "age": 0.0, "rollup": rollup}, ""
+
+
 def pr_rollup_head(repo: str, number: int, sha: str, now: float) -> tuple[dict | None, str]:
     """The second route for a head `checks` holds no entry for (hq docs/handbook/read-with-one-quota-route.md): PR
     NUMBER's own cached read, when its headRefOid is SHA and its rollup is whole and green. Returns (the head as
@@ -30021,8 +30199,9 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
     """Every check of each commit, from the daemon's cache. The daemon reads each head once for all
     sessions, within the consumer's hourly budget; a head it may not read is served stale or reported
     unread, and this command never reads GitHub itself. With PR, a head the store has no entry for is
-    served from that PR's cached rollup when it is of this head and all green (pr_rollup_head); each
-    head names its route (head or pr-rollup). PR N is registered for the daemon's read as well, and a PR this host
+    served from that PR's cached rollup when it is of this head and all green (pr_rollup_head), and a head with no
+    fresh entry from the controller's rollup when that is whole and green (controller_rollup_head); each
+    head names its route (head or pr-rollup; the controller's is pr-rollup with via=controller). PR N is registered for the daemon's read as well, and a PR this host
     holds no read of gets one bounded direct read (checks_pr_direct) before the head is called unread."""
     if not CONSUMER_RE.fullmatch(consumer or ""):
         raise WatchError("--consumer must be a short name (letters, digits, . _ -), e.g. autoland")
@@ -30077,6 +30256,10 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
                              if isinstance(data.get("statusDescriptions"), dict) else {})}
             if isinstance(data.get("runs"), dict):  # each check run's id and times (head_data's `runs`)
                 heads[sha]["runs"] = data["runs"]
+            if not fresh and pr is not None:  # a stale copy: the controller's green rollup stands in (LAND_ROLLUP_JUDGE)
+                third, _ = controller_rollup_head(repo, pr, sha, time.time())
+                if third is not None:
+                    heads[sha] = third
         elif sha in missing:
             unread[sha] = "no such commit"
         else:
@@ -30087,6 +30270,9 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
                 second, why_not = pr_rollup_head(repo, pr, sha, time.time())
                 if direct_why and second is None:
                     why_not = f"{why_not}; {direct_why}"
+            if second is None and pr is not None:
+                second, third_not = controller_rollup_head(repo, pr, sha, time.time())
+                why_not = f"{why_not}; {third_not}" if why_not and third_not else why_not or third_not
             if second is not None:
                 heads[sha] = second
             else:
@@ -37483,7 +37669,7 @@ def wait_extra_targets(message: str) -> tuple[str, str]:
         return "", ""  # an unrecognized flag, or a word that is no target: the usual usage error
     kind = Parser.argv[1] if len(Parser.argv) > 1 and not Parser.argv[1].startswith("-") else "KIND"
     kept = [w for w in Parser.argv if w not in extra]  # the call the lane meant, minus the targets past the first
-    form = ["glaeda-gh"] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
+    form = [CLI] + kept + ([] if "--timeout" in kept else ["--timeout", "1800"])
     first = Parser.argv[2] if len(Parser.argv) > 2 and TARGET_WORD.search(Parser.argv[2]) else ""
     both = ([first] if first else []) + extra
     hint = (f"`wait` waits for one target, so {', '.join(extra)} "
@@ -37550,15 +37736,18 @@ def post_elsewhere(kind: str) -> str:
     return ""
 
 
-def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
+def usage_next(argv: list[str], prog: str | None = None) -> str:
     """The right form of a mistyped call: `wait pr OWNER/REPO N` is `wait pr OWNER/REPO#N`; else the --help."""
+    prog = prog or CLI
+    cli = "cmux-gh" if prog.startswith("cmux-gh") else "glaeda-gh"  # the name the caller ran: a hint it can run again
+    prog_base = "glaeda-gh" + prog[len(cli):]  # one spelling for the comparisons below
     words = list(argv)
     if len(words) >= 4 and words[0] in ("wait", "status") and words[1] in ("pr", "comment") \
             and re.fullmatch(rf"{NAME}/{NAME}", words[2]) and BARE_NUMBER.fullmatch(words[3]):
         fixed = [words[0], words[1], f"{words[2]}#{words[3].lstrip('#')}"] + words[4:]
         if words[0] == "wait" and "--timeout" not in fixed:
             fixed += ["--timeout", "1800"]
-        return typed_line(["glaeda-gh"] + fixed)
+        return typed_line([cli] + fixed)
     # `wait pr A B`: two targets in one call, which `status pr` takes and `wait` does not. A wait is one key
     # by construction (one request file, one FIFO, one exit code -- 0/1/2/4 is *the* target's verdict, which
     # every caller branches on), so this names the two calls that do the job rather than inventing an
@@ -37572,28 +37761,28 @@ def usage_next(argv: list[str], prog: str = "glaeda-gh") -> str:
             targets.append(word)
         if len(targets) >= 2 and all(target_readable(words[1], w) for w in targets):
             rest = words[2 + len(targets):]
-            one = typed_line(["glaeda-gh", "wait", words[1], targets[0], *rest])
+            one = typed_line([cli, "wait", words[1], targets[0], *rest])
             return (f"wait takes one target, because its exit code is that target's verdict: "
-                    f"`glaeda-gh status {words[1]} {typed_line(targets)}` reads them all in one gather, "
+                    f"`{cli} status {words[1]} {typed_line(targets)}` reads them all in one gather, "
                     f"or run one wait each (`{one}`)")
     # prog is "glaeda-gh post" when the post parser itself refuses the kind, and "glaeda-gh" when the top-level
     # one does: the word typed, not the prog, says which command was meant.
-    if len(words) >= 2 and words[0] == "post" and prog in ("glaeda-gh", "glaeda-gh post"):
+    if len(words) >= 2 and words[0] == "post" and prog_base in ("glaeda-gh", "glaeda-gh post"):
         hand = post_elsewhere(words[1])
         if hand:
             return hand
     # `checks OWNER/REPO` with no commit and no --consumer (measured 2026-11-16..23): no default is safe (which commit
     # is the caller's to say), so the refusal is the form that runs in a checkout, and the read a PR's checks have.
-    if words[:1] == ["checks"] and prog in ("glaeda-gh", "glaeda-gh checks"):
+    if words[:1] == ["checks"] and prog_base in ("glaeda-gh", "glaeda-gh checks"):
         repo = next((w for w in words[1:] if re.fullmatch(rf"{NAME}/{NAME}", w)), "OWNER/REPO")
         shas = [w for w in words[1:] if SHA40.fullmatch(w)]
         consumer = os.environ.get("ACPMUX_SESSION_NAME") or "NAME"
         sha = " ".join(shas) or '"$(git rev-parse HEAD)"'
-        return (f"`glaeda-gh checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
-                f"name, so none is assumed; a pull request's checks: `glaeda-gh status pr {repo}#N`)")
-    if prog == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
+        return (f"`{cli} checks {repo} {sha} --consumer {shlex.quote(consumer)}` (commits are the caller's to "
+                f"name, so none is assumed; a pull request's checks: `{cli} status pr {repo}#N`)")
+    if prog_base == "glaeda-gh" and words[:1] and words[0] in ("status", "wait", "checks", "post", "budget", "audit",
                                                           "runners", "restart", "serve", "log", "land"):
-        return f"glaeda-gh {words[0]} --help"
+        return f"{cli} {words[0]} --help"
     return f"{prog} --help"
 
 
@@ -37765,7 +37954,7 @@ class ShorthandFlag(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         value = self.const if self.nargs == 0 else values
         setattr(namespace, self.dest, value)
-        say_waiting(f"glaeda-gh: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
+        say_waiting(f"{CLI}: {option_string} ran as {self.canonical.format(value, prog=parser.prog)}")
 
 
 class OptionalJobId(argparse.Action):
@@ -37777,7 +37966,7 @@ class OptionalJobId(argparse.Action):
 
 
 def parser() -> argparse.ArgumentParser:
-    p = Parser(prog="glaeda-gh", description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Parser(prog=CLI, description=DOC, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True, parser_class=Parser)
     sv = sub.add_parser("serve", help="run the daemon (the only process that polls GitHub); launchd or systemd runs it")
     sv.add_argument("--foreground-ok", action="store_true",
@@ -37865,7 +38054,9 @@ def parser() -> argparse.ArgumentParser:
                     help="comment, pr, review, update-branch (queued and paced), status, or issue, label, close, issue-comment "
                          "(made in this call, through the same quota shim and body guard)")
     po.add_argument("target", nargs="?", help="comment, review: OWNER/REPO#N or a URL; pr: OWNER/REPO; status: an id")
-    po.add_argument("--body", help="the text (prefer --body-file: backticks and dollar signs stay data)")
+    po.add_argument("--body", "--comment", dest="body",
+                    help="the text (prefer --body-file: backticks and dollar signs stay data); --comment is the "
+                         "same (gh's name for a close comment)")
     po.add_argument("--body-file", metavar="PATH", help="the text from a file, - for stdin")
     po.add_argument("--title", help="pr: the title")
     po.add_argument("--head", help="pr: the branch (OWNER:BRANCH from a fork)")
@@ -39212,7 +39403,13 @@ def from_loader() -> bool:
     return os.access(cache if os.path.isdir(cache) else here, os.W_OK)
 
 
+# The name this program was run as. cmux-gh is the primary name (Leo, 2026-11-25); glaeda-gh is the same bytes
+# under the old name (scripts/cmux-gh runs it), so every existing caller, timer and skill keeps working and says nothing about it.
+CLI = "cmux-gh" if os.environ.get("GLAEDA_GH_AS") == "cmux-gh" or os.path.basename(__file__) == "cmux-gh" else "glaeda-gh"
 DOC = __doc__.partition('"$@"\n')[2] or __doc__  # the usage, without the /bin/sh line the docstring opens with
+if CLI == "cmux-gh":
+    DOC = DOC.replace("glaeda-gh: one shared GitHub CI watcher", "cmux-gh (formerly glaeda-gh; that name runs the same program): one shared GitHub CI watcher", 1)
+    DOC = DOC.replace("glaeda-gh ", "cmux-gh ")
 PYC_ENV = "GLAEDA_GH_FROM_PYC"
 PYC_LOADER = ('import sys, types, importlib.machinery as m; p = sys.argv[1]; sys.argv = sys.argv[1:]; '
               'g = types.ModuleType("__main__"); g.__file__ = p; sys.modules["__main__"] = g; '
