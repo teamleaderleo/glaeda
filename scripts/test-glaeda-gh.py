@@ -1390,12 +1390,12 @@ class ControllerTest(Base):
         key = "pr:o/r#7"
         self.daemon.land_queue = types.SimpleNamespace(entries={key: {"state": "queued"}})
         self.daemon.store(key, None, data={"state": "OPEN", "headRefOid": "a" * 40,
-                                           "title": "old", "source": "rest"}, dataAt=NOW - 1)
+                                           "title": "old"}, dataAt=NOW - 1, via="rest")
         self.ctl.holds_docs[("o/r", 7)] = ctl_hold()
         self.daemon.now = NOW
         self.daemon.refresh_controller_holds([{"key": key, "cache": gg.read_cache(key)}])
         cached = gg.read_cache(key)
-        self.assertEqual(cached["source"], "controller")
+        self.assertEqual(cached["via"], "controller")
         self.assertEqual(cached["data"]["title"], "controller PR")
         self.assertEqual(self.gh.rest_calls(), [])
         self.assertEqual(self.ctl.hold_calls, [("o/r", 7)])
@@ -1404,7 +1404,7 @@ class ControllerTest(Base):
         key = "pr:o/r#7"
         self.daemon.land_queue = types.SimpleNamespace(entries={key: {"state": "queued"}})
         self.daemon.store(key, None, data={"state": "OPEN", "headRefOid": "a" * 40,
-                                           "title": "old", "source": "rest"}, dataAt=NOW - 1)
+                                           "title": "old"}, dataAt=NOW - 1, via="rest")
         before = gg.read_cache(key)
         self.ctl.holds_docs[("o/r", 7)] = ctl_hold(holds_as_of=iso(NOW - gg.CONTROLLER_HOLD_MAX_AGE - 1))
         self.daemon.now = NOW
