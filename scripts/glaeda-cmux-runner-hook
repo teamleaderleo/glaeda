@@ -577,6 +577,16 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # cmux-next-ios kit tests: swift test on the Mac, then xcodebuild test in one booted
                         # simulator; the picker sends it to the sim-first runner too.
                         ("cmux-next-ios-kit.yml", "kit-tests"): "simulator-step",
+                        # cmux's step table (pr-pipeline.yml, run by `ci/run`) is a reusable workflow, so its jobs
+                        # are keyed by the caller, pr-router.yml. `mac` (the fast tier's Swift suites in an
+                        # owned_spm_scratch lease) and `mac-fallback` (swift build of the canary targets in the
+                        # workspace) build only in their workspace: no canonical root, no kept DerivedData. `ios`
+                        # builds the FFI in its workspace and tests in one booted simulator. As unknown jobs they
+                        # were compiles and waited with no bound for persistent-dd: on 2026-11-25 every runner of
+                        # cmux18 sat busy 58 min ("waiting (3291 s so far) ... for persistent-dd; held by
+                        # persistent-dd: cmux18-glaeda-3") with the host's CPU idle.
+                        ("pr-router.yml", "mac"): "isolated", ("pr-router.yml", "mac-fallback"): "isolated",
+                        ("pr-router.yml", "ios"): "simulator-step",
                         # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
                         # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
                         ("fast-checks.yml", "checks-mac"): "isolated",
