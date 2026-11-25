@@ -14859,6 +14859,12 @@ LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the 
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
 LAND_PIN_PARENT_WAIT = 300.0
+# How long a row whose own update-branch made a checked clean base merge (update_tip_clean: the branch ref's commit has
+# the pin as its first parent and a commit on the base as its second) waits for GitHub's PR to show that commit before
+# it stops pr_head_unsynced. It never stops for a hand re-pin: once the PR shows the commit, pin_follow carries the pin
+# (2026-11-25 17:12Z-19:59Z, manaflow-ai/cmux#53399, #55811, #53921, #53968: 3 update_head_unread stops asked for a
+# re-pin, and each re-pin stopped head_moved 300 s later, the PR still at the old head).
+LAND_PR_SYNC_MAX = 1800.0
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -23018,6 +23024,32 @@ class LandQueue:
         tip = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
         return (tip if SHA40.fullmatch(tip) else ""), branch
 
+    def update_tip_clean(self, e: dict, head: str, tip: str, base: str) -> bool:
+        """Whether TIP, the PR branch's ref after this queue's update-branch at HEAD, is that update's own clean base
+        merge and nothing else: exactly two parents, the first HEAD (E's pin, when E has one), the second a commit on
+        BASE (compare BASE...it: behind or identical). Two REST reads; False when either fails or says otherwise, so a
+        commit anyone else put on the branch (a push on top, a merge of another branch) is never carried."""
+        pin, gh, repo = str(e.get("pinSha") or ""), self.gh(), e["repo"]
+        if gh is None or not SHA40.fullmatch(tip) or not base or (pin and land_head_moved(pin, head)):
+            return False
+        got = self.call([gh, "api", f"repos/{repo}/commits/{tip}", "--jq", "[.parents[].sha]"], LAND_GH_DEADLINE)
+        try:
+            parents = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            parents = None
+        if not isinstance(parents, list) or len(parents) != 2 or not all(isinstance(p, str) for p in parents):
+            return False
+        first, second = (p.lower() for p in parents)
+        if first != head.lower() or not SHA40.fullmatch(second):
+            return False
+        path = f"repos/{repo}/compare/{urllib.parse.quote(base, safe='')}...{second}"
+        got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        return isinstance(doc, dict) and doc.get("s") in ("behind", "identical")
+
     def update_noop(self, e: dict, head: str, sent: dict, waited: float) -> bool:
         """land_judge named the update-branch again at HEAD, where GitHub already answered one (the comment after
         LAND_UPDATE_ONCE). True when this decided E (a short wait, a re-judgment, a stop); False when the compare could
@@ -23050,6 +23082,8 @@ class LandQueue:
         # nothing". One REST read of the branch ref tells the two apart (update_live_tip).
         tip, branch = self.update_live_tip(e, data) if behind else ("", "")
         if tip and tip != head:
+            # Read on the second look only (the first waits, and most reads catch up by then).
+            clean = (e.get("updateUnread") or {}).get("head") == head and self.update_tip_clean(e, head, tip, base)
             with self.lock:
                 if (e.get("updateUnread") or {}).get("head") != head:
                     e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
@@ -23057,6 +23091,28 @@ class LandQueue:
                                  why=f"GitHub's {branch} is at {tip[:12]}: the update made it, the reads lag")
                     self.nudge(e["key"])
                     self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                    return True
+                u = e["updateUnread"]
+                since = float(u.get("at") or self.now)
+                if clean and self.now - since < LAND_PR_SYNC_MAX:
+                    # The update's own clean base merge: no re-pin by hand. The row waits for GitHub's PR to show it,
+                    # and pin_follow carries the pin there (its first parent is the pin) as for any own update.
+                    if u.get("clean") != tip:
+                        u["clean"] = tip
+                        self.history(e, "update_tip_clean", head=head[:12], tip=tip[:12],
+                                     why=f"{tip[:12]} is {head[:12]} merged with {base}: the pin follows it once "
+                                         "GitHub's PR shows it")
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now},
+                              min(LAND_HEAD_TIMEOUT, LAND_PR_SYNC_MAX - (self.now - since)))
+                    return True
+                if clean:
+                    self.stop(e, "pr_head_unsynced",
+                              f"the update-branch sent at {head[:12]} made {tip[:12]} ({head[:12]} merged with {base}, "
+                              f"GitHub's {branch} ref), but GitHub's PR still shows {head[:12]} after "
+                              f"{self.now - since:.0f} s: GitHub has not synced the PR to its branch",
+                              f"gh pr close {number} -R {repo} && gh pr reopen {number} -R {repo} (GitHub syncs the "
+                              f"PR's head on reopen), then glaeda-gh land {name} --sha {tip}")
                     return True
                 self.stop(e, "update_head_unread",
                           f"the update-branch sent at {head[:12]} {waited:.0f} s ago made {tip[:12]} (GitHub's {branch} "
