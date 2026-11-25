@@ -19096,9 +19096,18 @@ class LandQueue:
         kind = str((x.get("action") or {}).get("kind") or "")
         if x.get("ok") and kind == "merge" and head and str(x.get("head") or "").lower() == head:
             return 0
+        if self.override_pin_owed(e, head):
+            return 0  # its requester's say-so to merge the pin now (consider's override_pin): the next free worker's
         if kind in ("update_branch", "rerun_failed", "review", "retarget") and self.due(e):
             return 1
         return 2
+
+    def override_pin_owed(self, e: dict, head: str) -> bool:
+        """True while E, at HEAD, is a pinned override row owed the at-once judgment consider() gives it (override_pin):
+        the merge its requester asked for, so judge_tier puts it ahead of every row that waits."""
+        if e.get("state") in LAND_DONE or not land_override_pinned(e, head):
+            return False
+        return e.get("overridePinJudged") != f"{e.get('requestId') or ''}|{head}"
 
     def judge_order(self, key: str) -> tuple[int, int, int, float]:
         """The tick's order, so a free worker goes first to the land most likely to merge, then to the one that waited
@@ -19277,9 +19286,15 @@ class LandQueue:
         if running and kind not in ("head_change", "repin") and land_override_pinned(e, head) \
                 and e.get("overridePinJudged") != f"{e.get('requestId') or ''}|{head}":
             # LAND_OVERRIDE_PIN_KINDS' comment: a pinned override row is judged now, not after its checks finish;
-            # take() merges it at the pin if the judgment is a wait on those checks
-            e["overridePinJudged"] = f"{e.get('requestId') or ''}|{head}"
-            self.judge(e, head, fp, why="override_pin")
+            # take() merges it at the pin if the judgment is a wait on those checks. Marked judged only once a worker
+            # took it (judge_tier puts it first for the next one): a judge() that found every worker busy used to spend
+            # the mark, and the next pass put the row in wait_running with LAND_WAIT_DEFAULT's hour-long wake.
+            # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy, its one try was
+            # gated, it waited from 06:23:26Z on checks a spent GraphQL quota never re-read, and lanes merged by hand.
+            mark = f"{e.get('requestId') or ''}|{head}"
+            e["overridePinJudged"] = mark
+            if not self.judge(e, head, fp, why="override_pin") and e.get("overridePinJudged") == mark:
+                e.pop("overridePinJudged", None)
             return
         if running and kind not in ("head_change", "repin") and self.stuck_carry_due(e, head, data):
             # an override given after this head's checks_stuck verdict: judged now, not after another wait on the same
@@ -19778,7 +19793,24 @@ class LandQueue:
         probe, h = self.refresh_probe == key, self.refresh_hold
         if probe:
             self.refresh_probe = None
-        said = land_quota_said(error, now) if error and land_read_quota(error) else None
+        quota = bool(error) and land_read_quota(error)
+        said = land_quota_said(error, now) if quota else None
+        if quota and said is None:
+            # direct_read's DIRECT_QUOTA names no reset (the daemon's GraphQL or REST mode is "stop"): hold every
+            # refresh as a broker outage is held (doubling from LAND_REFRESH_BROKER_HOLD, at most
+            # LAND_REFRESH_BROKER_HOLD_MAX, never past the login's GraphQL reset), then one probe. It held nothing:
+            # cmux-cp-1, 2026-11-25 05:30-06:30Z, 197 of 440 refreshes came back refused this way, each on a worker
+            # the waiting lands needed, the same PR up to 12 times an hour.
+            if h is not None and now < float(h["until"]) and not probe:
+                return None  # a read started before the hold: counted once
+            n = int((h or {}).get("n") or 0) + 1 if (h or {}).get("kind") == "quota" else 1
+            said = now + min(LAND_REFRESH_BROKER_HOLD_MAX, LAND_REFRESH_BROKER_HOLD * 2 ** (n - 1))
+            seen = self.reading("graphql") if self.reading is not None else None
+            reset = seen.get("reset") if isinstance(seen, dict) else None
+            if isinstance(reset, (int, float)) and not isinstance(reset, bool) and now < float(reset) < said:
+                said = float(reset)
+            self.refresh_hold = {"kind": "quota", "until": said, "n": n, "why": land_trim(error, 160)}
+            return {"kind": "quota", "until": utc_clock(said), "n": n}
         if said is not None and said > now:
             if h is not None and float(h["until"]) >= said:
                 return None  # a later refusal never shortens a hold
@@ -20081,6 +20113,11 @@ class LandQueue:
                 and float(e.get("wakeAt") or 0) > self.now:
             return True  # its read failed: read again on that wait's wake
         if e["key"] not in self.jobs:
+            if self.busy() >= self.workers():
+                # its read waits for a free worker like every other (refill): cmux-cp-1's land-pool line read busy 25
+                # of 24 on 2026-11-25 06:29Z and 06:52Z, the extra one an ancestry read submitted past the ceiling
+                self.gated(e, ready=True)
+                return True
             self.submit(e["key"], self.ancestry_job, e["key"], head, pin, int(e.get("gen") or 0))
         known = self.head_ancestry(e, head, pin, data)  # an inline job has answered already
         return known is None or (known and self.old_pin_wait(e, head))

@@ -30044,6 +30044,31 @@ class LandTest(Base):
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
 
+    def test_land_override_pinned_row_that_finds_every_worker_busy_is_the_next_one_judged(self):
+        # cmux-cp-1, 2026-11-25: cmux#53519's override (06:22:54Z) met 24 of 24 workers busy. Its one at-once judgment
+        # was gated, the mark said it was spent, and the next pass put the row in wait_running with an hour-long wake on
+        # checks a spent GraphQL quota never re-read; lanes merged around the queue. Now the mark is spent only when a
+        # worker takes the row, and judge_tier puts it ahead of every waiting row for the next worker that frees.
+        pool = self.pooled(1)
+        for n in (2, 3):
+            key = f"pr:o/r#{n}"
+            self.pr(LA, key=key)
+            gg.land_request("land", f"o/r#{n}", [], "host/lane")
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#2"])  # the one worker is busy
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.tick()
+        e = self.q.entries["pr:o/r#1"]
+        self.assertEqual(len(pool.handed), 1)
+        self.assertNotEqual(e["state"], "waiting", "a gated override row never falls into wait_running's hour")
+        self.assertNotIn("overridePinJudged", e)
+        self.assertEqual(self.q.judge_tier(e), 0)
+        pool.handed[0][1].finished = True
+        self.tick()
+        self.assertEqual(pool.keys(), ["pr:o/r#2", "pr:o/r#1"])  # ahead of o/r#3, queued earlier
+        self.assertTrue(self.q.entries["pr:o/r#1"].get("overridePinJudged"))  # spent now that a worker took it
+
     def test_land_override_pinned_row_whose_merge_is_refused_stops_by_name_not_a_wait(self):
         self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
@@ -33851,7 +33876,7 @@ class LandTest(Base):
 
     def test_a_pinned_land_refused_for_quota_with_no_reset_known_is_not_counted(self):
         """No reading or refusal names the reset: the refusals are still not counted (no pin_unread), the PR is read
-        again on the usual cadence; real read errors after them still count and stop it."""
+        again past the refresh hold they set (refresh_outcome); real read errors after them still count and stop it."""
         self.nudge_reads = False
         self.pr(LA)
         self.refuse_for_quota()
@@ -33864,7 +33889,7 @@ class LandTest(Base):
         self.assertIn("pin_read_quota", [h.get("event") for h in e["history"]])
         self.refresh = type(self).refresh.__get__(self)
         self.q.refresh = self.refresh  # real failures ("lane-gh call get: quota" names no spent quota) count
-        for _ in range(int(gg.NUDGE_MIN) * (gg.LAND_PIN_READ_FAILS + 2)):
+        for _ in range(int(gg.NUDGE_MIN + gg.LAND_REFRESH_BROKER_HOLD_MAX) * (gg.LAND_PIN_READ_FAILS + 2)):
             e = self.tick(1)
             if e["state"] == "stopped":
                 break
@@ -35492,6 +35517,22 @@ class LandTest(Base):
         error[0] = None
         self.assertTrue(self.due("pr:o/r#2"))
         self.assertIsNone(self.q.refresh_hold)
+        self.assertEqual(refreshed, [self.KEY, "pr:o/r#2"])
+
+    def test_a_quota_refusal_naming_no_reset_holds_every_refresh_then_one_probe(self):
+        """cmux-cp-1, 2026-11-25 05:30-06:30Z: 197 of 440 land refreshes answered DIRECT_QUOTA (no reset named), held
+        nothing, and were sent again on the next pass, one PR 12 times in the hour."""
+        refreshed, rows = self.held_refresh_queue([gg.DIRECT_QUOTA])
+        self.assertTrue(self.due(self.KEY))
+        hold = self.q.refresh_hold
+        self.assertEqual((hold["kind"], hold["n"], hold["until"]),
+                         ("quota", 1, self.q.now + gg.LAND_REFRESH_BROKER_HOLD))
+        self.assertEqual(rows[-1]["hold"]["kind"], "quota")
+        self.assertFalse(self.due("pr:o/r#2"))  # held: judged on its copy, no read
+        self.q.now += gg.LAND_REFRESH_BROKER_HOLD + 1
+        self.assertTrue(self.due("pr:o/r#2"))  # one probe past the hold, refused again: the hold doubles
+        self.assertEqual((self.q.refresh_hold["n"], self.q.refresh_hold["until"]),
+                         (2, self.q.now + 2 * gg.LAND_REFRESH_BROKER_HOLD))
         self.assertEqual(refreshed, [self.KEY, "pr:o/r#2"])
 
     def test_land_status_names_an_entry_whose_refreshes_never_answered(self):
