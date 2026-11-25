@@ -28553,6 +28553,15 @@ class LandTest(Base):
                                      {"mb": LC, "files": [same, {**same, "f": "b.py"}]}))
         self.assertIn("no patch", why(LA, LB, LC, "main", {"files": [{**same, "d": None}]},
                                       {"mb": LC, "files": [same]}))
+        # lw#10961 2026-11-25: a mode-only file has no patch; the same blob at the pin and at HEAD is the same file
+        mode = {"f": "t.py", "s": "modified", "p": None, "d": None, "b": "d" * 40}
+        self.assertEqual(why(LA, LB, LC, "main", {"files": [same, mode]}, {"mb": LC, "files": [moved, mode]}), "")
+        self.assertIn("in t.py", why(LA, LB, LC, "main", {"files": [same, mode]},
+                                     {"mb": LC, "files": [moved, {**mode, "b": "e" * 40}]}))
+        self.assertIn("in t.py", why(LA, LB, LC, "main", {"files": [same, mode]},
+                                     {"mb": LC, "files": [moved, {**mode, "d": "@@ -1 +1 @@\n-x\n+y"}]}))
+        self.assertIn("no blob", why(LA, LB, LC, "main", {"files": [{**mode, "b": None}]},
+                                     {"mb": LC, "files": [mode]}))
         many = [{**same, "f": f"f{i}"} for i in range(gg.LAND_COMPARE_FILES_MAX)]
         self.assertIn("or more", why(LA, LB, LC, "main", {"files": many}, {"mb": LC, "files": many}))
         self.assertEqual(gg.land_base_merge_parent(LA[:12], LB, {"headRefOid": LB, "headParents": [LA, LC]}), LC)
