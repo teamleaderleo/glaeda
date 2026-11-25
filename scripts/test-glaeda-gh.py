@@ -16807,15 +16807,72 @@ class PostTest(unittest.TestCase):
         self.step(d, NOW)
         self.assertEqual((len(ran), gg.post_state(item["id"])["state"]), (1, "posted"))
 
-    def test_a_lane_vm_lost_broker_answer_fails_naming_the_read_never_twice(self) -> None:
-        item = self.queue("comment", "o/r#7", "--body", "x")
+    def lost_then(self, item, *answers):
+        """A lane VM's first broker call loses its answer (a timeout); ANSWERS are the later (exit, stdout) calls.
+        Returns the daemon, the calls made, and the time the look is due (the broker's own deadline later)."""
+        ran: list[list[str]] = []
+        replies = list(answers)
+
+        def run(argv, timeout=None, **_kw):
+            ran.append(list(argv))
+            if len(ran) == 1:
+                raise subprocess.TimeoutExpired("lane-gh", 1)
+            code, out = replies.pop(0)
+            return subprocess.CompletedProcess(argv, code, json.dumps(out), "")
         d = gg.Daemon(transport=Scripted(), token=lambda: TOKEN, controller=None)
-        with mock.patch.object(gg, "lane_vm_poster", return_value=True), \
-                mock.patch.object(gg, "run_bounded", side_effect=subprocess.TimeoutExpired("lane-gh", 1)):
-            self.step(d, NOW)
+        for patch in (mock.patch.object(gg, "lane_vm_poster", return_value=True),
+                      mock.patch.object(gg, "run_bounded", side_effect=run)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual(state["state"], "queued")  # a lost answer alone is never reported failed, nor done
+        self.assertIn("read o/r before sending it again", state.get("lastError") or "")
+        return d, ran, NOW + gg.BROKER_POST_DEADLINE + 1
+
+    def test_a_lane_vm_lost_broker_answer_is_posted_once_the_look_finds_it_never_sent_twice(self) -> None:
+        """gcp-agent-lane VM 2026-11-25: 4 of its last 10 queued writes ended "the lane-gh broker gave no answer in
+        120s; it may have been made" with no URL. The record now carries the write's own URL once the look finds it."""
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        url = "https://github.com/o/r/pull/7#issuecomment-5"
+        d, ran, due = self.lost_then(item, (0, {"ok": True, "data": [{"body": "y", "html_url": "other"},
+                                                                     {"body": "x", "html_url": url}]}))
+        self.step(d, NOW + 60)
+        self.assertEqual(len(ran), 1)  # the look waits out the broker's own deadline: it may still be making it
+        self.step(d, due)
+        self.assertEqual(ran[1][1:4], ["call", "get", "o/r"])
+        self.assertEqual(json.loads(ran[1][4])["path"], "issues/7/comments")
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"], len(ran)), ("posted", url, 2))
+
+    def test_a_lane_vm_lost_broker_answer_is_resent_only_when_the_look_says_it_is_not_there(self) -> None:
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "why")
+        d, ran, due = self.lost_then(item, (0, {"ok": True, "data": []}),
+                                     (0, {"ok": True, "data": {"number": 9, "url": "https://github.com/o/r/pull/9"}}))
+        self.step(d, due)
+        self.assertEqual([r[2] for r in ran], ["pr_create", "get", "pr_create"])
+        self.assertEqual(json.loads(ran[1][4])["query"]["head"], "o:lane/x")
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_a_lane_vm_look_with_no_answer_keeps_the_write_queued_then_gives_up_naming_the_read(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "x")
+        d, ran, due = self.lost_then(item, *[(1, {"ok": False, "error": "busy"})] * gg.POST_ATTEMPTS)
+        at = due
+        for _ in range(gg.POST_ATTEMPTS):
+            self.step(d, at)
+            at += gg.POST_RETRY * gg.POST_ATTEMPTS + 1
+        self.assertTrue(all(r[2] == "get" for r in ran[1:]))  # never a second comment while the look cannot answer
         state = gg.post_state(item["id"])
         self.assertEqual(state["state"], "failed")
         self.assertIn("read o/r before sending it again", state["error"])
+
+    def test_a_lane_vm_lost_update_branch_is_asked_again_without_a_look(self) -> None:
+        sha = "a" * 40
+        item = self.queue("update-branch", "o/r#7", "--sha", sha, stdin="")
+        d, ran, _due = self.lost_then(item, (0, {"ok": True, "data": {"url": "https://github.com/o/r/pull/7"}}))
+        self.step(d, NOW + gg.POST_RETRY + 1)
+        self.assertEqual([r[2] for r in ran], ["update_branch", "update_branch"])
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
     def test_a_lane_vm_review_is_refused_at_accept_naming_what_posts_it(self) -> None:
         args = gg.parser().parse_args(["post", "review", "o/r#7", "--body", "r"])

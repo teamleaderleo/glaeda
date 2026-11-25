@@ -8278,7 +8278,9 @@ class Daemon:
         `gh` takes: the daemon here has no login, and its `gh auth token` post held every write queued for good
         (lane_vm_poster). A limit's refusal made nothing, so the write waits out its retry_after, and so does every
         write behind it (the pause is the login's). A write with no broker form fails with the command that makes it.
-        A lost answer fails rather than risk a second PR or comment: it names the repository to read first. An entry
+        A lost answer is never sent again blind: once the broker's own deadline has passed, broker_find looks for it
+        (posted with its URL when found, resent when the look answers "not there", failed naming the repository to
+        read only when no look answers within POST_ATTEMPTS). An entry
         a token-less attempt marked uncertain was never sent (its POST needed the token it could not get)."""
         chosen = broker_post_args(item)
         if chosen is None:
@@ -8286,6 +8288,19 @@ class Daemon:
                                                f"status key or reviewers); {broker_post_next(item)}")
             return
         item.pop("uncertain", None)
+        if item.get("brokerLost"):
+            # The last broker call's answer was lost: the write may have landed. Look before sending it twice;
+            # report it posted only on what the look found, resend only on a look that answered "not there".
+            found, looked = broker_find(item, BROKER_OUTBOX_DEADLINE)
+            self.post_at = self.now
+            if found:
+                self.post_delivered(path, item, found, note="found through the lane-gh broker after a lost answer")
+                return
+            if not looked:
+                self.post_retry(path, item, f"could not look for the lost attempt in {item['repo']}; it may have been "
+                                            f"made: read {item['repo']} before sending it again")
+                return
+            item.pop("brokerLost", None)
         outcome, value = broker_write(item, chosen, BROKER_OUTBOX_DEADLINE)
         self.post_at = self.now
         if outcome == "made":
@@ -8301,8 +8316,14 @@ class Daemon:
             write_json(path, item)
             log({"event": "post-throttled", "id": item["id"], "wait": round(wait), "via": "lane-gh"})
         elif outcome == "lost":
-            self.post_finish(path, item, error=f"{value}; it may have been made: read {item['repo']} before sending "
-                                               "it again")
+            # Never "failed" on a lost answer alone: the next turn looks for it first (broker_find), so the record
+            # ends posted with the write's own URL, or resent once the look says it is not there. An update-branch
+            # is a base merge, safe to ask twice: it is simply asked again.
+            item["brokerLost"] = item["kind"] != "update-branch"
+            self.post_retry(path, item, f"{value}; it may have been made: read {item['repo']} before sending it again")
+            if item["brokerLost"] and path.exists():  # the broker may still make it until its own deadline: look after
+                item["notBefore"] = max(float(item.get("notBefore") or 0), self.now + BROKER_POST_DEADLINE)
+                write_json(path, item)
         else:
             ended = update_branch_retired(422, str(value)) if item["kind"] == "update-branch" else None
             if ended and ended[0] == "done":
@@ -35777,6 +35798,29 @@ def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool
             wait = float(found.group(1)) if found else float(POST_BACKOFF)
         return "limited", max(float(POST_SPACING), wait)
     return "refused", str(said)[:300]
+
+
+def broker_find(item: dict, timeout: float) -> tuple[dict | None, bool]:
+    """(the queued write if it already landed, whether the look got an answer), read through the lane-gh broker's
+    `get` as Daemon.post_find reads with the login: the open PR for its head and base, or a comment with the same
+    body made since it was queued. A page that may not hold every match is no answer (its `get` gives no link)."""
+    repo, kind = item["repo"], item.get("kind")
+    since = dt.datetime.fromtimestamp(float(item.get("queuedAt") or 0) - 60, dt.timezone.utc)
+    if kind == "pr":
+        head = item["head"] if ":" in item["head"] else f"{repo.split('/')[0]}:{item['head']}"
+        call = {"path": "pulls", "query": {"state": "open", "head": head, "base": item["base"], "per_page": "100"}}
+    elif kind == "comment":
+        call = {"path": f"issues/{item['number']}/comments",
+                "query": {"since": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "per_page": "100"}}
+    else:
+        return None, False
+    outcome, data = broker_write(item, ("get", call), timeout, pin=False)
+    if outcome != "made" or not isinstance(data, list) or len(data) >= 100:
+        return None, False
+    for found in reversed(data):
+        if isinstance(found, dict) and found.get("html_url") and (kind == "pr" or (found.get("body") or "") == item["body"]):
+            return found, True
+    return None, True
 
 
 def broker_made_where(data: Any) -> tuple[str | None, Any]:
