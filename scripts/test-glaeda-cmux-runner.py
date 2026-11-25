@@ -2592,6 +2592,38 @@ class HookTest(unittest.TestCase):
             peaks = hook.learned_job_peaks(hook.job_log_tail(self.peak_log(runs)))
             self.assertEqual(hook.job_peak_gib(peaks, self.PEAK_KEY)[0], 4.0)
 
+    def test_own_writes_peak_charges_a_running_job_in_the_listener_hold(self) -> None:
+        """JOB_OWN_WRITTEN and RUNNER_JOBS_OWN_PEAK: a job that never ran alone has no solo peak, but what its runs
+        wrote themselves (disk_written_gib) is its own need; only own_writes reads it, and the listener hold charges
+        a running job that peak, less what it already wrote, instead of the flat fleet p95."""
+        log = self.peak_log([(100.0, 40.0, False)] * 3, {"mini-a": "build-app"})
+        rows = [json.loads(line) for line in log.read_text().splitlines()]
+        for row in rows:
+            if row["event"] == "completed":
+                row[hook.JOB_OWN_WRITTEN_FIELD] = 30.0
+        rows[1][hook.JOB_OWN_WRITTEN_FIELD] = 25.0
+        log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        records = hook.job_log_tail(log)
+        self.assertEqual(hook.learned_job_peaks(records)[self.PEAK_KEY], (60.0, "p90 of 3 runs here"),
+                         "the warning's peak is unchanged")
+        self.assertNotIn(self.PEAK_KEY, hook.learned_job_peaks(records, alone_only=True),
+                         "JOB_DISK_OWN_NEED's refusal reads no own-writes peak")
+        self.assertEqual(hook.learned_job_peaks(records, own_writes=True)[self.PEAK_KEY],
+                         (30.0, "p90 of 3 runs here, its own writes"))
+        table = {**self.peak_runner("actions-runner-a", "mini-a", 4001),
+                 **self.peak_runner("actions-runner-b", "mini-b", 4002)}
+        running = [("actions-runner-a", 4001), ("actions-runner-b", 4002)]
+        self.assertEqual(hook.running_job_charges(self.dir, running, 5.3, log), {4001: 30.0},
+                         "mini-b's job has no peak here: the flat p95")
+        self.assertEqual(hook.running_job_charges(self.dir, running, 5.3, self.dir / "missing.jsonl"), {})
+        self.assertTrue(table)
+        # 2 running + this one at 5.3 = 25.9, plus 24.7 the build-app's own peak adds, less 8 it already wrote
+        why = hook.runner_jobs_refusal(40.0, 2, 5.3, "test", written_gib=8.0, extra_gib=24.7)
+        self.assertIn("40.0 GiB free, 42.6 GiB required", why or "")
+        self.assertIn("plus 24.7 GiB more the running jobs' own learned peaks here want (RUNNER_JOBS_OWN_PEAK)",
+                      why or "")
+        self.assertIsNone(hook.runner_jobs_refusal(43.0, 2, 5.3, "test", written_gib=8.0, extra_gib=24.7))
+
     def test_no_history_falls_back_to_the_flat_job_peak(self) -> None:
         with mock.patch.dict(os.environ):
             os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)

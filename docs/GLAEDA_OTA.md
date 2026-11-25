@@ -160,6 +160,26 @@ full run as the soak ends, which dispatches the promote run: about 16 minutes fr
 Before 2026-11-17 the same path took 23 to 50 minutes (a 15-minute soak, then a 10-13 minute poll and
 up to 15 more for the mirror).
 
+## Fast path for glaeda-gh
+
+The rings above stay the reconciler. Before they run, a merge to `main` also reaches each host's glaeda-gh
+on a faster path:
+
+- **Trigger.** The daemon's main watch (`MainWatch` in `scripts/glaeda-gh`) reads `main` with `git ls-remote`
+  every few seconds. When `main` moves, it starts the operator's `fast-patch glaeda COMMIT` with
+  `FAST_PATCH_TRIGGER=main-watch`.
+- **Swap.** fast-patch fetches the commit, swaps the installed script, and waits for the daemon to report it.
+  The daemon reports it through daemon.json's `scriptSha256`.
+- **Wake.** `ScriptWake` stats the script every 0.5 s. On new content it ends the running tick at its next
+  request boundary and wakes serve's sleep.
+- **Re-exec.** serve then decides with `reexec_due`:
+  - Land judgments in flight are handed to the next daemon.
+  - Only a claimed land step holds or drains the re-exec (`land_busy`). A read is judged again after the
+    restart.
+- **Rollback.** fast-patch rolls back when the daemon is not on the new bytes within its bound.
+- **Record.** Every run appends a line to `~/.local/state/fast-patch/runs.jsonl`. The line carries
+  `seconds`, `fetchedS` and `swapS`, plus `deferred` when land work held the hand-over.
+
 ## Rings
 
 | Host | Ring | Why |
