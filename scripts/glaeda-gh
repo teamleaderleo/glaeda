@@ -15221,6 +15221,23 @@ LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|r
                               r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
+# LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
+# scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
+# that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
+# 2026-11-25, 759 of 3,722 open feat-cmux-next PRs carried it, and repeat pushes to them were about 150k pr-router
+# (and other land-tier) runner minutes a day (ci-runner-min-per-day-50k; Leo: "de facto, im asking for 99% fewer
+# minutes of ci time, period." and "whatever we need to cut, we cut."). head_tier's rule stays: a re-land asks for the
+# label again (land_tier, do_label) and that one `labeled` event runs the full tier once, on the head being landed.
+# Taken off: a `cancelled` entry, a `closed` stop at once, and any other stop LAND_UNLABEL_AFTER after it when it will
+# not re-arm by itself (rearm: not a LAND_REARM_CODES code, or today's LAND_REARM_CAP spent). Never: full-ci (a person
+# or agent set that on purpose), a teammate's PR (a `teammate` stop in the history: their label is their opt-in), a
+# forwarded row (its executor's own loop takes it off), a broker client (no GitHub login of its own). One REST DELETE
+# per ended land (e["unlabeled"]), a 404 counting as gone, at most LAND_UNLABEL_BATCH a pass, off the pass thread;
+# a refused one is retried after LAND_UNLABEL_AFTER, LAND_UNLABEL_TRIES times. Detector: test-glaeda-gh.py -k unlabel.
+LAND_UNLABEL = "ready-to-land"
+LAND_UNLABEL_AFTER = 7200.0
+LAND_UNLABEL_BATCH = 4
+LAND_UNLABEL_TRIES = 3
 # LAND_STOP_REPEAT: a re-armed entry that stops again with the stop it was re-armed from (same code, same head, the
 # same reason once its counts and seconds are left out) tells its requester nothing: they were told at the first stop,
 # and every acpmux notice is a whole model turn for them. efficiency-scout pass 6, 2026-11-21: cmux#47074's session
@@ -17100,6 +17117,7 @@ class LandQueue:
         self.forward = forward
         self.sending: set[str] = set()  # keys whose handoff is in flight to the executor (forward_tick)
         self.forward_thread: threading.Thread | None = None
+        self.unlabel_thread: threading.Thread | None = None  # LAND_UNLABEL's sends, one batch at a time
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
@@ -17498,6 +17516,7 @@ class LandQueue:
                      lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
+                     unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
                      forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
@@ -17581,6 +17600,7 @@ class LandQueue:
         # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
         live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs
                 and k not in self.overflowing]
+        unlabel: list[str] = []  # ended lands that take their ready-to-land off (LAND_UNLABEL)
         for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
@@ -17591,8 +17611,11 @@ class LandQueue:
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
                         self.rearm(e)  # judged from the next pass
+                if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
+                    unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        self.unlabel_start(unlabel)
         if dirty is not None and not recovery and latch is None and ended is None:
             # The daemon tells us when a PR cache write or webhook changes a waiting head. A quiet CI wait
             # needs its watch renewed, but sorting it would reopen its cache on every daemon tick.
@@ -19187,6 +19210,82 @@ class LandQueue:
         log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
         self.save(e)
         return True
+
+    def unlabel_owed(self, e: dict) -> bool:
+        """Whether E's land ended unmerged and owes the PR its ready-to-land off now (LAND_UNLABEL's comment)."""
+        state = e.get("state")
+        if state not in ("stopped", "cancelled") or e.get("unlabeled") or self.broker_client():
+            return False
+        if any(h.get("code") == "teammate" for h in e.get("history") or []):
+            return False  # a teammate's label is their opt-in
+        fail = e.get("unlabelFail") or {}
+        if fail and self.now - float(fail.get("at") or 0) < LAND_UNLABEL_AFTER:
+            return False
+        if state == "cancelled":
+            at = max((float(h.get("at") or 0) for h in e.get("history") or [] if h.get("event") == "cancelled"),
+                     default=float(e.get("updated") or 0))
+            return self.now - at >= LAND_UNLABEL_AFTER
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if code == "teammate":
+            return False
+        if code == "closed":
+            return True
+        if LAND_REARM_CODES.match(code):
+            r = e.get("rearms") or {}
+            if not (r.get("day") == land_day(self.now) and int(r.get("n") or 0) >= LAND_REARM_CAP):
+                return False  # it re-arms by itself, and lands with its label
+        return self.now - float(st.get("at") or 0) >= LAND_UNLABEL_AFTER
+
+    def unlabel_start(self, keys: list[str]) -> None:
+        """Send the owed label removals (unlabel_owed), LAND_UNLABEL_BATCH at most, off the pass thread."""
+        if not keys or (self.unlabel_thread is not None and self.unlabel_thread.is_alive()):
+            return
+        batch = [(k, int(self.entries[k].get("gen") or 0)) for k in keys[:LAND_UNLABEL_BATCH]]
+        if self.inline:
+            self.unlabel_send(batch)
+        else:
+            self.unlabel_thread = threading.Thread(target=self.unlabel_send, args=(batch,), name="land-unlabel",
+                                                   daemon=True)
+            self.unlabel_thread.start()
+
+    def unlabel_send(self, batch: list[tuple[str, int]]) -> None:
+        """One REST DELETE of ready-to-land per entry in BATCH (key, gen), through the gh-quota shim; a 404 (the label
+        is already off) counts as done. An entry re-requested meanwhile (its gen moved) keeps what it has."""
+        gh = self.gh()
+        if gh is None:
+            return
+        for key, gen in batch:
+            try:
+                e = self.entries.get(key)
+                if e is None:
+                    continue
+                path = f"repos/{e['repo']}/issues/{e['number']}/labels/{LAND_UNLABEL}"
+                got = self.call([gh, "api", "-X", "DELETE", path], LAND_GH_DEADLINE, None)
+                said = f"{got.stderr or ''} {got.stdout or ''}"
+                gone = got.returncode == 0 or "404" in said or "Label does not exist" in said
+                with self.lock:
+                    if self.entries.get(key) is not e or int(e.get("gen") or 0) != gen \
+                            or e.get("state") not in ("stopped", "cancelled"):
+                        continue
+                    if gone:
+                        e["unlabeled"] = {"head": str(e.get("head") or ""), "at": self.now}
+                        e.pop("unlabelFail", None)
+                        self.history(e, "label_removed", label=LAND_UNLABEL,
+                                     note=None if got.returncode == 0 else "already off")
+                    else:
+                        n = int((e.get("unlabelFail") or {}).get("n") or 0) + 1
+                        why = land_tail(said.strip() or f"exit {got.returncode}", 200)
+                        if n >= LAND_UNLABEL_TRIES:
+                            e["unlabeled"] = {"head": str(e.get("head") or ""), "at": self.now, "failed": why}
+                            e.pop("unlabelFail", None)
+                        else:
+                            e["unlabelFail"] = {"n": n, "at": self.now}
+                        self.history(e, "label_remove_failed", label=LAND_UNLABEL, n=n, why=why)
+                    self.save(e)
+                log({"event": "land-unlabel", "key": key, "rc": got.returncode, "gone": gone})
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
 
     def latch_owed(self, e: dict, at: float) -> bool:
         """Whether E's retry_deadline stop at AT is owed a whole budget now (LAND_WAIT_HELD): the login's latch held it
