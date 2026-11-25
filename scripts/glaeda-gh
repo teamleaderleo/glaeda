@@ -35646,6 +35646,24 @@ def body_guard_args(item: dict, body_file: str) -> list[str]:
     return ["issue", "comment", str(item["number"]), "-R", repo, "--body-file", body_file]
 
 
+def footer_appended(guard, item: dict, args: list[str]) -> str | None:
+    """A PR post's body with the line `agent-identity footer --repo OWNER/REPO` prints appended, instead of refusing
+    it for lacking one (the gh shim does the same to `gh pr create`: public_body_guard.with_footer). None when the
+    post is no PR, the body has the footer, the guard has no own_footer, or there is no footer to be had."""
+    if item.get("kind") != "pr" or guard.footer_refusal(args, os.environ) is None:
+        return None
+    body = str(item.get("body") or "")
+    own = getattr(guard, "own_footer", None)
+    if own is None or guard.FOOTER.search(body):
+        return None
+    line = own(item["repo"], os.environ)
+    if not line:
+        return None
+    print("glaeda-gh: appended the `agent-identity footer` line to this PR body, which had none "
+          "(an agent's PR body carries it; pr-footer-guard)", file=sys.stderr)
+    return body.rstrip("\n") + "\n\n" + line + "\n"
+
+
 def body_guard_refusal(item: dict) -> str | None:
     """The guard's refusal of this post, or None (allowed, or no guard on this host). The guard asks GitHub
     whether the repo is private (cached an hour); an unknown answer counts as public."""
@@ -35666,7 +35684,15 @@ def body_guard_refusal(item: dict) -> str | None:
         with os.fdopen(fd, "w") as fh:  # inside the try: a failed write still removes the file
             fh.write(item["body"])
         args = body_guard_args(item, name)
-        return guard.refusal(args, os.environ) or guard.footer_refusal(args, os.environ)
+        refused = guard.refusal(args, os.environ)
+        if refused:
+            return refused
+        footed = footer_appended(guard, item, args)
+        if footed:  # the PR's body gets this session's footer line, as the gh shim gives `gh pr create` (with_footer)
+            item["body"] = footed
+            with open(name, "w") as fh:
+                fh.write(footed)
+        return guard.footer_refusal(args, os.environ)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(name)

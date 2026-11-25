@@ -18773,6 +18773,20 @@ class PostBodyGuardTest(unittest.TestCase):
                                    "--body", "x\n\nAgent session: [s](https://cmux.com/deeplink/agent?id=aid-1)")[0], 0)
         self.assertEqual(self.queued(), 1)
 
+    def test_a_pr_without_the_footer_gets_it_appended_and_is_queued(self) -> None:
+        line = "Agent session: [s](https://cmux.com/deeplink/agent?id=aid-1)"
+        self.guard.write_text(self.GUARD + "FOOTER = re.compile(r'^Agent session:', re.M)\n"
+                              f"def own_footer(repo, env):\n    return {line!r}\n")
+        code, err = self.post("pr", "pub/cmux", "--head", "h", "--base", "b", "--title", "t", "--body", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("appended the `agent-identity footer` line", err)
+        bodies = [json.loads(f.read_text())["body"] for f in gg.outbox_dir().glob("*.json")]
+        self.assertEqual(bodies, ["x\n\n" + line + "\n"])
+        code, err = self.post("comment", "pub/cmux#7", "--body", "y")  # a comment never gets one
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(json.loads(f.read_text())["body"] for f in gg.outbox_dir().glob("*.json"))[-1:],
+                         ["y"])
+
     def test_a_guard_that_breaks_queues_nothing(self) -> None:
         self.guard.write_text("def refusal(args, env):\n    raise RuntimeError('boom')\n")
         code, err = self.post("comment", "pub/cmux#7", "--body", "x")
