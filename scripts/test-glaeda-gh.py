@@ -27193,6 +27193,26 @@ class LandTest(Base):
         self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
         self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
 
+    def test_a_head_moved_stop_of_another_hosts_requester_is_an_fyi_that_wakes_nobody(self):
+        # LAND_FAR_HEAD_MOVED_FYI: Leo, 2026-11-24, "not unnecessarily waking up fellas". A far requester's own queue
+        # follows the land it handed here; this host's head_moved stop reaches it as an inbox fyi, never a blocker.
+        def stop_class(requester: str) -> str:
+            self.w.calls.clear()
+            self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+            gg.land_request("land", "o/r#1", [], requester, sha=LA)
+            self.tick()
+            evil = {**self.PIN_DIFF, "d": "@@ -14,3 +14,5 @@ def f():\n w\n+y\n+backdoor()\n z"}
+            self.base_merged(now={"mb": self.LD, "files": [evil]})
+            e = self.tick(30)
+            self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+            told = [m for m in self.w.sent() if m[3] == requester]
+            self.assertEqual(len(told), 1, told)
+            return told[0][told[0].index("--class") + 1]
+
+        with mock.patch.object(gg, "policy_host", return_value="host"):
+            self.assertEqual(stop_class("other/lane"), gg.LAND_FORWARD_FYI_CLASS)
+            self.assertEqual(stop_class("host/lane"), gg.LAND_NOTICE_CLASS)  # a session here is woken as before
+
     def test_a_merge_of_a_commit_not_on_the_base_still_stops_head_moved(self):
         self.pinned_and_waiting()
         self.base_merged(mb=LC)  # where HEAD meets main is not its second parent: another branch was merged

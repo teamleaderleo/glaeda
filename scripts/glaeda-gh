@@ -15276,6 +15276,22 @@ LAND_FORWARD_STATE_TRIES = 3
 LAND_FORWARD_FYI_CLASS = "fyi"
 
 
+# A head_moved stop of a land whose requester is a session on another host goes as an inbox fyi that wakes nobody
+# (LandQueue.stop). Such a land reached this queue from the requester's host (a forward, a lane VM's hand-off, the
+# broker), whose own row follows it (forward_follow: stop_moved_pin tells the requester there when that row still
+# holds the old pin), and the requester has usually queued the new head already. Leo, 2026-11-24: "let's make sure
+# we're being efficient rn and not unnecessarily waking up fellas". gcp-agent-lane-1, 24 h to 2026-11-25 01Z: 28 of
+# its 78 head_moved wakes came from another host (23 from the broker host), e.g. manaflow-ai/cmux#54347's stop at
+# e64607c after its requester had pushed 396e9e7 and queued that head at home.
+LAND_FAR_HEAD_MOVED_FYI = True
+
+
+def land_requester_far(e: dict) -> bool:
+    """Whether E's requester is a session on a known other host (land_session_host), never for an unknown one."""
+    host, _ = land_session_host(str(e.get("requester") or ""))
+    return LAND_FAR_HEAD_MOVED_FYI and bool(host) and host != policy_host()
+
+
 def land_session_lane(name: str) -> str:
     """The lane lane-gh names for session NAME (its last path component), or "" when that is no lane name."""
     lane = str(name or "").strip().rstrip("/").split("/")[-1]
@@ -21919,6 +21935,8 @@ class LandQueue:
             # LAND_STOP_REPEAT's comment: the requester already holds this exact stop; land status still shows it.
             log({"event": "land-stop-repeat-quiet", "key": e["key"], "code": code, "to": e.get("requester") or ""})
             return
+        if code == "head_moved" and not tell and land_requester_far(e):
+            tell = "fyi"  # LAND_FAR_HEAD_MOVED_FYI's comment: the requester's own queue says it, or it moved on
         # past LAND_INFRA_RETRY_CAP: still only an unread GitHub, nothing the requester acts on (LAND_INFRA_STOPS)
         self.notify(e, e.get("requester") or "", msg, wake=not infra and tell != "quiet",
                     cls=LAND_FORWARD_FYI_CLASS if tell == "fyi" else None)
