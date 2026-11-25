@@ -29662,6 +29662,86 @@ class LandTest(Base):
         e = self.tick(gg.LAND_REARM_AFTER * 2)
         self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "block", None))
 
+    def unlabels(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api", "-X", "DELETE") if "/labels/" in c[3]]
+
+    def stopped_on(self, code: str) -> dict:
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal(code, LA, {"kind": "stop", "stop": code}))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", code))
+        return e
+
+    def test_unlabel_a_stop_that_never_rearms_takes_ready_to_land_off_after_the_delay_once(self):
+        # 2026-11-25: 759 of 3,722 open feat-cmux-next PRs kept ready-to-land after their land ended, and head_tier ran
+        # the full tier on every later push to them (about 150k pr-router minutes a day).
+        self.stopped_on("block")
+        e = self.tick(gg.LAND_UNLABEL_AFTER - 10)
+        self.assertEqual(self.unlabels(), [])  # not before the delay: a quick re-land keeps its label
+        e = self.tick(20)
+        self.assertEqual(self.unlabels(), [["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"]])
+        self.assertEqual(e["unlabeled"]["head"], LA)
+        self.assertEqual(e["history"][-1]["event"], "label_removed")
+        self.tick(gg.LAND_UNLABEL_AFTER)
+        self.assertEqual(len(self.unlabels()), 1)  # once per ended land
+        # a re-land starts over: its own end takes the label off again
+        self.land()
+        self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+        e = self.tick()
+        self.assertIsNone(e.get("unlabeled"))
+        self.tick(gg.LAND_UNLABEL_AFTER + 1)
+        self.assertEqual(len(self.unlabels()), 2)
+
+    def test_unlabel_never_touches_a_teammates_pr(self):
+        self.stopped_on("teammate")
+        self.tick(gg.LAND_UNLABEL_AFTER * 3)
+        self.assertEqual(self.unlabels(), [])
+
+    def test_unlabel_never_sends_full_ci(self):
+        self.stopped_on("block")
+        self.tick(gg.LAND_UNLABEL_AFTER + 1)
+        sent = [c for c in self.w.calls if "full-ci" in " ".join(map(str, c))]
+        self.assertEqual(sent, [])
+        self.assertTrue(all(c[3].endswith("/labels/ready-to-land") for c in self.unlabels()))
+
+    def test_unlabel_a_cancelled_land_after_the_delay(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        self.tick()
+        gg.land_request(gg.LAND_WITHDRAW, "o/r#1", [], "host/lane")
+        e = self.tick()
+        self.assertEqual(e["state"], "cancelled")
+        self.assertEqual(self.unlabels(), [])
+        e = self.tick(gg.LAND_UNLABEL_AFTER + 1)
+        self.assertEqual(len(self.unlabels()), 1)
+        self.assertTrue(e["unlabeled"])
+
+    def test_unlabel_a_pr_closed_unmerged_at_once(self):
+        e = self.stopped_on("block")
+        with self.q.lock:
+            self.q.ended(e, "CLOSED", "", "test")
+        e = self.tick()
+        self.assertEqual((e["stop"]["code"], len(self.unlabels())), ("closed", 1))
+
+    def test_unlabel_a_rearming_stop_waits_for_its_rearms_and_a_refusal_retries_then_gives_up(self):
+        self.stopped_on("own_red")
+        self.tick(gg.LAND_UNLABEL_AFTER + 1)  # re-armed, not unlabeled
+        self.assertEqual(self.unlabels(), [])
+        e = self.q.entries[self.KEY]
+        with self.q.lock:
+            e.update(state="stopped", stop={"code": "own_red", "at": self.t, "head": LA},
+                     rearms={"day": gg.land_day(self.t), "n": gg.LAND_REARM_CAP})
+        self.w.gh_rc["other"] = 1
+        self.w.gh_err["other"] = "gh: HTTP 502"
+        for _ in range(gg.LAND_UNLABEL_TRIES):
+            e = self.tick(gg.LAND_UNLABEL_AFTER + 1)
+            e["rearms"] = {"day": gg.land_day(self.t), "n": gg.LAND_REARM_CAP}
+        self.assertEqual(len(self.unlabels()), gg.LAND_UNLABEL_TRIES)
+        self.assertIn("failed", e["unlabeled"])
+        self.tick(gg.LAND_UNLABEL_AFTER + 1)
+        self.assertEqual(len(self.unlabels()), gg.LAND_UNLABEL_TRIES)
+
     def test_a_transient_step_refusal_never_counts_toward_the_step_stop(self):
         # cmux#46145, 2026-11-19: broker refusals and one "timed out after 120s" made the "6 times in a row" stop.
         self.t = (NOW // 86400 + 1) * 86400 + 3600
