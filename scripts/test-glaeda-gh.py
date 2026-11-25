@@ -1963,29 +1963,38 @@ class ControllerTest(Base):
         self.ctl.statuses = statuses
         return pending
 
+    def start_feeds(self) -> None:
+        """A watched PR, and two ticks: the first learns the change feed's cursor, the second the status feed's."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+
     def test_a_commit_status_in_the_status_feed_reads_its_pr_at_once_and_marks_its_head_done(self) -> None:
         """hq#25251: a status delivery never reached the change feed, so a PR whose last check was a status waited for a
         timer. The status feed's completed status on the PR's head nudges it like a suite does, and marks the head's
         check done for the land queue (LAND_EVENT_JUDGE)."""
         pending = self.status_feed()
-        self.daemon.tick(NOW + gg.NUDGE_MIN)  # learns the status cursor
+        self.start_feeds()
+        self.assertIsNotNone(self.daemon.status_cursor)
         reads = len(self.gh.gql_calls())
         pending.append({"repo": "o/r", "head_sha": "a" * 40, "context": "ci/x", "state": "success",
                         "status": "completed"})
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.TICK)
         self.assertEqual(len(self.gh.gql_calls()), reads + 1)  # re-read at once
+        self.assertIn("pr:o/r#1", self.daemon.nudged)
         self.assertIsNotNone(self.daemon.land_feed_done("pr:o/r#1", "a" * 40))
         self.assertEqual(self.daemon.controller_status.get("state"), "ok")
         pending.append({"repo": "o/r", "head_sha": "b" * 40, "context": "ci/x", "state": "pending",
                         "status": "in_progress"})
-        self.daemon.tick(NOW + 2 * gg.NUDGE_MIN)
+        self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + gg.TICK)
         self.assertIsNone(self.daemon.land_feed_done("pr:o/r#1", "b" * 40), "a pending status is not a finished check")
 
     def test_a_controller_without_the_status_feed_keeps_the_change_feed_and_is_not_taken_out(self) -> None:
         self.ctl.statuses = mock.Mock(side_effect=gg.NoReceiver("controller HTTP 404"))
-        self.daemon.tick(NOW + gg.NUDGE_MIN)
-        self.assertLessEqual(self.daemon.controller_down_until, NOW + gg.NUDGE_MIN)
-        self.assertGreaterEqual(self.daemon.status_feed_off_until, NOW + gg.NUDGE_MIN + gg.STATUS_FEED_OFF)
+        self.start_feeds()
+        self.assertLessEqual(self.daemon.controller_down_until, NOW + gg.TICK)
+        self.assertGreaterEqual(self.daemon.status_feed_off_until, NOW + gg.TICK + gg.STATUS_FEED_OFF)
         calls = self.ctl.statuses.call_count
         self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
         reads = len(self.gh.gql_calls())
@@ -1995,7 +2004,7 @@ class ControllerTest(Base):
 
     def test_a_status_stream_long_poll_names_a_status_and_the_tick_reads_at_once(self) -> None:
         self.status_feed()
-        self.daemon.tick(NOW + gg.NUDGE_MIN)
+        self.start_feeds()
         self.assertIsNotNone(self.daemon.status_cursor)
         wake = threading.Event()
         stream = gg.FeedStream(self.daemon, wake, wait=0, kind="statuses")
@@ -2005,7 +2014,7 @@ class ControllerTest(Base):
             "cursor": since + 1, "statuses": [{"repo": "o/r", "head_sha": "a" * 40, "status": "completed"}]})
         self.assertEqual(stream.step(), 0.0)
         self.assertTrue(stream.ready.is_set() and wake.is_set())
-        self.assertTrue(self.daemon.feed_stream_due(NOW + gg.NUDGE_MIN))  # the tick reads at once
+        self.assertTrue(self.daemon.feed_stream_due(NOW + 2 * gg.TICK))  # the tick reads at once
         self.assertFalse(stream.ready.is_set())
         self.assertEqual(self.daemon.status_cursor, cursor, "the stream never moves the daemon's cursor")
 
