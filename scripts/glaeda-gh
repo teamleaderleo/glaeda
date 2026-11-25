@@ -973,6 +973,11 @@ HEAD_DIRECT_MAX = 60
 # and read at 23:41:22Z, at the next tick. Looked for every HEADS_BETWEEN_EVERY s, at most one GraphQL batch or
 # HEADS_BETWEEN_REST REST heads a look and HEADS_BETWEEN_TICK_MAX a tick, newest ask first, so a flood of asks (the
 # land queue's, glaeda#2489) keeps its turn at the tick's due phase and never takes the tick from the waited PRs.
+# And no look past the tick's heads' share (REST_HEAD_BUDGET, Daemon.past_heads_share) while a waited PR or run is due:
+# the looks had no time bound, and a look's batch reads each head's suites, check pages and steps (a 285-check head is
+# many requests), so with land-judge asking ~380 unanswered heads in 2 min (its controller rollups timing out sent it
+# to GitHub) half the land host's tick stacks sat in post_between's look, "read head" took 316 of 525 s of ticks per
+# 10 min, and waited PRs went 77 min unread through a restart (2026-11-25).
 HEADS_BETWEEN_EVERY = 5.0
 # How far a new file's mtime may lag time.time() (Linux's coarse clock: a jiffy, 4 ms at HZ=250; measured 5.5 ms).
 WATCH_MTIME_SLACK = 0.25
@@ -6455,6 +6460,10 @@ class Daemon:
         self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
         self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
         self.heads_between_read = 0  # heads a look sent this tick (HEADS_BETWEEN_TICK_MAX)
+        # The tick's heads' share (REST_HEAD_BUDGET) as a time.monotonic() deadline, None while no waited PR or run is
+        # due: a look between the read batches reads no head past it once a head query went this tick (heads_between).
+        self.head_until: float | None = None
+        self.phase_lent = 0.0  # seconds a look between batches booked as "read head", out of the phase it sat in
         self.tick_splits: dict[str, int] = {}  # queries each kind added this tick by splitting (GQL_SPLITS)
         self.tick_asked: dict[str, bool] = {}  # a kind sent a query this tick: a share's UNTIL may cut its next call
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
@@ -9237,6 +9246,8 @@ class Daemon:
             return
         if time.monotonic() - self.heads_between_at < HEADS_BETWEEN_EVERY:
             return
+        if self.past_heads_share():
+            return  # a waited PR or run is due and the heads had their share: the next tick reads these first
         self.heads_between_at = time.monotonic()
         self.heads_between_busy = True
         try:
@@ -9247,6 +9258,14 @@ class Daemon:
             self.errors.append(f"heads between reads: {describe(error)} at {error_site(error)}")
         finally:
             self.heads_between_busy = False
+
+    def past_heads_share(self) -> bool:
+        """Whether a look between the read batches is past the tick's heads' share (REST_HEAD_BUDGET, self.head_until):
+        a waited PR or run is due, the share is spent and a head was already read this tick. The looks ran after every
+        read batch with no bound of their own, so a land-judge asking hundreds of heads a minute kept the tick in head
+        reads (each batch's suites, pages and steps) to its end, and the waited PRs the due phase put first went stale."""
+        return (self.head_until is not None and time.monotonic() >= self.head_until
+                and (bool(self.tick_asked.get("head")) or self.heads_between_read > 0))
 
     def read_heads_between(self) -> None:
         since = self.heads_between_since
@@ -9289,9 +9308,12 @@ class Daemon:
             self.attempted.pop(e["key"], None)
         # (no phase of its own: the time goes to the read phase it sits in, never counted twice)
         if path == "graphql":
-            self.defer(self.batched("head", due, self.graphql_fetch["head"]))
+            self.defer(self.batched("head", due, self.graphql_fetch["head"], until=self.head_until))
             return
         for i, e in enumerate(due):
+            if i and self.past_heads_share():
+                self.defer(due[i:])  # past the heads' share mid-look: first next tick, not ahead of a waited PR
+                return
             try:
                 with self.calling(*caller_of(e["key"]), waiter_of(e)):
                     self.fetch_head_rest(e)
@@ -9674,6 +9696,7 @@ class Daemon:
         # until the next tick (2026-11-25): read_heads_between also takes a file up to WATCH_MTIME_SLACK older, unless
         # the watch read below already listed its key (that one is the due phase's: read, or deferred on purpose).
         self.heads_between_since = time.time()
+        self.head_until = None  # until the due phase knows whether a waited PR or run is due (until_of below)
         self.heads_between_seen = frozenset()
         self.heads_between_read = 0
         with self.phase("watches"):
@@ -9723,6 +9746,7 @@ class Daemon:
         # blocked batches, so the floor batch and the round robin's turn read heads for as long as the splits ran (the
         # land host, 2026-11-25, as at GQL_SPLITS). The first head query of the tick still goes (batched's UNTIL).
         until_of = {"head": time.monotonic() + REST_HEAD_BUDGET if blocked["pr"] or blocked["run"] else None}
+        self.head_until = until_of["head"]  # and the looks between the batches (heads_between) keep it too
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
             if over[kind] != "graphql":
                 continue
@@ -9785,6 +9809,7 @@ class Daemon:
         # the last waited PR or run in the order: a head past the heads' share ahead of it is deferred (REST_HEAD_BUDGET)
         last_waited = max((i for i, x in enumerate(over_rest) if x["key"].startswith(("pr:", "run:")) and self.waited(x)),
                           default=-1)
+        self.head_until = head_until if last_waited >= 0 else None  # the looks between these reads keep it too
         asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
