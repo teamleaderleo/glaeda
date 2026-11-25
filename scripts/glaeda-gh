@@ -22902,6 +22902,17 @@ class LandQueue:
             return LAND_FETCH_ONCE.as_posix()
         return shutil.which("git-fetch-once") or ""
 
+    def update_live_tip(self, e: dict, data: dict) -> tuple[str, str]:
+        """(sha, branch): the PR branch's tip as GitHub's branch ref gives it now (one REST read, apart from the GraphQL
+        PR reads that lag), ("", branch) when it cannot be read."""
+        branch, gh = str(data.get("headRefName") or ""), self.gh()
+        if not BRANCH_SAFE.fullmatch(branch) or ".." in branch or gh is None:
+            return "", branch
+        got = self.call([gh, "api", f"repos/{e['repo']}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}", "--jq",
+                         ".object.sha"], LAND_GH_DEADLINE)
+        tip = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
+        return (tip if SHA40.fullmatch(tip) else ""), branch
+
     def update_noop(self, e: dict, head: str, sent: dict, waited: float) -> bool:
         """land_judge named the update-branch again at HEAD, where GitHub already answered one (the comment after
         LAND_UPDATE_ONCE). True when this decided E (a short wait, a re-judgment, a stop); False when the compare could
@@ -22928,6 +22939,25 @@ class LandQueue:
         if not isinstance(behind, int) or isinstance(behind, bool):
             return False
         said = land_trim(sent.get("answered"), 160)
+        # The compare above is of the head this queue last read, not of the branch. hq#26227, lw#11062 (13:16Z) and
+        # hq#26324 (15:06Z), 2026-11-25: GitHub made the update's merge commit within seconds each time, while the
+        # cache and land_judge read the old head past LAND_HEAD_TIMEOUT, so this stopped saying "the update changed
+        # nothing". One REST read of the branch ref tells the two apart (update_live_tip).
+        tip, branch = self.update_live_tip(e, data) if behind else ("", "")
+        if tip and tip != head:
+            with self.lock:
+                if (e.get("updateUnread") or {}).get("head") != head:
+                    e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
+                    self.history(e, "update_unread", head=head[:12], tip=tip[:12],
+                                 why=f"GitHub's {branch} is at {tip[:12]}: the update made it, the reads lag")
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                    return True
+                self.stop(e, "update_head_unread",
+                          f"the update-branch sent at {head[:12]} {waited:.0f} s ago made {tip[:12]} (GitHub's {branch} "
+                          f"ref), but this host's PR reads still show {head[:12]}: the reads lag, not the update",
+                          f"glaeda-gh land {name} --sha {tip}")
+                return True
         with self.lock:
             if behind == 0 and (e.get("updateNoop") or {}).get("head") != head:
                 # The head already holds the base: the update had nothing to merge. Judged again at this head now.
