@@ -23396,6 +23396,40 @@ class ConcurrentWaitsRestTest(Base):
         self.daemon.tick(t)
         self.assertEqual(gg.read_cache("pr:o/r#3")["data"]["headRefOid"], "f" * 40)
 
+    def test_through_the_broker_with_no_etag_the_issue_updated_at_vouches_for_the_kept_pull(self) -> None:
+        """glaeda-upstream, 2026-11-25: through broker_transport (no ETag asked or answered, `etags` off) every direct
+        read sent GET pulls/N, 274-551 an hour fleet-wide, the broker's top App read. The issue's updated_at, which
+        GitHub moves on any change to the PR itself (a push, a title, a review), vouches for the kept pull within
+        PULL_REUSE_MAX instead, the way a 304 on the issue does with ETags; a base push alone does not move it."""
+        gh = self.gh
+
+        def broker(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
+            status, answer, data = gh(method, url, {k: v for k, v in headers.items() if k != "If-None-Match"}, body)
+            return status, {k: v for k, v in answer.items() if k.lower() != "etag"}, data
+
+        self.daemon.transport = broker
+        self.daemon.etags = False
+        self.ten_minutes_over_rest()
+        pulls = [c for c in gh.calls[self.after_setup:] if re.search(r"/pulls/\d+$", c[1].split("?")[0])]
+        print(f"\nHARNESS 7 waits, 10 min through the broker: {len(pulls)} pull reads (70 before)", file=sys.stderr)
+        self.assertLessEqual(len(pulls), 7 * (10 * gg.CYCLE // gg.PULL_REUSE_MAX) + 2, len(pulls))
+        for owner, repo, n in self.WAITS:
+            settled = (owner, repo, n) in {("o", "r", 2), ("o", "lw", 1)}
+            data = gg.read_cache(f"pr:{owner}/{repo}#{n}")["data"]
+            self.assertEqual(data["checkState"], "SUCCESS" if settled else "PENDING", (owner, repo, n))
+            if settled:
+                self.assertEqual(data["mergeStateStatus"], "CLEAN", "a settled head's merge state was not read anew")
+        # a push moves the issue's updated_at: the next read takes the pull, never the kept one
+        node = gh.prs[("o", "r", 3)]
+        node["headRefOid"] = "f" * 40
+        node["updatedAt"] = "pushed"
+        t = NOW + 11 * gg.CYCLE
+        path = gg.watch_dir() / gg.file_name("pr:o/r#3")
+        gg.write_json(path, {**gg.read_json(path), "waitedAt": t})
+        os.utime(path, (t, t))
+        self.daemon.tick(t)
+        self.assertEqual(gg.read_cache("pr:o/r#3")["data"]["headRefOid"], "f" * 40)
+
     def test_a_pr_read_costs_more_over_rest_so_rest_must_be_that_much_richer(self) -> None:
         self.daemon.now = NOW
         self.daemon.started_tick = NOW
@@ -24409,11 +24443,14 @@ class StaleDataTest(Base):
         self.assertEqual([c for c in self.gh.calls if c[1].endswith("/graphql")], [], "a GraphQL read the broker refuses")
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["headRefOid"], new)
 
-    def test_direct_reads_through_the_broker_share_the_repo_parts_and_send_no_issue_probe(self) -> None:
+    def test_direct_reads_through_the_broker_share_the_repo_parts_and_ask_the_issue_for_the_kept_pull(self) -> None:
         """gcp-codex-lane-12, 2026-11-17 07:00-07:55Z: 166 direct reads made 1,571 of the VM's 1,857 broker GETs,
         each asking the base's rulesets and the workflow list again (one process each, so repo_parts began empty) and
         an issues/N probe whose answer, with no ETag through the broker, could never vouch for a kept pull. Two direct
-        reads of one PR, as two waits' processes make them: the second reads only what moves (the pull and the head)."""
+        reads of one PR, as two waits' processes make them: the second reads only what moves. Since 2026-11-25 the
+        issue's updated_at vouches for the pull kept within PULL_REUSE_MAX (glaeda-upstream's pulls/N was the broker's
+        top App read, 274-551 an hour): the second read asks issues/N, which the broker keeps and revalidates free,
+        in place of pulls/N, whose ETag moves on every push to the repository."""
         config = Path(self.tmp.name) / "upstream.json"
         gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
         patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
@@ -24427,10 +24464,11 @@ class StaleDataTest(Base):
             for _ in range(2):
                 self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
                                                   "began": time.time() - 700}))
-        self.assertEqual([p for p in served if p.startswith("issues/")], [], served)
+        self.assertEqual(len([p for p in served if p.startswith("issues/")]), 1, served)
         self.assertEqual(len([p for p in served if p.startswith("rules/branches/")]), 1, served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
-        self.assertEqual(len([p for p in served if p == "pulls/9"]), 2, served)
+        self.assertEqual(len([p for p in served if p == "pulls/9"]), 1, served)
+        self.assertLess(served.index("pulls/9"), served.index("issues/9"), "the first read asked the issue")
         print(f"\ntwo direct reads of one PR through the broker: {len(served)} GETs ({served})")
         # past the TTL the next read asks them again
         later = time.time() + gg.REST_REPO_PART_TTL + 1

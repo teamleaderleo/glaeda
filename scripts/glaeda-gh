@@ -1333,6 +1333,9 @@ REST_SHARED_MAX = 600
 # (rest_pull). What the issue does not show is mergeability, which moves when the base moves: the kept pull is reused
 # at most PULL_REUSE_MAX, never once GitHub had not computed mergeability (mergeable null), and never on a head whose
 # checks have all finished and changed since (then the merge state the waits rule on is final, and is read anew).
+# Through broker_transport (a lane VM's direct reads: no ETag asked or answered) the issue's updated_at vouches in
+# place of its 304 (issue_vouches, issue_same): before 2026-11-25 that path never reused a pull, and glaeda-upstream's
+# GET pulls/N was the broker's top App read, 274 an hour over 6 h and 551 over the latest 3 h fleet-wide.
 PULL_REUSE_MAX = 300
 # A REST PR read whose head is still running pages nothing while the head's check suites say nothing changed
 # (claude-sr2-coord, 2026-11-17 09:41Z and 10:36Z: with GraphQL stopped, waits on cmux PRs cost 9.31 counted REST a
@@ -12464,7 +12467,7 @@ class Daemon:
             issue = self.head_part(old, probe, issue_path, slim_issue_gate)
             if str((issue or {}).get("state") or "").lower() != "open":
                 return False
-            if probe[issue_path].get("etag") != kept[issue_path].get("etag"):
+            if not self.issue_same(probe[issue_path], kept[issue_path]):
                 pulled = kept[pull_path].get("at")
                 if not isinstance(pulled, (int, float)) or self.now - pulled >= PULL_REUSE_MAX:
                     return False
@@ -12760,21 +12763,26 @@ class Daemon:
         at = kept.get("at")
         doc = kept.get("doc") if isinstance(kept.get("doc"), dict) else None
         held = old.get(gate) or {}
-        can_reuse = (reuse and self.etags and doc is not None and doc.get("mergeable") is not None
-                     and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX and bool(held.get("etag")))
+        can_reuse = (reuse and doc is not None and doc.get("mergeable") is not None
+                     and isinstance(at, (int, float)) and self.now - at < PULL_REUSE_MAX and self.issue_vouches(held))
         if can_reuse and gate not in parts:
             try:
                 self.head_part(old, parts, gate, slim_issue_gate)
             except WatchError:
                 parts.pop(gate, None)
             else:
-                if parts[gate].get("etag") == held.get("etag"):  # 304 (or shared now): unchanged since the kept pull
+                if self.issue_same(parts[gate], held):  # unchanged since the kept pull
                     parts[path] = kept
                     return doc, True
         pull = self.head_part(old, parts, path, slim_pull)
         parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}  # (a resumed read: its first try's)
-        if gate not in parts and held.get("etag") and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
+        if gate not in parts and self.issue_vouches(held) \
+                and (held.get("doc") or {}).get("updated_at") == pull.get("updated_at"):
             parts[gate] = held  # the issue answer kept still describes this pull
+        elif gate not in parts and not self.etags and pull.get("updated_at"):
+            # No ETag to ask with (broker_transport): the pull's own number, state and updated_at are what GET
+            # issues/N answers for it (a pull and its issue share updated_at), kept free as the next read's question.
+            parts[gate] = {"doc": slim_issue_gate(pull)}
         elif gate not in parts and self.etags and self.mode("rest") != "stop":
             try:  # the issue as of now, for the next read's question (shared: a kept ETag makes it a 304)
                 self.head_part(old, parts, gate, slim_issue_gate)
@@ -12783,6 +12791,21 @@ class Daemon:
         if (parts.get(gate) or {}).get("doc", {}).get("updated_at") != pull.get("updated_at"):
             parts.pop(gate, None)  # the PR changed between the two reads (or the issue lags): no 304 can vouch yet
         return pull, False
+
+    def issue_vouches(self, held: dict) -> bool:
+        """Whether HELD, a kept GET issues/N answer, can say a PR has not changed (issue_same): its ETag, or with no
+        ETag to ask with (broker_transport: the broker answers none, so `etags` is off) its updated_at. No request."""
+        if self.etags:
+            return bool(held.get("etag"))
+        return isinstance(held.get("doc"), dict) and bool(held["doc"].get("updated_at"))
+
+    def issue_same(self, now: dict, held: dict) -> bool:
+        """Whether NOW, this read's GET issues/N answer, shows the PR unchanged since HELD (issue_vouches): the same
+        ETag (a 304, or a shared answer), or with `etags` off the same number, state and updated_at, which GitHub moves
+        on every change to the PR (a push, a comment, a label, a title, an edit) as it moves the issue's ETag."""
+        if self.etags:
+            return now.get("etag") == held.get("etag")
+        return self.issue_vouches(held) and now.get("doc") == held.get("doc")
 
     def runs_unchanged(self, old: dict, parts: dict, root: str, sha: str) -> bool:
         """Whether this read's check-suites answer for SHA (in PARTS) is the kept one (a 304, or the same slimmed
