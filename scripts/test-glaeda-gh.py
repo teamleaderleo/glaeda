@@ -32068,15 +32068,17 @@ class LandTest(Base):
         self.assertEqual(gg.land_retarget_args("o/r", "3", "main", True), ["pr", "edit", "3", "-R", "o/r", "--base",
                                                                            "main"])
 
-    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
-        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_after_a_backoff_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: no stop, a backoff, and the retry at that head merges."""
         head, base = self.union_origin()
         with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
             e = self.union_conflict_tick(head)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
-        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIsNone(e.get("stop"))
+        self.assertIn("the fetch of main and lane/x failed", e["wait"]["why"])
         self.assertNotIn("unionMerge", e)
-        e = self.union_conflict_tick(head)
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
 
@@ -32112,9 +32114,9 @@ class LandTest(Base):
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
 
     def test_a_union_merge_whose_own_read_names_no_branch_says_so_and_is_tried_again(self):
-        """An unread PR decided nothing about the head: the stop names this host's missing read and the read's own
-        reason (before: "the PR's branch '' or base '' is not read or not a plain branch name", terminal, no file),
-        and a re-land once the read landed merges."""
+        """An unread PR decided nothing about the head: the step waits and names this host's missing read and the
+        read's own reason (before: "the PR's branch '' or base '' is not read or not a plain branch name", a
+        terminal stop naming no file), and a re-land once the read landed merges."""
         head, base = self.union_origin()
         reads: list[str] = []
 
@@ -32122,15 +32124,21 @@ class LandTest(Base):
             reads.append(key)
             return "a read gh refused"
         e = self.union_unread_tick(head, refresh)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        # the merged transient path (main, base_merge): no verdict at all, a backoff, and the reason names the read
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertEqual((e["stepTransient"]["kind"], e["stepTransient"]["count"]), ("base_merge", 1))
         again = self.q.branch_base(e, head)  # the bound: one read of its own per head, never a read a judgment
         self.assertEqual((again[0], again[1], again[3]), ("", "", True))
         self.assertIn("the one read this step makes per head named no branch", again[2])
         self.assertEqual(reads, [self.KEY])
-        self.assertIn("o/r#1's branch and base could not be read from this host", e["stop"]["reason"])
-        self.assertIn("a read gh refused", e["stop"]["reason"])
+        self.assertIn("o/r#1's branch and base could not be read from this host", e["wait"]["why"])
+        self.assertIn("a read gh refused", e["wait"]["why"])
         self.assertNotIn("unionMerge", e)
-        e = self.union_conflict_tick(head)
+        # the read lands, the backoff ends, and the same head's merge goes through: nothing was decided against it
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:],
                          [head, base])
@@ -32152,6 +32160,49 @@ class LandTest(Base):
         self.assertEqual(len(failed), 1, e.get("history"))
         self.assertIn("o/r#1's branch and base could not be read from this host", failed[0]["why"])
         self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
+
+    def judge_conflict_refusal(self, head: str) -> None:
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+
+    def test_a_judge_conflict_whose_fetch_failed_backs_off_and_merges_on_the_retry(self):
+        """cmux#50870 (three times), #49337, #49338, 2026-11-25: land_judge read conflicts_base, the base merge's fetch
+        timed out (~300 s), and the land stopped "conflict" with next: none, never retried, with no conflict at all.
+        A fetch that fails is transient: the entry waits a backoff, and the next judgment tries the merge again."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIsNone(e.get("stop"))
+        self.assertIn("the fetch of main and lane/x failed", e["wait"]["why"])
+        self.assertEqual(e["wakeAt"] - self.t, gg.LAND_STEP_BACKOFF)
+        self.assertEqual((e["stepTransient"]["kind"], e["stepTransient"]["count"]), ("base_merge", 1))
+        self.assertFalse([c for c in self.w.sent() if "stopped" in c[-1]], self.w.sent())
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # the backoff ends, the judgment is the same, and now the fetch works: merged here, the land goes on
+        self.judge_conflict_refusal(head)
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "base_merge_try"]), 2)
+
+    def test_a_base_merge_that_keeps_failing_doubles_its_backoff_and_stops_transient_never_conflict(self):
+        head, _ = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"), \
+                mock.patch.object(gg, "LAND_RETRY_STREAK_STOP", 3):
+            e = self.judge_conflict_tick(head)
+            self.assertEqual(e["wakeAt"] - self.t, gg.LAND_STEP_BACKOFF)
+            self.judge_conflict_refusal(head)
+            e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+            self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+            self.assertEqual(e["wakeAt"] - self.t, 2 * gg.LAND_STEP_BACKOFF)
+            self.judge_conflict_refusal(head)
+            e = self.tick(2 * gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "base_merge_transient"))
+        self.assertTrue(gg.LAND_REARM_CODES.match("base_merge_transient"))  # re-armed by itself
+        self.assertIn("never for a conflict", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
 
     def test_a_union_merge_a_restart_dropped_before_it_ran_is_tried_at_the_next_refusal(self):
         """cmux#51491, 2026-11-23: GitHub refused its update-branch at 99deda46, the queue planned the base merge, and
@@ -32270,7 +32321,7 @@ class LandTest(Base):
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
         self.assertEqual(len(self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefName,baseRefName")), 1)
 
-    def test_a_judge_conflict_whose_ref_names_cannot_be_read_stops_saying_so_and_retries(self):
+    def test_a_judge_conflict_whose_ref_names_cannot_be_read_backs_off_and_retries(self):
         head, _ = self.union_origin(main_path="goals/y.md")
         patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
         patch.start()
@@ -32281,7 +32332,7 @@ class LandTest(Base):
                                                                "why": self.JUDGE_CONFLICT_NEXT},
                                       nxt=self.JUDGE_CONFLICT_NEXT))
         e = self.tick()
-        self.assertEqual(e["state"], "stopped")
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
         self.assertIn("could not be read", " ".join(h.get("why", "") for h in e["history"]))
         self.assertNotIn("unionMerge", e)  # decided nothing: a re-land at this head tries the merge again
         self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
