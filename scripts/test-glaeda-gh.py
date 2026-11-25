@@ -27640,6 +27640,55 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"], self.w.explains()), ("stopped", "after_closed", []))
         self.assertIn("https://github.com/o/r/pull/1 stopped: after_closed", self.w.sent()[-1][-1])
 
+    def blind_after(self, answer: str | None) -> list[str]:
+        """Direct reads of --after PRs: each stores the PR as ANSWER (a state), or fails when ANSWER is None."""
+        read: list[str] = []
+
+        def refresh(key: str) -> str | None:
+            read.append(key)
+            if answer is None:
+                return "lane-gh call get: HTTP 502"
+            self.pr(LC, key=key, state=answer)
+            return None
+        self.q.refresh = refresh
+        return read
+
+    def test_a_predecessor_nobody_has_a_copy_of_is_read_directly_and_its_close_stops_the_row(self):
+        # cmux-cp-1, 2026-11-25: manaflow-ai/cmux-extensions#15 sat waiting_after manaflow-ai/cmux#46686 41 h, closed
+        # unmerged 11 min after it queued; the daemon never stored a copy of #46686 (its unwaited peek was starved).
+        read, start = self.blind_after("CLOSED"), self.t
+        self.pr(LA)
+        self.land(after=["o/r#2"])
+        self.assertEqual(self.tick()["state"], "waiting_after")
+        while self.t < start + gg.LAND_AFTER_BLIND - 60:
+            self.tick(30)
+        self.assertEqual((self.q.entries[self.KEY]["state"], read), ("waiting_after", []))  # the peek's time first
+        self.tick(120)
+        e = self.tick()
+        self.assertEqual((read, e["state"], e["stop"]["code"]), (["pr:o/r#2"], "stopped", "after_closed"))
+
+    def test_a_predecessor_whose_copy_went_stale_is_read_directly_and_its_merge_queues_the_row(self):
+        read = self.blind_after("MERGED")
+        self.pr(LA)
+        self.pr(LC, key="pr:o/r#2")
+        self.land(after=["o/r#2"])
+        self.tick()
+        for _ in range(int(gg.LAND_AFTER_BLIND // 30) + 2):
+            self.tick(30)
+            if read:
+                break
+        self.assertEqual(read, ["pr:o/r#2"])
+        self.assertIn("after_merged", [h.get("event") for h in self.q.entries[self.KEY]["history"]])
+
+    def test_a_failed_direct_read_of_a_predecessor_is_tried_again_once_per_bound(self):
+        read, start = self.blind_after(None), self.t
+        self.pr(LA)
+        self.land(after=["o/r#2"])
+        self.tick()
+        while self.t < start + 3 * gg.LAND_AFTER_BLIND + 60:
+            self.tick(30)
+        self.assertEqual((len(read), self.q.entries[self.KEY]["state"]), (3, "waiting_after"))  # at 30, 60 and 90 min
+
     def test_block_stops_and_notifies(self):
         self.pr(LA)
         self.land()
