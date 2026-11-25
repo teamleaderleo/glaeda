@@ -34468,6 +34468,51 @@ class LandTest(Base):
             self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)  # that event was judged; it asks nothing again
 
+    def test_a_check_completed_event_whose_judgment_was_not_handed_is_asked_again_next_pass(self):
+        """glaeda#2744, 2026-11-25: green by 07:29Z, the done event met a refused read (judge handed nothing), the
+        event was marked seen and the row slept to its 08:23Z wake. Now an event is spent only once handed."""
+        self.feed()
+        done, _, _ = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(60)
+        real = self.q.judge
+        refused = [True]
+
+        def judge(e, sha, fp, counts=True, why=""):
+            if refused and why == "checks_done":
+                refused.pop()
+                return False
+            return real(e, sha, fp, counts=counts, why=why)
+        self.q.judge = judge
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 1)
+        e = self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_re_request_of_a_waiting_checks_row_judges_it_again(self):
+        """glaeda#2744: two same-pin re-requests left the waiting row on its hour wake."""
+        self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(30)
+        self.land()  # the same request again
+        self.w.answers.append(ok_answer(LA))
+        self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
+
     def test_an_event_from_before_the_wait_verdict_or_no_feed_keeps_the_timer(self):
         """An event older than the wait's verdict was judged already; with no feed (a lane VM) feed_done says
         nothing, and the wait runs on its timer as before."""

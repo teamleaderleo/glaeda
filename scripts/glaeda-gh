@@ -16876,7 +16876,13 @@ class LandQueue:
             # when it was given: an override answers a checks_stuck verdict reached before it (land_override_carries)
             if fresh or previous_override != e["override"]:
                 e["overrideAt"] = self.now if e["override"] else None
-        if e.get("state") == "waiting" and (pin_changed or e.get("override") != previous_override):
+        if e.get("state") == "waiting" and not fresh and not pin_changed and e.get("override") == previous_override \
+                and (e.get("wait") or {}).get("kind") in ("pr", "run"):
+            # A plain re-request of a row waiting on the PR or a run is news to its wait: it wakes now and is judged
+            # again, not left to the wait's timer (glaeda#2744: two same-pin re-requests left a green PR waiting out
+            # its hour). Requeued, it would only be set to wait on the copy that still shows a check running.
+            e["wakeAt"] = self.now
+        elif e.get("state") == "waiting" and (pin_changed or e.get("override") != previous_override):
             verdict = e.get("explain") or {}
             wait = e.get("wait") or {}
             checks_wait = (wait.get("kind") in ("pr", "run") and not wait.get("rerun")
@@ -19402,7 +19408,12 @@ class LandQueue:
                 self.judge(e, head, fp, why="checks_woke")
             elif kind == "pr" and self.checks_done_event(e, head):
                 # the copy still shows a check running; the feed and the rollup say they all finished (LAND_EVENT_JUDGE)
-                self.judge(e, head, fp, counts=False, why="checks_done")
+                if not self.judge(e, head, fp, counts=False, why="checks_done"):
+                    # Not handed to a worker (no free one, or the read its head needs is refused for quota): the event
+                    # is not spent, asked again next pass. glaeda#2744, 2026-11-25: green 07:29Z, its done event met
+                    # a quota-refused refresh, the event was marked seen and the row slept to its 08:23Z wake.
+                    e.pop("doneEventSeen", None)
+                    self.save(e)
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             elif w.get("rerun"):
@@ -19704,8 +19715,10 @@ class LandQueue:
         self.save(e)
         if done is not True:
             return False
-        self.count("checks_done_event")
-        self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
+        if e.get("doneEventNoted") != at:  # once per event, though a judgment not handed asks again (consider)
+            e["doneEventNoted"] = at
+            self.count("checks_done_event")
+            self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
         return True
 
     def feed_holds(self, e: dict, head: str) -> bool:
