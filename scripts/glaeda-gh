@@ -20992,9 +20992,14 @@ class LandQueue:
         if land_base_merge_parent(pin, head, data):
             return True
         head = str(head or "").lower()
-        if not bool(pin) or SHA40.fullmatch(head) is None or str(data.get("headRefOid") or "").lower() != head \
-                or self.gh() is None:
+        if not bool(pin) or SHA40.fullmatch(head) is None or self.gh() is None:
             return False
+        if str(data.get("headRefOid") or "").lower() != head:
+            # The cache has not read HEAD yet: land_judge's live read named it first (a repin), so nothing here says
+            # its parents, and base_merge_check reads them (one commit read) before it repins or stops. hq#26571,
+            # cmux-cp-1 2026-11-25: 311 of 537 head_moved stops in a day were this, mostly base merges on the pin
+            # ("Merge branch 'feat-cmux-next' into ...", first parent the pin), each stopped with no read at all.
+            return True
         parents = data.get("headParents")
         # a merge whose first parent is not the pin may sit on top of other base merges (land_base_merge_chain)
         return not isinstance(parents, list) or len(parents) == 2
@@ -22915,6 +22920,17 @@ class LandQueue:
             return LAND_FETCH_ONCE.as_posix()
         return shutil.which("git-fetch-once") or ""
 
+    def update_live_tip(self, e: dict, data: dict) -> tuple[str, str]:
+        """(sha, branch): the PR branch's tip as GitHub's branch ref gives it now (one REST read, apart from the GraphQL
+        PR reads that lag), ("", branch) when it cannot be read."""
+        branch, gh = str(data.get("headRefName") or ""), self.gh()
+        if not BRANCH_SAFE.fullmatch(branch) or ".." in branch or gh is None:
+            return "", branch
+        got = self.call([gh, "api", f"repos/{e['repo']}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}", "--jq",
+                         ".object.sha"], LAND_GH_DEADLINE)
+        tip = (got.stdout or "").strip().lower() if got.returncode == 0 else ""
+        return (tip if SHA40.fullmatch(tip) else ""), branch
+
     def update_noop(self, e: dict, head: str, sent: dict, waited: float) -> bool:
         """land_judge named the update-branch again at HEAD, where GitHub already answered one (the comment after
         LAND_UPDATE_ONCE). True when this decided E (a short wait, a re-judgment, a stop); False when the compare could
@@ -22941,6 +22957,25 @@ class LandQueue:
         if not isinstance(behind, int) or isinstance(behind, bool):
             return False
         said = land_trim(sent.get("answered"), 160)
+        # The compare above is of the head this queue last read, not of the branch. hq#26227, lw#11062 (13:16Z) and
+        # hq#26324 (15:06Z), 2026-11-25: GitHub made the update's merge commit within seconds each time, while the
+        # cache and land_judge read the old head past LAND_HEAD_TIMEOUT, so this stopped saying "the update changed
+        # nothing". One REST read of the branch ref tells the two apart (update_live_tip).
+        tip, branch = self.update_live_tip(e, data) if behind else ("", "")
+        if tip and tip != head:
+            with self.lock:
+                if (e.get("updateUnread") or {}).get("head") != head:
+                    e["updateUnread"] = {"head": head, "tip": tip, "at": self.now}
+                    self.history(e, "update_unread", head=head[:12], tip=tip[:12],
+                                 why=f"GitHub's {branch} is at {tip[:12]}: the update made it, the reads lag")
+                    self.nudge(e["key"])
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                    return True
+                self.stop(e, "update_head_unread",
+                          f"the update-branch sent at {head[:12]} {waited:.0f} s ago made {tip[:12]} (GitHub's {branch} "
+                          f"ref), but this host's PR reads still show {head[:12]}: the reads lag, not the update",
+                          f"glaeda-gh land {name} --sha {tip}")
+                return True
         with self.lock:
             if behind == 0 and (e.get("updateNoop") or {}).get("head") != head:
                 # The head already holds the base: the update had nothing to merge. Judged again at this head now.
@@ -25073,10 +25108,64 @@ def land_cached_head(key: str, max_age: float) -> str:
     return str(data.get("headRefOid") or "").lower()
 
 
+# A pin is trusted as given (check_land_pin's comment) because this host's cached head is routinely older than the
+# head an agent just pushed. That reason covers a commit no read here has seen yet; it does not cover a sha no commit
+# anywhere has. land_pin_extends_head_refusal is the one check for that, and it judges the pin against a head this
+# host holds: with no cache read inside LAND_PIN_BEHIND_AGE and a caller outside a checkout of the repo, it is handed
+# "" and returns None. The request is then queued with the pin unchecked and prints the same "requested; the daemon
+# takes it next tick" as a checked one, so its caller cannot tell the check did not run. Measured on this host
+# 2026-11-25 landing two PRs from a directory that is no checkout of either repo: a 40-hex pin padded by hand out of
+# an abbreviated head was taken, and so was an all-zero pin, each at exit 0; each cost a daemon tick and a
+# re-request, and the second replaced the row's own correct pin with no word of what it replaced.
+def land_pin_null_refusal(repo: str, number: int, pin: str) -> tuple[str, str] | None:
+    """(why, the step that clears it) when PIN is all zeros, else None. No read of any kind: one string test. git's
+    null object id names no commit in any repository and is what a padded or truncated pin collapses to, so this is
+    the one invented pin that needs no head here to judge it -- the check the cache-less case above left to nobody."""
+    pin = str(pin or "").lower()
+    if not pin or pin.strip("0") != "":
+        return None
+    name = f"{repo}#{number}"
+    return (f"--match-head-commit {pin[:12]} is all zeros, which is git's null object id and names no commit in any repository, so "
+            f"the land would wait out a head that cannot come. A pin is the PR's head as a command printed it, never "
+            f"a sha filled in or padded by hand",
+            f"glaeda-gh land {name} --sha HEAD (this host pins the PR's current head), "
+            f"or glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+            f"then glaeda-gh land {name} --match-head-commit THAT")
+
+
+def land_pin_unchecked_note(repo: str, number: int, pin: str) -> str:
+    """One line for a request whose pin no head on this host could be judged against, else "". The queue takes the pin
+    either way -- it must, since the head may be newer than anything read here -- but the caller is told the check did
+    not run and the one call that runs it, instead of reading an unchecked pin as a checked one."""
+    if not pin:
+        return ""
+    return (f"--match-head-commit {pin[:12]} was taken as given: this host has no read of {repo}#{number} inside a day and the "
+            f"directory you ran in is no checkout of {repo}, so nothing here could tell that sha from one no commit "
+            f"has. A pin that names no commit parks the row (pin_wait) instead of landing it.\n"
+            f"next: glaeda-gh land {repo}#{number} --sha HEAD pins whatever the head is, checked here")
+
+
+def land_pin_replaces_note(entry: dict | None, pin: str, requester: str) -> str:
+    """The pin a live ENTRY holds, when this request replaces it with a different PIN, else "". A re-pin is ordinary
+    (the head moved and the requester pinned the new one) and is not refused; what was missing is the sha it replaced,
+    which is the only way its requester can put the row back. land_pin_already_followed answers the one case the
+    queue itself moved the pin; this covers every other, including a mistyped or probed sha landing on a correct pin
+    (2026-11-25, this lane)."""
+    if not isinstance(entry, dict) or not pin or entry.get("state") in LAND_DONE:
+        return ""
+    held = str(entry.get("pinSha") or "").lower()
+    if not SHA40.fullmatch(held) or not land_head_moved(pin.lower(), held):
+        return ""
+    if str(entry.get("requester") or "") != requester:
+        return ""  # another session's row: its pin is not this requester's to read as their own
+    return held
+
+
 # The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
 # the executor unchanged (cmd_land_forwarded prints them and drops the staged copy, land_forward_exit fails on them),
 # because the executor is the host that holds the cache and the land-judge the answer came from.
-LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft", "land_pin_behind", "land_pin_invented")
+LAND_REQUEST_REFUSED = ("land_judge_missing", "land_draft", "land_pin_behind", "land_pin_invented",
+                        "land_pin_null")
 
 
 def land_draft_refusal(key: str, repo: str, number: int, pin: str = "") -> tuple[str, str] | None:
@@ -25128,6 +25217,11 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
+    null = land_pin_null_refusal(repo, number, sha) if sha else None
+    if null is not None:
+        # First of the pin answers, before the draft read and before check_land_pin's two git calls: no head, cache
+        # or checkout is needed to know this sha names no commit, so the refusal costs nothing at all.
+        return land_request_refused(key, "land_pin_null", *null, as_json=as_json)
     draft = land_draft_refusal(key, repo, number, sha)
     if draft is not None:
         # Before the forward and before the queue: the request answers it, so no CI wait, judgment or merge call is
@@ -25146,6 +25240,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if invented is not None:
         # Before the ancestor check, which would say nothing here: no checkout holds a commit that does not exist.
         return land_request_refused(key, "land_pin_invented", *invented, as_json=as_json)
+    # The invented-pin check above is handed "" when this host holds no head, and then judges nothing: say so rather
+    # than let the request read as a checked pin (land_pin_unchecked_note).
+    unchecked = land_pin_unchecked_note(repo, number, sha) if sha and not (cached or local) else ""
     behind = land_pin_behind_refusal(repo, number, sha, cached) if sha else None
     if behind is not None:
         # Same place, same reason as the draft answer: a pin the head has already passed can only stop later.
@@ -25155,8 +25252,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if executor is not None:
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
                                   ceiling, nominated)
-    followed = land_pin_already_followed(read_json(LandQueue.entries_dir() / file_name(key)), sha, requester) \
-        if sha else ""
+    live = read_json(LandQueue.entries_dir() / file_name(key))
+    followed = land_pin_already_followed(live, sha, requester) if sha else ""
+    replaced = land_pin_replaces_note(live, sha, requester) if sha and not followed else ""
     if followed:
         # Not a refusal: the row is live, pinned ahead of this request, and keeps its place in the queue.
         why = (f"{repo}#{number} is already queued and its pin followed {sha[:12]} forward here: the row holds "
@@ -25188,6 +25286,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
                "lease") if not lane and land_broker_client() else ""
     if no_lane and not as_json:
         say_waiting(f"glaeda-gh land: {no_lane}")
+    if replaced and not as_json:
+        say_waiting(f"glaeda-gh land: this request re-pinned {repo}#{number}, which was queued pinned {replaced}: "
+                    f"that pin is gone from the row.\nnext: glaeda-gh land {repo}#{number} --match-head-commit {replaced} puts it "
+                    f"back, if {sha[:12]} was not the head you meant")
+    if unchecked and not as_json:
+        say_waiting(f"glaeda-gh land: {unchecked}")
     running = daemon_running()
     leash = Leash(wait, ceiling)  # --timeout is no change in the land's entry for that long, up to --max
     entry = None
@@ -25207,6 +25311,10 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         out.update(leash.fields())
     if no_lane:
         out["laneWarning"] = no_lane
+    if unchecked:
+        out["pinUnchecked"] = unchecked
+    if replaced:
+        out["pinReplaced"] = replaced
     if not running:
         out.update(code="daemon_down", reason=down_message(), next="glaeda-gh restart")
     if as_json:
