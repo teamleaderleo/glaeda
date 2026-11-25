@@ -775,6 +775,8 @@ CONTROLLER_TICK_BUDGET = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 
 CONTROLLER_DEADLINE = CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_READ_TIMEOUT + 1  # one whole controller request
 CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
+CONTROLLER_HOLD_MAX_AGE = 2 * CONTROLLER_FEED_EVERY  # a hold snapshot older than two feed gaps cannot vouch for a merge
+CONTROLLER_FREEZE_MAX_AGE = 3600  # PRSync's complete merge-freeze listing is refreshed at most hourly
 # whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
 CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
 REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
@@ -4915,6 +4917,103 @@ class Controller:
         return self.get(f"/v1/github/run-jobs?repo={urllib.parse.quote(repo, safe='/')}"
                         f"&run={int(run_id)}&attempt={int(attempt)}")
 
+    def holds(self, repo: str, number: int) -> dict:
+        """The controller's complete hold snapshot for one pull request, without a GitHub read."""
+        return self.get(f"/v1/github/holds?repo={urllib.parse.quote(repo.lower(), safe='/')}"
+                        f"&number={int(number)}")
+
+
+def controller_hold_projection(doc: dict, repo: str, number: int, head: str, now: float) -> tuple[dict, float] | None:
+    """Return a land-judge-shaped PR and its authoritative timestamp when DOC is whole and current.
+
+    The controller is a cache of GitHub events. Every completeness marker is required before its fields can replace a
+    cached PR, so a partial table or a filtered private-repository answer leaves the existing cache untouched.
+    """
+    if not isinstance(doc, dict) or doc.get("public_only") is True or doc.get("note") \
+            or str(doc.get("repo") or "").lower() != repo.lower() or doc.get("number") != number \
+            or doc.get("seeded") is not True or doc.get("found") is not True \
+            or doc.get("freeze_seeded") is not True \
+            or str(doc.get("freeze_error") or ""):
+        return None
+    as_of = iso_epoch(doc.get("holds_as_of"))
+    freeze_at = iso_epoch(doc.get("freeze_synced_at"))
+    holds_since = iso_epoch(doc.get("holds_since"))
+    if as_of is None or freeze_at is None or holds_since is None \
+            or not -5 <= now - as_of <= CONTROLLER_HOLD_MAX_AGE \
+            or not -5 <= now - freeze_at <= CONTROLLER_FREEZE_MAX_AGE \
+            or not isinstance(doc.get("freeze"), list):
+        return None
+    pr = doc.get("pr")
+    repo = repo.lower()
+    if not isinstance(pr, dict) or str(pr.get("repo") or "").lower() != repo \
+            or pr.get("number") != number or str(pr.get("state") or "").lower() != "open":
+        return None
+    if str(pr.get("head_sha") or "").lower() != head.lower() or pr.get("body_truncated") is True:
+        return None
+    body, body_hash = pr.get("body"), pr.get("body_sha256")
+    labels = pr.get("labels")
+    comments, reviews = pr.get("comments"), pr.get("reviews")
+    created_at = iso_epoch(pr.get("created_at"))
+    if created_at is None or created_at < holds_since \
+            or not isinstance(body, str) or not isinstance(body_hash, str) \
+            or hashlib.sha256(body.encode()).hexdigest() != body_hash.lower() \
+            or not isinstance(labels, list) or not all(isinstance(label, str) for label in labels) \
+            or not isinstance(comments, list) or pr.get("comments_complete") is not True \
+            or pr.get("comments_dropped") is True or not isinstance(reviews, list):
+        return None
+    updated = pr.get("updated_at")
+    if not isinstance(updated, str) or iso_epoch(updated) is None:
+        return None
+    base, branch, url, author = pr.get("base_ref"), pr.get("head_ref"), pr.get("url"), pr.get("author")
+    if not all(isinstance(value, str) and value for value in (base, branch, url, author)):
+        return None
+    additions, deletions = pr.get("additions"), pr.get("deletions")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (additions, deletions)):
+        return None
+    def typed(login: str) -> dict:
+        bot = login.lower().endswith("[bot]") or login.lower().startswith("app/")
+        return {"login": login, "__typename": "Bot" if bot else "User", "is_bot": bot}
+    shaped_comments = []
+    for item in comments:
+        if not isinstance(item, dict) or isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) \
+                or not isinstance(item.get("author"), str) or not isinstance(item.get("body"), str) \
+                or not isinstance(item.get("created_at"), str) or iso_epoch(item.get("created_at")) is None \
+                or (item.get("updated_at") is not None and iso_epoch(item.get("updated_at")) is None) \
+                or (not item["author"].lower().endswith("[bot]") and re.match(
+                    r"^\s*(?:independent\s+)?review\s*\(", item["body"], re.I)):
+            return None
+        shaped_comments.append({"databaseId": item["id"], "url": item.get("url"),
+                                "createdAt": item["created_at"], "lastEditedAt": item.get("updated_at"),
+                                "body": item["body"], "author": typed(item["author"]),
+                                "authorAssociation": "", **({"deleted": True} if item.get("deleted") else {})})
+    shaped_reviews = []
+    for item in reviews:
+        if not isinstance(item, dict) or isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int) \
+                or not isinstance(item.get("login"), str) or not item["login"] \
+                or not isinstance(item.get("state"), str) or not isinstance(item.get("submitted_at"), str) \
+                or iso_epoch(item.get("submitted_at")) is None \
+                or item["state"] not in {"APPROVED", "CHANGES_REQUESTED"}:
+            return None
+        shaped_reviews.append({"databaseId": item["id"], "submittedAt": item["submitted_at"],
+                               "state": item["state"], "body": "", "author": typed(item["login"]),
+                               "authorAssociation": "", "commit": {"oid": str(item.get("commit_id") or "")}})
+    mergeable = pr.get("mergeable")
+    if not isinstance(mergeable, bool) or pr.get("source") not in {"delivery", "read"} \
+            or len(reviews) >= 40:
+        return None
+    head_repo = str(pr.get("head_repo") or repo).lower()
+    data = {"number": number, "title": pr.get("title"), "body": body,
+            "labels": [{"name": label} for label in labels], "state": "OPEN", "url": url,
+            "headRefOid": head, "headRefName": branch, "baseRefName": base,
+            "isCrossRepository": head_repo != repo, "author": typed(author),
+            "additions": additions, "deletions": deletions, "comments": shaped_comments,
+            "reviews": shaped_reviews, "updatedAt": updated,
+            "mergeable": "MERGEABLE" if mergeable else "CONFLICTING",
+            "landJudgeControllerFreeze": list(doc["freeze"])}
+    if not isinstance(data["title"], str):
+        return None
+    return data, as_of
+
 
 def controller_run(run: dict) -> dict:
     """The controller's run record in slim_run's shape."""
@@ -6258,6 +6357,7 @@ class Daemon:
         self.status_feed_off_until = 0.0
         self.status_feed_error: str | None = None
         self.controller_seen: dict[str, bool] = {}  # watched run key -> the controller knows the run
+        self.controller_hold_at: dict[str, float] = {}  # PR hold snapshots last attempted, paced by feed gaps
         self.controller_status: dict[str, Any] = {"state": "off" if self.controller is None else "starting"}
         self.nudged: set[str] = set()  # PRs (and heads) a check event touched since their last fetch
         # Event streams (EVENT_STREAMS): the controller's last answer per PR key, when a PR's event count last moved,
@@ -13241,6 +13341,44 @@ class Daemon:
         return (self.controller is not None and self.now >= self.controller_down_until
                 and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
 
+    def refresh_controller_holds(self, entries: list[dict]) -> None:
+        """Project complete controller hold rows into watched PR caches, bounded to one request per feed gap."""
+        if self.controller is None:
+            return
+        landing = set() if self.land_queue is None else {
+            k for k, item in self.land_queue.entries.items() if item.get("state") not in LAND_DONE}
+        candidates = []
+        for entry in entries:
+            key = entry.get("key", "")
+            if not key.startswith("pr:") or not (entry.get("cache") or {}).get("data"):
+                continue
+            data = (entry.get("cache") or {}).get("data") or {}
+            if terminal("pr", data) or not isinstance(data.get("headRefOid"), str) or not data["headRefOid"]:
+                continue
+            if key in landing or self.waited(entry):
+                candidates.append(entry)
+        candidates.sort(key=lambda item: (item["key"] not in landing, self.wait_start(item)))
+        for entry in candidates:
+            key = entry["key"]
+            if self.now - self.controller_hold_at.get(key, float("-inf")) < CONTROLLER_FEED_EVERY:
+                continue
+            if not self.controller_room():
+                break
+            self.controller_hold_at[key] = self.now
+            _, owner, repo, number = split_key(key)
+            try:
+                doc = self.controller.holds(f"{owner}/{repo}", int(number))
+            except (NoReceiver, WatchError):
+                continue
+            prior = entry.get("cache") or {}
+            old = prior.get("data") if isinstance(prior.get("data"), dict) else {}
+            projected = controller_hold_projection(doc, f"{owner}/{repo}", int(number),
+                                                    str(old.get("headRefOid") or ""), self.now)
+            if projected is None:
+                continue
+            data, at = projected
+            self.store(key, prior, dataAt=at, data={**old, **data}, via="controller")
+
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
         last tick's reads (feed_held) are applied here first: their cursor is already past them."""
@@ -13260,6 +13398,7 @@ class Daemon:
                 self.on_event_tick(pages)
             except Exception as error:  # noqa: BLE001  a hook must never stop the reads
                 self.errors.append(f"on-event: {describe(error)} at {error_site(error)}")
+        self.refresh_controller_holds(entries)
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
         for key, e in runs.items():
