@@ -774,6 +774,19 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
+    def test_disposable_family_searches_deep_trees_to_the_bottom(self) -> None:
+        # gcp-agent-lane-14, 2026-11-25: an extracted toolchain under /tmp (11 levels, 2190 entries) read "unchecked"
+        # at the default depth 5 forever; a git_disposable family is bounded by the entry budget, not the depth
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        deep = self.root / "toolchain"
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c").mkdir(parents=True)
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/lib.so").write_text("x")
+        self.assertEqual(gd.git_state(deep), "unchecked")  # the plain default depth still fails closed
+        self.assertEqual(gd.family_git_state(self.fam, deep), "unchecked")  # so does a non-disposable family
+        self.assertEqual(gd.family_git_state(tmp, deep), "none")
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/repo/.git").mkdir(parents=True)
+        self.assertEqual(gd.family_git_state(tmp, deep), "git")  # a clone at the bottom is still found
+
     def test_old_tree_past_default_budget_is_searched_on_a_larger_budget(self) -> None:
         big = self.root / "big"
         for i in range(30):
