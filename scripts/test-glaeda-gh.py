@@ -29873,6 +29873,70 @@ class LandTest(Base):
         self.assertIn("update_once", [h["event"] for h in e["history"]])
         self.assertNotIn("identical refusals", self.w.sent()[-1][-1])
 
+    def noop_update_pr(self, behind: str | None) -> None:
+        """LA, base main, the update-branch answered (exit 0) and never moving the head; BEHIND is what GitHub's
+        compare main...LA answers (None: the read fails)."""
+        self.pr(LA)
+        self.w.cache[self.KEY]["data"]["baseRefName"] = "main"
+        self.w.api["repos/o/r/compare/main..."] = behind
+        self.land()
+
+    def test_an_answered_update_with_no_new_head_stops_at_once(self):
+        # manaflow-ai/cmux#53919 (transcript-lessons passes 74, 75): GitHub answered the update-branch, the head never
+        # moved, and the land waited 3,642 s for it before stopping update_branch_no_new_head. Now the judgment after
+        # the head wait (LAND_HEAD_TIMEOUT) reads one compare: still behind the base, it stops there, naming the update.
+        self.noop_update_pr(json.dumps({"s": "diverged", "b": 3}))
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"], e["stop"]["code"]), (1, "stopped", "update_branch_no_new_head"))
+        self.assertLess(self.t - start, gg.LAND_HEAD_TIMEOUT + 120)  # not the hour
+        self.assertIn("3 commit(s) behind main", e["stop"]["reason"])
+        self.assertIn(f"gh pr update-branch 1 -R o/r --match-head-commit {LA}", e["stop"]["next"])
+
+    def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
+        # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
+        # at once at that head, and a merge there lands it.
+        self.noop_update_pr(json.dumps({"s": "ahead", "b": 0}))
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 60, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIn("update_noop", [h["event"] for h in e["history"]])
+        self.w.answers[:] = [ok_answer(LA)]
+        self.run_hour(lambda: ok_answer(LA), seconds=300, step=30.0)
+        self.assert_merged_at(LA)
+
+    def test_a_green_head_an_update_never_moved_is_merged_after_one_head_wait(self):
+        # manaflow-ai/cmux#53799's class (reported green for 23 h): the update answered, the head never moved, and
+        # land_judge then said merge at that head. do_merge's stale_pin re-armed its head wait at every judgment, so
+        # the green PR was never merged. Past one LAND_HEAD_TIMEOUT it merges, pinned to the head.
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        self.tick()
+        start = self.t
+        e = self.run_hour(lambda: ok_answer(LA), seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        self.assertEqual(e["state"], "merged", e.get("stop"))
+        self.assertLess(self.t - start, gg.LAND_HEAD_TIMEOUT + 120)
+        self.assert_merged_at(LA)
+
+    def test_an_update_named_again_after_its_noop_stops_naming_the_rule(self):
+        self.noop_update_pr(json.dumps({"s": "ahead", "b": 0}))
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual((len(updates), e["state"], e["stop"]["code"]), (1, "stopped", "update_branch_noop"))
+        self.assertLess(self.t - start, gg.LAND_HEAD_TIMEOUT + 300)
+        self.assertIn(f"land-judge explain o/r 1 --sha {LA}", e["stop"]["next"])
+
+    def test_an_unread_compare_keeps_the_bounded_wait(self):
+        self.noop_update_pr(None)
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 300, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+
     def test_an_update_at_a_new_head_is_sent_again(self):
         # once per head: the update's own head, judged stale again (the base moved during its CI), takes its own
         self.pr(LA)

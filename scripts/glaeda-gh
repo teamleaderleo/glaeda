@@ -15154,6 +15154,14 @@ LAND_STEP_TRANSIENT = re.compile(r"\btimed out after \d+s\b|\bHTTP 5\d\d\b|\b5\d
 #   once LAND_UPDATE_ONCE has passed since the send with no new head.
 # A teammate's PR is a land_judge stop (code teammate) before any update is named, so this never sends one there.
 LAND_UPDATE_ONCE = 3600.0
+# An update-branch GitHub answered (exit 0) that made no new head is not waited out to LAND_UPDATE_ONCE. Reported by
+# transcript-lessons passes 74 and 75 (classes update_branch_no_new_head, land-forward-unreadable): manaflow-ai/cmux
+# #53919 sat 3,642 s on one answered update before this stop; #53799 sat green for 23 h around one. Once the head
+# wait after the send (LAND_HEAD_TIMEOUT) has passed and land_judge names the update again at the same head, one
+# compare BASE...HEAD decides it (update_noop): behind by 0, the head already holds the base, so the update had nothing
+# to merge and the PR is judged again at once (a second update named there stops update_branch_noop, naming the
+# rule's explain); behind by more, GitHub's answer changed nothing and it stops update_branch_no_new_head at once,
+# naming the hand update. A send that timed out (124, unanswered) or a compare that fails keeps the bounded wait.
 # A ci_never_ran refusal at a head this land itself made is a "not yet", not a refusal to act on. GitHub creates a
 # push's workflow runs asynchronously, and a fast pull_request_target run can be the only run at a head for minutes
 # after the push; land_judge's ci_never_ran compares the runs it reads at the head against what PRs into the base run
@@ -22100,6 +22108,9 @@ class LandQueue:
                 e.pop("stepFail", None)
                 e.pop("stepTransient", None)
             if got.returncode == 0 and kind == "update_branch":
+                if isinstance(e.get("updateSent"), dict):  # GitHub answered it (a timeout did not): update_noop
+                    e["updateSent"]["answered"] = land_trim(land_tail(f"{got.stdout or ''}\n{got.stderr or ''}"),
+                                                            200) or "exit 0"
                 self.nudge(e["key"])
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
             elif got.returncode == 0:
@@ -22530,6 +22541,55 @@ class LandQueue:
             return LAND_FETCH_ONCE.as_posix()
         return shutil.which("git-fetch-once") or ""
 
+    def update_noop(self, e: dict, head: str, sent: dict, waited: float) -> bool:
+        """land_judge named the update-branch again at HEAD, where GitHub already answered one (the comment after
+        LAND_UPDATE_ONCE). True when this decided E (a short wait, a re-judgment, a stop); False when the compare could
+        not be read, and the old bounded wait (LAND_UPDATE_ONCE) goes on."""
+        repo, number = e["repo"], str(e["number"])
+        name = key_name(e["key"])
+        if waited < LAND_HEAD_TIMEOUT:  # GitHub's merge is async: the new head may still be on its way
+            with self.lock:
+                self.history(e, "update_once", head=head[:12], why="answered: waiting for its new head")
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT - waited)
+            return True
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        base, gh = str(data.get("baseRefName") or ""), self.gh()
+        if not base or gh is None:
+            return False
+        path = f"repos/{repo}/compare/{urllib.parse.quote(base, safe='')}...{head}"
+        got = self.call([gh, "api", path, "--jq", LAND_ANCESTRY_JQ], LAND_GH_DEADLINE)
+        try:
+            doc = json.loads(got.stdout or "") if got.returncode == 0 else None
+        except ValueError:
+            doc = None
+        behind = doc.get("b") if isinstance(doc, dict) else None
+        if not isinstance(behind, int) or isinstance(behind, bool):
+            return False
+        said = land_trim(sent.get("answered"), 160)
+        with self.lock:
+            if behind == 0 and (e.get("updateNoop") or {}).get("head") != head:
+                # The head already holds the base: the update had nothing to merge. Judged again at this head now.
+                e["updateNoop"] = {"head": head, "at": self.now}
+                self.history(e, "update_noop", head=head[:12], why=f"the head already holds {base}: judged again")
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"the update-branch at {head[:12]} had nothing to merge"},
+                          NUDGE_MIN * 3)
+                return True
+            if behind == 0:
+                self.stop(e, "update_branch_noop",
+                          f"land_judge names an update-branch at {head[:12]}, which already holds {base} (GitHub's "
+                          f"compare: behind by 0); the one sent {waited:.0f} s ago had nothing to merge ({said}), and "
+                          "the judgment after it named the update again",
+                          f"land-judge explain {repo} {number} --sha {head} --json (the rule that names the update), "
+                          f"then glaeda-gh land {name}")
+                return True
+            self.stop(e, "update_branch_no_new_head",
+                      f"GitHub answered the update-branch sent at {head[:12]} {waited:.0f} s ago ({said}), and the head "
+                      f"is still {head[:12]}, {behind} commit(s) behind {base}: the update changed nothing",
+                      f"gh pr update-branch {number} -R {repo} --match-head-commit {head}, then glaeda-gh land {name}")
+            return True
+
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "") -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
@@ -22566,6 +22626,8 @@ class LandQueue:
             # Once per head (LAND_UPDATE_ONCE's comment): never a second update at this head. Wait for the new head
             # it makes; with none by the bound, stop and say so.
             waited = self.now - float(sent.get("at") or 0)
+            if sent.get("answered") and self.update_noop(e, head, sent, waited):
+                return
             with self.lock:
                 if waited >= LAND_UPDATE_ONCE:
                     self.stop(e, "update_branch_no_new_head",
@@ -22929,9 +22991,15 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "policy", f"land_judge said merge but named no full head ({sha!r})", "")
             return
+        sent = e.get("updateSent") or {}
         if answer.get("pinned", True) and e.get("preStepHead") == sha \
-                and (e.get("lastAction") or {}).get("kind") == "update_branch":
-            # Pinned to the head read before update-branch: wait for the new one instead.
+                and (e.get("lastAction") or {}).get("kind") == "update_branch" \
+                and not (sent.get("head") == sha and self.now - float(sent.get("at") or 0) >= LAND_HEAD_TIMEOUT):
+            # Pinned to the head read before update-branch: wait for the new one instead, once (LAND_HEAD_TIMEOUT).
+            # Past that wait, the update made no head and this one is the PR's: merged pinned to it (GitHub refuses a
+            # moved head). Before, every judgment at it re-armed this wait: an update with no new head kept a green
+            # PR here for good (the class of manaflow-ai/cmux#53799, reported green 23 h; the comment after
+            # LAND_UPDATE_ONCE).
             with self.lock:
                 self.history(e, "stale_pin", head=sha[:12])
                 self.nudge(e["key"])
