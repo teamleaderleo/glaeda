@@ -11603,6 +11603,99 @@ class HeadChecksTest(Base):
             self.assertIn(why, doc["unread"][SHA_A])
 
 
+    @staticmethod
+    def controller_rollup(sha: str, runs: list[dict] | None = None, statuses: list[dict] | None = None,
+                          complete: bool = True) -> dict:
+        runs = [{"id": 5, "name": "build", "status": "completed", "conclusion": "success",
+                 "app": {"slug": "github-actions"}, "check_suite": {"id": 90}},
+                {"id": 6, "name": "e2e", "status": "completed", "conclusion": "skipped",
+                 "app": {"slug": "github-actions"}, "check_suite": {"id": 90}}] if runs is None else runs
+        statuses = [{"id": 1, "context": "ci/legacy", "state": "success"}] if statuses is None else statuses
+        return {"sha": sha, "complete": complete, "check_runs_complete": complete, "status_complete": True,
+                "check_runs": {"total_count": len(runs), "check_runs": runs},
+                "status": {"state": "success", "statuses": statuses}}
+
+    def controller_fixture(self, doc: dict, state: str = "ok") -> mock.Mock:
+        """The daemon reads the controller (daemon.json), whose rollup answers DOC."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / "daemon.json", {"controller": {"state": state}})
+        ctl = mock.Mock()
+        ctl.get = mock.Mock(return_value=doc)
+        patcher = mock.patch.object(gg.Controller, "from_env", return_value=ctl)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return ctl
+
+    def test_controller_green_checks_takes_the_newest_attempt_and_refuses_anything_not_green(self) -> None:
+        """LAND_ROLLUP_JUDGE: only a whole, green head is ever handed on."""
+        doc = self.controller_rollup(SHA_A)
+        checks = gg.controller_green_checks(doc, SHA_A)
+        self.assertEqual([(c["name"], c["conclusion"], c["statusContext"]) for c in checks],
+                         [("build", "success", False), ("e2e", "skipped", False), ("ci/legacy", "success", True)])
+        rerun = [{"id": 4, "name": "build", "status": "completed", "conclusion": "failure",
+                  "app": {"slug": "github-actions"}, "check_suite": {"id": 90}}, *doc["check_runs"]["check_runs"]]
+        self.assertIsNotNone(gg.controller_green_checks(self.controller_rollup(SHA_A, runs=rerun), SHA_A),
+                             "an older failed attempt the newer one replaced is not a red")
+        nodes = gg.controller_green_rollup(doc, SHA_A)
+        self.assertEqual({n["__typename"] for n in nodes}, {"CheckRun", "StatusContext"})
+        self.assertTrue(all(isinstance(n["isRequired"], bool) for n in nodes))
+        for bad in (self.controller_rollup(SHA_A, complete=False), self.controller_rollup(SHA_B),
+                    self.controller_rollup(SHA_A, runs=[{**rerun[1], "status": "in_progress", "conclusion": None}]),
+                    self.controller_rollup(SHA_A, runs=[{**rerun[1], "id": 9, "conclusion": "failure"}]),
+                    self.controller_rollup(SHA_A, statuses=[{"context": "ci/x", "state": "pending"}]),
+                    self.controller_rollup(SHA_A, runs=[], statuses=[]), None):
+            self.assertIsNone(gg.controller_green_checks(bad, SHA_A), bad)
+
+    def test_a_stale_or_unread_head_is_served_from_the_controllers_green_rollup(self) -> None:
+        """LAND_ROLLUP_JUDGE: the store's head copy is stale (or missing) and the PR's copy a head behind, but the
+        controller's rollup says every check is done and green: `checks --pr` answers it in the pr-rollup shape
+        land-judge already judges green-only, with no GitHub read."""
+        self.pr_rollup_fixture(SHA_B, self.GREEN_ROLLUP)  # the PR's copy names another head: route two declines
+        ctl = self.controller_fixture(self.controller_rollup(SHA_A))
+        code, doc = self.run_checks("o/r", [SHA_A], "land-judge", 120, 0, True, pr=7)
+        self.assertEqual((code, doc["unread"]), (gg.EXIT_OK, {}))
+        head = doc["heads"][SHA_A]
+        self.assertEqual((head["route"], head["via"], head["stale"], head["settled"]),
+                         ("pr-rollup", "controller", False, True))
+        self.assertEqual(head["found"]["github-actions / build"], ["completed", "success"])
+        self.assertEqual(head["statusStates"], {"status / ci/legacy": "success"})
+        self.assertIn(f"/v1/github/commits/{SHA_A}/rollup?repo=o/r", ctl.get.call_args[0][0])
+        build = next(r for r in head["rollup"] if r["name"] == "build")
+        self.assertTrue(build["required"], "required by the PR's copy")
+
+    def test_the_controller_route_declines_a_missing_required_check_a_red_or_a_daemon_without_it(self) -> None:
+        self.pr_rollup_fixture(SHA_B, [*self.GREEN_ROLLUP, {"name": "lint", "workflow": "CI", "status": "COMPLETED",
+                                                            "conclusion": "SUCCESS", "id": "CR_9", "required": True}])
+        self.controller_fixture(self.controller_rollup(SHA_A))
+        code, doc = self.run_checks("o/r", [SHA_A], "land-judge", 120, 0, True, pr=7)
+        self.assertEqual((code, doc["heads"]), (gg.EXIT_PARTIAL, {}))
+        self.assertIn("required checks not in the controller's rollup: lint", doc["unread"][SHA_A])
+        self.pr_rollup_fixture(SHA_B, self.GREEN_ROLLUP)
+        self.controller_fixture(self.controller_rollup(SHA_A, statuses=[{"context": "ci/x", "state": "pending"}]))
+        code, doc = self.run_checks("o/r", [SHA_A], "land-judge", 120, 0, True, pr=7)
+        self.assertIn("not whole and green", doc["unread"][SHA_A])
+        ctl = self.controller_fixture(self.controller_rollup(SHA_A), state="down")
+        code, doc = self.run_checks("o/r", [SHA_A], "land-judge", 120, 0, True, pr=7)
+        self.assertNotIn("controller", doc["unread"][SHA_A])  # not offered here: the unread reason is as before
+        ctl.get.assert_not_called()
+
+    def test_the_land_queue_judges_a_green_rollup_without_waiting_for_its_github_snapshot(self) -> None:
+        """LAND_ROLLUP_JUDGE: a snapshot not ready ("wait") gives way to the controller's green rollup, asked at most
+        every LAND_ROLLUP_SEEN_TTL; an unpinned head never does."""
+        q = types.SimpleNamespace(now=NOW, rollup_seen={},
+                                  rollup_nodes=mock.Mock(return_value=[{"__typename": "CheckRun"}]))
+        q.github_snapshot = lambda key, sha: (None, "wait")
+        q.rollup_green = lambda key, sha: gg.LandQueue.rollup_green(q, key, sha)
+        snap, why = gg.LandQueue.snapshot(q, "pr:o/r#7", SHA_A)
+        self.assertEqual((why, snap["via"], snap["complete"], snap["head"]), ("", "controller", True, SHA_A))
+        gg.LandQueue.snapshot(q, "pr:o/r#7", SHA_A)
+        self.assertEqual(q.rollup_nodes.call_count, 1)
+        q.now += gg.LAND_ROLLUP_SEEN_TTL
+        q.rollup_nodes.return_value = None  # a rerun turned it: the wait stands
+        self.assertEqual(gg.LandQueue.snapshot(q, "pr:o/r#7", SHA_A), (None, "wait"))
+        q.github_snapshot = lambda key, sha: (None, "unpinned")
+        self.assertEqual(gg.LandQueue.snapshot(q, "pr:o/r#7", "short"), (None, "unpinned"))
+
     def no_pr_read_fixture(self) -> str:
         """A running daemon with no entry for any head and no read of PR o/r#7 at all; returns the PR's key."""
         self.pr_rollup_fixture(SHA_A, self.GREEN_ROLLUP)
@@ -23713,12 +23806,16 @@ class ReexecDrainTest(Base):
     def test_claimed_running_asks_without_reaping(self) -> None:
         done, running = mock.Mock(), mock.Mock()
         done.done.return_value, running.done.return_value = True, False
-        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, jobs={"j": running, "d": done, "r": running},
+        q = types.SimpleNamespace(handover=True, judging={"j": (0.0, 1.0)}, stepping=set(),
+                                  jobs={"j": running, "d": done, "r": running},
                                   entries={"j": {"action": {"kind": "fetch"}}, "d": {"action": {"kind": "merge"}},
                                            "r": {"action": None}})
         self.assertFalse(gg.LandQueue.claimed_running(q), "a handed judgment, a done job, a job with no claim")
         q.entries["r"]["action"] = {"kind": "merge"}
         self.assertTrue(gg.LandQueue.claimed_running(q))
+        q.stepping.add("r")
+        self.assertFalse(gg.LandQueue.claimed_running(q), "a claimed step waiting on its handed child")
+        q.stepping.discard("r")
         self.assertEqual(set(q.jobs), {"j", "d", "r"}, "nothing reaped off the tick's thread")
         q.handover, q.entries["r"]["action"] = False, None
         self.assertTrue(gg.LandQueue.claimed_running(q), "no handover: any running job")
@@ -26069,6 +26166,8 @@ class LandTest(Base):
         start, bound = seen[0][self.KEY]
         self.assertEqual(bound, seen[0]["timeout"])
         self.assertEqual(self.q.judging, {}, "a finished judgment is forgotten")
+        # a whole-second start: monotonic's own start can round (start + bound / 2) - start under bound / 2
+        start = float(int(start))
         self.q.judging[self.KEY] = (start, bound)
         self.assertEqual(self.q.finishing(start + bound / 2 - 1), 0.0, "under half its bound: not let finish")
         self.assertEqual(self.q.finishing(start + bound / 2), start + bound)
@@ -26781,9 +26880,12 @@ class LandTest(Base):
         self.q.tick(self.t + 2, dirty=set())
         self.assert_merged_at(LA)
 
-    def test_a_wait_verdict_is_kept_while_its_head_and_checks_hold(self):
-        # hq boneheaded-designs §4.2, huge-blue 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
-        # head. Each base push turned the parked PR's mergeable UNKNOWN and back, and each turn judged it again.
+    def test_a_parked_wait_judges_only_on_a_change_its_verdict_answers(self):
+        # hq boneheaded-designs 4.2, one host 2026-11-18: 841 explains for 97 merges, 214 shim calls in 44 min at one
+        # head. Each base push turned the parked PR's mergeable UNKNOWN and back, the wake's fingerprint held that raw
+        # value, and each turn judged it again once LAND_VERDICT_KEEP had run out. The wake reads mergeability as the
+        # judge does now -- CONFLICTING or not -- so base churn costs no judgment at any age, and a change the verdict
+        # answers differently (its checks, a conflict, its head) still judges at once.
         wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
         self.pr(LA)
         self.land()
@@ -26794,14 +26896,18 @@ class LandTest(Base):
             self.w.cache[self.KEY]["data"]["mergeStateStatus"] = "BEHIND"
             e = self.tick(30)
         self.assertEqual((e["state"], e["wait"]["kind"], len(self.w.explains())), ("waiting", "pr", 1))
-        self.assertEqual([h["event"] for h in e["history"]].count("kept"), 1)  # once per fingerprint it kept
-        self.assertEqual(gg.land_counts()[gg.land_day(self.t)]["kept"], 1)
+        self.assertEqual([h["event"] for h in e["history"]].count("kept"), 0)  # nothing the keep has to hold
+        # Older than the keep, which used to let every one of those turns through: still no judgment.
+        self.tick(gg.LAND_VERDICT_KEEP)
+        self.assertEqual(len(self.w.explains()), 1)
+        day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
+        self.assertEqual(day.get("explain_unmoved_fp_moved"), None)
         # A changed snapshot (a check's conclusion) is judged at once.
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "COMPLETED", "FAILURE")])
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick()
         self.assertEqual(len(self.w.explains()), 2)
-        # A CONFLICTING turn is judged at once.
+        # A CONFLICTING turn is judged at once: the one mergeability change the verdict answers differently.
         self.w.cache[self.KEY]["data"]["mergeable"] = "CONFLICTING"
         self.w.answers.append(refusal("ws_check_missing", LA, wait))
         self.tick()
@@ -26812,12 +26918,9 @@ class LandTest(Base):
         self.tick()
         self.assertEqual(self.w.explains()[-1][-2:], [LB, "--json"])
         self.assertEqual(len(self.w.explains()), 4)
-        # Past LAND_VERDICT_KEEP the change it held back is judged, though head and checks still hold.
-        self.w.cache[self.KEY]["data"]["mergeable"] = "UNKNOWN"
-        self.tick(30)
-        self.assertEqual(len(self.w.explains()), 4)
+        # What the fingerprint cannot see is bounded by the wait's own timeout, which still judges.
         self.w.answers.append(refusal("ws_check_missing", LB, {**wait, "sha": LB}))
-        self.tick(gg.LAND_VERDICT_KEEP)
+        self.tick(wait["timeout_s"])
         self.assertEqual(len(self.w.explains()), 5)
 
     def test_a_kept_wait_verdict_still_judges_at_its_own_timeout(self):
@@ -29344,35 +29447,33 @@ class LandTest(Base):
         self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]),
                          (len(judged) - 1, 0, {}))
 
-    def test_a_mergeability_flip_alone_judges_again_and_is_counted_as_the_skippable_kind(self):
-        # The other half of the same count, and the only half worth removing: mergeable UNKNOWN <-> MERGEABLE turns on
-        # every push to the base, moves land_fingerprint (which the wake reads) and not land_check_fingerprint (which
-        # the verdict's keep reads), so once LAND_VERDICT_KEEP has run out it judges again at the same head on the
-        # same checks for an answer that cannot differ. Counted apart from the backoff's judgments (explain_unmoved_
-        # fp_moved) so "judgments that moved nothing" is not read as one waste: hq#15832 Fix 120 measured 171 of them
-        # and nearly held every retry for 600 s on the strength of the total, which would have delayed every recovery.
-        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "until": "done",
-                                                      "timeout_s": 4 * gg.LAND_VERDICT_KEEP})
+    def test_a_mergeability_flip_alone_never_judges_however_long_it_waits(self):
+        # The other half of the same count, since removed: mergeable UNKNOWN <-> MERGEABLE turns on every push to the
+        # base, and while land_fingerprint (which the wake reads) held that raw value, each push moved it twice at an
+        # unchanged head on unchanged checks; past LAND_VERDICT_KEEP it judged again for an answer that cannot differ
+        # (5 judgments an hour per parked PR, measure-land-wake-redundancy.py; 69 of 669 on one host 2026-11-25).
+        # The wake now reads mergeability as the judge does -- CONFLICTING or not -- so no flip wakes it at any age,
+        # and what the fingerprint cannot see is bounded by the wait's own timeout, as it always was.
+        wait = lambda sha=LA: refusal("checks_running", sha, {"kind": "wait_pr", "sha": sha, "until": "done",
+                                                              "timeout_s": 100 * gg.LAND_VERDICT_KEEP})
         self.pr(LA)
         self.land()
         self.w.answers.append(wait())
         e = self.tick()
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"))
         first = len(self.w.explains())
-        # inside the keep, a flip is answered from the verdict: no judgment at all
-        self.pr(LA, mergeable="UNKNOWN")
-        self.tick(gg.LAND_VERDICT_KEEP / 2)
-        self.assertEqual(len(self.w.explains()), first, "the kept verdict answered the flip")
-        # past the keep, the same flip judges again (left flipped: flipping back would restore the fingerprint)
-        self.w.answers.append(wait())
-        e = self.tick(gg.LAND_VERDICT_KEEP)
-        judged = [h for h in e["history"] if h["event"] == "judged"]
-        self.assertEqual(len(self.w.explains()), first + 1)
-        self.assertEqual((judged[-1].get("why"), judged[-1].get("unmoved"), judged[-1].get("due")),
-                         ("fp_moved", True, None))
+        for n, mergeable in enumerate(("UNKNOWN", "MERGEABLE", "UNKNOWN", "MERGEABLE")):
+            self.pr(LA, mergeable=mergeable)  # a push to the base: same head, same checks
+            e = self.tick(gg.LAND_VERDICT_KEEP)  # each turn older than the keep that used to let it through
+            self.assertEqual(len(self.w.explains()), first, f"flip {n} judged again")
         day = (gg.read_json(gg.land_dir() / "counts.json").get("days") or {}).get(gg.land_day(self.t)) or {}
-        split = gg.land_unmoved_split(day)
-        self.assertEqual((split["due"], split["redundant"], split["redundantByWhy"]), (0, 1, {"fp_moved": 1}))
+        self.assertEqual(day.get("explain_unmoved_fp_moved"), None)
+        self.assertEqual(gg.land_unmoved_split(day)["redundantByWhy"], {})
+        # A CONFLICTING turn is the one mergeability change the verdict answers differently: judged at once.
+        self.pr(LA, mergeable="CONFLICTING")
+        self.w.answers.append(wait())
+        self.tick()
+        self.assertEqual(len(self.w.explains()), first + 1)
 
     def test_land_status_never_prints_the_unmoved_total_without_its_split(self):
         # A count whose name reads as waste has to say which half is skippable, in the line that prints it.
@@ -30630,6 +30731,50 @@ class LandTest(Base):
                 self.assertEqual(env.get("LAND_JUDGE_OVERRIDE"), self.OVERRIDE["reason"])
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual(took[-1]["code"], "ws_check_missing")
+
+    def test_land_override_waits_one_measured_ws_check_not_a_constant(self):
+        """2700 s held every override 45 min behind a ws-check that posts in about 27 (hq fast checks run 45562131182,
+        2026-11-25). The queue keeps how long each ws-check wait lasted until the check posted at that head, and an
+        override waits their p90 (at least LAND_OVERRIDE_WAIT_MIN_S, at most LAND_OVERRIDE_WAIT_S); too few
+        measurements, or a wait a new head or a stop cut, leave it at the ceiling."""
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.addCleanup(gg._LAND_CHECK_WAIT_READ.clear)
+        wait = {"kind": "wait_pr"}
+        missing = {"code": "ws_check_missing"}
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "nothing measured: the ceiling")
+        for i, took in enumerate((900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1620, 1650)):
+            e = {}
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 0.0))
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 30.0), "still waiting: no measurement")
+            self.assertEqual(gg.land_check_wait_ended(e, {"kind": "merge"}, {}, LA, float(took)), took)
+        self.assertEqual(gg.land_override_wait_s(1000.0), 1650.0, "p90 of the ten")
+        cut = {}
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "stop", "stop": "hold"}, {}, LA, 99999.0))
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "merge"}, {}, LB, 99999.0), "a new head")
+        self.assertEqual(len(gg.land_check_waits()), 10)
+        gg.write_json(gg.land_check_waits_path(), {"waits": [5.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_MIN_S, "never under the floor")
+        gg.write_json(gg.land_check_waits_path(), {"waits": [9000.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "never over the ceiling")
+        # the queue itself: past the measured wait, not the ceiling, the override's pinned merge goes
+        gg.write_json(gg.land_check_waits_path(), {"waits": [1200.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        for _ in range(3):
+            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr"}, reason=(
+                "land-judge: refused: PR #1 head " + LA + " has ws-check still pending, and it changes tools/x.py: a "
+                "PR that changes tools/ waits for its ws-check result even on the lagging sync"),
+                nxt="glaeda-gh wait pr o/r#1 --until done"))
+        e = self.tick()
+        e = self.tick(1100.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+        e = self.tick(1300.0)
+        self.assert_merged_at(LA)
 
     def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
         never = "git commit --allow-empty -m x && git push"
@@ -34620,6 +34765,51 @@ class LandTest(Base):
             self.tick(5)
         self.assertEqual(len(self.w.judgments()), 2)  # that event was judged; it asks nothing again
 
+    def test_a_check_completed_event_whose_judgment_was_not_handed_is_asked_again_next_pass(self):
+        """glaeda#2744, 2026-11-25: green by 07:29Z, the done event met a refused read (judge handed nothing), the
+        event was marked seen and the row slept to its 08:23Z wake. Now an event is spent only once handed."""
+        self.feed()
+        done, _, _ = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(60)
+        real = self.q.judge
+        refused = [True]
+
+        def judge(e, sha, fp, counts=True, why=""):
+            if refused and why == "checks_done":
+                refused.pop()
+                return False
+            return real(e, sha, fp, counts=counts, why=why)
+        self.q.judge = judge
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 1)
+        e = self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
+
+    def test_a_re_request_of_a_waiting_checks_row_judges_it_again(self):
+        """glaeda#2744: two same-pin re-requests left the waiting row on its hour wake."""
+        self.feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 3600}
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        self.tick()
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.tick(30)
+        self.land()  # the same request again
+        self.w.answers.append(ok_answer(LA))
+        self.tick(5)
+        self.assertEqual(len(self.w.judgments()), 2)
+
     def test_an_event_from_before_the_wait_verdict_or_no_feed_keeps_the_timer(self):
         """An event older than the wait's verdict was judged already; with no feed (a lane VM) feed_done says
         nothing, and the wait runs on its timer as before."""
@@ -36466,6 +36656,67 @@ class LandTest(Base):
         gg.write_json(meta, {"argv": argv + ["x"], "run": "other", "pid": os.getpid(), "at": time.time(),
                              "deadline": time.time() + 30})
         self.assertEqual(q.judge_handed("pr:o/r#1", argv, 30.0, dict(os.environ)).stdout.strip(), "fresh")
+        self.assertEqual(list(meta.parent.iterdir()), [])
+
+    def test_a_claimed_step_runs_in_a_handed_child_and_no_reexec_waits_for_it(self):
+        # gcp-agent-lane-9, glaeda a0271f3 (2026-11-25): live 22.56 s after its merge, 20.51 s of it reexec-deferred
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        self.assertTrue(q.handover)
+        key = "pr:o/r#7"
+        e = {"key": key, "repo": "o/r", "number": 7, "state": "acting", "action": {"kind": "merge", "sha": "a" * 40}}
+        q.entries[key] = e
+        fut = mock.Mock()
+        fut.done.return_value = False
+        q.jobs[key] = fut
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name(gg.LAND_STEP_PREFIX + key)
+        seen: list[tuple[bool, bool, bool]] = []
+        argv = [sys.executable, "-c", "import time; time.sleep(1.0); print('merged')"]
+        done = threading.Event()
+        got: list[subprocess.CompletedProcess] = []
+        threading.Thread(target=lambda: (got.append(q.call(argv, 30.0, e)), done.set()), daemon=True).start()
+        deadline = time.monotonic() + 10
+        while key not in q.stepping and time.monotonic() < deadline:
+            time.sleep(0.02)
+        seen.append((key in q.stepping, meta.exists(), self.daemon.land_busy()))
+        self.assertEqual(seen, [(True, True, False)], "its pid on disk, so the update need not wait for the merge")
+        self.assertTrue(done.wait(10))
+        self.assertEqual((got[0].returncode, got[0].stdout.strip()), (0, "merged"))
+        self.assertNotIn(key, q.stepping)
+        self.assertTrue(self.daemon.land_busy(), "back in this image's own code: waited for again")
+        self.assertEqual(list(meta.parent.iterdir()), [], "its files go with its answer")
+
+    def test_the_next_daemon_reads_a_handed_steps_answer_before_judging_again(self):
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        key = "pr:o/r#8"
+        meta = gg.land_dir() / gg.LAND_JUDGING_DIR / gg.file_name(gg.LAND_STEP_PREFIX + key)
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        out, err, rc = gg.handed_files(meta, "old")
+        old = subprocess.Popen(["/bin/sh", "-c", f'sleep 1; echo "merged it" > "{out}"; echo 0 > "{rc}"'])
+        gg.write_json(meta, {"argv": ["gh", "pr", "merge"], "run": "old", "pid": old.pid, "at": time.time(),
+                             "deadline": time.time() + 30})
+        e = {"key": key, "repo": "o/r", "number": 8, "state": "queued", "action": None,
+             "interrupted": {"kind": "merge", "sha": "b" * 40}, "history": []}
+        try:
+            q.adopt_step(e)
+        finally:
+            old.wait(timeout=10)
+        self.assertEqual((e["lastAction"]["kind"], e["lastAction"]["exit"], e["lastAction"]["handed"]), ("merge", 0, True))
+        self.assertIn("merged it", e["lastAction"]["out"])
+        self.assertEqual(list(meta.parent.iterdir()), [])
+        # one gone with no answer: nothing kept, its files dropped, judged afresh as before
+        dead = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        dead.wait()
+        gg.write_json(meta, {"argv": ["gh"], "run": "dead", "pid": dead.pid, "at": time.time(),
+                             "deadline": time.time() + 30})
+        e2 = {"key": key, "repo": "o/r", "number": 8, "state": "queued", "history": []}
+        started = time.monotonic()
+        q.adopt_step(e2)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotIn("lastAction", e2)
         self.assertEqual(list(meta.parent.iterdir()), [])
 
     def test_a_handed_judgment_past_its_bound_times_out(self):
@@ -41841,6 +42092,8 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
                          ["issue", "edit", "5", "-R", "o/r", "--add-label", "ci", "--remove-label", "old"])
         self.assertEqual(self.one_call(["post", "close", "o/r#5"]), ["issue", "close", "5", "-R", "o/r"])
         self.assertEqual(self.one_call(["post", "close", "o/r#5", "--body", "superseded by #7"]),
+                         ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
+        self.assertEqual(self.one_call(["post", "close", "o/r#5", "--comment", "superseded by #7"]),
                          ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
 
     def test_the_write_is_made_here_and_nothing_is_queued(self) -> None:
