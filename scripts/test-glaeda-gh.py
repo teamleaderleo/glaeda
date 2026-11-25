@@ -35473,6 +35473,20 @@ class LandTest(Base):
         self.assertFalse(self.q.reread(self.q.entries[again]))
         self.assertLess(self.q.judge_order(again), self.q.judge_order(moves))
 
+    def test_a_laneless_conflicting_row_sorts_behind_a_due_land_that_can_move(self):
+        """judge_order: a due row with no lane whose cache shows DIRTY can only be told to merge main, so it goes behind
+        every due row that can move, however long it waited; a row with a lane keeps its place."""
+        old = self.stuck(21, 3 * 3600)
+        moves = self.stuck(22, 600)
+        for k in (old, moves):
+            self.q.entries[k]["explain"]["code"] = "checks_pending"
+            self.q.entries[k].pop("lane", None)
+        self.assertLess(self.q.judge_order(old), self.q.judge_order(moves))
+        self.w.set_pr(old, {**land_pr("c" * 40), "mergeStateStatus": "DIRTY"}, self.t)
+        self.assertGreater(self.q.judge_order(old), self.q.judge_order(moves))
+        self.q.entries[old]["lane"] = "gcp-agent-lane-1/x"
+        self.assertLess(self.q.judge_order(old), self.q.judge_order(moves))
+
     def test_a_job_holding_its_worker_past_the_bound_is_logged_named_and_freed(self):
         """LAND_SLOT_HELD: a job holding its worker that long is logged once (land-slot-held), named in the land-pool
         line (slotHeld) and in its status line, and land-slot-freed is logged when it ends."""
