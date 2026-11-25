@@ -15010,6 +15010,13 @@ LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", 
                             ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
+# A check that says a label starts it (land_gate_labels) and has not moved for this long at the head while the queue
+# waits on it is given its label again, once per head: removed and added (LandQueue.refire_label), so GitHub sends the
+# `labeled` event the check's workflow starts on. A label added before the current head was pushed fired for the old
+# head only; it stays on the PR and nothing starts the gated checks at the new one. manaflow-ai/cmux#56619, 2026-11-25:
+# its clippy and land-tier checks sat pending 4.4 h with ready-to-land already on the PR, until checks_stuck stopped it
+# and a person removed and re-added the label.
+LAND_LABEL_REFIRE_AFTER = 900.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
 # (wait_comment), a judgment it could not make (retry: unreadable, explain_failed) and the rerun of a cancelled job
 # (rerun_failed; its checks' wait after it is a wait_pr above). interim-coord, 2026-11-18: "A refusal whose next step
@@ -22049,6 +22056,9 @@ class LandQueue:
         idle = self.now - float(w.get("movedAt") or self.now)
         self.history(e, "wait_refused", code=code, head=head[:12], n=w["count"], idle=round(idle))
         if idle < LAND_WAIT_STUCK:
+            gated = land_gate_labels(data) if idle >= LAND_LABEL_REFIRE_AFTER else []
+            if gated and (e.get("labelRefired") or {}).get("head") != head and not self.broker_client():
+                e["labelRefire"] = {"head": head, "labels": gated}  # taken off the lock by take (refire_label)
             return False
         left = land_unfinished(data, self.now) if fp else ""
         # Kept past the stop, a requeue and a rearm (keyed by head): an override given after it answers it at once
@@ -22121,6 +22131,8 @@ class LandQueue:
         kind = act.get("kind")
         repo, number, head = e["repo"], str(e["number"]), e.get("head") or ""
         land_check_wait_ended(e, act, answer, head, self.now)  # measures LAND_OVERRIDE_WAIT_S's wait (its comment)
+        if kind in LAND_WAIT_KINDS and (e.get("labelRefire") or {}).get("head") == head and head:
+            self.refire_label(e, head)
         if act.get("repo") and str(act["repo"]).lower() != repo.lower() or (
                 act.get("number") not in (None, "") and str(act.get("number")) != number):
             with self.lock:
@@ -22985,6 +22997,31 @@ class LandQueue:
             self.history(e, "union_merged", head=head[:12], merge=sha[:12], base=base_sha[:12],
                          paths=land_trim(", ".join(e["unionMerge"].get("paths") or []), 200))
             self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+
+    def refire_label(self, e: dict, head: str) -> None:
+        """Off the lock: remove and add again each label a gated check at HEAD says starts it (LAND_LABEL_REFIRE_AFTER's
+        comment), once per head; e["labelRefired"] is written before the calls, so a restart mid-call counts it done.
+        A removal that answers 404 (the label was not on the PR) still adds it. The wait that follows is taken as
+        before; the next judgment reads whatever the label started. Logged as label_refired."""
+        want = e.pop("labelRefire", None) or {}
+        gh = self.gh()
+        labels = [str(x) for x in want.get("labels") or [] if re.fullmatch(r"[\w.:-]+", str(x))]
+        if gh is None or not labels:
+            return
+        repo, number = e["repo"], str(e["number"])
+        with self.lock:
+            e["labelRefired"] = {"head": head, "at": self.now, "labels": labels}
+            self.save(e)
+        results = []
+        for label in labels:
+            off = self.call([gh, "api", "-X", "DELETE", f"repos/{repo}/issues/{number}/labels/{label}"],
+                            LAND_GH_DEADLINE, e)
+            on = self.call([gh, "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "-f",
+                            f"labels[]={label}"], LAND_GH_DEADLINE, e)
+            results.append(f"{label}:{off.returncode}/{on.returncode}")
+        with self.lock:
+            self.history(e, "label_refired", head=head[:12], labels=",".join(labels), exits=" ".join(results))
+            self.save(e)
 
     def do_label(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Add the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment), once per head, then judge

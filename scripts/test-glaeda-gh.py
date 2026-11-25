@@ -29916,6 +29916,34 @@ class LandTest(Base):
         self.assertIn("the ready-to-land label starts", reason)
         self.assertIn("ready-to-land", self.w.sent()[-1][-1])
 
+    def test_label_gated_checks_unmoved_past_the_bound_get_their_label_again_once_per_head(self):
+        """cmux#56619 (2026-11-25): ready-to-land was on the PR from before its head, so the `labeled` event fired for
+        the old head only, and the gated checks sat pending 4.4 h at the new one. Past LAND_LABEL_REFIRE_AFTER the
+        queue removes and adds the label once at the head, logged; a check that never says a label starts it gets
+        nothing."""
+        said = "Cheap tier: this check runs when ready-to-land (or full-ci) is added to the pull request"
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("clippy", "PENDING", None, said)])
+        self.land()
+        e = self.run_hour(lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                          seconds=gg.LAND_LABEL_REFIRE_AFTER + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        off = self.w.gh_calls("api", "-X", "DELETE")
+        on = [c for c in self.w.gh_calls("api", "-X", "POST") if "labels[]=ready-to-land" in c]
+        self.assertEqual(off, [["api", "-X", "DELETE", "repos/o/r/issues/1/labels/ready-to-land"]])
+        self.assertEqual(len(on), 1)
+        self.assertEqual(e["labelRefired"]["head"], LA)
+        self.assertEqual([h["labels"] for h in e["history"] if h["event"] == "label_refired"], ["ready-to-land"])
+        e = self.run_hour(lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                          seconds=gg.LAND_WAIT_STUCK, step=60.0)
+        self.assertEqual(len(self.w.gh_calls("api", "-X", "DELETE")), 1)  # once per head, then checks_stuck as before
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+
+    def test_an_ungated_pending_check_never_has_a_label_refired(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("ws-check", "PENDING", None, "Queued on a Linux runner")])
+        self.land()
+        self.run_hour(lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800}),
+                      seconds=gg.LAND_LABEL_REFIRE_AFTER + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual(self.w.gh_calls("api", "-X", "DELETE"), [])
+
     def test_an_ordinary_pending_status_adds_no_label_to_the_stop(self):
         # Only a description that says a label starts the check is the gate: a queued one is an ordinary wait, and a
         # stop that invented a label would send its reader to add one no workflow reads.
