@@ -10190,6 +10190,10 @@ class Daemon:
         self.in_land = True
         try:
             with self.phase("land refill"), self.land_controller_budget():
+                ingest = getattr(q, "ingest_between", None)
+                if ingest is not None:  # a forwarded land is a row within LAND_REFILL_EVERY, not at the next pass
+                    q.now = time.time() if getattr(self, "clock_real", True) else self.now
+                    ingest()
                 q.refill(None if getattr(self, "clock_real", True) else self.now)
         except Exception as error:  # noqa: BLE001  the land queue must never stop the reads
             self.errors.append(f"land refill: {describe(error)} at {error_site(error)}")
@@ -15994,6 +15998,10 @@ LAND_FORWARD_GIVE_UP = 7200.0
 # read of the PR (outcome_read: one peek, LAND_FORWARD_READ_WAIT for it to land), so a merged PR is never told
 # "no outcome".
 LAND_FORWARD_ASK_FIRST = 300.0
+# A row its far host stopped (forward_stopped) is asked about this long after its stop, this often: the far queue
+# rearms a stop that clears by itself (rearm), and its merge or reopen then reaches the forwarding host's row.
+LAND_FORWARD_STOPPED_FOLLOW = 24 * 3600.0
+LAND_FORWARD_STOPPED_ASK_EVERY = 1800.0
 LAND_FORWARD_ASK_EVERY = 600.0
 LAND_FORWARD_LOST_ASKS = 2
 LAND_FORWARD_READ_WAIT = 900.0
@@ -17315,6 +17323,32 @@ class LandQueue:
             self.apply(req, key, repo, number)
         p.unlink(missing_ok=True)
 
+    def ingest_between(self) -> int:
+        """Between two passes (refill): apply the requests that came since the last pass (ingest), and put each row
+        they made due at the end of the refill's line (next_up), so a worker that frees judges it before the next pass.
+        Only on a host that executes its lands (the last pass found no land.json executor); a forwarding host's
+        forward_tick takes its requests/. Returns how many requests it applied.
+
+        cmux-cp-1, 2026-11-25 07:20-13:20Z: a forwarded land waited p50 58 s, p90 297 s in requests/ for the pass that
+        applies it, which runs once per daemon tick, after up to TICK_BUDGET of reads and behind the judging pass."""
+        if not getattr(self, "executes", False):
+            return 0
+        d = self.requests_dir()
+        paths = sorted(d.glob("*.json")) if d.is_dir() else []
+        if not paths:
+            return 0
+        with self.lock:
+            before = {k: (e.get("gen"), e.get("state")) for k, e in self.entries.items()}
+        self.ingest()
+        with self.lock:
+            line = set(self.next_up)
+            for key, e in self.entries.items():
+                if before.get(key) != (e.get("gen"), e.get("state")) and e["state"] == "queued" and key not in line \
+                        and key not in self.jobs:
+                    self.next_up.append(key)
+        log({"event": "land-ingest-between", "requests": len(paths)})
+        return len(paths)
+
     def apply(self, req: dict, key: str, repo: str, number: int) -> None:
         e = self.entries.get(key)
         rid = req.get("id")
@@ -17440,6 +17474,7 @@ class LandQueue:
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
         executor = land_executor(self.config())
+        self.executes = executor is None  # ingest_between: a forwarding host's requests are forward_tick's
         if executor is not None:
             if not self.queue_quota_parked():
                 self.forwards_unjudged()  # its one-off reads need the login a quota park says is spent
@@ -18187,7 +18222,61 @@ class LandQueue:
                         due.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
                 log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
+        for key in [k for k, e in self.entries.items() if k in self.forward_answers and self.forward_stop_followed(e)]:
+            try:
+                with self.lock:
+                    self.forward_stop_follow(self.entries[key])
+            except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
+                log({"event": "land-error", "key": key, "error": describe(error), "site": error_site(error)})
         self.forward_state_reads(due, executor)
+
+    def forward_stop_followed(self, e: dict) -> bool:
+        """Whether E stopped forward_stopped (its far host's queue stopped it) in the last LAND_FORWARD_STOPPED_FOLLOW:
+        its far host is still asked about it, every LAND_FORWARD_STOPPED_ASK_EVERY, so a far rearm or merge reaches
+        this row (forward_stop_follow)."""
+        st = e.get("stop") if isinstance(e.get("stop"), dict) else {}
+        return e.get("state") == "stopped" and st.get("code") in ("forward_stopped", "forward_no_outcome") \
+            and bool(e.get("forwardedTo")) and self.now - float(st.get("at") or 0) < LAND_FORWARD_STOPPED_FOLLOW
+
+    def forward_stop_follow(self, e: dict) -> None:
+        """Under the lock. A forward_stopped E's far answer (forward_ask): the far queue rearmed its row (a stop that
+        clears by itself: a base red fixed, a retry, a predecessor that ended) or merged it, after E's stop. Merged
+        ends E merged; open again puts E back to forwarded, followed on a fresh give-up clock, held by that answer.
+        Neither wakes the requester: the far host tells it. cmux-cp-1, 2026-11-25 13:20Z: 5 of cosmic-gray's 23
+        forward_stopped rows were queued or waiting again there, and would merge with this host still saying stopped."""
+        answer = self.forward_answers.pop(e["key"], None)
+        row = answer.get("row") if isinstance(answer, dict) and isinstance(answer.get("row"), dict) else None
+        if row is None:
+            return
+        st = str(row.get("state") or "")
+        stopped_at = float((e.get("stop") or {}).get("at") or 0)
+        # a forward_no_outcome stop said the far host had none: whatever its row there says is news
+        no_outcome = (e.get("stop") or {}).get("code") == "forward_no_outcome"
+        if not no_outcome and float(row.get("updated") or 0) <= stopped_at:
+            return  # nothing has happened to it there since
+        host = str(answer.get("host") or e.get("forwardedTo") or "")
+        ours = str(row.get("requestId") or "") == self.handoff_request(e["key"], e)["id"] \
+            or float(row.get("updated") or 0) >= self.forwarded_since(e)
+        if no_outcome and st in ("stopped", "cancelled") and ours:
+            # cosmic-gray and huge-blue, 2026-11-25: 66 rows stopped forward_no_outcome in a day while cmux-cp-1 held
+            # each stopped with its reason; the far stop is the outcome, said in its words, quietly (it told them)
+            far = row.get("stop") if isinstance(row.get("stop"), dict) else {}
+            self.note_forward_outcome(e, host)
+            self.stop(e, "forward_stopped", f"{host}'s land queue {st} it ({far.get('code') or st}): "
+                      f"{far.get('reason') or 'it gave no reason'}",
+                      str(far.get("next") or f"glaeda-gh land status {key_name(e['key'])} on {host}"), tell="quiet")
+            return
+        if st == "merged":
+            self.note_forward_outcome(e, host)
+            self.merged(e, str(row.get("mergeSha") or e.get("mergeSha") or ""),
+                        f"forwarded to {host}: its land queue merged it after its stop", wake=False)
+            return
+        if st in LAND_FORWARD_OPEN and st != "requested":
+            e.update(state=LAND_FORWARDED, stop=None, forwardFirst=self.now,
+                     forwardHeld={"at": float(answer.get("at") or self.now), "state": st})
+            self.history(e, "forward_far_rearmed", to=host, far=st)
+            log({"event": "land-forward-far-rearmed", "key": e["key"], "to": host, "far": st})
+            self.save(e)
 
     def forward_state_reads(self, due: list[str], executor: bool) -> None:
         """One live read of each of the first LAND_FORWARD_STATE_READS keys in DUE (forward_read_state), off the lock
@@ -18290,9 +18379,14 @@ class LandQueue:
         groups: dict[str, tuple[list[str], list[str]]] = {}
         with self.lock:
             for key, e in self.entries.items():
-                if e["state"] != LAND_FORWARDED or key in self.jobs or key in self.sending or key in self.overflowing:
+                if key in self.jobs or key in self.sending or key in self.overflowing:
                     continue
-                if self.now - self.forwarded_since(e) < LAND_FORWARD_ASK_FIRST \
+                if self.forward_stop_followed(e):
+                    if self.now - self.forward_asked.get(key, float("-inf")) < LAND_FORWARD_STOPPED_ASK_EVERY:
+                        continue
+                elif e["state"] != LAND_FORWARDED:
+                    continue
+                elif self.now - self.forwarded_since(e) < LAND_FORWARD_ASK_FIRST \
                         or self.now - self.forward_asked.get(key, float("-inf")) < LAND_FORWARD_ASK_EVERY:
                     continue
                 host = self.forward_host(e)
@@ -18550,13 +18644,19 @@ class LandQueue:
         e.pop("forwardAsk", None)
         row = answer.get("row") if isinstance(answer.get("row"), dict) else None
         st = str((row or {}).get("state") or "")
-        if st == "merged" or (st in ("stopped", "cancelled") and float(row.get("updated") or 0) >= since):
+        # A far row that ended on this row's own request is its outcome, however long before this look's hand-off:
+        # a re-send keeps the id (handoff_request), and the far queue applies an id once, so its stop is never newer
+        # than the re-send. cosmic-gray, 2026-11-25: 18 rows read "holds no row of it" (forward_missing) and stopped
+        # forward_no_outcome while cmux-cp-1 held each stopped with its reason (conflict, block, ...).
+        ours = bool(row) and str(row.get("requestId") or "") == self.handoff_request(e["key"], e)["id"]
+        ended = st in ("stopped", "cancelled") and (float(row.get("updated") or 0) >= since or ours)
+        if st == "merged" or ended:
             self.note_forward_outcome(e, host)  # an outcome from it (silent_peers); a row held open there is none
         if st == "merged":
             self.merged(e, str(row.get("mergeSha") or e.get("mergeSha") or ""),
                         f"forwarded to {host}: its land queue merged it", wake=False)
             return True
-        if st in ("stopped", "cancelled") and float(row.get("updated") or 0) >= since:
+        if ended:
             far = row.get("stop") if isinstance(row.get("stop"), dict) else {}
             code = str(far.get("code") or st)
             self.stop(e, "forward_stopped", f"{host}'s land queue {st} it ({code}): "
@@ -18705,7 +18805,11 @@ class LandQueue:
         HEAD, as a fresh request from E's own requester (a new request id, so a far queue that holds the old one
         applies it). On a host that forwards its lands the next forward batch carries the pin (handoff_request)."""
         n = int((e.get("forwardRelanded") or {}).get("n") or 0) + 1
-        rid = f"forward-reland-{file_name(e['key'])[:16]}-{head[:12]}-{n}"
+        # the row's gen in the id: a re-land after a repair that cleared forwardRelanded (n back to 1) is a new request,
+        # never the id an earlier re-land used. cosmic-gray, 2026-11-25 08:15Z: 20 reopened rows re-landed under their
+        # 11-23 re-land's id; apply here and on cmux-cp-1 both took it as applied before, nothing was judged, and each
+        # stopped forward_no_outcome ~2 min later on the first hand-off's clock ("handed 170373 s ago").
+        rid = f"forward-reland-{file_name(e['key'])[:16]}-{head[:12]}-{n}-g{int(e.get('gen') or 0)}"
         req = {"op": "land", "target": key_name(e["key"]), "after": [key_name(a) for a in e.get("after") or []],
                "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
                "queuedBy": e.get("queuedBy") or "", "id": rid, "sha": head, "at": self.now}
