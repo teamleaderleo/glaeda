@@ -445,7 +445,7 @@ class MiniSetupTest(unittest.TestCase):
         gen = update / "generations" / tag
         scripts = gen / "glaeda/scripts"
         scripts.mkdir(parents=True)
-        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh"):
+        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh", "cmux-disk"):
             shutil.copy2(ms.SCRIPT_DIR / name, scripts / name)
         old = b"#!/bin/sh\necho previous release\n"
         for name in ("glaeda-gh", "glaeda-disk", "disk-pressure.sh"):
@@ -1069,7 +1069,7 @@ class MiniSetupTest(unittest.TestCase):
                           "glaeda-update.service", "glaeda-update.timer"])
         self.assertNotIn("--idle", (units / "glaeda-disk-pressure.service").read_text())
         self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()),
-                         ["cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
+                         ["cmux-disk", "cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
         config = json.loads((self.home / ".config/glaeda/update.json").read_text())
         self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
