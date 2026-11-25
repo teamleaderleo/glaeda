@@ -21214,6 +21214,7 @@ class LandQueue:
     def take(self, e: dict, act: dict, answer: dict) -> None:
         kind = act.get("kind")
         repo, number, head = e["repo"], str(e["number"]), e.get("head") or ""
+        land_check_wait_ended(e, act, answer, head, self.now)  # measures LAND_OVERRIDE_WAIT_S's wait (its comment)
         if act.get("repo") and str(act["repo"]).lower() != repo.lower() or (
                 act.get("number") not in (None, "") and str(act.get("number")) != number):
             with self.lock:
@@ -21391,8 +21392,14 @@ class LandQueue:
                 if isinstance(esc, dict) and esc.get("to") and f"{head}|{esc['to']}" not in e.setdefault("escalated", []):
                     e["escalated"].append(f"{head}|{esc['to']}")
                     self.notify(e, str(esc["to"]), land_trim(f"glaeda land {self.url(e)}: {esc.get('message') or ''}"))
+                seconds = land_seconds(act.get("timeout_s"), LAND_WAIT_DEFAULT)
+                ow = e.get("overrideWait") or {}
+                if ow.get("head") == head and isinstance(ow.get("since"), (int, float)):
+                    # an override's wait on its ws-check is judged again when its measured wait is up
+                    # (land_override_wait_s), not at the wait's own timeout: a check that posts ends it sooner
+                    seconds = min(seconds, max(60.0, ow["since"] + land_override_wait_s(self.now) - self.now))
                 self.wait(e, {"kind": "pr", "sha": str(act.get("sha") or head).lower(), "until": act.get("until") or "done"},
-                          land_seconds(act.get("timeout_s"), LAND_WAIT_DEFAULT))
+                          seconds)
             elif kind == "wait_run":
                 run = str(act.get("run") or "")
                 if not run.isdigit():
@@ -23033,12 +23040,73 @@ def land_override_carries(e: dict, act: dict, head: str, data: dict) -> dict | N
 # verdicts, posted through the lane-gh broker, never came (its host's broker serve wedged, 2,093 calls in flight). A
 # check still inside its wait keeps it: the override never skips a run that may still post.
 LAND_OVERRIDE_WAIT_CODES = frozenset({"ws_check_missing"})
-LAND_OVERRIDE_WAIT_S = 2700.0
+LAND_OVERRIDE_WAIT_S = 2700.0  # the ceiling, and the wait while too few waits are measured (land_override_wait_s)
+# The wait is one measured ws-check: the p90 of the last LAND_CHECK_WAIT_KEEP waits this queue saw end with the check
+# posted (land_check_wait_ended), between LAND_OVERRIDE_WAIT_MIN_S and LAND_OVERRIDE_WAIT_S, once it has
+# LAND_CHECK_WAIT_MIN_SAMPLES of them. 2700 s held every override 45 min behind a check that posts in about 27 (ws-check
+# run 45562131182, hq fast checks, 2026-11-25: 27 min), while the queue waited behind the ws-check queue. A wait cut by a
+# new head or a stop is no measurement: only a wait that ended with the check posted at the same head counts.
+LAND_OVERRIDE_WAIT_MIN_S = 600.0
+LAND_CHECK_WAIT_KEEP = 40
+LAND_CHECK_WAIT_MIN_SAMPLES = 5
+LAND_CHECK_WAIT_READ_S = 60.0  # the measured wait is read again at most this often
+_LAND_CHECK_WAIT_READ: dict = {}
+
+
+def land_check_waits_path() -> Path:
+    return land_dir() / "check-waits.json"
+
+
+def land_check_waits() -> list[float]:
+    """The kept waits (seconds), newest last: only finite positive numbers from the file."""
+    doc = read_json(land_check_waits_path())
+    got = doc.get("waits") if isinstance(doc, dict) else None
+    return [float(w) for w in got if isinstance(w, (int, float)) and math.isfinite(w) and w > 0][-LAND_CHECK_WAIT_KEEP:] \
+        if isinstance(got, list) else []
+
+
+def land_override_wait_s(now: float | None = None) -> float:
+    """How long an override waits on a ws-check that has not posted: one measured ws-check (the comment above)."""
+    now = time.time() if now is None else now
+    held = _LAND_CHECK_WAIT_READ
+    if held and held.get("path") == str(land_check_waits_path()) and 0 <= now - held["at"] < LAND_CHECK_WAIT_READ_S:
+        return held["s"]
+    waits = sorted(land_check_waits())
+    if len(waits) < LAND_CHECK_WAIT_MIN_SAMPLES:
+        got = LAND_OVERRIDE_WAIT_S
+    else:
+        got = min(LAND_OVERRIDE_WAIT_S, max(LAND_OVERRIDE_WAIT_MIN_S, waits[min(len(waits) - 1, int(0.9 * len(waits)))]))
+    _LAND_CHECK_WAIT_READ.update(at=now, s=got, path=str(land_check_waits_path()))
+    return got
+
+
+def land_check_wait_ended(e: dict, act: dict, answer: dict, head: str, now: float) -> float | None:
+    """Track E's wait on its ws-check (checkWait) and, when it ends with the check posted at the same head, keep its
+    length (land-check-waits.json); the seconds kept, or None."""
+    waiting = act.get("kind") == "wait_pr" and str(answer.get("code") or "") in LAND_OVERRIDE_WAIT_CODES
+    w = e.get("checkWait") or {}
+    if waiting:
+        if w.get("head") != head:
+            e["checkWait"] = {"head": head, "since": now}
+        return None
+    e.pop("checkWait", None)
+    if w.get("head") != head or act.get("kind") == "stop" or not SHA40.fullmatch(head or ""):
+        return None  # a new head, or a stop: no measurement of the check
+    since = w.get("since")
+    took = now - float(since) if isinstance(since, (int, float)) else 0.0
+    if not 0 < took <= 4 * LAND_OVERRIDE_WAIT_S:
+        return None
+    try:
+        write_json(land_check_waits_path(), {"waits": (land_check_waits() + [round(took, 1)])[-LAND_CHECK_WAIT_KEEP:]})
+    except OSError:
+        return None
+    _LAND_CHECK_WAIT_READ.clear()
+    return took
 
 
 def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float) -> bool:
     """True when E's override answers ACT, a wait_pr step for one of LAND_OVERRIDE_WAIT_CODES at HEAD that has held
-    E at that head LAND_OVERRIDE_WAIT_S (the comment above). Marks when the wait began (overrideWait)."""
+    E at that head land_override_wait_s() (the comment above). Marks when the wait began (overrideWait)."""
     if act.get("kind") != "wait_pr" or str(answer.get("code") or "") not in LAND_OVERRIDE_WAIT_CODES:
         e.pop("overrideWait", None)
         return False
@@ -23048,7 +23116,7 @@ def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float
     if w.get("head") != head:
         e["overrideWait"] = {"head": head, "since": now}
         return False
-    return now - float(w.get("since") or now) >= LAND_OVERRIDE_WAIT_S
+    return now - float(w.get("since") or now) >= land_override_wait_s(now)
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",

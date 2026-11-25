@@ -30315,6 +30315,50 @@ class LandTest(Base):
                 took = [h for h in e["history"] if h["event"] == "override_merge"]
                 self.assertEqual(took[-1]["code"], "ws_check_missing")
 
+    def test_land_override_waits_one_measured_ws_check_not_a_constant(self):
+        """2700 s held every override 45 min behind a ws-check that posts in about 27 (hq fast checks run 45562131182,
+        2026-11-25). The queue keeps how long each ws-check wait lasted until the check posted at that head, and an
+        override waits their p90 (at least LAND_OVERRIDE_WAIT_MIN_S, at most LAND_OVERRIDE_WAIT_S); too few
+        measurements, or a wait a new head or a stop cut, leave it at the ceiling."""
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.addCleanup(gg._LAND_CHECK_WAIT_READ.clear)
+        wait = {"kind": "wait_pr"}
+        missing = {"code": "ws_check_missing"}
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "nothing measured: the ceiling")
+        for i, took in enumerate((900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1620, 1650)):
+            e = {}
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 0.0))
+            self.assertIsNone(gg.land_check_wait_ended(e, wait, missing, LA, 30.0), "still waiting: no measurement")
+            self.assertEqual(gg.land_check_wait_ended(e, {"kind": "merge"}, {}, LA, float(took)), took)
+        self.assertEqual(gg.land_override_wait_s(1000.0), 1650.0, "p90 of the ten")
+        cut = {}
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "stop", "stop": "hold"}, {}, LA, 99999.0))
+        gg.land_check_wait_ended(cut, wait, missing, LA, 0.0)
+        self.assertIsNone(gg.land_check_wait_ended(cut, {"kind": "merge"}, {}, LB, 99999.0), "a new head")
+        self.assertEqual(len(gg.land_check_waits()), 10)
+        gg.write_json(gg.land_check_waits_path(), {"waits": [5.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_MIN_S, "never under the floor")
+        gg.write_json(gg.land_check_waits_path(), {"waits": [9000.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.assertEqual(gg.land_override_wait_s(1000.0), gg.LAND_OVERRIDE_WAIT_S, "never over the ceiling")
+        # the queue itself: past the measured wait, not the ceiling, the override's pinned merge goes
+        gg.write_json(gg.land_check_waits_path(), {"waits": [1200.0] * 10})
+        gg._LAND_CHECK_WAIT_READ.clear()
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], "host/lane", override=dict(self.OVERRIDE))
+        for _ in range(3):
+            self.w.answers.append(refusal("ws_check_missing", LA, {"kind": "wait_pr"}, reason=(
+                "land-judge: refused: PR #1 head " + LA + " has ws-check still pending, and it changes tools/x.py: a "
+                "PR that changes tools/ waits for its ws-check result even on the lagging sync"),
+                nxt="glaeda-gh wait pr o/r#1 --until done"))
+        e = self.tick()
+        e = self.tick(1100.0)
+        self.assertEqual((e["state"], self.merge_envs()), ("waiting", []))
+        e = self.tick(1300.0)
+        self.assert_merged_at(LA)
+
     def test_land_override_never_passes_a_hold_and_no_override_still_stops_on_ci_never_ran(self):
         never = "git commit --allow-empty -m x && git push"
         for override, answer, stopped in (
