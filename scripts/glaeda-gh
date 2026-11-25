@@ -5371,7 +5371,10 @@ def parse_pr(node: dict) -> dict:
             state = c.get("state")
             done = state in {"SUCCESS", "FAILURE", "ERROR"}
             check = {"name": c.get("context"), "workflow": None, "status": "COMPLETED" if done else "PENDING",
-                     "conclusion": state if done else None, "url": c.get("targetUrl")}
+                     "conclusion": state if done else None, "url": c.get("targetUrl"),
+                     # a status's own words, which GitHub caps at 140 characters: the only place a deferred check says
+                     # what starts it (land_gate_labels), and a count of check runs never shows it
+                     **({"description": c["description"]} if isinstance(c.get("description"), str) else {})}
             order = (0, c.get("createdAt") or "")
         else:
             workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {}).get("workflow") or {}).get("name")
@@ -16035,6 +16038,41 @@ def land_pending_status(data: dict) -> bool:
                 and sum(n for state, n in (counts.get("statuses") or {}).items() if state in COUNT_PENDING) > 0)
 
 
+# A deferred check says in its own description which label starts it: "Cheap tier: this check runs when ready-to-land
+# (or full-ci) is added to the pull request". cmux#55176 (2026-11-25) carried no cmux/land-tier status at all, only one
+# such status per deferred check, so every judgment read ordinary running checks and the land waited 4.1 h over 9 wait
+# refusals for runs nothing but the label dispatches. land_judge's gate now reads the description too (leo-workspace
+# lw#10785); this names the label in the stop, so its reader is told what to add instead of to wait again. The
+# giveaway of the class: a refusal whose own next step is "wait longer" while nothing moves is not slow CI, it is a
+# gate that cannot fire (cmuxterm-hq docs/handbook/gate-keyed-on-one-exact-name.md).
+LAND_GATE_SAID = re.compile(r"runs? when\b.{0,120}?\b([\w.-]+)\b.{0,120}?\bis added\b", re.IGNORECASE | re.DOTALL)
+
+
+def land_gate_labels(data: dict) -> list[str]:
+    """The labels DATA's unfinished checks say start them, sorted, or []: only an unfinished one's own description
+    counts, and only when it says a label is what starts it. A finished check needs nothing added, and a queued one
+    that says it waits for a runner is an ordinary wait no label ends."""
+    found = set()
+    for c in data.get("checks") or []:
+        if str(c.get("status") or "").upper() in ("COMPLETED", ""):
+            continue
+        said = c.get("description")
+        match = LAND_GATE_SAID.search(said) if isinstance(said, str) else None
+        if match:
+            found.add(match.group(1))
+    return sorted(found)
+
+
+def land_gate_said(data: dict) -> str:
+    """What a checks_stuck stop adds about the gate: "; the LABEL label starts them, so no runner ever takes them
+    until it is added" or "" when no unfinished check named a label."""
+    labels = land_gate_labels(data)
+    if not labels:
+        return ""
+    return (f"; the {' and '.join(labels)} label{'s' if len(labels) > 1 else ''} starts them, so no runner ever takes "
+            f"them until it is added")
+
+
 def land_unfinished(data: dict, now: float, limit: int = 6) -> str:
     """The checks DATA shows unfinished, as said in a checks_stuck stop: "NAME (STATUS N min), ..." or ""."""
     out = []
@@ -21404,8 +21442,8 @@ class LandQueue:
         # (land_override_carries)
         e["stuckVerdict"] = {"head": head, "at": self.now, "checks": land_unfinished_names(data, head), "code": code}
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
-                  f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
-                  f"{land_reason(reason, 200)}", land_trim(nxt))
+                  f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}"
+                  f"{land_gate_said(data)}; {land_reason(reason, 200)}", land_trim(nxt))
         return True
 
     def ci_never_ran_step(self, e: dict, act: dict, answer: dict, head: str, why: str, nxt: str) -> None:
@@ -21469,6 +21507,7 @@ class LandQueue:
     def take(self, e: dict, act: dict, answer: dict) -> None:
         kind = act.get("kind")
         repo, number, head = e["repo"], str(e["number"]), e.get("head") or ""
+        land_check_wait_ended(e, act, answer, head, self.now)  # measures LAND_OVERRIDE_WAIT_S's wait (its comment)
         if act.get("repo") and str(act["repo"]).lower() != repo.lower() or (
                 act.get("number") not in (None, "") and str(act.get("number")) != number):
             with self.lock:
@@ -21646,8 +21685,14 @@ class LandQueue:
                 if isinstance(esc, dict) and esc.get("to") and f"{head}|{esc['to']}" not in e.setdefault("escalated", []):
                     e["escalated"].append(f"{head}|{esc['to']}")
                     self.notify(e, str(esc["to"]), land_trim(f"glaeda land {self.url(e)}: {esc.get('message') or ''}"))
+                seconds = land_seconds(act.get("timeout_s"), LAND_WAIT_DEFAULT)
+                ow = e.get("overrideWait") or {}
+                if ow.get("head") == head and isinstance(ow.get("since"), (int, float)):
+                    # an override's wait on its ws-check is judged again when its measured wait is up
+                    # (land_override_wait_s), not at the wait's own timeout: a check that posts ends it sooner
+                    seconds = min(seconds, max(60.0, ow["since"] + land_override_wait_s(self.now) - self.now))
                 self.wait(e, {"kind": "pr", "sha": str(act.get("sha") or head).lower(), "until": act.get("until") or "done"},
-                          land_seconds(act.get("timeout_s"), LAND_WAIT_DEFAULT))
+                          seconds)
             elif kind == "wait_run":
                 run = str(act.get("run") or "")
                 if not run.isdigit():
@@ -23288,12 +23333,73 @@ def land_override_carries(e: dict, act: dict, head: str, data: dict) -> dict | N
 # verdicts, posted through the lane-gh broker, never came (its host's broker serve wedged, 2,093 calls in flight). A
 # check still inside its wait keeps it: the override never skips a run that may still post.
 LAND_OVERRIDE_WAIT_CODES = frozenset({"ws_check_missing"})
-LAND_OVERRIDE_WAIT_S = 2700.0
+LAND_OVERRIDE_WAIT_S = 2700.0  # the ceiling, and the wait while too few waits are measured (land_override_wait_s)
+# The wait is one measured ws-check: the p90 of the last LAND_CHECK_WAIT_KEEP waits this queue saw end with the check
+# posted (land_check_wait_ended), between LAND_OVERRIDE_WAIT_MIN_S and LAND_OVERRIDE_WAIT_S, once it has
+# LAND_CHECK_WAIT_MIN_SAMPLES of them. 2700 s held every override 45 min behind a check that posts in about 27 (ws-check
+# run 45562131182, hq fast checks, 2026-11-25: 27 min), while the queue waited behind the ws-check queue. A wait cut by a
+# new head or a stop is no measurement: only a wait that ended with the check posted at the same head counts.
+LAND_OVERRIDE_WAIT_MIN_S = 600.0
+LAND_CHECK_WAIT_KEEP = 40
+LAND_CHECK_WAIT_MIN_SAMPLES = 5
+LAND_CHECK_WAIT_READ_S = 60.0  # the measured wait is read again at most this often
+_LAND_CHECK_WAIT_READ: dict = {}
+
+
+def land_check_waits_path() -> Path:
+    return land_dir() / "check-waits.json"
+
+
+def land_check_waits() -> list[float]:
+    """The kept waits (seconds), newest last: only finite positive numbers from the file."""
+    doc = read_json(land_check_waits_path())
+    got = doc.get("waits") if isinstance(doc, dict) else None
+    return [float(w) for w in got if isinstance(w, (int, float)) and math.isfinite(w) and w > 0][-LAND_CHECK_WAIT_KEEP:] \
+        if isinstance(got, list) else []
+
+
+def land_override_wait_s(now: float | None = None) -> float:
+    """How long an override waits on a ws-check that has not posted: one measured ws-check (the comment above)."""
+    now = time.time() if now is None else now
+    held = _LAND_CHECK_WAIT_READ
+    if held and held.get("path") == str(land_check_waits_path()) and 0 <= now - held["at"] < LAND_CHECK_WAIT_READ_S:
+        return held["s"]
+    waits = sorted(land_check_waits())
+    if len(waits) < LAND_CHECK_WAIT_MIN_SAMPLES:
+        got = LAND_OVERRIDE_WAIT_S
+    else:
+        got = min(LAND_OVERRIDE_WAIT_S, max(LAND_OVERRIDE_WAIT_MIN_S, waits[min(len(waits) - 1, int(0.9 * len(waits)))]))
+    _LAND_CHECK_WAIT_READ.update(at=now, s=got, path=str(land_check_waits_path()))
+    return got
+
+
+def land_check_wait_ended(e: dict, act: dict, answer: dict, head: str, now: float) -> float | None:
+    """Track E's wait on its ws-check (checkWait) and, when it ends with the check posted at the same head, keep its
+    length (land-check-waits.json); the seconds kept, or None."""
+    waiting = act.get("kind") == "wait_pr" and str(answer.get("code") or "") in LAND_OVERRIDE_WAIT_CODES
+    w = e.get("checkWait") or {}
+    if waiting:
+        if w.get("head") != head:
+            e["checkWait"] = {"head": head, "since": now}
+        return None
+    e.pop("checkWait", None)
+    if w.get("head") != head or act.get("kind") == "stop" or not SHA40.fullmatch(head or ""):
+        return None  # a new head, or a stop: no measurement of the check
+    since = w.get("since")
+    took = now - float(since) if isinstance(since, (int, float)) else 0.0
+    if not 0 < took <= 4 * LAND_OVERRIDE_WAIT_S:
+        return None
+    try:
+        write_json(land_check_waits_path(), {"waits": (land_check_waits() + [round(took, 1)])[-LAND_CHECK_WAIT_KEEP:]})
+    except OSError:
+        return None
+    _LAND_CHECK_WAIT_READ.clear()
+    return took
 
 
 def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float) -> bool:
     """True when E's override answers ACT, a wait_pr step for one of LAND_OVERRIDE_WAIT_CODES at HEAD that has held
-    E at that head LAND_OVERRIDE_WAIT_S (the comment above). Marks when the wait began (overrideWait)."""
+    E at that head land_override_wait_s() (the comment above). Marks when the wait began (overrideWait)."""
     if act.get("kind") != "wait_pr" or str(answer.get("code") or "") not in LAND_OVERRIDE_WAIT_CODES:
         e.pop("overrideWait", None)
         return False
@@ -23303,7 +23409,7 @@ def land_override_waited(e: dict, act: dict, answer: dict, head: str, now: float
     if w.get("head") != head:
         e["overrideWait"] = {"head": head, "since": now}
         return False
-    return now - float(w.get("since") or now) >= LAND_OVERRIDE_WAIT_S
+    return now - float(w.get("since") or now) >= land_override_wait_s(now)
 
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
@@ -35935,6 +36041,24 @@ def body_guard_args(item: dict, body_file: str) -> list[str]:
     return ["issue", "comment", str(item["number"]), "-R", repo, "--body-file", body_file]
 
 
+def footer_appended(guard, item: dict, args: list[str]) -> str | None:
+    """A PR post's body with the line `agent-identity footer --repo OWNER/REPO` prints appended, instead of refusing
+    it for lacking one (the gh shim does the same to `gh pr create`: public_body_guard.with_footer). None when the
+    post is no PR, the body has the footer, the guard has no own_footer, or there is no footer to be had."""
+    if item.get("kind") != "pr" or guard.footer_refusal(args, os.environ) is None:
+        return None
+    body = str(item.get("body") or "")
+    own = getattr(guard, "own_footer", None)
+    if own is None or guard.FOOTER.search(body):
+        return None
+    line = own(item["repo"], os.environ)
+    if not line:
+        return None
+    print("glaeda-gh: appended the `agent-identity footer` line to this PR body, which had none "
+          "(an agent's PR body carries it; pr-footer-guard)", file=sys.stderr)
+    return body.rstrip("\n") + "\n\n" + line + "\n"
+
+
 def body_guard_refusal(item: dict) -> str | None:
     """The guard's refusal of this post, or None (allowed, or no guard on this host). The guard asks GitHub
     whether the repo is private (cached an hour); an unknown answer counts as public."""
@@ -35955,7 +36079,15 @@ def body_guard_refusal(item: dict) -> str | None:
         with os.fdopen(fd, "w") as fh:  # inside the try: a failed write still removes the file
             fh.write(item["body"])
         args = body_guard_args(item, name)
-        return guard.refusal(args, os.environ) or guard.footer_refusal(args, os.environ)
+        refused = guard.refusal(args, os.environ)
+        if refused:
+            return refused
+        footed = footer_appended(guard, item, args)
+        if footed:  # the PR's body gets this session's footer line, as the gh shim gives `gh pr create` (with_footer)
+            item["body"] = footed
+            with open(name, "w") as fh:
+                fh.write(footed)
+        return guard.footer_refusal(args, os.environ)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(name)
