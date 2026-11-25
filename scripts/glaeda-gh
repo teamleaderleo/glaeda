@@ -31119,7 +31119,7 @@ def until_epoch(target: str, now: float) -> float | None:
     duration from now (45m), or `quota`: the latest of this host's gh-quota marks (None when no pool is spent)."""
     text = target.strip()
     if text in ("quota", "quota:rest", "quota:graphql"):
-        marks = exhausted_marks(now)
+        marks = quota_wait_marks(now)
         pools = [text.split(":")[1]] if ":" in text else list(marks)
         return max([marks[p]["until"] for p in pools if p in marks] or [0.0]) or None
     match = re.fullmatch(r"(\d+)([smhd])", text)
@@ -31138,12 +31138,59 @@ def until_epoch(target: str, now: float) -> float | None:
     return at
 
 
+def quota_wait_marks(now: float) -> dict:
+    """{pool: {"until", "identities"}} of every gh-quota mark on this host that holds at NOW, whatever identity it is
+    for: the login's (rest-exhausted.json) and each other identity's (rest-exhausted@read-pool.json, @ROLE), as
+    leo-workspace tools/gh_latch.py path() names them (one latch per host, pool and identity). `wait until quota` waits
+    on these, not on exhausted_marks (the login's only, which `budget` reports): on a lane VM the broker's "read Apps
+    busy" refusal marks the read pool, and a PR read (`gh pr edit`'s) is held by that mark while the login's files say
+    nothing (gcp-agent-lane-4 2026-11-25 23:40:40Z: `wait until quota` "reached after 0s", then `gh pr edit 26226`
+    refused "read Apps busy, retry 23:41Z")."""
+    state = Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota")
+    out: dict = {}
+    for bucket in ("rest", "graphql"):
+        try:
+            files = sorted(state.glob(f"{bucket}-exhausted*.json"))
+        except OSError:
+            files = []
+        for f in files:
+            name = f.name[len(f"{bucket}-exhausted"):-len(".json")]
+            if name and not name.startswith("@"):
+                continue  # not a mark (a .lock or some other file of the same prefix)
+            doc = read_json(f)
+            until = doc.get("until") if isinstance(doc, dict) else None
+            if not isinstance(until, (int, float)) or isinstance(until, bool) or until <= now:
+                continue
+            until = min(float(until), now + QUOTA_MARK_MAX_S)  # gh_latch MAX_S: a corrupt far future holds that long
+            ident = name[1:] or str((doc or {}).get("identity") or "login")
+            row = out.setdefault(bucket, {"until": until, "identities": []})
+            row["until"] = max(row["until"], until)
+            row["identities"].append(ident)
+    return out
+
+
+QUOTA_MARK_MAX_S = 3700.0
+
+
 def cmd_wait_until(target: str, timeout: float, as_json: bool) -> int:
     """Block until a time, or until GitHub quota this host marked spent resets (`wait until quota`): the one wait for
     "go on at T" every agent hook accepts, with no head SHA to read while quota is spent. A quota mark is read again
     on each pass, so a pool spent again on the way is waited out too. Exit 0 at the time, 2 on --timeout."""
     start = time.monotonic()
     deadline = until_epoch(target, time.time())
+    if target.startswith("quota") and deadline is None:
+        # Nothing on this host holds that pool: say so, so a refusal that follows is not read as a reset that came
+        # and went. What refused then was no mark here (the broker's own answer): wait the time it named.
+        print(json.dumps({"result": "success", "until": None, "waited_s": 0, "held": {}}) if as_json
+              else f"glaeda-gh: no gh-quota mark holds {target} on this host (any identity): nothing to wait for. "
+                   f"If a call is still refused, wait the time its refusal names: glaeda-gh wait until HH:MM:SSZ")
+        return EXIT_OK
+    if target.startswith("quota"):
+        held = quota_wait_marks(time.time())
+        named = ", ".join(f"{b} ({'/'.join(sorted(set(m['identities'])))}) until {utc_clock(m['until'])}"
+                          for b, m in sorted(held.items()))
+        if not as_json:
+            print(f"glaeda-gh: waiting out {named}", file=sys.stderr)
     say_waiting(waiting_line(f"until {target}", "the time comes", None, True, timeout, leash=False))
     while deadline is not None and time.time() < deadline:
         waited = int(time.monotonic() - start)

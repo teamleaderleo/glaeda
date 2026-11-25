@@ -13335,6 +13335,37 @@ class FileAndPidWaitTest(unittest.TestCase):
             self.assertEqual(gg.cmd_wait_until("0s", 1, True), gg.EXIT_OK)
         self.assertEqual(json.loads(out.getvalue().splitlines()[-1])["result"], "success")
 
+    def test_wait_until_quota_waits_out_every_identitys_mark(self) -> None:
+        """A lane VM's read-pool mark (the broker's "read Apps busy") holds `gh pr edit`'s PR read while the login's
+        files are clear: `wait until quota` waits it out, not "reached after 0s" (gcp-agent-lane-4 2026-11-25)."""
+        now = 1_795_650_040.0
+        state = self.dir / "gh-quota-ids"
+        state.mkdir()
+        with mock.patch.dict(os.environ, {"GH_QUOTA_STATE": str(state)}):
+            (state / "rest-exhausted.json").write_text(json.dumps({"until": now - 5}))  # the login's: ended
+            (state / "rest-exhausted.json.lock").write_text("")
+            (state / "rest-exhausted@read-pool.json").write_text(json.dumps(
+                {"until": now + 20, "identity": "read-pool", "share": True}))
+            (state / "graphql-exhausted@review.json").write_text(json.dumps({"until": now + 7}))
+            self.assertEqual(gg.exhausted_marks(now), {})  # `budget`'s login view is unchanged
+            held = gg.quota_wait_marks(now)
+            self.assertEqual(held["rest"], {"until": now + 20, "identities": ["read-pool"]})
+            self.assertEqual(held["graphql"]["identities"], ["review"])
+            self.assertEqual(gg.until_epoch("quota", now), now + 20)
+            self.assertEqual(gg.until_epoch("quota:graphql", now), now + 7)
+            (state / "rest-exhausted@read-pool.json").write_text(json.dumps({"until": now + 99_999}))
+            self.assertEqual(gg.until_epoch("quota:rest", now), now + gg.QUOTA_MARK_MAX_S)  # a corrupt future is cut
+            (state / "rest-exhausted@read-pool.json").write_text(json.dumps({"until": time.time() + 600}))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gg.cmd_wait_until("quota:rest", 0.05, True), gg.EXIT_TIMEOUT)
+            for f in state.glob("*-exhausted*.json"):
+                f.unlink()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(gg.cmd_wait_until("quota", 5, False), gg.EXIT_OK)
+            self.assertIn("no gh-quota mark holds quota", out.getvalue())
+            self.assertNotIn("reached after", out.getvalue())
+
     def test_cli_parses_the_new_forms(self) -> None:
         target = self.dir / "ready"
         target.write_text("1")
