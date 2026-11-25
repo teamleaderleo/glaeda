@@ -199,8 +199,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   check_suite and issue_comment webhooks. Each tick the daemon reads its change feed once: free,
   so a finished run shows up within about TICK seconds and costs no quota, a check event on a
   watched PR's head commit or branch re-reads that PR at once (at most every NUDGE_MIN seconds),
-  and a new comment reaches comment waits. While the controller tracks a run, REST reads it only
-  as a safety net every 15 minutes; when the controller is unreachable or has never seen the run,
+  and a new comment reaches comment waits. A completed run or suite on the head of a land waiting on
+  its checks judges that land at once when the controller's rollup shows every check run there done,
+  without waiting for the re-read or the wait's timer (LAND_EVENT_JUDGE). While the controller
+  tracks a run, REST reads it only as a safety net every 15 minutes; when the controller is unreachable or has never seen the run,
   the REST path above applies unchanged. Public repositories need no token; private ones need the
   controller token. Controller: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the
   fleet default; token: $CMUX_CI_TOKEN_FILE, else ~/.config/cmux/build-fleet/controller.token.
@@ -6049,6 +6051,8 @@ class Daemon:
         # "pr:owner/repo#N", "sha:owner/repo@SHA", "branch:owner/repo@B" -> when the feed last delivered an event
         # for it (LAND_FEED_QUIET_MAX's comment), and since when the feed has answered without a gap (None: down)
         self.feed_marks: dict[str, float] = {}
+        # "owner/repo@SHA" -> when the feed last delivered a *completed* run or suite for that commit (LAND_EVENT_JUDGE)
+        self.feed_done: dict[str, float] = {}
         self.feed_live_since: float | None = None
         self.feed_unstarved = 0  # PR waits not handed back as starved: the feed showed their copy current
         # On an upstream host: PR key -> the upstream's feed view of it (feed_view) and when it was given (answeredAt)
@@ -9896,7 +9900,8 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
-                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room)
+                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room,
+                                        feed_done=self.land_feed_done, checks_done=self.land_checks_done)
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -12698,6 +12703,7 @@ class Daemon:
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.feed_marks, self.feed_live_since = {}, None
+        self.feed_done = {}
         self.controller_down_until, self.controller_failures = 0.0, 0
         self.controller_missed_deadline = False
         self.controller_status = {"state": "off" if current is None else "starting"}
@@ -12801,6 +12807,7 @@ class Daemon:
                     self.feed_mark(repo, item)
         if pages:
             self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+            self.feed_done = {k: t for k, t in self.feed_done.items() if self.now - t <= LAND_FEED_KEEP}
 
     def feed_due(self) -> None:
         """feed_between_reads, asked before every read request (as post_due is), on the tick's own thread only: a land
@@ -12884,6 +12891,30 @@ class Daemon:
             marks.add(f"branch:{repo}@{item['head_branch']}")
         for mark in marks:
             self.feed_marks[mark] = self.now
+        if item.get("number") is None and item.get("head_sha") and str(item.get("status") or "").lower() == "completed":
+            self.feed_done[f"{repo}@{str(item['head_sha']).lower()}"] = self.now  # a check finished (LAND_EVENT_JUDGE)
+
+    def land_feed_done(self, key: str, sha: str) -> float | None:
+        """When the feed last delivered a completed run or check suite for SHA, the head of KEY's PR, else None (no
+        feed here, or none within LAND_FEED_KEEP): the land queue's check-completed event (LAND_EVENT_JUDGE)."""
+        try:
+            _, owner, repo, _ = split_key(key)
+        except ValueError:
+            return None
+        return self.feed_done.get(f"{owner}/{repo}".lower() + "@" + str(sha or "").lower())
+
+    def land_checks_done(self, key: str, sha: str) -> bool | None:
+        """Whether the controller's rollup of SHA (over the tailnet, no GitHub request) says every check run at it has
+        completed: True, False (one still queued or running), or None when the rollup cannot say (off, slow, incomplete,
+        unreachable). Commit statuses are not in it; land_judge reads those itself (LAND_EVENT_JUDGE)."""
+        try:
+            _, owner, repo, _ = split_key(key)
+        except ValueError:
+            return None
+        doc = self.controller_suites(f"/repos/{owner}/{repo}", str(sha or "").lower())
+        if not isinstance(doc, dict) or not doc.get("suites"):
+            return None
+        return all(s[1] == "completed" for s in doc["suites"])
 
     def wait_feed_quiet(self, req: dict, cached: dict | None, now: float) -> bool:
         """A PR wait's copy that only looks starved: the feed shows nothing reached the PR, its head or its branch since
@@ -14220,6 +14251,15 @@ LAND_FEED_QUIET_MAX = 1800.0
 # the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
 # never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
 LAND_TIMER_HELD = frozenset({"checks_running"})
+# The check-completed event judges a wait on the PR's checks at once (LandQueue.checks_done_event, why=checks_done):
+# when the feed delivers a completed run or check suite for the head after the wait's verdict and the controller's
+# rollup of the head (no GitHub request) shows every check run there completed, land_judge is asked now, on its own
+# live read, instead of when the daemon's copy catches up or the wait's timer fires. Leo, 2026-11-25 ~02:10Z: "wall time
+# > runner hour time"; the decision: event streams are the transport, merge on the check-completed event, the timer is
+# the slow sweep. cmux-cp-1, 2026-11-25 02:55Z: 60 of the 103 rows waiting on their checks with the copy showing a
+# check running had every check done on GitHub, a median 59 min before, each asleep until its timer (median ~20 min
+# more); over 72 h the queue's merges came a median 31 min (p90 190 min) after the head's last check finished. One
+# judgment per event (doneEventSeen); a rollup that cannot say judges nothing, and the timer and copy paths stand.
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -14270,7 +14310,8 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
-                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", ""})
+                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", "checks_done",
+                            ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
@@ -16149,7 +16190,13 @@ class LandQueue:
                  head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading,
                  feed_quiet: Callable[[str, str, float], bool] | None = None,
-                 read_room: Callable[[], int | None] | None = None) -> None:
+                 read_room: Callable[[], int | None] | None = None,
+                 feed_done: Callable[[str, str], float | None] | None = None,
+                 checks_done: Callable[[str, str], bool | None] | None = None) -> None:
+        # (key, head) -> when the feed last said a check finished at the head, and whether the controller's rollup
+        # shows every check run there completed (LAND_EVENT_JUDGE). None: no feed here, so no event judges.
+        self.feed_done = feed_done or (lambda key, sha: None)
+        self.checks_done = checks_done or (lambda key, sha: None)
         # how many due lands may hold a waited PR watch, by the daemon's own read rate (LAND_WATCH_SHARE); None: no cap
         self.read_room = read_room or (lambda: None)
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
@@ -18757,6 +18804,9 @@ class LandQueue:
         if running:
             if woke:  # a check that never finishes (a status never posted, no runner): land_judge says what now
                 self.judge(e, head, fp, why="checks_woke")
+            elif kind == "pr" and self.checks_done_event(e, head):
+                # the copy still shows a check running; the feed and the rollup say they all finished (LAND_EVENT_JUDGE)
+                self.judge(e, head, fp, counts=False, why="checks_done")
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             elif w.get("rerun"):
@@ -19038,6 +19088,29 @@ class LandQueue:
             return False
         wake = e.get("wakeAt")
         return isinstance(wake, (int, float)) and not isinstance(wake, bool) and wake - self.now <= LAND_RETRY_MAX
+
+    def checks_done_event(self, e: dict, head: str) -> bool:
+        """True when E, waiting on its checks at HEAD with the copy still showing one running, has had a check-completed
+        event since its last judgment and the controller's rollup shows every check run at HEAD completed
+        (LAND_EVENT_JUDGE). Each event is looked at once (doneEventSeen), so an event the rollup says is not the last
+        check, or one it cannot judge, asks nothing again; the next event, the copy or the timer does."""
+        at = self.feed_done(e["key"], head)
+        if not head or not isinstance(at, (int, float)) or isinstance(at, bool):
+            return False
+        v = e.get("feedVerdict") or {}
+        # since the last judgment began (feedVerdict's at), else ended: an event while land_judge read is still news
+        since = v.get("at") if v.get("head") == head else (e.get("explain") or {}).get("at")
+        seen = e.get("doneEventSeen")
+        if any(isinstance(t, (int, float)) and not isinstance(t, bool) and at <= t for t in (since, seen)):
+            return False
+        e["doneEventSeen"] = at
+        done = self.checks_done(e["key"], head)
+        self.save(e)
+        if done is not True:
+            return False
+        self.count("checks_done_event")
+        self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
+        return True
 
     def feed_holds(self, e: dict, head: str) -> bool:
         """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
