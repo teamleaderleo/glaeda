@@ -787,6 +787,25 @@ class GlaedaDiskTest(unittest.TestCase):
         (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/repo/.git").mkdir(parents=True)
         self.assertEqual(gd.family_git_state(tmp, deep), "git")  # a clone at the bottom is still found
 
+    def test_disposable_item_past_its_window_gets_the_larger_budget_within_a_day(self) -> None:
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        big = self.root / "copy"
+        for i in range(30):
+            (big / f"d{i}").mkdir(parents=True)
+            for j in range(10):
+                (big / f"d{i}" / f"f{j}").write_text("x")
+        real = gd.git_state
+
+        def small(path, depth=5, budget=20000, sealed=False):
+            return real(path, depth, 50 if budget == 20000 else budget, sealed)
+
+        with mock.patch.object(gd, "git_state", small):
+            self.age(big, *big.iterdir(), hours=13)
+            self.assertEqual(gd.family_git_state(tmp, big), "none")  # disposable, past 12 h: larger budget now
+            self.assertEqual(gd.family_git_state(self.fam, big), "unchecked")  # a cache family still waits 7 days
+            self.age(big, *big.iterdir(), hours=2)
+            self.assertEqual(gd.family_git_state(tmp, big), "unchecked")  # recent: fails closed
+
     def test_old_tree_past_default_budget_is_searched_on_a_larger_budget(self) -> None:
         big = self.root / "big"
         for i in range(30):
