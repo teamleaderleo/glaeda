@@ -18134,6 +18134,28 @@ class PostTest(unittest.TestCase):
                          ("posted", "https://github.com/o/r/pull/9", 9, 2))
         self.assertEqual(d.post_backoff, gg.POST_BACKOFF)
 
+    def test_a_throttled_write_records_which_refusal_held_it_and_what_github_said(self) -> None:
+        """A hold used to record only its wait, so a secondary content limit, a spent hour and an abuse-detection
+        refusal of this one write all read `wait: 240` and the only move left was to wait again."""
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "b")
+        secondary = (403, {}, {"message": "You have exceeded a secondary rate limit. Please wait a few minutes."})
+        blocked = (403, {"retry-after": "120"}, {"message": "You have been temporarily blocked from content creation"})
+        d, t = self.daemon(secondary, blocked)
+        d.clock_real = False
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["throttleWhy"], state["throttleStatus"], state["throttleFrom"], state["throttled"]),
+                         ("secondary", 403, "rest", 1))
+        self.assertIn("secondary rate limit", state["throttleSaid"])
+        line = gg.post_line(state)  # `post status ID` says it without reading the daemon's log
+        self.assertIn("(secondary, HTTP 403, over rest)", line)
+        self.assertIn("secondary rate limit", line)
+        self.step(d, d.post_hold)  # a Retry-After refusal of this write is a different refusal, and says so
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["throttleWhy"], state["throttled"]), ("retry-after", 2))
+        self.assertIn("temporarily blocked", state["throttleSaid"])
+        self.assertEqual(len(t.calls), 2)
+
     def test_a_lost_answer_is_looked_up_before_writing_again(self) -> None:
         item = self.queue("comment", "o/r#7", "--body", "receipt")
         d, t = self.daemon(gg.WatchError("request failed: TimeoutError"),

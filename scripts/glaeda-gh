@@ -2990,6 +2990,47 @@ def gh_said(error: Any, limit: int | None = GH_SAID_MAX, default: str = "") -> s
     return out if limit is None or len(out) <= limit else out[:limit]
 
 
+def throttle_why(status: int | None, h: dict, text: str) -> str:
+    """Which refusal held this write, named from GitHub's own answer.
+
+    A held write used to record only how long to wait, so every one of them read the same: a secondary
+    content-creation limit (wait it out, every writer on the login with you), a spent hourly counter (whose reset is a
+    time GitHub gave us, not a guess) and an abuse-detection refusal of this one write are three different problems
+    with three different next steps. The name is the evidence a reader needs to pick one."""
+    body = text or ""
+    if re.search(r"abuse detection", body, re.I):
+        return "abuse-detection"
+    if re.search(r"submitted too quickly|secondary rate limit", body, re.I):
+        return "secondary"
+    if h.get("x-ratelimit-remaining") == "0":
+        return "hourly-spent"
+    if h.get("retry-after"):
+        return "retry-after"
+    if status == 429:
+        return "throttled-429"
+    return "unknown"
+
+
+def gql_text(doc: Any) -> str:
+    """A GraphQL answer as the bounded text throttle_why/throttle_message read."""
+    try:
+        return json.dumps(doc)[:4000] if isinstance(doc, (dict, list)) else str(doc or "")[:4000]
+    except (TypeError, ValueError):
+        return ""
+
+
+def throttle_message(text: str) -> str:
+    """GitHub's own words for a throttled write, sanitized and bounded (gh_said), or "" when it said nothing."""
+    try:
+        doc = json.loads(text) if text else None
+    except (TypeError, ValueError):
+        doc = None
+    if isinstance(doc, dict):
+        errors = [e for e in (doc.get("errors") or []) if isinstance(e, dict)]
+        return gh_said(doc.get("message")) or (gh_said(errors[0]) if errors else "")
+    return gh_said((text or "")[:400])
+
+
 def graphql_slot_wanted(want: Path) -> bool:
     """Whether a priority taker (the daemon) waits for a slot now: its want mark is GRAPHQL_SLOT_WANT_FRESH fresh."""
     try:
@@ -8241,7 +8282,12 @@ class Daemon:
             except Exception as error:  # noqa: BLE001  OSError, ValueError, OverflowError
                 self.errors.append(f"content pause hold: {describe(error)}")
 
-    def post_hold_for(self, h: dict, path: Path, item: dict) -> None:
+    def post_hold_for(self, h: dict, path: Path, item: dict, status: int | None = None, text: str = "",
+                      where: str = "rest") -> None:
+        """Hold this login's writes after GitHub throttled one, and write down *what* held it.
+
+        Every caller already holds the status and GitHub's answer; keeping only the wait left a reader (and
+        `post status`) with nothing to act on but another wait."""
         try:
             wait = (retry_after_seconds(h["retry-after"]) or 0.0) if h.get("retry-after") else (
                 float(h.get("x-ratelimit-reset", 0)) - self.now if h.get("x-ratelimit-remaining") == "0" else 0.0)
@@ -8251,10 +8297,19 @@ class Daemon:
         wait = max(wait, self.post_backoff) if wait <= 0 else wait
         self.post_backoff = min(POST_BACKOFF_MAX, self.post_backoff * 2)
         self.post_hold = self.now + max(POST_SPACING, wait)
+        why = throttle_why(status, h, text)
+        said = throttle_message(text)
         item["throttled"] = int(item.get("throttled") or 0) + 1
         item["holdUntil"] = self.post_hold
+        item["throttleWhy"] = why
+        item["throttleFrom"] = where
+        if status is not None:
+            item["throttleStatus"] = int(status)
+        if said:
+            item["throttleSaid"] = said
         write_json(path, item)
-        log({"event": "post-throttled", "id": item["id"], "wait": round(wait)})
+        log({"event": "post-throttled", "id": item["id"], "wait": round(wait), "why": why, "from": where,
+             "status": status, "throttled": item["throttled"], "said": said or None})
         if h.get("retry-after") or h.get("x-ratelimit-remaining") != "0":
             # the secondary limit, not the hourly one: the pause is the login's, so report it where every writer reads
             self.report_content_pause(self.post_hold, str(item.get("kind") or "write"))
@@ -8332,7 +8387,7 @@ class Daemon:
                 self.post_finish(path, item, superseded=retired[1])  # it can no longer mean anything: retired, recorded
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):
-            self.post_hold_for(h, path, item)
+            self.post_hold_for(h, path, item, status, text)
         elif status >= 500:
             self.post_retry(path, item, f"HTTP {status}", uncertain=True)  # a POST that 502s often landed
         elif status == 401:
@@ -8500,7 +8555,7 @@ class Daemon:
                 pass  # REST's hour, not a secondary limit: comments go on over GraphQL
             elif status in {403, 422, 429} and (status == 429 or h.get("retry-after")
                     or h.get("x-ratelimit-remaining") == "0" or THROTTLED.search(text)):
-                self.post_hold_for(h, path, item)
+                self.post_hold_for(h, path, item, status, text)
 
     def outbox_request(self, method: str, api: str, body: dict | None, actor: dict | None):
         if not actor:
@@ -8798,7 +8853,7 @@ class Daemon:
                 write_json(path, item)  # GraphQL is out (backed off): the next turn posts over REST
                 return None
             if self.gql_throttled(status, h, doc):
-                return self.post_hold_for(h, path, item)
+                return self.post_hold_for(h, path, item, status, gql_text(doc), "graphql")
             if status == 401:
                 return self.post_retry(path, item, "graphql subject: HTTP 401")  # request() re-reads the token
             if status != 200 or not isinstance(node, dict) or not node.get("id"):
@@ -8855,7 +8910,7 @@ class Daemon:
             write_json(path, item)  # not run: GraphQL is out, so the next turn sends it over REST
             return None
         if self.gql_throttled(status, h, doc):
-            return self.post_hold_for(h, path, item)
+            return self.post_hold_for(h, path, item, status, gql_text(doc), "graphql")
         if status >= 500 or (status == 200 and (not errors or self.gql_transient(errors))):
             # it may have landed: the retry looks for it over REST first (post_find)
             return self.post_retry(path, item, f"graphql: HTTP {status}", uncertain=True)
@@ -36358,6 +36413,11 @@ def post_line(state: dict) -> str:
     parts = [f"queued as {state['id']}", f"{state.get('ahead', 0)} ahead"]
     if state.get("holdUntil") and state["holdUntil"] > time.time():
         parts.append(f"GitHub holds writes for {span(state['holdUntil'] - time.time())}")
+    if state.get("throttleWhy"):
+        held = f"GitHub throttled it {state.get('throttled', 1)}x ({state['throttleWhy']}"
+        held += f", HTTP {state['throttleStatus']}" if state.get("throttleStatus") else ""
+        held += f", over {state['throttleFrom']}" if state.get("throttleFrom") else ""
+        parts.append(held + ")" + (f": {state['throttleSaid']}" if state.get("throttleSaid") else ""))
     parts.extend(pause_line(state.get("pause")))
     if state.get("lastError"):
         parts.append(f"last attempt: {state['lastError']}")
