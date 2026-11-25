@@ -42028,6 +42028,8 @@ class PostKindMadeInOneCallTest(unittest.TestCase):
         self.assertEqual(self.one_call(["post", "close", "o/r#5"]), ["issue", "close", "5", "-R", "o/r"])
         self.assertEqual(self.one_call(["post", "close", "o/r#5", "--body", "superseded by #7"]),
                          ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
+        self.assertEqual(self.one_call(["post", "close", "o/r#5", "--comment", "superseded by #7"]),
+                         ["issue", "close", "5", "-R", "o/r", "--comment", "superseded by #7"])
 
     def test_the_write_is_made_here_and_nothing_is_queued(self) -> None:
         """The whole point: one call. It goes through cmd_gh -- this tool's own quota shim -- and leaves no
