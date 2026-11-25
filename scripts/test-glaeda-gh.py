@@ -1965,7 +1965,10 @@ class StreamsTest(Base):
     def pr_reads(self) -> int:
         return sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])
 
-    def wait_ticks(self, n: int, start: float = NOW, every: float = gg.CYCLE, between=None) -> None:
+    def wait_ticks(self, n: int, start: float | None = None, every: float = gg.CYCLE, between=None) -> None:
+        # start defaults to this test's NOW (Base.setUp), not the import's: bound at import, it ran the ticks behind the
+        # watch files' real mtimes once the suite had run a while (#2691's whole suite: StreamsTest red in its shard)
+        start = NOW if start is None else start
         for i in range(n):
             at = start + i * every
             gg.register("pr:o/r#1", waited=True)
