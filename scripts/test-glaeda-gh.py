@@ -8,6 +8,7 @@ import collections
 import contextlib
 import copy
 import datetime as dt
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -3272,6 +3273,47 @@ class UpstreamTest(Base):
         self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": {**view, "head": "b" * 40}}
         self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
         self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "a view of another head does not cover it")
+
+    def test_a_full_disk_in_a_cache_write_still_reaches_the_land_pass(self) -> None:
+        """A lane VM, 2026-11-25: keep_feed_view's cache write hit ENOSPC in "read upstream", every tick died
+        before land_tick, and 4 land requests were not forwarded. A read phase's disk-full error is named in the tick's
+        errors and the tick goes on; any other OSError there, and a state write's, stay loud."""
+        key = "pr:o/r#7"
+        gg.register(key)
+        data = self.pr_data()
+        self.daemon.store(key, None, data=data, dataAt=NOW - 200)  # newer here: the answer goes to keep_feed_view
+        view = {"liveSince": NOW - 7200, "at": NOW - 2, "eventAt": None, "head": str(data["headRefOid"]).lower()}
+        self.answers[key] = {"data": data, "dataAt": NOW - 300, "feed": view}
+        cache, real_open, real_write = str(gg.cache_dir()), os.open, os.write
+        landed: list[float] = []
+        full: set[int] = set()  # the fds opened in the cache folder: the disk is full there only
+
+        def opener(path: Any, *args: Any, **kw: Any) -> int:
+            fd = real_open(path, *args, **kw)
+            (full.add if str(path).startswith(cache) else full.discard)(fd)
+            return fd
+
+        def write(fd: int, data_: Any) -> int:
+            if fd in full:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return real_write(fd, data_)
+
+        with mock.patch.object(gg.os, "write", write), mock.patch.object(gg.os, "open", opener), \
+                mock.patch.object(self.daemon, "land_tick", lambda: landed.append(self.daemon.now)):
+            status = self.daemon.tick(now=NOW)
+        self.assertEqual(landed, [NOW], "the land pass (which forwards land requests) ran")
+        self.assertTrue(any(e.startswith("read upstream: ENOSPC at ") and "disk full" in e for e in status["errors"]),
+                        status["errors"])
+        self.assertIsNone(gg.read_cache(key).get("upstreamFeed"), "the skipped write left the cache as it was")
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)  # room again: the next tick writes it
+        self.assertEqual(gg.read_cache(key)["upstreamFeed"]["head"], view["head"])
+        for loud in (OSError(errno.EACCES, "denied"), OSError(errno.EIO, "io")):
+            with self.subTest(errno=loud.errno), self.assertRaises(OSError):
+                with self.daemon.phase("read upstream"):
+                    raise loud
+        with self.assertRaises(OSError):
+            with self.daemon.phase("land"):
+                raise OSError(errno.ENOSPC, "a state write stays loud")
 
     def test_read_answers_a_prs_feed_view(self) -> None:
         sha = "a" * 40
@@ -9275,7 +9317,7 @@ class TickBudgetTest(Base):
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
     def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
-        """fs-agent-lane-27, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
+        """A lane VM, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
         mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
         the tick's watch read could carry an mtime before heads_between_since and was skipped until the next tick.
         Here the head's mtime is set 3 ms behind the tick's own wall time, every run."""
@@ -23376,7 +23418,7 @@ class RestPrefetchTest(Base):
                   f"{early[name]['requests']} requests / {early[name]['counted']} counted", file=sys.stderr)
             self.assertEqual(early[name]["counted"], serial[name]["counted"], name)
             self.assertLessEqual(early[name]["requests"], serial[name]["requests"] + gg.REST_PREFETCH_HELD, name)
-            # Not a wall-clock ratio: on a loaded VM (load 40, fs-agent-lane-27, 2026-11-25) the threads were starved and
+            # Not a wall-clock ratio: on a loaded VM (load 40, A lane VM, 2026-11-25) the threads were starved and
             # "prefetched under 0.6x serial" failed at random. Overlap is what makes it faster, and is read exactly.
         self.assertEqual(early["data"], serial["data"])
         self.assertTrue(serial["fresh"] and early["fresh"], "a PR was left unread")

@@ -341,6 +341,7 @@ import base64
 import calendar
 import contextlib
 import datetime as dt
+import errno
 import faulthandler
 import fcntl
 import fnmatch
@@ -2220,6 +2221,15 @@ def stable_replace(path: Path, data: bytes, keep_mode: bool = False) -> None:
         with contextlib.suppress(OSError):
             fcntl.flock(folder, fcntl.LOCK_UN)
         os.close(folder)
+
+
+DISK_FULL_ERRNOS = frozenset(n for n in (errno.ENOSPC, getattr(errno, "EDQUOT", None), errno.EROFS) if n is not None)
+
+
+def disk_full(error: BaseException) -> bool:
+    """Whether ERROR is a write the disk refused for room or mode (ENOSPC, EDQUOT, EROFS): what a best-effort cache
+    write may skip (Daemon.phase), never a state write the land queue or a wait needs."""
+    return isinstance(error, OSError) and error.errno in DISK_FULL_ERRNOS
 
 
 def write_json(path: Path, doc: Any) -> None:
@@ -6417,10 +6427,19 @@ class Daemon:
 
     @contextlib.contextmanager
     def phase(self, name: str):
-        """The wall time inside is one tick phase's (READ_PROGRESS_WINDOW): where the ticks went, for stall_cause."""
+        """The wall time inside is one tick phase's (READ_PROGRESS_WINDOW): where the ticks went, for stall_cause.
+        A read phase ("read ...") writes only the cache, which the next read rebuilds: a full disk there (disk_full)
+        ends the phase, named in the tick's errors, and the tick goes on to its land, wait and outbox phases, whose
+        writes stay loud. A lane VM, 2026-11-25: keep_feed_view's cache write hit ENOSPC in "read upstream",
+        every tick died before land_tick, and 4 land requests sat unforwarded until the disk was freed."""
         start, prior, self.phase_now = time.monotonic(), self.phase_now, name
         try:
             yield
+        except OSError as error:
+            if not (name.startswith("read ") and disk_full(error)):
+                raise
+            self.errors.append(f"{name}: {errno.errorcode.get(error.errno, describe(error))} at {error_site(error)}: a cache "
+                               "write skipped (disk full); the tick goes on")
         finally:
             self.phase_now = prior
             self.note_spent(name, time.monotonic() - start)
@@ -8930,7 +8949,12 @@ class Daemon:
             dormant = {"key": doc["key"], "dormant": True}
             if isinstance(doc.get("since"), (int, float)) and not isinstance(doc.get("since"), bool):
                 dormant["since"] = doc["since"]
-            write_json(path, dormant)
+            try:
+                write_json(path, dormant)
+            except OSError as error:
+                if not disk_full(error):
+                    raise
+                return False  # a full disk keeps the watch live, tried again next tick: housekeeping never ends a tick
             with contextlib.suppress(OSError):
                 os.utime(path, (touched, touched))
         return True
