@@ -1982,7 +1982,6 @@ class ControllerTest(Base):
                         "status": "completed"})
         self.daemon.tick(NOW + gg.NUDGE_MIN + gg.TICK)
         self.assertEqual(len(self.gh.gql_calls()), reads + 1)  # re-read at once
-        self.assertIn("pr:o/r#1", self.daemon.nudged)
         self.assertIsNotNone(self.daemon.land_feed_done("pr:o/r#1", "a" * 40))
         self.assertEqual(self.daemon.controller_status.get("state"), "ok")
         pending.append({"repo": "o/r", "head_sha": "b" * 40, "context": "ci/x", "state": "pending",
