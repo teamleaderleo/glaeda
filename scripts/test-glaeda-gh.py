@@ -7217,6 +7217,81 @@ class OverloadTest(Base):
         self.assertGreaterEqual(self.daemon.heavy["pr:o/r#3"]["fails"], gg.HEAVY_AFTER)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_a_heavy_pr_with_no_rest_to_take_it_is_read_alone_on_its_own_back_off(self) -> None:
+        # the land host, 2026-11-25: a PR that timed out alone was handed to REST, which was stopped and read nothing: no
+        # read stored for 5,800 s and no error either. With REST unable, it is read alone over GraphQL, paced per entry.
+        self.watch(6)
+        seen = []
+        self.transport(lambda prs: seen.append(list(prs)) or ((504, b"{}") if 3 in prs else None))
+        lone = []
+        with mock.patch.object(self.daemon, "rest_capped", return_value=True):
+            for cycle in range(0, 12):
+                for n in range(1, 7):
+                    os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+                seen.clear()
+                self.daemon.tick(NOW + cycle * gg.CYCLE)
+                lone.append(sum(1 for prs in seen if prs == [3]))
+        late = lone[gg.HEAVY_AFTER + 2:]
+        self.assertGreater(sum(late), 0, "still tried alone after it backed off, REST cannot take it")
+        self.assertLess(sum(late), len(late), "but not every cycle: the pause doubles per failure")
+        self.assertGreater(self.daemon.heavy["pr:o/r#3"]["fails"], gg.HEAVY_AFTER)
+        self.assertEqual((gg.heavy_pause(gg.HEAVY_AFTER), gg.heavy_pause(gg.HEAVY_AFTER + 1), gg.heavy_pause(99)),
+                         (30.0, 60.0, 600.0))
+        for n in (1, 2, 4, 5, 6):
+            self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["dataAt"], NOW + 11 * gg.CYCLE)  # the others never wait for it
+
+    def test_chunks_are_read_oldest_data_first_across_repositories(self) -> None:
+        # a repository at a time put one repository's newer data ahead of another's oldest when a tick ran out of time
+        for repo, n, age in (("a", 1, 100), ("a", 2, 90), ("b", 3, 9000), ("b", 4, 8000)):
+            self.gh.prs[("o", repo, n)] = pr_node(n)
+            key = f"pr:o/{repo}#{n}"
+            gg.register(key, waited=True, at={"touched": NOW, "waitedAt": NOW, "waitBegan": NOW - 10000})
+            self.daemon.store(key, None, dataAt=NOW - age, data={"state": "OPEN", "number": n}, via="graphql")
+        first = []
+        self.transport(lambda prs: first.append(list(prs)) or None)
+        self.daemon.batch["pr"] = 2
+        self.daemon.tick(NOW)
+        self.assertEqual(sorted(first[0]), [3, 4], first)  # repository b, the older pair, goes first
+
+    def test_health_reports_the_age_of_waited_data_and_a_held_or_stale_verdict_is_not_healthy(self) -> None:
+        self.daemon.waited_ages = {"pr": [10.0, 20.0, 30.0, 4607.0], "run": [], "comment": [], "head": []}
+        age = self.daemon.data_age()
+        self.assertEqual(age["pr"]["max"], 4607)
+        self.assertEqual(age["pr"]["n"], 4)
+        self.assertNotIn("run", age)
+
+    def test_a_backlog_never_restarts_the_daemon_however_many_keys_are_old(self) -> None:
+        # the land host, 2026-11-22 to 11-25: "backlog: 192 pr reads stored in the last 600s", 12 ticks in a row, and the valve
+        # re-executed the daemon every 30 min for 50 h to no effect
+        self.daemon.now = NOW
+        self.daemon.started_tick = NOW - 2 * gg.STALE_DATA_AFTER
+        self.daemon.stale_count = {"pr": 400}
+        self.daemon.fresh_waited = {"pr": 900.0}
+        self.daemon.stale_streak = 12
+        self.assertIn("backlog", gg.STALE_NO_RESTART)
+        data = {"kind": "pr", "age": 4607, "key": "pr:o/r#1", "cause": "backlog"}
+        _, _, valved = self.daemon.stale_valve(("fire", "FIRE x", data), {})
+        self.assertEqual(valved["valve"], "backlog")
+        self.assertIsNone(self.daemon.valve_due)
+
+    def test_failed_check_steps_are_read_over_an_app_while_the_login_graphql_is_stopped(self) -> None:
+        # the land host, 2026-11-25: the login sat under its reserve all hour, fill_steps gave up on it, and 182 of 823 PRs kept
+        # a failed check without its steps: probe_ok then sent each of them to a full read every cycle
+        pool = mock.Mock()
+        pool.owner_of.return_value = "o"
+        pool.scope.return_value = "graphql:o:r"
+        pool.pick.return_value = object()
+        self.daemon.app_pool = pool
+        with mock.patch.object(self.daemon, "mode", side_effect=lambda b: "stop" if b == "graphql" else "normal"):
+            self.assertFalse(self.daemon.graphql_stopped_for(["o/r"], gg.STEPS_QUERY, {"ids": ["CR_1"]}))
+            pool.pick.return_value = None  # every App is resting
+            self.assertTrue(self.daemon.graphql_stopped_for(["o/r"], gg.STEPS_QUERY, {"ids": ["CR_1"]}))
+            pool.pick.return_value = object()
+            pool.owner_of.return_value = None  # a query spanning owners has no App
+            self.assertTrue(self.daemon.graphql_stopped_for(["o/r", "x/y"], gg.STEPS_QUERY, {"ids": ["CR_1"]}))
+        with mock.patch.object(self.daemon, "mode", return_value="normal"):
+            self.assertFalse(self.daemon.graphql_stopped_for(["o/r"], gg.STEPS_QUERY, {"ids": ["CR_1"]}))
+
     def resource_limited(self, partial, field="statusCheckRollup"):
         """Answer PR queries as GitHub does past its per-query resource limit: 200, with each PR `partial(prs)` names
         missing a field (its check rollup, null) beside an error of type RESOURCE_LIMITS_EXCEEDED for it."""
