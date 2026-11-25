@@ -29871,6 +29871,18 @@ class LandTest(Base):
         for env in envs:
             self.assertEqual(env[gg.LAND_QUEUE_ENV], "1")
 
+    def test_the_queue_judgment_names_the_lane_its_label_add_writes_as(self):
+        # cmuxterm-hq#24362, 2026-11-25: land_judge's own ready-to-land add went out as lane-gh pr_edit with no lane
+        # and was refused "lease acquisition requires a lane session" on every judgment.
+        self.pr(LA)
+        gg.land_request("land", "o/r#1", [], f"{gg.policy_host()}/my-lane")
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        envs = self.judge_envs()
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertEqual(env.get(gg.LAND_LANE_ENV), "my-lane")
+
     def test_a_nominated_land_judges_and_merges_with_its_nomination_and_a_plain_one_without(self):
         # ci-v2 step 12: the nomination rode only a mark on the host that filed the land, so a queue on another host
         # judged the merge as a plain glaeda-land. Now every judgment and merge try carries it (LAND_NOMINATED_ENV).
