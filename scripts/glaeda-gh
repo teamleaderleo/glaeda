@@ -701,6 +701,7 @@ EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
+STATUS_UPSTREAM_WAIT = 8.0  # status on an upstream-fed host: a tick plus two UPSTREAM_NEW asks, then read directly
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
 # All of a tick's upstream runs together (the non-head part and the head part, UPSTREAM_DEADLINE each before): gcp-agent-
 # lane-1, 2026-11-21 23:0xZ, spent 643.0 s of a 600 s progress window in "read upstream" (huge-blue's daemon slow to
@@ -26946,6 +26947,12 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
     always has; several print one block (or `--json` object, in a list) each, in the order given."""
     if first_wait is None:
         first_wait = daemon_policy()["cycle"] + 10.0  # a first read lands within one configured cycle
+        if upstream_command() is not None and direct_command() is not None:
+            # An upstream-fed host with a direct route reads a cold key itself after STATUS_UPSTREAM_WAIT, not a
+            # cycle: the upstream rarely fills a key it has never watched within a cycle, and the direct read below
+            # ran anyway once the wait ended. Measured on a lane VM 2026-11-25: cold `status pr` 62-76 s, the
+            # upstream answering null for 4+ min; every `land-judge explain` paid it.
+            first_wait = min(first_wait, STATUS_UPSTREAM_WAIT)
     keys = status_keys(kind, [target] if isinstance(target, str) else list(target))
     if not daemon_running(grace=DOWN_GRACE):
         say_daemon_problem("daemon-down", down_message(), as_json)
