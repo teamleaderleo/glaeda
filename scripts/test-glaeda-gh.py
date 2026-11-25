@@ -1948,6 +1948,76 @@ class ControllerTest(Base):
         self.assertEqual(stream.step(), gg.FEED_STREAM_RETRY)
         self.assertIn("URLError", stream.error)
 
+    def status_feed(self) -> list[dict]:
+        """The fake controller's status feed (STATUS_FEED_OFF): what is appended to the list it returns is delivered."""
+        pending: list[dict] = []
+        state = {"seq": 0}
+
+        def statuses(since: int | None, wait: int = 0) -> dict:
+            if since is None:
+                return {"cursor": state["seq"], "statuses": []}
+            state["seq"] += len(pending)
+            doc = {"cursor": state["seq"], "more": False, "statuses": list(pending)}
+            pending.clear()
+            return doc
+
+        self.ctl.statuses = statuses
+        return pending
+
+    def start_feeds(self) -> None:
+        """A watched PR, and two ticks: the first learns the change feed's cursor, the second the status feed's."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.daemon.tick(NOW + gg.TICK)
+
+    def test_a_commit_status_in_the_status_feed_reads_its_pr_at_once_and_marks_its_head_done(self) -> None:
+        """hq#25251: a status delivery never reached the change feed, so a PR whose last check was a status waited for a
+        timer. The status feed's completed status on the PR's head nudges it like a suite does, and marks the head's
+        check done for the land queue (LAND_EVENT_JUDGE)."""
+        pending = self.status_feed()
+        self.start_feeds()
+        self.assertIsNotNone(self.daemon.status_cursor)
+        reads = len(self.gh.gql_calls())
+        pending.append({"repo": "o/r", "head_sha": "a" * 40, "context": "ci/x", "state": "success",
+                        "status": "completed"})
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), reads + 1)  # re-read at once
+        self.assertIsNotNone(self.daemon.land_feed_done("pr:o/r#1", "a" * 40))
+        self.assertEqual(self.daemon.controller_status.get("state"), "ok")
+        pending.append({"repo": "o/r", "head_sha": "b" * 40, "context": "ci/x", "state": "pending",
+                        "status": "in_progress"})
+        self.daemon.tick(NOW + 2 * gg.NUDGE_MIN + gg.TICK)
+        self.assertIsNone(self.daemon.land_feed_done("pr:o/r#1", "b" * 40), "a pending status is not a finished check")
+
+    def test_a_controller_without_the_status_feed_keeps_the_change_feed_and_is_not_taken_out(self) -> None:
+        self.ctl.statuses = mock.Mock(side_effect=gg.NoReceiver("controller HTTP 404"))
+        self.start_feeds()
+        self.assertLessEqual(self.daemon.controller_down_until, NOW + gg.TICK)
+        self.assertGreaterEqual(self.daemon.status_feed_off_until, NOW + gg.TICK + gg.STATUS_FEED_OFF)
+        calls = self.ctl.statuses.call_count
+        self.ctl.suites.append({"id": 1, "repo": "o/r", "head_sha": "a" * 40, "status": "completed"})
+        reads = len(self.gh.gql_calls())
+        self.daemon.tick(NOW + gg.NUDGE_MIN + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), reads + 1)  # the change feed still serves
+        self.assertEqual(self.ctl.statuses.call_count, calls, "an absent route is not asked again for STATUS_FEED_OFF")
+
+    def test_a_status_stream_long_poll_names_a_status_and_the_tick_reads_at_once(self) -> None:
+        self.status_feed()
+        self.start_feeds()
+        self.assertIsNotNone(self.daemon.status_cursor)
+        wake = threading.Event()
+        stream = gg.FeedStream(self.daemon, wake, wait=0, kind="statuses")
+        self.daemon.status_stream = stream
+        cursor = self.daemon.status_cursor
+        stream.client = types.SimpleNamespace(base=None, token=None, statuses=lambda since, wait=0: {
+            "cursor": since + 1, "statuses": [{"repo": "o/r", "head_sha": "a" * 40, "status": "completed"}]})
+        self.assertEqual(stream.step(), 0.0)
+        self.assertTrue(stream.ready.is_set() and wake.is_set())
+        self.assertTrue(self.daemon.feed_stream_due(NOW + 2 * gg.TICK))  # the tick reads at once
+        self.assertFalse(stream.ready.is_set())
+        self.assertEqual(self.daemon.status_cursor, cursor, "the stream never moves the daemon's cursor")
+
     def test_a_check_event_on_a_parked_lands_head_watches_and_reads_its_pr(self) -> None:
         """A land parked in a long wait has no watch on its PR: a run or suite event on its head must still reach the
         land queue at once (watch it now, mark it dirty), not at the next LAND_PEEK_EVERY peek or a timeout."""
@@ -26610,7 +26680,8 @@ class LandTest(Base):
         self.land()
         self.w.answers.append(self.tier_refusal(LA))
         e = self.tick()
-        self.assertEqual(self.w.gh_calls("pr", "edit"), [["pr", "edit", "1", "-R", "o/r", "--add-label", "ready-to-land"]])
+        self.assertEqual(self.w.gh_calls("api"), [["api", "-X", "POST", "repos/o/r/issues/1/labels", "-f",
+                                                     "labels[]=ready-to-land"]])
         self.assertEqual((e["state"], e["wait"]["kind"], e["lastAction"]["kind"], e["lastAction"]["exit"]),
                          ("waiting", "retry", "label", 0))
         self.assertEqual(e["labelSent"]["head"], LA)
@@ -26619,7 +26690,7 @@ class LandTest(Base):
             self.w.answers.append(self.tier_refusal(LA))
         for _ in range(3):
             e = self.tick(gg.NUDGE_MIN * 3 + 1)
-        self.assertEqual(len(self.w.gh_calls("pr", "edit")), 1)
+        self.assertEqual(len(self.w.gh_calls("api")), 1)
 
     def test_the_land_tier_label_is_never_run_on_a_broker_client(self):
         self.broker = True
@@ -26627,7 +26698,7 @@ class LandTest(Base):
         self.land()
         self.w.answers.append(self.tier_refusal(LA))
         e = self.tick()
-        self.assertEqual(self.w.gh_calls("pr", "edit"), [])
+        self.assertEqual(self.w.gh_calls("api"), [])
         self.assertFalse(e.get("labelSent"))
 
     def test_only_the_land_tier_codes_own_label_command_is_taken(self):
@@ -26649,6 +26720,21 @@ class LandTest(Base):
                                   "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
                                                            "number": 1}}, LA)
             self.assertEqual((act["kind"], act["label"]), ("label", label))
+        # leo-workspace#10642's REST shape, as land_tier.label_command now writes it
+        for label in ("ready-to-land", "full-ci"):
+            text = f"gh api -X POST repos/o/r/issues/1/labels -f 'labels[]={label}' --silent"
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual((act["kind"], act["label"]), ("label", label))
+        for text in ("gh api -X POST repos/o/r/issues/2/labels -f 'labels[]=ready-to-land' --silent",
+                     "gh api -X POST repos/x/y/issues/1/labels -f 'labels[]=ready-to-land' --silent",
+                     "gh api -X POST repos/o/r/issues/1/labels -f 'labels[]=hold' --silent",
+                     "gh api -X DELETE repos/o/r/issues/1/labels/ready-to-land --silent"):
+            act = gg.land_action({"ok": False, "code": "land_tier_pending", "repo": "o/r", "number": "1",
+                                  "next": text, "action": {"v": 1, "kind": "command", "text": text, "repo": "o/r",
+                                                           "number": 1}}, LA)
+            self.assertEqual(act["kind"], "command", text)
 
     def test_a_fetch_argv_glaeda_does_not_run_stops_as_policy(self):
         bad = {
