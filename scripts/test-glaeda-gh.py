@@ -9083,6 +9083,36 @@ class TickBudgetTest(Base):
         self.assertEqual(queries[1], ("head", [head]), queries)
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
+    def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
+        """fs-agent-lane-27, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
+        mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
+        the tick's watch read could carry an mtime before heads_between_since and was skipped until the next tick.
+        Here the head's mtime is set 3 ms behind the tick's own wall time, every run."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "pr": 1}
+        for n in (1, 2, 3):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        head = f"head:o/r@{'b' * 40}"
+        queries: list[tuple[str, list[str]]] = []
+
+        def fetch(kind):
+            def read(chunk):
+                if kind == "pr" and not queries:
+                    gg.register(head, consumer="owner-merge")
+                    wall = self.daemon.heads_between_since + getattr(gg, "WATCH_MTIME_SLACK", 0)  # the read's time
+                    lag = wall - 0.003
+                    os.utime(gg.watch_dir() / gg.file_name(head), (lag, lag))
+                queries.append((kind, [e["key"] for e in chunk]))
+            return read
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        self.assertEqual(queries[1], ("head", [head]), queries)
+
     def test_a_head_asked_during_a_rest_tick_is_read_before_the_next_pr_and_a_flood_is_bounded(self) -> None:
         """The same over REST (GraphQL stopped, as on cosmic-gray 23:17-23:42Z that night): a head asked while the tick
         reads its PRs is read before the next PR, at most HEADS_BETWEEN_REST a look; the rest are not charged and
@@ -22914,9 +22944,17 @@ class RestPrefetchTest(Base):
         self.daemon.tick(NOW)  # every PR's first read: nothing kept to send early
         gh, lock = self.gh, threading.Lock()
         threads: set[str] = set()
+        flight = {"now": 0, "most": 0}  # requests in flight at once: overlap, read without the wall clock
 
         def slow(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
-            time.sleep(self.DELAY)
+            with lock:
+                flight["now"] += 1
+                flight["most"] = max(flight["most"], flight["now"])
+            try:
+                time.sleep(self.DELAY)
+            finally:
+                with lock:
+                    flight["now"] -= 1
             threads.add(threading.current_thread().name)
             with lock:  # the fake's own state is not thread-safe; the delay is outside it
                 return gh(method, url, headers, body)
@@ -22943,6 +22981,7 @@ class RestPrefetchTest(Base):
                            for n in range(1, self.N + 1))
         out["threads"] = len(threads - {threading.current_thread().name})
         out["spent"] = self.daemon.rest_spent()
+        out["overlap"] = flight["most"]
         return out
 
     def test_prefetched_reads_send_the_same_requests_in_a_fraction_of_the_time(self) -> None:
@@ -22957,11 +22996,14 @@ class RestPrefetchTest(Base):
                   f"{early[name]['requests']} requests / {early[name]['counted']} counted", file=sys.stderr)
             self.assertEqual(early[name]["counted"], serial[name]["counted"], name)
             self.assertLessEqual(early[name]["requests"], serial[name]["requests"] + gg.REST_PREFETCH_HELD, name)
-            self.assertLess(early[name]["seconds"], serial[name]["seconds"] * 0.6, name)
+            # Not a wall-clock ratio: on a loaded VM (load 40, fs-agent-lane-27, 2026-11-25) the threads were starved and
+            # "prefetched under 0.6x serial" failed at random. Overlap is what makes it faster, and is read exactly.
         self.assertEqual(early["data"], serial["data"])
         self.assertTrue(serial["fresh"] and early["fresh"], "a PR was left unread")
         self.assertEqual(early["spent"], serial["spent"], "the REST share was charged differently")
         self.assertEqual(serial["threads"], 0)
+        self.assertEqual(serial["overlap"], 1, "serial reads overlapped")
+        self.assertGreater(early["overlap"], 1, "no prefetched request was in flight alongside another")
         self.assertLessEqual(early["threads"], gg.REST_PREFETCH_WORKERS)
         self.assertFalse(self.daemon.prefetched, "an early request was left unsettled")
 
